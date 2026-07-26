@@ -99,6 +99,25 @@ pub fn follow_up(thread_id: &str, message_id: &str, text: &str) -> Value {
     })
 }
 
+/// The `thread.turn.interrupt` the composer's stop button sends.
+///
+/// `turn_id` is optional in the contract and the UI means something by leaving
+/// it out: `buildThreadTurnInterruptInput` (`ChatView.logic.ts`) sends it only
+/// while the session is `running`, so `None` is the client saying "stop whatever
+/// is going, if anything is".
+pub fn interrupt_turn(thread_id: &str, turn_id: Option<&str>) -> Value {
+    let mut command = json!({
+        "type": "thread.turn.interrupt",
+        "commandId": format!("test:interrupt:{thread_id}"),
+        "threadId": thread_id,
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    });
+    if let Some(turn_id) = turn_id {
+        command["turnId"] = json!(turn_id);
+    }
+    command
+}
+
 /// The `thread.approval.respond` the composer's approval buttons send.
 ///
 /// `decision` is one of `accept`, `acceptForSession`, `decline`, `cancel` —
@@ -250,7 +269,10 @@ impl SocketClient {
     pub async fn events_through_the_turn(&mut self, subscription: &str) -> Vec<Value> {
         self.values_until(subscription, |item| {
             let settled = |status: Option<&str>| {
-                matches!(status, Some("ready") | Some("error") | Some("stopped"))
+                matches!(
+                    status,
+                    Some("ready") | Some("error") | Some("stopped") | Some("interrupted")
+                )
             };
             match item["kind"].as_str() {
                 Some("event") => {
@@ -285,6 +307,21 @@ impl SocketClient {
             .expect("a request the client can answer names an id")
             .to_string();
         (events, request_id)
+    }
+
+    /// Read the turn out up to and including the agent having said something.
+    ///
+    /// What a test that means to interrupt *mid-turn* needs: pressing stop before
+    /// the agent has streamed anything would be a test of stopping a turn that
+    /// had not started, and the partial reply is the thing the ticket asks to be
+    /// kept — so there has to be one.
+    pub async fn events_until_streaming(&mut self, subscription: &str) -> Vec<Value> {
+        self.values_until(subscription, |item| {
+            item["event"]["type"] == "thread.message-sent"
+                && item["event"]["payload"]["role"] == "assistant"
+                && item["event"]["payload"]["streaming"] == json!(true)
+        })
+        .await
     }
 
     /// Subscribe to a thread and take the snapshot it opens with.

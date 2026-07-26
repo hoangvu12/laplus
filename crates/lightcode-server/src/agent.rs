@@ -11,16 +11,33 @@
 //! the same split the crate keeps everywhere: a format change has a blast radius
 //! of one pure file, and the process handling is not in it.
 //!
-//! ## Two kinds of line go out, and the second one has the agent waiting
+//! ## Three kinds of line go out, and each is a different kind of thing to say
 //!
 //! [`Agent::send`] is a turn. [`Agent::answer`] is a permission decision, and it
 //! is different in kind rather than in content: the agent has *stopped* until it
-//! arrives. Both are one line and both are flushed, and the reason for flushing
-//! is the same in both cases and merely more urgent in the second.
+//! arrives. [`Agent::interrupt`] is the third and the only one that is a
+//! *request* — it carries an id and the CLI answers it. All three are one line
+//! and all three are flushed, and the reason for flushing is the same in every
+//! case and merely more urgent in the last two.
 //!
 //! What makes an answer possible at all is [`PERMISSION_PROMPT_TOOL`], which is
 //! passed on every session and tells the CLI to ask this stdio pair rather than
-//! an MCP server.
+//! an MCP server. An interrupt needs no flag: `--input-format stream-json` is
+//! itself a control channel, and the CLI reads a `control_request` on it
+//! whether or not it is currently mid-turn.
+//!
+//! ## Interrupting is not stopping
+//!
+//! The two are deliberately different operations on this type, because they are
+//! different things to want. [`Agent::stop`] ends the *session* — it closes
+//! stdin and reaps the child, and the conversation is over.
+//! [`Agent::interrupt`] ends the *turn* and leaves the child running, which is
+//! what makes a correction sent a moment later a correction rather than the
+//! first message of a new conversation.
+//!
+//! `fixtures/claude-cli/12-interrupt-then-continue.ndjson` is the recording that
+//! settles it: an interrupt, an aborted `result`, and then a second turn
+//! answered normally by the same process.
 //!
 //! ## Why the output is read by a task rather than by whoever wants it
 //!
@@ -293,6 +310,21 @@ impl Agent {
         answer: &crate::protocol::Answer,
     ) -> std::io::Result<()> {
         self.write_line(crate::protocol::control_response_line(request_id, answer))
+            .await
+    }
+
+    /// Stop the turn in flight, without ending the session.
+    ///
+    /// The one line this server sends that is a *question*: the CLI answers it
+    /// with a `control_response` naming the same `request_id`, which is why the
+    /// caller mints one and keeps it. A write that failed here is a stop button
+    /// that did nothing, so — as with a decision — the caller reports it.
+    ///
+    /// Nothing is waited for. The agent's account of what the interrupt did
+    /// arrives on stdout like everything else it says: an acknowledgement, then
+    /// whatever the turn had already buffered, then the turn's `result`.
+    pub async fn interrupt(&mut self, request_id: &str) -> std::io::Result<()> {
+        self.write_line(crate::protocol::interrupt_line(request_id))
             .await
     }
 

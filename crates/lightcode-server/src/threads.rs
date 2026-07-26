@@ -96,15 +96,16 @@ pub const SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
 /// started cannot absorb prompts forever.
 const PROMPT_QUEUE: usize = 8;
 
-/// How many permission decisions may be waiting for a driver that has not read
-/// them yet.
+/// How many signals — decisions and interrupts — may be waiting for a driver
+/// that has not read them yet.
 ///
 /// A separate channel from the prompts rather than a second kind of message on
 /// one, and that is the whole reason it exists: a turn is queued *behind* the
-/// turn in flight, and an answer is owed to the turn in flight. Sharing a channel
-/// would put the answer behind a prompt the driver is deliberately not reading
-/// yet, which is a conversation waiting on a decision that has already been made.
-const ANSWER_QUEUE: usize = 8;
+/// turn in flight, and a signal is owed *to* the turn in flight. Sharing a
+/// channel would put the signal behind a prompt the driver is deliberately not
+/// reading yet, which is a conversation waiting on a decision that has already
+/// been made — or an agent still running after the developer pressed stop.
+const SIGNAL_QUEUE: usize = 8;
 
 // ---------------------------------------------------------------------------
 // What a thread is
@@ -580,6 +581,19 @@ pub enum Change {
         runtime_mode: Option<String>,
         interaction_mode: Option<String>,
     },
+    /// The developer stopped a turn. `thread.turn-interrupt-requested`.
+    ///
+    /// Published when the agent has been *asked* to stop rather than when it
+    /// has, and that is what the event is for: the client's reducer moves the
+    /// latest turn to `interrupted` on it immediately (`threadReducer.ts`,
+    /// `case "thread.turn-interrupt-requested"`), so the developer's own click
+    /// settles the turn instead of a round trip to the agent doing it. The
+    /// session follows a moment later, when the agent says it has stopped.
+    ///
+    /// The turn is named because the reducer requires it — an event without one
+    /// is folded as `unchanged`, and so is one naming a turn that is not the
+    /// latest.
+    InterruptRequested { turn_id: String },
     /// Live assistant text. `thread.message-sent` with `streaming: true`, which
     /// the client appends.
     AssistantDelta {
@@ -675,7 +689,7 @@ struct Entry {
 #[derive(Debug)]
 struct Live {
     prompts: mpsc::Sender<Prompt>,
-    answers: mpsc::Sender<Answered>,
+    signals: mpsc::Sender<Signal>,
     task: JoinHandle<()>,
 }
 
@@ -707,6 +721,27 @@ pub struct Reconciliation {
 pub struct Prompt {
     pub turn_id: String,
     pub text: String,
+}
+
+/// Something owed to the turn the agent is working on right now.
+///
+/// One channel for both kinds rather than one each, and the ordering is the
+/// reason: a developer who approves a tool and then immediately presses stop
+/// means those two things *in that order*, and two channels would leave a
+/// `select!` free to take them in either. One channel is also one place where
+/// the rule "a signal is never queued behind a prompt" has to be got right.
+#[derive(Debug, Clone)]
+pub enum Signal {
+    /// The developer answered a permission request.
+    Answer(Answered),
+    /// The developer stopped the agent.
+    ///
+    /// The turn is carried because the client names the one it is looking at,
+    /// and a moment is all it takes for that to stop being the one in flight —
+    /// the turn it asked about may have finished while the click was travelling.
+    /// `None` is the client saying "whatever is running", which is what it sends
+    /// when it does not believe anything is.
+    Interrupt { turn_id: Option<String> },
 }
 
 /// One permission decision on its way to the agent waiting for it.
@@ -932,6 +967,28 @@ impl Threads {
                     "modelSelection": thread.model_selection,
                     "runtimeMode": thread.runtime_mode,
                     "interactionMode": thread.interaction_mode,
+                    "createdAt": at,
+                })
+            }
+            // The client's reducer, mirrored: the latest turn moves to
+            // `interrupted` and keeps whatever `completedAt` it already had, and
+            // an event naming some other turn changes nothing. The mirroring is
+            // the same rule the rest of this fold follows — a client that watched
+            // every event and one that arrives late and takes a snapshot have to
+            // see the same conversation.
+            Change::InterruptRequested { turn_id } => {
+                if let Some(latest) = thread
+                    .latest_turn
+                    .as_mut()
+                    .filter(|latest| &latest.turn_id == turn_id)
+                {
+                    latest.state = "interrupted";
+                    latest.started_at.get_or_insert_with(|| at.to_string());
+                    latest.completed_at.get_or_insert_with(|| at.to_string());
+                }
+                json!({
+                    "threadId": thread.id,
+                    "turnId": turn_id,
                     "createdAt": at,
                 })
             }
@@ -1272,7 +1329,7 @@ impl Threads {
     pub fn attach(
         &self,
         thread_id: &str,
-        start: impl FnOnce(mpsc::Receiver<Prompt>, mpsc::Receiver<Answered>) -> JoinHandle<()>,
+        start: impl FnOnce(mpsc::Receiver<Prompt>, mpsc::Receiver<Signal>) -> JoinHandle<()>,
     ) -> mpsc::Sender<Prompt> {
         let entry = self.entry(thread_id);
         let mut live = lock(&entry.live);
@@ -1281,12 +1338,12 @@ impl Threads {
         }
 
         let (prompts, incoming) = mpsc::channel(PROMPT_QUEUE);
-        let (answers, decisions) = mpsc::channel(ANSWER_QUEUE);
+        let (signals, signalled) = mpsc::channel(SIGNAL_QUEUE);
         self.inner.live_agents.fetch_add(1, Ordering::Relaxed);
         *live = Some(Live {
             prompts: prompts.clone(),
-            answers,
-            task: start(incoming, decisions),
+            signals,
+            task: start(incoming, signalled),
         });
         prompts
     }
@@ -1303,11 +1360,7 @@ impl Threads {
     /// called from the socket's read loop, which has to stay free for the next
     /// frame.
     pub fn answer(&self, thread_id: &str, answered: Answered) -> Result<(), String> {
-        let entry = self
-            .find(thread_id)
-            .ok_or_else(|| format!("There is no conversation '{thread_id}' on this server."))?;
-        let live = lock(&entry.live);
-        let Some(running) = live.as_ref() else {
+        let Some(running) = self.live(thread_id)? else {
             return Err(
                 "No agent is running for this conversation, so there is no permission request \
                  left to answer."
@@ -1315,7 +1368,7 @@ impl Threads {
             );
         };
 
-        running.answers.try_send(answered).map_err(|error| match error {
+        running.try_send(Signal::Answer(answered)).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => {
                 "The agent has not read the decisions already sent to it, so this one was not \
                  queued."
@@ -1325,6 +1378,72 @@ impl Threads {
                 "The agent session has ended and could not be given this decision.".to_string()
             }
         })
+    }
+
+    /// Stop whatever the agent is doing for this conversation.
+    ///
+    /// **A session that is not there is not an error**, and that is the whole
+    /// difference between this and [`Threads::answer`] beside it. A decision with
+    /// nothing to route it to is a developer about to be told their click did not
+    /// land; an interrupt with nothing to route it to is a developer who got what
+    /// they asked for — the agent is not running. The ticket asks for exactly
+    /// that: "interrupting when no turn is in flight is a no-op rather than an
+    /// error".
+    ///
+    /// Whether the turn *named* is the turn in flight is the driver's question,
+    /// for the same reason the request id is: the driver is the only thing that
+    /// knows what it is currently working on.
+    ///
+    /// The one failure left is a driver that has stopped reading, which is worth
+    /// saying because the stop button will otherwise appear to have worked.
+    pub fn interrupt(&self, thread_id: &str, turn_id: Option<String>) -> Result<(), String> {
+        let Some(running) = self.live(thread_id)? else {
+            return Ok(());
+        };
+
+        match running.try_send(Signal::Interrupt { turn_id }) {
+            Ok(()) => Ok(()),
+            // The session ended between the lookup and the send, which is the
+            // no-op case arriving a moment later than it might have.
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(
+                "The agent has not read the signals already sent to it, so it was not asked to \
+                 stop."
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// The running session's signal channel, or `None` when nothing is running.
+    ///
+    /// `Err` is reserved for a conversation this server has never heard of,
+    /// which is a client naming something that does not exist rather than
+    /// anything about a session.
+    fn live(&self, thread_id: &str) -> Result<Option<mpsc::Sender<Signal>>, String> {
+        let entry = self
+            .find(thread_id)
+            .ok_or_else(|| format!("There is no conversation '{thread_id}' on this server."))?;
+        let live = lock(&entry.live);
+        Ok(live.as_ref().map(|running| running.signals.clone()))
+    }
+
+    /// The turn this conversation's session says it is working on.
+    ///
+    /// Asked by the driver before it settles a turn, and the reason it has to be
+    /// asked rather than assumed: after an interrupt the developer can send the
+    /// next turn while the agent is still winding the old one down, and a session
+    /// change published for the finished turn would describe the one that just
+    /// started. Reads one field rather than cloning the conversation, because it
+    /// is on the path of every completed turn.
+    pub fn active_turn(&self, thread_id: &str) -> Option<String> {
+        let entry = self.find(thread_id)?;
+        let state = lock(&entry.state);
+        state
+            .as_ref()?
+            .session
+            .as_ref()?
+            .active_turn_id
+            .clone()
     }
 
     /// Called by the driver when its agent has gone, so the next turn starts a
@@ -1395,6 +1514,7 @@ impl Change {
             | Change::AssistantDelta { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
             Change::TurnRequested { .. } => "thread.turn-start-requested",
+            Change::InterruptRequested { .. } => "thread.turn-interrupt-requested",
             Change::Session(_) => "thread.session-set",
             Change::Activity(_) => "thread.activity-appended",
         }

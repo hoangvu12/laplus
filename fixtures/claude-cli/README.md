@@ -20,6 +20,12 @@ request is: the CLI waits there for an answer, and everything after that line in
 the recording happened *because of* the answer. Playing it straight through would
 have the stand-in react to a decision nobody had made.
 
+A capture containing a `control_response` is replayed with a stop *before* it,
+for the mirror-image reason: that line is the CLI answering something the server
+asked it, and the request travelled on stdin so it is not in the recording.
+Playing it straight through would have the stand-in answer a request nobody had
+sent, and then abort a turn nobody had stopped.
+
 ## The captures
 
 | File | Provenance | What it covers |
@@ -34,11 +40,55 @@ have the stand-in react to a decision nobody had made.
 | `08-permission-declined.ndjson` | Recorded, ticket 13 | The same request declined: the tool result carries the refusal, and the agent answers anyway |
 | `09-permission-unanswered.ndjson` | Recorded, ticket 13 | The same request left hanging until stdin closed — the CLI abandons it and finishes the turn |
 | `10-permission-for-the-session.ndjson` | Recorded, ticket 13 | Approved with the CLI's own permission suggestion handed back: two `Write` calls, one request |
+| `11-interrupted-turn.ndjson` | Recorded, ticket 14 | A reply stopped mid-sentence: the acknowledgement, the partial text handed over whole, and an aborted `result` |
+| `12-interrupt-then-continue.ndjson` | Recorded, ticket 14 | The same, and then a second turn answered normally by the same process |
+| `13-interrupt-during-tool-use.ndjson` | Recorded, ticket 14 | A stop in the middle of a run of `Write` calls, as the agent was opening the next one |
+| `14-interrupt-with-nothing-running.ndjson` | Recorded, ticket 14 | A stop sent after the turn had already ended — acknowledged, and nothing else happens |
+| `15-permission-cancelled.ndjson` | Recorded, ticket 14 | "Cancel" on a permission: a denial carrying `interrupt: true`, which ends the turn the way an interrupt does |
 
 The `.scratch/*.ndjson` originals stay where they are as raw evidence; these are
-the committed, test-facing copies. `04`–`10` were recorded straight into
+the committed, test-facing copies. `04`–`15` were recorded straight into
 `fixtures/` against `claude-haiku-4-5`, with the same flags
 [`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes.
+
+## What `11`–`15` settled
+
+The interrupt channel is not in `--help` either, and it is the same envelope as
+the permission one travelling the other way. What these five record is that it
+exists, what it is, and — the part that could not have been guessed — how a
+stopped turn *ends*:
+
+- **The request is a `control_request` on stdin** with `{"subtype": "interrupt"}`
+  and an id this server mints. The CLI's schema has an optional `reason` beside
+  it, forwarded to the turn's abort signal; lightcode sends none. No flag turns
+  this on: `--input-format stream-json` is itself a control channel.
+- **The answer is a `control_response` naming the same id**, and on `11`–`14` it
+  is `{"subtype": "success", "response": {"still_queued": []}}` every time.
+  `15` has none, because a cancelled permission stops the turn without any
+  request being sent — the stop travels on the decision.
+- **A stopped turn is reported as a failed one.** `"is_error": true`, subtype
+  `error_during_execution`, `terminal_reason` `aborted_streaming`. Nothing in the
+  output distinguishes "the developer pressed stop" from "the turn went wrong",
+  which is why [`crate::turn`] carries its own flag rather than reading one.
+- **The partial reply is handed over whole.** In `11` and `12` a buffered
+  `assistant` message arrives after the acknowledgement carrying exactly what had
+  streamed, followed by a `user` message reading
+  `[Request interrupted by user]` — the CLI's own marker, which this server does
+  not publish because it publishes a row of its own.
+- **The session survives.** `12` is the proof and the only one that can be: the
+  same process took a second turn afterwards and answered it normally, exiting 0.
+- **A stop with nothing to stop is acknowledged and does nothing.** `14` is an
+  interrupt sent after the `result`; there is no second `result` and no error.
+- **"Cancel" on a permission is an interrupt too.** `15`'s turn ends exactly as
+  `11`'s does, marker and all. Ticket 13 sent that decision correctly and left
+  what the CLI does with it untested; this is it.
+
+`tools/interrupt-capture/record.mjs` made `11`–`14` and
+`tools/permission-capture/record.mjs` made `15`. Neither capture can be produced
+by hand, and `11`–`13` cannot be produced by a clock either: at four seconds the
+model was still thinking and at twenty the whole turn had finished, so the
+recorder triggers on what it is waiting for — the fortieth text delta, or the
+second tool call.
 
 ## What `07`–`10` settled
 

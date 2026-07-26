@@ -147,6 +147,7 @@ enum Command {
     DeleteProject { project_id: String },
     CreateThread(CreateThread),
     StartTurn(Box<StartTurn>),
+    InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
 }
 
@@ -272,6 +273,7 @@ impl Shell {
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
             Command::CreateThread(create) => self.create_thread(&create)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
+            Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
         };
 
@@ -324,6 +326,32 @@ impl Shell {
             return Err(CommandError::new(why));
         }
 
+        Ok(self.inner.sequences.current())
+    }
+
+    /// Stop the turn the agent is working on.
+    ///
+    /// **Answers with the log position rather than with a number of its own**,
+    /// for the same reason `thread.approval.respond` does: it commits nothing.
+    /// What it causes — the `turn.interrupted` row, the partial reply the agent
+    /// had buffered, the turn settling — is published by the driver once the
+    /// request has actually reached the child, and numbering a change here that
+    /// had not happened would let the client drop the row that did.
+    ///
+    /// **Succeeding when there is nothing to stop is the behaviour, not a
+    /// shortcut.** The client sends this command with no `turnId` precisely when
+    /// it does not believe a turn is running, and the turn it *does* name can
+    /// finish while the click is in flight. A failure in either case would be
+    /// this server telling the developer that stopping an agent which is not
+    /// running went wrong. The thread still has to exist: a command naming a
+    /// conversation this server has never heard of is a client bug rather than a
+    /// race, and is worth saying so.
+    fn interrupt_turn(&self, interrupt: &InterruptTurn) -> Result<i64, CommandError> {
+        self.open_thread(&interrupt.thread_id)?;
+        self.inner
+            .threads
+            .interrupt(&interrupt.thread_id, interrupt.turn_id.clone())
+            .map_err(CommandError::new)?;
         Ok(self.inner.sequences.current())
     }
 
@@ -869,6 +897,22 @@ struct Bootstrap {
     prepare_worktree: Option<Value>,
 }
 
+/// `thread.turn.interrupt` — the developer stopping the agent.
+///
+/// `turnId` is optional in the contract and the UI means something by leaving it
+/// out: `buildThreadTurnInterruptInput` sends it only while the session is
+/// `running`, so an absent one is the client saying "stop whatever is going, if
+/// anything is". Carried as an `Option` all the way to the driver rather than
+/// resolved here, because the only thing that knows what is running is the thing
+/// running it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptTurn {
+    thread_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
 /// `thread.approval.respond` — the developer answering the agent.
 ///
 /// `decision` is a string rather than an enum here so that an unreadable one is
@@ -982,6 +1026,22 @@ impl Command {
                     },
                     ..start
                 })))
+            }
+            "thread.turn.interrupt" => {
+                let interrupt: InterruptTurn = read(payload, kind)?;
+                Ok(Command::InterruptTurn(InterruptTurn {
+                    thread_id: non_blank(interrupt.thread_id, "threadId", kind)?,
+                    // Refused rather than dropped, unlike an *absent* one. Absent
+                    // means "whatever is running" and is what the client sends
+                    // when it believes nothing is; blank is a `TurnId` the
+                    // contract types as trimmed and non-empty, and it would name
+                    // no turn — so the stop would silently do nothing rather than
+                    // stop the turn the developer is watching.
+                    turn_id: interrupt
+                        .turn_id
+                        .map(|turn_id| non_blank(turn_id, "turnId", kind))
+                        .transpose()?,
+                }))
             }
             "thread.approval.respond" => {
                 let respond: RespondToApproval = read(payload, kind)?;

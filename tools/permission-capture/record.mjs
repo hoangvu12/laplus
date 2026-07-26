@@ -14,6 +14,10 @@
 //   deny     decline                      -> 08-permission-declined.ndjson
 //   ignore   never answer, then close     -> 09-permission-unanswered.ndjson
 //   session  approve and stop being asked -> 10-permission-for-the-session.ndjson
+//   cancel   decline and stop the turn    -> 15-permission-cancelled.ndjson
+//
+// `cancel` is `deny` with `interrupt: true`, which is the composer's fourth
+// button and the one ticket 13 sent correctly and never recorded the answer to.
 //
 // The flags below are `crate::agent`'s, verbatim, plus `--model` for cost. The
 // agent runs in a fresh temporary directory so the prompt has somewhere harmless
@@ -25,7 +29,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import readline from "node:readline";
 
-const DECISIONS = new Set(["allow", "deny", "ignore", "session"]);
+const DECISIONS = new Set(["allow", "deny", "ignore", "session", "cancel"]);
 
 /** How long to wait, after a request goes unanswered, before closing stdin. */
 const GIVE_UP_AFTER_MS = 5_000;
@@ -83,6 +87,15 @@ function responseFor(request) {
         // The CLI's own suggestions, handed back. This is what stops it asking.
         updatedPermissions: request.permission_suggestions ?? [],
         decisionClassification: "user_permanent",
+      };
+    case "cancel":
+      return {
+        behavior: "deny",
+        message: "The developer cancelled the turn.",
+        // The whole difference between this and a decline: the CLI stops the
+        // turn on it rather than handing the refusal to the model as a result.
+        interrupt: true,
+        decisionClassification: "user_reject",
       };
     default:
       return {

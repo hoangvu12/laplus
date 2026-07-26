@@ -129,12 +129,14 @@ pub const PAUSE: &str = "<pause>";
 /// A place where the agent stops until the server writes it a line, and records
 /// what it was written.
 ///
-/// The real CLI does this at exactly one point: having asked permission, it
-/// waits. Nothing else it sends needs a reply, so nothing else in a script needs
-/// this — and [`ScriptedAgent::replaying`] inserts one after every
-/// `control_request` in a recording for that reason.
+/// The real CLI stops for the server at exactly one point — having asked
+/// permission, it waits — and there is one more point where the *recording*
+/// has to: the CLI's answer to something the server asked *it*. Both are the
+/// same thing from a script's side, which is "do not go on until you have been
+/// written to", so both use this marker and [`ScriptedAgent::replaying`] inserts
+/// it at both.
 ///
-/// **The line is not required.** If the server closes stdin instead of answering,
+/// **The line is not required.** If the server closes stdin instead of writing,
 /// the script carries on with the rest of the recording rather than stopping,
 /// which is what the CLI itself does: the permission stream closes, the tool
 /// comes back as an abort, and the turn finishes. See
@@ -544,29 +546,61 @@ fn segments<'a>(lines: &'a [&'a str]) -> Vec<Segment<'a>> {
 
 /// A recording, as a script.
 ///
-/// A recording is a monologue with one exception: where the CLI asked permission
-/// it stopped, and everything after that line is what happened *because of the
-/// answer*. So the replay stops there too — emitting the rest without waiting
-/// would have the agent react to a decision that had not been made.
+/// A recording is a monologue with two exceptions, and both are places where the
+/// server's own line is missing from it:
+///
+/// - **Where the CLI asked permission it stopped**, and everything after that
+///   line is what happened *because of the answer*. So the replay stops after
+///   it — emitting the rest without waiting would have the agent react to a
+///   decision that had not been made.
+/// - **Where the CLI acknowledged something the server asked it**, the request
+///   came first and is not in the recording, because it travelled on stdin. So
+///   the replay stops *before* it. Playing an interrupt's acknowledgement
+///   straight through would have the agent answer a request nobody had sent, and
+///   then abort a turn nobody had stopped.
+///
+/// The asymmetry is the direction of the missing line: after a question the
+/// server has to answer, before an answer the server had to ask for.
 fn replayable(recorded: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = Vec::new();
     for line in recorded.lines() {
-        lines.push(line);
-        if asks_permission(line) {
-            lines.push(AWAIT_ANSWER);
+        match exchange(line) {
+            Some(Exchange::Asks) => {
+                lines.push(line);
+                lines.push(AWAIT_ANSWER);
+            }
+            Some(Exchange::Answers) => {
+                lines.push(AWAIT_ANSWER);
+                lines.push(line);
+            }
+            None => lines.push(line),
         }
     }
     lines
 }
 
-/// Is this recorded line the CLI asking permission?
+/// A recorded line that is half of a conversation rather than a statement, and
+/// which half.
+enum Exchange {
+    /// The CLI asking the server something. The server's line comes next.
+    Asks,
+    /// The CLI answering the server. The server's line came first, and is not in
+    /// the recording.
+    Answers,
+}
+
+/// Which half of an exchange this line is, if it is one.
 ///
 /// Read rather than matched on as a string: `control_request` appears inside a
 /// recorded `tool_result` in at least one capture, and a stop inserted there
-/// would wait for an answer nobody was going to send.
-fn asks_permission(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .is_ok_and(|event| event["type"] == "control_request")
+/// would wait for a line nobody was going to send.
+fn exchange(line: &str) -> Option<Exchange> {
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    match event["type"].as_str()? {
+        "control_request" => Some(Exchange::Asks),
+        "control_response" => Some(Exchange::Answers),
+        _ => None,
+    }
 }
 
 /// One line per process the agent script has started, beside the script itself.

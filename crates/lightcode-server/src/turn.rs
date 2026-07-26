@@ -34,9 +34,11 @@
 //! | a `control_request` asking to use a tool | an `approval.requested` activity, which is the client's pending-approval panel |
 //! | `result` | an activity carrying the duration and the cost, and the session is ready again |
 //!
-//! and one row that goes the other way: a `thread.approval.respond` command
-//! becomes a `control_response` on the agent's stdin, and an `approval.resolved`
-//! activity that closes the panel.
+//! and two rows that go the other way: a `thread.approval.respond` command
+//! becomes a `control_response` on the agent's stdin and an `approval.resolved`
+//! activity that closes the panel, and a `thread.turn.interrupt` becomes a
+//! `control_request` on that stdin, a `thread.turn-interrupt-requested` event
+//! that settles the turn, and a `turn.interrupted` activity that records it.
 //!
 //! The second and third rows *are* accumulate-and-reconcile. Nothing decides
 //! between them here: [`crate::protocol::Folded`] says which of the two a line
@@ -98,6 +100,45 @@
 //! the turn finishes. `fixtures/claude-cli/09-permission-unanswered.ndjson` is a
 //! recording of exactly that, and [`crate::agent`] documents the mechanism.
 //!
+//! ## Stopping a turn is not stopping a session, and the difference is the point
+//!
+//! A turn is interrupted by a `control_request` on the agent's stdin — the same
+//! envelope a permission arrives in, going the other way. It leaves the child
+//! running, which is what makes the correction the developer types next a
+//! *correction* rather than the first message of a conversation that has
+//! forgotten what it was about.
+//!
+//! Four things follow, and the recordings in `fixtures/claude-cli/11`–`14` are
+//! where each of them came from rather than from documentation:
+//!
+//! - **The CLI reports a stopped turn as a failed one.** Its `result` carries
+//!   `"is_error": true` and the subtype `error_during_execution`. Nothing in the
+//!   output distinguishes "the developer pressed stop" from "the turn went
+//!   wrong" — so [`InFlight::stopped`] is the only thing that can, and it is why
+//!   the flag exists rather than the turn being read off the wire.
+//! - **The partial reply is kept, and the CLI hands it over whole.** After the
+//!   acknowledgement comes a buffered `assistant` message carrying exactly what
+//!   had streamed. So "output produced before the interrupt is retained" needs
+//!   nothing special here: it is the ordinary reconcile, on a shorter message.
+//! - **The turn settles twice, on purpose, and the first one is the click.**
+//!   `thread.turn-interrupt-requested` goes up the moment the request has been
+//!   written, and the client's reducer moves the latest turn to `interrupted` on
+//!   it — so the turn stops being reported as running when the developer stops
+//!   it rather than when the agent gets round to admitting it. The session
+//!   follows when the agent's `result` arrives, as `interrupted` rather than
+//!   `ready` or `error`. Both are the contract's own vocabulary; neither alone
+//!   is enough, because the event does not describe the session and the session
+//!   status arrives too late to be what the developer sees.
+//! - **The session change at the end of a turn is conditional.** A developer who
+//!   stops the agent can send the next turn while this one is still winding
+//!   down, and by then the session describes *that* turn. Settling it here would
+//!   report a turn that had just started as finished.
+//!
+//! An interrupt for a turn that is not running is a no-op rather than an error,
+//! at every layer: the client sends one when it believes nothing is running, the
+//! registry takes it with no session to route it to, and the driver drops it
+//! with no turn to stop. See [`interrupt`], where the three races are named.
+//!
 //! ## Continuity is the agent's, and this is where the handle on it is kept
 //!
 //! Within one process there is nothing to do: the child is long-lived and the
@@ -130,7 +171,7 @@ use crate::clock::now_iso;
 use crate::config::ClaudeSettings;
 use crate::process::Search;
 use crate::protocol::{ContentBlock, Folded, Permission, SessionState};
-use crate::threads::{Activity, Answered, Change, Prompt, Session, Thread, Threads};
+use crate::threads::{Activity, Answered, Change, Prompt, Session, Signal, Thread, Threads};
 use crate::worklog::{Call, Decision, Returned};
 
 /// Everything a session needs to start an agent, gathered while the thread is
@@ -162,8 +203,8 @@ pub struct Start {
 pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
-    let prompts = threads.attach(&start.thread_id, move |incoming, decisions| {
-        tokio::spawn(drive(driving, starting, incoming, decisions))
+    let prompts = threads.attach(&start.thread_id, move |incoming, signals| {
+        tokio::spawn(drive(driving, starting, incoming, signals))
     });
 
     prompts.try_send(prompt).map_err(|error| match error {
@@ -183,7 +224,7 @@ async fn drive(
     threads: Threads,
     start: Start,
     mut prompts: tokio::sync::mpsc::Receiver<Prompt>,
-    mut decisions: tokio::sync::mpsc::Receiver<Answered>,
+    mut signals: tokio::sync::mpsc::Receiver<Signal>,
 ) {
     let mut agent = match open(&start).await {
         Ok(agent) => agent,
@@ -215,6 +256,7 @@ async fn drive(
     let mut driving = Driving {
         turn: None,
         outstanding: HashMap::new(),
+        interrupts: 0,
     };
     // A turn that arrived while another was still running. Held rather than
     // sent: sending it would orphan the turn in flight — that turn would never
@@ -224,11 +266,11 @@ async fn drive(
     // False once the prompt channel has closed. The agent is then told there
     // will be no more turns and the loop keeps draining what it still owes.
     let mut accepting = true;
-    // False once the decision channel has closed, which is the same moment —
-    // both ends live on the thread's `Live`. Tracked separately anyway, because
-    // a closed channel yields `None` forever and a `select!` arm that kept
-    // polling one would spin.
-    let mut answering = true;
+    // False once the signal channel has closed, which is the same moment — both
+    // ends live on the thread's `Live`. Tracked separately anyway, because a
+    // closed channel yields `None` forever and a `select!` arm that kept polling
+    // one would spin.
+    let mut listening = true;
 
     loop {
         // Whatever is waiting goes next, as soon as the turn before it is done.
@@ -242,6 +284,7 @@ async fn drive(
                     turn_id: prompt.turn_id.clone(),
                     assistant_message_id: None,
                     tools: HashMap::new(),
+                    stopped: None,
                 });
                 // The turn is under way, and *this* is where the session enters
                 // `running` — not the agent's `init` line, which a long-lived
@@ -260,12 +303,14 @@ async fn drive(
         // not allowed to do is take a second prompt before the first has been
         // dealt with, which is what `PROMPT_QUEUE` is behind it for.
         //
-        // A decision is polled under no such condition, and that asymmetry is the
-        // point: the agent has *stopped* until one arrives, so anything that
-        // deferred it would be the deadlock this ticket is about.
+        // A signal is polled under no such condition, and that asymmetry is the
+        // point: both kinds are owed to the turn *in flight*. A decision the
+        // agent has stopped for, deferred behind a queued turn, is the deadlock
+        // ticket 13 was about; an interrupt deferred the same way is a stop
+        // button that works once the thing it was meant to stop has finished.
         let next = tokio::select! {
             line = agent.next_line() => Next::Line(line),
-            decision = decisions.recv(), if answering => Next::Answer(decision),
+            signal = signals.recv(), if listening => Next::Signal(signal),
             prompt = prompts.recv(), if accepting && waiting.is_none() => Next::Prompt(prompt),
         };
 
@@ -276,10 +321,13 @@ async fn drive(
             // The agent stopped producing: it exited, or its output was
             // abandoned. Either way there is nothing more to publish.
             Next::Line(None) => break,
-            Next::Answer(Some(answered)) => {
+            Next::Signal(Some(Signal::Answer(answered))) => {
                 answer(&threads, &start, &mut agent, &mut driving, answered).await;
             }
-            Next::Answer(None) => answering = false,
+            Next::Signal(Some(Signal::Interrupt { turn_id })) => {
+                interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await;
+            }
+            Next::Signal(None) => listening = false,
             Next::Prompt(Some(prompt)) => waiting = Some(prompt),
             Next::Prompt(None) => {
                 accepting = false;
@@ -373,7 +421,7 @@ fn resume_refused(session_id: &str, complaint: Option<&str>) -> String {
 enum Next {
     Line(Option<String>),
     Prompt(Option<Prompt>),
-    Answer(Option<Answered>),
+    Signal(Option<Signal>),
 }
 
 /// What the driver knows that the fold does not.
@@ -393,9 +441,22 @@ struct Driving {
     /// the developer is still looking at*. Settling one is a thing that has to
     /// happen, so it must not be dropped with the turn.
     outstanding: HashMap<String, Permission>,
+    /// How many interrupts this session has sent, which is what the next one's
+    /// id is minted from.
+    ///
+    /// Per session and monotonic, so an acknowledgement can be matched to the
+    /// request it answers and a *late* one — for a turn that has already ended —
+    /// is recognised as late rather than mistaken for the current one.
+    interrupts: usize,
 }
 
 impl Driving {
+    /// The id for the next interrupt, and the count that makes it unique.
+    fn next_interrupt_id(&mut self) -> String {
+        self.interrupts += 1;
+        format!("interrupt-{}", self.interrupts)
+    }
+
     /// Take every request still waiting, so the caller can close it.
     fn take_outstanding(&mut self) -> Vec<Permission> {
         let mut open: Vec<Permission> = std::mem::take(&mut self.outstanding)
@@ -437,6 +498,22 @@ async fn answer(
     let sent = agent
         .answer(&asked.request_id, &answered.decision.answer(&asked))
         .await;
+
+    // "Cancel" is a denial that also carries `interrupt: true`, so the CLI stops
+    // the turn on it — which makes it an interrupt this server did not send but
+    // did cause, and the turn has to end the same way one it did send would.
+    // Ticket 13 sent the decision correctly and left this half undone by name;
+    // it is the same fact recorded in the same field, and it is recorded only if
+    // the decision actually reached the agent.
+    let mut cancelled = None;
+    if sent.is_ok() && answered.decision == Decision::Cancel {
+        if let Some(active) = driving.turn.as_mut() {
+            if active.stop(&asked.request_id) {
+                cancelled = Some(active.turn_id.clone());
+            }
+        }
+    }
+
     let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
 
     // Reported as a *session* failure rather than as an unanswerable request:
@@ -466,6 +543,129 @@ async fn answer(
             &asked,
             answered.decision,
             turn_id,
+        )),
+    );
+
+    // After the resolution, so the work log reads in the order it happened: the
+    // developer answered the question, and answering it that way stopped the turn.
+    if let Some(turn_id) = cancelled {
+        stopped(threads, start, &turn_id, &asked.request_id);
+    }
+}
+
+/// Stop the turn the agent is working on, and say so in the conversation.
+///
+/// Three things make this a no-op rather than an error, and each is a race the
+/// developer cannot see and should not have to think about:
+///
+/// - **Nothing is in flight.** The turn ended while the click was travelling, or
+///   there was never one. Either way the agent is not doing the thing they asked
+///   it to stop doing, which is what they wanted.
+/// - **The turn named is not the turn running.** The client names the turn it is
+///   looking at (`buildThreadTurnInterruptInput`), and the same race makes that
+///   the *previous* turn a moment later. Stopping the one after it would be
+///   stopping work the developer never saw start.
+/// - **This turn has already been stopped.** A second click, or a stop after a
+///   permission was cancelled. The agent is already winding down and a second
+///   request would produce a second row saying so.
+///
+/// What is *not* published here is a session change. The turn is not over until
+/// the agent says it is — the CLI still owes whatever it had buffered and then a
+/// `result` — and this server saying "stopped" before that would be describing
+/// an ending it had only asked for. `Folded::Completed` is where the turn
+/// settles, and [`InFlight::stopped`] is what tells it how.
+async fn interrupt(
+    threads: &Threads,
+    start: &Start,
+    agent: &mut Agent,
+    driving: &mut Driving,
+    wanted: Option<String>,
+) {
+    // Every reason to do nothing is settled before an id is minted, so a no-op
+    // costs nothing and the ids in the work log count stops that happened.
+    let Some(active) = driving.turn.as_ref() else {
+        return;
+    };
+    if wanted.is_some_and(|turn_id| turn_id != active.turn_id) || active.stopped.is_some() {
+        return;
+    }
+    let turn_id = active.turn_id.clone();
+    let request_id = driving.next_interrupt_id();
+
+    // The agent is written to before anything else happens, the same way a
+    // decision is and for the same reason: the rows below are what the developer
+    // sees and the write is what actually stops the work. Publishing first would
+    // be a claim about an agent still going — and *recording* first would be
+    // worse, because a turn marked stopped that nobody managed to stop would
+    // report itself as stopped when it finished normally.
+    //
+    // The borrow is taken again afterwards rather than held across the write:
+    // `agent` and `driving` are separate borrows and the second must not outlive
+    // the await, which is the same reason [`Next`] exists.
+    if let Err(error) = agent.interrupt(&request_id).await {
+        eprintln!("lightcode: cannot interrupt the agent: {error}");
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(Activity::failed(
+                "turn.interrupt-failed",
+                &format!(
+                    "The agent could not be asked to stop, because it is no longer reading: \
+                     {error}"
+                ),
+            )),
+        );
+        return;
+    }
+
+    // The turn can only have gone away while the write was in flight if the
+    // agent's output ended, and then the loop is about to end too.
+    let Some(active) = driving.turn.as_mut() else {
+        return;
+    };
+    active.stop(&request_id);
+    stopped(threads, start, &turn_id, &request_id);
+}
+
+/// Say in the conversation that the developer stopped this turn.
+///
+/// Two changes rather than one, because they are read by different parts of the
+/// client and neither can be derived from the other:
+///
+/// - **The event settles the turn.** `thread.turn-interrupt-requested` is the
+///   contract's own, and the client's reducer moves the latest turn to
+///   `interrupted` on it *immediately* — so the turn stops being reported as
+///   running when the developer's click lands rather than when the agent gets
+///   round to admitting it. Without it the composer would show work in progress
+///   for as long as the agent took to wind down.
+/// - **The row is the record.** The work log is what a developer reads later,
+///   and "this turn stopped because I stopped it" is not derivable from the
+///   partial reply above it.
+///
+/// Shared by the two things that stop a turn — the stop button, and cancelling a
+/// permission — because they are the same event to a client either way.
+fn stopped(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
+    threads.apply(
+        &start.thread_id,
+        Change::InterruptRequested {
+            turn_id: turn_id.to_string(),
+        },
+    );
+    threads.apply(
+        &start.thread_id,
+        Change::Activity(Activity::info(
+            "turn.interrupted",
+            "The developer stopped the turn.",
+            json!({
+                "requestId": request_id,
+                "turnId": turn_id,
+                // What the client's work log renders as the row's body. Without
+                // it the row is a heading with nothing under it — see
+                // `Activity::failed`, which repeats its summary for the same
+                // reason.
+                "detail": "The developer stopped the turn. Anything the agent had already \
+                           said is kept.",
+            }),
+            Some(turn_id.to_string()),
         )),
     );
 }
@@ -500,6 +700,122 @@ struct InFlight {
     /// made it — and a turn that ended with one outstanding has nothing left to
     /// answer it.
     tools: HashMap<String, Call>,
+    /// The id of the request that stopped this turn, once something has.
+    ///
+    /// Two things can be: an interrupt this server sent, or a permission the
+    /// developer *cancelled*, which is a denial the CLI honours by stopping the
+    /// turn. They are one field because they are one fact — the turn is ending
+    /// because the developer said so — and the turn's ending has to read the
+    /// same way whichever of them it was.
+    ///
+    /// Two things read it. An acknowledgement matches against it, so an answer
+    /// to some other request is not taken for this one. And `Folded::Completed`
+    /// reads it as a fact about *how* the turn ended: the CLI reports an aborted
+    /// turn as an error, and a turn the developer stopped on purpose is not one
+    /// to show them a failure for.
+    stopped: Option<String>,
+}
+
+impl InFlight {
+    /// Record that something has stopped this turn, and say whether it was the
+    /// first thing to.
+    ///
+    /// `false` is a turn already stopping — a second click, or a stop after a
+    /// permission was cancelled — and the caller answers it by saying nothing,
+    /// because the work log already says the turn is being stopped.
+    fn stop(&mut self, request_id: &str) -> bool {
+        if self.stopped.is_some() {
+            return false;
+        }
+        self.stopped = Some(request_id.to_string());
+        true
+    }
+
+    /// Is this the answer to the stop this turn is waiting on?
+    fn awaiting(&self, request_id: &str) -> bool {
+        self.stopped.as_deref() == Some(request_id)
+    }
+
+    /// The agent will not stop, so this turn is going to end the way it was
+    /// going to end.
+    ///
+    /// The flag has to come off rather than merely being ignored: a normal
+    /// ending reported as one the developer asked for would be a work log
+    /// claiming they did something they did not.
+    fn carries_on(&mut self) {
+        self.stopped = None;
+    }
+
+    fn was_stopped(&self) -> bool {
+        self.stopped.is_some()
+    }
+}
+
+/// How a turn ended.
+///
+/// Three outcomes where the wire has two: a `result` is an error or it is not,
+/// and a turn the developer stopped arrives as an error
+/// (`fixtures/claude-cli/11-interrupted-turn.ndjson`). The third is this
+/// server's own knowledge that it asked, and naming it once is what stops the
+/// summary, the tone, the payload and the session status each working it out
+/// again — three `match`es on the same pair of booleans, which is three chances
+/// to disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl Ending {
+    fn of(turn: Option<&InFlight>, result: Option<&crate::protocol::ResultSummary>) -> Ending {
+        // Stopped wins over failed, because it is the more specific truth about
+        // the same `result`.
+        match (
+            turn.is_some_and(InFlight::was_stopped),
+            result.is_some_and(|result| result.is_error),
+        ) {
+            (true, _) => Ending::Stopped,
+            (false, true) => Ending::Failed,
+            (false, false) => Ending::Completed,
+        }
+    }
+
+    /// What the session becomes. `interrupted` is one of the contract's own
+    /// statuses and [`crate::threads`] settles the turn as interrupted with it.
+    fn session_status(self) -> &'static str {
+        match self {
+            Ending::Completed => "ready",
+            Ending::Failed => "error",
+            Ending::Stopped => "interrupted",
+        }
+    }
+
+    /// Only a failure is styled as one. A turn the developer stopped is not
+    /// something that went wrong.
+    fn tone(self) -> &'static str {
+        match self {
+            Ending::Failed => "error",
+            _ => "info",
+        }
+    }
+
+    fn failed(self) -> bool {
+        self == Ending::Failed
+    }
+
+    fn stopped(self) -> bool {
+        self == Ending::Stopped
+    }
+
+    /// How the sentence a developer reads begins.
+    fn opening(self) -> &'static str {
+        match self {
+            Ending::Completed => "Turn completed",
+            Ending::Failed => "Turn failed",
+            Ending::Stopped => "Turn stopped by the developer",
+        }
+    }
 }
 
 /// Resolve the binary and start the agent, or say why not.
@@ -694,45 +1010,80 @@ fn publish(
             }
         }
 
+        // The agent answering the one thing this server asks it. Matched against
+        // the request that is outstanding, because an acknowledgement for some
+        // other id — a late one, for a turn that has already ended — says nothing
+        // about the turn running now.
+        Folded::Acknowledged(acknowledged) => {
+            let Some(active) = turn.as_mut() else { return };
+            if !active.awaiting(&acknowledged.request_id) {
+                return;
+            }
+            let Some(why) = acknowledged.refusal() else { return };
+
+            active.carries_on();
+            threads.apply(
+                &start.thread_id,
+                Change::Activity(Activity::failed(
+                    "turn.interrupt-failed",
+                    &format!("The agent would not stop the turn: {why}"),
+                )),
+            );
+        }
+
         Folded::Completed => {
             let finished = turn.take();
             let active = finished.as_ref().map(|turn| turn.turn_id.clone());
             let summary = folding.last_result.as_ref();
-            let failed = summary.is_some_and(|result| result.is_error);
+            let ending = Ending::of(finished.as_ref(), summary);
 
-            let mut completed = Activity::info(
-                "turn.completed",
-                &turn_summary(folding),
-                json!({
-                    "durationMs": summary.and_then(|result| result.duration_ms),
-                    "totalCostUsd": summary.and_then(|result| result.total_cost_usd),
-                    "numTurns": summary.and_then(|result| result.num_turns),
-                    "stopReason": summary.and_then(|result| result.stop_reason.clone()),
-                    "isError": failed,
-                    // The drift accounting for this session, next to the turn it
-                    // accumulated over — so a CLI that moved shows up where a
-                    // developer is already looking.
-                    "unknownEvents": folding.unknown_events,
-                    "parseErrors": folding.parse_errors,
-                }),
-                active,
-            );
-            if failed {
-                completed.tone = "error";
-            }
+            let completed = Activity {
+                tone: ending.tone(),
+                ..Activity::info(
+                    "turn.completed",
+                    &turn_summary(folding, ending),
+                    json!({
+                        "durationMs": summary.and_then(|result| result.duration_ms),
+                        "totalCostUsd": summary.and_then(|result| result.total_cost_usd),
+                        "numTurns": summary.and_then(|result| result.num_turns),
+                        "stopReason": summary.and_then(|result| result.stop_reason.clone()),
+                        "isError": ending.failed(),
+                        "interrupted": ending.stopped(),
+                        // The drift accounting for this session, next to the turn
+                        // it accumulated over — so a CLI that moved shows up where
+                        // a developer is already looking.
+                        "unknownEvents": folding.unknown_events,
+                        "parseErrors": folding.parse_errors,
+                    }),
+                    active.clone(),
+                )
+            };
             threads.apply(&start.thread_id, Change::Activity(completed));
+
+            // **Only when the session is still describing this turn.** A
+            // developer who stopped the agent can send the next turn while this
+            // one is still winding down — that is the whole point of stopping it
+            // — and the dispatch has already moved the session on to that turn.
+            // Publishing here would settle a turn that has just started, and the
+            // client would show it finished until the agent got round to it.
+            if threads.active_turn(&start.thread_id) != active {
+                return;
+            }
 
             // Leaving `running` is what ends the turn for the client, so this
             // is the event that settles it — and the reason a turn's reported
             // duration covers the whole turn rather than stopping at the last
-            // thing the assistant said.
+            // thing the assistant said. `interrupted` is one of the contract's
+            // own session statuses and settles the turn as interrupted with it,
+            // which is what keeps the partial reply on screen marked as what it
+            // is rather than as an answer.
             threads.apply(
                 &start.thread_id,
                 Change::Session(Session {
-                    status: if failed { "error" } else { "ready" },
+                    status: ending.session_status(),
                     runtime_mode: start.runtime_mode.clone(),
                     active_turn_id: None,
-                    last_error: failed.then(|| turn_summary(folding)),
+                    last_error: ending.failed().then(|| turn_summary(folding, ending)),
                     updated_at: now_iso(),
                 }),
             );
@@ -765,15 +1116,12 @@ fn session_summary(state: &SessionState) -> String {
 /// log renders any kind it does not specifically suppress — so the sentence is
 /// what a developer actually sees, and the payload beside it is what a later
 /// ticket can render properly.
-fn turn_summary(state: &SessionState) -> String {
+fn turn_summary(state: &SessionState, ending: Ending) -> String {
     let Some(result) = &state.last_result else {
-        return "Turn completed.".to_string();
+        return format!("{}.", ending.opening());
     };
 
-    let mut summary = match result.is_error {
-        true => "Turn failed".to_string(),
-        false => "Turn completed".to_string(),
-    };
+    let mut summary = ending.opening().to_string();
     if let Some(duration) = result.duration_ms {
         summary.push_str(&format!(" in {}", human_duration(duration)));
     }
@@ -846,12 +1194,15 @@ mod tests {
     /// against a real turn rather than a round number.
     #[test]
     fn a_completed_turn_reports_its_duration_and_its_cost() {
-        let summary = turn_summary(&result(
-            false,
-            Some(2008),
-            Some(0.079_471_999_999_999_99),
-            Some("end_turn"),
-        ));
+        let summary = turn_summary(
+            &result(
+                false,
+                Some(2008),
+                Some(0.079_471_999_999_999_99),
+                Some("end_turn"),
+            ),
+            Ending::Completed,
+        );
 
         assert_eq!(summary, "Turn completed in 2.0s · $0.0795 · end_turn");
     }
@@ -860,8 +1211,91 @@ mod tests {
     /// needs from the sentence before anything else in it.
     #[test]
     fn a_failed_turn_says_so_before_it_says_anything_else() {
-        let summary = turn_summary(&result(true, Some(400), Some(0.0), Some("error")));
+        let summary = turn_summary(
+            &result(true, Some(400), Some(0.0), Some("error")),
+            Ending::Failed,
+        );
         assert!(summary.starts_with("Turn failed"), "{summary}");
+    }
+
+    /// A turn the developer stopped says *that*, over the failure the CLI
+    /// reports it as. The values are `11-interrupted-turn.ndjson`'s own: the
+    /// recording's `result` is `"is_error": true` with no cost and no stop
+    /// reason, so a server reading the wire alone would tell the developer their
+    /// own decision had gone wrong — which is the reading `Ending::of` exists to
+    /// prevent, and the line below is the whole of it.
+    #[test]
+    fn a_stopped_turn_says_it_was_stopped_rather_than_that_it_failed() {
+        let interrupted = InFlight {
+            turn_id: "turn-1".to_string(),
+            assistant_message_id: None,
+            tools: HashMap::new(),
+            stopped: Some("interrupt-1".to_string()),
+        };
+        let aborted = result(true, Some(13_660), Some(0.0), None);
+        let ending = Ending::of(Some(&interrupted), aborted.last_result.as_ref());
+        assert_eq!(ending, Ending::Stopped);
+        assert_eq!(ending.session_status(), "interrupted");
+        assert_eq!(ending.tone(), "info");
+        assert!(!ending.failed(), "a turn the developer stopped is not an error");
+
+        assert_eq!(
+            turn_summary(&aborted, ending),
+            "Turn stopped by the developer in 13.7s · $0.0000"
+        );
+
+        // And with nothing reported at all, which is the shape a session that
+        // died before its `result` would leave behind.
+        assert_eq!(
+            turn_summary(&SessionState::new(), Ending::Stopped),
+            "Turn stopped by the developer."
+        );
+    }
+
+    /// The same turn *without* the flag reads as the failure the CLI called it.
+    /// The pair is the point: one field decides which, and this is the other half
+    /// of it.
+    #[test]
+    fn the_same_aborted_result_reads_as_a_failure_when_nobody_stopped_it() {
+        let running = InFlight {
+            turn_id: "turn-1".to_string(),
+            assistant_message_id: None,
+            tools: HashMap::new(),
+            stopped: None,
+        };
+        let aborted = result(true, Some(13_660), Some(0.0), None);
+        let ending = Ending::of(Some(&running), aborted.last_result.as_ref());
+
+        assert_eq!(ending, Ending::Failed);
+        assert_eq!(ending.session_status(), "error");
+        assert_eq!(ending.tone(), "error");
+    }
+
+    /// A turn stops once. A second stop — a second click, or a stop after a
+    /// permission was cancelled — is not a second row in the work log, and the
+    /// id kept is the one the agent will answer.
+    #[test]
+    fn a_turn_records_the_first_thing_that_stopped_it_and_not_the_second() {
+        let mut turn = InFlight {
+            turn_id: "turn-1".to_string(),
+            assistant_message_id: None,
+            tools: HashMap::new(),
+            stopped: None,
+        };
+
+        assert!(turn.stop("interrupt-1"));
+        assert!(!turn.stop("interrupt-2"), "a turn cannot be stopped twice");
+        assert!(turn.awaiting("interrupt-1"));
+        assert!(
+            !turn.awaiting("interrupt-2"),
+            "an answer to a request this turn never made must not be taken for its own"
+        );
+
+        // And an agent that refuses puts the turn back where it was, so its
+        // ordinary ending is reported as an ordinary ending.
+        turn.carries_on();
+        assert!(!turn.was_stopped());
+        assert!(turn.stop("interrupt-3"), "a refused stop can be retried");
     }
 
     /// A CLI that reported neither still produces a sentence. The fields are
@@ -869,8 +1303,14 @@ mod tests {
     /// separator would be worse than a short one.
     #[test]
     fn a_turn_with_nothing_to_report_still_says_it_finished() {
-        assert_eq!(turn_summary(&result(false, None, None, None)), "Turn completed");
-        assert_eq!(turn_summary(&SessionState::new()), "Turn completed.");
+        assert_eq!(
+            turn_summary(&result(false, None, None, None), Ending::Completed),
+            "Turn completed"
+        );
+        assert_eq!(
+            turn_summary(&SessionState::new(), Ending::Completed),
+            "Turn completed."
+        );
     }
 
     /// Three orders of magnitude, because a turn can be any of them and

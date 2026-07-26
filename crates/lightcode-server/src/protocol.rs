@@ -46,6 +46,11 @@ pub enum Event {
         request_id: String,
         request: Ask,
     },
+    /// The CLI answering something the *host* asked it. The other direction of
+    /// the same envelope, and the reason it is read rather than ignored: an
+    /// interrupt is a request this server makes, and this is the only line that
+    /// says whether it was accepted.
+    ControlResponse { response: Acknowledgement },
     /// Terminal event for the turn.
     Result(ResultEvent),
     #[serde(other)]
@@ -102,6 +107,74 @@ pub struct Permission {
     /// is the whole of how that answer works — see [`Answer::Allow`].
     #[serde(default, rename = "permission_suggestions")]
     pub suggestions: Vec<Value>,
+}
+
+/// The CLI's answer to a request this server made.
+///
+/// Recorded rather than read off a contract:
+/// `fixtures/claude-cli/11`–`14` are real acknowledgements from `claude`
+/// 2.1.220, and every one of them is
+/// `{"subtype": "success", "request_id": …, "response": {"still_queued": []}}`.
+/// The inner `response` is deliberately not read — `still_queued` is the list of
+/// turns the CLI is holding for a host that queues several, and this server
+/// sends one at a time.
+///
+/// The failing shape is the same envelope with `"subtype": "error"` and a
+/// sentence, which is what the CLI answers a control request it does not
+/// understand. It has never been seen from this server, and it is read anyway:
+/// a stop button that quietly did nothing is the one outcome worse than a stop
+/// button that reports it failed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Acknowledgement {
+    /// The id this server minted for the request being answered. Defaulted
+    /// rather than required so a malformed answer is still an answer — the
+    /// alternative is the whole line failing to parse and reading as drift.
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub subtype: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl Acknowledgement {
+    /// Why the CLI would not do what it was asked, if it would not.
+    ///
+    /// Anything that is not `success` is a refusal, including a subtype this
+    /// build has never seen: the question being answered is "did the turn stop",
+    /// and an answer that cannot be read as yes has to be read as no.
+    pub fn refusal(&self) -> Option<String> {
+        if self.subtype == "success" {
+            return None;
+        }
+        Some(match &self.error {
+            Some(said) => said.clone(),
+            None => format!("the agent answered '{}'", self.subtype),
+        })
+    }
+}
+
+/// Build the stdin line that stops the turn in flight.
+///
+/// The third and last thing this server ever says to the agent, beside
+/// [`user_message_line`] and [`control_response_line`], and the only one that is
+/// a *request* rather than a statement or a reply — so it carries an id, and the
+/// CLI answers it with an [`Acknowledgement`] naming the same id.
+///
+/// `reason` is in the CLI's schema for this request and is deliberately not
+/// sent: it is forwarded to the turn's abort signal, where tool implementations
+/// branch on it, and the developer pressing stop has no reason to give beyond
+/// having pressed stop.
+///
+/// Found in the binary rather than in documentation, the same way the permission
+/// channel was — see `fixtures/claude-cli/README.md`.
+pub fn interrupt_line(request_id: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "interrupt" },
+    })
+    .to_string()
 }
 
 /// What the developer decided, in the CLI's own vocabulary.
@@ -478,6 +551,10 @@ pub enum Folded {
     /// joined `permissions` at this index; answering it is
     /// [`control_response_line`], and until something does the agent is stopped.
     PermissionRequested { index: usize },
+    /// The agent answered something this server asked it — today, an interrupt.
+    /// Carried rather than swallowed so a *refused* request can be reported: see
+    /// [`Acknowledgement::refusal`].
+    Acknowledged(Acknowledgement),
     /// The terminal `result` for the turn. `last_result` holds the duration and
     /// the cost.
     Completed,
@@ -668,6 +745,14 @@ impl SessionState {
                 self.bump("control_request/UNKNOWN");
                 self.unknown_events += 1;
                 Folded::Nothing
+            }
+
+            // Not drift, and that is the point of recognizing it: an interrupted
+            // turn produces one of these, and before ticket 14 it was counted as
+            // a format change on every turn a developer stopped.
+            Event::ControlResponse { response } => {
+                self.bump("control_response");
+                Folded::Acknowledged(response)
             }
 
             Event::Unknown => {
@@ -1129,6 +1214,76 @@ mod tests {
         assert!(
             line["response"]["response"].get("updatedPermissions").is_none(),
             "{line}"
+        );
+    }
+
+    // -- interrupts ------------------------------------------------------------
+    //
+    // The one request this server makes of the agent. Whole captured interrupts
+    // are in the golden files (`11`–`14`); what lives here is the line that goes
+    // out and how each shape of answer to it reads.
+
+    /// The request the CLI's own schema declares, and nothing beside it. The
+    /// optional `reason` is deliberately absent — see [`interrupt_line`].
+    #[test]
+    fn the_interrupt_is_the_control_request_the_cli_expects() {
+        assert_eq!(
+            serde_json::from_str::<Value>(&interrupt_line("interrupt-1")).unwrap(),
+            json!({
+                "type": "control_request",
+                "request_id": "interrupt-1",
+                "request": {"subtype": "interrupt"},
+            })
+        );
+    }
+
+    /// The acknowledgement, verbatim in shape from
+    /// `fixtures/claude-cli/11-interrupted-turn.ndjson`. It names the id this
+    /// server minted, which is the whole of how a driver knows the answer is to
+    /// its own request rather than to somebody else's.
+    #[test]
+    fn an_accepted_interrupt_reads_as_an_acknowledgement_naming_the_request() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"interrupt-1","response":{"still_queued":[]}}}"#,
+        );
+
+        let Folded::Acknowledged(acknowledged) = told else {
+            panic!("{told:?}");
+        };
+        assert_eq!(acknowledged.request_id, "interrupt-1");
+        assert_eq!(acknowledged.refusal(), None);
+        // And it is not drift. Before this was recognized, every interrupted
+        // turn reported a format change it had caused itself.
+        assert_eq!(state.unknown_events, 0);
+        assert_eq!(state.parse_errors, 0);
+    }
+
+    /// A refusal has to carry something a developer can read, whichever way it
+    /// arrives — the CLI's own sentence when there is one, and the subtype when
+    /// there is not. A stop that silently did nothing is the outcome this exists
+    /// to prevent.
+    #[test]
+    fn a_refused_interrupt_says_why_however_little_it_was_given() {
+        let mut state = SessionState::new();
+
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
+        );
+        let Folded::Acknowledged(refused) = told else {
+            panic!("{told:?}");
+        };
+        assert_eq!(refused.refusal().as_deref(), Some("No active turn"));
+
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"deferred","request_id":"interrupt-1"}}"#,
+        );
+        let Folded::Acknowledged(unreadable) = told else {
+            panic!("{told:?}");
+        };
+        assert!(
+            unreadable.refusal().is_some_and(|why| why.contains("deferred")),
+            "an answer that cannot be read as yes has to be read as no"
         );
     }
 
