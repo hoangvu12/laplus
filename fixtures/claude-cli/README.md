@@ -45,11 +45,40 @@ sent, and then abort a turn nobody had stopped.
 | `13-interrupt-during-tool-use.ndjson` | Recorded, ticket 14 | A stop in the middle of a run of `Write` calls, as the agent was opening the next one |
 | `14-interrupt-with-nothing-running.ndjson` | Recorded, ticket 14 | A stop sent after the turn had already ended — acknowledged, and nothing else happens |
 | `15-permission-cancelled.ndjson` | Recorded, ticket 14 | "Cancel" on a permission: a denial carrying `interrupt: true`, which ends the turn the way an interrupt does |
+| `16-error-result.ndjson` | Hand-written | A turn the agent reports as failed, with its reason in the `result`'s `errors` array — which is the only thing in a failed turn a developer can act on |
+| `17-rate-limited.ndjson` | Hand-written | Three `rate_limit_event`s — fine, close to the limit, refused — and the failed turn the third produces |
+| `18-compacted.ndjson` | Hand-written | A `system`/`compact_boundary` between two turns: the agent's memory rewritten, and the transcript deliberately unchanged by it |
 
 The `.scratch/*.ndjson` originals stay where they are as raw evidence; these are
 the committed, test-facing copies. `04`–`15` were recorded straight into
 `fixtures/` against `claude-haiku-4-5`, with the same flags
 [`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes.
+
+## What `16`–`18` are, and why they are not recordings
+
+Ticket 15's three cases have one thing in common: a healthy CLI on a healthy
+account does not produce them on demand. An API failure cannot be asked for, a
+usage limit cannot be reached to order, and a compaction takes a conversation
+long enough to fill the context window — so these are hand-written, like `03`,
+and the *shapes* are read off the `claude` binary rather than guessed:
+
+- **`rate_limit_event` carries `rate_limit_info`**, whose fields are the API's
+  own response headers in the CLI's camel case: `status` (`allowed`,
+  `allowed_warning`, `rejected`), `rateLimitType`, `resetsAt`, `utilization`.
+  Only the two standings a developer can act on are surfaced — see
+  `RateLimit::worth_reporting`, and `17`'s first notice, which is not.
+- **`compact_boundary` carries `compact_metadata`** with `trigger` (`auto` or
+  `manual`) and the token counts either side. Every field is optional, and a
+  boundary with none of them is still a boundary.
+- **A failed `result` puts its reason in `errors`, in `result`, or in neither** —
+  which is why `ResultEvent::complaint` reads all three in that order and falls
+  back to the subtype. `11-interrupted-turn.ndjson` is the recorded proof that
+  `errors` is real.
+
+The one thing no capture can contain is the fourth failure mode ticket 15 covers:
+an agent that **dies mid-stream**. A CLI that crashes has, by definition, not
+finished writing the recording. `harness::agent::DIES` is where that lives
+instead, and `tests/socket_resilience.rs` is what drives it.
 
 ## What `11`–`15` settled
 

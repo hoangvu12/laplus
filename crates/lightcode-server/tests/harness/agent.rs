@@ -144,6 +144,24 @@ pub const PAUSE: &str = "<pause>";
 /// recorded behaviour being replayed.
 pub const AWAIT_ANSWER: &str = "<answer>";
 
+/// A place where the agent stops being a process at all: it complains on stderr
+/// and exits, in the middle of whatever it was saying.
+///
+/// The one failure mode with no recording and no possible one — a CLI that
+/// crashes has, by definition, not finished writing the capture. Everything
+/// after this marker in a turn's script is never printed, which is the point:
+/// what the server sees is output that stops, and the turn it was in the middle
+/// of will never end on its own.
+pub const DIES: &str = "<dies>";
+
+/// What a scripted agent says on stderr on its way out.
+///
+/// Real, in shape: a `claude` that dies mid-turn has said something about why,
+/// and the server quotes it into the conversation for the same reason it quotes
+/// a refused resume — the agent's own words beat anything this server could
+/// infer.
+pub const LAST_WORDS: &str = "FATAL ERROR: the agent went away";
+
 /// A file every scripted agent writes into whatever directory it was started
 /// in, on every turn.
 ///
@@ -161,6 +179,16 @@ enum OnResume {
     /// exit without a line of NDJSON. Ticket 11's "the underlying agent session
     /// is no longer available", and no recording contains it.
     Refuse,
+    /// The same as [`OnResume::Continue`], except that the scripts belong to the
+    /// **conversation** rather than to the process: a start carrying `--resume`
+    /// begins at the second script, because a previous process already played
+    /// the first.
+    ///
+    /// What ticket 15's restart needs, and the only thing that can express it.
+    /// A process that died halfway through turn one is replaced by one that has
+    /// to answer turn two — and the replacement's own turn counter starts at
+    /// zero, so without this it would replay the death.
+    PickUpWhereTheLastOneStopped,
 }
 
 impl ScriptedAgent {
@@ -228,6 +256,17 @@ impl ScriptedAgent {
     /// when the session id names nothing it still holds.
     pub fn refusing_to_resume<'a>(turns: &[impl AsRef<[&'a str]>]) -> ScriptedAgent {
         ScriptedAgent::written(turns, OnResume::Refuse)
+    }
+
+    /// An agent whose scripts belong to the conversation rather than to the
+    /// process: a start carrying `--resume` skips the first script, because a
+    /// previous process already played it.
+    ///
+    /// For the one thing a per-process counter cannot express — a session that
+    /// died in the middle of turn one and a *replacement* that has to answer
+    /// turn two. See [`OnResume::PickUpWhereTheLastOneStopped`].
+    pub fn resuming_after_a_death<'a>(turns: &[impl AsRef<[&'a str]>]) -> ScriptedAgent {
+        ScriptedAgent::written(turns, OnResume::PickUpWhereTheLastOneStopped)
     }
 
     fn written<'a>(turns: &[impl AsRef<[&'a str]>], on_resume: OnResume) -> ScriptedAgent {
@@ -360,7 +399,7 @@ impl ScriptedAgent {
         // a file-descriptor number and `--resume abc1>>log` would redirect fd 1
         // and lose the "1" out of the text.
         let refusal = match on_resume {
-            OnResume::Continue => String::new(),
+            OnResume::Continue | OnResume::PickUpWhereTheLastOneStopped => String::new(),
             OnResume::Refuse => format!(
                 "echo %* | findstr /C:\"--resume\" >nul\r\n\
                  if not errorlevel 1 (\r\n\
@@ -368,6 +407,17 @@ impl ScriptedAgent {
                  \x20 exit /b 1\r\n\
                  )\r\n"
             ),
+        };
+
+        // Where the turn counter starts. Zero for a process that is the whole
+        // conversation; one for a replacement that is picking up after a turn
+        // somebody else already played.
+        let first_turn = match on_resume {
+            OnResume::PickUpWhereTheLastOneStopped => {
+                "echo %* | findstr /C:\"--resume\" >nul\r\nif not errorlevel 1 set TURN=1\r\n"
+                    .to_string()
+            }
+            OnResume::Continue | OnResume::Refuse => String::new(),
         };
 
         // One `if` per turn, and the last one catches every turn past the end so
@@ -394,6 +444,13 @@ impl ScriptedAgent {
                          set /p ANSWER=\r\n\
                          if defined ANSWER >>\"%~dp0{ANSWERS_LOG}\" echo %ANSWER%\r\n"
                     )),
+                    // `exit` rather than `exit /b`: this is inside a `call`, and
+                    // `/b` would return from the subroutine and carry on reading
+                    // stdin — which is a turn that went quiet, not an agent that
+                    // died.
+                    Some(Stop::Die) => {
+                        bodies.push_str(&format!(">&2 echo {LAST_WORDS}\r\nexit 3\r\n"))
+                    }
                     None => {}
                 }
                 bodies.push_str(&format!("type \"%~dp0{}\"\r\n", segment_name(turn - 1, index)));
@@ -416,6 +473,7 @@ impl ScriptedAgent {
              rem working-directory marker goes.\r\n\
              >>\"%~dp0{STARTS_LOG}\" echo started\r\n\
              set TURN=0\r\n\
+             {first_turn}\
              :turns\r\n\
              rem `set /p` leaves the variable undefined when stdin has\r\n\
              rem closed, which is how this loop hears that the server is\r\n\
@@ -435,7 +493,7 @@ impl ScriptedAgent {
 
     fn shell(&self, turns: &[Vec<Segment<'_>>], on_resume: OnResume) -> String {
         let refusal = match on_resume {
-            OnResume::Continue => String::new(),
+            OnResume::Continue | OnResume::PickUpWhereTheLastOneStopped => String::new(),
             OnResume::Refuse => format!(
                 "case \" $* \" in\n\
                  \x20 *\" --resume \"*)\n\
@@ -444,6 +502,13 @@ impl ScriptedAgent {
                  \x20   ;;\n\
                  esac\n"
             ),
+        };
+
+        let first_turn = match on_resume {
+            OnResume::PickUpWhereTheLastOneStopped => {
+                "case \" $* \" in\n  *\" --resume \"*) turn=1 ;;\nesac\n".to_string()
+            }
+            OnResume::Continue | OnResume::Refuse => String::new(),
         };
 
         let mut cases = String::new();
@@ -465,6 +530,9 @@ impl ScriptedAgent {
                          \x20       printf '%s\\n' \"$answer\" >> \"$here/{ANSWERS_LOG}\"\n\
                          \x20     fi\n"
                     )),
+                    Some(Stop::Die) => {
+                        cases.push_str(&format!("      echo \"{LAST_WORDS}\" >&2\n      exit 3\n"))
+                    }
                     None => {}
                 }
                 cases.push_str(&format!(
@@ -486,6 +554,7 @@ impl ScriptedAgent {
              {refusal}\
              echo started >> \"$here/{STARTS_LOG}\"\n\
              turn=0\n\
+             {first_turn}\
              while IFS= read -r line; do\n\
              \x20 : > \"{WORKING_DIRECTORY_MARKER}\"\n\
              \x20 turn=$((turn + 1))\n\
@@ -512,11 +581,13 @@ struct Segment<'a> {
     lines: &'a [&'a str],
 }
 
-/// The two kinds of stop a script can contain.
+/// The three kinds of stop a script can contain. The third is not a stop the
+/// script comes back from.
 #[derive(Debug, Clone, Copy)]
 enum Stop {
     Pause,
     Answer,
+    Die,
 }
 
 /// Split one turn's lines at the markers, keeping which marker each split was.
@@ -528,6 +599,7 @@ fn segments<'a>(lines: &'a [&'a str]) -> Vec<Segment<'a>> {
         let stop = match *line {
             PAUSE => Stop::Pause,
             AWAIT_ANSWER => Stop::Answer,
+            DIES => Stop::Die,
             _ => continue,
         };
         segments.push(Segment {

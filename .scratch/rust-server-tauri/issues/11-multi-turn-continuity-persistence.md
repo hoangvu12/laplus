@@ -108,6 +108,19 @@ never arrived. An ordinary close is unaffected — shutdown reaps the agents and
 *then* flushes, in that order, because a session publishes its last changes on
 the way down and those are exactly the ones a flush that ran first would miss.
 
+> **Narrowed by ticket 15.** The cost above was stated for the hard kill and was
+> being paid by every ending, including the graceful ones: the buffered message
+> never arrives whether the process was killed or merely told to stop, so a
+> conversation closed mid-turn came back showing a prompt nobody had answered —
+> and, while the app was still open, a reply the UI renders as still growing.
+> The driver now settles the streaming message on its way down, which is the
+> moment it knows no buffered message is coming. This paragraph's rule is
+> unchanged: a delta still owes the database nothing, and what is written is
+> still one row at a message boundary. The hard kill still loses the tail,
+> because the driver never runs at all. See ADR-0004's consequences, and
+> `a_turn_the_app_closed_during_does_not_come_back_running`, which was pinning
+> the old behaviour and now pins this one.
+
 ### A refused resume is the one failure with no NDJSON to it
 
 Every other agent failure this server reports arrives as a line to fold. A

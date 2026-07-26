@@ -167,10 +167,12 @@ use std::collections::HashMap;
 use serde_json::json;
 
 use crate::agent::{permission_mode_for, Agent, Launch};
-use crate::clock::now_iso;
+use crate::clock::{iso_from_epoch, now_iso};
 use crate::config::ClaudeSettings;
 use crate::process::Search;
-use crate::protocol::{ContentBlock, Folded, Permission, SessionState};
+use crate::protocol::{
+    Compaction, ContentBlock, Drift, Folded, Permission, RateLimit, SessionState,
+};
 use crate::settling::SessionStatus;
 use crate::threads::{Activity, Answered, Change, Prompt, Session, Signal, Thread, Threads};
 use crate::worklog::{Call, Decision, Returned};
@@ -258,6 +260,7 @@ async fn drive(
         turn: None,
         outstanding: HashMap::new(),
         interrupts: 0,
+        drift_reported: Drift::default(),
     };
     // A turn that arrived while another was still running. Held rather than
     // sent: sending it would orphan the turn in flight — that turn would never
@@ -337,6 +340,38 @@ async fn drive(
         }
     }
 
+    // A reply that streamed and will never be buffered, because the agent went
+    // away in the middle of it. Two things are owed to it and neither is
+    // optional:
+    //
+    // - **The client is showing it as still arriving.** A message left
+    //   `streaming` is a reply the UI renders as growing, for the life of the
+    //   thread, and after every restart — the same defect the ordinary
+    //   reconcile is careful to avoid when a turn buffers nothing.
+    // - **A delta owes the database nothing**, by design ([`crate::threads`]'s
+    //   `durable`: a row per token would put the disk in the streaming path), so
+    //   until a message settles there is nothing written down. Without this, the
+    //   partial reply survives in memory and is gone the next time the app opens.
+    //
+    // Sent with **no text**, which is deliberate: the empty case is the one
+    // where the accumulation stands rather than being replaced, so what the
+    // developer saw stream is what is kept — and no reconciliation is recorded,
+    // because none happened. A message forged out of the deltas and compared
+    // against them would report the assumption as checked on a turn where
+    // nothing checked it.
+    if let Some(active) = driving.turn.as_mut() {
+        if let Some(message_id) = active.assistant_message_id.take() {
+            threads.apply(
+                &start.thread_id,
+                Change::AssistantMessage {
+                    message_id,
+                    turn_id: active.turn_id.clone(),
+                    text: String::new(),
+                },
+            );
+        }
+    }
+
     // Whatever the agent was still waiting on is never going to be answered now,
     // and the client derives its pending-approval panel from these two kinds
     // alone — so a request left open here is a composer the developer cannot type
@@ -373,35 +408,69 @@ async fn drive(
     }
 
     // A turn still in flight when the agent went is a turn that will never
-    // finish, and saying "stopped" would let it sit in the UI as running
-    // forever. Which of the two it is decides how the client settles the turn.
-    let unfinished = driving.turn.is_some();
+    // finish, and this is the only moment anybody can say so. The refusal wins
+    // when there is one: "the agent stopped before the turn finished" is true of
+    // a resume that was refused and says nothing about why.
+    //
+    // The drift goes here too, and this is the only place it can: a turn that
+    // never ends emits no `turn.completed`, so a session that died having also
+    // been talking in a dialect this build could not read would otherwise report
+    // the death and nothing about the dialect — which is the more likely
+    // explanation of the two.
+    let unread = driving.drift_to_report(&folding);
+    let death = driving
+        .turn
+        .is_some()
+        .then(|| died_mid_turn(complaint.as_deref(), unread));
+
+    // Said in the conversation and not only on the session, because the session
+    // is a banner and the conversation is what the developer is reading. A
+    // refusal has already put its own row up, so this does not repeat it.
+    if let (Some(why), None) = (&death, &refused) {
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(Activity::failed("session.failed", why)),
+        );
+    }
+
+    let failure = refused.or(death);
     threads.apply(
         &start.thread_id,
         Change::Session(Session {
-            // `error` rather than `stopped` for an unfinished turn, and that is
-            // a choice about *diagnosis*, not about settling: the turn settles as
-            // `interrupted` either way now that
-            // [`crate::settling::SessionStatus::Stopped`] says so. What `error`
-            // buys is `last_error` below, which is the only place the developer
-            // is told the agent went away mid-turn. Ticket 15 owns whether that
-            // sentence is worth reporting the session as failed for.
-            status: if unfinished || refused.is_some() {
-                SessionStatus::Error
-            } else {
-                SessionStatus::Stopped
+            // **`error` rather than `stopped` for a turn cut short**, and ticket
+            // 15 settled it deliberately — see ADR-0004. `stopped` is available
+            // and would settle the turn as `interrupted`; it is not used, because
+            // nobody asked for this and because `lastError` below — the only
+            // place the developer is told the agent went away mid-turn — is the
+            // sentence a session that is not in `error` has nowhere to put.
+            status: match failure.is_some() {
+                true => SessionStatus::Error,
+                false => SessionStatus::Stopped,
             },
             runtime_mode: start.runtime_mode.clone(),
             active_turn_id: None,
-            // The refusal wins when there is one: "the agent stopped before the
-            // turn finished" is true of it and says nothing about why.
-            last_error: refused.or_else(|| {
-                unfinished.then(|| "The agent stopped before the turn finished.".to_string())
-            }),
+            last_error: failure,
             updated_at: now_iso(),
         }),
     );
     threads.detach(&start.thread_id);
+}
+
+/// What the developer is told when the agent went away in the middle of a turn.
+///
+/// The CLI's own last words are quoted when it left any, for the same reason
+/// [`resume_refused`] quotes them: a process that died because it ran out of
+/// memory, or because the machine has no credentials any more, said so on
+/// stderr, and nothing this server could infer would be as useful.
+fn died_mid_turn(complaint: Option<&str>, unread: Drift) -> String {
+    let mut why = "The agent stopped before the turn finished.".to_string();
+    if let Some(said) = complaint {
+        why.push_str(&format!(" The agent said: {said}"));
+    }
+    if let Some(drifted) = drift_clause(unread) {
+        why.push_str(&format!(" This session had {drifted}."));
+    }
+    why
 }
 
 /// What the developer is told when a conversation cannot be picked back up.
@@ -456,6 +525,19 @@ struct Driving {
     /// request it answers and a *late* one — for a turn that has already ended —
     /// is recognised as late rather than mistaken for the current one.
     interrupts: usize,
+    /// How much of this session's drift the developer has already been shown.
+    ///
+    /// The counters are the session's and monotonic, so what a report has to
+    /// carry is the *difference* — a running total repeated on every turn would
+    /// say the format moved on a turn where nothing did, which is the noise that
+    /// trains a reader to skip the turn where it had.
+    ///
+    /// Kept here rather than on the turn, and that is the difference between
+    /// "what this turn failed to read" and "what has gone unreported": the CLI
+    /// talks *between* turns as well as during them — a rate-limit notice, a
+    /// compaction boundary — and drift there belongs to somebody. Anchoring it
+    /// to the start of a turn would drop it.
+    drift_reported: Drift,
 }
 
 impl Driving {
@@ -463,6 +545,14 @@ impl Driving {
     fn next_interrupt_id(&mut self) -> String {
         self.interrupts += 1;
         format!("interrupt-{}", self.interrupts)
+    }
+
+    /// What has gone unread since the last time anybody was told, and a note
+    /// that they have now been told it.
+    fn drift_to_report(&mut self, folding: &SessionState) -> Drift {
+        let unreported = folding.drift().since(self.drift_reported);
+        self.drift_reported = folding.drift();
+        unreported
     }
 
     /// Take every request still waiting, so the caller can close it.
@@ -923,6 +1013,56 @@ fn publish(
             );
         }
 
+        // A row and nothing else, which is the whole of the criterion: the
+        // transcript is this server's own copy and no branch here touches it.
+        //
+        // Reported rather than merely tolerated, because it explains something a
+        // developer would otherwise experience as the agent losing the thread —
+        // a follow-up that refers to what is plainly on screen may be answered
+        // by an agent that no longer has it.
+        Folded::Compacted(compaction) => {
+            threads.apply(
+                &start.thread_id,
+                Change::Activity(Activity::info(
+                    "session.compacted",
+                    &compaction_summary(&compaction),
+                    json!({
+                        "trigger": compaction.trigger,
+                        "preTokens": compaction.pre_tokens,
+                        "postTokens": compaction.post_tokens,
+                        "detail": "The agent summarised the conversation to make room. \
+                                   Everything above is still here — what changed is how much \
+                                   of it the agent can still see.",
+                    }),
+                    turn.as_ref().map(|turn| turn.turn_id.clone()),
+                )),
+            );
+        }
+
+        // The account's standing with the API, when it is worth saying. Surfaced
+        // rather than swallowed because it is the difference between a turn that
+        // is slow and a turn that is not going to happen — and because a
+        // developer who is refused with no explanation has nothing to act on.
+        Folded::RateLimited(limit) => {
+            let summary = rate_limit_summary(&limit);
+            let mut told = Activity::info(
+                "session.rate-limited",
+                &summary,
+                json!({
+                    "status": limit.status,
+                    "limit": limit.limit,
+                    "resetsAt": limit.resets_at.map(reset_time),
+                    "detail": summary,
+                }),
+                turn.as_ref().map(|turn| turn.turn_id.clone()),
+            );
+            // A refusal is a failure; being close to a limit is not yet one.
+            if limit.rejected() {
+                told.tone = "error";
+            }
+            threads.apply(&start.thread_id, Change::Activity(told));
+        }
+
         Folded::Streamed(text) => {
             let Some(active) = turn.as_mut() else { return };
             let message_id = active
@@ -1046,16 +1186,21 @@ fn publish(
         }
 
         Folded::Completed => {
-            let finished = turn.take();
+            let finished = driving.turn.take();
             let active = finished.as_ref().map(|turn| turn.turn_id.clone());
             let summary = folding.last_result.as_ref();
             let ending = Ending::of(finished.as_ref(), summary);
+            // What has gone unread and unreported. The session's running totals
+            // go in the payload beside it; the sentence gets what is new, so a
+            // turn that drifted says so and the one after it does not repeat the
+            // claim.
+            let drift = driving.drift_to_report(folding);
 
             let completed = Activity {
                 tone: ending.tone(),
                 ..Activity::info(
                     "turn.completed",
-                    &turn_summary(folding, ending),
+                    &turn_summary(folding, ending, drift),
                     json!({
                         "durationMs": summary.and_then(|result| result.duration_ms),
                         "totalCostUsd": summary.and_then(|result| result.total_cost_usd),
@@ -1065,7 +1210,10 @@ fn publish(
                         "interrupted": ending.stopped(),
                         // The drift accounting for this session, next to the turn
                         // it accumulated over — so a CLI that moved shows up where
-                        // a developer is already looking.
+                        // a developer is already looking. Session totals rather
+                        // than this turn's, because the question a number answers
+                        // is "how much of this build has the CLI outgrown"; the
+                        // summary above carries the turn's own.
                         "unknownEvents": folding.unknown_events,
                         "parseErrors": folding.parse_errors,
                     }),
@@ -1097,7 +1245,9 @@ fn publish(
                     status: ending.session_status(),
                     runtime_mode: start.runtime_mode.clone(),
                     active_turn_id: None,
-                    last_error: ending.failed().then(|| turn_summary(folding, ending)),
+                    last_error: ending
+                        .failed()
+                        .then(|| turn_summary(folding, ending, drift)),
                     updated_at: now_iso(),
                 }),
             );
@@ -1130,24 +1280,150 @@ fn session_summary(state: &SessionState) -> String {
 /// log renders any kind it does not specifically suppress — so the sentence is
 /// what a developer actually sees, and the payload beside it is what a later
 /// ticket can render properly.
-fn turn_summary(state: &SessionState, ending: Ending) -> String {
-    let Some(result) = &state.last_result else {
-        return format!("{}.", ending.opening());
+fn turn_summary(state: &SessionState, ending: Ending, drift: Drift) -> String {
+    let mut summary = match &state.last_result {
+        None => format!("{}.", ending.opening()),
+        Some(result) => {
+            let mut summary = ending.opening().to_string();
+            if let Some(duration) = result.duration_ms {
+                summary.push_str(&format!(" in {}", human_duration(duration)));
+            }
+            if let Some(cost) = result.total_cost_usd {
+                // Four decimal places: a short turn costs a fraction of a cent,
+                // and two would round every one of them to zero.
+                summary.push_str(&format!(" · ${cost:.4}"));
+            }
+            if let Some(reason) = &result.stop_reason {
+                summary.push_str(&format!(" · {reason}"));
+            }
+            // The agent's own account of what went wrong, on a turn that went
+            // wrong. Without it the sentence is "Turn failed" and the developer
+            // has nothing to decide with — and this sentence is also the
+            // session's `lastError`, which is the banner they are looking at.
+            //
+            // Only on a failure: the CLI reports a turn the developer *stopped*
+            // as a failed one, and quoting its diagnostics there would show them
+            // an error for having pressed stop.
+            if let (true, Some(said)) = (ending.failed(), result.error.as_deref()) {
+                summary.push_str(&format!(" · {said}"));
+            }
+            summary
+        }
     };
 
-    let mut summary = ending.opening().to_string();
-    if let Some(duration) = result.duration_ms {
-        summary.push_str(&format!(" in {}", human_duration(duration)));
-    }
-    if let Some(cost) = result.total_cost_usd {
-        // Four decimal places: a short turn costs a fraction of a cent, and two
-        // would round every one of them to zero.
-        summary.push_str(&format!(" · ${cost:.4}"));
-    }
-    if let Some(reason) = &result.stop_reason {
-        summary.push_str(&format!(" · {reason}"));
+    // Last, because it is about this build rather than about the turn.
+    if let Some(drifted) = drift_clause(drift) {
+        summary.push_str(&format!(" · {drifted}"));
     }
     summary
+}
+
+/// What a turn failed to read, as a clause a developer can see.
+///
+/// The counters are the project's early-warning system for its most externally
+/// volatile dependency, and a number nobody renders is not a warning. The
+/// payload beside this row already carried both totals before ticket 15; what it
+/// did not do was put either one anywhere the UI shows, so a `claude` release
+/// that moved the format would still have been learned from a bug report.
+///
+/// `None` on a clean turn, which is almost all of them — a clause saying nothing
+/// went unread on every turn would be noise that trained the developer to skip
+/// the one that mattered.
+fn drift_clause(drift: Drift) -> Option<String> {
+    if drift.is_clean() {
+        return None;
+    }
+    let mut said = Vec::new();
+    if drift.unknown_events > 0 {
+        said.push(format!(
+            "{} unrecognised {}",
+            drift.unknown_events,
+            plural(drift.unknown_events, "event", "events")
+        ));
+    }
+    if drift.parse_errors > 0 {
+        said.push(format!(
+            "{} unreadable {}",
+            drift.parse_errors,
+            plural(drift.parse_errors, "line", "lines")
+        ));
+    }
+    Some(said.join(" and "))
+}
+
+fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
+    match count {
+        1 => one,
+        _ => many,
+    }
+}
+
+/// What the developer is told when the agent compacted its own context.
+///
+/// The trigger is named because the two are different events to a reader: one is
+/// the conversation having outgrown the window, the other is somebody having
+/// asked. The token counts are shown when the CLI gave them, because "how much
+/// was thrown away" is the only quantity here that predicts what the agent will
+/// have forgotten.
+fn compaction_summary(compaction: &Compaction) -> String {
+    let mut summary = match compaction.trigger.as_deref() {
+        Some("auto") => "Context compacted automatically".to_string(),
+        Some("manual") => "Context compacted at the developer's request".to_string(),
+        Some(other) => format!("Context compacted ({other})"),
+        None => "Context compacted".to_string(),
+    };
+    if let (Some(before), Some(after)) = (compaction.pre_tokens, compaction.post_tokens) {
+        summary.push_str(&format!(
+            " · {} tokens → {}",
+            thousands(before),
+            thousands(after)
+        ));
+    }
+    summary
+}
+
+/// What the developer is told about the account's standing.
+///
+/// The reset time is the whole reason this is worth a row: "you have run out"
+/// with no answer to "until when" leaves the developer with nothing to plan
+/// around.
+fn rate_limit_summary(limit: &RateLimit) -> String {
+    let mut summary = match limit.status.as_str() {
+        "rejected" => "The agent's usage limit has been reached".to_string(),
+        "allowed_warning" => "The agent is close to its usage limit".to_string(),
+        // A standing this build has never seen. Named rather than described:
+        // saying "close to its limit" about a word nobody read would be
+        // asserting something the agent did not say.
+        unknown => format!("The agent reported its usage standing as '{unknown}'"),
+    };
+    if let Some(kind) = &limit.limit {
+        summary.push_str(&format!(" ({kind})"));
+    }
+    if let Some(resets_at) = limit.resets_at {
+        summary.push_str(&format!(" · resets at {}", reset_time(resets_at)));
+    }
+    summary
+}
+
+/// The CLI's Unix-seconds reset stamp, as the timestamp the rest of this wire
+/// speaks. A number of seconds since 1970 is not something a developer reads,
+/// and every other instant the client is handed is an `IsoDateTime`.
+fn reset_time(seconds: i64) -> String {
+    iso_from_epoch(seconds.max(0) as u64, 0)
+}
+
+/// A token count with separators, because six digits without them is not a
+/// number anybody reads at a glance.
+fn thousands(count: u64) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 /// A duration a person reads rather than a number of milliseconds.
@@ -1198,8 +1474,19 @@ mod tests {
             num_turns: Some(1),
             duration_ms,
             total_cost_usd: cost,
+            error: None,
         });
         state
+    }
+
+    /// A turn in flight, however it is going.
+    fn in_flight(stopped: Option<&str>) -> InFlight {
+        InFlight {
+            turn_id: "turn-1".to_string(),
+            assistant_message_id: None,
+            tools: HashMap::new(),
+            stopped: stopped.map(str::to_string),
+        }
     }
 
     /// The ticket asks a completed turn to report its duration and its cost, and
@@ -1216,20 +1503,188 @@ mod tests {
                 Some("end_turn"),
             ),
             Ending::Completed,
+            Drift::default(),
         );
 
         assert_eq!(summary, "Turn completed in 2.0s · $0.0795 · end_turn");
     }
 
     /// A turn that failed says so first, because that is what the developer
-    /// needs from the sentence before anything else in it.
+    /// needs from the sentence before anything else in it — and then says what
+    /// the agent said went wrong, because "Turn failed" alone is not something
+    /// anybody can act on.
     #[test]
-    fn a_failed_turn_says_so_before_it_says_anything_else() {
-        let summary = turn_summary(
-            &result(true, Some(400), Some(0.0), Some("error")),
-            Ending::Failed,
-        );
+    fn a_failed_turn_says_so_first_and_then_says_why() {
+        let mut failed = result(true, Some(400), Some(0.0), Some("error"));
+        failed.last_result.as_mut().expect("a result").error =
+            Some("upstream connect error".to_string());
+
+        let summary = turn_summary(&failed, Ending::Failed, Drift::default());
         assert!(summary.starts_with("Turn failed"), "{summary}");
+        assert!(summary.ends_with("· upstream connect error"), "{summary}");
+
+        // And the same failure with nothing said about it still reads as a
+        // sentence rather than as one with a dangling separator.
+        assert_eq!(
+            turn_summary(
+                &result(true, Some(400), Some(0.0), Some("error")),
+                Ending::Failed,
+                Drift::default()
+            ),
+            "Turn failed in 400ms · $0.0000 · error"
+        );
+    }
+
+    /// A turn the developer stopped is reported as an error by the CLI and
+    /// carries the CLI's diagnostics with it. Quoting those would show the
+    /// developer a failure for having pressed stop, so the agent's complaint is
+    /// read only on a turn that actually failed.
+    #[test]
+    fn a_stopped_turn_does_not_quote_the_clis_complaint_about_it() {
+        let mut aborted = result(true, Some(13_660), Some(0.0), None);
+        aborted.last_result.as_mut().expect("a result").error =
+            Some("[ede_diagnostic] result_type=user".to_string());
+
+        let summary = turn_summary(&aborted, Ending::Stopped, Drift::default());
+        assert_eq!(summary, "Turn stopped by the developer in 13.7s · $0.0000");
+    }
+
+    /// What a turn could not read, in the sentence a developer actually sees.
+    /// The counters existed before ticket 15 and were only in a payload nothing
+    /// renders, which is a warning system nobody is warned by.
+    #[test]
+    fn a_turn_that_drifted_says_so_in_the_sentence() {
+        let finished = result(false, Some(2008), None, None);
+
+        assert_eq!(
+            turn_summary(
+                &finished,
+                Ending::Completed,
+                Drift {
+                    unknown_events: 1,
+                    parse_errors: 0
+                }
+            ),
+            "Turn completed in 2.0s · 1 unrecognised event"
+        );
+        assert_eq!(
+            turn_summary(
+                &finished,
+                Ending::Completed,
+                Drift {
+                    unknown_events: 3,
+                    parse_errors: 2
+                }
+            ),
+            "Turn completed in 2.0s · 3 unrecognised events and 2 unreadable lines"
+        );
+        // And a clean turn says nothing, which is what stops the clause becoming
+        // noise a developer learns to skip.
+        assert_eq!(
+            turn_summary(&finished, Ending::Completed, Drift::default()),
+            "Turn completed in 2.0s"
+        );
+    }
+
+    /// Compaction is reported as what it is: the agent's memory rewritten, not
+    /// the conversation changed.
+    #[test]
+    fn compaction_names_its_trigger_and_what_it_cost() {
+        assert_eq!(
+            compaction_summary(&Compaction {
+                trigger: Some("auto".to_string()),
+                pre_tokens: Some(154_000),
+                post_tokens: Some(21_000),
+            }),
+            "Context compacted automatically · 154,000 tokens → 21,000"
+        );
+        assert_eq!(
+            compaction_summary(&Compaction {
+                trigger: Some("manual".to_string()),
+                ..Compaction::default()
+            }),
+            "Context compacted at the developer's request"
+        );
+        // A trigger this build has never heard of is still worth a row, and is
+        // named rather than dropped.
+        assert!(compaction_summary(&Compaction {
+            trigger: Some("microcompact".to_string()),
+            ..Compaction::default()
+        })
+        .contains("microcompact"));
+        assert_eq!(
+            compaction_summary(&Compaction::default()),
+            "Context compacted"
+        );
+    }
+
+    /// The reset time is the whole reason a rate-limit row is worth having:
+    /// "you have run out" with no answer to "until when" is not something a
+    /// developer can plan around.
+    #[test]
+    fn a_rate_limit_says_which_limit_and_when_it_lifts() {
+        assert_eq!(
+            rate_limit_summary(&RateLimit {
+                status: "rejected".to_string(),
+                limit: Some("five_hour".to_string()),
+                resets_at: Some(1_700_000_000),
+            }),
+            "The agent's usage limit has been reached (five_hour) · resets at \
+             2023-11-14T22:13:20.000Z"
+        );
+        assert_eq!(
+            rate_limit_summary(&RateLimit {
+                status: "allowed_warning".to_string(),
+                limit: None,
+                resets_at: None,
+            }),
+            "The agent is close to its usage limit"
+        );
+        // A standing this build has never seen is named rather than guessed at.
+        // Describing it as either of the two above would be putting words in the
+        // agent's mouth about the one thing it is telling us.
+        assert_eq!(
+            rate_limit_summary(&RateLimit {
+                status: "allowed_overage".to_string(),
+                limit: None,
+                resets_at: None,
+            }),
+            "The agent reported its usage standing as 'allowed_overage'"
+        );
+    }
+
+    /// The agent's own last words are what a developer needs when the process
+    /// went away, because nothing this server could infer would say why.
+    ///
+    /// The drift is there too, and this is the only sentence it can be in: a
+    /// turn that never ends emits no `turn.completed`, and a session talking in
+    /// a dialect this build could not read is the likelier explanation of the
+    /// two for why it stopped talking at all.
+    #[test]
+    fn a_dead_agent_quotes_what_it_said_on_the_way_out() {
+        assert_eq!(
+            died_mid_turn(None, Drift::default()),
+            "The agent stopped before the turn finished."
+        );
+        assert_eq!(
+            died_mid_turn(
+                Some("FATAL ERROR: JavaScript heap out of memory"),
+                Drift::default()
+            ),
+            "The agent stopped before the turn finished. The agent said: FATAL ERROR: \
+             JavaScript heap out of memory"
+        );
+        assert_eq!(
+            died_mid_turn(
+                None,
+                Drift {
+                    unknown_events: 4,
+                    parse_errors: 0
+                }
+            ),
+            "The agent stopped before the turn finished. This session had 4 unrecognised \
+             events."
+        );
     }
 
     /// A turn the developer stopped says *that*, over the failure the CLI
@@ -1240,12 +1695,7 @@ mod tests {
     /// prevent, and the line below is the whole of it.
     #[test]
     fn a_stopped_turn_says_it_was_stopped_rather_than_that_it_failed() {
-        let interrupted = InFlight {
-            turn_id: "turn-1".to_string(),
-            assistant_message_id: None,
-            tools: HashMap::new(),
-            stopped: Some("interrupt-1".to_string()),
-        };
+        let interrupted = in_flight(Some("interrupt-1"));
         let aborted = result(true, Some(13_660), Some(0.0), None);
         let ending = Ending::of(Some(&interrupted), aborted.last_result.as_ref());
         assert_eq!(ending, Ending::Stopped);
@@ -1254,14 +1704,14 @@ mod tests {
         assert!(!ending.failed(), "a turn the developer stopped is not an error");
 
         assert_eq!(
-            turn_summary(&aborted, ending),
+            turn_summary(&aborted, ending, Drift::default()),
             "Turn stopped by the developer in 13.7s · $0.0000"
         );
 
         // And with nothing reported at all, which is the shape a session that
         // died before its `result` would leave behind.
         assert_eq!(
-            turn_summary(&SessionState::new(), Ending::Stopped),
+            turn_summary(&SessionState::new(), Ending::Stopped, Drift::default()),
             "Turn stopped by the developer."
         );
     }
@@ -1271,12 +1721,7 @@ mod tests {
     /// of it.
     #[test]
     fn the_same_aborted_result_reads_as_a_failure_when_nobody_stopped_it() {
-        let running = InFlight {
-            turn_id: "turn-1".to_string(),
-            assistant_message_id: None,
-            tools: HashMap::new(),
-            stopped: None,
-        };
+        let running = in_flight(None);
         let aborted = result(true, Some(13_660), Some(0.0), None);
         let ending = Ending::of(Some(&running), aborted.last_result.as_ref());
 
@@ -1290,12 +1735,7 @@ mod tests {
     /// id kept is the one the agent will answer.
     #[test]
     fn a_turn_records_the_first_thing_that_stopped_it_and_not_the_second() {
-        let mut turn = InFlight {
-            turn_id: "turn-1".to_string(),
-            assistant_message_id: None,
-            tools: HashMap::new(),
-            stopped: None,
-        };
+        let mut turn = in_flight(None);
 
         assert!(turn.stop("interrupt-1"));
         assert!(!turn.stop("interrupt-2"), "a turn cannot be stopped twice");
@@ -1318,11 +1758,11 @@ mod tests {
     #[test]
     fn a_turn_with_nothing_to_report_still_says_it_finished() {
         assert_eq!(
-            turn_summary(&result(false, None, None, None), Ending::Completed),
+            turn_summary(&result(false, None, None, None), Ending::Completed, Drift::default()),
             "Turn completed"
         );
         assert_eq!(
-            turn_summary(&SessionState::new(), Ending::Completed),
+            turn_summary(&SessionState::new(), Ending::Completed, Drift::default()),
             "Turn completed."
         );
     }

@@ -54,7 +54,19 @@ apart. `crate::turn::Ending`.
 
 **Drift counter** — a tally of agent-protocol events this build did not
 recognise. Unknown variants increment it instead of failing, so a CLI upgrade is
-learned from a number rather than a bug report.
+learned from a number rather than a bug report. Two of them, because they are two
+failures: an unrecognised event type and a line that is not JSON at all.
+`crate::protocol::Drift`, which is subtractable — a turn reports its own, the
+session reports its total.
+
+**Compaction** — the agent summarising its own conversation to make room, and
+carrying on. A fact about what the *agent* can still see; the transcript is this
+server's own copy and is untouched by one. `crate::protocol::Compaction`.
+
+**Standing** — how the developer's account is placed against its usage limits,
+as the CLI reports it: allowed, close to the limit, or refused.
+`crate::protocol::RateLimit`. Agent-protocol vocabulary with no contract
+equivalent, so it reaches the developer as an activity rather than as a field.
 
 **Reconciliation** — assistant text arrives twice, as deltas and again as a
 buffered message. The deltas drive live rendering; the buffered message is

@@ -152,6 +152,28 @@ fn the_captures_cover_the_wire_format() {
         *totals.entry("unknown events").or_default() += state.unknown_events;
         *totals.entry("parse errors").or_default() += state.parse_errors;
 
+        // Ticket 15's, and the reason they are read off `counts` rather than off
+        // the serialized state is that neither leaves a trace in it: compaction
+        // deliberately changes nothing a client can see, and a rate-limit notice
+        // is a moment rather than a fact about the session. The count is the only
+        // record that the capture set still reaches them.
+        *totals.entry("results that failed").or_default() += usize::from(
+            state
+                .last_result
+                .as_ref()
+                .is_some_and(|result| result.is_error),
+        );
+        *totals.entry("failures the agent explained").or_default() += usize::from(
+            state
+                .last_result
+                .as_ref()
+                .is_some_and(|result| result.error.is_some()),
+        );
+        *totals.entry("context compactions").or_default() +=
+            state.counts.get("system/compact_boundary").copied().unwrap_or(0);
+        *totals.entry("rate-limit notices").or_default() +=
+            state.counts.get("rate_limit_event").copied().unwrap_or(0);
+
         // Ticket 12's cases, counted rather than asserted per file: what matters
         // is that the capture set as a whole reaches a tool call, a result that
         // failed, a session that made several calls, and the reasoning between

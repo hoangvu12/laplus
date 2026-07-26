@@ -54,9 +54,9 @@ enums, not `&'static str`. That is what stops a sixth site writing
 ## Consequences
 
 - `stopped` now settles a running turn as `interrupted`, matching upstream.
-  Currently unreachable — `turn.rs` reports an unfinished turn as `error` and
-  keeps `stopped` for when none was running — so no behaviour a developer sees
-  changes today. Ticket 15 owns whether that encoder choice should change.
+  Unreachable when this was written — `turn.rs` reports an unfinished turn as
+  `error` and keeps `stopped` for when none was running. Ticket 15 took that
+  encoder choice up and kept it, for the reasons in ADR-0004.
 - A status added to the contract is a compile error here, not a silent
   fall-through.
 - Do not propose fusing `Ending` and `settling` into one codec. That was

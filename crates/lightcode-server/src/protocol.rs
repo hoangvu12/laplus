@@ -38,7 +38,13 @@ pub enum Event {
     User(MessageEnvelope),
     /// A verbatim Messages API SSE event, for token-level rendering.
     StreamEvent { event: StreamEvent },
-    RateLimitEvent(serde_json::Value),
+    /// The account's rate-limit standing changed. Emitted whenever the CLI's
+    /// view of it moves, so most of them say everything is fine — see
+    /// [`RateLimit::worth_reporting`].
+    RateLimitEvent {
+        #[serde(default)]
+        rate_limit_info: Option<RateLimit>,
+    },
     /// The CLI asking its host something, over the same stdout the events arrive
     /// on. The only line that expects a reply, and the only one the conversation
     /// stops for until it gets one.
@@ -269,8 +275,80 @@ pub fn control_response_line(request_id: &str, answer: &Answer) -> String {
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum SystemEvent {
     Init(Box<InitEvent>),
+    /// The agent summarised its own conversation to make room and carried on.
+    /// The one `system` subtype besides `init` that a developer needs told
+    /// about — see [`Compaction`].
+    CompactBoundary(Box<CompactBoundaryEvent>),
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactBoundaryEvent {
+    #[serde(default)]
+    pub compact_metadata: Compaction,
+}
+
+/// What the agent threw away, and why.
+///
+/// Read off the CLI's own `compact_metadata`: `trigger` is `auto` when the
+/// context filled up and `manual` when somebody asked, and the two token counts
+/// are the size before and after. Every field is optional because the shape is
+/// the CLI's rather than a contract, and a boundary that arrived with none of
+/// them is still a boundary — the developer needs telling that the agent's
+/// memory of the conversation was rewritten either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Compaction {
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub pre_tokens: Option<u64>,
+    #[serde(default)]
+    pub post_tokens: Option<u64>,
+}
+
+/// The account's standing with the API, as the CLI reports it.
+///
+/// Read off the binary rather than off documentation, the same way the
+/// permission and interrupt channels were: the event is
+/// `{"type": "rate_limit_event", "rate_limit_info": {…}}`, and the field names
+/// inside it are the API's response headers in the CLI's own camel case.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RateLimit {
+    /// `allowed`, `allowed_warning` or `rejected`.
+    ///
+    /// A string rather than an enum, unlike the contract's own closed
+    /// vocabularies in [`crate::settling`]: this is the *CLI's* vocabulary, and
+    /// the rest of this module keeps those as strings for the same reason
+    /// (`subtype`, `role`, `stop_reason`). A standing this build has never seen
+    /// is then reported verbatim, which is better than a counter — the developer
+    /// is told the word the agent used rather than that something moved.
+    #[serde(default)]
+    pub status: String,
+    /// Which limit — the CLI's own `five_hour`, `seven_day` and so on.
+    #[serde(default, rename = "rateLimitType")]
+    pub limit: Option<String>,
+    /// Unix seconds at which the limit resets.
+    #[serde(default, rename = "resetsAt")]
+    pub resets_at: Option<i64>,
+}
+
+impl RateLimit {
+    /// Is this worth telling the developer about?
+    ///
+    /// The CLI emits one of these whenever its view of the account moves, which
+    /// includes moving back to fine. Publishing those would put a row in the
+    /// work log saying nothing is wrong, on a schedule nobody chose — so what is
+    /// surfaced is the two standings that change what the developer can do, and
+    /// `allowed` is counted like any other line and otherwise left alone.
+    pub fn worth_reporting(&self) -> bool {
+        self.status != "allowed"
+    }
+
+    /// Is the account actually being refused, rather than warned?
+    pub fn rejected(&self) -> bool {
+        self.status == "rejected"
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +523,41 @@ pub struct ResultEvent {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// The CLI's own diagnostics for a turn that went wrong.
+    /// `fixtures/claude-cli/11-interrupted-turn.ndjson` carries one.
+    #[serde(default)]
+    pub errors: Vec<String>,
+    /// The turn's final text on a success, and on some failures the sentence
+    /// saying what failed. Read only in the second case — see
+    /// [`ResultEvent::complaint`].
+    #[serde(default)]
+    pub result: Option<String>,
+}
+
+impl ResultEvent {
+    /// What the CLI said went wrong, when it says something did.
+    ///
+    /// Three sources in order of how much they tell a developer, because the CLI
+    /// uses whichever fits: an `errors` array, a `result` string, and — when it
+    /// gave neither — the subtype, which at least distinguishes
+    /// `error_max_turns` from `error_during_execution`.
+    ///
+    /// Not read on a successful turn. `result` is the reply itself there, and
+    /// the reply is already the transcript.
+    fn complaint(&self) -> Option<String> {
+        if !self.is_error {
+            return None;
+        }
+        if !self.errors.is_empty() {
+            return Some(self.errors.join("; "));
+        }
+        self.result
+            .as_deref()
+            .map(str::trim)
+            .filter(|said| !said.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.subtype.clone())
+    }
 }
 
 /// Parse one NDJSON line. A malformed or unrecognized line is an `Err`/`Unknown`
@@ -540,6 +653,15 @@ pub enum Folded {
     /// `system`/`init`: the session id, model, working directory and permission
     /// mode are now known, and are on the state.
     Initialized,
+    /// The agent rewrote its own memory of the conversation to make room, and
+    /// carried on. Nothing in `transcript` changes: this server's copy of what
+    /// was said is its own, and compaction is a fact about what the *agent* can
+    /// still see.
+    Compacted(Compaction),
+    /// The account's standing with the API changed for the worse. Reported
+    /// rather than swallowed, because it is the difference between a turn that
+    /// is slow and a turn that is not going to happen.
+    RateLimited(RateLimit),
     /// Live text arrived. Carries the delta itself rather than a position,
     /// because the accumulation is cleared out from under the caller when the
     /// turn reconciles.
@@ -567,6 +689,43 @@ pub struct ResultSummary {
     pub num_turns: Option<u32>,
     pub duration_ms: Option<u64>,
     pub total_cost_usd: Option<f64>,
+    /// The agent's own account of what went wrong, on a turn that did.
+    ///
+    /// Carried because it is the only thing in a failed `result` a developer can
+    /// act on: without it the conversation says "Turn failed" and stops there,
+    /// and the whole point of reporting an error rather than crashing is that
+    /// the developer can decide whether to retry.
+    pub error: Option<String>,
+}
+
+/// A session's tally of what this build could not read.
+///
+/// Two numbers rather than one because they are two different failures with two
+/// different fixes: an unrecognised event type is the CLI having grown something
+/// new, and an unparseable line is a line that is not JSON at all. Copyable and
+/// subtractable, so a caller can ask what *one turn* drifted rather than only
+/// what the session has drifted since it started — see
+/// [`crate::turn`], where the difference is what reaches the developer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Drift {
+    pub unknown_events: usize,
+    pub parse_errors: usize,
+}
+
+impl Drift {
+    /// What has drifted since `earlier` — the counts are monotonic, so this is
+    /// the difference.
+    pub fn since(self, earlier: Drift) -> Drift {
+        Drift {
+            unknown_events: self.unknown_events.saturating_sub(earlier.unknown_events),
+            parse_errors: self.parse_errors.saturating_sub(earlier.parse_errors),
+        }
+    }
+
+    /// Nothing went unread.
+    pub fn is_clean(self) -> bool {
+        self.unknown_events == 0 && self.parse_errors == 0
+    }
 }
 
 impl SessionState {
@@ -616,6 +775,12 @@ impl SessionState {
                 self.permission_mode = Some(init.permission_mode);
                 self.tool_count = init.tools.len();
                 Folded::Initialized
+            }
+            // `transcript` is deliberately not touched here. See
+            // [`Folded::Compacted`] for why.
+            Event::System(SystemEvent::CompactBoundary(boundary)) => {
+                self.bump("system/compact_boundary");
+                Folded::Compacted(boundary.compact_metadata)
             }
             Event::System(SystemEvent::Other) => {
                 self.bump("system/other");
@@ -707,19 +872,37 @@ impl SessionState {
             Event::Result(r) => {
                 self.bump("result");
                 self.streaming = false;
+                let error = r.complaint();
                 self.last_result = Some(ResultSummary {
                     is_error: r.is_error,
                     stop_reason: r.stop_reason,
                     num_turns: r.num_turns,
                     duration_ms: r.duration_ms,
                     total_cost_usd: r.total_cost_usd,
+                    error,
                 });
                 Folded::Completed
             }
 
-            Event::RateLimitEvent(_) => {
+            Event::RateLimitEvent { rate_limit_info } => {
                 self.bump("rate_limit_event");
-                Folded::Nothing
+                match rate_limit_info {
+                    // The CLI said the account is fine. True, and not something
+                    // to put in front of a developer.
+                    Some(limit) if !limit.worth_reporting() => Folded::Nothing,
+                    Some(limit) => Folded::RateLimited(limit),
+                    // The event arrived and its payload did not. Counted rather
+                    // than passed over in the same silence as the healthy case:
+                    // this build can then say *nothing* about the account, and
+                    // `rate_limit_info` is the likeliest field in this module to
+                    // move — it was read off the binary rather than recorded, so
+                    // the counter is the only thing that would notice.
+                    None => {
+                        self.bump("rate_limit_event/UNKNOWN");
+                        self.unknown_events += 1;
+                        Folded::Nothing
+                    }
+                }
             }
 
             // The one line the agent stops for. Nothing else it says needs a
@@ -797,6 +980,14 @@ impl SessionState {
     /// What the UI would render right now for the in-flight turn.
     pub fn visible_text(&self) -> &str {
         &self.live_text
+    }
+
+    /// What this session has failed to read so far.
+    pub fn drift(&self) -> Drift {
+        Drift {
+            unknown_events: self.unknown_events,
+            parse_errors: self.parse_errors,
+        }
     }
 }
 
@@ -1285,6 +1476,179 @@ mod tests {
             unreadable.refusal().is_some_and(|why| why.contains("deferred")),
             "an answer that cannot be read as yes has to be read as no"
         );
+    }
+
+    // -- long sessions and bad weather -----------------------------------------
+    //
+    // The three things that happen to a session rather than to a turn:
+    // the agent rewriting its own memory, the account running out of room, and
+    // the CLI reporting that the turn itself went wrong.
+
+    /// Compaction is a fact about what the *agent* can still see. The
+    /// transcript here is this server's own copy, so folding a boundary must
+    /// leave it exactly as it was — that is the whole of "compaction does not
+    /// lose the visible transcript" at this layer.
+    #[test]
+    fn compaction_is_reported_and_leaves_the_transcript_alone() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"before"}]}}"#,
+        );
+
+        let told = state.fold_line(
+            r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"auto","pre_tokens":154000,"post_tokens":21000}}"#,
+        );
+
+        assert_eq!(
+            told,
+            Folded::Compacted(Compaction {
+                trigger: Some("auto".to_string()),
+                pre_tokens: Some(154_000),
+                post_tokens: Some(21_000),
+            })
+        );
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].text, "before");
+        // And it is not drift. Before this was recognised it fell to
+        // `SystemEvent::Other`, which is silence — a developer whose agent had
+        // just forgotten half the conversation was told nothing.
+        assert_eq!((state.unknown_events, state.parse_errors), (0, 0));
+
+        // A boundary carrying no metadata is still a boundary.
+        assert_eq!(
+            state.fold_line(r#"{"type":"system","subtype":"compact_boundary","session_id":"s"}"#),
+            Folded::Compacted(Compaction::default())
+        );
+    }
+
+    /// The two standings a developer can act on are reported; the one that says
+    /// everything is fine is not. The CLI emits an event whenever its view
+    /// moves, so surfacing all of them would put "you are not rate limited" in
+    /// the work log on a schedule nobody chose.
+    #[test]
+    fn only_a_rate_limit_worth_acting_on_is_reported() {
+        let mut state = SessionState::new();
+
+        let warned = state.fold_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1764547200,"utilization":0.92,"unifiedRateLimitFallbackAvailable":false,"isUsingOverage":false},"uuid":"u","session_id":"s"}"#,
+        );
+        let Folded::RateLimited(limit) = warned else {
+            panic!("{warned:?}");
+        };
+        assert_eq!(limit.status, "allowed_warning");
+        assert_eq!(limit.limit.as_deref(), Some("five_hour"));
+        assert_eq!(limit.resets_at, Some(1_764_547_200));
+        assert!(!limit.rejected(), "a warning is not a refusal");
+
+        let refused = state.fold_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1764547200},"session_id":"s"}"#,
+        );
+        let Folded::RateLimited(limit) = refused else {
+            panic!("{refused:?}");
+        };
+        assert!(limit.rejected());
+
+        // And the ordinary case says nothing, without becoming drift.
+        assert_eq!(
+            state.fold_line(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"},"session_id":"s"}"#
+            ),
+            Folded::Nothing
+        );
+        assert_eq!((state.unknown_events, state.parse_errors), (0, 0));
+
+        // A payload this build cannot read is *not* the same silence. Nothing is
+        // published — inventing a standing would be worse — but it is counted,
+        // because this shape was read off the binary rather than recorded and
+        // the counter is the only thing that would notice it moving.
+        assert_eq!(
+            state.fold_line(r#"{"type":"rate_limit_event","session_id":"s"}"#),
+            Folded::Nothing
+        );
+        assert_eq!((state.unknown_events, state.parse_errors), (1, 0));
+    }
+
+    /// A failed turn carries the agent's own account of the failure. Without it
+    /// the conversation says "Turn failed" and stops there, which is not
+    /// something a developer can act on.
+    #[test]
+    fn a_failed_result_carries_what_the_agent_said_went_wrong() {
+        // The `errors` array, which is what a real aborted turn carries — see
+        // `fixtures/claude-cli/11-interrupted-turn.ndjson`.
+        let mut state = SessionState::new();
+        state.fold_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["upstream connect error","retry budget exhausted"]}"#,
+        );
+        assert_eq!(
+            state.last_result.as_ref().and_then(|r| r.error.clone()),
+            Some("upstream connect error; retry budget exhausted".to_string())
+        );
+
+        // The `result` string, which is what the CLI puts a sentence in.
+        let mut state = SessionState::new();
+        state.fold_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Claude's response exceeded the output token limit."}"#,
+        );
+        assert_eq!(
+            state.last_result.as_ref().and_then(|r| r.error.clone()),
+            Some("Claude's response exceeded the output token limit.".to_string())
+        );
+
+        // Neither, which still leaves the subtype — `error_max_turns` and
+        // `error_during_execution` are different problems.
+        let mut state = SessionState::new();
+        state.fold_line(r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#);
+        assert_eq!(
+            state.last_result.as_ref().and_then(|r| r.error.clone()),
+            Some("error_max_turns".to_string())
+        );
+
+        // And a turn that went well says nothing went wrong, even though its
+        // `result` is full of text — that text is the reply, and the reply is
+        // already the transcript.
+        let mut state = SessionState::new();
+        state.fold_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"here is your answer"}"#,
+        );
+        assert_eq!(state.last_result.as_ref().and_then(|r| r.error.clone()), None);
+    }
+
+    /// Drift is subtractable, so a caller can ask what one turn failed to read
+    /// rather than only what the session has failed to read since it started.
+    #[test]
+    fn drift_is_counted_per_session_and_readable_per_turn() {
+        let mut state = SessionState::new();
+        state.fold_line(r#"{"type":"telemetry_event"}"#);
+        let after_the_first_turn = state.drift();
+        assert_eq!(
+            after_the_first_turn,
+            Drift {
+                unknown_events: 1,
+                parse_errors: 0
+            }
+        );
+
+        state.fold_line("}{");
+        state.fold_line(r#"{"type":"holograph_event"}"#);
+
+        assert_eq!(
+            state.drift(),
+            Drift {
+                unknown_events: 2,
+                parse_errors: 1
+            }
+        );
+        assert_eq!(
+            state.drift().since(after_the_first_turn),
+            Drift {
+                unknown_events: 1,
+                parse_errors: 1
+            },
+            "the second turn's drift is its own, not the session's running total"
+        );
+
+        assert!(Drift::default().is_clean());
+        assert!(!state.drift().is_clean());
     }
 
     #[test]

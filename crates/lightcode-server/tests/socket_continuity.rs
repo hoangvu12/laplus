@@ -729,11 +729,19 @@ async fn deleting_a_project_takes_its_conversations_with_it() {
 
 /// A turn the app closed in the middle of comes back as one that did not finish.
 ///
-/// Two things are being pinned. The streamed tail of that reply was never written
-/// down — only whole messages are — so what is left is the developer's prompt.
-/// And the turn does not come back `running`: nothing is alive to settle it, so a
-/// conversation that showed one working forever would be a conversation the
-/// developer could only close.
+/// Two things are being pinned. The turn does not come back `running`: nothing is
+/// alive to settle it, so a conversation that showed one working forever would be
+/// a conversation the developer could only close. And the reply the agent had
+/// begun comes back with it, finished rather than mid-flight.
+///
+/// That second half changed in ticket 15. Only whole messages are written down —
+/// a delta owes the database nothing, which is what keeps the disk out of the
+/// streaming path — so before it, a reply cut short had nothing on disk at all and
+/// the conversation came back showing a prompt nobody had answered. The driver now
+/// settles the message on its way down, which is the moment it knows no buffered
+/// message is coming: the developer sees how far the agent got, and the message
+/// stops claiming to still be arriving. What is still lost is the *hard*-kill
+/// case, where the driver never runs at all.
 ///
 /// The state is `error` rather than `interrupted` because that is what a graceful
 /// close produces: the agent is told there will be no more turns and stops with
@@ -789,8 +797,16 @@ async fn a_turn_the_app_closed_during_does_not_come_back_running() {
 
     assert_eq!(
         transcript(&snapshot),
-        vec![("user".to_string(), "start something".to_string())],
-        "the streamed tail of an unfinished reply was written down"
+        vec![
+            ("user".to_string(), "start something".to_string()),
+            ("assistant".to_string(), "halfway thr".to_string()),
+        ],
+        "the reply the agent had begun was lost rather than settled"
+    );
+    assert_eq!(
+        snapshot["thread"]["messages"][1]["streaming"],
+        json!(false),
+        "a reply nothing is left to finish came back claiming to still be arriving"
     );
     let turn = &snapshot["thread"]["latestTurn"];
     assert_ne!(
