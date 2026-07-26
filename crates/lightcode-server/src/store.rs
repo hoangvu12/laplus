@@ -1036,7 +1036,9 @@ fn latest_turn_from_json(stored: &str) -> Option<LatestTurn> {
 
     Some(LatestTurn {
         turn_id: text("turnId")?,
-        state: crate::threads::turn_state(turn.get("state").and_then(serde_json::Value::as_str)?),
+        state: crate::settling::TurnState::from_stored(
+            turn.get("state").and_then(serde_json::Value::as_str)?,
+        ),
         requested_at: text("requestedAt")?,
         started_at: text("startedAt"),
         completed_at: text("completedAt"),
@@ -1463,7 +1465,7 @@ mod tests {
         let mut thread = a_thread("thread-1", "project-1");
         thread.latest_turn = Some(LatestTurn {
             turn_id: "turn-1".to_string(),
-            state: "completed",
+            state: crate::settling::TurnState::Completed,
             requested_at: "2026-07-26T00:23:05.000Z".to_string(),
             started_at: Some("2026-07-26T00:23:05.100Z".to_string()),
             completed_at: Some("2026-07-26T00:23:07.108Z".to_string()),

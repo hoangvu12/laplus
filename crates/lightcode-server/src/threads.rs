@@ -81,6 +81,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::clock::now_iso;
+use crate::settling::SessionStatus;
 use crate::store::Sequences;
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::transcripts::{Transcripts, Write};
@@ -190,17 +191,10 @@ pub fn tone(stored: &str) -> &'static str {
 
 /// A stored turn state, back as one of the contract's four.
 ///
-/// Same reasoning as [`tone`], with one addition: an unrecognised state becomes
-/// `error` rather than `completed`, because a turn whose outcome cannot be read
-/// is not one to report as having gone well.
-pub fn turn_state(stored: &str) -> &'static str {
-    match stored {
-        "running" => "running",
-        "interrupted" => "interrupted",
-        "completed" => "completed",
-        _ => "error",
-    }
-}
+/// Same reasoning as [`tone`]. Lives in [`crate::settling`] now, because the
+/// four states are half of one vocabulary and reading a stored one is the same
+/// question as reading a session's.
+pub use crate::settling::TurnState;
 
 /// One message in the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +242,7 @@ pub struct Activity {
 /// The agent process behind a thread, as the client sees it.
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub status: &'static str,
+    pub status: SessionStatus,
     pub runtime_mode: String,
     pub active_turn_id: Option<String>,
     pub last_error: Option<String>,
@@ -259,7 +253,7 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestTurn {
     pub turn_id: String,
-    pub state: &'static str,
+    pub state: TurnState,
     pub requested_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -379,8 +373,8 @@ impl Thread {
     pub fn restored(stored: Conversation) -> Thread {
         let row = stored.thread;
         let latest_turn = row.latest_turn.map(|turn| match turn.state {
-            "running" => LatestTurn {
-                state: "interrupted",
+            TurnState::Running => LatestTurn {
+                state: TurnState::Interrupted,
                 completed_at: Some(row.updated_at.clone()),
                 ..turn
             },
@@ -519,7 +513,7 @@ impl Session {
     fn to_value(&self, thread_id: &str) -> Value {
         json!({
             "threadId": thread_id,
-            "status": self.status,
+            "status": self.status.as_str(),
             // The driver slug, which is what upstream puts here and what the UI
             // renders beside the session state.
             "providerName": crate::provider::INSTANCE_ID,
@@ -539,7 +533,7 @@ impl LatestTurn {
     pub fn to_value(&self) -> Value {
         json!({
             "turnId": self.turn_id,
-            "state": self.state,
+            "state": self.state.as_str(),
             "requestedAt": self.requested_at,
             "startedAt": self.started_at,
             "completedAt": self.completed_at,
@@ -955,7 +949,7 @@ impl Threads {
                 }
                 thread.latest_turn = Some(LatestTurn {
                     turn_id: turn_id.clone(),
-                    state: "running",
+                    state: TurnState::Running,
                     requested_at: at.to_string(),
                     started_at: None,
                     completed_at: None,
@@ -982,7 +976,7 @@ impl Threads {
                     .as_mut()
                     .filter(|latest| &latest.turn_id == turn_id)
                 {
-                    latest.state = "interrupted";
+                    latest.state = TurnState::Interrupted;
                     latest.started_at.get_or_insert_with(|| at.to_string());
                     latest.completed_at.get_or_insert_with(|| at.to_string());
                 }
@@ -1604,7 +1598,8 @@ fn bind_assistant_message(
     }
 
     let still_running = session.is_some_and(|session| {
-        session.status == "running" && session.active_turn_id.as_ref() == Some(turn_id)
+        session.status == SessionStatus::Running
+            && session.active_turn_id.as_ref() == Some(turn_id)
     });
     let settles = !streaming && !still_running;
     let previous = latest.as_ref();
@@ -1612,11 +1607,11 @@ fn bind_assistant_message(
     Some(LatestTurn {
         turn_id: turn_id.clone(),
         state: match settles {
-            false => "running",
+            false => TurnState::Running,
             true => match previous.map(|turn| turn.state) {
-                Some("interrupted") => "interrupted",
-                Some("error") => "error",
-                _ => "completed",
+                Some(TurnState::Interrupted) => TurnState::Interrupted,
+                Some(TurnState::Error) => TurnState::Error,
+                _ => TurnState::Completed,
             },
         },
         requested_at: previous
@@ -1639,12 +1634,12 @@ fn bind_assistant_message(
 /// reducer settles on, and the reason a turn's duration covers the whole turn
 /// rather than stopping at the last assistant message.
 fn settle(latest: Option<LatestTurn>, session: &Session) -> Option<LatestTurn> {
-    if session.status == "running" {
+    if session.status == SessionStatus::Running {
         if let Some(active) = &session.active_turn_id {
             let previous = latest.as_ref().filter(|turn| &turn.turn_id == active);
             return Some(LatestTurn {
                 turn_id: active.clone(),
-                state: "running",
+                state: TurnState::Running,
                 requested_at: previous
                     .map(|turn| turn.requested_at.clone())
                     .unwrap_or_else(|| session.updated_at.clone()),
@@ -1657,17 +1652,17 @@ fn settle(latest: Option<LatestTurn>, session: &Session) -> Option<LatestTurn> {
         }
     }
 
-    let settled = match session.status {
-        "idle" | "ready" => "completed",
-        "error" => "error",
-        "interrupted" => "interrupted",
-        // `starting` and `stopped` say nothing about how the turn went, so a
-        // running turn stays running rather than being called completed.
-        _ => return latest,
+    // `starting` and `running` say nothing about how the turn went, so a running
+    // turn stays running rather than being called completed. Every other status
+    // settles it — including `stopped`, which is the process going away
+    // underneath a turn: nobody asked for that, but the turn did not finish, and
+    // upstream reads it as `interrupted` in both of its copies of this rule.
+    let Some(settled) = session.status.settles_turn_as() else {
+        return latest;
     };
 
     match latest {
-        Some(turn) if turn.state == "running" => Some(LatestTurn {
+        Some(turn) if turn.state == TurnState::Running => Some(LatestTurn {
             state: settled,
             completed_at: Some(session.updated_at.clone()),
             ..turn
@@ -1811,7 +1806,7 @@ mod tests {
 
     fn running(turn_id: &str) -> Session {
         Session {
-            status: "running",
+            status: SessionStatus::Running,
             runtime_mode: "full-access".to_string(),
             active_turn_id: Some(turn_id.to_string()),
             last_error: None,
@@ -2116,7 +2111,7 @@ mod tests {
             },
         );
         let turn = threads.get("thread-1").expect("the thread").latest_turn;
-        assert_eq!(turn.as_ref().map(|turn| turn.state), Some("running"));
+        assert_eq!(turn.as_ref().map(|turn| turn.state), Some(TurnState::Running));
         assert_eq!(
             turn.as_ref().and_then(|turn| turn.assistant_message_id.clone()),
             Some("assistant-1".to_string())
@@ -2125,7 +2120,7 @@ mod tests {
         threads.apply(
             "thread-1",
             Change::Session(Session {
-                status: "ready",
+                status: SessionStatus::Ready,
                 active_turn_id: None,
                 ..running("turn-1")
             }),
@@ -2135,9 +2130,49 @@ mod tests {
             .expect("the thread")
             .latest_turn
             .expect("a turn");
-        assert_eq!(turn.state, "completed");
+        assert_eq!(turn.state, TurnState::Completed);
         assert!(turn.completed_at.is_some(), "a completed turn has an end");
         assert!(turn.started_at.is_some(), "and a beginning to measure from");
+    }
+
+    /// The agent process going away under a running turn settles that turn, and
+    /// settles it as interrupted rather than leaving it running forever.
+    ///
+    /// Nobody asked for it — that is what makes the session `stopped` rather
+    /// than `interrupted` — but the turn did not finish, and the two copies of
+    /// this rule upstream keeps (`ProjectionPipeline.ts:78`,
+    /// `threadReducer.ts:539`) both read it that way. The client folds the same
+    /// events with its own copy, so a turn left `running` here would be a
+    /// conversation this server reports as working and the UI does not.
+    ///
+    /// Ticket 15 is what makes this reachable: `crate::turn` currently reports an
+    /// unfinished turn as `error` and keeps `stopped` for the case where none was
+    /// running. This is the ground that choice will stand on.
+    #[test]
+    fn a_turn_the_process_died_under_settles_as_interrupted() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.apply("thread-1", Change::Session(running("turn-1")));
+
+        threads.apply(
+            "thread-1",
+            Change::Session(Session {
+                status: SessionStatus::Stopped,
+                active_turn_id: None,
+                ..running("turn-1")
+            }),
+        );
+
+        let turn = threads
+            .get("thread-1")
+            .expect("the thread")
+            .latest_turn
+            .expect("a turn");
+        assert_eq!(turn.state, TurnState::Interrupted);
+        assert!(
+            turn.completed_at.is_some(),
+            "a turn nothing is going to finish has ended"
+        );
     }
 
     /// A thread the server has never heard of is a draft the UI is showing. Its
@@ -2344,7 +2379,7 @@ mod tests {
         let mut row = a_thread("thread-1").row();
         row.latest_turn = Some(LatestTurn {
             turn_id: "turn-1".to_string(),
-            state: "running",
+            state: TurnState::Running,
             requested_at: "2026-07-26T00:23:04.909Z".to_string(),
             started_at: Some("2026-07-26T00:23:04.909Z".to_string()),
             completed_at: None,
@@ -2363,7 +2398,7 @@ mod tests {
             .expect("the conversation")
             .latest_turn
             .expect("a turn");
-        assert_eq!(turn.state, "interrupted");
+        assert_eq!(turn.state, TurnState::Interrupted);
         assert_eq!(
             turn.completed_at,
             Some("2026-07-26T00:23:09.000Z".to_string()),
@@ -2374,7 +2409,7 @@ mod tests {
         // A turn that had already settled is left exactly as it was.
         let mut finished = a_thread("thread-2").row();
         finished.latest_turn = Some(LatestTurn {
-            state: "completed",
+            state: TurnState::Completed,
             completed_at: Some("2026-07-26T00:23:07.000Z".to_string()),
             ..turn
         });
@@ -2389,7 +2424,7 @@ mod tests {
                 .expect("the conversation")
                 .latest_turn
                 .map(|turn| turn.state),
-            Some("completed")
+            Some(TurnState::Completed)
         );
     }
 

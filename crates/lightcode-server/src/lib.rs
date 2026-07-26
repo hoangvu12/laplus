@@ -29,7 +29,10 @@
 //! [`server`] is the endpoint and the connection loop that ties them together.
 //!
 //! The two formats meet in exactly one place. [`agent`] runs the `claude`
-//! subprocess, [`threads`] holds a conversation as the UI reads one,
+//! subprocess, [`settling`] holds the contract's two lifecycle vocabularies and
+//! the one rule that reads a session's status as how its turn went — the third
+//! copy of a rule upstream keeps in both its server and its client, and the only
+//! one this repository controls — [`threads`] holds a conversation as the UI reads one,
 //! [`transcripts`] writes one down behind the stream that is producing it,
 //! [`worklog`] says how a tool call and a pause to reason look to the UI, and
 //! [`turn`] is the join: it folds what the agent said with [`protocol`] and
@@ -52,6 +55,7 @@ pub mod protocol;
 pub mod provider;
 pub mod rpc;
 pub mod server;
+pub mod settling;
 pub mod store;
 pub mod subscriptions;
 pub mod threads;

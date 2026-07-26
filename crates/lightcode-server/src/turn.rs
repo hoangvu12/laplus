@@ -171,6 +171,7 @@ use crate::clock::now_iso;
 use crate::config::ClaudeSettings;
 use crate::process::Search;
 use crate::protocol::{ContentBlock, Folded, Permission, SessionState};
+use crate::settling::SessionStatus;
 use crate::threads::{Activity, Answered, Change, Prompt, Session, Signal, Thread, Threads};
 use crate::worklog::{Call, Decision, Returned};
 
@@ -240,7 +241,7 @@ async fn drive(
             threads.apply(
                 &start.thread_id,
                 Change::Session(Session {
-                    status: "error",
+                    status: SessionStatus::Error,
                     runtime_mode: start.runtime_mode.clone(),
                     active_turn_id: None,
                     last_error: Some(why),
@@ -378,10 +379,17 @@ async fn drive(
     threads.apply(
         &start.thread_id,
         Change::Session(Session {
+            // `error` rather than `stopped` for an unfinished turn, and that is
+            // a choice about *diagnosis*, not about settling: the turn settles as
+            // `interrupted` either way now that
+            // [`crate::settling::SessionStatus::Stopped`] says so. What `error`
+            // buys is `last_error` below, which is the only place the developer
+            // is told the agent went away mid-turn. Ticket 15 owns whether that
+            // sentence is worth reporting the session as failed for.
             status: if unfinished || refused.is_some() {
-                "error"
+                SessionStatus::Error
             } else {
-                "stopped"
+                SessionStatus::Stopped
             },
             runtime_mode: start.runtime_mode.clone(),
             active_turn_id: None,
@@ -675,7 +683,7 @@ fn running(threads: &Threads, start: &Start, turn_id: &str) {
     threads.apply(
         &start.thread_id,
         Change::Session(Session {
-            status: "running",
+            status: SessionStatus::Running,
             runtime_mode: start.runtime_mode.clone(),
             active_turn_id: Some(turn_id.to_string()),
             last_error: None,
@@ -781,13 +789,19 @@ impl Ending {
         }
     }
 
-    /// What the session becomes. `interrupted` is one of the contract's own
-    /// statuses and [`crate::threads`] settles the turn as interrupted with it.
-    fn session_status(self) -> &'static str {
+    /// What the session becomes.
+    ///
+    /// This is the **encoder** — the one step on this path that knows about the
+    /// `claude` CLI, which is why it lives beside the driver rather than in
+    /// [`crate::settling`]. Upstream keeps its equivalents per-provider for the
+    /// same reason. Reading these back out is
+    /// [`crate::settling::SessionStatus::settles_turn_as`]'s job, and the two
+    /// are not inverses: `ready` settles a turn as `completed`.
+    fn session_status(self) -> SessionStatus {
         match self {
-            Ending::Completed => "ready",
-            Ending::Failed => "error",
-            Ending::Stopped => "interrupted",
+            Ending::Completed => SessionStatus::Ready,
+            Ending::Failed => SessionStatus::Error,
+            Ending::Stopped => SessionStatus::Interrupted,
         }
     }
 
@@ -1235,7 +1249,7 @@ mod tests {
         let aborted = result(true, Some(13_660), Some(0.0), None);
         let ending = Ending::of(Some(&interrupted), aborted.last_result.as_ref());
         assert_eq!(ending, Ending::Stopped);
-        assert_eq!(ending.session_status(), "interrupted");
+        assert_eq!(ending.session_status(), SessionStatus::Interrupted);
         assert_eq!(ending.tone(), "info");
         assert!(!ending.failed(), "a turn the developer stopped is not an error");
 
@@ -1267,7 +1281,7 @@ mod tests {
         let ending = Ending::of(Some(&running), aborted.last_result.as_ref());
 
         assert_eq!(ending, Ending::Failed);
-        assert_eq!(ending.session_status(), "error");
+        assert_eq!(ending.session_status(), SessionStatus::Error);
         assert_eq!(ending.tone(), "error");
     }
 

@@ -93,6 +93,7 @@ use crate::filesystem::Index;
 use crate::projects::{Project, WorkspaceRoot};
 use crate::store::{Conflict, Database, Insert, Registry, Removal, Sequences, StorageError};
 use crate::subscriptions::{EventSource, BACKLOG};
+use crate::settling::SessionStatus;
 use crate::threads::{self, Change, Prompt, Session, Thread, Threads};
 use crate::transcripts::Transcripts;
 
@@ -439,7 +440,7 @@ impl Shell {
             .apply(
                 &start.thread_id,
                 Change::Session(Session {
-                    status: "starting",
+                    status: SessionStatus::Starting,
                     runtime_mode: thread.runtime_mode.clone(),
                     active_turn_id: Some(turn_id.clone()),
                     last_error: None,
@@ -468,7 +469,7 @@ impl Shell {
             self.inner.threads.apply(
                 &start.thread_id,
                 Change::Session(Session {
-                    status: "error",
+                    status: SessionStatus::Error,
                     runtime_mode: thread.runtime_mode.clone(),
                     active_turn_id: None,
                     last_error: Some(why.clone()),
@@ -1585,11 +1586,11 @@ mod tests {
         assert_eq!(thread.messages[0].text, "hello");
         assert_eq!(
             thread.session.as_ref().map(|session| session.status),
-            Some("starting")
+            Some(SessionStatus::Starting)
         );
         assert_eq!(
             thread.latest_turn.as_ref().map(|turn| turn.state),
-            Some("running")
+            Some(crate::settling::TurnState::Running)
         );
 
         fixture.shell.threads().shutdown().await;

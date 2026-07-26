@@ -17,6 +17,19 @@ visible transcript.
 
 **Status:** ready-for-agent
 
+**Groundwork already landed.** The turn lifecycle now lives in `crate::settling`
+(ADR-0001): session status and turn state are typed, and settling is one rule
+mirrored from upstream's two copies rather than five hand-written matches. Two
+things follow for this ticket:
+
+- A turn caught by a session going `stopped` settles as `interrupted`, matching
+  upstream. That path is currently unreachable, because `turn.rs` reports an
+  unfinished turn as `error` and keeps `stopped` for when none was running.
+- **That encoder choice is this ticket's to make.** `error` is what carries
+  `last_error` — the only place the developer is told the agent went away
+  mid-turn — so reporting it as `stopped` instead would settle the turn the same
+  way but lose the sentence. Decide it here rather than inheriting it.
+
 - [ ] An error reported by the agent appears in the conversation and the session
       stays usable
 - [ ] A turn can be retried after an error
