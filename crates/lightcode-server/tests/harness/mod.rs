@@ -99,12 +99,25 @@ impl TestServer {
     /// count drops a moment after the client stops caring. Polling is the
     /// honest way to observe that without pretending it is synchronous.
     pub async fn await_live_connections(&self, expected: usize) {
+        self.await_gauge("live connections", expected, || self.live_connections())
+            .await;
+    }
+
+    /// The waiting the three gauges share.
+    ///
+    /// Each of them is a number some other task moves — a connection's own
+    /// teardown, a pump ending, a deferred listing finishing — so none of them
+    /// settles synchronously with the call that caused it. `name` is only for
+    /// the failure message, and the failure message is the point: without it a
+    /// gauge that never settles is a hung suite instead of a sentence saying
+    /// which one and what it stuck at.
+    async fn await_gauge(&self, name: &str, expected: usize, read: impl Fn() -> usize) {
         let deadline = std::time::Instant::now() + READ_TIMEOUT;
-        while self.live_connections() != expected {
+        while read() != expected {
             assert!(
                 std::time::Instant::now() < deadline,
-                "live connections stayed at {} instead of settling to {expected}",
-                self.live_connections()
+                "{name} stayed at {} instead of settling to {expected}",
+                read()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -122,15 +135,27 @@ impl TestServer {
     /// what it was. Same reasoning as [`TestServer::await_live_connections`]:
     /// a pump is torn down by its own task, a moment after whatever ended it.
     pub async fn await_live_subscriptions(&self, expected: usize) {
-        let deadline = std::time::Instant::now() + READ_TIMEOUT;
-        while self.live_subscriptions() != expected {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "live subscriptions stayed at {} instead of settling to {expected}",
-                self.live_subscriptions()
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        self.await_gauge("live subscriptions", expected, || {
+            self.live_subscriptions()
+        })
+        .await;
+    }
+
+    /// Workspaces the server is watching. The filesystem half of the same
+    /// accounting: a watch outlives the call that started it, so this is where
+    /// one that was never released shows up.
+    pub fn watched_workspaces(&self) -> usize {
+        self.server.state().watched_workspaces()
+    }
+
+    /// Wait for the watch gauge to reach `expected`, or fail saying what it
+    /// was. `projects.listEntries` is answered off the read loop, so the watch
+    /// it starts is in place a moment after the client has its answer.
+    pub async fn await_watched_workspaces(&self, expected: usize) {
+        self.await_gauge("watched workspaces", expected, || {
+            self.watched_workspaces()
+        })
+        .await;
     }
 
     pub fn unrecognized_messages(&self) -> usize {

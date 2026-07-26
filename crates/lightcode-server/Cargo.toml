@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 futures-util.workspace = true
+notify.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

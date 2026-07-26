@@ -10,6 +10,11 @@ publish = false
 [workspace.dependencies]
 axum = { version = "0.8", features = ["ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The only way to hear about a change the app did not make. Default features are
+# kept: everything they add is target-gated to macOS, so on the platform v1 ships
+# they cost nothing, and dropping them would leave a developer running the suite
+# on a Mac without a backend at all.
+notify = "8"
 # `bundled` compiles SQLite into the binary. The alternative is linking whatever
 # the machine happens to have, which on Windows is usually nothing — and a
 # desktop app that asks the user to install a database first has given up the

@@ -44,9 +44,10 @@ pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
 pub struct Services {
     pub config: ConfigStore,
     pub shell: Shell,
-    /// The last scan of each workspace. Shared rather than per-connection: two
-    /// windows on one project are looking at one filesystem, and scanning it
-    /// twice would be paying twice for the same answer.
+    /// The last scan of each workspace, and the watcher that keeps it honest.
+    /// Shared rather than per-connection: two windows on one project are
+    /// looking at one filesystem, and scanning it twice — or watching it twice
+    /// — would be paying twice for the same answer.
     pub index: Index,
 }
 
@@ -203,7 +204,7 @@ pub fn dispatch(
         SUBSCRIBE_SERVER_CONFIG => Ok(Answer::Stream(services.config.subscribe())),
         orchestration::DISPATCH_COMMAND => services
             .shell
-            .dispatch(payload)
+            .dispatch(payload, &services.index)
             .map(Answer::Value)
             .map_err(|refusal| DispatchError::Declared(refusal.to_error())),
         orchestration::SUBSCRIBE_SHELL => Ok(Answer::Stream(services.shell.subscribe(payload))),

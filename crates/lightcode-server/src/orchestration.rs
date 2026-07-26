@@ -84,6 +84,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::filesystem::Index;
 use crate::projects::{Project, WorkspaceRoot};
 use crate::store::{Conflict, Database, Insert, Registry, Removal, StorageError};
 use crate::subscriptions::{EventSource, BACKLOG};
@@ -179,10 +180,16 @@ impl Shell {
 
     /// Carry out one `orchestration.dispatchCommand`, answering with the
     /// sequence it committed at.
-    pub fn dispatch(&self, payload: &Value) -> Result<Value, CommandError> {
+    ///
+    /// The index arrives as an argument rather than as a field because it is
+    /// wanted by exactly one command out of two — a deleted project releases
+    /// the scan and the filesystem watcher held for it (ticket 08). Making it a
+    /// field would say the registry depends on the index, which is not true of
+    /// anything else it does.
+    pub fn dispatch(&self, payload: &Value, index: &Index) -> Result<Value, CommandError> {
         let sequence = match Command::parse(payload)? {
             Command::CreateProject(create) => self.create_project(&create)?,
-            Command::DeleteProject { project_id } => self.delete_project(&project_id)?,
+            Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
         };
 
         Ok(json!({ "sequence": sequence }))
@@ -228,7 +235,7 @@ impl Shell {
         }
     }
 
-    fn delete_project(&self, project_id: &str) -> Result<i64, CommandError> {
+    fn delete_project(&self, project_id: &str, index: &Index) -> Result<i64, CommandError> {
         let _commit = self.lock();
         let removal = self
             .inner
@@ -236,8 +243,18 @@ impl Shell {
             .remove_project(project_id)
             .map_err(unavailable("remove the project"))?;
 
-        if let Removal::Committed(sequence) = removal {
-            self.announce(project_removed(sequence, project_id));
+        if let Removal::Committed {
+            sequence,
+            canonical_root,
+        } = &removal
+        {
+            // The only moment on this wire that means "this project is closed",
+            // and so the only moment the server can give back what it was
+            // holding to keep the project's file tree fresh. Before the
+            // announcement, so a client that reacts to `project-removed` by
+            // asking about something else does not race a release.
+            index.release(canonical_root);
+            self.announce(project_removed(*sequence, project_id));
         }
         Ok(removal.sequence())
     }
@@ -455,6 +472,10 @@ mod tests {
 
     struct Fixture {
         shell: Shell,
+        /// The registry's neighbour rather than its property: a command is
+        /// dispatched against both, because deleting a project releases what
+        /// the index holds for it.
+        index: Index,
         directory: tempfile::TempDir,
     }
 
@@ -462,6 +483,7 @@ mod tests {
         fn new() -> Fixture {
             Fixture {
                 shell: Shell::new(Database::in_memory().expect("an in-memory database")),
+                index: Index::new(),
                 directory: tempfile::tempdir().expect("a temporary directory"),
             }
         }
@@ -483,15 +505,18 @@ mod tests {
                 "createWorkspaceRootIfMissing": true,
                 "defaultModelSelection": Value::Null,
                 "createdAt": "2026-07-26T00:23:04.909Z",
-            }))
+            }), &self.index)
         }
 
         fn remove(&self, id: &str) -> Result<Value, CommandError> {
-            self.shell.dispatch(&json!({
-                "type": "project.delete",
-                "commandId": format!("test:delete:{id}"),
-                "projectId": id,
-            }))
+            self.shell.dispatch(
+                &json!({
+                    "type": "project.delete",
+                    "commandId": format!("test:delete:{id}"),
+                    "projectId": id,
+                }),
+                &self.index,
+            )
         }
 
         fn snapshot(&self) -> Value {
@@ -617,7 +642,7 @@ mod tests {
                 "workspaceRoot": missing.to_string_lossy(),
                 "createWorkspaceRootIfMissing": true,
                 "createdAt": "2026-07-26T00:23:04.909Z",
-            }))
+            }), &fixture.index)
             .expect_err("the flag is not honoured");
 
         assert!(
@@ -656,7 +681,10 @@ mod tests {
             if let Some(sent) = sent {
                 command["createdAt"] = json!(sent);
             }
-            fixture.shell.dispatch(&command).expect("registered");
+            fixture
+                .shell
+                .dispatch(&command, &fixture.index)
+                .expect("registered");
         }
 
         for project in fixture.listed() {
@@ -733,9 +761,13 @@ mod tests {
     #[test]
     fn an_unimplemented_or_malformed_command_is_refused_by_name() {
         let shell = Shell::new(Database::in_memory().expect("an in-memory database"));
+        let index = Index::new();
 
         let refusal = shell
-            .dispatch(&json!({"type": "thread.create", "commandId": "c", "threadId": "t"}))
+            .dispatch(
+                &json!({"type": "thread.create", "commandId": "c", "threadId": "t"}),
+                &index,
+            )
             .expect_err("threads arrive in ticket 10");
         assert!(
             refusal.message().contains("thread.create"),
@@ -748,11 +780,13 @@ mod tests {
         );
         assert_eq!(refusal.to_error()["message"], refusal.message());
 
-        let refusal = shell.dispatch(&json!({})).expect_err("no type at all");
+        let refusal = shell
+            .dispatch(&json!({}), &index)
+            .expect_err("no type at all");
         assert!(refusal.message().contains("type"), "{}", refusal.message());
 
         let refusal = shell
-            .dispatch(&json!({"type": "project.create", "projectId": "p"}))
+            .dispatch(&json!({"type": "project.create", "projectId": "p"}), &index)
             .expect_err("no workspace root");
         assert!(
             refusal.message().contains("project.create") && refusal.message().contains("malformed"),
@@ -761,7 +795,7 @@ mod tests {
         );
 
         let refusal = shell
-            .dispatch(&json!({"type": "project.delete", "projectId": "   "}))
+            .dispatch(&json!({"type": "project.delete", "projectId": "   "}), &index)
             .expect_err("a blank id");
         assert!(
             refusal.message().contains("projectId"),

@@ -116,10 +116,22 @@ pub enum Conflict {
 }
 
 /// What happened to an attempt to remove a project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Removal {
     /// Gone, and the log advanced to this sequence.
-    Committed(i64),
+    Committed {
+        sequence: i64,
+        /// The folder that is no longer a project, in the form
+        /// [`crate::projects::WorkspaceRoot::canonical`] gives — which is the
+        /// form everything the server holds *about* a project is keyed by.
+        ///
+        /// Read out of the row before it is deleted rather than resolved
+        /// afterwards, because by then there is nothing left to resolve it
+        /// from: the point of carrying it is that a caller can release what it
+        /// was holding, and a deleted project the caller cannot name is one
+        /// whose resources stay held.
+        canonical_root: String,
+    },
     /// Nothing was registered under that id, so nothing changed. Carries the
     /// unchanged sequence, because the caller still owes the client one.
     Absent(i64),
@@ -127,9 +139,9 @@ pub enum Removal {
 
 impl Removal {
     /// The sequence to answer the client with, whichever way it went.
-    pub fn sequence(self) -> i64 {
+    pub fn sequence(&self) -> i64 {
         match self {
-            Removal::Committed(sequence) | Removal::Absent(sequence) => sequence,
+            Removal::Committed { sequence, .. } | Removal::Absent(sequence) => *sequence,
         }
     }
 }
@@ -345,6 +357,11 @@ impl Database {
             .transaction()
             .map_err(StorageError::while_("remove the project"))?;
 
+        // Read before the delete, inside the same transaction: after it there
+        // is no row to read the folder out of, and the caller needs the folder
+        // to release what it was holding for it.
+        let going = find_project(&transaction, "id", id)?;
+
         let removed = transaction
             .execute("DELETE FROM projects WHERE id = ?1", (id,))
             .map_err(StorageError::while_("remove the project"))?;
@@ -353,11 +370,28 @@ impl Database {
             return Ok(Removal::Absent(sequence));
         }
 
+        // The read above and the delete are one transaction, so a row that
+        // deleted must have been readable a statement earlier. Checked rather
+        // than defaulted: an empty `canonical_root` is not a harmless fallback,
+        // it is a value the caller would release nothing under and never be
+        // told about. Refusing here is before the commit, so the transaction
+        // rolls back and the registry is left as it was — the same shape as the
+        // symmetric check in `insert_project`.
+        let canonical_root = going.map(|project| project.canonical_root).ok_or_else(|| {
+            StorageError::refusing(
+                "remove the project",
+                format!("the row for '{id}' deleted but could not be read a statement earlier"),
+            )
+        })?;
+
         let sequence = advance(&transaction)?;
         transaction
             .commit()
             .map_err(StorageError::while_("remove the project"))?;
-        Ok(Removal::Committed(sequence))
+        Ok(Removal::Committed {
+            sequence,
+            canonical_root,
+        })
     }
 
     /// A poisoned lock means a previous holder panicked mid-statement. SQLite
@@ -596,7 +630,17 @@ mod tests {
             .database
             .remove_project("project-1")
             .expect("the delete reaches the database");
-        assert_eq!(removal, Removal::Committed(2));
+        // The folder comes back with the sequence. It is what the caller
+        // releases the project's watcher and held scan by, and it is only
+        // readable while the row still exists — so if it were resolved after
+        // the delete rather than before it, there would be nothing to resolve.
+        assert_eq!(
+            removal,
+            Removal::Committed {
+                sequence: 2,
+                canonical_root: fixture.root.canonical().to_string(),
+            }
+        );
 
         assert!(fixture
             .database

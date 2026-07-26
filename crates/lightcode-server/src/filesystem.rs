@@ -12,7 +12,8 @@
 //!   answer. It is what the file tree renders from.
 //! - **searchEntries** is that same workspace filtered by a fragment of a path.
 //!   It is what the composer's `@` mention drives, debounced at 120 ms, so it
-//!   reads [`Index`] rather than the disk.
+//!   reads [`Index`] rather than the disk. What keeps that reading true while
+//!   the agent works is [`crate::watcher`] — see [`Index`].
 //!
 //! Reading and writing the *contents* of one of these files is
 //! [`crate::files`], which is a different concern with a different rule — it
@@ -63,6 +64,7 @@ use serde_json::{json, Value};
 
 use crate::projects::{expand_home, Rejection, WorkspaceRoot};
 use crate::rpc::{declared, non_blank};
+use crate::watcher::Watcher;
 
 /// One directory, for the folder picker.
 pub const BROWSE: &str = "filesystem.browse";
@@ -572,29 +574,78 @@ fn normalise_query(query: &str) -> String {
 /// `listEntries` is the UI saying "show me this project" — on opening it, and
 /// on the refresh button — so it always rescans and leaves the result here.
 /// `searchEntries` is a keystroke, so it takes whatever is here and only scans
-/// when there is nothing. A write invalidates ([`Index::forget`]), which is
-/// what upstream's indexer does too. Ticket 08's watcher is what will make this
-/// track changes the agent makes, and it will invalidate through the same door.
+/// when there is nothing. Two things invalidate: the app's own
+/// `projects.writeFile` ([`Index::forget`]), and — ticket 08 — a change made by
+/// anything else, which [`crate::watcher`] reports and [`Index::changed`] acts
+/// on. Both go through the same door, which is why there is only one.
 ///
 /// No expiry: an entry costs one workspace's paths and is replaced on the next
 /// `listEntries`. A time-to-live would be a guess at how stale is too stale,
-/// and the honest answer to that is the watcher rather than a number.
-#[derive(Debug, Clone, Default)]
+/// and the watcher is the honest answer to the question a number would be
+/// guessing at.
+///
+/// ## Why a change invalidates rather than rescanning
+///
+/// The obvious alternative is to rescan in the background when the watcher
+/// fires, so a search never waits. It is the wrong trade here, for two reasons
+/// that only show up under load. A rescan shells out to `git ls-files` twice
+/// and costs about a tenth of a second on a large repository, so a `cargo
+/// build` or an `npm install` — thousands of events over minutes — would be
+/// asking a background thread to do that over and over for a workspace nobody
+/// is currently searching, which is exactly the "pins a core" failure. And it
+/// would have to be debounced to be tolerable, which trades a bounded cost for
+/// unbounded staleness during a sustained burst.
+///
+/// Forgetting costs one map removal per event and moves the scan to the first
+/// caller who actually needs it. **That is where the coalescing comes from**:
+/// a thousand changes and one search cost one scan, however fast the thousand
+/// arrived, because forgetting something that is already forgotten is free.
+#[derive(Debug, Clone)]
 pub struct Index {
     /// Keyed by [`WorkspaceRoot::canonical`], so two spellings of one folder
     /// share a scan rather than each paying for their own.
-    scans: Arc<Mutex<HashMap<String, Arc<Listing>>>>,
+    scans: Scans,
+    /// Watching whatever [`Index::rescan`] has held a scan for. Holds a handle
+    /// on `scans` and nothing on the `Index` itself, so the two do not keep
+    /// each other alive.
+    watcher: Watcher,
+}
+
+/// The last scan of each workspace, shared with the watcher's callback.
+type Scans = Arc<Mutex<HashMap<String, Arc<Listing>>>>;
+
+impl Default for Index {
+    fn default() -> Index {
+        Index::new()
+    }
 }
 
 impl Index {
     pub fn new() -> Index {
-        Index::default()
+        let scans = Scans::default();
+        let held = Arc::clone(&scans);
+        Index {
+            watcher: Watcher::new(move |key: &str, relative: &str| changed(&held, key, relative)),
+            scans,
+        }
     }
 
-    /// Scan now, and keep the result.
+    /// Scan now, keep the result, and watch the workspace it came from.
+    ///
+    /// The watch is started here rather than when the project is registered
+    /// because this is the moment there is something to keep fresh: a scan
+    /// nobody has taken cannot go stale. It is idempotent, so the refresh
+    /// button does not accumulate registrations.
+    ///
+    /// **The hold is released before the watch is asked for.** The watcher's
+    /// callback runs on its own thread and takes `scans`; this path takes
+    /// `scans` and then the watcher's registry. Holding one across the other
+    /// here would complete the cycle.
     fn rescan(&self, root: &WorkspaceRoot, limit: usize) -> Result<Arc<Listing>, Rejection> {
         let listing = Arc::new(scan(root, limit)?);
         self.hold(root.canonical(), Arc::clone(&listing));
+        self.watcher
+            .watch(root.canonical(), Path::new(root.display()));
         Ok(listing)
     }
 
@@ -613,23 +664,66 @@ impl Index {
     /// guarantee the two calls spelled it identically.
     pub fn forget(&self, cwd: &str) {
         if let Ok(root) = WorkspaceRoot::check(cwd) {
-            self.lock().remove(root.canonical());
+            lock(&self.scans).remove(root.canonical());
         }
     }
 
+    /// Forget a workspace and stop watching it — what a project being closed
+    /// costs the server.
+    ///
+    /// Keyed by the canonical root rather than by a path from a client, because
+    /// the caller is `project.delete` and the folder may well be gone by the
+    /// time it runs; [`Index::forget`]'s re-check would then quietly do
+    /// nothing and leave the handle held.
+    pub fn release(&self, canonical_root: &str) {
+        self.watcher.release(canonical_root);
+        lock(&self.scans).remove(canonical_root);
+    }
+
+    /// Workspaces currently being watched. The gauge that says a closed project
+    /// gave its handle back.
+    pub fn watched(&self) -> usize {
+        self.watcher.len()
+    }
+
     fn held(&self, key: &str) -> Option<Arc<Listing>> {
-        self.lock().get(key).map(Arc::clone)
+        lock(&self.scans).get(key).map(Arc::clone)
     }
 
     fn hold(&self, key: &str, listing: Arc<Listing>) {
-        self.lock().insert(key.to_string(), listing);
+        lock(&self.scans).insert(key.to_string(), listing);
     }
+}
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Listing>>> {
-        self.scans
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// What the watcher does with a reported change.
+///
+/// A free function rather than a method because it is called from the watcher's
+/// own thread, which holds the scans and not the [`Index`] — see
+/// [`Index::new`].
+///
+/// **Two changes are ignored, and between them they are most of what a busy
+/// machine produces.** A workspace with nothing held has nothing to invalidate,
+/// so a build that has already forgotten it once costs nothing for the rest of
+/// its run. And a path the last listing would not have named is not part of the
+/// workspace — see [`Listing::is_interesting`], which is where `node_modules`,
+/// `target` and `.git` stop being the server's problem without this module
+/// having to know any of those names.
+fn changed(scans: &Scans, key: &str, relative: &str) {
+    let mut scans = lock(scans);
+    let Some(listing) = scans.get(key) else {
+        return;
+    };
+    if listing.is_interesting(relative) {
+        scans.remove(key);
     }
+}
+
+/// A poisoned lock means a previous holder panicked while holding it. A
+/// `HashMap` is not left half-written by that, and refusing to read the scans
+/// again would turn one panic into a session where no project can be searched —
+/// the same reasoning, and the same choice, as [`crate::watcher`]'s own lock.
+fn lock(scans: &Scans) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Listing>>> {
+    scans.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// What a workspace holds, as the file tree reads it.
@@ -639,14 +733,78 @@ struct Listing {
     /// The workspace held more than the limit. The UI renders this as
     /// "· partial" beside the file count.
     truncated: bool,
+    /// Every directory in `entries`, lower-cased, for
+    /// [`Listing::is_interesting`]. Derived rather than given — see
+    /// [`Listing::new`], which is the only way to build one.
+    directories: HashSet<String>,
 }
 
 impl Listing {
+    /// Build a listing, deriving what the watcher will need to ask of it.
+    ///
+    /// The set is built from the entries *after* truncation, so it describes
+    /// the listing the client was actually given rather than the one the scan
+    /// found. Lower-cased once here rather than at each of the thousands of
+    /// events a build produces.
+    fn new(entries: Vec<Entry>, truncated: bool) -> Listing {
+        Listing {
+            directories: entries
+                .iter()
+                .filter(|entry| entry.kind == Kind::Directory)
+                .map(|entry| entry.path.to_lowercase())
+                .collect(),
+            entries,
+            truncated,
+        }
+    }
+
     fn to_value(&self) -> Value {
         json!({
             "entries": self.entries.iter().map(Entry::to_value).collect::<Vec<Value>>(),
             "truncated": self.truncated,
         })
+    }
+
+    /// Could a change at this path have changed what this listing says?
+    ///
+    /// **The rule is one line: the path's parent must be the workspace root or
+    /// a directory this listing names.** It is worth spelling out why that is
+    /// the right line, because it is doing the whole of ticket 08's "watching
+    /// does not recurse into ignored directories".
+    ///
+    /// A recursive watch cannot be told to skip a subtree — Windows'
+    /// `ReadDirectoryChangesW` is all-or-nothing — so the exclusion has to
+    /// happen on the events. But the server has no ignore rules of its own to
+    /// filter by: what is in a workspace is whatever `git ls-files` said, and
+    /// asking git per event would cost far more than the scan being avoided.
+    ///
+    /// The last listing *is* the ignore rule, already computed. `node_modules`
+    /// is not in it, so nothing under `node_modules/left-pad/` has a parent it
+    /// names, and an `npm install` passes without a single invalidation. The
+    /// same holds for `target/debug/…` and `.git/objects/…`, and it holds for
+    /// whatever a project ignores that this server has never heard of.
+    ///
+    /// The one thing it deliberately does not filter is a change *directly*
+    /// inside a known directory — including the creation of `node_modules`
+    /// itself, whose parent is the root. That costs one invalidation, and it
+    /// has to: until the workspace is scanned again there is no way to know
+    /// whether a new directory is ignored or is the user's new feature. After
+    /// that scan it is absent from the listing and its subtree is silent.
+    ///
+    /// Two consequences worth naming. A file created two levels below the last
+    /// listing — `src/newthing/a.rs` where `src/newthing` is also new — is not
+    /// reported, but the creation of `src/newthing` was, so the listing is
+    /// already forgotten by the time the file arrives and there is nothing left
+    /// to miss. And a listing that was `truncated` names fewer directories than
+    /// the workspace has, so changes below the cut are ignored — which is the
+    /// same bargain the truncation itself struck.
+    fn is_interesting(&self, relative: &str) -> bool {
+        match relative.rsplit_once('/') {
+            // Directly in the workspace root, or the root itself. Nothing a
+            // listing knows can dismiss that.
+            None => true,
+            Some((parent, _)) => self.directories.contains(&parent.to_lowercase()),
+        }
     }
 }
 
@@ -784,7 +942,7 @@ fn listing_of(files: Vec<String>, limit: usize) -> Listing {
     // whose parent is missing.
     let truncated = entries.len() > limit;
     entries.truncate(limit);
-    Listing { entries, truncated }
+    Listing::new(entries, truncated)
 }
 
 /// Walk `cwd` and describe everything under it, up to `limit` entries.
@@ -884,7 +1042,7 @@ fn walk(root: &Path, limit: usize) -> Result<Listing, Rejection> {
     }
 
     entries.sort_by(|left, right| by_name(&left.path, &right.path));
-    Ok(Listing { entries, truncated })
+    Ok(Listing::new(entries, truncated))
 }
 
 /// May the walk go inside this directory?
@@ -982,6 +1140,14 @@ fn by_name(left: &str, right: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long a test will wait for the operating system to report a change.
+    ///
+    /// The same bound, for the same reason, as `watcher::tests::PATIENCE` and
+    /// `socket_watch.rs`'s: generously long, and not a claim about latency. It
+    /// is what turns "never arrives" into a failure with a message rather than
+    /// a hung suite.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// A tree written out from a list of `path -> contents`. Directories are
     /// implied by the paths, and a path ending in `/` is an empty one.
@@ -1544,8 +1710,13 @@ mod tests {
         assert_eq!(complete["truncated"], json!(false));
     }
 
-    /// Search reads the held scan; the listing is what replaces it. That is the
-    /// whole freshness rule, and it is what keeps a keystroke off the disk.
+    /// Search reads the held scan; a listing replaces it, and a write forgets
+    /// it. Those are the two doors a *method* controls, and between them they
+    /// are the freshness rule as the client can see it.
+    ///
+    /// The third door — a change nobody asked for — is ticket 08's, and it is
+    /// driven separately below, because asserting it here would mean asserting
+    /// that an operating-system event had *not* arrived yet.
     #[test]
     fn a_search_reads_the_held_scan_and_a_listing_replaces_it() {
         let directory = tree(&["before.txt"]);
@@ -1559,12 +1730,6 @@ mod tests {
         );
 
         std::fs::write(directory.path().join("after.txt"), "new").expect("writes the file");
-        assert_eq!(
-            matched(&search(&index, directory.path(), "txt", 80)),
-            ["before.txt"],
-            "a keystroke must not pay for a rescan"
-        );
-
         ListEntries::read(&json!({"cwd": &cwd}))
             .expect("a well-formed payload")
             .run(&index)
@@ -1582,6 +1747,168 @@ mod tests {
             matched(&search(&index, directory.path(), "txt", 80)),
             ["after.txt", "before.txt", "third.txt"]
         );
+    }
+
+    /// A keystroke must not pay for a rescan. Nothing changes between the two
+    /// reads, so nothing can invalidate between them either — which is what
+    /// makes this the one form of the claim that is not a race with the
+    /// watcher.
+    ///
+    /// Identity rather than equality: two scans of an unchanged workspace are
+    /// equal, so comparing values would pass whether or not the disk was
+    /// touched again.
+    #[test]
+    fn a_second_search_reads_the_scan_the_first_one_took() {
+        let directory = tree(&["src/main.rs", "README.md"]);
+        let index = Index::new();
+        let root = WorkspaceRoot::check(&directory.path().to_string_lossy()).expect("a workspace");
+
+        let first = index.current(&root, MAX_ENTRIES).expect("scanned");
+        let second = index.current(&root, MAX_ENTRIES).expect("read");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second keystroke went back to the disk"
+        );
+    }
+
+    /// The rule the watcher's events are filtered by, without an operating
+    /// system in the way. It is doing the whole of "watching does not recurse
+    /// into ignored directories", so it is worth pinning case by case.
+    #[test]
+    fn a_change_matters_only_where_the_listing_names_its_parent() {
+        let listing = Listing::new(
+            vec![
+                Entry {
+                    path: "src".to_string(),
+                    kind: Kind::Directory,
+                },
+                Entry {
+                    path: "src/lib".to_string(),
+                    kind: Kind::Directory,
+                },
+                Entry {
+                    path: "src/main.rs".to_string(),
+                    kind: Kind::File,
+                },
+                Entry {
+                    path: ".gitignore".to_string(),
+                    kind: Kind::File,
+                },
+            ],
+            false,
+        );
+
+        // Anything directly in the root, including the root itself and a
+        // directory that is about to turn out to be ignored.
+        for relative in ["", "README.md", ".gitignore", "node_modules", "target"] {
+            assert!(listing.is_interesting(relative), "{relative:?}");
+        }
+        // Anything directly inside a directory the listing names.
+        for relative in ["src/other.rs", "src/lib", "src/lib/util.rs", "SRC/other.rs"] {
+            assert!(listing.is_interesting(relative), "{relative:?}");
+        }
+
+        // The whole of an ignored subtree, which is where the noise lives: a
+        // build writing into `target/`, an install writing into
+        // `node_modules/`, and git writing into its own directory.
+        for relative in [
+            "target/debug/build.log",
+            "node_modules/left-pad/index.js",
+            ".git/objects/ab/cdef",
+            "src/lib/deeper/still/leaf.rs",
+        ] {
+            assert!(!listing.is_interesting(relative), "{relative:?}");
+        }
+
+        // A file that is *not* a directory is not somewhere changes can happen,
+        // so nothing claiming to be inside one is worth acting on.
+        assert!(!listing.is_interesting("src/main.rs/impossible"));
+    }
+
+    /// What the watcher's callback does with a change, driven directly.
+    ///
+    /// The end-to-end path is `tests/socket_watch.rs`; this is the decision it
+    /// rests on, made without waiting for anything.
+    #[test]
+    fn a_reported_change_drops_the_scan_only_when_it_could_have_changed_it() {
+        let directory = repository(&[".gitignore", "src/main.rs", "target/debug/build.log"]);
+        std::fs::write(directory.path().join(".gitignore"), "target/\n")
+            .expect("writes the ignore file");
+        let index = Index::new();
+        let root = WorkspaceRoot::check(&directory.path().to_string_lossy()).expect("a workspace");
+
+        let held = index.current(&root, MAX_ENTRIES).expect("scanned");
+        let key = root.canonical();
+
+        // Deep inside a directory the listing never named. This is an
+        // `npm install` or a `cargo build`, and it must cost nothing.
+        changed(&index.scans, key, "target/debug/build.log");
+        assert!(
+            index.held(key).is_some_and(|now| Arc::ptr_eq(&held, &now)),
+            "a change under an ignored directory threw the scan away"
+        );
+
+        // A workspace nothing is held for has nothing to invalidate, which is
+        // what keeps the *rest* of a long build free.
+        changed(&index.scans, "a-workspace-nobody-listed", "src/main.rs");
+
+        // And a change where the listing can see it.
+        changed(&index.scans, key, "src/other.rs");
+        assert!(
+            index.held(key).is_none(),
+            "a change beside a listed file left the scan in place"
+        );
+    }
+
+    /// The end of the whole path, with a real watcher and a real change: a file
+    /// that appears without the server writing it makes the next search go and
+    /// look.
+    ///
+    /// Bounded rather than slept-through, so "never arrives" fails with a
+    /// message instead of passing by accident.
+    #[test]
+    fn a_file_created_outside_the_server_reaches_the_next_search() {
+        let directory = tree(&["before.txt"]);
+        let index = Index::new();
+        let root = WorkspaceRoot::check(&directory.path().to_string_lossy()).expect("a workspace");
+
+        index.current(&root, MAX_ENTRIES).expect("scanned");
+        assert_eq!(index.watched(), 1, "listing a workspace did not watch it");
+
+        std::fs::write(directory.path().join("ghost.txt"), "not ours").expect("writes the file");
+
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while index.held(root.canonical()).is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a file created outside the server never invalidated the scan"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            matched(&search(&index, directory.path(), "txt", 80)),
+            ["before.txt", "ghost.txt"]
+        );
+    }
+
+    /// Closing a project gives back what was held for it — the scan and the
+    /// watch both, keyed by the same canonical root.
+    #[test]
+    fn releasing_a_workspace_drops_its_scan_and_its_watch() {
+        let directory = tree(&["src/main.rs"]);
+        let index = Index::new();
+        let root = WorkspaceRoot::check(&directory.path().to_string_lossy()).expect("a workspace");
+
+        index.current(&root, MAX_ENTRIES).expect("scanned");
+        assert_eq!(index.watched(), 1);
+        assert!(index.held(root.canonical()).is_some());
+
+        index.release(root.canonical());
+
+        assert_eq!(index.watched(), 0);
+        assert!(index.held(root.canonical()).is_none());
     }
 
     /// A workspace root that is missing, is a file, or is blank each fails with
@@ -1625,8 +1952,8 @@ mod tests {
     /// The listing the client actually decodes, key for key.
     #[test]
     fn a_listing_serializes_to_the_contract_shape() {
-        let listing = Listing {
-            entries: vec![
+        let listing = Listing::new(
+            vec![
                 Entry {
                     path: "src".to_string(),
                     kind: Kind::Directory,
@@ -1636,8 +1963,8 @@ mod tests {
                     kind: Kind::File,
                 },
             ],
-            truncated: true,
-        };
+            true,
+        );
 
         assert_eq!(
             listing.to_value(),

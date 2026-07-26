@@ -111,6 +111,14 @@ impl ServerState {
         self.live_subscriptions.load(Ordering::Relaxed)
     }
 
+    /// Workspaces the server is watching for changes it did not make. The third
+    /// of the same family of gauges: it is how "watchers are released when a
+    /// project is closed" is observed from outside, without a test reaching
+    /// into the index to look.
+    pub fn watched_workspaces(&self) -> usize {
+        self.services.index.watched()
+    }
+
     fn subscription_gauge(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.live_subscriptions)
     }
