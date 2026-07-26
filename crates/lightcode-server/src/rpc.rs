@@ -1,19 +1,25 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Eleven are implemented — the
+//! The vocabulary is roughly sixty methods. Sixteen are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
 //! registry and starts a conversation, the subscription that *is* the project
 //! list, the subscription that *is* one conversation, the three that enumerate
 //! names on disk for the picker, the tree and the `@` mention, the two that open
-//! and save one of those files, and the one that hands a file to the developer's
-//! own editor — and every other tag lands in the unknown-method path, which is
-//! itself part of the contract and is pinned by a capture.
+//! and save one of those files, the one that hands a file to the developer's
+//! own editor, and the five that open a terminal, read it, type into it, resize
+//! it and list them — and every other tag lands in the unknown-method path,
+//! which is itself part of the contract and is pinned by a capture.
 //!
 //! Nothing in a `Request` says whether the answer will be one value, a stream
 //! of them, or a value that is not ready yet; that is knowledge the method name
 //! carries and the client already has. [`Answer`] is where the three part
 //! company.
+//!
+//! Two of the methods here declare no success value at all. `Schema.Void`
+//! encodes to `null` over this wire — `SchemaAST.Void::toCodecJson` links it
+//! through `undefinedToNull` — so a bare [`Value::Null`] is the whole of what
+//! `terminal.write` and `terminal.resize` answer with, and it decodes.
 
 use std::fmt;
 
@@ -25,6 +31,7 @@ use crate::files::{self, ReadFile, WriteFile};
 use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::orchestration::{self, Shell};
 use crate::subscriptions::EventSource;
+use crate::terminal::{self, Attach, Resize, Terminals, WriteInput};
 use crate::threads;
 
 /// The payload of an `orchestration.subscribeThread`.
@@ -76,6 +83,11 @@ pub struct Services {
     /// looking at one filesystem, and scanning it twice — or watching it twice
     /// — would be paying twice for the same answer.
     pub index: Index,
+    /// The shells the developer has open. Shared for the same reason the index
+    /// is, and for a stronger one: a terminal outlives the connection that
+    /// opened it, so a per-connection registry would kill a build every time
+    /// the socket blinked.
+    pub terminals: Terminals,
 }
 
 /// What a method answers with.
@@ -100,6 +112,12 @@ pub enum Answer {
 /// subscription's next chunk, the `Ping` the UI sends every five seconds, and
 /// every other call the window makes would all queue behind it — the file tree
 /// would arrive and the rest of the app would have stopped.
+///
+/// The line is *unbounded* work rather than "touches the world": adding a
+/// project stats a folder and writes a row on the read loop, and starting a
+/// terminal's shell is one process spawn. Those are bounded by something other
+/// than the size of the developer's repository, which is what makes them
+/// affordable inline.
 ///
 /// So the method hands back the work instead of the answer, and
 /// [`crate::server`] runs it on a blocking thread that writes the `Exit`
@@ -267,6 +285,32 @@ pub fn dispatch(
         editor::OPEN_IN_EDITOR => OpenInEditor::read(payload)
             .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
             .map_err(DispatchError::Declared),
+        // Opening a terminal stats a directory and starts a process, so it goes
+        // off the read loop. Attaching to one cannot — a stream is answered by
+        // its own pump and there is no deferred form of that — but it only
+        // *opens* in the case where the client's own open has not landed yet,
+        // and a process spawn is bounded work. See [`Deferred`].
+        terminal::OPEN => terminal::Open::read(payload)
+            .map(|call| {
+                let terminals = services.terminals.clone();
+                Answer::Deferred(Deferred::new(move || terminals.open(call)))
+            })
+            .map_err(DispatchError::Declared),
+        terminal::ATTACH => Attach::read(payload)
+            .and_then(|call| services.terminals.attach(call))
+            .map(Answer::Stream)
+            .map_err(DispatchError::Declared),
+        terminal::WRITE => WriteInput::read(payload)
+            .and_then(|call| services.terminals.write(&call))
+            .map(Answer::Value)
+            .map_err(DispatchError::Declared),
+        terminal::RESIZE => Resize::read(payload)
+            .and_then(|call| services.terminals.resize(&call))
+            .map(Answer::Value)
+            .map_err(DispatchError::Declared),
+        // The payload is an empty struct in the contract, like the
+        // configuration subscription's.
+        terminal::SUBSCRIBE_METADATA => Ok(Answer::Stream(services.terminals.subscribe_metadata())),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -296,6 +340,7 @@ mod tests {
             config: ConfigStore::new(ServerConfig::detect()),
             shell: Shell::new(Database::in_memory().expect("an in-memory database")),
             index: Index::new(),
+            terminals: Terminals::new(),
         }
     }
 
@@ -335,6 +380,7 @@ mod tests {
             // opens first: a new conversation is a client-side draft until its
             // first turn reaches this server.
             (threads::SUBSCRIBE_THREAD, json!({"threadId": "thread-1"})),
+            (terminal::SUBSCRIBE_METADATA, json!({})),
         ] {
             let answer = dispatch(&services, tag, &payload).expect("dispatches");
             assert!(matches!(answer, Answer::Stream(_)), "{tag} does not stream");
@@ -371,6 +417,37 @@ mod tests {
             assert!(matches!(error, DispatchError::Declared(_)), "{tag}");
             assert_eq!(error.to_error()["_tag"], expected, "{tag}");
             assert!(error.to_error()["message"].is_string(), "{tag}");
+        }
+    }
+
+    /// The terminal methods refuse the same way, but **without a `message`** —
+    /// and that is the contract rather than an omission. Every class in
+    /// `TerminalError` defines `message` as a getter over its declared fields,
+    /// so the client computes the sentence and a server that sent one would be
+    /// sending a field the reference server does not.
+    #[test]
+    fn a_terminal_that_is_not_there_is_refused_by_its_two_names() {
+        let services = services();
+
+        for (tag, payload) in [
+            (terminal::ATTACH, json!({})),
+            (terminal::WRITE, json!({"data": "ls\r"})),
+            (terminal::RESIZE, json!({"cols": 80, "rows": 24})),
+        ] {
+            let payload = {
+                let mut payload = payload;
+                payload["threadId"] = json!("thread-1");
+                payload["terminalId"] = json!("term-1");
+                payload
+            };
+            let error = dispatch(&services, tag, &payload).expect_err("a refusal");
+
+            assert!(matches!(error, DispatchError::Declared(_)), "{tag}");
+            let error = error.to_error();
+            assert_eq!(error["_tag"], "TerminalSessionLookupError", "{tag}");
+            assert_eq!(error["threadId"], "thread-1", "{tag}");
+            assert_eq!(error["terminalId"], "term-1", "{tag}");
+            assert!(error["message"].is_null(), "{tag}: {error}");
         }
     }
 

@@ -401,11 +401,12 @@ guessed at.
    captured was client-initiated and came back as `Failure`/`Interrupt`. Natural
    completion of a server-side stream was never observed.
 
-   Still open, and lightcode has not had to answer it: the configuration
-   subscription ticket 04 implements never ends by itself, so every stream it
-   serves ends the captured way. A later subscription that *can* complete —
-   a thread that finishes, a terminal that exits — is where this has to be
-   settled.
+   Still open, and lightcode has still not had to answer it. Ticket 17 was the
+   first candidate — a terminal whose shell exits — and it turned out not to be
+   one: an exited terminal is still a terminal, showing what it said and what it
+   exited with, so `terminal.attach` stays open and ends the captured way when
+   the client unsubscribes. Every stream lightcode serves is of that shape, so
+   the question is deferred rather than resolved.
 6. **What happens to the user-driven surface?** `01-browser-session.ndjson` is
    the boot sequence only; no capture drives the UI through opening a file,
    starting a thread or running a turn. Nothing in the framing suggests those

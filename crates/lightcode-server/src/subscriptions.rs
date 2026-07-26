@@ -64,6 +64,7 @@ pub const BACKLOG: usize = 64;
 pub struct EventSource {
     description: Box<dyn Fn() -> Vec<Value> + Send>,
     updates: broadcast::Receiver<Value>,
+    superseded: Box<dyn Fn(&Value) -> bool + Send>,
 }
 
 impl EventSource {
@@ -74,7 +75,34 @@ impl EventSource {
         EventSource {
             description: Box::new(description),
             updates,
+            superseded: Box::new(|_| false),
         }
+    }
+
+    /// Say which updates a description has already accounted for.
+    ///
+    /// Needed by exactly one kind of source, and by that one badly. Most
+    /// subscriptions on this wire deliver *replacements* — a project, a
+    /// configuration, a terminal's summary — so seeing an update the snapshot
+    /// beside it already contained lands on the same state, and the contract
+    /// says so ("overlapping events are deduped by sequence on the client").
+    /// A terminal's output is not a replacement: it is appended, so an update
+    /// the snapshot already carried is text on the screen twice, and nothing
+    /// later corrects it.
+    ///
+    /// The overlap is not theoretical. [`EventSource::resynchronise`] drains
+    /// and then describes, and the producer is another thread — so anything
+    /// published between those two statements is in both. That path is taken
+    /// every time a subscriber falls behind, which on a busy terminal is often.
+    ///
+    /// Called on the pump's task and only ever after a description, so a source
+    /// may carry its watermark in whatever the description writes it to.
+    pub fn superseding(
+        mut self,
+        superseded: impl Fn(&Value) -> bool + Send + 'static,
+    ) -> EventSource {
+        self.superseded = Box::new(superseded);
+        self
     }
 
     /// What this source would open with, right now.
@@ -106,6 +134,14 @@ impl EventSource {
         // loop is done only when the receiver is empty or the feed has ended.
         while let Ok(_) | Err(TryRecvError::Lagged(_)) = self.updates.try_recv() {}
         self.describe()
+    }
+
+    /// Add one update to what is going out, unless the last description
+    /// already covered it. See [`EventSource::superseding`].
+    fn keep(&self, pending: &mut Vec<Value>, event: Value) {
+        if !(self.superseded)(&event) {
+            pending.push(event);
+        }
     }
 }
 
@@ -270,11 +306,11 @@ async fn pump(
 
         match source.updates.recv().await {
             Ok(event) => {
-                pending.push(event);
+                source.keep(&mut pending, event);
                 // Whatever else is already waiting rides in the same chunk.
                 while pending.len() < BACKLOG {
                     match source.updates.try_recv() {
-                        Ok(event) => pending.push(event),
+                        Ok(event) => source.keep(&mut pending, event),
                         // Fell behind mid-gather. The snapshot supersedes what
                         // was already collected too, so it replaces `pending`
                         // rather than joining it.

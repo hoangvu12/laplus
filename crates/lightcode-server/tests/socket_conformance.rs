@@ -259,10 +259,12 @@ const UNCOMPARED: &[Declared] = &[
 /// `04-streaming-subscription.ndjson` — the minimal recording of one: request,
 /// chunk, acknowledgement, interrupt, terminal exit.
 ///
-/// The captured subscription is `subscribeTerminalMetadata`, which lightcode
-/// does not implement; what is compared is the *framing*, which is the same
-/// for every subscription on this wire and is the thing ticket 04 exists to
-/// prove. The payload inside the chunk is the next test's business.
+/// The captured subscription is `subscribeTerminalMetadata`, and since
+/// ticket 17 lightcode answers it — so this compares the whole frame rather
+/// than only the envelope. The framing is the same for every subscription on
+/// this wire and is the thing ticket 04 exists to prove; that the *payload*
+/// inside now matches too is what makes this the strictest conformance
+/// assertion in the file.
 #[tokio::test]
 async fn the_subscription_lifecycle_matches_the_capture() {
     let capture = Capture::load("04-streaming-subscription");
@@ -272,7 +274,9 @@ async fn the_subscription_lifecycle_matches_the_capture() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    let subscription = client.subscribe("subscribeServerConfig", json!({})).await;
+    let subscription = client
+        .subscribe("subscribeTerminalMetadata", json!({}))
+        .await;
     let live_chunk = client.next_frame_for(&subscription).await;
     client.ack(&subscription).await;
     client.interrupt(&subscription).await;
@@ -289,8 +293,11 @@ async fn the_subscription_lifecycle_matches_the_capture() {
     assert_eq!(keys(&live_exit), keys(&captured_exit));
 
     // Values batch — a client iterates them — and the capture's one chunk
-    // carried a single value, as ours does here.
+    // carried a single value, as ours does here. Same method, same empty
+    // server, so the value itself is comparable and is compared.
     assert_eq!(live_chunk["values"].as_array().map(Vec::len), Some(1));
+    assert_eq!(live_chunk["values"], captured_chunk["values"]);
+    assert_eq!(live_chunk, captured_chunk, "the whole frame, byte for byte");
 
     // A client-initiated unsubscribe ends as a *failure* with an interrupt
     // cause, not a success. The `fiberId` differs — it names a runtime object

@@ -25,8 +25,16 @@
 //! already enumerated has changed underneath, [`files`] opens and saves what
 //! those names point at, [`editor`] hands one to the developer's own editor,
 //! [`provider`] finds the agent binary and reports what it found, [`process`]
-//! is how all three of those start a program and where they look for one, and
-//! [`server`] is the endpoint and the connection loop that ties them together.
+//! is how all three of those start a program and where they look for one,
+//! [`terminal`] runs a shell in a project's folder and pipes it to the pane the
+//! developer typed into, and [`server`] is the endpoint and the connection loop
+//! that ties them together.
+//!
+//! [`terminal`] is the one subsystem here that is deliberately *not* a
+//! translation. The two formats above are parsed; a terminal's bytes are not
+//! read at all, because the thing that reads them is the emulator in the UI.
+//! The only exception is the copy kept for a client that reconnects, and the
+//! module says why.
 //!
 //! The two formats meet in exactly one place. [`agent`] runs the `claude`
 //! subprocess, [`settling`] holds the contract's two lifecycle vocabularies and
@@ -58,6 +66,7 @@ pub mod server;
 pub mod settling;
 pub mod store;
 pub mod subscriptions;
+pub mod terminal;
 pub mod threads;
 pub mod transcripts;
 pub mod turn;

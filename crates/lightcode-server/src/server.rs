@@ -50,6 +50,7 @@ use crate::process::Search;
 use crate::rpc::{Answer, Deferred, Services};
 use crate::store::{Database, StorageError};
 use crate::subscriptions::Subscriptions;
+use crate::terminal::Terminals;
 use crate::wire::{Cause, ClientMessage, Exit, ServerMessage};
 use crate::{http, rpc};
 
@@ -125,6 +126,13 @@ impl ServerState {
     /// ends" something a test can observe rather than assert about internals.
     pub fn live_agents(&self) -> usize {
         self.services.shell.threads().live_agents()
+    }
+
+    /// Shells still running behind a terminal. The fifth of the family, and the
+    /// one that makes "closing the app reaps its terminals" something a test
+    /// can observe rather than assert about internals.
+    pub fn live_terminals(&self) -> usize {
+        self.services.terminals.live()
     }
 
     /// How often the buffered assistant message and the deltas before it agreed.
@@ -235,6 +243,7 @@ impl Server {
             config: ConfigStore::new(config),
             shell: Shell::new(database),
             index: Index::new(),
+            terminals: Terminals::new(),
         };
         let state = Arc::new(ServerState::new(services, shutdown.subscribe()));
 
@@ -312,8 +321,9 @@ impl Server {
         });
     }
 
-    /// Stop accepting, close open sockets, end every agent session, write down
-    /// what they said, and wait for all of it to actually be done.
+    /// Stop accepting, close open sockets, end every agent session and every
+    /// terminal, write down what the agents said, and wait for all of it to
+    /// actually be done.
     ///
     /// The order is the whole content of this method. The agents are reaped
     /// before the transcripts are flushed, because a session publishes its last
@@ -324,10 +334,16 @@ impl Server {
     /// this process can produce that survives the process, since it holds the
     /// project's files open and keeps talking to an API on the developer's
     /// account.
+    ///
+    /// The terminals are the second thing with that property and they are
+    /// waited for too. A shell left behind holds the project's files open, and
+    /// whatever the developer had running in it goes on running with nothing
+    /// left that can show it to them.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         let _ = self.serving.await;
         self.state.services.shell.threads().shutdown().await;
+        self.state.services.terminals.shutdown().await;
         self.state.services.shell.flush().await;
     }
 
@@ -635,6 +651,7 @@ mod tests {
                         Database::in_memory().expect("an in-memory database"),
                     ),
                     index: Index::new(),
+                    terminals: Terminals::new(),
                 },
                 watch::channel(false).1,
             ));

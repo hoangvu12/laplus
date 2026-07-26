@@ -26,6 +26,7 @@ pub mod agent;
 pub mod captures;
 pub mod conversation;
 pub mod shape;
+pub mod terminal;
 pub mod workspace;
 
 use std::path::Path;
@@ -200,6 +201,20 @@ impl TestServer {
     /// synchronously with the call that caused it.
     pub async fn await_live_agents(&self, expected: usize) {
         self.await_gauge("live agents", expected, || self.live_agents())
+            .await;
+    }
+
+    /// Shells running behind a terminal. The fifth of the same family, and how
+    /// "closing the app reaps its terminals" is observed from outside.
+    pub fn live_terminals(&self) -> usize {
+        self.server.state().live_terminals()
+    }
+
+    /// Wait for the terminal gauge to reach `expected`, or fail saying what it
+    /// was. A shell is reaped by a thread of its own, so it settles a moment
+    /// after whatever ended it.
+    pub async fn await_live_terminals(&self, expected: usize) {
+        self.await_gauge("live terminals", expected, || self.live_terminals())
             .await;
     }
 

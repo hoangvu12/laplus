@@ -15,6 +15,13 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # they cost nothing, and dropping them would leave a developer running the suite
 # on a Mac without a backend at all.
 notify = "8"
+# Ticket 17: a terminal is a pseudo-terminal or it is nothing. A program only
+# emits colour, redraws a full screen, or asks for the window size when it
+# believes it is talking to a tty, so a pair of pipes would not be a smaller
+# version of this feature — it would be a different one that looks broken. On
+# Windows this is a thin wrapper over ConPTY, which ships with the operating
+# system, so what it costs the artifact is the wrapper and not an emulator.
+portable-pty = "0.9"
 # `bundled` compiles SQLite into the binary. The alternative is linking whatever
 # the machine happens to have, which on Windows is usually nothing — and a
 # desktop app that asks the user to install a database first has given up the

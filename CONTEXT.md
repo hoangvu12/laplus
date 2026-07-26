@@ -74,3 +74,27 @@ authoritative and replaces the accumulation. Whether the two agreed is recorded.
 
 **Join** — a place where the agent protocol and the contract meet. `crate::turn`
 is the declared one; `crate::worklog` is a second.
+
+## Terminal
+
+**Terminal** — one shell in a project's folder, named by the client and unique
+within a thread. The client always chooses the name; the server never allocates
+one. `crate::terminal`.
+
+**Pane** — the terminal as the developer sees it: the emulator half, in the UI.
+The server owns the pty half and the wire between them, and nothing else. Not a
+type here; the word matters because it is what "resize the terminal" is a
+consequence of.
+
+**Scrollback** — the server's copy of what a terminal has shown, sent to a
+client that attaches or that fell too far behind to catch up. Not the stream: it
+is replayed into a live emulator, so the questions are taken out of it.
+Bounded, at the same number the client's own buffer is bounded at.
+
+**Question** — a control sequence that asks the emulator something rather than
+telling it something: cursor position, device attributes, the colour queries. A
+shell blocks on the first one it asks. Kept out of scrollback and remembered
+instead, so that whoever attaches next is asked it. See ADR-0005.
+
+**Attachment** — one `terminal.attach` subscription. A terminal outlives every
+attachment to it, which is what makes reattaching a thing rather than a restart.

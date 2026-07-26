@@ -21,3 +21,30 @@ process.
 - [ ] No orphaned processes, file handles or threads remain after terminals are
       closed
 - [ ] Tests cover detach, reattach and close-and-reap through the socket boundary
+
+## Comments
+
+### What ticket 17 already left here
+
+`terminal.attach` exists — it is the only way output reaches a client at all, so
+it could not wait. What it does *not* do yet is this ticket's list:
+
+- **`restartIfNotRunning`** is read off the payload and ignored. Attaching to a
+  terminal whose shell has exited gives you the terminal as it stands.
+- **`terminal.clear`, `terminal.restart` and `terminal.close`** are unimplemented,
+  so `terminal.open` on an exited terminal returns it rather than quietly
+  starting a second shell. Restarting is a thing the developer asks for by name.
+- **Scrollback does not survive a server restart.** It is in memory only; upstream
+  persists it under its logs directory. "Navigating away and back" works without
+  it, "closing the app and coming back" does not.
+- **`hasRunningSubprocess` is always `false`.** This ticket's "a long-running
+  process is never lost by clicking elsewhere" is the acceptance that would want
+  it to be true.
+
+The reaping machinery is already there and used by shutdown —
+`Terminals::shutdown` kills each shell and waits for its reaper, which closes the
+pty and joins the reader and writer threads. `terminal.close` is that per
+terminal, plus a `remove` on the metadata feed.
+
+Read **ADR-0005** before touching the attach path: the rule about questions and
+scrollback is what makes a reattached terminal work at all.
