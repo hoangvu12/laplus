@@ -17,11 +17,12 @@
 //!   writers must not be able to publish in the opposite order to the one they
 //!   wrote in, or a client's projection ends up on the losing value.
 //!
-//! Nothing mutates the configuration yet — ticket 09 fills `providers` when it
-//! resolves the `claude` binary, and ticket 22 owns keybindings and settings.
-//! [`ConfigChange`] is the vocabulary they will use, and it is closed on
-//! purpose: it mirrors `ServerConfigStreamEvent` in the contract, which has
-//! exactly these three update members plus the snapshot.
+//! One thing mutates the configuration: [`crate::provider::refresh`] publishes
+//! `providers` when it has resolved the `claude` binary, which is the first real
+//! use these two invariants were built for. Ticket 22 owns keybindings and
+//! settings. [`ConfigChange`] is the vocabulary, and it is closed on purpose: it
+//! mirrors `ServerConfigStreamEvent` in the contract, which has exactly these
+//! three update members plus the snapshot.
 
 use std::sync::{Arc, RwLock};
 
@@ -61,7 +62,7 @@ pub enum ConfigChange {
         keybindings: Vec<ResolvedKeybinding>,
         issues: Vec<ConfigIssue>,
     },
-    /// Ticket 09, and every later provider status refresh.
+    /// [`crate::provider::refresh`], and every later provider status refresh.
     Providers(Vec<Provider>),
     /// Ticket 22. Boxed because it is much the largest member and an enum is
     /// as big as its widest arm.

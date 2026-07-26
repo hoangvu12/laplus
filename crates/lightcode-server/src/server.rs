@@ -46,6 +46,7 @@ use crate::config::ServerConfig;
 use crate::config_store::ConfigStore;
 use crate::filesystem::Index;
 use crate::orchestration::Shell;
+use crate::process::Search;
 use crate::rpc::{Answer, Deferred, Services};
 use crate::store::{Database, StorageError};
 use crate::subscriptions::Subscriptions;
@@ -194,9 +195,11 @@ impl Server {
     pub async fn bind(port: u16) -> Result<Server, StartupFailure> {
         let database =
             Database::open(&crate::store::default_path()).map_err(StartupFailure::Database)?;
-        Server::bind_with(port, ServerConfig::detect(), database)
+        let server = Server::bind_with(port, ServerConfig::detect(), database)
             .await
-            .map_err(|error| StartupFailure::Listen { port, error })
+            .map_err(|error| StartupFailure::Listen { port, error })?;
+        server.probe_provider();
+        Ok(server)
     }
 
     /// Serve a database the caller already opened.
@@ -205,6 +208,10 @@ impl Server {
     /// nothing to say about persistence, and a temporary file for the ones that
     /// do. It is not a test-only entry point — ticket 23's Tauri shell will
     /// want the same control over where the app's state lives.
+    ///
+    /// Binding does **not** go looking for the agent binary; [`Server::bind`]
+    /// does that as a second step, and a shell assembling its own startup wants
+    /// [`Server::probe_provider`] in the same place.
     pub async fn bind_with(
         port: u16,
         config: ServerConfig,
@@ -263,6 +270,33 @@ impl Server {
 
     pub fn state(&self) -> &Arc<ServerState> {
         &self.state
+    }
+
+    /// Go looking for the agent binary on this machine's `PATH`, and publish what
+    /// was found.
+    ///
+    /// Returns immediately; the answer arrives on the configuration subscription
+    /// whenever the lookup is done. That is the whole reason it is not part of
+    /// binding: resolving means walking `PATH` and then waiting on a child
+    /// process, and a socket that did not open until the agent had answered would
+    /// not open at all on a machine where the agent is wedged. Until it lands, the
+    /// configuration reports no provider instance, which is the state upstream's
+    /// UI renders as "Checking provider status".
+    ///
+    /// Not a startup-only call. The reference server re-probes every five minutes
+    /// and after any change to the provider's settings; this is the method those
+    /// will use.
+    ///
+    /// Blocking work on a blocking thread, for the same reason every filesystem
+    /// method is a [`Deferred`]. The task is untracked, like a deferred call's:
+    /// it holds a clone of the configuration store and nothing else, so if the
+    /// server is dropped first it publishes into a store nobody is reading and
+    /// the thread comes back.
+    pub fn probe_provider(&self) {
+        let config = self.state.config().clone();
+        tokio::task::spawn_blocking(move || {
+            crate::provider::refresh(&config, &Search::from_environment())
+        });
     }
 
     /// Stop accepting, close open sockets, and wait for the listener to go.

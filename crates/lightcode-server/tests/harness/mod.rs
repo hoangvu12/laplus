@@ -22,6 +22,7 @@
 
 #![allow(dead_code)]
 
+pub mod agent;
 pub mod captures;
 pub mod shape;
 pub mod workspace;
@@ -32,6 +33,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use lightcode_server::config::ServerConfig;
 use lightcode_server::config_store::ConfigChange;
+use lightcode_server::config::ProviderState;
+use lightcode_server::process::Search;
 use lightcode_server::store::Database;
 use lightcode_server::Server;
 use serde_json::{json, Value};
@@ -176,6 +179,52 @@ impl TestServer {
     /// observes; nothing about the assertion reaches into the server.
     pub fn change_config(&self, change: ConfigChange) {
         self.server.state().config().apply(change);
+    }
+
+    /// Resolve the agent binary the way the app's own startup does, off the
+    /// machine's `PATH`. Returns at once; the answer arrives from its own thread,
+    /// so pair it with [`TestServer::await_provider_state`].
+    pub fn probe_provider(&self) {
+        self.server.probe_provider();
+    }
+
+    /// Go looking for the agent binary in `search` and wait for the answer to be
+    /// published — the same call [`Server::probe_provider`] makes, with the
+    /// directories it may look in supplied by the test rather than read off the
+    /// machine.
+    ///
+    /// That substitution is data, not a switch: resolution runs in full, and only
+    /// the list of directories differs. It has to be an argument because `PATH` is
+    /// process-wide mutable state, so a test that set it would be changing it for
+    /// every other test running beside it.
+    pub async fn refresh_providers(&self, search: Search) {
+        let config = self.server.state().config().clone();
+        tokio::task::spawn_blocking(move || lightcode_server::provider::refresh(&config, &search))
+            .await
+            .expect("the probe finishes");
+    }
+
+    /// Wait for the provider instance to appear in `state`, or fail saying what it
+    /// was instead.
+    ///
+    /// [`Server::probe_provider`] publishes from its own thread, so the state a
+    /// test is waiting for arrives a moment after the call — the same reasoning as
+    /// [`TestServer::await_live_connections`]. Takes a [`ProviderState`] rather
+    /// than a string so a typo is a compile error.
+    pub async fn await_provider_state(&self, state: ProviderState) -> Value {
+        let wanted = serde_json::to_value(state).expect("a provider state serializes");
+        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        loop {
+            let providers = self.config()["providers"].clone();
+            if providers[0]["status"] == wanted {
+                return providers[0].clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the provider stayed at {providers} instead of settling to {wanted}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// A settings change that alters one visible flag. The cheapest real

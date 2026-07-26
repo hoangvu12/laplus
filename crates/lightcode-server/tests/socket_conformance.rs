@@ -13,10 +13,37 @@
 
 mod harness;
 
+use harness::agent::FakeAgent;
 use harness::captures::Capture;
 use harness::shape::{assert_declared, compare, Declared};
 use harness::{ClientIdentity, TestServer};
+use lightcode_server::process::Search;
 use serde_json::json;
+
+/// The version the stand-in agent reports for these comparisons.
+///
+/// Current enough to clear every gate in `provider::BUILT_IN_MODELS`, which is
+/// what makes the comparison the strict one: the capture's provider was ready on
+/// a current CLI with the whole model table and no message, so a stand-in that
+/// reported an older version would be compared as a *different state* and would
+/// quietly need extra declarations to pass.
+const AGENT_VERSION: &str = "2.1.220";
+
+/// A server whose provider has been resolved against a stand-in agent.
+///
+/// The capture holds a `claudeAgent` instance that was found, ran, and reported a
+/// version. Comparing our *unresolved* provider against it would compare two
+/// different states — and comparing our resolved one against the machine's real
+/// `claude` would make this suite pass or fail according to what the developer
+/// happens to have installed. So the agent is the test's own file, and the
+/// comparison is like for like.
+async fn resolved_against_a_stand_in_agent(agent: &FakeAgent) -> TestServer {
+    let server = TestServer::start().await;
+    server
+        .refresh_providers(Search::over(&[agent.directory()]))
+        .await;
+    server
+}
 
 /// The whole envelope, not just the payload: `_tag`, `requestId` and the exit
 /// tag are what the client's protocol layer reads before it looks at anything
@@ -53,7 +80,8 @@ async fn the_server_config_payload_conforms_to_the_capture() {
     let capture = Capture::load("02-request-response");
     let captured = capture.response_to("server.getConfig");
 
-    let server = TestServer::start().await;
+    let agent = FakeAgent::reporting(AGENT_VERSION);
+    let server = resolved_against_a_stand_in_agent(&agent).await;
     let mut client = server.connect().await;
     let live = client
         .call_raw("server.getConfig", json!({}))
@@ -62,6 +90,13 @@ async fn the_server_config_payload_conforms_to_the_capture() {
         .and_then(|exit| exit.get("value"))
         .cloned()
         .expect("a success value");
+
+    // The state being compared, asserted rather than assumed: every declaration
+    // below is written against a provider that resolved cleanly, and a stand-in
+    // that had stopped working would silently turn this into a comparison of
+    // something else.
+    assert_eq!(live["providers"][0]["status"], json!("ready"), "{live}");
+    assert_eq!(live["providers"][0]["version"], json!(AGENT_VERSION));
 
     let differences = compare(&captured["exit"]["value"], &live);
 
@@ -92,7 +127,52 @@ const MISSING: &[Declared] = &[
     },
     Declared {
         path: "/settings/textGenerationModelSelection",
-        because: "no model slugs until ticket 09 queries the CLI; the field has a decoding default",
+        // Ticket 03 expected ticket 09 to fill this "once model slugs are known
+        // from the CLI". There is no such call: the CLI has no way to be asked
+        // what models it accepts, and upstream hardcodes the list — which
+        // `provider::BUILT_IN_MODELS` now does too. What is left is a *stored
+        // preference* over those slugs, which is a settings feature.
+        //
+        // It cannot simply be left absent forever, and the reason is worth
+        // recording where the next ticket will find it: the field's decoding
+        // default in `settings.ts` is
+        // `{instanceId: "codex", model: DEFAULT_GIT_TEXT_GENERATION_MODEL}`, so a
+        // client filling it in names an instance v1 does not ship. Nothing reads
+        // it yet — thread titles and commit messages are later tickets — but
+        // whichever ticket wants text generation has to send this rather than
+        // inherit the default.
+        because: "a stored preference over the model slugs, not something the CLI can \
+                  be asked; ticket 22 owns settings, and nothing reads it until a \
+                  ticket wants generated titles",
+    },
+    Declared {
+        path: "/providers/0/continuation",
+        because: "`groupKey` is how threads are grouped for resumption; ticket 11 \
+                  owns multi-turn continuity",
+    },
+    Declared {
+        path: "/providers/0/showInteractionModeToggle",
+        because: "the plan / accept-edits toggle; ticket 13 owns permission modes, \
+                  and offering the control before it means anything would be a \
+                  switch that does nothing",
+    },
+    Declared {
+        path: "/providers/0/versionAdvisory",
+        because: "an update check is a network call on boot, which \
+                  settings.enableProviderUpdateChecks is off to prevent",
+    },
+    Declared {
+        path: "/providers/0/auth/type",
+        because: "nothing reads a credential in ticket 09; auth.status is `unknown`, \
+                  which is the contract's own literal for it",
+    },
+    Declared {
+        path: "/providers/0/auth/label",
+        because: "as auth/type — no credential is read, so there is no plan to label",
+    },
+    Declared {
+        path: "/providers/0/auth/email",
+        because: "as auth/type — no credential is read, so there is no account to name",
     },
     Declared {
         path: "/settings/providers/codex",
@@ -125,11 +205,23 @@ const MISSING: &[Declared] = &[
 /// Fields lightcode sends and the reference server did not. There should never
 /// be any: this payload is decoded against upstream's schema, and an unknown
 /// key is at best ignored and at worst a decode failure.
+///
+/// `providers[0].message` came close to belonging here. It is the diagnostic
+/// ticket 09 exists to produce, and the captured provider carries none — but that
+/// is because a provider that resolved cleanly on a current CLI has nothing to
+/// say, and so does the one compared here. A stand-in reporting an older version
+/// would carry the model-gate advice and this list would stop being empty, which
+/// is why `AGENT_VERSION` is current.
 const ADDED: &[Declared] = &[];
 
 /// Fields present in both but holding a different JSON type. Same reasoning as
 /// added fields — the client decodes this, so a type change is a break.
-const RETYPED: &[Declared] = &[];
+const RETYPED: &[Declared] = &[Declared {
+    path: "/providers/0/models/0/capabilities",
+    because: "`null`, which the contract permits, until the ticket that sends \
+              a turn can honour the reasoning and context-window options a \
+              descriptor would advertise",
+}];
 
 /// Arrays whose element shape this comparison could not reach, because one
 /// side was empty. Every one is a field a later ticket fills; when it does,
@@ -148,8 +240,14 @@ const UNCOMPARED: &[Declared] = &[
         because: "empty in the capture too — the reference server had no config issues either",
     },
     Declared {
-        path: "/providers[]",
-        because: "ticket 09 resolves the claude binary and fills this",
+        path: "/providers/0/slashCommands[]",
+        because: "the CLI's slash commands come from a second probe of its \
+                  initialisation output; ticket 09 only asks it its version",
+    },
+    Declared {
+        path: "/providers/0/skills[]",
+        because: "as slashCommands — discovering skills means reading the agent's \
+                  own directories, which the ticket that runs one owns",
     },
     Declared {
         path: "/settings/providers/claudeAgent/customModels[]",
@@ -225,7 +323,8 @@ async fn the_config_snapshot_chunk_conforms_to_the_capture() {
     assert_eq!(chunks.len(), 1, "the boot capture holds one config chunk");
     let captured = &chunks[0]["values"][0];
 
-    let server = TestServer::start().await;
+    let agent = FakeAgent::reporting(AGENT_VERSION);
+    let server = resolved_against_a_stand_in_agent(&agent).await;
     let mut client = server.connect().await;
     let subscription = client.subscribe("subscribeServerConfig", json!({})).await;
     let live = client.next_event(&subscription).await;

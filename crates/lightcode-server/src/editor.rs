@@ -29,6 +29,8 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::process::Search;
+
 /// Open a path in the developer's editor.
 pub const OPEN_IN_EDITOR: &str = "shell.openInEditor";
 
@@ -100,22 +102,28 @@ const EDITORS: &[Editor] = &[
 /// installs an editor, which they will not do without restarting the app to see
 /// it offered anyway.
 pub fn available() -> Vec<String> {
+    let search = Search::from_environment();
     EDITORS
         .iter()
-        .filter(|editor| resolve(editor).is_some())
+        .filter(|editor| resolve(editor, &search).is_some())
         .map(|editor| editor.id.to_string())
         .collect()
 }
 
 /// The command this editor would be started with, if the machine has it.
-fn resolve(editor: &Editor) -> Option<String> {
+///
+/// The *name*, not the resolved path: it goes to `Command::new`, which does its
+/// own lookup, and an editor installed twice should be started the way the user's
+/// own shell would start it. The lookup here is only to decide whether to offer
+/// it at all.
+fn resolve(editor: &Editor, search: &Search) -> Option<String> {
     if editor.commands.is_empty() {
         return Some(file_manager().to_string());
     }
     editor
         .commands
         .iter()
-        .find(|command| on_path(command))
+        .find(|command| search.locate(command).is_some())
         .map(|command| (*command).to_string())
 }
 
@@ -127,48 +135,6 @@ fn file_manager() -> &'static str {
     } else {
         "xdg-open"
     }
-}
-
-/// Is this command startable?
-///
-/// A `PATH` walk by hand rather than `where`/`which`, which would be a process
-/// spawn each — twenty of them at startup, each flashing a console window on
-/// Windows. On Windows a bare name is not enough either: `code` is `code.cmd`,
-/// so every extension in `PATHEXT` is tried.
-fn on_path(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-
-    for directory in std::env::split_paths(&paths) {
-        let candidate = directory.join(command);
-        if candidate.is_file() {
-            return true;
-        }
-        for extension in executable_extensions() {
-            if candidate
-                .with_extension(extension.trim_start_matches('.'))
-                .is_file()
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// `PATHEXT` on Windows, nothing anywhere else — an executable bit is not a
-/// suffix.
-fn executable_extensions() -> Vec<String> {
-    if !cfg!(windows) {
-        return Vec::new();
-    }
-    std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-        .split(';')
-        .filter(|extension| !extension.trim().is_empty())
-        .map(|extension| extension.trim().to_string())
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +190,7 @@ impl OpenInEditor {
             return Err(unknown_editor(&self.editor));
         };
 
-        let Some(command) = resolve(editor) else {
+        let Some(command) = resolve(editor, &Search::from_environment()) else {
             // The UI only offers what `available()` reported, so reaching this
             // means the editor was uninstalled while the app was running. It
             // is still the client's own declared error rather than a crash.

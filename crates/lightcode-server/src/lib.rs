@@ -24,8 +24,9 @@
 //! tree and the search behind them, [`watcher`] tells it when something it has
 //! already enumerated has changed underneath, [`files`] opens and saves what
 //! those names point at, [`editor`] hands one to the developer's own editor,
-//! and [`server`] is the endpoint and the connection loop that ties them
-//! together.
+//! [`provider`] finds the agent binary and reports what it found, [`process`]
+//! is how all three of those start a program and where they look for one, and
+//! [`server`] is the endpoint and the connection loop that ties them together.
 
 pub mod auth;
 pub mod config;
@@ -38,6 +39,7 @@ pub mod orchestration;
 pub mod process;
 pub mod projects;
 pub mod protocol;
+pub mod provider;
 pub mod rpc;
 pub mod server;
 pub mod store;

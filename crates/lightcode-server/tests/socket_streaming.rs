@@ -22,8 +22,10 @@ mod harness;
 use std::time::Duration;
 
 use harness::{Outcome, TestServer};
-use lightcode_server::config::{Provider, ProviderAuth};
+use lightcode_server::config::{Provider, ServerConfig};
 use lightcode_server::config_store::ConfigChange;
+use lightcode_server::process::Search;
+use lightcode_server::provider;
 use serde_json::json;
 
 const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
@@ -539,23 +541,15 @@ async fn shutting_the_server_down_releases_open_subscriptions() {
         .expect("the server stops rather than waiting on a stream that never ends");
 }
 
-/// Ticket 09 fills `providers` for real; this is the shape it will fill it
-/// with, which is all a streaming test needs.
+/// A provider snapshot that is not the one the configuration starts with, which
+/// is all a streaming test needs of it.
+///
+/// Ticket 09 turned this from a hand-built stand-in into the real thing — the
+/// result of a lookup that finds nothing, which is a perfectly ordinary snapshot
+/// and differs from the pending one every server starts with. A test about the
+/// change feed should be moving the value the feed actually carries; a literal
+/// here would go on compiling after the payload it imitates had changed shape.
 fn a_provider() -> Provider {
-    Provider {
-        instance_id: "claudeAgent".to_string(),
-        driver: "claudeAgent".to_string(),
-        display_name: "Claude Code".to_string(),
-        enabled: true,
-        installed: true,
-        version: Some("2.0.0".to_string()),
-        status: "ready".to_string(),
-        auth: ProviderAuth {
-            status: "authenticated".to_string(),
-        },
-        checked_at: "2026-07-26T00:00:00.000Z".to_string(),
-        models: Vec::new(),
-        slash_commands: Vec::new(),
-        skills: Vec::new(),
-    }
+    let settings = ServerConfig::detect().settings.providers.claude_agent;
+    provider::describe(&settings, &Search::over(&[]))
 }

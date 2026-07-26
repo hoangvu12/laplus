@@ -15,7 +15,7 @@
 //! | Field | Filled by |
 //! |---|---|
 //! | `repositoryIdentity` | tickets 19–21 — git, which is where a repository's canonical identity comes from |
-//! | `defaultModelSelection` | ticket 09, once model slugs are known |
+//! | `defaultModelSelection` | ticket 22 — the slugs exist as of ticket 09 (`crate::provider`), but a *per-project* default is a stored preference |
 //! | `scripts` | not in v1's scope at all; the contract requires the key |
 
 use std::path::{Path, PathBuf};

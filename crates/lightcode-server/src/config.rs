@@ -9,13 +9,20 @@
 //! response against a live one and requires each divergence to be declared, so
 //! the list below is enforced rather than aspirational.
 //!
-//! What is deliberately empty at this ticket, and who fills it:
+//! What is deliberately empty, and who fills it:
 //!
 //! | Field | Filled by |
 //! |---|---|
-//! | `providers` | ticket 09 — provider config and binary resolution |
 //! | `keybindings` | ticket 22 — settings and keybindings |
-//! | `settings.textGenerationModelSelection` | ticket 09, once model slugs are known |
+//! | `settings.textGenerationModelSelection` | ticket 22 — it is a stored preference, not something the CLI can be asked |
+//!
+//! `providers` is a third, and its emptiness is a *state* rather than a gap:
+//! ticket 09 fills it, but from [`crate::provider::refresh`] rather than from
+//! here. Assembling this payload starts no child process, so the first
+//! `server.getConfig` is answered without waiting on an agent that may not exist,
+//! and the UI renders "Checking provider status" — which is what upstream's own
+//! `getProviderSummary` does for an absent instance — until the answer arrives
+//! through the change feed.
 //!
 //! Two capability flags are *false rather than absent-and-assumed*: the
 //! contract reads every optional capability as "unsupported when missing", and
@@ -124,9 +131,12 @@ pub struct ConfigIssue {
     pub message: String,
 }
 
-/// A configured provider instance. Empty until ticket 09 resolves the `claude`
-/// binary; the type is here so the field's element shape is pinned rather than
-/// left to be discovered later.
+/// A configured provider instance: what the UI shows in its picker and routes a
+/// turn through. [`crate::provider`] builds them; this is only their shape.
+///
+/// Every field the reference server sends and this does not is declared in
+/// `tests/socket_conformance.rs` with the ticket that owns it, so the list of
+/// omissions is enforced rather than remembered.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {
@@ -135,19 +145,67 @@ pub struct Provider {
     pub display_name: String,
     pub enabled: bool,
     pub installed: bool,
+    /// `null` rather than absent when unknown: the contract types this as
+    /// `NullOr`, and a missing key would decode as a schema failure.
     pub version: Option<String>,
-    pub status: String,
+    pub status: ProviderState,
+    /// What the developer needs to know, when there is something. Optional in
+    /// the contract, so absent — not an empty string — when a provider is simply
+    /// working; the UI substitutes its own phrasing per state and would render an
+    /// empty sentence as a blank line under the provider's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub auth: ProviderAuth,
     pub checked_at: String,
-    pub models: Vec<serde_json::Value>,
+    pub models: Vec<ProviderModel>,
     pub slash_commands: Vec<serde_json::Value>,
     pub skills: Vec<serde_json::Value>,
+}
+
+/// How the UI should present a provider instance. The contract's
+/// `ServerProviderState`, as a closed set rather than a string, because these
+/// four literals are what the client dispatches on: `ready` fills the model
+/// picker, `warning` and `error` raise a banner, `disabled` hides the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderState {
+    Ready,
+    Warning,
+    Error,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAuth {
-    pub status: String,
+    pub status: AuthStatus,
+}
+
+/// Whether the agent has credentials. `Unknown` is the contract's own literal
+/// for "nothing looked", which is the honest answer until a ticket reads one —
+/// see [`crate::provider`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthStatus {
+    Authenticated,
+    Unauthenticated,
+    Unknown,
+}
+
+/// One model the UI may offer for this provider.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModel {
+    /// What the CLI is given as `--model`.
+    pub slug: String,
+    pub name: String,
+    pub is_custom: bool,
+    /// The reasoning-effort, fast-mode and context-window toggles the composer
+    /// shows for this model. `null`, which the contract permits and the client
+    /// reads as "no options", until the ticket that *sends* a turn can honour
+    /// them: advertising a toggle whose value this server would drop on the floor
+    /// is worse than not advertising it.
+    pub capabilities: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -190,7 +248,10 @@ pub struct ProviderSettings {
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSettings {
     pub enabled: bool,
-    /// Empty means "resolve from PATH". Ticket 09 owns the resolution.
+    /// Where the agent binary is, or what it is called. A value containing a
+    /// path separator is a *place*; anything else — including the default
+    /// `claude` and the empty string — is a name to look up on `PATH`. See
+    /// [`crate::provider::resolve`], which owns the rule.
     pub binary_path: String,
     pub home_path: String,
     pub launch_args: String,
@@ -206,6 +267,13 @@ pub struct ObservabilitySettings {
 
 impl ServerConfig {
     /// Assemble the config from the machine the server is running on.
+    ///
+    /// Not free — `available_editors` stats every candidate command against every
+    /// `PATH` entry — but it starts **no child process**, which is the property
+    /// that matters: this is called before the listener exists, and a server whose
+    /// startup waited on the agent answering would not start at all on a machine
+    /// where the agent is wedged. See [`crate::provider::refresh`], which is the
+    /// part that does wait, off the startup path.
     pub fn detect() -> Self {
         let data_dir = data_dir();
 
@@ -242,6 +310,7 @@ impl ServerConfig {
             keybindings_config_path: display_path(data_dir.join("keybindings.json"), "keybindings.json"),
             keybindings: Vec::new(),
             issues: Vec::new(),
+            // Empty until something has looked. See the module docs.
             providers: Vec::new(),
             available_editors: crate::editor::available(),
             observability: Observability {
