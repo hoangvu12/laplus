@@ -281,9 +281,10 @@ impl ServerConfig {
     }
 }
 
-/// Where lightcode keeps its own files: keybindings, logs, and later the
-/// SQLite database the persistence tickets need.
-fn data_dir() -> PathBuf {
+/// Where lightcode keeps its own files: keybindings, logs, and — since ticket
+/// 05 — the SQLite database. [`crate::store::default_path`] is the one caller
+/// outside this module.
+pub(crate) fn data_dir() -> PathBuf {
     for variable in ["LOCALAPPDATA", "APPDATA", "XDG_DATA_HOME"] {
         if let Some(base) = non_empty_env(variable) {
             return PathBuf::from(base).join("lightcode");

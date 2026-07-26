@@ -62,19 +62,30 @@ pub const BACKLOG: usize = 64;
 /// once when the subscription opens, and again whenever a subscriber falls far
 /// enough behind that resynchronising beats catching up.
 pub struct EventSource {
-    describe: Box<dyn Fn() -> Vec<Value> + Send>,
+    description: Box<dyn Fn() -> Vec<Value> + Send>,
     updates: broadcast::Receiver<Value>,
 }
 
 impl EventSource {
     pub fn new(
-        describe: impl Fn() -> Vec<Value> + Send + 'static,
+        description: impl Fn() -> Vec<Value> + Send + 'static,
         updates: broadcast::Receiver<Value>,
     ) -> EventSource {
         EventSource {
-            describe: Box::new(describe),
+            description: Box::new(description),
             updates,
         }
+    }
+
+    /// What this source would open with, right now.
+    ///
+    /// The primitive the rest of the module is built from: [`Self::resynchronise`]
+    /// is this plus a drain. A source may answer with *no* events — a
+    /// description it cannot currently produce is better withheld than replaced
+    /// with an empty one, which would be a positive claim about the world
+    /// rather than an absence of one.
+    pub fn describe(&self) -> Vec<Value> {
+        (self.description)()
     }
 
     /// Describe the world again, **discarding the backlog it supersedes**.
@@ -94,7 +105,7 @@ impl EventSource {
         // `Lagged` keeps the drain going: the sender can outrun it, and the
         // loop is done only when the receiver is empty or the feed has ended.
         while let Ok(_) | Err(TryRecvError::Lagged(_)) = self.updates.try_recv() {}
-        (self.describe)()
+        self.describe()
     }
 }
 

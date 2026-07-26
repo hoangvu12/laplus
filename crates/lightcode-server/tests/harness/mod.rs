@@ -25,11 +25,13 @@
 pub mod captures;
 pub mod shape;
 
+use std::path::Path;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use lightcode_server::config::ServerConfig;
 use lightcode_server::config_store::ConfigChange;
+use lightcode_server::store::Database;
 use lightcode_server::Server;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,12 +49,30 @@ pub struct TestServer {
 }
 
 impl TestServer {
+    /// A server whose registry lives only as long as it does. What every test
+    /// that is not about persistence wants: nothing is shared between tests,
+    /// and the developer's own project list is never touched.
     pub async fn start() -> TestServer {
         TestServer::start_with(ServerConfig::detect()).await
     }
 
     pub async fn start_with(config: ServerConfig) -> TestServer {
-        let server = Server::bind_with(0, config)
+        TestServer::start_on(config, Database::in_memory().expect("an in-memory database")).await
+    }
+
+    /// A server whose registry is a file. Start a second one on the same path
+    /// and that is a restart — which is how the "survives a restart" test is
+    /// driven without a second process.
+    pub async fn start_at(database: &Path) -> TestServer {
+        TestServer::start_on(
+            ServerConfig::detect(),
+            Database::open(database).expect("the database opens"),
+        )
+        .await
+    }
+
+    async fn start_on(config: ServerConfig, database: Database) -> TestServer {
+        let server = Server::bind_with(0, config, database)
             .await
             .expect("server binds to a free loopback port");
         TestServer { server }

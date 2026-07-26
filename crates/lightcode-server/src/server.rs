@@ -40,10 +40,12 @@ use tokio::sync::{mpsc, watch};
 use crate::auth::{self, Credential, UpgradeRequest};
 use crate::config::ServerConfig;
 use crate::config_store::ConfigStore;
+use crate::orchestration::Shell;
+use crate::rpc::{Answer, Services};
+use crate::store::{Database, StorageError};
 use crate::subscriptions::Subscriptions;
 use crate::wire::{Cause, ClientMessage, Exit, ServerMessage};
 use crate::{http, rpc};
-use crate::rpc::Answer;
 
 /// How many frames may be waiting for the socket before whoever produced them
 /// has to wait too.
@@ -58,7 +60,7 @@ const FRAME_QUEUE: usize = 64;
 /// Everything a connection can read. One instance, shared by every socket.
 #[derive(Debug)]
 pub struct ServerState {
-    config: ConfigStore,
+    services: Services,
     /// Flipped once when the server is asked to stop. Open sockets watch it,
     /// because `axum`'s graceful shutdown waits for connections to end and a
     /// long-lived socket never would on its own.
@@ -73,9 +75,9 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    fn new(config: ConfigStore, shutdown: watch::Receiver<bool>) -> Self {
+    fn new(services: Services, shutdown: watch::Receiver<bool>) -> Self {
         ServerState {
-            config,
+            services,
             shutdown,
             live_connections: AtomicUsize::new(0),
             live_subscriptions: Arc::new(AtomicUsize::new(0)),
@@ -86,7 +88,7 @@ impl ServerState {
     }
 
     pub fn config(&self) -> &ConfigStore {
-        &self.config
+        &self.services.config
     }
 
     /// Sockets currently open. A gauge rather than a counter: it is how
@@ -145,22 +147,62 @@ pub struct Server {
     serving: tokio::task::JoinHandle<()>,
 }
 
+/// Why the server did not start.
+///
+/// Two distinct failures with two distinct fixes — a port already in use is
+/// something the user can change, an unusable database is not — so they are not
+/// flattened into one `io::Error` whose message would have to guess which
+/// happened.
+#[derive(Debug)]
+pub enum StartupFailure {
+    Database(StorageError),
+    Listen { port: u16, error: std::io::Error },
+}
+
+impl std::fmt::Display for StartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupFailure::Database(error) => write!(formatter, "{error}"),
+            StartupFailure::Listen { port, error } => {
+                write!(formatter, "cannot listen on 127.0.0.1:{port}: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StartupFailure {}
+
 impl Server {
-    /// Bind to loopback on `port` and start serving. Port 0 asks the OS for a
-    /// free one, which is what the tests use.
+    /// Bind to loopback on `port`, open the registry, and start serving. Port 0
+    /// asks the OS for a free one, which is what the tests use.
     ///
     /// Loopback is not a default here, it is the security model: v1 has no
     /// identity store, so reachability *is* the boundary.
-    pub async fn bind(port: u16) -> std::io::Result<Server> {
-        Server::bind_with(port, ServerConfig::detect()).await
+    pub async fn bind(port: u16) -> Result<Server, StartupFailure> {
+        let database =
+            Database::open(&crate::store::default_path()).map_err(StartupFailure::Database)?;
+        Server::bind_with(port, ServerConfig::detect(), database)
+            .await
+            .map_err(|error| StartupFailure::Listen { port, error })
     }
 
-    pub async fn bind_with(port: u16, config: ServerConfig) -> std::io::Result<Server> {
+    /// Serve a database the caller already opened.
+    ///
+    /// The seam the tests use: an in-memory registry for the ones that have
+    /// nothing to say about persistence, and a temporary file for the ones that
+    /// do. It is not a test-only entry point — ticket 23's Tauri shell will
+    /// want the same control over where the app's state lives.
+    pub async fn bind_with(
+        port: u16,
+        config: ServerConfig,
+        database: Database,
+    ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
-        let state = Arc::new(ServerState::new(
-            ConfigStore::new(config),
-            shutdown.subscribe(),
-        ));
+        let services = Services {
+            config: ConfigStore::new(config),
+            shell: Shell::new(database),
+        };
+        let state = Arc::new(ServerState::new(services, shutdown.subscribe()));
 
         let app = Router::new()
             .route("/ws", get(upgrade))
@@ -303,7 +345,7 @@ impl Connection {
 
         match message {
             ClientMessage::Request { id, tag, payload } => {
-                match rpc::dispatch(self.state.config(), &tag, &payload) {
+                match rpc::dispatch(&self.state.services, &tag, &payload) {
                     Ok(Answer::Value(value)) => self.send(ServerMessage::success(id, value)).await,
                     // A subscription's first chunk comes from its own task, so
                     // there is nothing to write here. The `Request` is answered
@@ -479,7 +521,12 @@ mod tests {
     impl Loopback {
         fn new() -> Loopback {
             let state = Arc::new(ServerState::new(
-                ConfigStore::new(ServerConfig::detect()),
+                Services {
+                    config: ConfigStore::new(ServerConfig::detect()),
+                    shell: Shell::new(
+                        Database::in_memory().expect("an in-memory database"),
+                    ),
+                },
                 watch::channel(false).1,
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);

@@ -100,20 +100,20 @@ async fn concurrent_calls_are_correlated_by_request_id() {
     server.stop().await;
 }
 
-/// Fifty-nine of the sixty methods are unimplemented at this ticket, and the
-/// UI's own boot sequence asks for four of them. Each refusal must cost one
-/// call and nothing else.
+/// Most of the sixty methods are unimplemented at this ticket, and the UI's own
+/// boot sequence asks for several of them. Each refusal must cost one call and
+/// nothing else.
 #[tokio::test]
 async fn an_unimplemented_method_is_reported_without_dropping_the_connection() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    match client.call("orchestration.subscribeShell", json!({})).await {
+    match client.call("orchestration.subscribeThread", json!({})).await {
         Outcome::Failure(cause) => {
             assert_eq!(cause.len(), 1, "one cause entry: {cause:?}");
             assert_eq!(cause[0]["_tag"], "Fail");
             assert_eq!(cause[0]["error"]["_tag"], "ServerMethodNotImplementedError");
-            assert_eq!(cause[0]["error"]["method"], "orchestration.subscribeShell");
+            assert_eq!(cause[0]["error"]["method"], "orchestration.subscribeThread");
         }
         other => panic!("expected a typed failure, got {other:?}"),
     }

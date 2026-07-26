@@ -27,10 +27,13 @@ pub mod auth;
 pub mod config;
 pub mod config_store;
 pub mod http;
+pub mod orchestration;
+pub mod projects;
 pub mod protocol;
 pub mod rpc;
 pub mod server;
+pub mod store;
 pub mod subscriptions;
 pub mod wire;
 
-pub use server::{Server, ServerState};
+pub use server::{Server, ServerState, StartupFailure};

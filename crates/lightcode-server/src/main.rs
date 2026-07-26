@@ -24,8 +24,8 @@ async fn main() -> ExitCode {
 
     let server = match Server::bind(port).await {
         Ok(server) => server,
-        Err(error) => {
-            eprintln!("lightcode: cannot listen on 127.0.0.1:{port}: {error}");
+        Err(failure) => {
+            eprintln!("lightcode: {failure}");
             return ExitCode::FAILURE;
         }
     };
