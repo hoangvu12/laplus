@@ -125,6 +125,13 @@ It is left as it is here rather than patched with a guessed skip list
 hidden is a product decision and a wrong guess hides files silently. Ticket 25
 carries the fix.
 
+**Since closed.** Ticket 25 was built as part of ticket 07 — search made it
+urgent rather than optional — and the scan now asks
+`git ls-files --cached --others --exclude-standard`, keeping the walk described
+here as the fallback for a folder that is not a repository. Everything below
+about breadth-first truncation and the cycle guard still describes that
+fallback.
+
 ### The walk is breadth-first, and that is load-bearing
 
 A listing that stops at the limit stops somewhere, and where decides what the

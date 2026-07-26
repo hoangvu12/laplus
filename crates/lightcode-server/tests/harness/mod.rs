@@ -24,6 +24,7 @@
 
 pub mod captures;
 pub mod shape;
+pub mod workspace;
 
 use std::path::Path;
 use std::time::Duration;
@@ -389,12 +390,20 @@ impl Outcome {
     /// The typed error from a refused call, checked to be one the method
     /// declares.
     ///
-    /// The three assertions are the ones every refusal has to pass, and each is
-    /// a distinct way of failing the client. An error that is not `Fail` is not
-    /// a refusal at all; one whose `_tag` is not in the method's declared union
-    /// fails to decode and costs the call; and the message is often the whole
-    /// diagnostic the UI can show, so an absent one leaves the user with
-    /// nothing.
+    /// Two assertions, and each is a distinct way of failing the client: an
+    /// error that is not `Fail` is not a refusal at all, and one whose `_tag`
+    /// is not in the method's declared union fails to decode and costs the
+    /// call.
+    ///
+    /// **Not asserted here: a `message`.** Whether the sentence is on the wire
+    /// depends on the error's own schema. `ProjectReadFileError` declares
+    /// `message` as a field and carries it — see the captured payload in
+    /// `fixtures/socket-wire/03-typed-error.ndjson` — while every
+    /// `ExternalLauncher*` class defines `message` as a getter over its
+    /// structured fields, so the client computes it and the reference server
+    /// sends nothing. A blanket assertion here would force lightcode to send a
+    /// field the reference server does not. Tests that care assert on it
+    /// themselves.
     pub fn expect_declared(self, tag: &str) -> Value {
         match self {
             Outcome::Failure(cause) => {
@@ -403,10 +412,6 @@ impl Outcome {
                 assert_eq!(
                     cause[0]["error"]["_tag"], tag,
                     "the error must be one the method declares, or the client cannot decode it"
-                );
-                assert!(
-                    cause[0]["error"]["message"].is_string(),
-                    "a refusal owes the user a sentence: {cause:?}"
                 );
                 cause[0]["error"].clone()
             }

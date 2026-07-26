@@ -152,10 +152,6 @@ const UNCOMPARED: &[Declared] = &[
         because: "ticket 09 resolves the claude binary and fills this",
     },
     Declared {
-        path: "/availableEditors[]",
-        because: "story 18 — open in an external editor — detects installed editors",
-    },
-    Declared {
         path: "/settings/providers/claudeAgent/customModels[]",
         because: "empty in the capture too — no custom models were configured",
     },

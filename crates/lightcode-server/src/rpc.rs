@@ -1,12 +1,14 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Six are implemented — the
+//! The vocabulary is roughly sixty methods. Ten are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
-//! registry and the subscription that *is* the project list, and the two that
-//! read the disk for the folder picker and the file tree — and every other tag
-//! lands in the unknown-method path, which is itself part of the contract and
-//! is pinned by a capture.
+//! registry and the subscription that *is* the project list, the three that
+//! enumerate names on disk for the picker, the tree and the `@` mention, the
+//! two that open and save one of those files, and the one that hands a file to
+//! the developer's own editor — and every other tag lands in the
+//! unknown-method path, which is itself part of the contract and is pinned by
+//! a capture.
 //!
 //! Nothing in a `Request` says whether the answer will be one value, a stream
 //! of them, or a value that is not ready yet; that is knowledge the method name
@@ -18,7 +20,9 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::config_store::ConfigStore;
-use crate::filesystem::{self, Browse, ListEntries};
+use crate::editor::{self, OpenInEditor};
+use crate::files::{self, ReadFile, WriteFile};
+use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::orchestration::{self, Shell};
 use crate::subscriptions::EventSource;
 
@@ -40,6 +44,10 @@ pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
 pub struct Services {
     pub config: ConfigStore,
     pub shell: Shell,
+    /// The last scan of each workspace. Shared rather than per-connection: two
+    /// windows on one project are looking at one filesystem, and scanning it
+    /// twice would be paying twice for the same answer.
+    pub index: Index,
 }
 
 /// What a method answers with.
@@ -154,6 +162,34 @@ impl DispatchError {
     }
 }
 
+/// A typed error under `tag`, carrying a sentence and nothing else.
+///
+/// Every method that parses a payload needs this shape for the case where the
+/// payload was not one — a missing field, a blank path, a number where a string
+/// belongs. There is deliberately no `failure` code: each method's failure
+/// literals describe things that went wrong with a request that *was*
+/// well-formed, and none of them describes a request that never arrived
+/// properly. The field is optional on the wire, so leaving it out still decodes.
+pub fn declared(tag: &str, message: impl std::fmt::Display) -> Value {
+    serde_json::json!({"_tag": tag, "message": message.to_string()})
+}
+
+/// A required string from a payload, trimmed, or the method's own refusal.
+///
+/// The contract types these as `TrimmedNonEmptyString` throughout, so a blank
+/// one is not a value — and letting one through would mean a workspace root of
+/// `""` reaching the disk, where it means the process's own directory.
+pub fn non_blank(value: &str, tag: &str, subject: &str) -> Result<String, Value> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(declared(
+            tag,
+            format_args!("This call needs a {subject}; none was given."),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Answer one call.
 pub fn dispatch(
     services: &Services,
@@ -171,18 +207,43 @@ pub fn dispatch(
             .map(Answer::Value)
             .map_err(|refusal| DispatchError::Declared(refusal.to_error())),
         orchestration::SUBSCRIBE_SHELL => Ok(Answer::Stream(services.shell.subscribe(payload))),
-        // Both filesystem methods read their payload here and do their work
-        // elsewhere. Reading is arithmetic on a string, so a malformed call is
-        // refused immediately rather than after a thread has been found for it;
-        // everything after that is disk.
+        // Every method that touches a disk reads its payload here and does its
+        // work elsewhere. Reading is arithmetic on a string, so a malformed
+        // call is refused immediately rather than after a thread has been found
+        // for it; everything after that is I/O.
         filesystem::BROWSE => Browse::read(payload)
             .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
             .map_err(DispatchError::Declared),
         filesystem::LIST_ENTRIES => ListEntries::read(payload)
+            .map(|call| deferred_with(&services.index, |index| call.run(index)))
+            .map_err(DispatchError::Declared),
+        filesystem::SEARCH_ENTRIES => SearchEntries::read(payload)
+            .map(|call| deferred_with(&services.index, |index| call.run(index)))
+            .map_err(DispatchError::Declared),
+        files::READ_FILE => ReadFile::read(payload)
+            .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
+            .map_err(DispatchError::Declared),
+        files::WRITE_FILE => WriteFile::read(payload)
+            .map(|call| deferred_with(&services.index, |index| call.run(index)))
+            .map_err(DispatchError::Declared),
+        editor::OPEN_IN_EDITOR => OpenInEditor::read(payload)
             .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
             .map_err(DispatchError::Declared),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
+}
+
+/// Defer work that needs the workspace index.
+///
+/// The index outlives the call by design — it is the server's, not the
+/// connection's — so the closure takes a clone rather than a borrow of
+/// `Services`, which the deferred task cannot hold.
+fn deferred_with(
+    index: &Index,
+    work: impl FnOnce(&Index) -> Result<Value, Value> + Send + 'static,
+) -> Answer {
+    let index = index.clone();
+    Answer::Deferred(Deferred::new(move || work(&index)))
 }
 
 #[cfg(test)]
@@ -196,6 +257,7 @@ mod tests {
         Services {
             config: ConfigStore::new(ServerConfig::detect()),
             shell: Shell::new(Database::in_memory().expect("an in-memory database")),
+            index: Index::new(),
         }
     }
 

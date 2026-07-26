@@ -17,28 +17,9 @@ mod harness;
 use std::path::Path;
 use std::time::Duration;
 
+use harness::workspace::{inside, names, paths, Workspace};
 use harness::{Outcome, SocketClient, TestServer};
-use serde_json::{json, Value};
-
-/// A tree written out from a list of paths. A path ending in `/` is an empty
-/// directory; anything else is a file.
-fn tree(root: &Path, paths: &[&str]) {
-    for path in paths {
-        let full = root.join(path.trim_end_matches('/'));
-        if path.ends_with('/') {
-            std::fs::create_dir_all(&full).expect("creates the directory");
-        } else {
-            std::fs::create_dir_all(full.parent().expect("a parent")).expect("creates the parents");
-            std::fs::write(&full, "contents").expect("writes the file");
-        }
-    }
-}
-
-/// A path with the platform's separator on the end — what the picker sends once
-/// the user has finished typing a directory name.
-fn inside(path: &Path) -> String {
-    format!("{}{}", path.to_string_lossy(), std::path::MAIN_SEPARATOR)
-}
+use serde_json::json;
 
 async fn browse(client: &mut SocketClient, partial_path: &str) -> Outcome {
     client
@@ -55,52 +36,30 @@ async fn list_entries(client: &mut SocketClient, cwd: &Path) -> Outcome {
         .await
 }
 
-fn names(browsed: &Value) -> Vec<&str> {
-    browsed["entries"]
-        .as_array()
-        .unwrap_or_else(|| panic!("an array of entries: {browsed}"))
-        .iter()
-        .map(|entry| entry["name"].as_str().expect("a name"))
-        .collect()
-}
-
-fn paths(listed: &Value) -> Vec<&str> {
-    listed["entries"]
-        .as_array()
-        .unwrap_or_else(|| panic!("an array of entries: {listed}"))
-        .iter()
-        .map(|entry| entry["path"].as_str().expect("a path"))
-        .collect()
-}
-
 /// The ticket's first line, at the seam the user meets it: the palette walks the
 /// filesystem one directory per keystroke, offering folders and nothing else.
 #[tokio::test]
 async fn the_filesystem_can_be_browsed_to_pick_a_folder_for_a_new_project() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(
-        directory.path(),
-        &[
+    let workspace = Workspace::with(&[
             "projects/lightcode/src/",
             "projects/lighthouse/",
             "projects/notes.md",
             "photos/",
-        ],
-    );
+        ]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
     // "…\" — the user has finished a directory name and wants what is in it.
-    let listed = browse(&mut client, &inside(directory.path()))
+    let listed = browse(&mut client, &workspace.inside())
         .await
         .expect_success();
-    assert_eq!(listed["parentPath"], json!(directory.path().to_string_lossy()));
+    assert_eq!(listed["parentPath"], json!(workspace.path().to_string_lossy()));
     assert_eq!(names(&listed), ["photos", "projects"]);
 
     // "…\projects\light" — part way through the next name. Folders only: the
     // markdown file beside them is not somewhere a project can live.
-    let projects = directory.path().join("projects");
+    let projects = workspace.path().join("projects");
     let filtered = browse(&mut client, &format!("{}light", inside(&projects)))
         .await
         .expect_success();
@@ -141,21 +100,17 @@ async fn the_filesystem_can_be_browsed_to_pick_a_folder_for_a_new_project() {
 /// paths.
 #[tokio::test]
 async fn an_open_project_lists_its_tree_in_one_answer() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(
-        directory.path(),
-        &[
+    let workspace = Workspace::with(&[
             "src/main.rs",
             "src/lib/util.rs",
             "README.md",
             ".git/objects/ab/cdef",
-        ],
-    );
+        ]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    let listed = list_entries(&mut client, directory.path())
+    let listed = list_entries(&mut client, workspace.path())
         .await
         .expect_success();
 
@@ -180,16 +135,12 @@ async fn an_open_project_lists_its_tree_in_one_answer() {
 /// socket rather than in the walk.
 #[tokio::test]
 async fn listings_are_correct_for_spaces_and_non_ascii_names() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(
-        directory.path(),
-        &["my documents/note book.txt", "café/naïve.txt", "日本語/ファイル.txt"],
-    );
+    let workspace = Workspace::with(&["my documents/note book.txt", "café/naïve.txt", "日本語/ファイル.txt"]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    let listed = list_entries(&mut client, directory.path())
+    let listed = list_entries(&mut client, workspace.path())
         .await
         .expect_success();
     let paths = paths(&listed);
@@ -205,7 +156,7 @@ async fn listings_are_correct_for_spaces_and_non_ascii_names() {
     }
 
     // And the picker offers them back under the same names.
-    let browsed = browse(&mut client, &inside(directory.path()))
+    let browsed = browse(&mut client, &workspace.inside())
         .await
         .expect_success();
     assert_eq!(names(&browsed), ["café", "my documents", "日本語"]);
@@ -223,9 +174,9 @@ async fn listings_are_correct_for_spaces_and_non_ascii_names() {
 /// both impossible — every frame behind it would wait for the disk.
 #[tokio::test]
 async fn a_large_repository_does_not_stall_the_connection_while_it_is_listed() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
+    let workspace = Workspace::with(&[]);
     for folder in 0..40 {
-        let path = directory.path().join(format!("package-{folder:02}")).join("src");
+        let path = workspace.path().join(format!("package-{folder:02}")).join("src");
         std::fs::create_dir_all(&path).expect("creates the folder");
         for file in 0..50 {
             std::fs::write(path.join(format!("module-{file:02}.ts")), "export {};\n")
@@ -247,7 +198,7 @@ async fn a_large_repository_does_not_stall_the_connection_while_it_is_listed() {
     let listing = client
         .send_request(
             "projects.listEntries",
-            json!({"cwd": directory.path().to_string_lossy()}),
+            json!({"cwd": workspace.path().to_string_lossy()}),
         )
         .await;
     client.send(json!({"_tag": "Ping"})).await;
@@ -274,8 +225,8 @@ async fn a_large_repository_does_not_stall_the_connection_while_it_is_listed() {
 /// and the connection carries on.
 #[tokio::test]
 async fn a_path_that_cannot_be_read_fails_only_its_own_call() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    let missing = directory.path().join("not-there");
+    let workspace = Workspace::with(&[]);
+    let missing = workspace.path().join("not-there");
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
@@ -311,7 +262,7 @@ async fn a_path_that_cannot_be_read_fails_only_its_own_call() {
         Outcome::Success(_)
     ));
     assert!(matches!(
-        list_entries(&mut client, directory.path()).await,
+        list_entries(&mut client, workspace.path()).await,
         Outcome::Success(_)
     ));
 
@@ -325,8 +276,7 @@ async fn a_path_that_cannot_be_read_fails_only_its_own_call() {
 /// them off the read loop safe in the first place.
 #[tokio::test]
 async fn concurrent_listings_are_correlated_by_request_id() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(directory.path(), &["first/only-here.txt", "second/and-here.txt"]);
+    let workspace = Workspace::with(&["first/only-here.txt", "second/and-here.txt"]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
@@ -334,13 +284,13 @@ async fn concurrent_listings_are_correlated_by_request_id() {
     let first = client
         .send_request(
             "projects.listEntries",
-            json!({"cwd": directory.path().join("first").to_string_lossy()}),
+            json!({"cwd": workspace.path().join("first").to_string_lossy()}),
         )
         .await;
     let second = client
         .send_request(
             "projects.listEntries",
-            json!({"cwd": directory.path().join("second").to_string_lossy()}),
+            json!({"cwd": workspace.path().join("second").to_string_lossy()}),
         )
         .await;
 
@@ -361,15 +311,14 @@ async fn concurrent_listings_are_correlated_by_request_id() {
 /// is accounted for as gone, and the next client is served normally.
 #[tokio::test]
 async fn a_client_that_leaves_mid_listing_leaves_nothing_behind() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(directory.path(), &["src/main.rs"]);
+    let workspace = Workspace::with(&["src/main.rs"]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
     client
         .send_request(
             "projects.listEntries",
-            json!({"cwd": directory.path().to_string_lossy()}),
+            json!({"cwd": workspace.path().to_string_lossy()}),
         )
         .await;
     client.abandon();
@@ -378,7 +327,7 @@ async fn a_client_that_leaves_mid_listing_leaves_nothing_behind() {
     assert_eq!(server.live_subscriptions(), 0);
 
     let mut client = server.connect().await;
-    let listed = list_entries(&mut client, directory.path())
+    let listed = list_entries(&mut client, workspace.path())
         .await
         .expect_success();
     assert_eq!(paths(&listed), ["src", "src/main.rs"]);
@@ -397,13 +346,12 @@ async fn a_client_that_leaves_mid_listing_leaves_nothing_behind() {
 /// decodes as a boolean, and is `false` for a workspace that fits.
 #[tokio::test]
 async fn a_listing_that_fits_is_not_reported_as_partial() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(directory.path(), &["one.txt", "two.txt"]);
+    let workspace = Workspace::with(&["one.txt", "two.txt"]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    let listed = list_entries(&mut client, directory.path())
+    let listed = list_entries(&mut client, workspace.path())
         .await
         .expect_success();
     assert_eq!(listed["truncated"], json!(false));
@@ -418,16 +366,15 @@ async fn a_listing_that_fits_is_not_reported_as_partial() {
 /// also is.
 #[tokio::test]
 async fn reading_the_disk_opens_no_subscription() {
-    let directory = tempfile::tempdir().expect("a temporary directory");
-    tree(directory.path(), &["src/main.rs"]);
+    let workspace = Workspace::with(&["src/main.rs"]);
 
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    browse(&mut client, &inside(directory.path()))
+    browse(&mut client, &workspace.inside())
         .await
         .expect_success();
-    list_entries(&mut client, directory.path())
+    list_entries(&mut client, workspace.path())
         .await
         .expect_success();
 

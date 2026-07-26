@@ -15,7 +15,6 @@
 //! |---|---|
 //! | `providers` | ticket 09 — provider config and binary resolution |
 //! | `keybindings` | ticket 22 — settings and keybindings |
-//! | `availableEditors` | story 18 — open in an external editor |
 //! | `settings.textGenerationModelSelection` | ticket 09, once model slugs are known |
 //!
 //! Two capability flags are *false rather than absent-and-assumed*: the
@@ -244,7 +243,7 @@ impl ServerConfig {
             keybindings: Vec::new(),
             issues: Vec::new(),
             providers: Vec::new(),
-            available_editors: Vec::new(),
+            available_editors: crate::editor::available(),
             observability: Observability {
                 logs_directory_path: display_path(data_dir.join("logs"), "logs"),
                 local_tracing_enabled: false,

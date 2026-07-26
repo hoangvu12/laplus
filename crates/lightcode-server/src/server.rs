@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, watch};
 use crate::auth::{self, Credential, UpgradeRequest};
 use crate::config::ServerConfig;
 use crate::config_store::ConfigStore;
+use crate::filesystem::Index;
 use crate::orchestration::Shell;
 use crate::rpc::{Answer, Deferred, Services};
 use crate::store::{Database, StorageError};
@@ -205,6 +206,7 @@ impl Server {
         let services = Services {
             config: ConfigStore::new(config),
             shell: Shell::new(database),
+            index: Index::new(),
         };
         let state = Arc::new(ServerState::new(services, shutdown.subscribe()));
 
@@ -564,6 +566,7 @@ mod tests {
                     shell: Shell::new(
                         Database::in_memory().expect("an in-memory database"),
                     ),
+                    index: Index::new(),
                 },
                 watch::channel(false).1,
             ));

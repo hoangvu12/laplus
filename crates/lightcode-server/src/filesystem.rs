@@ -1,14 +1,22 @@
-//! Reading the disk: the folder picker, and the file tree.
+//! Enumerating names on disk: the folder picker, the file tree, and the search
+//! behind them.
 //!
-//! Two method tags land here, and their namespaces are upstream's rather than a
-//! boundary — `filesystem.browse` and `projects.listEntries` are the same
-//! question asked at two scales:
+//! Three method tags land here, and their namespaces are upstream's rather than
+//! a boundary — they are the same question asked at three scales, which is why
+//! upstream groups them in one service too (`WorkspaceEntries`):
 //!
 //! - **browse** is one directory, directories only, filtered by a prefix. It is
 //!   what the command palette drives while a user types a path into "add
 //!   project", so it is called once per keystroke and must stay small.
 //! - **listEntries** is a whole workspace, files and directories, in one
 //!   answer. It is what the file tree renders from.
+//! - **searchEntries** is that same workspace filtered by a fragment of a path.
+//!   It is what the composer's `@` mention drives, debounced at 120 ms, so it
+//!   reads [`Index`] rather than the disk.
+//!
+//! Reading and writing the *contents* of one of these files is
+//! [`crate::files`], which is a different concern with a different rule — it
+//! confines itself to a workspace root, and nothing here does.
 //!
 //! ## The file tree is not fetched a directory at a time
 //!
@@ -32,13 +40,13 @@
 //!
 //! ## Scope, and why there is no path confinement here
 //!
-//! Neither method restricts where it may look, and that is deliberate rather
+//! No method here restricts where it may look, and that is deliberate rather
 //! than overlooked: the folder picker's whole purpose is to walk a filesystem
 //! the server has no project for yet, so a confinement rule would have to admit
 //! every path anyway. Reachability is the boundary — the socket is bound to
-//! loopback (see [`crate::server`]) — and both methods only ever *read*.
-//! Ticket 07's `projects.readFile` and `projects.writeFile` are a different
-//! case and do confine themselves to a workspace root.
+//! loopback (see [`crate::server`]) — and everything here only ever *reads*.
+//! [`crate::files`] is the module that does confine itself, because it is the
+//! one that writes.
 //!
 //! Shapes are hand-written from `FilesystemBrowseResult` and
 //! `ProjectListEntriesResult` in `t3code/packages/contracts/src/filesystem.ts`
@@ -46,19 +54,31 @@
 //! captured in `fixtures/socket-wire/03-typed-error.ndjson` — the one typed
 //! error of this family that was recorded from the reference server.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::projects::{expand_home, Rejection, WorkspaceRoot};
+use crate::rpc::{declared, non_blank};
 
 /// One directory, for the folder picker.
 pub const BROWSE: &str = "filesystem.browse";
 
+/// The `_tag` each of the three methods refuses under. The client decodes
+/// against the error union its own method declares, so these are not
+/// interchangeable.
+const BROWSE_ERROR: &str = "FilesystemBrowseError";
+const LIST_ERROR: &str = "ProjectListEntriesError";
+const SEARCH_ERROR: &str = "ProjectSearchEntriesError";
+
 /// A whole workspace, for the file tree.
 pub const LIST_ENTRIES: &str = "projects.listEntries";
+
+/// That workspace filtered by a fragment of a path, for the `@` mention.
+pub const SEARCH_ENTRIES: &str = "projects.searchEntries";
 
 /// The most entries one listing will carry.
 ///
@@ -72,16 +92,14 @@ pub const LIST_ENTRIES: &str = "projects.listEntries";
 /// about the *quality* of the answer rather than about termination.
 pub const MAX_ENTRIES: usize = 25_000;
 
-/// The directory the walk never descends into.
+/// The directory the fallback walk never descends into.
 ///
-/// Not an ignore-file implementation and not the start of one — lightcode has
-/// no `.gitignore` semantics, and
-/// `.scratch/rust-server-tauri/issues/06-filesystem-browse-file-tree.md` says
-/// what that costs. This single name is here because it is the one directory
-/// that is present in every repository, is machine state rather than source,
-/// and is large enough on its own to spend the whole of [`MAX_ENTRIES`] on
-/// loose objects. Upstream's indexer does not surface it either, so a tree that
-/// showed it would be a visible difference from the UI's own expectations.
+/// Only the walk needs this: the repository path below asks git, and git has
+/// never listed its own directory. It is here because the walk is what runs on
+/// a folder that is *not* a repository, where `.git` may still exist — a
+/// checkout with a broken index, a worktree git will not answer for — and it is
+/// the one directory that is machine state rather than source and is large
+/// enough on its own to spend the whole of [`MAX_ENTRIES`] on loose objects.
 const NEVER_WALKED: &str = ".git";
 
 // ---------------------------------------------------------------------------
@@ -109,11 +127,11 @@ impl Browse {
     /// Read the payload, or refuse with the error the method declares.
     pub fn read(payload: &Value) -> Result<Browse, Value> {
         let read: BrowsePayload = serde_json::from_value(payload.clone())
-            .map_err(|error| malformed_browse(&format!("filesystem.browse is malformed: {error}")))?;
+            .map_err(|error| declared(BROWSE_ERROR, format_args!("filesystem.browse is malformed: {error}")))?;
 
         let partial_path = read.partial_path.trim().to_string();
         if partial_path.is_empty() {
-            return Err(malformed_browse("A browse needs a path; none was given."));
+            return Err(declared(BROWSE_ERROR, "A browse needs a path; none was given."));
         }
 
         Ok(Browse {
@@ -198,7 +216,7 @@ impl Browse {
     /// `relativePath` alongside the diagnosis.
     fn to_error(&self, rejection: &BrowseRejection) -> Value {
         let mut error = json!({
-            "_tag": "FilesystemBrowseError",
+            "_tag": BROWSE_ERROR,
             "partialPath": self.partial_path,
             "failure": rejection.failure(),
             "message": rejection.message(&self.partial_path),
@@ -347,14 +365,6 @@ impl BrowseRejection {
     }
 }
 
-/// A payload that did not decode. `failure` is deliberately absent: the
-/// contract's three literals all describe a path that was read and refused, and
-/// none of them describes a request that never named a path at all. The field
-/// is optional on the wire, so the client decodes the error and shows the
-/// message.
-fn malformed_browse(message: &str) -> Value {
-    json!({"_tag": "FilesystemBrowseError", "message": message})
-}
 
 // ---------------------------------------------------------------------------
 // projects.listEntries
@@ -375,24 +385,24 @@ struct ListEntriesPayload {
 impl ListEntries {
     pub fn read(payload: &Value) -> Result<ListEntries, Value> {
         let read: ListEntriesPayload = serde_json::from_value(payload.clone()).map_err(|error| {
-            malformed_listing(&format!("projects.listEntries is malformed: {error}"))
+            declared(LIST_ERROR, format_args!("projects.listEntries is malformed: {error}"))
         })?;
 
-        let cwd = read.cwd.trim().to_string();
-        if cwd.is_empty() {
-            return Err(malformed_listing(
-                "A listing needs a workspace root; none was given.",
-            ));
-        }
-
-        Ok(ListEntries { cwd })
+        Ok(ListEntries {
+            cwd: non_blank(&read.cwd, LIST_ERROR, "workspace root")?,
+        })
     }
 
     /// Do the work. Blocking, and called from a blocking task — a cold
     /// repository of twenty thousand files is seconds of disk, not microseconds
     /// of memory.
-    pub fn run(self) -> Result<Value, Value> {
-        match list(&self.cwd, MAX_ENTRIES) {
+    ///
+    /// Always rescans. This is the UI saying "show me this project", on opening
+    /// it and on the refresh button, and answering either of those from a held
+    /// scan would show the user a tree they had just asked to have redrawn.
+    pub fn run(self, index: &Index) -> Result<Value, Value> {
+        let root = WorkspaceRoot::check(&self.cwd).map_err(|rejection| self.to_error(&rejection))?;
+        match index.rescan(&root, MAX_ENTRIES) {
             Ok(listing) => Ok(listing.to_value()),
             Err(rejection) => Err(self.to_error(&rejection)),
         }
@@ -409,7 +419,7 @@ impl ListEntries {
     /// this method's contract rather than about the folder.
     fn to_error(&self, rejection: &Rejection) -> Value {
         let mut error = json!({
-            "_tag": "ProjectListEntriesError",
+            "_tag": LIST_ERROR,
             "cwd": self.cwd,
             "failure": listing_failure(rejection),
             "message": rejection.message(),
@@ -444,13 +454,182 @@ fn listing_failure(rejection: &Rejection) -> &'static str {
     }
 }
 
-/// A payload that did not name a workspace root. `failure` and `normalizedCwd`
-/// are optional on the wire — the contract keeps them optional so a newer
-/// client can decode an older server's message-only failure — so a request that
-/// never got as far as a path can leave both out and still arrive as a failed
-/// call rather than a broken connection.
-fn malformed_listing(message: &str) -> Value {
-    json!({"_tag": "ProjectListEntriesError", "message": message})
+
+// ---------------------------------------------------------------------------
+// projects.searchEntries
+// ---------------------------------------------------------------------------
+
+/// The most matches a client may ask for, from `ProjectSearchEntriesInput`.
+/// The composer asks for eighty.
+const MAX_MATCHES: usize = 200;
+
+/// A validated `projects.searchEntries` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchEntries {
+    cwd: String,
+    /// Lower-cased and stripped, ready to match against a lower-cased path.
+    query: String,
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchEntriesPayload {
+    cwd: String,
+    query: String,
+    limit: usize,
+}
+
+impl SearchEntries {
+    pub fn read(payload: &Value) -> Result<SearchEntries, Value> {
+        let read: SearchEntriesPayload = serde_json::from_value(payload.clone()).map_err(|error| {
+            declared(SEARCH_ERROR, format_args!("projects.searchEntries is malformed: {error}"))
+        })?;
+
+        Ok(SearchEntries {
+            cwd: non_blank(&read.cwd, SEARCH_ERROR, "workspace root")?,
+            query: normalise_query(&read.query),
+            // The contract caps the limit and the client already honours it, so
+            // this is a clamp rather than a refusal — a client asking for too
+            // much gets as much as the contract allows rather than an error it
+            // cannot act on. Zero would mean "no matches, and also truncated",
+            // which is not an answer, so it takes at least one.
+            limit: read.limit.clamp(1, MAX_MATCHES),
+        })
+    }
+
+    /// Answer from the held scan, scanning only if there is none.
+    ///
+    /// This is a keystroke — the composer debounces at 120 ms and the user is
+    /// mid-word — so it must not cost a repository scan. What it can cost is
+    /// being one write behind, and [`Index::forget`] is what keeps that bounded.
+    pub fn run(self, index: &Index) -> Result<Value, Value> {
+        let root = WorkspaceRoot::check(&self.cwd).map_err(|rejection| self.to_error(&rejection))?;
+        let listing = index
+            .current(&root, MAX_ENTRIES)
+            .map_err(|rejection| self.to_error(&rejection))?;
+
+        // An empty query is not "match everything": the composer only sends one
+        // once the user has typed after the `@`, and answering the whole
+        // workspace would put a thousand unrelated files under the cursor.
+        let matched: Vec<&Entry> = if self.query.is_empty() {
+            Vec::new()
+        } else {
+            listing
+                .entries
+                .iter()
+                .filter(|entry| entry.path.to_lowercase().contains(&self.query))
+                .collect()
+        };
+
+        Ok(json!({
+            "entries": matched
+                .iter()
+                .take(self.limit)
+                .map(|entry| entry.to_value())
+                .collect::<Vec<Value>>(),
+            "truncated": matched.len() > self.limit,
+        }))
+    }
+
+    fn to_error(&self, rejection: &Rejection) -> Value {
+        let mut error = declared(SEARCH_ERROR, rejection.message());
+        error["cwd"] = json!(self.cwd);
+        error["queryLength"] = json!(self.query.len());
+        error["limit"] = json!(self.limit);
+        error["failure"] = json!(listing_failure(rejection));
+        error
+    }
+}
+
+/// What the client typed, reduced to what it can be matched on.
+///
+/// The leading `@`, `.` and `/` come off because the composer sends the mention
+/// trigger along with the fragment — upstream strips exactly these
+/// (`WorkspaceEntries.search`), and a query of `@src` would otherwise match
+/// nothing at all.
+fn normalise_query(query: &str) -> String {
+    query
+        .trim()
+        .trim_start_matches(['@', '.', '/'])
+        .to_lowercase()
+}
+
+
+// ---------------------------------------------------------------------------
+// The scan behind listEntries and searchEntries
+// ---------------------------------------------------------------------------
+
+/// The last scan of each workspace, so a burst of searches costs one.
+///
+/// The composer debounces its `@` mention at 120 ms and asks for eighty
+/// matches; scanning a repository takes tens to hundreds of milliseconds. One
+/// scan per keystroke would be the difference between a picker that keeps up
+/// with typing and one that does not, so the scan is held and the search reads
+/// it.
+///
+/// **Freshness is decided by which method is asking, not by a clock.**
+/// `listEntries` is the UI saying "show me this project" — on opening it, and
+/// on the refresh button — so it always rescans and leaves the result here.
+/// `searchEntries` is a keystroke, so it takes whatever is here and only scans
+/// when there is nothing. A write invalidates ([`Index::forget`]), which is
+/// what upstream's indexer does too. Ticket 08's watcher is what will make this
+/// track changes the agent makes, and it will invalidate through the same door.
+///
+/// No expiry: an entry costs one workspace's paths and is replaced on the next
+/// `listEntries`. A time-to-live would be a guess at how stale is too stale,
+/// and the honest answer to that is the watcher rather than a number.
+#[derive(Debug, Clone, Default)]
+pub struct Index {
+    /// Keyed by [`WorkspaceRoot::canonical`], so two spellings of one folder
+    /// share a scan rather than each paying for their own.
+    scans: Arc<Mutex<HashMap<String, Arc<Listing>>>>,
+}
+
+impl Index {
+    pub fn new() -> Index {
+        Index::default()
+    }
+
+    /// Scan now, and keep the result.
+    fn rescan(&self, root: &WorkspaceRoot, limit: usize) -> Result<Arc<Listing>, Rejection> {
+        let listing = Arc::new(scan(root, limit)?);
+        self.hold(root.canonical(), Arc::clone(&listing));
+        Ok(listing)
+    }
+
+    /// Whatever was last scanned, scanning only if nothing was.
+    fn current(&self, root: &WorkspaceRoot, limit: usize) -> Result<Arc<Listing>, Rejection> {
+        if let Some(held) = self.held(root.canonical()) {
+            return Ok(held);
+        }
+        self.rescan(root, limit)
+    }
+
+    /// Drop what is held for a workspace, so the next reader scans.
+    ///
+    /// Takes the path as the client spelled it and canonicalises it here: a
+    /// write names the workspace the same way the listing did, but there is no
+    /// guarantee the two calls spelled it identically.
+    pub fn forget(&self, cwd: &str) {
+        if let Ok(root) = WorkspaceRoot::check(cwd) {
+            self.lock().remove(root.canonical());
+        }
+    }
+
+    fn held(&self, key: &str) -> Option<Arc<Listing>> {
+        self.lock().get(key).map(Arc::clone)
+    }
+
+    fn hold(&self, key: &str, listing: Arc<Listing>) {
+        self.lock().insert(key.to_string(), listing);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Listing>>> {
+        self.scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// What a workspace holds, as the file tree reads it.
@@ -501,6 +680,113 @@ impl Kind {
     }
 }
 
+/// Describe a workspace: what git says is in it, or a plain walk if git will
+/// not say.
+///
+/// **Asking git is how lightcode gets ignore semantics without owning any.**
+/// A file tree that shows `node_modules` is not merely untidy — the entry limit
+/// is finite, and in a JavaScript project the ignored files exhaust it before
+/// the walk reaches the user's own source, so the tree renders with
+/// `packages/web/src` present and empty. Ticket 25 is where that was decided;
+/// the short version is that `.gitignore` has enough subtlety (negations,
+/// anchoring, nested files) that implementing it approximately would hide files
+/// silently, and the two honest options were a matcher crate — which roughly
+/// doubles the dependency graph of a project whose whole reason is size — or
+/// the tool that already knows the answer.
+///
+/// The spec already commits to shelling out to `git` for the git tickets, so
+/// this adds no dependency and no bytes.
+///
+/// Two calls rather than one, and the second is not optional: `--cached` lists
+/// what the *index* holds, which includes files the user has deleted without
+/// staging the deletion. A tree that offered those would offer files that are
+/// not there, and ticket 07's read would fail on every one of them.
+fn scan(root: &WorkspaceRoot, limit: usize) -> Result<Listing, Rejection> {
+    let directory = Path::new(root.display());
+    match tracked(directory) {
+        Some(files) => Ok(listing_of(files, limit)),
+        None => walk(directory, limit),
+    }
+}
+
+/// The paths git says are in the working tree, or `None` when it will not
+/// answer — git is not installed, or this folder is not a repository.
+fn tracked(root: &Path) -> Option<Vec<String>> {
+    let present = git(
+        root,
+        &["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    )?;
+    // A failure here is not a reason to abandon a listing git has already
+    // given: the worst case is a handful of deleted files shown as present,
+    // which is better than falling back to a walk that shows every ignored one.
+    let gone: HashSet<String> = git(root, &["ls-files", "--deleted", "-z"])
+        .map(|deleted| split_nul(&deleted).collect())
+        .unwrap_or_default();
+
+    Some(
+        split_nul(&present)
+            .filter(|path| !gone.contains(path))
+            .collect(),
+    )
+}
+
+/// Run one `git` and take its output, or `None` if it did not succeed.
+fn git(root: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root).args(arguments);
+    let output = crate::process::without_a_console(&mut command).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// `-z` output: NUL-separated, and unquoted whatever `core.quotePath` says —
+/// which is the reason for asking for it in the first place, because the
+/// default quoting would mangle every non-ASCII name.
+fn split_nul(output: &[u8]) -> impl Iterator<Item = String> + '_ {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| String::from_utf8_lossy(piece).into_owned())
+}
+
+/// Turn a flat list of files into the tree the client decodes.
+///
+/// Git names files and never the directories holding them, so the ancestors are
+/// synthesised — the same manoeuvre upstream's indexer makes
+/// (`withDirectoryAncestors`), for the same reason: the tree splits paths and
+/// needs a node to hang each level on.
+///
+/// One consequence is worth naming: a directory with no files under it does not
+/// appear, because git has nothing to say about it. An empty folder is
+/// invisible in the tree until something is put in it.
+fn listing_of(files: Vec<String>, limit: usize) -> Listing {
+    let mut known: HashMap<String, Kind> = HashMap::new();
+    for file in files {
+        let mut ancestor = file.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if known.insert(parent.to_string(), Kind::Directory).is_some() {
+                // This parent was reached before, so every parent above it was
+                // too.
+                break;
+            }
+            ancestor = parent;
+        }
+        known.insert(file, Kind::File);
+    }
+
+    let mut entries: Vec<Entry> = known
+        .into_iter()
+        .map(|(path, kind)| Entry { path, kind })
+        .collect();
+    entries.sort_by(|left, right| by_name(&left.path, &right.path));
+
+    // Sorting first is what makes truncation safe: a path always sorts after
+    // the path that is its prefix, so cutting the tail can never leave an entry
+    // whose parent is missing.
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
+    Listing { entries, truncated }
+}
+
 /// Walk `cwd` and describe everything under it, up to `limit` entries.
 ///
 /// **Breadth-first, and that is the load-bearing choice.** A listing that stops
@@ -516,13 +802,8 @@ impl Kind {
 /// truncation behaviour can be tested against a handful of files instead of
 /// twenty-five thousand. It is a real parameter and not a test seam — the
 /// socket path passes [`MAX_ENTRIES`], and there is no other caller.
-///
-/// The precondition is [`WorkspaceRoot::check`]'s and not a second one written
-/// here: "is this folder there, is it a folder, and will it open" is the same
-/// question the registry asks, asked in the same order, answered in the same
-/// words.
-fn list(cwd: &str, limit: usize) -> Result<Listing, Rejection> {
-    let root = PathBuf::from(WorkspaceRoot::check(cwd)?.display());
+fn walk(root: &Path, limit: usize) -> Result<Listing, Rejection> {
+    let root = root.to_path_buf();
     let display = root.to_string_lossy().into_owned();
 
     let mut entries = Vec::new();
@@ -898,7 +1179,7 @@ mod tests {
     fn a_listing_names_every_file_and_directory_relative_to_the_root() {
         let directory = tree(&["src/main.rs", "src/lib/util.rs", "README.md", "empty/"]);
 
-        let listing = list(&directory.path().to_string_lossy(), MAX_ENTRIES).expect("listed");
+        let listing = walk(directory.path(), MAX_ENTRIES).expect("listed");
 
         assert_eq!(
             paths(&listing),
@@ -938,7 +1219,7 @@ mod tests {
             "日本語/ファイル.txt",
         ]);
 
-        let listing = list(&directory.path().to_string_lossy(), MAX_ENTRIES).expect("listed");
+        let listing = walk(directory.path(), MAX_ENTRIES).expect("listed");
         let paths = paths(&listing);
 
         for expected in [
@@ -960,7 +1241,7 @@ mod tests {
     fn a_listing_past_the_limit_is_truncated_with_its_shallow_levels_intact() {
         let directory = tree(&["a/deep/deeper/leaf.txt", "b.txt", "c.txt"]);
 
-        let listing = list(&directory.path().to_string_lossy(), 3).expect("listed");
+        let listing = walk(directory.path(), 3).expect("listed");
 
         assert!(listing.truncated);
         assert_eq!(listing.entries.len(), 3);
@@ -984,7 +1265,7 @@ mod tests {
     fn the_git_directory_is_not_listed() {
         let directory = tree(&[".git/objects/ab/cdef", ".gitignore", "src/main.rs"]);
 
-        let listing = list(&directory.path().to_string_lossy(), MAX_ENTRIES).expect("listed");
+        let listing = walk(directory.path(), MAX_ENTRIES).expect("listed");
 
         assert_eq!(paths(&listing), [".gitignore", "src", "src/main.rs"]);
     }
@@ -1007,13 +1288,300 @@ mod tests {
             return;
         }
 
-        let listing = list(&directory.path().to_string_lossy(), MAX_ENTRIES)
+        let listing = walk(directory.path(), MAX_ENTRIES)
             .expect("one unreadable entry does not fail the workspace");
 
         assert_eq!(paths(&listing), ["dangling", "kept", "kept/file.txt"]);
         // Nothing resolves behind it, so the only honest kind left is the one
         // that promises the tree no children.
         assert_eq!(listing.entries[0].kind, Kind::File);
+    }
+
+    /// Run one git command in `directory`, failing the test if it does not
+    /// succeed. Unlike the symlink helper this does not skip: the spec commits
+    /// to shelling out to `git` for the git tickets, so a machine without it
+    /// cannot run this suite meaningfully in the first place.
+    fn run_git(directory: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            // A repository made inside a test must not inherit the developer's
+            // identity, hooks or templates — and `commit` refuses without a
+            // name and address, so they are supplied rather than assumed.
+            .args(["-c", "user.name=lightcode-test"])
+            .args(["-c", "user.email=test@lightcode.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(arguments)
+            .output()
+            .expect("git runs");
+        assert!(
+            status.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    fn repository(paths: &[&str]) -> tempfile::TempDir {
+        let directory = tree(paths);
+        run_git(directory.path(), &["init"]);
+        directory
+    }
+
+    fn scanned(directory: &Path) -> Listing {
+        let root = WorkspaceRoot::check(&directory.to_string_lossy()).expect("a workspace");
+        scan(&root, MAX_ENTRIES).expect("scanned")
+    }
+
+    /// The whole point of asking git: what the repository ignores does not
+    /// reach the tree.
+    ///
+    /// Nothing is committed here, so this runs entirely through
+    /// `--others --exclude-standard` — which is the case that matters, because
+    /// a working tree is mostly untracked files the moment anyone edits it.
+    #[test]
+    fn a_repository_does_not_list_what_it_ignores() {
+        let directory = repository(&[
+            ".gitignore",
+            "src/main.rs",
+            "node_modules/left-pad/index.js",
+            "target/debug/build.log",
+        ]);
+        std::fs::write(
+            directory.path().join(".gitignore"),
+            "node_modules/\ntarget/\n",
+        )
+        .expect("writes the ignore file");
+
+        let paths = {
+            let listing = scanned(directory.path());
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(paths, [".gitignore", "src", "src/main.rs"], "{paths:?}");
+    }
+
+    /// Git names files; the directories holding them are inferred. Without that
+    /// the tree would have leaves and no branches to hang them on.
+    #[test]
+    fn directories_are_inferred_from_the_files_git_names() {
+        let listing = listing_of(
+            vec![
+                "packages/web/src/app.tsx".to_string(),
+                "packages/web/README.md".to_string(),
+                "top.txt".to_string(),
+            ],
+            MAX_ENTRIES,
+        );
+
+        assert_eq!(
+            paths(&listing),
+            [
+                "packages",
+                "packages/web",
+                "packages/web/README.md",
+                "packages/web/src",
+                "packages/web/src/app.tsx",
+                "top.txt",
+            ]
+        );
+        assert_eq!(listing.entries[0].kind, Kind::Directory);
+        assert!(!listing.truncated);
+    }
+
+    /// Sorting before truncating is what keeps a cut listing coherent: a path
+    /// always sorts after the path that is its prefix, so no entry can lose its
+    /// parent.
+    #[test]
+    fn a_truncated_git_listing_still_has_every_parent() {
+        let listing = listing_of(
+            vec![
+                "a/b/c/d.txt".to_string(),
+                "z.txt".to_string(),
+                "m/n.txt".to_string(),
+            ],
+            4,
+        );
+
+        assert!(listing.truncated);
+        assert_eq!(listing.entries.len(), 4);
+        for entry in &listing.entries {
+            if let Some((parent, _)) = entry.path.rsplit_once('/') {
+                assert!(
+                    paths(&listing).contains(&parent),
+                    "{} lost its parent",
+                    entry.path
+                );
+            }
+        }
+    }
+
+    /// `--cached` lists what the index holds, which includes a file the user
+    /// deleted without staging the deletion. Offering those would put files in
+    /// the tree that are not on disk, and every attempt to open one would fail.
+    #[test]
+    fn a_file_deleted_without_staging_is_not_listed() {
+        let directory = repository(&["kept.txt", "removed.txt"]);
+        run_git(directory.path(), &["add", "."]);
+        run_git(directory.path(), &["commit", "-m", "first"]);
+        std::fs::remove_file(directory.path().join("removed.txt")).expect("removes the file");
+
+        let listing = scanned(directory.path());
+
+        assert_eq!(paths(&listing), ["kept.txt"], "{:?}", paths(&listing));
+    }
+
+    /// A folder that is not a repository still has a file tree, and it comes
+    /// from the walk — which is also the path every other test in this module
+    /// drives directly.
+    #[test]
+    fn a_folder_that_is_not_a_repository_falls_back_to_the_walk() {
+        let directory = tree(&["src/main.rs", "notes.md"]);
+        assert!(
+            !directory.path().join(".git").exists(),
+            "the fixture is not a repository"
+        );
+
+        assert_eq!(
+            paths(&scanned(directory.path())),
+            paths(&walk(directory.path(), MAX_ENTRIES).expect("walked"))
+        );
+    }
+
+    fn search(index: &Index, cwd: &Path, query: &str, limit: usize) -> Value {
+        SearchEntries::read(&json!({
+            "cwd": cwd.to_string_lossy(),
+            "query": query,
+            "limit": limit,
+        }))
+        .expect("a well-formed payload")
+        .run(index)
+        .expect("a readable workspace")
+    }
+
+    fn matched(result: &Value) -> Vec<&str> {
+        result["entries"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("a path"))
+            .collect()
+    }
+
+    /// The composer's `@` mention: a fragment of a path in, the paths holding
+    /// it out. Matching is on the whole path rather than the final component,
+    /// because `web/app` is how a user distinguishes two files both called
+    /// `app.tsx`.
+    #[test]
+    fn a_search_matches_any_part_of_a_path() {
+        let directory = tree(&["packages/web/app.tsx", "packages/api/app.ts", "README.md"]);
+        let index = Index::new();
+
+        assert_eq!(
+            matched(&search(&index, directory.path(), "app.ts", 80)),
+            ["packages/api/app.ts", "packages/web/app.tsx"]
+        );
+        assert_eq!(
+            matched(&search(&index, directory.path(), "web/app", 80)),
+            ["packages/web/app.tsx"]
+        );
+        // Case-insensitively, because the user is typing.
+        assert_eq!(
+            matched(&search(&index, directory.path(), "README", 80)),
+            ["README.md"]
+        );
+        assert_eq!(
+            matched(&search(&index, directory.path(), "readme", 80)),
+            ["README.md"]
+        );
+    }
+
+    /// The trigger character arrives with the fragment, and a query of `@src`
+    /// would otherwise match nothing at all.
+    #[test]
+    fn the_mention_trigger_is_stripped_from_the_query() {
+        let directory = tree(&["src/main.rs"]);
+        let index = Index::new();
+
+        for query in ["@src", "./src", "/src", "@./src"] {
+            assert_eq!(
+                matched(&search(&index, directory.path(), query, 80)),
+                ["src", "src/main.rs"],
+                "{query}"
+            );
+        }
+    }
+
+    /// An empty query is not "everything". The composer sends one while the
+    /// user is still deciding, and a thousand unrelated files under the cursor
+    /// is not a useful answer to that.
+    #[test]
+    fn an_empty_query_matches_nothing() {
+        let directory = tree(&["src/main.rs"]);
+        let result = search(&Index::new(), directory.path(), "   @  ", 80);
+
+        assert_eq!(matched(&result), Vec::<&str>::new());
+        assert_eq!(result["truncated"], json!(false));
+    }
+
+    /// The client says how many it can show. More than that is `truncated`, so
+    /// the picker can say there is more rather than implying it has everything.
+    #[test]
+    fn a_search_stops_at_the_limit_the_client_asked_for() {
+        let directory = tree(&["a1.rs", "a2.rs", "a3.rs", "b.rs"]);
+        let index = Index::new();
+
+        let capped = search(&index, directory.path(), "a", 2);
+        assert_eq!(matched(&capped).len(), 2);
+        assert_eq!(capped["truncated"], json!(true));
+
+        let complete = search(&index, directory.path(), "a", 80);
+        assert_eq!(matched(&complete).len(), 3);
+        assert_eq!(complete["truncated"], json!(false));
+    }
+
+    /// Search reads the held scan; the listing is what replaces it. That is the
+    /// whole freshness rule, and it is what keeps a keystroke off the disk.
+    #[test]
+    fn a_search_reads_the_held_scan_and_a_listing_replaces_it() {
+        let directory = tree(&["before.txt"]);
+        let index = Index::new();
+        let cwd = directory.path().to_string_lossy().into_owned();
+
+        // Nothing held yet, so the first search scans for itself.
+        assert_eq!(
+            matched(&search(&index, directory.path(), "txt", 80)),
+            ["before.txt"]
+        );
+
+        std::fs::write(directory.path().join("after.txt"), "new").expect("writes the file");
+        assert_eq!(
+            matched(&search(&index, directory.path(), "txt", 80)),
+            ["before.txt"],
+            "a keystroke must not pay for a rescan"
+        );
+
+        ListEntries::read(&json!({"cwd": &cwd}))
+            .expect("a well-formed payload")
+            .run(&index)
+            .expect("listed");
+        assert_eq!(
+            matched(&search(&index, directory.path(), "txt", 80)),
+            ["after.txt", "before.txt"],
+            "listing the project did not refresh what search reads"
+        );
+
+        // And forgetting is the other door in, which is what a write uses.
+        std::fs::write(directory.path().join("third.txt"), "new").expect("writes the file");
+        index.forget(&cwd);
+        assert_eq!(
+            matched(&search(&index, directory.path(), "txt", 80)),
+            ["after.txt", "before.txt", "third.txt"]
+        );
     }
 
     /// A workspace root that is missing, is a file, or is blank each fails with
@@ -1025,7 +1593,7 @@ mod tests {
         let missing = directory.path().join("not-there");
         let error = ListEntries::read(&json!({"cwd": missing.to_string_lossy()}))
             .expect("a well-formed payload")
-            .run()
+            .run(&Index::new())
             .expect_err("nothing there");
         assert_eq!(error["_tag"], "ProjectListEntriesError");
         assert_eq!(error["failure"], "workspace_root_not_found");
@@ -1039,7 +1607,7 @@ mod tests {
         let file = directory.path().join("a-file.txt");
         let error = ListEntries::read(&json!({"cwd": file.to_string_lossy()}))
             .expect("a well-formed payload")
-            .run()
+            .run(&Index::new())
             .expect_err("a file is not a workspace");
         assert_eq!(error["failure"], "workspace_root_not_directory");
         assert!(error["message"]
@@ -1114,7 +1682,7 @@ mod tests {
             return;
         }
 
-        let listing = list(&directory.path().to_string_lossy(), MAX_ENTRIES).expect("listed");
+        let listing = walk(directory.path(), MAX_ENTRIES).expect("listed");
         let paths = paths(&listing);
 
         assert_eq!(
