@@ -1,0 +1,257 @@
+//! What the composer sends, and how to read a conversation back off the wire.
+//!
+//! Shared by `socket_turn.rs` and `socket_continuity.rs`, and shared for one
+//! reason: these payloads are the real UI's, verbatim in shape from
+//! `apps/web/src/components/ChatView.tsx`. Two copies would be two chances for a
+//! test to keep passing against a command the composer no longer sends.
+//!
+//! Nothing here reaches into the server. A turn goes in as a dispatched command
+//! and comes back out as the events a client would fold, which is the seam the
+//! spec calls primary.
+
+#![allow(dead_code)]
+
+use std::path::Path;
+
+use serde_json::{json, Value};
+
+use super::workspace::Workspace;
+use super::SocketClient;
+
+/// The captured `project.create` payload with a folder the test made.
+pub fn create_project(id: &str, folder: &Path) -> Value {
+    json!({
+        "type": "project.create",
+        "commandId": format!("test:create:{id}"),
+        "projectId": id,
+        "title": "",
+        "workspaceRoot": folder.to_string_lossy(),
+        "createWorkspaceRootIfMissing": true,
+        "defaultModelSelection": Value::Null,
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
+/// The `thread.turn.start` the composer sends for the first message of a new
+/// conversation.
+///
+/// A new conversation is a **client-side draft**: the composer subscribes to a
+/// thread the server has never heard of, and the thread only reaches the server
+/// when the first turn is dispatched — carrying, under `bootstrap.createThread`,
+/// the thread it wants created. A server that implemented only `thread.create`
+/// would answer the real UI's first message with "there is no such thread".
+pub fn start_turn(thread_id: &str, message_id: &str, text: &str) -> Value {
+    json!({
+        "type": "thread.turn.start",
+        "commandId": format!("test:turn:{message_id}"),
+        "threadId": thread_id,
+        "message": {
+            "messageId": message_id,
+            "role": "user",
+            "text": text,
+            "attachments": [],
+        },
+        "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
+        "titleSeed": "A conversation",
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "bootstrap": {
+            "createThread": {
+                "projectId": "project-1",
+                "title": "A conversation",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": Value::Null,
+                "worktreePath": Value::Null,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            },
+        },
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
+/// A follow-up, which asks for no thread to be created because there already is
+/// one.
+pub fn follow_up(thread_id: &str, message_id: &str, text: &str) -> Value {
+    json!({
+        "type": "thread.turn.start",
+        "commandId": format!("test:turn:{message_id}"),
+        "threadId": thread_id,
+        "message": {
+            "messageId": message_id,
+            "role": "user",
+            "text": text,
+            "attachments": [],
+        },
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
+/// The `type` of each event, in order.
+pub fn kinds(events: &[Value]) -> Vec<&str> {
+    events
+        .iter()
+        .map(|item| item["event"]["type"].as_str().unwrap_or("<not an event>"))
+        .collect()
+}
+
+/// Every `thread.message-sent` for the assistant, as (text, streaming).
+pub fn assistant_sends(events: &[Value]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| {
+            event["type"] == "thread.message-sent" && event["payload"]["role"] == "assistant"
+        })
+        .map(|event| {
+            (
+                event["payload"]["text"].as_str().unwrap_or("").to_string(),
+                event["payload"]["streaming"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+/// The first activity of this kind.
+pub fn activity<'a>(events: &'a [Value], kind: &str) -> &'a Value {
+    find_activity(events, kind)
+        .unwrap_or_else(|| panic!("no {kind} activity in {:?}", kinds(events)))
+}
+
+/// The first activity of this kind, if there is one.
+pub fn find_activity<'a>(events: &'a [Value], kind: &str) -> Option<&'a Value> {
+    events
+        .iter()
+        .map(|item| &item["event"])
+        .find(|event| {
+            event["type"] == "thread.activity-appended"
+                && event["payload"]["activity"]["kind"] == kind
+        })
+}
+
+/// The last `thread.session-set` in a run of events — how the session ended up.
+pub fn last_session<'a>(events: &'a [Value], events_of: &str) -> &'a Value {
+    events
+        .iter()
+        .map(|item| &item["event"])
+        .rfind(|event| event["type"] == "thread.session-set")
+        .unwrap_or_else(|| panic!("the session never said anything about {events_of}"))
+}
+
+impl SocketClient {
+    /// Register a project and open the thread subscription, as the UI does before
+    /// the developer has typed anything.
+    pub async fn open_conversation(&mut self, workspace: &Workspace, thread_id: &str) -> String {
+        self.call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+
+        self.watch_conversation(thread_id, true).await
+    }
+
+    /// Open the thread subscription for a conversation whose project is already
+    /// registered — a second window, or the same window after a restart.
+    ///
+    /// `expect_draft` says which opening chunk this is: a conversation the server
+    /// has never heard of describes itself as *nothing*, because an empty snapshot
+    /// would be a positive claim that the conversation is empty and would wipe
+    /// what the composer is optimistically showing. A restored one opens with its
+    /// transcript.
+    pub async fn watch_conversation(&mut self, thread_id: &str, expect_draft: bool) -> String {
+        let subscription = self
+            .subscribe(
+                "orchestration.subscribeThread",
+                json!({"threadId": thread_id, "requestCompletionMarker": true}),
+            )
+            .await;
+
+        let opening = self.next_chunk(&subscription).await;
+        self.ack(&subscription).await;
+        match expect_draft {
+            true => assert_eq!(
+                opening,
+                vec![json!({"kind": "synchronized"})],
+                "a subscription to a draft must open without claiming the thread is empty"
+            ),
+            false => assert_eq!(
+                opening.first().map(|item| item["kind"].clone()),
+                Some(json!("snapshot")),
+                "a conversation the server holds must open with it: {opening:#?}"
+            ),
+        }
+
+        subscription
+    }
+
+    /// Read the turn out of a thread subscription, up to and including the session
+    /// going quiet again.
+    ///
+    /// A *snapshot* saying the session has gone quiet ends the read too, and that
+    /// is not belt-and-braces: a turn that publishes hundreds of events outruns the
+    /// subscription's backlog, and the pump answers that by discarding what it
+    /// could not deliver and describing the world again. The terminal event is then
+    /// one of the things discarded — so a reader that only watched for the event
+    /// would wait for one that had already been superseded.
+    pub async fn events_through_the_turn(&mut self, subscription: &str) -> Vec<Value> {
+        self.values_until(subscription, |item| {
+            let settled = |status: Option<&str>| {
+                matches!(status, Some("ready") | Some("error") | Some("stopped"))
+            };
+            match item["kind"].as_str() {
+                Some("event") => {
+                    item["event"]["type"] == "thread.session-set"
+                        && settled(item["event"]["payload"]["session"]["status"].as_str())
+                }
+                Some("snapshot") => {
+                    settled(item["snapshot"]["thread"]["session"]["status"].as_str())
+                }
+                _ => false,
+            }
+        })
+        .await
+    }
+
+    /// Subscribe to a thread and take the snapshot it opens with.
+    ///
+    /// What a second window, or a client that arrived late, or the first window
+    /// after a restart is handed. Used to check that the transcript the server
+    /// holds is the one a client that watched every event would have folded — if
+    /// the two ever differ, which conversation a developer sees depends on when
+    /// they opened it.
+    pub async fn into_thread_snapshot(mut self, thread_id: &str) -> Value {
+        let subscription = self
+            .subscribe(
+                "orchestration.subscribeThread",
+                json!({"threadId": thread_id}),
+            )
+            .await;
+        let opening = self.next_chunk(&subscription).await;
+        let snapshot = opening
+            .into_iter()
+            .find(|item| item["kind"] == "snapshot")
+            .unwrap_or_else(|| panic!("no snapshot for {thread_id}"));
+        self.close().await;
+        snapshot["snapshot"].clone()
+    }
+
+    /// The project list as it opens, which is where a restored conversation has to
+    /// appear for the developer to be able to click on it.
+    pub async fn into_shell_snapshot(mut self) -> Value {
+        let subscription = self
+            .subscribe("orchestration.subscribeShell", json!({}))
+            .await;
+        let opening = self.next_chunk(&subscription).await;
+        let snapshot = opening
+            .into_iter()
+            .find(|item| item["kind"] == "snapshot")
+            .expect("the shell describes itself");
+        self.close().await;
+        snapshot["snapshot"].clone()
+    }
+}

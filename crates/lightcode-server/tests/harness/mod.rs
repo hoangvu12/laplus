@@ -24,6 +24,7 @@
 
 pub mod agent;
 pub mod captures;
+pub mod conversation;
 pub mod shape;
 pub mod workspace;
 
@@ -87,6 +88,19 @@ impl TestServer {
             Database::open(database).expect("the database opens"),
         )
         .await
+    }
+
+    /// A restart that can also take a turn: a registry on disk *and* an agent to
+    /// start when one is dispatched.
+    ///
+    /// The two halves of "a restored conversation can be continued, not just
+    /// read" — the transcript comes from the file and the continuation comes from
+    /// the agent, which is handed the same stand-in the first run used so that
+    /// `--resume` reaches something that can answer it.
+    pub async fn start_at_with_agent(database: &Path, binary: &str) -> TestServer {
+        let mut config = ServerConfig::detect();
+        config.settings.providers.claude_agent.binary_path = binary.to_string();
+        TestServer::start_on(config, Database::open(database).expect("the database opens")).await
     }
 
     async fn start_on(config: ServerConfig, database: Database) -> TestServer {

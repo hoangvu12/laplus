@@ -312,18 +312,23 @@ impl Server {
         });
     }
 
-    /// Stop accepting, close open sockets, end every agent session, and wait for
-    /// all of it to actually be gone.
+    /// Stop accepting, close open sockets, end every agent session, write down
+    /// what they said, and wait for all of it to actually be done.
     ///
-    /// The agents go last and are waited for. A `claude` outliving the server
-    /// that started it is the one leak this process can produce that survives
-    /// the process — it holds the project's files open and keeps talking to an
-    /// API on the developer's account — so "stopped" here means reaped rather
-    /// than asked.
+    /// The order is the whole content of this method. The agents are reaped
+    /// before the transcripts are flushed, because a session publishes its last
+    /// changes on the way down and those are exactly the ones a flush that ran
+    /// first would miss — the last message of a conversation is the one a
+    /// developer notices missing. And the agents are waited for rather than
+    /// asked: a `claude` outliving the server that started it is the one leak
+    /// this process can produce that survives the process, since it holds the
+    /// project's files open and keeps talking to an API on the developer's
+    /// account.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         let _ = self.serving.await;
         self.state.services.shell.threads().shutdown().await;
+        self.state.services.shell.flush().await;
     }
 
     /// Serve until the process is interrupted. This is what the binary calls.

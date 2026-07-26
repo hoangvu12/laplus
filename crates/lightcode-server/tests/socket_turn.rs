@@ -29,167 +29,20 @@
 //! `thread.create` would answer the real UI's first message with "there is no
 //! such thread", so every turn here goes through the bootstrap the way the UI's
 //! own does.
+//!
+//! Those payloads, and the helpers that read a conversation back off the wire,
+//! live in `harness::conversation` — shared with `socket_continuity.rs`, because
+//! two copies of "what the real UI sends" would be two chances for a test to keep
+//! passing against a command that no longer exists.
 
 mod harness;
 
-use std::path::Path;
-
 use harness::agent::{ScriptedAgent, PAUSE, WORKING_DIRECTORY_MARKER};
+use harness::conversation::{activity, assistant_sends, follow_up, kinds, start_turn};
 use harness::workspace::Workspace;
-use harness::{SocketClient, TestServer};
+use harness::TestServer;
 use lightcode_server::threads::Reconciliation;
 use serde_json::{json, Value};
-
-/// The captured `project.create` payload with a folder this test made.
-fn create_project(id: &str, folder: &Path) -> Value {
-    json!({
-        "type": "project.create",
-        "commandId": format!("test:create:{id}"),
-        "projectId": id,
-        "title": "",
-        "workspaceRoot": folder.to_string_lossy(),
-        "createWorkspaceRootIfMissing": true,
-        "defaultModelSelection": Value::Null,
-        "createdAt": "2026-07-26T00:23:04.909Z",
-    })
-}
-
-/// The `thread.turn.start` the composer sends for the first message of a new
-/// conversation, verbatim in shape from `ChatView.tsx`.
-fn start_turn(thread_id: &str, message_id: &str, text: &str) -> Value {
-    json!({
-        "type": "thread.turn.start",
-        "commandId": format!("test:turn:{message_id}"),
-        "threadId": thread_id,
-        "message": {
-            "messageId": message_id,
-            "role": "user",
-            "text": text,
-            "attachments": [],
-        },
-        "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
-        "titleSeed": "A conversation",
-        "runtimeMode": "full-access",
-        "interactionMode": "default",
-        "bootstrap": {
-            "createThread": {
-                "projectId": "project-1",
-                "title": "A conversation",
-                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
-                "runtimeMode": "full-access",
-                "interactionMode": "default",
-                "branch": Value::Null,
-                "worktreePath": Value::Null,
-                "createdAt": "2026-07-26T00:23:04.909Z",
-            },
-        },
-        "createdAt": "2026-07-26T00:23:04.909Z",
-    })
-}
-
-/// A follow-up, which asks for no thread to be created because there already is
-/// one.
-fn follow_up(thread_id: &str, message_id: &str, text: &str) -> Value {
-    json!({
-        "type": "thread.turn.start",
-        "commandId": format!("test:turn:{message_id}"),
-        "threadId": thread_id,
-        "message": {
-            "messageId": message_id,
-            "role": "user",
-            "text": text,
-            "attachments": [],
-        },
-        "runtimeMode": "full-access",
-        "interactionMode": "default",
-        "createdAt": "2026-07-26T00:23:04.909Z",
-    })
-}
-
-/// Register a project and open the thread subscription, as the UI does before
-/// the developer has typed anything.
-async fn open_conversation(
-    client: &mut SocketClient,
-    workspace: &Workspace,
-    thread_id: &str,
-) -> String {
-    client
-        .call(
-            "orchestration.dispatchCommand",
-            create_project("project-1", workspace.path()),
-        )
-        .await
-        .expect_success();
-
-    let subscription = client
-        .subscribe(
-            "orchestration.subscribeThread",
-            json!({"threadId": thread_id, "requestCompletionMarker": true}),
-        )
-        .await;
-
-    // A draft describes itself as nothing — there is no conversation yet — so
-    // the opening chunk is the marker alone.
-    let opening = client.next_chunk(&subscription).await;
-    client.ack(&subscription).await;
-    assert_eq!(
-        opening,
-        vec![json!({"kind": "synchronized"})],
-        "a subscription to a draft must open without claiming the thread is empty"
-    );
-
-    subscription
-}
-
-/// Read the turn out of a thread subscription, up to and including the session
-/// going quiet again.
-async fn events_through_the_turn(client: &mut SocketClient, subscription: &str) -> Vec<Value> {
-    client
-        .values_until(subscription, |item| {
-            item["event"]["type"] == "thread.session-set"
-                && matches!(
-                    item["event"]["payload"]["session"]["status"].as_str(),
-                    Some("ready") | Some("error") | Some("stopped")
-                )
-        })
-        .await
-}
-
-/// The `type` of each event, in order.
-fn kinds(events: &[Value]) -> Vec<&str> {
-    events
-        .iter()
-        .map(|item| item["event"]["type"].as_str().unwrap_or("<not an event>"))
-        .collect()
-}
-
-/// Every `thread.message-sent` for the assistant, as (text, streaming).
-fn assistant_sends(events: &[Value]) -> Vec<(String, bool)> {
-    events
-        .iter()
-        .map(|item| &item["event"])
-        .filter(|event| {
-            event["type"] == "thread.message-sent" && event["payload"]["role"] == "assistant"
-        })
-        .map(|event| {
-            (
-                event["payload"]["text"].as_str().unwrap_or("").to_string(),
-                event["payload"]["streaming"].as_bool().unwrap_or(false),
-            )
-        })
-        .collect()
-}
-
-/// The first activity of this kind.
-fn activity<'a>(events: &'a [Value], kind: &str) -> &'a Value {
-    events
-        .iter()
-        .map(|item| &item["event"])
-        .find(|event| {
-            event["type"] == "thread.activity-appended" && event["payload"]["activity"]["kind"] == kind
-        })
-        .unwrap_or_else(|| panic!("no {kind} activity in {:?}", kinds(events)))
-}
 
 /// The whole ticket in one test: a prompt goes in, the reply comes back token by
 /// token, and the transcript ends holding what the agent actually said.
@@ -204,7 +57,7 @@ async fn a_prompt_streams_a_reply_and_ends_with_the_buffered_message() {
     let server = TestServer::start_with_agent(&agent.configured()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
 
     // Acknowledged immediately: the answer is a log position, and it arrives
     // without anything having waited for a process to exist.
@@ -220,7 +73,7 @@ async fn a_prompt_streams_a_reply_and_ends_with_the_buffered_message() {
         "{accepted}"
     );
 
-    let events = events_through_the_turn(&mut client, &subscription).await;
+    let events = client.events_through_the_turn(&subscription).await;
 
     // The whole shape of a turn, in order. The client folds these into the
     // conversation, so their order *is* what the developer sees happen.
@@ -293,7 +146,7 @@ async fn the_transcript_holds_the_buffered_message_even_when_deltas_were_shed() 
     let server = TestServer::start_with_agent(&agent.configured()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -302,7 +155,7 @@ async fn the_transcript_holds_the_buffered_message_even_when_deltas_were_shed() 
         .await
         .expect_success();
 
-    let events = events_through_the_turn(&mut client, &subscription).await;
+    let events = client.events_through_the_turn(&subscription).await;
     let sends = assistant_sends(&events);
 
     assert_eq!(
@@ -346,7 +199,7 @@ async fn deltas_that_agreed_with_the_buffered_message_are_recorded_as_agreeing()
     let server = TestServer::start_with_agent(&agent.configured()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -354,7 +207,7 @@ async fn deltas_that_agreed_with_the_buffered_message_are_recorded_as_agreeing()
         )
         .await
         .expect_success();
-    events_through_the_turn(&mut client, &subscription).await;
+    client.events_through_the_turn(&subscription).await;
 
     assert_eq!(
         server.reconciliation(),
@@ -385,7 +238,7 @@ async fn the_reply_is_readable_before_the_turn_has_finished() {
     let server = TestServer::start_with_agent(&agent.configured()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -418,7 +271,7 @@ async fn the_reply_is_readable_before_the_turn_has_finished() {
     );
 
     // And then the rest of it arrives.
-    let rest = events_through_the_turn(&mut client, &subscription).await;
+    let rest = client.events_through_the_turn(&subscription).await;
     assert_eq!(
         assistant_sends(&rest).last(),
         Some(&("thinking out loud, and done".to_string(), false))
@@ -442,7 +295,7 @@ async fn a_turn_reports_its_model_its_permission_mode_and_what_it_cost() {
     let server = TestServer::start_with_agent(&agent.configured()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -450,7 +303,7 @@ async fn a_turn_reports_its_model_its_permission_mode_and_what_it_cost() {
         )
         .await
         .expect_success();
-    let events = events_through_the_turn(&mut client, &subscription).await;
+    let events = client.events_through_the_turn(&subscription).await;
 
     // The session's own account of itself, from the recording's `init` line.
     let started = &activity(&events, "session.init")["payload"]["activity"];
@@ -497,7 +350,7 @@ async fn the_agent_runs_in_the_projects_directory() {
     let server = TestServer::start_with_agent(&agent.configured()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -505,7 +358,7 @@ async fn the_agent_runs_in_the_projects_directory() {
         )
         .await
         .expect_success();
-    events_through_the_turn(&mut client, &subscription).await;
+    client.events_through_the_turn(&subscription).await;
 
     assert!(
         workspace.path().join(WORKING_DIRECTORY_MARKER).exists(),
@@ -533,7 +386,7 @@ async fn one_subprocess_serves_the_conversation_and_is_reaped_when_the_server_st
     assert_eq!(server.live_agents(), 0, "nothing runs before a turn");
     assert_eq!(agent.starts(), 0);
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -541,7 +394,7 @@ async fn one_subprocess_serves_the_conversation_and_is_reaped_when_the_server_st
         )
         .await
         .expect_success();
-    events_through_the_turn(&mut client, &subscription).await;
+    client.events_through_the_turn(&subscription).await;
     server.await_live_agents(1).await;
 
     client
@@ -551,7 +404,7 @@ async fn one_subprocess_serves_the_conversation_and_is_reaped_when_the_server_st
         )
         .await
         .expect_success();
-    let second = events_through_the_turn(&mut client, &subscription).await;
+    let second = client.events_through_the_turn(&subscription).await;
 
     assert_eq!(
         agent.starts(),
@@ -605,7 +458,7 @@ async fn an_agent_that_cannot_be_started_is_reported_in_the_conversation() {
     let server = TestServer::start_with_agent(&configured.to_string_lossy()).await;
     let mut client = server.connect().await;
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -614,7 +467,7 @@ async fn an_agent_that_cannot_be_started_is_reported_in_the_conversation() {
         .await
         .expect_success();
 
-    let events = events_through_the_turn(&mut client, &subscription).await;
+    let events = client.events_through_the_turn(&subscription).await;
     let failed = &activity(&events, "session.failed")["payload"]["activity"];
     let detail = failed["summary"].as_str().expect("a summary");
     assert!(
@@ -656,7 +509,7 @@ async fn the_project_list_hears_about_the_thread_but_not_about_every_token() {
     client.ack(&shell).await;
     assert_eq!(opening[0]["snapshot"]["threads"], json!([]));
 
-    let subscription = open_conversation(&mut client, &workspace, "thread-1").await;
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
         .call(
             "orchestration.dispatchCommand",
@@ -664,7 +517,7 @@ async fn the_project_list_hears_about_the_thread_but_not_about_every_token() {
         )
         .await
         .expect_success();
-    events_through_the_turn(&mut client, &subscription).await;
+    client.events_through_the_turn(&subscription).await;
 
     // Read the shell until the turn has settled there too.
     let shell_events = client
@@ -730,30 +583,6 @@ async fn a_turn_for_a_project_this_server_does_not_know_is_refused_by_name() {
 
     client.close().await;
     server.stop().await;
-}
-
-impl SocketClient {
-    /// Subscribe to a thread and take the snapshot it opens with.
-    ///
-    /// What a second window, or a client that arrived late, is handed. Used to
-    /// check that the transcript the server holds is the one a client that
-    /// watched every event would have folded — if the two ever differ, which
-    /// conversation a developer sees depends on when they opened it.
-    async fn into_thread_snapshot(mut self, thread_id: &str) -> Value {
-        let subscription = self
-            .subscribe(
-                "orchestration.subscribeThread",
-                json!({"threadId": thread_id}),
-            )
-            .await;
-        let opening = self.next_chunk(&subscription).await;
-        let snapshot = opening
-            .into_iter()
-            .find(|item| item["kind"] == "snapshot")
-            .unwrap_or_else(|| panic!("no snapshot for {thread_id}"));
-        self.close().await;
-        snapshot["snapshot"].clone()
-    }
 }
 
 /// Nothing here may reach the developer's own agent, and the way one could is a

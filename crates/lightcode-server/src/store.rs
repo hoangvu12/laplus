@@ -27,13 +27,16 @@
 //! desktop app's registry is a few dozen rows. A pool would be machinery
 //! standing in for a problem this does not have.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::projects::{Project, WorkspaceRoot};
+use crate::threads::{Activity, Conversation, LatestTurn, Message, ThreadRow};
+use crate::transcripts::Write;
 
 /// The schema, one entry per version. The index is the `user_version` the
 /// entry brings the database *to*, so appending is the only supported edit —
@@ -64,6 +67,78 @@ const MIGRATIONS: &[&str] = &[
         updated_at TEXT NOT NULL
     ) STRICT;
     "#,
+    // v2 — ticket 11, conversations and their transcripts.
+    r#"
+    CREATE TABLE threads (
+        id         TEXT PRIMARY KEY,
+        -- A conversation exists to run an agent in a project's folder, so a
+        -- thread whose project has gone is not a smaller thing, it is nothing.
+        -- The cascade is what makes `project.delete` complete rather than
+        -- leaving rows only a later restart would find.
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title      TEXT NOT NULL,
+        -- Two columns hold JSON verbatim: `model_selection` is the contract's
+        -- `ModelSelection` and `latest_turn` its `OrchestrationLatestTurn`.
+        -- Neither is ever queried into — this database sorts and joins on ids
+        -- and timestamps and nothing else — so spreading them over nine columns
+        -- would buy a shape this file has to keep in step with the client's, for
+        -- no query it enables.
+        model_selection        TEXT NOT NULL,
+        runtime_mode           TEXT NOT NULL,
+        interaction_mode       TEXT NOT NULL,
+        branch                 TEXT,
+        worktree_path          TEXT,
+        -- The `claude` session this conversation is being held in, as the agent
+        -- itself reported it. What `--resume` is given, and therefore the whole
+        -- of how continuity survives a restart: the context is in the agent's
+        -- own store and this is the handle on it.
+        agent_session_id       TEXT,
+        latest_turn            TEXT,
+        latest_user_message_at TEXT,
+        created_at             TEXT NOT NULL,
+        updated_at             TEXT NOT NULL
+    ) STRICT;
+
+    CREATE INDEX threads_by_project ON threads (project_id);
+
+    CREATE TABLE thread_messages (
+        thread_id  TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        id         TEXT NOT NULL,
+        -- The position in the transcript. Stored rather than derived from
+        -- `created_at`, because that is a millisecond timestamp and two messages
+        -- inside one would come back in whichever order the file happened to
+        -- yield — a transcript that reordered itself across a restart would be a
+        -- different conversation.
+        ordinal    INTEGER NOT NULL,
+        role       TEXT NOT NULL,
+        text       TEXT NOT NULL,
+        turn_id    TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        -- Keyed by both, so the buffered message that replaces what the deltas
+        -- built is an upsert of one row rather than a second copy of the reply.
+        PRIMARY KEY (thread_id, id)
+    ) STRICT;
+
+    CREATE INDEX thread_messages_in_order ON thread_messages (thread_id, ordinal);
+
+    CREATE TABLE thread_activities (
+        thread_id  TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        id         TEXT NOT NULL,
+        ordinal    INTEGER NOT NULL,
+        tone       TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        summary    TEXT NOT NULL,
+        -- The activity's own payload, verbatim. Same reasoning as
+        -- `model_selection`: its shape belongs to whatever appended it.
+        payload    TEXT NOT NULL,
+        turn_id    TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (thread_id, id)
+    ) STRICT;
+
+    CREATE INDEX thread_activities_in_order ON thread_activities (thread_id, ordinal);
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -76,6 +151,11 @@ const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 /// other is a runtime error rather than a compile-time one.
 const PROJECT_COLUMNS: &str =
     "id, title, workspace_root, canonical_root, created_at, updated_at";
+
+/// The thread table's columns, in the order [`thread_from_row`] reads them.
+const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mode, \
+     interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
+     latest_user_message_at, created_at, updated_at";
 
 /// The registry's durable half.
 #[derive(Debug)]
@@ -516,6 +596,116 @@ impl Database {
         })
     }
 
+    /// Write down a batch of conversation changes, as one transaction.
+    ///
+    /// The vocabulary is [`crate::transcripts::Write`] and the order is the order
+    /// they were queued in, which is load-bearing twice: a message cannot be
+    /// stored before the thread it belongs to exists, and a buffered message has
+    /// to land after the accumulation it replaces.
+    ///
+    /// One transaction for the batch is the whole point — a commit is an `fsync`,
+    /// and a turn's several writes are worth one of them rather than six. The
+    /// caller's part of that bargain is that a failing batch is retried a write
+    /// at a time; see [`crate::transcripts`].
+    pub fn transcribe(&self, writes: &[Write]) -> Result<(), StorageError> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(StorageError::while_("store the transcript"))?;
+
+        for write in writes {
+            match write {
+                Write::Thread(thread) => upsert_thread(&transaction, thread)?,
+                Write::Message {
+                    thread_id,
+                    ordinal,
+                    message,
+                } => upsert_message(&transaction, thread_id, *ordinal, message)?,
+                Write::Activity {
+                    thread_id,
+                    ordinal,
+                    activity,
+                } => upsert_activity(&transaction, thread_id, *ordinal, activity)?,
+                Write::AgentSession {
+                    thread_id,
+                    session_id,
+                } => remember_agent_session(&transaction, thread_id, session_id)?,
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(StorageError::while_("store the transcript"))
+    }
+
+    /// Every conversation this database holds, with its transcript.
+    ///
+    /// Three queries rather than a join, and the reason is the shape of the
+    /// answer: a join would return one row per message with the thread's columns
+    /// repeated on each, and rebuilding the nesting from that is more code than
+    /// reading three ordered lists and walking them. It is also one pass over
+    /// each table rather than an index lookup per thread, which is what makes a
+    /// boot's cost the size of the history rather than the number of
+    /// conversations times its depth.
+    pub fn conversations(&self) -> Result<Vec<Conversation>, StorageError> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(StorageError::while_("read the conversations"))?;
+
+        let threads: Vec<ThreadRow> = query(
+            &transaction,
+            &format!("SELECT {THREAD_COLUMNS} FROM threads ORDER BY created_at ASC, id ASC"),
+            thread_from_row,
+            "read the conversations",
+        )?;
+        let messages: Vec<(String, Message)> = query(
+            &transaction,
+            "SELECT thread_id, id, role, text, turn_id, created_at, updated_at \
+             FROM thread_messages ORDER BY thread_id ASC, ordinal ASC",
+            message_from_row,
+            "read the transcripts",
+        )?;
+        let activities: Vec<(String, Activity)> = query(
+            &transaction,
+            "SELECT thread_id, id, tone, kind, summary, payload, turn_id, created_at \
+             FROM thread_activities ORDER BY thread_id ASC, ordinal ASC",
+            activity_from_row,
+            "read the work logs",
+        )?;
+
+        // Where each thread ended up, so the two ordered lists can be walked
+        // once and dealt into place. A row whose thread is not here is
+        // impossible while the foreign key holds; ignoring one rather than
+        // failing means a database somebody edited by hand still opens.
+        let at: HashMap<String, usize> = threads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| (thread.id.clone(), index))
+            .collect();
+        let mut conversations: Vec<Conversation> = threads
+            .into_iter()
+            .map(|thread| Conversation {
+                thread,
+                messages: Vec::new(),
+                activities: Vec::new(),
+            })
+            .collect();
+
+        for (thread_id, message) in messages {
+            if let Some(index) = at.get(&thread_id) {
+                conversations[*index].messages.push(message);
+            }
+        }
+        for (thread_id, activity) in activities {
+            if let Some(index) = at.get(&thread_id) {
+                conversations[*index].activities.push(activity);
+            }
+        }
+
+        Ok(conversations)
+    }
+
     /// A poisoned lock means a previous holder panicked mid-statement. SQLite
     /// rolls its transaction back on drop, so the connection is still sound and
     /// refusing to use it would turn one panic into a dead registry.
@@ -617,6 +807,259 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
     })
+}
+
+/// Read a whole ordered table, mapping each row.
+///
+/// The statement is a literal from this file every time; the shared shape is
+/// here because [`Database::conversations`] runs three of them and the borrow
+/// dance around a prepared statement is the same each time.
+fn query<T>(
+    connection: &Connection,
+    statement: &str,
+    read: impl Fn(&Row<'_>) -> rusqlite::Result<T>,
+    attempting: &'static str,
+) -> Result<Vec<T>, StorageError> {
+    let mut prepared = connection
+        .prepare(statement)
+        .map_err(StorageError::while_(attempting))?;
+    let rows = prepared
+        .query_map([], read)
+        .map_err(StorageError::while_(attempting))?;
+    rows.collect::<rusqlite::Result<Vec<T>>>()
+        .map_err(StorageError::while_(attempting))
+}
+
+/// Store a thread's own row, replacing whatever was there.
+///
+/// An upsert rather than an insert because every change to a conversation writes
+/// this — `updatedAt` moves on all of them — so the second one onwards is
+/// necessarily a replacement. `created_at` is excluded from the update: the row
+/// is rewritten from a live thread whose `created_at` is the stored one, but
+/// leaving it out means a future caller cannot move it by accident.
+fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO threads (id, project_id, title, model_selection, runtime_mode, \
+                interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
+                latest_user_message_at, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT (id) DO UPDATE SET \
+                project_id = excluded.project_id, \
+                title = excluded.title, \
+                model_selection = excluded.model_selection, \
+                runtime_mode = excluded.runtime_mode, \
+                interaction_mode = excluded.interaction_mode, \
+                branch = excluded.branch, \
+                worktree_path = excluded.worktree_path, \
+                agent_session_id = excluded.agent_session_id, \
+                latest_turn = excluded.latest_turn, \
+                latest_user_message_at = excluded.latest_user_message_at, \
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                thread.id,
+                thread.project_id,
+                thread.title,
+                thread.model_selection.to_string(),
+                thread.runtime_mode,
+                thread.interaction_mode,
+                thread.branch,
+                thread.worktree_path,
+                thread.agent_session_id,
+                thread.latest_turn.as_ref().map(|turn| turn.to_value().to_string()),
+                thread.latest_user_message_at,
+                thread.created_at,
+                thread.updated_at,
+            ],
+        )
+        .map_err(StorageError::while_("store the conversation"))?;
+    Ok(())
+}
+
+/// Store one message at its position in the transcript.
+///
+/// `streaming` is not a column. Only whole messages are ever written — a delta
+/// owes the database nothing, because the buffered message supersedes it — so a
+/// stored message was never mid-stream, and [`message_from_row`] says `false`
+/// because that is what it was rather than as a default.
+fn upsert_message(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    ordinal: usize,
+    message: &Message,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO thread_messages \
+                (thread_id, id, ordinal, role, text, turn_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (thread_id, id) DO UPDATE SET \
+                ordinal = excluded.ordinal, \
+                text = excluded.text, \
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                thread_id,
+                message.id,
+                ordinal as i64,
+                message.role,
+                message.text,
+                message.turn_id,
+                message.created_at,
+                message.updated_at,
+            ],
+        )
+        .map_err(StorageError::while_("store the message"))?;
+    Ok(())
+}
+
+/// Store one activity at its position in the work log.
+///
+/// An upsert, though nothing rewrites an activity today: the same id arriving
+/// twice is a repeat rather than a second thing that happened, and a second row
+/// would put it in the work log twice.
+fn upsert_activity(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    ordinal: usize,
+    activity: &Activity,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO thread_activities \
+                (thread_id, id, ordinal, tone, kind, summary, payload, turn_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT (thread_id, id) DO UPDATE SET \
+                ordinal = excluded.ordinal, \
+                tone = excluded.tone, \
+                summary = excluded.summary, \
+                payload = excluded.payload",
+            rusqlite::params![
+                thread_id,
+                activity.id,
+                ordinal as i64,
+                activity.tone,
+                activity.kind,
+                activity.summary,
+                activity.payload.to_string(),
+                activity.turn_id,
+                activity.created_at,
+            ],
+        )
+        .map_err(StorageError::while_("store the activity"))?;
+    Ok(())
+}
+
+/// Record the `claude` session a conversation is being held in.
+///
+/// Its own statement rather than part of the row upsert, because it arrives from
+/// somewhere else entirely: the agent's `init` line, mid-turn, while the thread
+/// row is being written by every other change beside it. Touching one column
+/// means the two cannot overwrite each other's work.
+/// Refuses to update nothing, rather than succeeding at it. The stored session is
+/// what a restart resumes into, so an update that matched no row is continuity
+/// silently lost — the same reasoning as the checked row counts in
+/// [`Database::remove_project`], and refusing before the commit rolls the
+/// transaction back so the write is retried on its own and named in the log.
+fn remember_agent_session(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    session_id: &str,
+) -> Result<(), StorageError> {
+    let updated = transaction
+        .execute(
+            "UPDATE threads SET agent_session_id = ?2 WHERE id = ?1",
+            (thread_id, session_id),
+        )
+        .map_err(StorageError::while_("store the agent session"))?;
+    if updated == 0 {
+        return Err(StorageError::refusing(
+            "store the agent session",
+            format!("there is no thread '{thread_id}' to record session '{session_id}' against"),
+        ));
+    }
+    Ok(())
+}
+
+fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
+    let model_selection: String = row.get(3)?;
+    let latest_turn: Option<String> = row.get(9)?;
+
+    Ok(ThreadRow {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        // A selection that will not parse is a row somebody edited by hand.
+        // `null` decodes on the client as "no selection", which is a worse answer
+        // than the stored one and a much better one than no conversation.
+        model_selection: serde_json::from_str(&model_selection).unwrap_or(serde_json::Value::Null),
+        runtime_mode: row.get(4)?,
+        interaction_mode: row.get(5)?,
+        branch: row.get(6)?,
+        worktree_path: row.get(7)?,
+        agent_session_id: row.get(8)?,
+        latest_turn: latest_turn.as_deref().and_then(latest_turn_from_json),
+        latest_user_message_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+/// A stored `OrchestrationLatestTurn` back as one.
+///
+/// Read field by field rather than deserialized, for the same reason every
+/// payload in this crate is built by hand: the shape is the contract's and the
+/// two ends of it are worth being able to see together. A turn missing its id or
+/// its request time is not a turn, so it comes back as `None` and the
+/// conversation as one that has not taken a turn yet.
+fn latest_turn_from_json(stored: &str) -> Option<LatestTurn> {
+    let turn: serde_json::Value = serde_json::from_str(stored).ok()?;
+    let text = |key: &str| {
+        turn.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+
+    Some(LatestTurn {
+        turn_id: text("turnId")?,
+        state: crate::threads::turn_state(turn.get("state").and_then(serde_json::Value::as_str)?),
+        requested_at: text("requestedAt")?,
+        started_at: text("startedAt"),
+        completed_at: text("completedAt"),
+        assistant_message_id: text("assistantMessageId"),
+    })
+}
+
+fn message_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Message)> {
+    Ok((
+        row.get(0)?,
+        Message {
+            id: row.get(1)?,
+            role: row.get(2)?,
+            text: row.get(3)?,
+            turn_id: row.get(4)?,
+            streaming: false,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        },
+    ))
+}
+
+fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Activity)> {
+    let tone: String = row.get(2)?;
+    let payload: String = row.get(5)?;
+
+    Ok((
+        row.get(0)?,
+        Activity {
+            id: row.get(1)?,
+            tone: crate::threads::tone(&tone),
+            kind: row.get(3)?,
+            summary: row.get(4)?,
+            payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+            turn_id: row.get(6)?,
+            created_at: row.get(7)?,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -967,6 +1410,225 @@ mod tests {
             failure.to_string().contains("newer version"),
             "the refusal must say why: {failure}"
         );
+    }
+
+    // -- conversations --------------------------------------------------------
+
+    fn a_thread(id: &str, project_id: &str) -> ThreadRow {
+        ThreadRow {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            title: "A conversation".to_string(),
+            model_selection: serde_json::json!({
+                "instanceId": "claudeAgent",
+                "model": "claude-opus-5",
+            }),
+            runtime_mode: "full-access".to_string(),
+            interaction_mode: "default".to_string(),
+            branch: None,
+            worktree_path: None,
+            agent_session_id: None,
+            latest_turn: None,
+            latest_user_message_at: None,
+            created_at: "2026-07-26T00:23:04.909Z".to_string(),
+            updated_at: "2026-07-26T00:23:04.909Z".to_string(),
+        }
+    }
+
+    /// A conversation comes back as what was written, field for field. Everything
+    /// ticket 11 promises rests on this being exact — a restored thread that
+    /// differed from the live one would show a developer a different conversation
+    /// depending on when they opened it.
+    #[test]
+    fn a_stored_conversation_comes_back_as_what_was_written() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+
+        let mut thread = a_thread("thread-1", "project-1");
+        thread.latest_turn = Some(LatestTurn {
+            turn_id: "turn-1".to_string(),
+            state: "completed",
+            requested_at: "2026-07-26T00:23:05.000Z".to_string(),
+            started_at: Some("2026-07-26T00:23:05.100Z".to_string()),
+            completed_at: Some("2026-07-26T00:23:07.108Z".to_string()),
+            assistant_message_id: Some("assistant-1".to_string()),
+        });
+        thread.latest_user_message_at = Some("2026-07-26T00:23:05.000Z".to_string());
+        thread.agent_session_id = Some("session-alpha".to_string());
+
+        let messages = vec![
+            Message {
+                id: "message-1".to_string(),
+                role: "user".to_string(),
+                text: "the question".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                streaming: false,
+                created_at: "2026-07-26T00:23:05.000Z".to_string(),
+                updated_at: "2026-07-26T00:23:05.000Z".to_string(),
+            },
+            Message {
+                id: "assistant-1".to_string(),
+                role: "assistant".to_string(),
+                text: "the answer".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                streaming: false,
+                created_at: "2026-07-26T00:23:06.000Z".to_string(),
+                updated_at: "2026-07-26T00:23:07.000Z".to_string(),
+            },
+        ];
+        let activities = vec![Activity {
+            id: "activity-1".to_string(),
+            tone: "info",
+            kind: "turn.completed".to_string(),
+            summary: "Turn completed in 2.0s · $0.0795 · end_turn".to_string(),
+            payload: serde_json::json!({"durationMs": 2008, "isError": false}),
+            turn_id: Some("turn-1".to_string()),
+            created_at: "2026-07-26T00:23:07.108Z".to_string(),
+        }];
+
+        let mut writes = vec![Write::Thread(Box::new(thread.clone()))];
+        for (ordinal, message) in messages.iter().enumerate() {
+            writes.push(Write::Message {
+                thread_id: "thread-1".to_string(),
+                ordinal,
+                message: message.clone(),
+            });
+        }
+        writes.push(Write::Activity {
+            thread_id: "thread-1".to_string(),
+            ordinal: 0,
+            activity: activities[0].clone(),
+        });
+        fixture.database.transcribe(&writes).expect("stores");
+
+        assert_eq!(
+            fixture.database.conversations().expect("reads"),
+            vec![Conversation {
+                thread,
+                messages,
+                activities,
+            }]
+        );
+    }
+
+    /// The one column that arrives from somewhere else. The agent's `init` line
+    /// lands mid-turn, while every other change is rewriting the whole row beside
+    /// it, so it is its own statement — and a later row write must not lose it.
+    #[test]
+    fn the_agents_session_survives_the_row_being_rewritten() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        let thread = a_thread("thread-1", "project-1");
+
+        fixture
+            .database
+            .transcribe(&[
+                Write::Thread(Box::new(thread.clone())),
+                Write::AgentSession {
+                    thread_id: "thread-1".to_string(),
+                    session_id: "session-alpha".to_string(),
+                },
+            ])
+            .expect("stores");
+
+        // The next change to the conversation writes the row it has, which now
+        // carries the session — so the round trip is the live thread's copy of it
+        // rather than the column being overwritten with nothing.
+        let stored = &fixture.database.conversations().expect("reads")[0].thread;
+        assert_eq!(stored.agent_session_id, Some("session-alpha".to_string()));
+
+        fixture
+            .database
+            .transcribe(&[Write::Thread(Box::new(stored.clone()))])
+            .expect("stores");
+        assert_eq!(
+            fixture.database.conversations().expect("reads")[0]
+                .thread
+                .agent_session_id,
+            Some("session-alpha".to_string())
+        );
+    }
+
+    /// Deleting a project takes its conversations with it, by the schema's own
+    /// cascade. Which conversations there *were* is not this layer's answer —
+    /// `crate::threads` holds the live view and the stored rows are a subset of it
+    /// — so what is checked here is only that nothing is left behind.
+    #[test]
+    fn removing_a_project_removes_its_conversations() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        fixture
+            .database
+            .transcribe(&[
+                Write::Thread(Box::new(a_thread("thread-1", "project-1"))),
+                Write::Thread(Box::new(a_thread("thread-2", "project-1"))),
+                Write::Message {
+                    thread_id: "thread-1".to_string(),
+                    ordinal: 0,
+                    message: Message {
+                        id: "message-1".to_string(),
+                        role: "user".to_string(),
+                        text: "hello".to_string(),
+                        turn_id: Some("turn-1".to_string()),
+                        streaming: false,
+                        created_at: "2026-07-26T00:23:05.000Z".to_string(),
+                        updated_at: "2026-07-26T00:23:05.000Z".to_string(),
+                    },
+                },
+            ])
+            .expect("stores");
+        assert_eq!(fixture.database.conversations().expect("reads").len(), 2);
+
+        assert!(matches!(
+            fixture.remove("project-1"),
+            Removal::Committed { .. }
+        ));
+        assert!(fixture
+            .database
+            .conversations()
+            .expect("reads")
+            .is_empty());
+    }
+
+    /// A session recorded against a thread that is not there is refused rather
+    /// than succeeding at updating nothing. The stored session is what a restart
+    /// resumes into, so an update that quietly matched no row is continuity lost
+    /// with nothing said about it.
+    #[test]
+    fn a_session_for_a_thread_that_does_not_exist_is_refused() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+
+        let refusal = fixture
+            .database
+            .transcribe(&[Write::AgentSession {
+                thread_id: "never-created".to_string(),
+                session_id: "session-alpha".to_string(),
+            }])
+            .expect_err("there is no such thread");
+        assert!(
+            refusal.to_string().contains("never-created")
+                && refusal.to_string().contains("session-alpha"),
+            "{refusal}"
+        );
+    }
+
+    /// A conversation cannot be stored against a project that is not there. The
+    /// foreign key is what makes the cascade above possible, so this is the other
+    /// half of the same decision rather than a separate rule.
+    #[test]
+    fn a_conversation_needs_a_project_to_belong_to() {
+        let fixture = Fixture::new();
+
+        fixture
+            .database
+            .transcribe(&[Write::Thread(Box::new(a_thread("thread-1", "never-registered")))])
+            .expect_err("there is no such project");
+        assert!(fixture
+            .database
+            .conversations()
+            .expect("reads")
+            .is_empty());
     }
 
     /// The registry's timestamps are the contract's `IsoDateTime`, and the

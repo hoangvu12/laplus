@@ -36,12 +36,32 @@
 //! that a client which arrives mid-turn and takes a snapshot sees what a client
 //! that watched every event sees.
 //!
+//! ## Persistence is a projection, not a second model
+//!
+//! Ticket 11 made conversations durable, and the shape it chose is: this module
+//! stays the live one and [`crate::transcripts`] mirrors it to disk behind the
+//! stream. Two things follow, and both are decisions rather than details.
+//!
+//! **A durable write is a [`ThreadRow`], not a [`Thread`].** The row is
+//! everything about a conversation except what is in it. A change to a title or
+//! a latest turn must not cost a clone of every message the thread holds, or a
+//! long conversation would pay for its own length on every change to it.
+//!
+//! **Deltas are not persisted.** A token delta is superseded by the buffered
+//! message a moment later, and the buffered message is the authoritative one —
+//! the same rule that governs the transcript governs the table. So a write
+//! happens at a *message boundary*, not per token, which is what keeps the disk
+//! out of the streaming path entirely. See [`crate::transcripts`] for what that
+//! costs, which is the tail of a reply the app was killed in the middle of.
+//!
 //! ## What is deliberately not here
 //!
-//! - **Persistence.** Threads live for as long as the server does. Ticket 11 owns
-//!   multi-turn continuity and persistence together, and they are one job: what
-//!   makes a conversation survive a restart is the CLI's own `--session-id` and
-//!   `--resume`, not a table of messages the agent has forgotten about.
+//! - **A live session, stored.** [`Session`] describes a running process and
+//!   [`LatestTurn`] describes a turn in flight; neither is true after a restart.
+//!   The row carries the latest turn — a restored conversation showing how its
+//!   last turn went is worth having — and [`Thread::restored`] moves a turn that
+//!   was still `running` to `interrupted`, because the app stopped in the middle
+//!   of it and nothing is going to finish it.
 //! - **Tool use, approvals, checkpoints, proposed plans.** `activities`,
 //!   `checkpoints` and `proposedPlans` are present and empty except for the two
 //!   activities a turn produces here; tickets 12, 13 and 20 fill them.
@@ -61,6 +81,7 @@ use tokio::task::JoinHandle;
 use crate::clock::now_iso;
 use crate::store::Sequences;
 use crate::subscriptions::{EventSource, BACKLOG};
+use crate::transcripts::{Transcripts, Write};
 
 /// The subscription that *is* one conversation.
 pub const SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
@@ -99,10 +120,75 @@ pub struct Thread {
     /// When the developer last said something. On the shell summary rather than
     /// derived by the client, so the thread list can sort without the messages.
     pub latest_user_message_at: Option<String>,
+    /// The `claude` session this conversation is being held in, as the agent
+    /// itself reported it on its `init` line.
+    ///
+    /// The one field here that is neither in the contract nor derived from it.
+    /// It is what `--resume` is given, and it is therefore the whole of how a
+    /// conversation survives a restart: the context is in the agent's own store,
+    /// not in this server's transcript, and this id is the handle on it. `None`
+    /// until an agent has announced itself for this thread.
+    pub agent_session_id: Option<String>,
+}
+
+/// A conversation's own row: everything about a thread except what is in it.
+///
+/// The unit of a durable write, and the reason [`crate::transcripts`] can keep
+/// up with a conversation of any length — see this module's documentation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadRow {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub model_selection: Value,
+    pub runtime_mode: String,
+    pub interaction_mode: String,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub latest_turn: Option<LatestTurn>,
+    pub latest_user_message_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A thread as the database gives it back: its row, and everything in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Conversation {
+    pub thread: ThreadRow,
+    pub messages: Vec<Message>,
+    pub activities: Vec<Activity>,
+}
+
+/// A stored tone, back as one of the two this server produces.
+///
+/// [`Activity::tone`] is a `&'static str` because every value it can hold is a
+/// literal in this file — `info` from [`Activity::info`] and `error` from
+/// [`Activity::failed`]. So the round trip is lossless for everything that can
+/// be written, and anything else is a row this build did not put there.
+pub fn tone(stored: &str) -> &'static str {
+    match stored {
+        "error" => "error",
+        _ => "info",
+    }
+}
+
+/// A stored turn state, back as one of the contract's four.
+///
+/// Same reasoning as [`tone`], with one addition: an unrecognised state becomes
+/// `error` rather than `completed`, because a turn whose outcome cannot be read
+/// is not one to report as having gone well.
+pub fn turn_state(stored: &str) -> &'static str {
+    match stored {
+        "running" => "running",
+        "interrupted" => "interrupted",
+        "completed" => "completed",
+        _ => "error",
+    }
 }
 
 /// One message in the transcript.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
     pub role: String,
@@ -117,7 +203,7 @@ pub struct Message {
 /// Something worth showing that is not a message. The UI's work log is built
 /// from these (`session-logic.ts`, `deriveWorkLogEntries`), which renders any
 /// kind it does not specifically suppress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Activity {
     pub id: String,
     pub tone: &'static str,
@@ -139,7 +225,7 @@ pub struct Session {
 }
 
 /// The most recent turn and how far it got.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestTurn {
     pub turn_id: String,
     pub state: &'static str,
@@ -218,6 +304,68 @@ impl Thread {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string)
+    }
+
+    /// This conversation without its transcript — what a durable write carries.
+    pub fn row(&self) -> ThreadRow {
+        ThreadRow {
+            id: self.id.clone(),
+            project_id: self.project_id.clone(),
+            title: self.title.clone(),
+            model_selection: self.model_selection.clone(),
+            runtime_mode: self.runtime_mode.clone(),
+            interaction_mode: self.interaction_mode.clone(),
+            branch: self.branch.clone(),
+            worktree_path: self.worktree_path.clone(),
+            agent_session_id: self.agent_session_id.clone(),
+            latest_turn: self.latest_turn.clone(),
+            latest_user_message_at: self.latest_user_message_at.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+
+    /// A conversation as it comes back from a restart.
+    ///
+    /// Two things are deliberately not what was stored:
+    ///
+    /// - **There is no session.** A session is a running process, and after a
+    ///   restart there is none. The first turn on this thread starts one, with
+    ///   `--resume` pointed at [`Thread::agent_session_id`].
+    /// - **A turn that was still `running` becomes `interrupted`.** The app
+    ///   stopped in the middle of it and nothing is going to finish it, so
+    ///   leaving it `running` would show a conversation working forever. The
+    ///   turn's `completedAt` is the last moment the thread is known to have
+    ///   changed, which is the closest true answer available.
+    pub fn restored(stored: Conversation) -> Thread {
+        let row = stored.thread;
+        let latest_turn = row.latest_turn.map(|turn| match turn.state {
+            "running" => LatestTurn {
+                state: "interrupted",
+                completed_at: Some(row.updated_at.clone()),
+                ..turn
+            },
+            _ => turn,
+        });
+
+        Thread {
+            id: row.id,
+            project_id: row.project_id,
+            title: row.title,
+            model_selection: row.model_selection,
+            runtime_mode: row.runtime_mode,
+            interaction_mode: row.interaction_mode,
+            branch: row.branch,
+            worktree_path: row.worktree_path,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            messages: stored.messages,
+            activities: stored.activities,
+            session: None,
+            latest_turn,
+            latest_user_message_at: row.latest_user_message_at,
+            agent_session_id: row.agent_session_id,
+        }
     }
 }
 
@@ -305,7 +453,10 @@ impl Session {
 }
 
 impl LatestTurn {
-    fn to_value(&self) -> Value {
+    /// The contract's `OrchestrationLatestTurn`. Also the stored form — see the
+    /// `threads` table in [`crate::store`], which keeps this shape verbatim
+    /// rather than spreading it over six columns nothing queries.
+    pub fn to_value(&self) -> Value {
         json!({
             "turnId": self.turn_id,
             "state": self.state,
@@ -407,6 +558,19 @@ struct Inner {
     /// as well as its event on its own feed — the two subscriptions are read by
     /// different parts of the UI and neither can be derived from the other.
     shell: broadcast::Sender<Value>,
+    /// Where a change goes to be written down. Queueing only — see
+    /// [`crate::transcripts`], whose whole purpose is that publishing a change
+    /// and storing it are never the same wait.
+    transcripts: Transcripts,
+    /// Drivers whose thread has been forgotten and which are still winding down.
+    ///
+    /// [`Threads::forget`] cannot wait for them — a project delete answers the
+    /// client immediately — but it must not *drop* them either: dropping a
+    /// `JoinHandle` detaches the task, and a detached driver is one
+    /// [`Threads::shutdown`] would not wait for. That is the single leak this
+    /// process can produce that outlives the process, so the handle is parked here
+    /// instead and shutdown waits for it with the rest.
+    winding_down: Mutex<Vec<JoinHandle<()>>>,
     live_agents: AtomicUsize,
     reconciled_messages: AtomicUsize,
     messages_matching_deltas: AtomicUsize,
@@ -466,16 +630,42 @@ pub struct Prompt {
 }
 
 impl Threads {
-    pub fn new(sequences: Sequences, shell: broadcast::Sender<Value>) -> Threads {
+    pub fn new(
+        sequences: Sequences,
+        shell: broadcast::Sender<Value>,
+        transcripts: Transcripts,
+    ) -> Threads {
         Threads {
             inner: Arc::new(Inner {
                 open: Mutex::new(HashMap::new()),
                 sequences,
                 shell,
+                transcripts,
+                winding_down: Mutex::new(Vec::new()),
                 live_agents: AtomicUsize::new(0),
                 reconciled_messages: AtomicUsize::new(0),
                 messages_matching_deltas: AtomicUsize::new(0),
             }),
+        }
+    }
+
+    /// Put back the conversations the last run left behind.
+    ///
+    /// Silent on purpose: nothing is announced and no sequence is taken. These
+    /// are not changes — they are the world as the first client will find it, and
+    /// an event for each would number a restart as though a hundred
+    /// conversations had just been created.
+    ///
+    /// Anything already open under the same id is left alone. Nothing calls this
+    /// twice today; refusing to overwrite is what makes that harmless rather than
+    /// a way to lose a live conversation.
+    pub fn restore(&self, stored: Vec<Conversation>) {
+        for conversation in stored {
+            let entry = self.entry(&conversation.thread.id);
+            let mut state = lock(&entry.state);
+            if state.is_none() {
+                *state = Some(Thread::restored(conversation));
+            }
         }
     }
 
@@ -544,6 +734,7 @@ impl Threads {
         let sequence = commit.sequence();
         let event = created_event(sequence, &thread);
         let summary = thread.to_shell_value();
+        self.inner.transcripts.queue(Write::Thread(Box::new(thread.row())));
         *state = Some(thread);
         drop(state);
 
@@ -578,6 +769,11 @@ impl Threads {
 
         let event = thread_event(sequence, thread_id, change.event_type(), payload, &occurred_at);
         let summary = change.reaches_the_shell().then(|| thread.to_shell_value());
+        // Under the same lock as the fold, so what is written down is what was
+        // just folded in and not whatever a later change left behind.
+        for write in durable(thread, &change) {
+            self.inner.transcripts.queue(write);
+        }
         drop(state);
 
         // `send` on a broadcast channel never blocks — it drops the oldest value
@@ -846,6 +1042,105 @@ impl Threads {
             .max()
     }
 
+    /// Remember the `claude` session the agent announced for this thread.
+    ///
+    /// Nothing is published, and that is not an omission: no event in the
+    /// contract describes this and no client renders it. It is the server's own
+    /// handle on the agent's memory — what `--resume` will be given — so what it
+    /// owes is a durable write and nothing else. The `session.init` activity
+    /// beside it is where the same id becomes visible.
+    ///
+    /// An id the thread already holds is dropped rather than rewritten. A
+    /// resumed session announces one on every start, and a row that says what it
+    /// already said is a disk touch for nothing.
+    pub fn remember_agent_session(&self, thread_id: &str, session_id: &str) {
+        let Some(entry) = self.find(thread_id) else {
+            return;
+        };
+        let mut state = lock(&entry.state);
+        let Some(thread) = state.as_mut() else { return };
+        if thread.agent_session_id.as_deref() == Some(session_id) {
+            return;
+        }
+
+        thread.agent_session_id = Some(session_id.to_string());
+        self.inner.transcripts.queue(Write::AgentSession {
+            thread_id: thread.id.clone(),
+            session_id: session_id.to_string(),
+        });
+    }
+
+    /// The conversations in a project, oldest first.
+    ///
+    /// Asked of this registry rather than of the database, and that is the whole
+    /// point of the method: a thread reaches the database *eventually* — see
+    /// [`crate::transcripts`] — so the stored rows are a subset of what exists. A
+    /// project deleted seconds after a conversation started would leave that
+    /// conversation behind if the database were the source of truth for which
+    /// conversations there were.
+    pub fn of_project(&self, project_id: &str) -> Vec<String> {
+        let entries: Vec<Arc<Entry>> = self.lock().values().map(Arc::clone).collect();
+        let mut found: Vec<(String, String)> = entries
+            .iter()
+            .filter_map(|entry| {
+                let state = lock(&entry.state);
+                let thread = state.as_ref().filter(|thread| thread.project_id == project_id)?;
+                Some((thread.created_at.clone(), thread.id.clone()))
+            })
+            .collect();
+        // The same total order the snapshot uses, so the events that remove these
+        // arrive in the order the thread list has them.
+        found.sort();
+        found.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Forget these conversations.
+    ///
+    /// Called when their project is deleted. Doing it here as well as in the
+    /// database is not tidying: a thread that outlived its project in this registry
+    /// would be listed in every snapshot until the next restart and gone after it,
+    /// which is the worst of both answers.
+    ///
+    /// An agent still running for one of them is told there will be no more turns,
+    /// by the same mechanism a shutdown uses — dropping the prompt channel. Nothing
+    /// *waits* for it, because a project delete answers the client immediately; the
+    /// driver's handle is parked on [`Inner::winding_down`] so that a shutdown a
+    /// moment later still reaps the child rather than finding the task detached.
+    ///
+    /// The queue is told as well, so the writes already in flight for these
+    /// conversations are dropped rather than refused by a foreign key whose project
+    /// is now gone.
+    pub fn forget(&self, thread_ids: &[String]) {
+        // The entries are taken out from under the registry lock and their drivers
+        // released afterwards, which is the order [`Threads::shutdown`] uses. One
+        // path that held both locks in the other order would be enough for a
+        // deadlock, and there is no reason for this to be that path.
+        let going: Vec<Arc<Entry>> = {
+            let mut open = self.lock();
+            thread_ids
+                .iter()
+                .filter_map(|thread_id| open.remove(thread_id))
+                .collect()
+        };
+
+        let mut winding_down = lock(&self.inner.winding_down);
+        // Whatever has already finished is dropped here rather than accumulating
+        // for the life of the process.
+        winding_down.retain(|driver| !driver.is_finished());
+        for entry in going {
+            if let Some(live) = lock(&entry.live).take() {
+                self.inner.live_agents.fetch_sub(1, Ordering::Relaxed);
+                // Dropping the sender is the driver's signal that there are no
+                // more turns; keeping the handle is what lets shutdown wait.
+                drop(live.prompts);
+                winding_down.push(live.task);
+            }
+        }
+        drop(winding_down);
+
+        self.inner.transcripts.discard(thread_ids);
+    }
+
     /// Is a thread here?
     pub fn contains(&self, thread_id: &str) -> bool {
         self.get(thread_id).is_some()
@@ -894,8 +1189,15 @@ impl Threads {
     /// new one rather than writing into a closed pipe.
     ///
     /// Does not wait for the task: this *is* the task, at the end of itself.
+    ///
+    /// Asks for the slot rather than making one. A driver can outlive the thread
+    /// it was driving — [`Threads::forget`] removes a deleted project's
+    /// conversations while their agents are still winding down — and allocating
+    /// here would put an empty slot back for every one of them.
     pub fn detach(&self, thread_id: &str) {
-        let entry = self.entry(thread_id);
+        let Some(entry) = self.find(thread_id) else {
+            return;
+        };
         if lock(&entry.live).take().is_some() {
             self.inner.live_agents.fetch_sub(1, Ordering::Relaxed);
         }
@@ -908,7 +1210,7 @@ impl Threads {
     /// and lets it exit — and awaiting the task is what makes "reaped" true
     /// rather than merely asked for.
     pub async fn shutdown(&self) {
-        let running: Vec<JoinHandle<()>> = {
+        let mut running: Vec<JoinHandle<()>> = {
             let open: Vec<Arc<Entry>> = self.lock().values().map(Arc::clone).collect();
             open.iter()
                 .filter_map(|entry| lock(&entry.live).take())
@@ -920,6 +1222,9 @@ impl Threads {
                 })
                 .collect()
         };
+        // The drivers of conversations whose project was deleted. They were already
+        // told there would be no more turns; what is owed them is the wait.
+        running.append(&mut lock(&self.inner.winding_down));
 
         for task in running {
             let _ = task.await;
@@ -952,6 +1257,67 @@ impl Change {
             Change::Activity(_) => "thread.activity-appended",
         }
     }
+}
+
+/// What a change owes the database, once it has been folded in.
+///
+/// Three rules, and each is a decision this module's documentation argues:
+///
+/// - **A delta owes nothing.** The buffered message supersedes it within the
+///   turn, and a row per token would put the disk in the streaming path.
+/// - **Everything else writes the row.** Every change moves `updatedAt` and most
+///   of them move the latest turn with it. The row is a dozen small fields and
+///   the writes are batched, so writing it unconditionally costs less than
+///   working out whether it was needed.
+/// - **A message or an activity writes itself as well, at the position the fold
+///   gave it.** The position is stored because a millisecond timestamp is not a
+///   total order, and a transcript that reordered itself across a restart would
+///   be a different conversation.
+fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
+    let message_id = match change {
+        Change::AssistantDelta { .. } => return Vec::new(),
+        Change::UserMessage { message_id, .. } | Change::AssistantMessage { message_id, .. } => {
+            Some(message_id)
+        }
+        _ => None,
+    };
+
+    let mut writes = vec![Write::Thread(Box::new(thread.row()))];
+
+    // Both positions are *found* rather than assumed to be the end. For a message
+    // that is load-bearing — a buffered message replaces one the deltas already put
+    // in the transcript, and that one is not at the end once a turn has said
+    // several things — and for an activity it is merely honest: a position that
+    // came from a length would have to invent an answer for a log the fold had not
+    // appended to, and there is no honest one.
+    if let Some(message_id) = message_id {
+        if let Some((ordinal, message)) = at(&thread.messages, |message| &message.id == message_id) {
+            writes.push(Write::Message {
+                thread_id: thread.id.clone(),
+                ordinal,
+                message: message.clone(),
+            });
+        }
+    }
+
+    if let Change::Activity(appended) = change {
+        if let Some((ordinal, activity)) = at(&thread.activities, |activity| {
+            activity.id == appended.id
+        }) {
+            writes.push(Write::Activity {
+                thread_id: thread.id.clone(),
+                ordinal,
+                activity: activity.clone(),
+            });
+        }
+    }
+
+    writes
+}
+
+/// The first item matching `wanted`, and where it is.
+fn at<T>(items: &[T], wanted: impl Fn(&T) -> bool) -> Option<(usize, &T)> {
+    items.iter().enumerate().find(|(_, item)| wanted(item))
 }
 
 /// Move the latest turn on when an assistant message lands.
@@ -1150,7 +1516,13 @@ mod tests {
 
     fn threads() -> (Threads, broadcast::Receiver<Value>) {
         let (shell, watching) = broadcast::channel(BACKLOG);
-        (Threads::new(Sequences::from(0), shell), watching)
+        // Nothing here is about the stored conversation — `crate::transcripts`
+        // drives its own writes and `tests/socket_continuity.rs` drives a
+        // restart — so these threads are written down nowhere.
+        (
+            Threads::new(Sequences::from(0), shell, Transcripts::nowhere()),
+            watching,
+        )
     }
 
     fn a_thread(id: &str) -> Thread {
@@ -1170,6 +1542,7 @@ mod tests {
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
+            agent_session_id: None,
         }
     }
 
@@ -1614,6 +1987,169 @@ mod tests {
         assert_eq!(session["threadId"], "thread-1");
         assert_eq!(session["status"], "running");
         assert_eq!(session["providerName"], crate::provider::INSTANCE_ID);
+    }
+
+    // -- coming back from a restart -----------------------------------------
+
+    /// A stored conversation comes back with its transcript and without a
+    /// session. Nothing is running after a restart, and a thread claiming an
+    /// agent behind it would have the composer offering to interrupt one.
+    #[test]
+    fn a_restored_conversation_has_its_transcript_and_no_session() {
+        let (threads, mut shell) = threads();
+        threads.restore(vec![Conversation {
+            thread: a_thread("thread-1").row(),
+            messages: vec![Message {
+                id: "message-1".to_string(),
+                role: "user".to_string(),
+                text: "yesterday".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                streaming: false,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+            }],
+            activities: Vec::new(),
+        }]);
+
+        let restored = threads.get("thread-1").expect("the conversation is back");
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.messages[0].text, "yesterday");
+        assert!(restored.session.is_none());
+        assert!(
+            shell.try_recv().is_err(),
+            "a restart is not a hundred conversations being created"
+        );
+        assert_eq!(
+            threads.inner.sequences.current(),
+            0,
+            "restoring took a sequence number"
+        );
+    }
+
+    /// The hard-kill case: the app went while a turn was in flight, so the stored
+    /// turn is still `running` and nothing ever got to say otherwise. It has to
+    /// come back as interrupted, or the conversation shows an agent working with
+    /// nothing left alive to settle it.
+    #[test]
+    fn a_turn_stored_while_it_was_still_running_comes_back_interrupted() {
+        let (threads, _shell) = threads();
+        let mut row = a_thread("thread-1").row();
+        row.latest_turn = Some(LatestTurn {
+            turn_id: "turn-1".to_string(),
+            state: "running",
+            requested_at: "2026-07-26T00:23:04.909Z".to_string(),
+            started_at: Some("2026-07-26T00:23:04.909Z".to_string()),
+            completed_at: None,
+            assistant_message_id: None,
+        });
+        row.updated_at = "2026-07-26T00:23:09.000Z".to_string();
+
+        threads.restore(vec![Conversation {
+            thread: row,
+            messages: Vec::new(),
+            activities: Vec::new(),
+        }]);
+
+        let turn = threads
+            .get("thread-1")
+            .expect("the conversation")
+            .latest_turn
+            .expect("a turn");
+        assert_eq!(turn.state, "interrupted");
+        assert_eq!(
+            turn.completed_at,
+            Some("2026-07-26T00:23:09.000Z".to_string()),
+            "the last moment the thread is known to have changed is the closest \
+             true answer available"
+        );
+
+        // A turn that had already settled is left exactly as it was.
+        let mut finished = a_thread("thread-2").row();
+        finished.latest_turn = Some(LatestTurn {
+            state: "completed",
+            completed_at: Some("2026-07-26T00:23:07.000Z".to_string()),
+            ..turn
+        });
+        threads.restore(vec![Conversation {
+            thread: finished,
+            messages: Vec::new(),
+            activities: Vec::new(),
+        }]);
+        assert_eq!(
+            threads
+                .get("thread-2")
+                .expect("the conversation")
+                .latest_turn
+                .map(|turn| turn.state),
+            Some("completed")
+        );
+    }
+
+    /// The agent's session id is the server's own bookkeeping: remembered and
+    /// written down, and published to nobody, because no event in the contract
+    /// describes it and no client renders it.
+    #[test]
+    fn the_agents_session_is_remembered_without_being_announced() {
+        let (threads, mut shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        shell.try_recv().expect("the thread was announced");
+
+        threads.remember_agent_session("thread-1", "session-alpha");
+        assert_eq!(
+            threads.get("thread-1").expect("the thread").agent_session_id,
+            Some("session-alpha".to_string())
+        );
+        assert!(
+            shell.try_recv().is_err(),
+            "remembering the agent's session republished the thread"
+        );
+
+        // A resumed session announces one on every start, and the newest is the
+        // one the next `--resume` has to be given.
+        threads.remember_agent_session("thread-1", "session-beta");
+        assert_eq!(
+            threads.get("thread-1").expect("the thread").agent_session_id,
+            Some("session-beta".to_string())
+        );
+    }
+
+    /// A delta owes the database nothing — the buffered message supersedes it —
+    /// and everything else writes the row it changed. This is the rule that keeps
+    /// the disk out of the streaming path, checked where it is decided.
+    #[test]
+    fn a_delta_is_the_one_change_that_is_not_written_down() {
+        let mut thread = a_thread("thread-1");
+        thread.messages.push(Message {
+            id: "assistant-1".to_string(),
+            role: "assistant".to_string(),
+            text: "hell".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            streaming: true,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        });
+
+        let delta = Change::AssistantDelta {
+            message_id: "assistant-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            text: "o".to_string(),
+        };
+        assert!(durable(&thread, &delta).is_empty());
+
+        let buffered = Change::AssistantMessage {
+            message_id: "assistant-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            text: "hello".to_string(),
+        };
+        let writes = durable(&thread, &buffered);
+        assert_eq!(writes.len(), 2, "{writes:#?}");
+        assert!(matches!(writes[0], Write::Thread(_)));
+        // At the position the fold gave it, which is not necessarily the end: a
+        // buffered message replaces one the deltas already put in the transcript.
+        assert!(matches!(
+            &writes[1],
+            Write::Message { ordinal: 0, message, .. } if message.id == "assistant-1"
+        ));
     }
 
     /// Identifiers appear in a transcript a developer is reading, and two the

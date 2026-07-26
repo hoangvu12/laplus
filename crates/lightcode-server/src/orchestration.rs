@@ -94,6 +94,7 @@ use crate::projects::{Project, WorkspaceRoot};
 use crate::store::{Conflict, Database, Insert, Registry, Removal, Sequences, StorageError};
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::threads::{self, Change, Prompt, Session, Thread, Threads};
+use crate::transcripts::Transcripts;
 
 /// The tag that carries every write to the registry.
 pub const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
@@ -122,13 +123,17 @@ pub struct Shell {
 
 #[derive(Debug)]
 struct Inner {
-    database: Database,
+    /// Behind an [`Arc`] because the transcript writer holds it too — see
+    /// [`crate::transcripts`], where the whole point is that a conversation is
+    /// written down on a thread of its own rather than on whoever changed it.
+    database: Arc<Database>,
     updates: broadcast::Sender<Value>,
     /// The number every change on this wire is ordered by, shared with
     /// [`Threads`] because both aggregates travel on the same subscription and
     /// a client folds them against one cursor.
     sequences: Sequences,
     threads: Threads,
+    transcripts: Transcripts,
 }
 
 /// A command this server understands, once its payload has been read.
@@ -179,6 +184,14 @@ impl CommandError {
 }
 
 impl Shell {
+    /// Open the registry and put back what the last run left in it.
+    ///
+    /// The conversations are read here rather than lazily, and that is a
+    /// decision: a thread's *summary* is what the project list opens with, so a
+    /// server that had not read them yet would have to answer its first
+    /// `subscribeShell` with a claim that the user has no conversations. One pass
+    /// over three tables is the cost, and it is the size of the history rather
+    /// than a query per conversation — see [`Database::conversations`].
     pub fn new(database: Database) -> Shell {
         let sequences = Sequences::resuming(&database).unwrap_or_else(|error| {
             // Unreachable in practice: everything else this server does with the
@@ -188,14 +201,28 @@ impl Shell {
             eprintln!("lightcode: cannot read the registry's log position, resuming from zero: {error}");
             Sequences::from(0)
         });
+        let stored = database.conversations().unwrap_or_else(|error| {
+            // Same shape and the same reasoning as above, and the same
+            // unreachability: this read is a `SELECT` over tables the migration
+            // just created. Carrying on means the conversations are not shown,
+            // and they are still on disk to be shown by the next run.
+            eprintln!("lightcode: cannot read the stored conversations: {error}");
+            Vec::new()
+        });
+
+        let database = Arc::new(database);
         let updates = broadcast::channel(BACKLOG).0;
+        let transcripts = Transcripts::writing_to(Arc::clone(&database));
+        let threads = Threads::new(sequences.clone(), updates.clone(), transcripts.clone());
+        threads.restore(stored);
 
         Shell {
             inner: Arc::new(Inner {
                 database,
-                threads: Threads::new(sequences.clone(), updates.clone()),
+                threads,
                 sequences,
                 updates,
+                transcripts,
             }),
         }
     }
@@ -204,6 +231,17 @@ impl Shell {
     /// way the shell itself is.
     pub fn threads(&self) -> &Threads {
         &self.inner.threads
+    }
+
+    /// Wait until every change made so far is on disk.
+    ///
+    /// What shutdown calls, after the agents have been reaped so that whatever
+    /// they published on their way down is in the queue this waits for. Nothing
+    /// else calls it: the queue is drained continuously and a caller that waited
+    /// for the disk mid-conversation would be the stutter
+    /// [`crate::transcripts`] exists to avoid.
+    pub async fn flush(&self) {
+        self.inner.transcripts.flush().await;
     }
 
     /// Carry out one `orchestration.dispatchCommand`, answering with the
@@ -438,28 +476,67 @@ impl Shell {
         }
     }
 
+    /// Take a project off the registry, and its conversations with it.
+    ///
+    /// **Several events, and therefore several numbers.** The client's shell
+    /// reducer answers `project-removed` by filtering the projects and nothing
+    /// else (`shellReducer.ts`), so a conversation whose project has gone stays
+    /// in its snapshot until a `thread-removed` says otherwise — and the rows
+    /// have already gone, by the schema's own cascade. One number for all of them
+    /// would not do: a client ignores anything at or below the sequence it holds,
+    /// so every event after the first would be dropped. The answer is the last
+    /// number taken, which is the position the log reached.
     fn delete_project(&self, project_id: &str, index: &Index) -> Result<i64, CommandError> {
-        let commit = self.inner.sequences.commit();
-        let removal = self
-            .inner
-            .database
-            .remove_project(project_id, commit.sequence())
-            .map_err(unavailable("remove the project"))?;
+        // Which conversations there *are* is a question for the registry, not the
+        // database: a thread reaches the database eventually (see
+        // [`crate::transcripts`]), so a project deleted seconds after a
+        // conversation started would leave that conversation behind if the stored
+        // rows were the source of truth. Read before the delete either way, because
+        // the delete is what makes them unreadable.
+        let thread_ids = self.inner.threads.of_project(project_id);
 
-        if let Removal::Committed {
-            sequence,
-            canonical_root,
-        } = &removal
-        {
-            // The only moment on this wire that means "this project is closed",
-            // and so the only moment the server can give back what it was
-            // holding to keep the project's file tree fresh. Before the
-            // announcement, so a client that reacts to `project-removed` by
-            // asking about something else does not race a release.
-            index.release(canonical_root);
-            self.announce(project_removed(*sequence, project_id));
+        // The guard is released at the end of this block, before any further
+        // number is taken — it is not reentrant, and each announcement only has
+        // to be ordered against the writers it races.
+        let removal = {
+            let commit = self.inner.sequences.commit();
+            let removal = self
+                .inner
+                .database
+                .remove_project(project_id, commit.sequence())
+                .map_err(unavailable("remove the project"))?;
+
+            if let Removal::Committed {
+                sequence,
+                canonical_root,
+            } = &removal
+            {
+                // The only moment on this wire that means "this project is
+                // closed", and so the only moment the server can give back what
+                // it was holding to keep the project's file tree fresh. Before
+                // the announcement, so a client that reacts to `project-removed`
+                // by asking about something else does not race a release.
+                index.release(canonical_root);
+                self.announce(project_removed(*sequence, project_id));
+            }
+            removal
+        };
+
+        let mut sequence = removal.sequence();
+        if matches!(removal, Removal::Committed { .. }) {
+            // Forgotten here as well as in the database, and before the
+            // announcements: a thread that outlived its project in this registry
+            // would be in every snapshot until the next restart and gone after
+            // it, which is the worst of both answers.
+            self.inner.threads.forget(&thread_ids);
+            for thread_id in &thread_ids {
+                let commit = self.inner.sequences.commit();
+                sequence = commit.sequence();
+                self.announce(thread_removed(sequence, thread_id));
+            }
         }
-        Ok(removal.sequence())
+
+        Ok(sequence)
     }
 
     /// Open an `orchestration.subscribeShell` subscription: the registry now,
@@ -578,6 +655,14 @@ fn project_removed(sequence: i64, project_id: &str) -> Value {
     })
 }
 
+fn thread_removed(sequence: i64, thread_id: &str) -> Value {
+    json!({
+        "kind": "thread-removed",
+        "sequence": sequence,
+        "threadId": thread_id,
+    })
+}
+
 /// The fields of `project.create` this server reads. `commandId` and
 /// `defaultModelSelection` are in the contract and deliberately absent here —
 /// see the module documentation for why neither is kept.
@@ -668,6 +753,9 @@ impl CreateThread {
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
+            // Nothing has run yet, so there is no agent session to resume into.
+            // The first turn's `init` line is where this is filled in.
+            agent_session_id: None,
         }
     }
 }

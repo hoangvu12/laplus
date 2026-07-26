@@ -135,6 +135,16 @@ pub const PAUSE: &str = "<pause>";
 /// escaped by a batch file, and a Windows path is mostly backslashes.
 pub const WORKING_DIRECTORY_MARKER: &str = "lightcode-agent-was-here";
 
+/// What a scripted agent does when it is asked to continue a conversation.
+enum OnResume {
+    /// What a healthy CLI does: resume, announce a session, take the turn.
+    Continue,
+    /// What one whose stored conversation has gone does: complain on stderr and
+    /// exit without a line of NDJSON. Ticket 11's "the underlying agent session
+    /// is no longer available", and no recording contains it.
+    Refuse,
+}
+
 impl ScriptedAgent {
     /// Replay a committed capture — one of `fixtures/claude-cli/*.ndjson`, the
     /// same files the protocol module's golden tests are held to.
@@ -152,25 +162,61 @@ impl ScriptedAgent {
         ScriptedAgent::emitting(&recorded.lines().collect::<Vec<&str>>())
     }
 
-    /// Replay lines written for the occasion.
+    /// Replay lines written for the occasion, for every turn.
     ///
     /// For the cases no recording contains, because a healthy CLI does not
     /// produce them: deltas that disagree with the buffered message, an errored
     /// result, a session that says nothing at all.
     pub fn emitting(lines: &[&str]) -> ScriptedAgent {
+        ScriptedAgent::written(&[lines], OnResume::Continue)
+    }
+
+    /// Replay a *different* script for each turn: the first turn gets the first,
+    /// the second the second, and any turn past the end gets the last again.
+    ///
+    /// The counter is a variable inside the process, which is what makes this the
+    /// discriminator ticket 11's continuity needs. A server that re-spawned the
+    /// agent per turn would reset it and answer the second turn with the first
+    /// script — so a reply that only the second script contains is proof that one
+    /// session took both turns, and that is exactly what "a follow-up retains
+    /// prior context" rests on: the context is the agent's, and the agent is the
+    /// same one.
+    pub fn per_turn<'a>(turns: &[impl AsRef<[&'a str]>]) -> ScriptedAgent {
+        ScriptedAgent::written(turns, OnResume::Continue)
+    }
+
+    /// An agent that will not continue a conversation it is asked to resume.
+    ///
+    /// A fresh start behaves normally; one carrying `--resume` writes its reason
+    /// to stderr and exits without producing anything, which is what the CLI does
+    /// when the session id names nothing it still holds.
+    pub fn refusing_to_resume<'a>(turns: &[impl AsRef<[&'a str]>]) -> ScriptedAgent {
+        ScriptedAgent::written(turns, OnResume::Refuse)
+    }
+
+    fn written<'a>(turns: &[impl AsRef<[&'a str]>], on_resume: OnResume) -> ScriptedAgent {
+        assert!(!turns.is_empty(), "an agent has to say something");
         let agent = ScriptedAgent {
             directory: tempfile::tempdir().expect("a temporary directory"),
         };
 
-        let segments: Vec<&[&str]> = lines.split(|line| *line == PAUSE).collect();
-        for (index, segment) in segments.iter().enumerate() {
-            let mut text = segment.join("\n");
-            text.push('\n');
-            std::fs::write(agent.directory.path().join(segment_name(index)), text)
-                .expect("writes a script segment");
+        // Each turn is split into segments at a `PAUSE`, so a script can be slow
+        // in the middle of a turn as well as different from one turn to the next.
+        let scripted: Vec<Vec<&[&str]>> = turns
+            .iter()
+            .map(|lines| lines.as_ref().split(|line| *line == PAUSE).collect())
+            .collect();
+        for (turn, segments) in scripted.iter().enumerate() {
+            for (index, segment) in segments.iter().enumerate() {
+                let mut text = segment.join("\n");
+                text.push('\n');
+                std::fs::write(agent.directory.path().join(segment_name(turn, index)), text)
+                    .expect("writes a script segment");
+            }
         }
 
-        std::fs::write(agent.path(), agent.script(segments.len())).expect("writes the agent");
+        std::fs::write(agent.path(), agent.script(&scripted, on_resume))
+            .expect("writes the agent");
         #[cfg(not(windows))]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -194,11 +240,44 @@ impl ScriptedAgent {
     /// script appends a line before it begins its loop, so this counts
     /// processes rather than turns.
     pub fn starts(&self) -> usize {
-        match std::fs::read_to_string(self.directory.path().join(STARTS_LOG)) {
-            Ok(log) => log.lines().filter(|line| !line.trim().is_empty()).count(),
-            // Nothing has run yet, which is zero starts rather than a failure —
+        self.logged(STARTS_LOG).len()
+    }
+
+    /// The arguments each start was given, one entry per process.
+    ///
+    /// How a test observes what the server asked the CLI for without reaching
+    /// into the server: the argv is the contract between the two, and
+    /// `--resume` is the whole of ticket 11's continuity mechanism.
+    pub fn arguments(&self) -> Vec<String> {
+        self.logged(ARGUMENTS_LOG)
+    }
+
+    /// The sessions this agent was asked to resume, in the order it was asked.
+    ///
+    /// Empty when every start was a fresh conversation, which is what a single
+    /// run of the server produces — a long-lived child needs no resuming.
+    pub fn resumed(&self) -> Vec<String> {
+        self.arguments()
+            .iter()
+            .filter_map(|argv| {
+                let mut words = argv.split_whitespace();
+                words.find(|word| *word == "--resume")?;
+                words.next().map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn logged(&self, name: &str) -> Vec<String> {
+        match std::fs::read_to_string(self.directory.path().join(name)) {
+            Ok(log) => log
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            // Nothing has run yet, which is an empty log rather than a failure —
             // a test may reasonably assert that.
-            Err(_) => 0,
+            Err(_) => Vec::new(),
         }
     }
 
@@ -216,69 +295,157 @@ impl ScriptedAgent {
     /// may keep one process for a whole conversation. The loop ends when stdin
     /// closes, so closing it is what stops the agent, exactly as it is for the
     /// real one.
-    fn script(&self, segments: usize) -> String {
-        // A relative path, so it lands wherever the agent was started — which is
-        // the whole point of writing it.
-        let mut replay = match cfg!(windows) {
-            true => format!("echo.>\"{WORKING_DIRECTORY_MARKER}\"\r\n"),
-            false => format!("  : > \"{WORKING_DIRECTORY_MARKER}\"\n"),
+    ///
+    /// The turn counter lives in the process, so which script a turn gets is also
+    /// an answer to "was this the same process as last time". See
+    /// [`ScriptedAgent::per_turn`].
+    fn script(&self, turns: &[Vec<&[&str]>], on_resume: OnResume) -> String {
+        match cfg!(windows) {
+            true => self.batch(turns, on_resume),
+            false => self.shell(turns, on_resume),
+        }
+    }
+
+    fn batch(&self, turns: &[Vec<&[&str]>], on_resume: OnResume) -> String {
+        // Every redirection here leads its command. `>>file echo %*` rather than
+        // `echo %*>>file`, because a `%*` ending in a digit turns the digit into
+        // a file-descriptor number and `--resume abc1>>log` would redirect fd 1
+        // and lose the "1" out of the text.
+        let refusal = match on_resume {
+            OnResume::Continue => String::new(),
+            OnResume::Refuse => format!(
+                "echo %* | findstr /C:\"--resume\" >nul\r\n\
+                 if not errorlevel 1 (\r\n\
+                 \x20 >&2 echo {REFUSAL}\r\n\
+                 \x20 exit /b 1\r\n\
+                 )\r\n"
+            ),
         };
-        for index in 0..segments {
-            if index > 0 {
-                // A second, in the platform's idiom for sleeping without a
-                // console: `timeout` needs one, and `powershell -c Start-Sleep`
-                // costs more to start than it sleeps for.
-                replay.push_str(match cfg!(windows) {
-                    true => "ping -n 2 127.0.0.1 >nul\r\n",
-                    false => "  sleep 1\n",
-                });
-            }
-            replay.push_str(&match cfg!(windows) {
-                true => format!("type \"%~dp0{}\"\r\n", segment_name(index)),
-                false => format!("  cat \"$here/{}\"\n", segment_name(index)),
+
+        // One `if` per turn, and the last one catches every turn past the end so
+        // a conversation longer than the script keeps answering.
+        let mut dispatch = String::new();
+        let mut bodies = String::new();
+        for turn in 1..=turns.len() {
+            dispatch.push_str(&match turn == turns.len() {
+                true => format!("if %TURN% GEQ {turn} call :turn-{turn}\r\n"),
+                false => format!("if \"%TURN%\"==\"{turn}\" call :turn-{turn}\r\n"),
             });
+            bodies.push_str(&format!("\r\n:turn-{turn}\r\n"));
+            for index in 0..turns[turn - 1].len() {
+                if index > 0 {
+                    // A second, in the platform's idiom for sleeping without a
+                    // console: `timeout` needs one, and `powershell -c
+                    // Start-Sleep` costs more to start than it sleeps for.
+                    bodies.push_str("ping -n 2 127.0.0.1 >nul\r\n");
+                }
+                bodies.push_str(&format!("type \"%~dp0{}\"\r\n", segment_name(turn - 1, index)));
+            }
+            bodies.push_str("goto :eof\r\n");
         }
 
-        if cfg!(windows) {
-            format!(
-                "@echo off\r\n\
-                 if not \"%~1\"==\"--version\" goto started\r\n\
-                 echo 2.1.220 ^(Claude Code^)\r\n\
-                 exit /b 0\r\n\
-                 :started\r\n\
-                 rem One line per process, beside the script rather than in the\r\n\
-                 rem project — this counts starts, and the project is where the\r\n\
-                 rem working-directory marker goes.\r\n\
-                 echo started>>\"%~dp0{STARTS_LOG}\"\r\n\
-                 :turns\r\n\
-                 rem `set /p` leaves the variable undefined when stdin has\r\n\
-                 rem closed, which is how this loop hears that the server is\r\n\
-                 rem finished with it.\r\n\
-                 set \"LINE=\"\r\n\
-                 set /p LINE=\r\n\
-                 if not defined LINE exit /b 0\r\n\
-                 {replay}goto turns\r\n"
-            )
-        } else {
-            format!(
-                "#!/bin/sh\n\
-                 if [ \"$1\" = \"--version\" ]; then\n\
-                 \x20 echo \"2.1.220 (Claude Code)\"\n\
-                 \x20 exit 0\n\
-                 fi\n\
-                 here=$(dirname \"$0\")\n\
-                 echo started >> \"$here/{STARTS_LOG}\"\n\
-                 while IFS= read -r line; do\n\
-                 {replay}done\n"
-            )
+        format!(
+            "@echo off\r\n\
+             if not \"%~1\"==\"--version\" goto started\r\n\
+             echo 2.1.220 ^(Claude Code^)\r\n\
+             exit /b 0\r\n\
+             :started\r\n\
+             rem The argv of this start, so a test can see what the server asked\r\n\
+             rem for — `--resume` above all.\r\n\
+             >>\"%~dp0{ARGUMENTS_LOG}\" echo %*\r\n\
+             {refusal}\
+             rem One line per process, beside the script rather than in the\r\n\
+             rem project — this counts starts, and the project is where the\r\n\
+             rem working-directory marker goes.\r\n\
+             >>\"%~dp0{STARTS_LOG}\" echo started\r\n\
+             set TURN=0\r\n\
+             :turns\r\n\
+             rem `set /p` leaves the variable undefined when stdin has\r\n\
+             rem closed, which is how this loop hears that the server is\r\n\
+             rem finished with it.\r\n\
+             set \"LINE=\"\r\n\
+             set /p LINE=\r\n\
+             if not defined LINE exit /b 0\r\n\
+             rem A relative path, so it lands wherever the agent was started —\r\n\
+             rem which is the whole point of writing it.\r\n\
+             echo.>\"{WORKING_DIRECTORY_MARKER}\"\r\n\
+             set /a TURN+=1\r\n\
+             {dispatch}\
+             goto turns\r\n\
+             {bodies}"
+        )
+    }
+
+    fn shell(&self, turns: &[Vec<&[&str]>], on_resume: OnResume) -> String {
+        let refusal = match on_resume {
+            OnResume::Continue => String::new(),
+            OnResume::Refuse => format!(
+                "case \" $* \" in\n\
+                 \x20 *\" --resume \"*)\n\
+                 \x20   echo \"{REFUSAL}\" >&2\n\
+                 \x20   exit 1\n\
+                 \x20   ;;\n\
+                 esac\n"
+            ),
+        };
+
+        let mut cases = String::new();
+        for turn in 1..=turns.len() {
+            // The wildcard is the last turn's, so a conversation longer than the
+            // script keeps answering with the last thing it had to say.
+            cases.push_str(&match turn == turns.len() {
+                true => "    *)\n".to_string(),
+                false => format!("    {turn})\n"),
+            });
+            for index in 0..turns[turn - 1].len() {
+                if index > 0 {
+                    cases.push_str("      sleep 1\n");
+                }
+                cases.push_str(&format!(
+                    "      cat \"$here/{}\"\n",
+                    segment_name(turn - 1, index)
+                ));
+            }
+            cases.push_str("      ;;\n");
         }
+
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+             \x20 echo \"2.1.220 (Claude Code)\"\n\
+             \x20 exit 0\n\
+             fi\n\
+             here=$(dirname \"$0\")\n\
+             echo \"$*\" >> \"$here/{ARGUMENTS_LOG}\"\n\
+             {refusal}\
+             echo started >> \"$here/{STARTS_LOG}\"\n\
+             turn=0\n\
+             while IFS= read -r line; do\n\
+             \x20 : > \"{WORKING_DIRECTORY_MARKER}\"\n\
+             \x20 turn=$((turn + 1))\n\
+             \x20 case \"$turn\" in\n\
+             {cases}\
+             \x20 esac\n\
+             done\n"
+        )
     }
 }
 
-fn segment_name(index: usize) -> String {
-    format!("segment-{index}.ndjson")
+fn segment_name(turn: usize, index: usize) -> String {
+    format!("turn-{turn}-segment-{index}.ndjson")
 }
 
 /// One line per process the agent script has started, beside the script itself.
 /// Read by [`ScriptedAgent::starts`].
 const STARTS_LOG: &str = "starts.log";
+
+/// One line per process, holding the arguments it was given. Read by
+/// [`ScriptedAgent::arguments`].
+const ARGUMENTS_LOG: &str = "args.log";
+
+/// What an agent says when it will not resume a conversation.
+///
+/// Close to the real CLI's wording, because the server quotes it into the
+/// conversation verbatim and the point of quoting it is that the agent's own
+/// words are more useful than anything the server could infer.
+pub const REFUSAL: &str = "No conversation found with session ID.";

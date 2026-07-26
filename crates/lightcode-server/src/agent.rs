@@ -39,6 +39,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -84,6 +85,14 @@ pub struct Launch {
     /// The CLI's own permission-mode literal, from
     /// [`permission_mode_for`].
     pub permission_mode: Option<&'static str>,
+    /// The `claude` session to continue, when this conversation has one.
+    ///
+    /// `Some` is what makes a conversation survive a restart, and it is the whole
+    /// of the mechanism: the context is in the agent's own store, so continuity
+    /// is a flag rather than a replay of the transcript into the prompt. The id
+    /// is the agent's own, read off a previous run's `init` line — see
+    /// [`crate::threads::Thread::agent_session_id`].
+    pub resume: Option<String>,
 }
 
 /// The CLI's `--permission-mode` for a thread's runtime mode.
@@ -113,6 +122,25 @@ pub struct Agent {
     /// leaving an open pipe beside a boolean saying it is shut.
     stdin: Option<ChildStdin>,
     output: mpsc::Receiver<String>,
+    /// The last thing the agent said on stderr.
+    ///
+    /// Kept because there is one failure whose only account of itself is here: a
+    /// `--resume` the CLI will not honour writes its reason to stderr and exits,
+    /// producing no NDJSON at all. Without this, the server could only report
+    /// that the agent said nothing — see [`crate::turn`], which turns it into a
+    /// sentence in the conversation.
+    ///
+    /// One line rather than a log: the point is to have the CLI's own words for
+    /// a specific failure, not to become a second place the agent's output lives.
+    complaint: Arc<Mutex<Option<String>>>,
+    /// The task reading stderr, so [`Agent::stop`] can wait for it.
+    ///
+    /// Without the wait, "the last thing the agent said" would mean "whatever had
+    /// arrived by the time somebody asked": stdout and stderr are drained by
+    /// separate tasks, so the end of the output and the writing of the reason for
+    /// it are not ordered. That is precisely the case
+    /// [`Agent::complaint`] exists for.
+    stderr: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Agent {
@@ -146,6 +174,13 @@ impl Agent {
         if let Some(mode) = launch.permission_mode {
             command.arg("--permission-mode").arg(mode);
         }
+        // Continuity, in one flag. The CLI keeps the conversation itself, so this
+        // is what makes a follow-up after a restart a follow-up rather than a
+        // first message — and it is the reason this server does not replay its
+        // transcript into the prompt.
+        if let Some(session) = &launch.resume {
+            command.arg("--resume").arg(session);
+        }
         crate::process::without_a_console(command.as_std_mut());
 
         let mut child = command.spawn()?;
@@ -174,14 +209,20 @@ impl Agent {
             }
         });
 
-        // Not a channel: nothing in this server acts on the agent's stderr, and
-        // giving it one would be inventing a consumer. What it is for is the
-        // developer's terminal, so that is where it goes — prefixed, because a
-        // line with no prefix reads as lightcode's own.
-        tokio::spawn(async move {
+        // Still not a channel: nothing in this server *acts* on the agent's
+        // stderr, and giving it one would be inventing a consumer. It goes to the
+        // developer's terminal, prefixed, because a line with no prefix reads as
+        // lightcode's own — and the most recent one is kept, for the one failure
+        // whose only account of itself is there. See [`Agent::complaint`].
+        let complaint = Arc::new(Mutex::new(None));
+        let latest = Arc::clone(&complaint);
+        let reading_stderr = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 eprintln!("lightcode: claude: {line}");
+                if !line.trim().is_empty() {
+                    *lock(&latest) = Some(line.trim().to_string());
+                }
             }
         });
 
@@ -189,6 +230,8 @@ impl Agent {
             child,
             stdin: Some(stdin),
             output,
+            complaint,
+            stderr: Some(reading_stderr),
         })
     }
 
@@ -227,18 +270,28 @@ impl Agent {
         self.output.recv().await
     }
 
-    /// Close stdin, wait, and kill if waiting was not enough.
+    /// Close stdin, wait, kill if waiting was not enough, and hand back the last
+    /// thing the agent said on stderr.
     ///
     /// Always ends with the child reaped: every branch either waits or kills and
     /// then waits, so there is no path out of here that leaves a zombie.
-    pub async fn stop(mut self) {
+    ///
+    /// The complaint comes back from *here* rather than being readable at any
+    /// moment, and that is the point. stdout and stderr are drained by separate
+    /// tasks, so "the agent's output ended" and "the agent wrote why" are not
+    /// ordered against each other — a caller that asked the moment the output
+    /// ended would get whatever had happened to arrive. Once the child has gone
+    /// its stderr is closed, the reader is finishing, and joining it is what makes
+    /// the answer final. That matters for exactly one failure, and it is the one
+    /// with no NDJSON to it: a `--resume` the CLI will not honour.
+    pub async fn stop(mut self) -> Option<String> {
         // EOF. The CLI's own way of being told the conversation is over.
         drop(self.stdin.take());
 
         let deadline = tokio::time::Instant::now() + EXIT_GRACE;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => return self.last_words().await,
                 Err(error) => {
                     eprintln!("lightcode: cannot wait for the agent: {error}");
                     break;
@@ -256,11 +309,33 @@ impl Agent {
         // reasoning as `provider::probe`'s timeout, and the same conclusion,
         // which is that a job object is not worth it here.
         let _ = self.child.kill().await;
+        self.last_words().await
+    }
+
+    /// Let the stderr reader finish, then take what it last saw.
+    ///
+    /// Bounded, because the reader ends when the pipe closes and the pipe closes
+    /// when the last holder of it exits — which for the `.cmd` stand-ins the suite
+    /// uses is a grandchild a kill does not reach. The same case, and the same
+    /// bound, as the exit grace above.
+    async fn last_words(&mut self) -> Option<String> {
+        if let Some(reader) = self.stderr.take() {
+            let _ = tokio::time::timeout(EXIT_GRACE, reader).await;
+        }
+        lock(&self.complaint).clone()
     }
 }
 
 fn missing_pipe() -> std::io::Error {
     std::io::Error::other("the agent was started without one of its pipes")
+}
+
+/// A poisoned lock means the stderr reader panicked mid-line. What is behind it
+/// is one `Option<String>` with no invariant a panic could have broken, so
+/// refusing to use it would turn one panic into a session that cannot report why
+/// it failed.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -298,6 +373,7 @@ mod tests {
             cwd: directory.path().to_string_lossy().into_owned(),
             model: None,
             permission_mode: None,
+            resume: None,
         })
         .await
         .expect_err("nothing is there to start");

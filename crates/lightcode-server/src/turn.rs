@@ -38,6 +38,29 @@
 //! Nothing in that table makes the session `running`, and that is deliberate:
 //! `init` is printed once for the whole conversation, so the transition belongs
 //! to the prompt being sent rather than to anything the agent says.
+//!
+//! ## Continuity is the agent's, and this is where the handle on it is kept
+//!
+//! Within one process there is nothing to do: the child is long-lived and the
+//! conversation is its own, so a follow-up is a second line on the same stdin.
+//! Across a restart there is exactly one thing to do, and it is a flag —
+//! `--resume <session-id>` — because the context lives in the agent's own store
+//! rather than in this server's transcript. Replaying the transcript into each
+//! prompt would be the alternative, and it would be a second, worse copy of the
+//! conversation that the agent had no reason to believe.
+//!
+//! So the `init` line's session id is remembered on the thread and written down
+//! ([`crate::threads::Threads::remember_agent_session`]), and a session opened
+//! for a thread that has one is opened with `--resume`. The id is the agent's own
+//! account of itself rather than something this server minted, for the same
+//! reason the model and the permission mode are.
+//!
+//! A resume the CLI will not honour is the one failure with no NDJSON to it at
+//! all: the child writes its reason to stderr and exits. [`resume_refused`] is
+//! how that becomes a sentence in the conversation, and the stored id is
+//! deliberately *kept* — starting a fresh session under a thread whose history
+//! the agent has forgotten would leave the developer talking to something that
+//! cannot see the transcript in front of them.
 
 use serde_json::json;
 
@@ -58,6 +81,10 @@ pub struct Start {
     pub workspace_root: String,
     pub model: Option<String>,
     pub runtime_mode: String,
+    /// The `claude` session to continue, when the thread already has one. See
+    /// this module's documentation: it is the whole of how a conversation
+    /// survives a restart.
+    pub resume: Option<String>,
     /// Read once, when the turn is dispatched. A settings change mid-session
     /// does not move a running agent, which is honest — the process was started
     /// with the old value and cannot be told otherwise.
@@ -179,7 +206,23 @@ async fn drive(
         }
     }
 
-    agent.stop().await;
+    // Reaped first, and the complaint comes back from the reaping. A session that
+    // was asked to continue an old conversation and never announced itself did not
+    // continue it: the CLI writes its reason to stderr and exits without a line of
+    // NDJSON, so the agent's own words are the only account of it — and they are
+    // only final once the child has gone. See [`Agent::stop`].
+    let complaint = agent.stop().await;
+    let refused = start
+        .resume
+        .as_ref()
+        .filter(|_| folding.session_id.is_none())
+        .map(|session| resume_refused(session, complaint.as_deref()));
+    if let Some(why) = &refused {
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(Activity::failed("session.resume-failed", why)),
+        );
+    }
 
     // A turn still in flight when the agent went is a turn that will never
     // finish, and saying "stopped" would let it sit in the UI as running
@@ -188,15 +231,41 @@ async fn drive(
     threads.apply(
         &start.thread_id,
         Change::Session(Session {
-            status: if unfinished { "error" } else { "stopped" },
+            status: if unfinished || refused.is_some() {
+                "error"
+            } else {
+                "stopped"
+            },
             runtime_mode: start.runtime_mode.clone(),
             active_turn_id: None,
-            last_error: unfinished
-                .then(|| "The agent stopped before the turn finished.".to_string()),
+            // The refusal wins when there is one: "the agent stopped before the
+            // turn finished" is true of it and says nothing about why.
+            last_error: refused.or_else(|| {
+                unfinished.then(|| "The agent stopped before the turn finished.".to_string())
+            }),
             updated_at: now_iso(),
         }),
     );
     threads.detach(&start.thread_id);
+}
+
+/// What the developer is told when a conversation cannot be picked back up.
+///
+/// The transcript above it is untouched and still readable — it is this server's
+/// own copy, not the agent's — so what the sentence has to do is say that the
+/// conversation is readable and not continuable, and name the session so the
+/// developer can go and look for it. The CLI's own words are quoted when it left
+/// any, because "no conversation found with that session id" is a great deal more
+/// useful than anything this server could infer.
+fn resume_refused(session_id: &str, complaint: Option<&str>) -> String {
+    let mut why = format!(
+        "Claude Code would not resume session {session_id}, so this conversation can be read \
+         but not continued."
+    );
+    if let Some(complaint) = complaint {
+        why.push_str(&format!(" The agent said: {complaint}"));
+    }
+    why
 }
 
 /// Which of the two sources the loop heard from. A named value rather than
@@ -246,6 +315,7 @@ async fn open(start: &Start) -> Result<Agent, String> {
         cwd: start.workspace_root.clone(),
         model: start.model.clone(),
         permission_mode: permission_mode_for(&start.runtime_mode),
+        resume: start.resume.clone(),
     })
     .await
     .map_err(|error| {
@@ -272,6 +342,14 @@ fn publish(
         // this only ever appends the activity; the session's `running` comes
         // from the prompt being sent, in `drive`.
         Folded::Initialized => {
+            // Before the activity, because this is the load-bearing half: the
+            // activity is what a developer reads and this is what the next run
+            // resumes into. A resumed session announces an id too — the CLI is
+            // free to hand back a new one — so the thread always holds the most
+            // recent, which is the one `--resume` will be given next.
+            if let Some(session_id) = &folding.session_id {
+                threads.remember_agent_session(&start.thread_id, session_id);
+            }
             threads.apply(
                 &start.thread_id,
                 Change::Activity(Activity::info(
@@ -444,6 +522,11 @@ pub fn starting(thread: &Thread, workspace_root: &str, settings: &ClaudeSettings
         workspace_root: workspace_root.to_string(),
         model: thread.model(),
         runtime_mode: thread.runtime_mode.clone(),
+        // Read here rather than inside the driver, so what is resumed is the
+        // session the thread held when the turn was dispatched. A session opened
+        // for a thread that has none starts a fresh conversation and reports its
+        // own id back a moment later.
+        resume: thread.agent_session_id.clone(),
         settings: settings.clone(),
     }
 }

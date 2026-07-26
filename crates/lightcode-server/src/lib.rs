@@ -29,7 +29,8 @@
 //! [`server`] is the endpoint and the connection loop that ties them together.
 //!
 //! The two formats meet in exactly one place. [`agent`] runs the `claude`
-//! subprocess, [`threads`] holds a conversation as the UI reads one, and
+//! subprocess, [`threads`] holds a conversation as the UI reads one,
+//! [`transcripts`] writes one down behind the stream that is producing it, and
 //! [`turn`] is the join: it folds what the agent said with [`protocol`] and
 //! publishes it as what the UI reads. Keeping the join to one file is what makes
 //! "the agent's format moved" and "the UI's contract moved" separate failures.
@@ -53,6 +54,7 @@ pub mod server;
 pub mod store;
 pub mod subscriptions;
 pub mod threads;
+pub mod transcripts;
 pub mod turn;
 pub mod watcher;
 pub mod wire;
