@@ -50,6 +50,27 @@ pub fn start_turn(thread_id: &str, message_id: &str, text: &str) -> Value {
 /// being asked about. Ticket 13's want `approval-required`, which is the mode
 /// whose whole meaning is that the agent asks.
 pub fn start_turn_in(thread_id: &str, message_id: &str, text: &str, runtime_mode: &str) -> Value {
+    turn_start("project-1", thread_id, message_id, text, runtime_mode)
+}
+
+/// The same, for a conversation belonging to a project other than the first.
+///
+/// A thread is scoped to a project — `CONTEXT.md`'s *Thread* — and the composer
+/// says which one under `bootstrap.createThread`. Every test before ticket 16 had
+/// one project and could leave it implied; two conversations in two projects
+/// cannot, because which project a thread is in is what decides whose delete
+/// takes it away.
+pub fn start_turn_for(project_id: &str, thread_id: &str, message_id: &str, text: &str) -> Value {
+    turn_start(project_id, thread_id, message_id, text, "full-access")
+}
+
+fn turn_start(
+    project_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    text: &str,
+    runtime_mode: &str,
+) -> Value {
     json!({
         "type": "thread.turn.start",
         "commandId": format!("test:turn:{message_id}"),
@@ -66,7 +87,7 @@ pub fn start_turn_in(thread_id: &str, message_id: &str, text: &str, runtime_mode
         "interactionMode": "default",
         "bootstrap": {
             "createThread": {
-                "projectId": "project-1",
+                "projectId": project_id,
                 "title": "A conversation",
                 "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
                 "runtimeMode": runtime_mode,
@@ -213,9 +234,25 @@ impl SocketClient {
     /// Register a project and open the thread subscription, as the UI does before
     /// the developer has typed anything.
     pub async fn open_conversation(&mut self, workspace: &Workspace, thread_id: &str) -> String {
+        self.open_conversation_in(workspace, "project-1", thread_id)
+            .await
+    }
+
+    /// The same, naming the project the folder is registered as.
+    ///
+    /// Ticket 16's, and the reason it exists is that a second project has to be a
+    /// second *folder*: `project.create` refuses a root another project already
+    /// holds, so "two conversations in different projects" is two workspaces as
+    /// well as two ids.
+    pub async fn open_conversation_in(
+        &mut self,
+        workspace: &Workspace,
+        project_id: &str,
+        thread_id: &str,
+    ) -> String {
         self.call(
             "orchestration.dispatchCommand",
-            create_project("project-1", workspace.path()),
+            create_project(project_id, workspace.path()),
         )
         .await
         .expect_success();
