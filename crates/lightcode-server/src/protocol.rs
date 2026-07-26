@@ -178,6 +178,38 @@ pub struct Turn {
     pub from_deltas: bool,
 }
 
+/// What folding one line changed, for a caller that has to tell somebody.
+///
+/// The reducer was written for the spike, where the whole of the answer was the
+/// final state and nothing needed to know *when* a piece of it arrived. A server
+/// streaming a turn does: it has to publish a delta the moment it lands and the
+/// reconciled message the moment that does.
+///
+/// It is a return value rather than a callback, and rather than a second reducer
+/// in the driver, because the accumulate-and-reconcile rule has to exist in
+/// exactly one place. A driver that re-implemented "the buffered message wins"
+/// alongside this one would be two rules that agree until they do not, and the
+/// one that the golden files check would not be the one the UI sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Folded {
+    /// A line that changed nothing a client would notice — a hook event, a
+    /// block boundary, a rate-limit notice, drift, or a line that did not parse.
+    Nothing,
+    /// `system`/`init`: the session id, model, working directory and permission
+    /// mode are now known, and are on the state.
+    Initialized,
+    /// Live text arrived. Carries the delta itself rather than a position,
+    /// because the accumulation is cleared out from under the caller when the
+    /// turn reconciles.
+    Streamed(String),
+    /// A complete message joined `transcript` at this index. Reading it there
+    /// gives the role, the authoritative text, and whether the deltas agreed.
+    Turn { index: usize },
+    /// The terminal `result` for the turn. `last_result` holds the duration and
+    /// the cost.
+    Completed,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ResultSummary {
     pub is_error: bool,
@@ -202,13 +234,16 @@ impl SessionState {
     /// CLI's output ends with one), and a line that does not parse is counted
     /// rather than returned, because one bad line must not end a session any
     /// more than one unrecognized event type does.
-    pub fn fold_line(&mut self, line: &str) {
+    pub fn fold_line(&mut self, line: &str) -> Folded {
         if line.trim().is_empty() {
-            return;
+            return Folded::Nothing;
         }
         match parse_line(line) {
             Ok(event) => self.reduce(event),
-            Err(_) => self.note_parse_error(),
+            Err(_) => {
+                self.note_parse_error();
+                Folded::Nothing
+            }
         }
     }
 
@@ -221,7 +256,7 @@ impl SessionState {
     /// text when it lands — deltas are best-effort and may be shed, so the
     /// buffered message is authoritative. This is the accumulate-and-reconcile
     /// pattern, and it is the shape the real server should use too.
-    pub fn reduce(&mut self, event: Event) {
+    pub fn reduce(&mut self, event: Event) -> Folded {
         match event {
             Event::System(SystemEvent::Init(init)) => {
                 self.bump("system/init");
@@ -230,31 +265,54 @@ impl SessionState {
                 self.cwd = Some(init.cwd);
                 self.permission_mode = Some(init.permission_mode);
                 self.tool_count = init.tools.len();
+                Folded::Initialized
             }
-            Event::System(SystemEvent::Other) => self.bump("system/other"),
+            Event::System(SystemEvent::Other) => {
+                self.bump("system/other");
+                Folded::Nothing
+            }
 
             Event::StreamEvent { event } => match event {
                 StreamEvent::MessageStart {} => {
                     self.bump("stream/message_start");
                     self.streaming = true;
                     self.live_text.clear();
+                    Folded::Nothing
                 }
                 StreamEvent::ContentBlockDelta { delta, .. } => {
                     self.bump("stream/content_block_delta");
-                    if let Delta::TextDelta { text } = delta {
-                        self.live_text.push_str(&text);
+                    match delta {
+                        Delta::TextDelta { text } => {
+                            self.live_text.push_str(&text);
+                            Folded::Streamed(text)
+                        }
+                        // Thinking, signature and tool-input deltas all land
+                        // here. They are not the assistant's visible text, so
+                        // there is nothing to append and nothing to publish.
+                        Delta::Unknown => Folded::Nothing,
                     }
                 }
                 StreamEvent::MessageStop => {
                     self.bump("stream/message_stop");
                     self.streaming = false;
+                    Folded::Nothing
                 }
-                StreamEvent::ContentBlockStart { .. } => self.bump("stream/content_block_start"),
-                StreamEvent::ContentBlockStop { .. } => self.bump("stream/content_block_stop"),
-                StreamEvent::MessageDelta {} => self.bump("stream/message_delta"),
+                StreamEvent::ContentBlockStart { .. } => {
+                    self.bump("stream/content_block_start");
+                    Folded::Nothing
+                }
+                StreamEvent::ContentBlockStop { .. } => {
+                    self.bump("stream/content_block_stop");
+                    Folded::Nothing
+                }
+                StreamEvent::MessageDelta {} => {
+                    self.bump("stream/message_delta");
+                    Folded::Nothing
+                }
                 StreamEvent::Unknown => {
                     self.bump("stream/UNKNOWN");
                     self.unknown_events += 1;
+                    Folded::Nothing
                 }
             },
 
@@ -269,6 +327,9 @@ impl SessionState {
                     from_deltas,
                 });
                 self.live_text.clear();
+                Folded::Turn {
+                    index: self.transcript.len() - 1,
+                }
             }
 
             Event::User(env) => {
@@ -279,6 +340,9 @@ impl SessionState {
                     text,
                     from_deltas: false,
                 });
+                Folded::Turn {
+                    index: self.transcript.len() - 1,
+                }
             }
 
             Event::Result(r) => {
@@ -291,13 +355,18 @@ impl SessionState {
                     duration_ms: r.duration_ms,
                     total_cost_usd: r.total_cost_usd,
                 });
+                Folded::Completed
             }
 
-            Event::RateLimitEvent(_) => self.bump("rate_limit_event"),
+            Event::RateLimitEvent(_) => {
+                self.bump("rate_limit_event");
+                Folded::Nothing
+            }
 
             Event::Unknown => {
                 self.bump("UNKNOWN");
                 self.unknown_events += 1;
+                Folded::Nothing
             }
         }
     }
@@ -355,6 +424,12 @@ mod tests {
             state.fold_line(line);
         }
         state
+    }
+
+    /// What each line changed, in order — the driver's view of the same fold.
+    fn outcomes(lines: &[&str]) -> Vec<Folded> {
+        let mut state = SessionState::new();
+        lines.iter().map(|line| state.fold_line(line)).collect()
     }
 
     #[test]
@@ -434,5 +509,70 @@ mod tests {
         ]);
 
         assert!(state.transcript[0].from_deltas);
+    }
+
+    // -- what the driver is told ---------------------------------------------
+
+    /// One turn, line by line, as the thing that has to publish it sees it: the
+    /// session announces itself, text arrives in pieces, a whole message lands,
+    /// and the turn ends. Everything in between is a line with nothing to say.
+    #[test]
+    fn a_streamed_turn_reports_each_line_that_a_client_would_notice() {
+        let told = outcomes(&[
+            r#"{"type":"system","subtype":"init","session_id":"s","model":"m","cwd":"/tmp","permissionMode":"default"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"type":"result","subtype":"success","duration_ms":12,"total_cost_usd":0.5}"#,
+        ]);
+
+        assert_eq!(
+            told,
+            vec![
+                Folded::Initialized,
+                Folded::Nothing,
+                Folded::Nothing,
+                Folded::Streamed("hel".to_string()),
+                Folded::Streamed("lo".to_string()),
+                Folded::Nothing,
+                Folded::Nothing,
+                Folded::Turn { index: 0 },
+                Folded::Completed,
+            ]
+        );
+    }
+
+    /// The deltas a healthy turn is full of that are *not* the visible reply —
+    /// reasoning, block signatures, tool arguments. Publishing one as assistant
+    /// text would put the model's thinking in the transcript.
+    #[test]
+    fn a_delta_that_is_not_visible_text_reports_nothing() {
+        assert_eq!(
+            outcomes(&[
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}}"#,
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}}"#,
+            ]),
+            vec![Folded::Nothing, Folded::Nothing]
+        );
+    }
+
+    /// Drift and malformed lines report nothing rather than something a driver
+    /// would try to publish. This is the same survival property the counters
+    /// record, seen from the side that has a client attached.
+    #[test]
+    fn drift_and_malformed_lines_report_nothing_to_publish() {
+        assert_eq!(
+            outcomes(&[
+                r#"{"type":"telemetry_event"}"#,
+                "}{",
+                "",
+                r#"{"type":"stream_event","event":{"type":"citation_delta","index":0}}"#,
+            ]),
+            vec![Folded::Nothing; 4]
+        );
     }
 }

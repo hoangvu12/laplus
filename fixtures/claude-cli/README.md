@@ -8,6 +8,13 @@ line by line through a fresh `SessionState`; the result is compared against
 Sibling of `fixtures/socket-wire/`, which pins the *other* protocol — the one
 the UI speaks. This directory pins the one the agent speaks.
 
+Since ticket 10 they are also **replayed**: `harness::agent::ScriptedAgent`
+writes a stand-in `claude` that reads a turn on stdin and prints one of these
+files back, so `tests/socket_turn.rs` drives a whole turn through the socket
+against what the CLI actually said. That gives a capture two jobs — the reducer
+is held to it, and the server is driven by it — and it is why re-capturing after
+a `claude` release is worth doing even when the golden files still match.
+
 ## The captures
 
 | File | Provenance | What it covers |

@@ -50,8 +50,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use crate::clock::now_iso;
 use crate::config::{
     AuthStatus, ClaudeSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
 };
@@ -118,6 +119,43 @@ pub enum Located {
         name: String,
         directories: Vec<PathBuf>,
     },
+}
+
+impl Located {
+    /// The binary and how it was found, or the sentence saying why there is
+    /// none.
+    ///
+    /// The one place [`Located`]'s three variants are collapsed to two, so that
+    /// no caller has to match a variant it has already excluded — and so that a
+    /// fourth variant, if one is ever needed, is a compile error here rather
+    /// than something a catch-all absorbs silently.
+    ///
+    /// The sentence is the ticket 09 diagnostic verbatim: it names the
+    /// configured path when there was one, what was looked for, and every
+    /// directory it was looked for in. Two callers want it — the provider
+    /// snapshot the UI shows at rest, and a turn that went to start an agent and
+    /// found none — and a second wording for the same fact would drift from the
+    /// first.
+    pub fn startable(self) -> Result<(PathBuf, Source), String> {
+        match self {
+            Located::Binary { path, source } => Ok((path, source)),
+            // `installed: false` although the file exists, because what
+            // `installed` claims is that there is an agent here — and a
+            // directory or a text file is not one.
+            Located::NotExecutable { configured } => Err(format!(
+                "The configured Claude Code binary path {} exists but is not a program this \
+                 machine can start. {} PATH was not searched, because a path was configured \
+                 and something is there.",
+                configured.display(),
+                what_would_start(),
+            )),
+            Located::Nothing {
+                configured,
+                name,
+                directories,
+            } => Err(not_found(configured.as_deref(), &name, &directories)),
+        }
+    }
 }
 
 /// Which of the two strategies produced the binary.
@@ -534,8 +572,8 @@ pub fn describe(settings: &ClaudeSettings, search: &Search) -> Provider {
         return disabled(settings);
     }
 
-    match resolve(&settings.binary_path, search) {
-        Located::Binary { path, source } => {
+    match resolve(&settings.binary_path, search).startable() {
+        Ok((path, source)) => {
             // stderr, because "which binary is it actually running" is the first
             // question a developer asks when a turn misbehaves, and the resolved
             // path is deliberately not on the wire — `ServerProvider` has no
@@ -545,34 +583,14 @@ pub fn describe(settings: &ClaudeSettings, search: &Search) -> Provider {
             let probed = probe(&path, PROBE_TIMEOUT);
             describe_probe(settings, &path, &source, probed)
         }
-        // `installed: false` although the file exists, because what `installed`
-        // claims is that there is an agent here — and a directory or a text file
-        // is not one. The UI's headline is then "Not found", with this sentence
-        // underneath saying what *was* found, which is the pair a developer can
-        // act on.
-        Located::NotExecutable { configured } => snapshot(
+        // The UI's headline is "Not found", with this sentence underneath saying
+        // what *was* found, which is the pair a developer can act on.
+        Err(why) => snapshot(
             settings,
             None,
             Installed::No,
             ProviderState::Error,
-            Some(format!(
-                "The configured Claude Code binary path {} exists but is not a program this \
-                 machine can start. {} PATH was not searched, because a path was configured \
-                 and something is there.",
-                configured.display(),
-                what_would_start(),
-            )),
-        ),
-        Located::Nothing {
-            configured,
-            name,
-            directories,
-        } => snapshot(
-            settings,
-            None,
-            Installed::No,
-            ProviderState::Error,
-            Some(not_found(configured.as_deref(), &name, &directories)),
+            Some(why),
         ),
     }
 }
@@ -794,72 +812,6 @@ pub fn refresh(config: &ConfigStore, search: &Search) {
         eprintln!("lightcode: provider claudeAgent: {message}");
     }
     config.apply(ConfigChange::Providers(vec![provider]));
-}
-
-// ---------------------------------------------------------------------------
-// The clock
-// ---------------------------------------------------------------------------
-
-/// Now, rendered as the contract's `IsoDateTime`.
-///
-/// Hand-rolled rather than pulled in with a date crate, and not out of thrift:
-/// the only thing this server wants from a calendar is this one string.
-/// [`crate::store`] gets its timestamps from SQLite's `strftime` because the
-/// registry's clock has to be the database's; a provider snapshot never reaches
-/// SQLite, so asking the database what time it is would mean taking a lock to
-/// answer a question that has nothing to do with it. The rendering matches
-/// `store::NOW` exactly — `2026-07-26T00:23:04.909Z`, milliseconds and a `Z` —
-/// so the two clocks in one payload do not look like two formats.
-fn now_iso() -> String {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        // Before 1970 the machine's clock is wrong in a way this cannot fix, and
-        // a panic in a status probe would be a poor way to say so.
-        .unwrap_or_default();
-    iso_from_epoch(since_epoch.as_secs(), since_epoch.subsec_millis())
-}
-
-/// The civil date and time `seconds` after the Unix epoch, as an ISO string.
-///
-/// Split out from [`now_iso`] because a clock that cannot be given a time is a
-/// clock that cannot be tested.
-fn iso_from_epoch(seconds: u64, milliseconds: u32) -> String {
-    let days = seconds / 86_400;
-    let rest = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days as i64);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{milliseconds:03}Z",
-        rest / 3_600,
-        (rest % 3_600) / 60,
-        rest % 60,
-    )
-}
-
-/// Days since the Unix epoch to a civil year, month and day.
-///
-/// Howard Hinnant's `civil_from_days`, which is the standard way to do this
-/// without a table of leap years: it shifts the epoch to March 1st of year 0 so
-/// the leap day lands at the end of the cycle, then divides by the lengths of the
-/// 400-, 100- and 4-year eras. Correct for every date this server can produce,
-/// and the proof is arithmetic rather than a list of cases.
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
-    let shifted = days + 719_468;
-    let era = match shifted >= 0 {
-        true => shifted,
-        false => shifted - 146_096,
-    } / 146_097;
-    let day_of_era = (shifted - era * 146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = match shifted_month < 10 {
-        true => shifted_month + 3,
-        false => shifted_month - 9,
-    };
-    (year + i64::from(month <= 2), month, day)
 }
 
 #[cfg(test)]
@@ -1258,23 +1210,12 @@ mod tests {
     }
 
     // -- the clock ----------------------------------------------------------
+    //
+    // The rendering itself moved to `crate::clock` with ticket 10, which stamps
+    // every message and activity rather than one probe. What stays here is the
+    // one assertion that is about *this* payload: two clocks meet in it.
 
-    /// Five instants chosen for the arithmetic rather than for coverage: the
-    /// epoch, a sub-second, an ordinary date, a leap day, and a century boundary
-    /// that is not a leap year.
-    #[test]
-    fn the_clock_renders_a_known_instant_correctly() {
-        assert_eq!(iso_from_epoch(0, 0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(iso_from_epoch(1, 7), "1970-01-01T00:00:01.007Z");
-        assert_eq!(
-            iso_from_epoch(1_700_000_000, 909),
-            "2023-11-14T22:13:20.909Z"
-        );
-        assert_eq!(iso_from_epoch(1_709_164_800, 0), "2024-02-29T00:00:00.000Z");
-        assert_eq!(iso_from_epoch(4_102_444_800, 0), "2100-01-01T00:00:00.000Z");
-    }
-
-    /// The payload carries two clocks — this one and the registry's, which is
+    /// The payload carries two clocks — [`crate::clock`] and the registry's, which is
     /// SQLite's — and a client parses both with the same `new Date`. If they ever
     /// render differently, one of them stops being a date.
     #[test]

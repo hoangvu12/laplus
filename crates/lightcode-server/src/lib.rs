@@ -27,8 +27,16 @@
 //! [`provider`] finds the agent binary and reports what it found, [`process`]
 //! is how all three of those start a program and where they look for one, and
 //! [`server`] is the endpoint and the connection loop that ties them together.
+//!
+//! The two formats meet in exactly one place. [`agent`] runs the `claude`
+//! subprocess, [`threads`] holds a conversation as the UI reads one, and
+//! [`turn`] is the join: it folds what the agent said with [`protocol`] and
+//! publishes it as what the UI reads. Keeping the join to one file is what makes
+//! "the agent's format moved" and "the UI's contract moved" separate failures.
 
+pub mod agent;
 pub mod auth;
+pub mod clock;
 pub mod config;
 pub mod config_store;
 pub mod editor;
@@ -44,6 +52,8 @@ pub mod rpc;
 pub mod server;
 pub mod store;
 pub mod subscriptions;
+pub mod threads;
+pub mod turn;
 pub mod watcher;
 pub mod wire;
 

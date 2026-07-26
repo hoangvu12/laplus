@@ -208,16 +208,16 @@ mod tests {
     fn a_change_is_visible_to_the_next_reader() {
         let store = store();
         assert!(
-            !store.current().settings.enable_assistant_streaming,
+            store.current().settings.enable_assistant_streaming,
             "the value this test moves off"
         );
 
-        store.apply(settings_change(&store, true));
+        store.apply(settings_change(&store, false));
 
-        assert!(store.current().settings.enable_assistant_streaming);
+        assert!(!store.current().settings.enable_assistant_streaming);
         assert_eq!(
             store.current().to_value()["settings"]["enableAssistantStreaming"],
-            json!(true)
+            json!(false)
         );
     }
 

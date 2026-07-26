@@ -120,6 +120,19 @@ impl ServerState {
         self.services.index.watched()
     }
 
+    /// Agent processes currently running. The fourth of the family, and the one
+    /// that makes "the subprocess is terminated and reaped when the session
+    /// ends" something a test can observe rather than assert about internals.
+    pub fn live_agents(&self) -> usize {
+        self.services.shell.threads().live_agents()
+    }
+
+    /// How often the buffered assistant message and the deltas before it agreed.
+    /// See [`crate::threads::Reconciliation`], which is the check itself.
+    pub fn reconciliation(&self) -> crate::threads::Reconciliation {
+        self.services.shell.threads().reconciliation()
+    }
+
     fn subscription_gauge(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.live_subscriptions)
     }
@@ -299,10 +312,18 @@ impl Server {
         });
     }
 
-    /// Stop accepting, close open sockets, and wait for the listener to go.
+    /// Stop accepting, close open sockets, end every agent session, and wait for
+    /// all of it to actually be gone.
+    ///
+    /// The agents go last and are waited for. A `claude` outliving the server
+    /// that started it is the one leak this process can produce that survives
+    /// the process — it holds the project's files open and keeps talking to an
+    /// API on the developer's account — so "stopped" here means reaped rather
+    /// than asked.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         let _ = self.serving.await;
+        self.state.services.shell.threads().shutdown().await;
     }
 
     /// Serve until the process is interrupted. This is what the binary calls.

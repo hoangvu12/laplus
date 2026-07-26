@@ -28,7 +28,8 @@
 //! standing in for a problem this does not have.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Row};
 
@@ -80,6 +81,110 @@ const PROJECT_COLUMNS: &str =
 #[derive(Debug)]
 pub struct Database {
     connection: Mutex<Connection>,
+}
+
+/// Hands out the number every orchestration change is ordered by, and keeps the
+/// announcements in that order.
+///
+/// Ticket 05 had the database do the numbering, incrementing a column inside the
+/// same transaction as the write. Ticket 10 could not keep that: a streamed turn
+/// publishes an event per token, and a counter that lived in SQLite would mean
+/// a transaction commit — an `fsync` — per token of a reply that is not
+/// persisted at all. So the counter moved into memory and the database records
+/// the number a durable write *was given* rather than choosing it.
+///
+/// Two properties survive the move, and they are the ones ticket 05 was after:
+///
+/// - **It is seeded from the database**, so a restart never re-issues a number a
+///   committed change already used. That was the reason the sequence was
+///   persisted, and it still is.
+/// - **A commit stamps the database with its own number**, so the stored value
+///   stays a high-water mark rather than a count of commits.
+///
+/// What the move costs is gaps: a number is taken before a command knows whether
+/// it will commit, and a refused command leaves its number unused. Nothing reads
+/// this as a dense log — the client only ever asks whether an event is newer than
+/// what it holds — so a gap is invisible and a *reused* number would not be.
+///
+/// ## Taking a number is holding the log open
+///
+/// [`Sequences::commit`] returns a **guard**, not an integer, and that is the
+/// whole of the ordering guarantee. Projects are committed by a socket's read
+/// loop and threads by an agent's driver task; both publish onto the one feed the
+/// project list is folding, and a client drops anything at or below the sequence
+/// it already holds. So a project numbered 5 that published after a thread event
+/// numbered 6 would be dropped permanently — the project would simply never
+/// appear.
+///
+/// Holding the guard from taking the number to publishing the change makes that
+/// impossible. It replaces the plain `Mutex<()>` ticket 05 held for the same
+/// reason across one aggregate; there are two now, and one lock has to cover
+/// both.
+#[derive(Debug, Clone)]
+pub struct Sequences {
+    committed: Arc<Mutex<i64>>,
+    /// Read without the lock, for the callers that only want to know how far the
+    /// log has got — a snapshot describing when it was taken. Kept in step with
+    /// the value behind the lock, and only ever written while it is held.
+    watermark: Arc<AtomicI64>,
+}
+
+/// A number taken, and the log held open until the change it numbers has been
+/// announced. Dropping it releases the next writer.
+#[derive(Debug)]
+pub struct Numbered<'a> {
+    sequence: i64,
+    _log: std::sync::MutexGuard<'a, i64>,
+}
+
+impl Numbered<'_> {
+    pub fn sequence(&self) -> i64 {
+        self.sequence
+    }
+}
+
+impl Sequences {
+    /// Continue from wherever this database was left.
+    pub fn resuming(database: &Database) -> Result<Sequences, StorageError> {
+        Ok(Sequences::from(database.registry()?.sequence))
+    }
+
+    /// Continue from a known position. The seam the tests use, and what a
+    /// caller that already read the registry wants.
+    pub fn from(committed: i64) -> Sequences {
+        Sequences {
+            committed: Arc::new(Mutex::new(committed)),
+            watermark: Arc::new(AtomicI64::new(committed)),
+        }
+    }
+
+    /// Take the number for the change about to happen, and hold the log until it
+    /// has been announced.
+    ///
+    /// A poisoned lock means a previous holder panicked between taking a number
+    /// and publishing. The counter behind it is one integer with no invariant a
+    /// panic could have left half-built, so carrying on is better than turning
+    /// one panic into a server that can never change anything again.
+    pub fn commit(&self) -> Numbered<'_> {
+        let mut log = self
+            .committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *log += 1;
+        let sequence = *log;
+        self.watermark.store(sequence, Ordering::SeqCst);
+        Numbered {
+            sequence,
+            _log: log,
+        }
+    }
+
+    /// The highest number handed out so far — what a snapshot describes itself
+    /// as being taken at, so that every event issued after it is strictly newer
+    /// and none is dropped by a client comparing the two.
+    pub fn current(&self) -> i64 {
+        self.watermark.load(Ordering::SeqCst)
+    }
 }
 
 /// Everything a shell snapshot is made of, read as one consistent picture.
@@ -278,6 +383,12 @@ impl Database {
         })
     }
 
+    /// One project by id, for a caller that has a thread and needs the folder
+    /// the agent should run in.
+    pub fn project(&self, id: &str) -> Result<Option<Project>, StorageError> {
+        find_project(&self.lock(), "id", id)
+    }
+
     /// Register a project, unless its id or its folder is already taken.
     ///
     /// The check and the write are one transaction, so two clients racing to
@@ -287,12 +398,18 @@ impl Database {
     /// that omits its timestamp gets the database's, which is why this is an
     /// `Option` rather than a string the caller had to invent: the contract
     /// types the field as non-empty, so there is no honest empty value.
+    ///
+    /// `at` is the sequence this write commits at, taken from [`Sequences`] by
+    /// the caller. It is an argument rather than something read here because the
+    /// same counter orders changes that never reach a database at all — see
+    /// [`Sequences`] for why that had to become true.
     pub fn insert_project(
         &self,
         id: &str,
         title: &str,
         root: &WorkspaceRoot,
         created_at: Option<&str>,
+        at: i64,
     ) -> Result<Insert, StorageError> {
         let mut connection = self.lock();
         let transaction = connection
@@ -335,11 +452,14 @@ impl Database {
             )
         })?;
 
-        let sequence = advance(&transaction)?;
+        stamp(&transaction, at)?;
         transaction
             .commit()
             .map_err(StorageError::while_("register the project"))?;
-        Ok(Insert::Committed { sequence, project })
+        Ok(Insert::Committed {
+            sequence: at,
+            project,
+        })
     }
 
     /// Take a project off the registry.
@@ -350,8 +470,10 @@ impl Database {
     /// Removing an id that is not there is not an error. A client that retries
     /// a delete it already succeeded at is describing a world the server agrees
     /// with, and answering it with a failure would be the server disagreeing
-    /// about the past.
-    pub fn remove_project(&self, id: &str) -> Result<Removal, StorageError> {
+    /// about the past. Such a no-op answers with the sequence the registry is
+    /// *already* at rather than with `at`, because nothing happened at `at` and
+    /// a client that waited for an event there would wait forever.
+    pub fn remove_project(&self, id: &str, at: i64) -> Result<Removal, StorageError> {
         let mut connection = self.lock();
         let transaction = connection
             .transaction()
@@ -384,12 +506,12 @@ impl Database {
             )
         })?;
 
-        let sequence = advance(&transaction)?;
+        stamp(&transaction, at)?;
         transaction
             .commit()
             .map_err(StorageError::while_("remove the project"))?;
         Ok(Removal::Committed {
-            sequence,
+            sequence: at,
             canonical_root,
         })
     }
@@ -437,16 +559,23 @@ fn migrate(connection: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Move the log on by one and stamp the registry. The single writer of both,
-/// so "the sequence advanced" and "the registry changed at" cannot drift apart.
-fn advance(connection: &Connection) -> Result<i64, StorageError> {
+/// Record the sequence a change committed at, and stamp the registry. The
+/// single writer of both, so "the log reached here" and "the registry changed
+/// at" cannot drift apart.
+///
+/// `MAX` rather than an assignment: the counter is in memory now (see
+/// [`Sequences`]) and nothing stops two commits reaching this out of the order
+/// they took their numbers in. What the column has to be is the highest number
+/// any committed change has used, because that is what the next boot resumes
+/// from — and a plain assignment would let a slower commit lower it.
+fn stamp(connection: &Connection, at: i64) -> Result<(), StorageError> {
     connection
         .execute(
-            &format!("UPDATE orchestration SET sequence = sequence + 1, updated_at = {NOW}"),
-            [],
+            &format!("UPDATE orchestration SET sequence = MAX(sequence, ?1), updated_at = {NOW}"),
+            (at,),
         )
         .map_err(StorageError::while_("advance the registry"))?;
-    Ok(orchestration_row(connection)?.0)
+    Ok(())
 }
 
 fn orchestration_row(connection: &Connection) -> Result<(i64, String), StorageError> {
@@ -494,11 +623,14 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
 mod tests {
     use super::*;
 
-    /// A real directory to register, and a database to register it in.
+    /// A real directory to register, a database to register it in, and the
+    /// counter the writes take their sequence from — which is the arrangement a
+    /// real caller has, since [`crate::orchestration::Shell`] owns one of each.
     struct Fixture {
         database: Database,
         _directory: tempfile::TempDir,
         root: WorkspaceRoot,
+        sequences: Sequences,
     }
 
     impl Fixture {
@@ -506,17 +638,32 @@ mod tests {
             let directory = tempfile::tempdir().expect("a temporary directory");
             let root = WorkspaceRoot::check(&directory.path().to_string_lossy())
                 .expect("a temporary directory is a usable workspace root");
+            let database = Database::in_memory().expect("an in-memory database");
+            let sequences = Sequences::resuming(&database).expect("a fresh log");
             Fixture {
-                database: Database::in_memory().expect("an in-memory database"),
+                database,
                 _directory: directory,
                 root,
+                sequences,
             }
         }
 
         fn add(&self, id: &str) -> Insert {
             self.database
-                .insert_project(id, "project", &self.root, Some("2026-07-26T00:23:04.909Z"))
+                .insert_project(
+                    id,
+                    "project",
+                    &self.root,
+                    Some("2026-07-26T00:23:04.909Z"),
+                    self.sequences.commit().sequence(),
+                )
                 .expect("the insert reaches the database")
+        }
+
+        fn remove(&self, id: &str) -> Removal {
+            self.database
+                .remove_project(id, self.sequences.commit().sequence())
+                .expect("the delete reaches the database")
         }
     }
 
@@ -596,7 +743,13 @@ mod tests {
         fixture.add("project-1");
         let refusal = fixture
             .database
-            .insert_project("project-1", "elsewhere", &other_root, Some("2026-07-26T00:00:00.000Z"))
+            .insert_project(
+                "project-1",
+                "elsewhere",
+                &other_root,
+                Some("2026-07-26T00:00:00.000Z"),
+                fixture.sequences.commit().sequence(),
+            )
             .expect("the insert reaches the database");
 
         match refusal {
@@ -610,6 +763,11 @@ mod tests {
 
     /// A refused insert must leave the log where it was. If it advanced, a
     /// client would be told something changed when nothing had.
+    ///
+    /// The *number* it was offered is spent either way — see [`Sequences`], where
+    /// gaps are the accepted cost of a counter that does not touch a disk — but
+    /// what the registry reports is the last number something actually happened
+    /// at, and that is what a client compares against.
     #[test]
     fn a_refused_insert_does_not_advance_the_sequence() {
         let fixture = Fixture::new();
@@ -626,10 +784,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.add("project-1");
 
-        let removal = fixture
-            .database
-            .remove_project("project-1")
-            .expect("the delete reaches the database");
+        let removal = fixture.remove("project-1");
         // The folder comes back with the sequence. It is what the caller
         // releases the project's watcher and held scan by, and it is only
         // readable while the row still exists — so if it were resolved after
@@ -651,16 +806,15 @@ mod tests {
     }
 
     /// Removing something that is not there is agreement, not an error — and
-    /// it must not move the log, because nothing happened.
+    /// it must not move the log, because nothing happened. It answers with the
+    /// sequence the registry is already at rather than with the number it was
+    /// offered, so a client that waits for that event is not left waiting.
     #[test]
     fn removing_an_unregistered_project_changes_nothing() {
         let fixture = Fixture::new();
         fixture.add("project-1");
 
-        let removal = fixture
-            .database
-            .remove_project("never-registered")
-            .expect("the delete reaches the database");
+        let removal = fixture.remove("never-registered");
         assert_eq!(removal, Removal::Absent(1));
         assert_eq!(removal.sequence(), 1);
         assert_eq!(
@@ -676,7 +830,7 @@ mod tests {
     fn a_removed_folder_can_be_registered_again() {
         let fixture = Fixture::new();
         fixture.add("project-1");
-        fixture.database.remove_project("project-1").expect("removed");
+        fixture.remove("project-1");
 
         assert!(matches!(fixture.add("project-2"), Insert::Committed { .. }));
         assert_eq!(
@@ -694,13 +848,24 @@ mod tests {
         let workspace = WorkspaceRoot::check(&directory.path().to_string_lossy())
             .expect("accepted");
 
+        // A number well past the first, as a live server's would be: the counter
+        // is shared with changes that never reach this database, so what is
+        // stored has to be the number the write was given rather than a count of
+        // writes.
         let sequence = {
             let database = Database::open(&path).expect("creates the database and its directory");
             let insert = database
-                .insert_project("project-1", "project", &workspace, Some("2026-07-26T00:23:04.909Z"))
+                .insert_project(
+                    "project-1",
+                    "project",
+                    &workspace,
+                    Some("2026-07-26T00:23:04.909Z"),
+                    41,
+                )
                 .expect("registers");
             sequence(insert)
         };
+        assert_eq!(sequence, 41);
         assert!(path.exists(), "the database file was not created");
 
         let reopened = Database::open(&path).expect("opens the existing database");
@@ -708,6 +873,65 @@ mod tests {
         assert_eq!(registry.sequence, sequence);
         assert_eq!(registry.projects.len(), 1);
         assert_eq!(registry.projects[0].id, "project-1");
+
+        // And the next boot carries on from there rather than from zero, which
+        // is the whole reason the number is stored at all.
+        let resumed = Sequences::resuming(&reopened).expect("a resumed log");
+        assert_eq!(resumed.current(), 41);
+        assert_eq!(resumed.commit().sequence(), 42);
+    }
+
+    /// Taking a number holds the log, and that is the whole ordering guarantee:
+    /// a second writer cannot take its number — let alone publish — until the
+    /// first has announced what it took.
+    ///
+    /// Without it a project committed on a socket's read loop and a thread event
+    /// published by an agent's driver could reach the one feed they share in the
+    /// opposite order to their numbers, and a client drops anything at or below
+    /// the sequence it holds — so the lower of the two would be lost rather than
+    /// reordered.
+    #[test]
+    fn a_number_is_not_handed_out_while_the_last_one_is_still_being_announced() {
+        let sequences = Sequences::from(0);
+        let held = sequences.commit();
+        assert_eq!(held.sequence(), 1);
+
+        let waiting = sequences.clone();
+        let second = std::thread::spawn(move || waiting.commit().sequence());
+
+        // Long enough that a counter without the lock would have finished.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !second.is_finished(),
+            "a second writer took a number while the first was still announcing"
+        );
+
+        drop(held);
+        assert_eq!(second.join().expect("the second writer finishes"), 2);
+        assert_eq!(sequences.current(), 2);
+    }
+
+    /// Two commits that took their numbers in one order and reached the database
+    /// in the other must not leave the stored high-water mark behind the higher
+    /// of them — the next boot resumes from it, and a lowered mark would re-issue
+    /// a number a committed change had already used.
+    #[test]
+    fn a_commit_never_lowers_the_stored_high_water_mark() {
+        let fixture = Fixture::new();
+
+        fixture
+            .database
+            .insert_project("later", "later", &fixture.root, None, 9)
+            .expect("registers");
+        let second = tempfile::tempdir().expect("a second temporary directory");
+        let elsewhere =
+            WorkspaceRoot::check(&second.path().to_string_lossy()).expect("accepted");
+        fixture
+            .database
+            .insert_project("earlier", "earlier", &elsewhere, None, 4)
+            .expect("registers");
+
+        assert_eq!(fixture.database.registry().expect("reads").sequence, 9);
     }
 
     /// Opening an already-migrated database must not try to migrate it again —

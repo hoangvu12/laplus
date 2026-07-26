@@ -108,12 +108,12 @@ async fn an_unimplemented_method_is_reported_without_dropping_the_connection() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    match client.call("orchestration.subscribeThread", json!({})).await {
+    match client.call("orchestration.getTurnDiff", json!({})).await {
         Outcome::Failure(cause) => {
             assert_eq!(cause.len(), 1, "one cause entry: {cause:?}");
             assert_eq!(cause[0]["_tag"], "Fail");
             assert_eq!(cause[0]["error"]["_tag"], "ServerMethodNotImplementedError");
-            assert_eq!(cause[0]["error"]["method"], "orchestration.subscribeThread");
+            assert_eq!(cause[0]["error"]["method"], "orchestration.getTurnDiff");
         }
         other => panic!("expected a typed failure, got {other:?}"),
     }

@@ -27,6 +27,10 @@ tokio = { version = "1", features = [
   "io-util",
   "macros",
   "net",
+  # Ticket 10: the agent is a long-lived child driven over its stdio, which
+  # needs an async child rather than `std::process` — the server cannot afford a
+  # thread parked on a blocking read for the length of a turn.
+  "process",
   "rt-multi-thread",
   "signal",
   "sync",

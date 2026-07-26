@@ -1,14 +1,14 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Ten are implemented — the
+//! The vocabulary is roughly sixty methods. Eleven are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
-//! registry and the subscription that *is* the project list, the three that
-//! enumerate names on disk for the picker, the tree and the `@` mention, the
-//! two that open and save one of those files, and the one that hands a file to
-//! the developer's own editor — and every other tag lands in the
-//! unknown-method path, which is itself part of the contract and is pinned by
-//! a capture.
+//! registry and starts a conversation, the subscription that *is* the project
+//! list, the subscription that *is* one conversation, the three that enumerate
+//! names on disk for the picker, the tree and the `@` mention, the two that open
+//! and save one of those files, and the one that hands a file to the developer's
+//! own editor — and every other tag lands in the unknown-method path, which is
+//! itself part of the contract and is pinned by a capture.
 //!
 //! Nothing in a `Request` says whether the answer will be one value, a stream
 //! of them, or a value that is not ready yet; that is knowledge the method name
@@ -25,6 +25,33 @@ use crate::files::{self, ReadFile, WriteFile};
 use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::orchestration::{self, Shell};
 use crate::subscriptions::EventSource;
+use crate::threads;
+
+/// The payload of an `orchestration.subscribeThread`.
+///
+/// Read by hand rather than deserialized, because there are two fields and one
+/// of them decides whether the call is answerable at all — a subscription to a
+/// blank thread id would open a stream against a conversation nothing can name.
+struct SubscribeThread {
+    thread_id: String,
+    wants_marker: bool,
+}
+
+impl SubscribeThread {
+    fn read(payload: &Value) -> Result<SubscribeThread, Value> {
+        let thread_id = payload
+            .get("threadId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(SubscribeThread {
+            thread_id: non_blank(thread_id, "OrchestrationGetSnapshotError", "thread id")?,
+            wants_marker: payload
+                .get("requestCompletionMarker")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
 
 /// The tag the UI sends first, and the tag it re-sends as a liveness probe
 /// when the server does not advertise `connectionProbe`.
@@ -204,10 +231,20 @@ pub fn dispatch(
         SUBSCRIBE_SERVER_CONFIG => Ok(Answer::Stream(services.config.subscribe())),
         orchestration::DISPATCH_COMMAND => services
             .shell
-            .dispatch(payload, &services.index)
+            .dispatch(payload, &services.index, &services.config.current())
             .map(Answer::Value)
             .map_err(|refusal| DispatchError::Declared(refusal.to_error())),
         orchestration::SUBSCRIBE_SHELL => Ok(Answer::Stream(services.shell.subscribe(payload))),
+        threads::SUBSCRIBE_THREAD => SubscribeThread::read(payload)
+            .map(|call| {
+                Answer::Stream(
+                    services
+                        .shell
+                        .threads()
+                        .subscribe(&call.thread_id, call.wants_marker),
+                )
+            })
+            .map_err(DispatchError::Declared),
         // Every method that touches a disk reads its payload here and does its
         // work elsewhere. Reading is arithmetic on a string, so a malformed
         // call is refused immediately rather than after a thread has been found
@@ -286,13 +323,20 @@ mod tests {
         assert_eq!(value(first), value(second));
     }
 
-    /// Both subscriptions are dispatched by the same path as a unary call and
-    /// only part company at the answer.
+    /// Every subscription is dispatched by the same path as a unary call and
+    /// only parts company at the answer.
     #[test]
     fn the_subscriptions_answer_with_a_stream() {
         let services = services();
-        for tag in [SUBSCRIBE_SERVER_CONFIG, orchestration::SUBSCRIBE_SHELL] {
-            let answer = dispatch(&services, tag, &json!({})).expect("dispatches");
+        for (tag, payload) in [
+            (SUBSCRIBE_SERVER_CONFIG, json!({})),
+            (orchestration::SUBSCRIBE_SHELL, json!({})),
+            // Against a thread that does not exist, because that is what the UI
+            // opens first: a new conversation is a client-side draft until its
+            // first turn reaches this server.
+            (threads::SUBSCRIBE_THREAD, json!({"threadId": "thread-1"})),
+        ] {
+            let answer = dispatch(&services, tag, &payload).expect("dispatches");
             assert!(matches!(answer, Answer::Stream(_)), "{tag} does not stream");
         }
     }
@@ -315,6 +359,11 @@ mod tests {
                 filesystem::LIST_ENTRIES,
                 json!({"cwd": "  "}),
                 "ProjectListEntriesError",
+            ),
+            (
+                threads::SUBSCRIBE_THREAD,
+                json!({}),
+                "OrchestrationGetSnapshotError",
             ),
         ] {
             let error = dispatch(&services, tag, &payload).expect_err("a refusal");
@@ -353,19 +402,19 @@ mod tests {
     #[test]
     fn an_unknown_tag_becomes_a_typed_error_naming_the_method() {
         let services = services();
-        let error = dispatch(&services, "orchestration.subscribeThread", &json!({}))
+        let error = dispatch(&services, "orchestration.getTurnDiff", &json!({}))
             .expect_err("not implemented");
         assert_eq!(
             error,
-            DispatchError::UnknownMethod("orchestration.subscribeThread".to_string())
+            DispatchError::UnknownMethod("orchestration.getTurnDiff".to_string())
         );
 
         let payload = error.to_error();
         assert_eq!(payload["_tag"], "ServerMethodNotImplementedError");
-        assert_eq!(payload["method"], "orchestration.subscribeThread");
+        assert_eq!(payload["method"], "orchestration.getTurnDiff");
         assert!(payload["message"]
             .as_str()
             .expect("a message")
-            .contains("orchestration.subscribeThread"));
+            .contains("orchestration.getTurnDiff"));
     }
 }

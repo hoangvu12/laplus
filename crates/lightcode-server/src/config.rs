@@ -220,6 +220,15 @@ pub struct Observability {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    /// On, where upstream defaults it off.
+    ///
+    /// This is a report of what the server does rather than a switch over it —
+    /// nothing can write a setting until ticket 22 — and what this server does
+    /// is publish assistant text as it arrives. Upstream's `false` means its
+    /// ingestion buffers up to 24,000 characters before sending anything, which
+    /// is a reply that appears in one jump at the end; ticket 10's second
+    /// criterion rules that out. Reporting `false` while streaming anyway would
+    /// be the payload disagreeing with the wire beside it.
     pub enable_assistant_streaming: bool,
     /// Off, where upstream defaults it on. The spec's story 7 is that the app
     /// runs entirely on the user's machine with no network service of its own;
@@ -320,7 +329,7 @@ impl ServerConfig {
                 otlp_metrics_enabled: false,
             },
             settings: Settings {
-                enable_assistant_streaming: false,
+                enable_assistant_streaming: true,
                 enable_provider_update_checks: false,
                 automatic_git_fetch_interval: 30_000,
                 default_thread_env_mode: "local",

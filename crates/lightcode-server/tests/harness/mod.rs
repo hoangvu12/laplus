@@ -36,6 +36,7 @@ use lightcode_server::config_store::ConfigChange;
 use lightcode_server::config::ProviderState;
 use lightcode_server::process::Search;
 use lightcode_server::store::Database;
+use lightcode_server::threads::Reconciliation;
 use lightcode_server::Server;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -62,6 +63,19 @@ impl TestServer {
 
     pub async fn start_with(config: ServerConfig) -> TestServer {
         TestServer::start_on(config, Database::in_memory().expect("an in-memory database")).await
+    }
+
+    /// A server that will start `binary` when a turn is dispatched.
+    ///
+    /// The injection the spec asks for, and the whole of it: the agent-executable
+    /// path is `settings.providers.claudeAgent.binaryPath`, a value the server
+    /// already needs for real use, so pointing it at a stand-in adds no test-only
+    /// seam. Everything downstream — resolution, the child, the stdio, the fold,
+    /// the socket — is the production path.
+    pub async fn start_with_agent(binary: &str) -> TestServer {
+        let mut config = ServerConfig::detect();
+        config.settings.providers.claude_agent.binary_path = binary.to_string();
+        TestServer::start_with(config).await
     }
 
     /// A server whose registry is a file. Start a second one on the same path
@@ -159,6 +173,27 @@ impl TestServer {
             self.watched_workspaces()
         })
         .await;
+    }
+
+    /// Agent processes running, as the server counts them. How "the subprocess
+    /// is terminated and reaped when the session ends" is observed from outside.
+    pub fn live_agents(&self) -> usize {
+        self.server.state().live_agents()
+    }
+
+    /// Wait for the agent gauge to reach `expected`, or fail saying what it was.
+    /// A session starts and ends on its own task, so neither settles
+    /// synchronously with the call that caused it.
+    pub async fn await_live_agents(&self, expected: usize) {
+        self.await_gauge("live agents", expected, || self.live_agents())
+            .await;
+    }
+
+    /// How often the buffered assistant message and the deltas before it
+    /// agreed — the continuous check on the assumption that makes streaming
+    /// safe. See `lightcode_server::threads::Reconciliation`.
+    pub fn reconciliation(&self) -> Reconciliation {
+        self.server.state().reconciliation()
     }
 
     pub fn unrecognized_messages(&self) -> usize {
@@ -596,6 +631,32 @@ impl SocketClient {
             .as_array()
             .unwrap_or_else(|| panic!("a chunk's values are an array: {frame}"))
             .clone()
+    }
+
+    /// Everything a subscription has produced up to and including the first
+    /// value matching `wanted`, acknowledging as it goes.
+    ///
+    /// What a streamed turn needs: it produces a dozen values whose split
+    /// across chunks is decided by how fast the agent talks relative to how fast
+    /// the test acknowledges, so a test that counted chunks would be asserting
+    /// on timing. This asserts on the *sequence of values*, which is what the UI
+    /// folds, and reads until the turn is over rather than a fixed number of
+    /// times.
+    pub async fn values_until(
+        &mut self,
+        request_id: &str,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut seen = Vec::new();
+        loop {
+            let values = self.next_chunk(request_id).await;
+            self.ack(request_id).await;
+            let arrived = values.iter().any(&wanted);
+            seen.extend(values);
+            if arrived {
+                return seen;
+            }
+        }
     }
 
     /// The single value of the next chunk, acknowledged. `values` genuinely

@@ -34,10 +34,13 @@
 //! is and which folders qualify, [`crate::store`] keeps them; nothing here
 //! knows any SQL and nothing there knows any JSON.
 //!
+//! Ticket 10 added the second aggregate. A thread is dispatched to and
+//! subscribed to through exactly the same two mechanisms, so what lives here is
+//! the routing and the parsing; what a thread *is* lives in [`crate::threads`],
+//! which stands to this module as [`crate::projects`] does.
+//!
 //! ## What this ticket does not do
 //!
-//! - **Threads are an empty array.** They join the same snapshot in tickets 10
-//!   and 11 and share this sequence when they do.
 //! - **`afterSequence` is honoured by over-answering.** The contract lets a
 //!   client with a cached snapshot ask for a replay from a sequence instead of
 //!   a fresh snapshot; lightcode sends the snapshot anyway. It is a superset of
@@ -78,22 +81,33 @@
 //! and the answer to it is a sentence saying which path was not found.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::clock::now_iso;
+use crate::config::ServerConfig;
 use crate::filesystem::Index;
 use crate::projects::{Project, WorkspaceRoot};
-use crate::store::{Conflict, Database, Insert, Registry, Removal, StorageError};
+use crate::store::{Conflict, Database, Insert, Registry, Removal, Sequences, StorageError};
 use crate::subscriptions::{EventSource, BACKLOG};
+use crate::threads::{self, Change, Prompt, Session, Thread, Threads};
 
 /// The tag that carries every write to the registry.
 pub const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
 
 /// The subscription that *is* the project list.
 pub const SUBSCRIBE_SHELL: &str = "orchestration.subscribeShell";
+
+/// The contract's default when a client sends no runtime mode
+/// (`DEFAULT_RUNTIME_MODE` in `orchestration.ts`). Repeated here rather than
+/// inferred, because it decides how much latitude the agent is given.
+const DEFAULT_RUNTIME_MODE: &str = "full-access";
+
+/// The contract's `DEFAULT_PROVIDER_INTERACTION_MODE`.
+const DEFAULT_INTERACTION_MODE: &str = "default";
 
 /// The registry, live: what is in it, what changes it, and who is watching.
 ///
@@ -110,16 +124,11 @@ pub struct Shell {
 struct Inner {
     database: Database,
     updates: broadcast::Sender<Value>,
-    /// Held across "commit, then announce".
-    ///
-    /// The database would serialise the writes on its own; what this adds is
-    /// that a command's event is published before the next command's is.
-    /// Without it two concurrent adds could commit as 5 then 6 and publish as
-    /// 6 then 5 — and a client that ignores events at or below the highest
-    /// sequence it has seen would drop 5 permanently. The lock is held over a
-    /// local SQLite write and a non-blocking broadcast send, neither of which
-    /// awaits.
-    commit: Mutex<()>,
+    /// The number every change on this wire is ordered by, shared with
+    /// [`Threads`] because both aggregates travel on the same subscription and
+    /// a client folds them against one cursor.
+    sequences: Sequences,
+    threads: Threads,
 }
 
 /// A command this server understands, once its payload has been read.
@@ -127,10 +136,12 @@ struct Inner {
 /// Parsing to this is where a malformed or unimplemented command is turned
 /// away, so by the time [`Shell::dispatch`] has one it is only the *world* that
 /// can still refuse it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Command {
     CreateProject(CreateProject),
     DeleteProject { project_id: String },
+    CreateThread(CreateThread),
+    StartTurn(Box<StartTurn>),
 }
 
 /// A command that was not carried out, as the client will read it.
@@ -169,30 +180,213 @@ impl CommandError {
 
 impl Shell {
     pub fn new(database: Database) -> Shell {
+        let sequences = Sequences::resuming(&database).unwrap_or_else(|error| {
+            // Unreachable in practice: everything else this server does with the
+            // registry would already have failed. Loud rather than silent,
+            // because carrying on from zero is the one thing that could re-issue
+            // a number a committed change has already used.
+            eprintln!("lightcode: cannot read the registry's log position, resuming from zero: {error}");
+            Sequences::from(0)
+        });
+        let updates = broadcast::channel(BACKLOG).0;
+
         Shell {
             inner: Arc::new(Inner {
                 database,
-                updates: broadcast::channel(BACKLOG).0,
-                commit: Mutex::new(()),
+                threads: Threads::new(sequences.clone(), updates.clone()),
+                sequences,
+                updates,
             }),
         }
+    }
+
+    /// The conversations this shell carries. One registry per server, shared the
+    /// way the shell itself is.
+    pub fn threads(&self) -> &Threads {
+        &self.inner.threads
     }
 
     /// Carry out one `orchestration.dispatchCommand`, answering with the
     /// sequence it committed at.
     ///
     /// The index arrives as an argument rather than as a field because it is
-    /// wanted by exactly one command out of two — a deleted project releases
-    /// the scan and the filesystem watcher held for it (ticket 08). Making it a
-    /// field would say the registry depends on the index, which is not true of
-    /// anything else it does.
-    pub fn dispatch(&self, payload: &Value, index: &Index) -> Result<Value, CommandError> {
+    /// wanted by exactly one command — a deleted project releases the scan and
+    /// the filesystem watcher held for it (ticket 08). Making it a field would
+    /// say the registry depends on the index, which is not true of anything else
+    /// it does. `config` is here for the same reason and for one command only:
+    /// starting a turn needs to know which binary to look for.
+    ///
+    /// **One command, several events.** A project command commits once and
+    /// answers with that number. A turn does not: it puts the developer's
+    /// message in the transcript, records that a turn was asked for, and marks
+    /// the session as starting — three events, three numbers. The answer is the
+    /// last of them, which is the position the log reached, and every one of
+    /// them has already been published by the time the client reads it.
+    pub fn dispatch(
+        &self,
+        payload: &Value,
+        index: &Index,
+        config: &ServerConfig,
+    ) -> Result<Value, CommandError> {
         let sequence = match Command::parse(payload)? {
             Command::CreateProject(create) => self.create_project(&create)?,
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
+            Command::CreateThread(create) => self.create_thread(&create)?,
+            Command::StartTurn(start) => self.start_turn(&start, config)?,
         };
 
         Ok(json!({ "sequence": sequence }))
+    }
+
+    /// Register a conversation.
+    ///
+    /// The project has to be one this server knows, because the thread's whole
+    /// purpose is to run an agent in that project's folder — a thread pointing
+    /// at nothing would be a conversation that could never take a turn.
+    fn create_thread(&self, create: &CreateThread) -> Result<i64, CommandError> {
+        let project = self.project(&create.thread.project_id)?;
+        self.inner
+            .threads
+            .create(create.to_thread(&project))
+            .map_err(CommandError::new)
+    }
+
+    /// Send a turn: put the prompt in the transcript and hand it to the agent.
+    ///
+    /// Returns as soon as the prompt is queued. Nothing here waits for a process
+    /// to start, let alone for the agent to answer — the developer has just
+    /// pressed enter and what they are owed first is an acknowledgement.
+    fn start_turn(&self, start: &StartTurn, config: &ServerConfig) -> Result<i64, CommandError> {
+        if start.prepares_a_worktree() {
+            return Err(CommandError::new(
+                "This server cannot prepare a git worktree for a thread, so the turn was not \
+                 started. Run the conversation in the project's own checkout instead.",
+            ));
+        }
+
+        // Bootstrapping is how the UI's composer starts a *new* conversation:
+        // the thread is a client-side draft until the first turn, which carries
+        // the thread it wants created alongside the message. Creating it here
+        // rather than expecting a separate `thread.create` is not a shortcut —
+        // it is the only path the real composer takes.
+        if !self.inner.threads.contains(&start.thread_id) {
+            let Some(create) = start.bootstrap_thread() else {
+                return Err(CommandError::new(format!(
+                    "There is no thread '{}' on this server, and the turn did not ask for one to \
+                     be created.",
+                    start.thread_id
+                )));
+            };
+            self.create_thread(&create)?;
+        }
+
+        // Everything that can still refuse the turn happens before anything is
+        // published. A refusal that had already put the prompt in the transcript
+        // would leave a conversation showing a message and a turn marked running
+        // with nothing left alive to settle it.
+        let project = self.project(&self.open_thread(&start.thread_id)?.project_id)?;
+
+        let turn_id = threads::fresh_turn_id();
+        // The developer's own message first, so it is in the transcript before
+        // anything the agent says about it can be.
+        self.inner
+            .threads
+            .apply(
+                &start.thread_id,
+                Change::UserMessage {
+                    message_id: start.message.message_id.clone(),
+                    text: start.message.text.clone(),
+                    turn_id: turn_id.clone(),
+                },
+            )
+            .ok_or_else(|| self.not_open(&start.thread_id))?;
+        self.inner.threads.apply(
+            &start.thread_id,
+            Change::TurnRequested {
+                turn_id: turn_id.clone(),
+                message_id: start.message.message_id.clone(),
+                model_selection: start.model_selection.clone(),
+                runtime_mode: start.runtime_mode.clone(),
+                interaction_mode: start.interaction_mode.clone(),
+            },
+        );
+
+        // Read *after* the turn request, because that is what carries the
+        // composer's current selection: a model or a runtime mode picked for
+        // this turn has to be the one the agent is started with, not the one the
+        // thread was created with.
+        let thread = self.open_thread(&start.thread_id)?;
+        let sequence = self
+            .inner
+            .threads
+            .apply(
+                &start.thread_id,
+                Change::Session(Session {
+                    status: "starting",
+                    runtime_mode: thread.runtime_mode.clone(),
+                    active_turn_id: Some(turn_id.clone()),
+                    last_error: None,
+                    updated_at: now_iso(),
+                }),
+            )
+            .ok_or_else(|| self.not_open(&start.thread_id))?;
+
+        let starting = crate::turn::starting(
+            &thread,
+            &project.workspace_root,
+            &config.settings.providers.claude_agent,
+        );
+        if let Err(why) = crate::turn::send(
+            &self.inner.threads,
+            &starting,
+            Prompt {
+                turn_id,
+                text: start.message.text.clone(),
+            },
+        ) {
+            // The prompt is already in the transcript and the turn is already
+            // marked running, so the refusal has to end them as well as being
+            // returned — otherwise the conversation sits waiting for a turn that
+            // was never handed to anything.
+            self.inner.threads.apply(
+                &start.thread_id,
+                Change::Session(Session {
+                    status: "error",
+                    runtime_mode: thread.runtime_mode.clone(),
+                    active_turn_id: None,
+                    last_error: Some(why.clone()),
+                    updated_at: now_iso(),
+                }),
+            );
+            return Err(CommandError::new(why));
+        }
+
+        Ok(sequence)
+    }
+
+    /// A thread that was there a statement ago and is not now. Unreachable while
+    /// nothing removes threads, and cheaper to say than to reason about.
+    fn not_open(&self, thread_id: &str) -> CommandError {
+        CommandError::new(format!("Thread '{thread_id}' is not open."))
+    }
+
+    fn open_thread(&self, thread_id: &str) -> Result<Thread, CommandError> {
+        self.inner
+            .threads
+            .get(thread_id)
+            .ok_or_else(|| self.not_open(thread_id))
+    }
+
+    fn project(&self, project_id: &str) -> Result<Project, CommandError> {
+        self.inner
+            .database
+            .project(project_id)
+            .map_err(unavailable("look up the project"))?
+            .ok_or_else(|| {
+                CommandError::new(format!(
+                    "Project '{project_id}' is not registered with this server."
+                ))
+            })
     }
 
     fn create_project(&self, create: &CreateProject) -> Result<i64, CommandError> {
@@ -205,11 +399,20 @@ impl Shell {
             given => given.to_string(),
         };
 
-        let _commit = self.lock();
+        // Taking the number holds the log open until the change it numbers has
+        // been announced. Two aggregates publish onto one feed now, so nothing
+        // weaker orders them — see `store::Sequences`.
+        let commit = self.inner.sequences.commit();
         let insert = self
             .inner
             .database
-            .insert_project(&create.project_id, &title, &root, create.created_at.as_deref())
+            .insert_project(
+                &create.project_id,
+                &title,
+                &root,
+                create.created_at.as_deref(),
+                commit.sequence(),
+            )
             .map_err(unavailable("register the project"))?;
 
         match insert {
@@ -236,11 +439,11 @@ impl Shell {
     }
 
     fn delete_project(&self, project_id: &str, index: &Index) -> Result<i64, CommandError> {
-        let _commit = self.lock();
+        let commit = self.inner.sequences.commit();
         let removal = self
             .inner
             .database
-            .remove_project(project_id)
+            .remove_project(project_id, commit.sequence())
             .map_err(unavailable("remove the project"))?;
 
         if let Removal::Committed {
@@ -303,7 +506,11 @@ impl Shell {
     }
 
     fn snapshot(&self) -> Result<Value, StorageError> {
-        Ok(snapshot_event(&self.inner.database.registry()?))
+        Ok(snapshot_event(
+            &self.inner.database.registry()?,
+            &self.inner.threads,
+            self.inner.sequences.current(),
+        ))
     }
 
     fn announce(&self, event: Value) {
@@ -313,12 +520,6 @@ impl Shell {
         let _ = self.inner.updates.send(event);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.inner
-            .commit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 }
 
 /// A storage failure, said in a sentence a user can act on.
@@ -330,23 +531,33 @@ fn unavailable(attempting: &'static str) -> impl Fn(StorageError) -> CommandErro
     move |error| CommandError::new(format!("Could not {attempting}: {error}"))
 }
 
-/// The opening chunk of a shell subscription.
+/// The opening chunk of a shell subscription: every project and every thread.
 ///
-/// `threads` is an empty array rather than an absent key: the contract requires
-/// it, and a client decoding `OrchestrationShellSnapshot` rejects the whole
-/// snapshot — and so shows no projects either — if it is missing.
-fn snapshot_event(registry: &Registry) -> Value {
+/// `snapshotSequence` is the log position rather than the registry's stored one.
+/// They differ as soon as a conversation is under way — a turn advances the log
+/// without writing a row — and a snapshot that reported the *stored* number
+/// would be older than events the client had already folded, so the client would
+/// re-apply them.
+///
+/// `updatedAt` is the later of the registry's own timestamp and the newest
+/// thread's, because the field describes the shell rather than either half of it.
+fn snapshot_event(registry: &Registry, threads: &Threads, sequence: i64) -> Value {
+    let updated_at = threads
+        .latest_change()
+        .filter(|latest| latest > &registry.updated_at)
+        .unwrap_or_else(|| registry.updated_at.clone());
+
     json!({
         "kind": "snapshot",
         "snapshot": {
-            "snapshotSequence": registry.sequence,
+            "snapshotSequence": sequence,
             "projects": registry
                 .projects
                 .iter()
                 .map(Project::to_value)
                 .collect::<Vec<Value>>(),
-            "threads": [],
-            "updatedAt": registry.updated_at,
+            "threads": threads.shell_summaries(),
+            "updatedAt": updated_at,
         },
     })
 }
@@ -387,6 +598,161 @@ struct CreateProject {
 #[serde(rename_all = "camelCase")]
 struct DeleteProjectPayload {
     project_id: String,
+}
+
+/// The fields that describe a conversation, wherever they arrive from.
+///
+/// They arrive from two places and are identical in both: `thread.create` sends
+/// them beside a `threadId`, and `thread.turn.start` sends them under
+/// `bootstrap.createThread` with the id on the command. One struct, because two
+/// would be two places to get `runtimeMode`'s default wrong.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadFields {
+    project_id: String,
+    #[serde(default)]
+    title: String,
+    /// `{instanceId, model}`. Required by the contract in both places it
+    /// arrives, and it is what the agent is started with — so a thread without
+    /// one would be a conversation nothing could choose a model for.
+    model_selection: Value,
+    #[serde(default = "default_runtime_mode")]
+    runtime_mode: String,
+    #[serde(default = "default_interaction_mode")]
+    interaction_mode: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    worktree_path: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CreateThread {
+    thread_id: String,
+    thread: ThreadFields,
+}
+
+impl CreateThread {
+    /// The thread as it will be stored.
+    ///
+    /// The project supplies the title when the client did not, the same way it
+    /// does for a project with a blank name — the composer normally sends one,
+    /// and a conversation called "" would be unreachable in the thread list.
+    fn to_thread(&self, project: &Project) -> Thread {
+        let created_at = self
+            .thread
+            .created_at
+            .clone()
+            .and_then(usable_timestamp)
+            .unwrap_or_else(now_iso);
+        let title = match self.thread.title.trim() {
+            "" => project.title.clone(),
+            given => given.to_string(),
+        };
+
+        Thread {
+            id: self.thread_id.clone(),
+            project_id: self.thread.project_id.clone(),
+            title,
+            model_selection: self.thread.model_selection.clone(),
+            runtime_mode: self.thread.runtime_mode.clone(),
+            interaction_mode: self.thread.interaction_mode.clone(),
+            branch: self.thread.branch.clone(),
+            worktree_path: self.thread.worktree_path.clone(),
+            updated_at: created_at.clone(),
+            created_at,
+            messages: Vec::new(),
+            activities: Vec::new(),
+            session: None,
+            latest_turn: None,
+            latest_user_message_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateThreadPayload {
+    thread_id: String,
+    #[serde(flatten)]
+    thread: ThreadFields,
+}
+
+/// `thread.turn.start` — the command the whole ticket exists to answer.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartTurn {
+    thread_id: String,
+    message: TurnMessage,
+    /// What the composer had selected when the developer pressed enter. Absent
+    /// means "whatever the thread already had", which is why none of these three
+    /// has a default — a default would move a conversation back to the default
+    /// every turn rather than leaving it where the developer put it.
+    #[serde(default)]
+    model_selection: Option<Value>,
+    #[serde(default)]
+    runtime_mode: Option<String>,
+    #[serde(default)]
+    interaction_mode: Option<String>,
+    #[serde(default)]
+    bootstrap: Option<Bootstrap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnMessage {
+    message_id: String,
+    /// The contract types this as a plain string, so an empty prompt decodes.
+    /// It is not refused here: the CLI is free to treat one however it likes,
+    /// and a server that second-guessed it would be inventing a rule.
+    #[serde(default)]
+    text: String,
+    /// Images pasted into the composer. Carried so a client that sends them is
+    /// not refused, and dropped on the way to the agent — attachments need the
+    /// asset service the spec puts out of scope.
+    #[serde(default)]
+    attachments: Vec<Value>,
+}
+
+/// The work a turn asks to have done before it starts.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Bootstrap {
+    #[serde(default)]
+    create_thread: Option<ThreadFields>,
+    /// Present when the UI wants the turn run in a fresh git worktree. Refused
+    /// by name rather than ignored — see [`Shell::start_turn`], where running in
+    /// the project root instead would silently put the agent's changes somewhere
+    /// the developer did not ask for.
+    #[serde(default)]
+    prepare_worktree: Option<Value>,
+}
+
+impl StartTurn {
+    fn prepares_a_worktree(&self) -> bool {
+        self.bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| bootstrap.prepare_worktree.is_some())
+    }
+
+    /// The thread this turn asks to have created, if it asks for one.
+    fn bootstrap_thread(&self) -> Option<CreateThread> {
+        let fields = self.bootstrap.as_ref()?.create_thread.clone()?;
+        Some(CreateThread {
+            thread_id: self.thread_id.clone(),
+            thread: fields,
+        })
+    }
+}
+
+fn default_runtime_mode() -> String {
+    DEFAULT_RUNTIME_MODE.to_string()
+}
+
+fn default_interaction_mode() -> String {
+    DEFAULT_INTERACTION_MODE.to_string()
 }
 
 /// Keep a client's `createdAt` only if it is one.
@@ -444,6 +810,27 @@ impl Command {
                     project_id: non_blank(delete.project_id, "projectId", kind)?,
                 })
             }
+            "thread.create" => {
+                let create: CreateThreadPayload = read(payload, kind)?;
+                Ok(Command::CreateThread(CreateThread {
+                    thread_id: non_blank(create.thread_id, "threadId", kind)?,
+                    thread: ThreadFields {
+                        project_id: non_blank(create.thread.project_id, "projectId", kind)?,
+                        ..create.thread
+                    },
+                }))
+            }
+            "thread.turn.start" => {
+                let start: StartTurn = read(payload, kind)?;
+                Ok(Command::StartTurn(Box::new(StartTurn {
+                    thread_id: non_blank(start.thread_id, "threadId", kind)?,
+                    message: TurnMessage {
+                        message_id: non_blank(start.message.message_id, "messageId", kind)?,
+                        ..start.message
+                    },
+                    ..start
+                })))
+            }
             unimplemented => Err(CommandError::new(format!(
                 "Command not implemented by this server: {unimplemented}"
             ))),
@@ -476,15 +863,40 @@ mod tests {
         /// dispatched against both, because deleting a project releases what
         /// the index holds for it.
         index: Index,
+        /// Dispatch reads one thing out of the configuration — which binary to
+        /// start an agent with — so the tests that never start one still have to
+        /// supply it.
+        config: ServerConfig,
         directory: tempfile::TempDir,
     }
 
     impl Fixture {
         fn new() -> Fixture {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+
+            // **The agent this fixture cannot start.** A turn dispatched here
+            // reaches `turn::send`, which resolves `binaryPath` for real — so
+            // the default `claude` would find the developer's own install and
+            // run a real turn against the real API. That is what spec story 61
+            // and the ticket forbid, and the default is a bare name precisely
+            // because a bare name is looked up on `PATH`.
+            //
+            // A file that *exists and is not a program* is the one unusable case
+            // that does not fall back to `PATH` (see `provider::resolve`, where
+            // the asymmetry is deliberate), so it is the only configuration that
+            // is deterministically offline. `socket_turn.rs` drives real turns,
+            // against a scripted stand-in.
+            let unusable = directory.path().join("not-an-agent.txt");
+            std::fs::write(&unusable, "not a program").expect("writes the file");
+            let mut config = ServerConfig::detect();
+            config.settings.providers.claude_agent.binary_path =
+                unusable.to_string_lossy().into_owned();
+
             Fixture {
                 shell: Shell::new(Database::in_memory().expect("an in-memory database")),
                 index: Index::new(),
-                directory: tempfile::tempdir().expect("a temporary directory"),
+                config,
+                directory,
             }
         }
 
@@ -494,9 +906,13 @@ mod tests {
             path.to_string_lossy().into_owned()
         }
 
+        fn dispatch(&self, command: &Value) -> Result<Value, CommandError> {
+            self.shell.dispatch(command, &self.index, &self.config)
+        }
+
         /// The captured `project.create` payload, with the folder swapped.
         fn add(&self, id: &str, folder: &str) -> Result<Value, CommandError> {
-            self.shell.dispatch(&json!({
+            self.dispatch(&json!({
                 "type": "project.create",
                 "commandId": format!("test:create:{id}"),
                 "projectId": id,
@@ -505,18 +921,33 @@ mod tests {
                 "createWorkspaceRootIfMissing": true,
                 "defaultModelSelection": Value::Null,
                 "createdAt": "2026-07-26T00:23:04.909Z",
-            }), &self.index)
+            }))
         }
 
         fn remove(&self, id: &str) -> Result<Value, CommandError> {
-            self.shell.dispatch(
-                &json!({
-                    "type": "project.delete",
-                    "commandId": format!("test:delete:{id}"),
-                    "projectId": id,
-                }),
-                &self.index,
-            )
+            self.dispatch(&json!({
+                "type": "project.delete",
+                "commandId": format!("test:delete:{id}"),
+                "projectId": id,
+            }))
+        }
+
+        /// The `thread.create` payload the client-runtime's `createThread`
+        /// builds.
+        fn add_thread(&self, id: &str, project_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.create",
+                "commandId": format!("test:thread:{id}"),
+                "threadId": id,
+                "projectId": project_id,
+                "title": "A conversation",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": Value::Null,
+                "worktreePath": Value::Null,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
         }
 
         fn snapshot(&self) -> Value {
@@ -527,6 +958,13 @@ mod tests {
             self.snapshot()["snapshot"]["projects"]
                 .as_array()
                 .expect("an array of projects")
+                .clone()
+        }
+
+        fn listed_threads(&self) -> Vec<Value> {
+            self.snapshot()["snapshot"]["threads"]
+                .as_array()
+                .expect("an array of threads")
                 .clone()
         }
     }
@@ -633,7 +1071,6 @@ mod tests {
         let missing = fixture.directory.path().join("please-create-me");
 
         let refusal = fixture
-            .shell
             .dispatch(&json!({
                 "type": "project.create",
                 "commandId": "test:create:1",
@@ -642,7 +1079,7 @@ mod tests {
                 "workspaceRoot": missing.to_string_lossy(),
                 "createWorkspaceRootIfMissing": true,
                 "createdAt": "2026-07-26T00:23:04.909Z",
-            }), &fixture.index)
+            }))
             .expect_err("the flag is not honoured");
 
         assert!(
@@ -681,10 +1118,7 @@ mod tests {
             if let Some(sent) = sent {
                 command["createdAt"] = json!(sent);
             }
-            fixture
-                .shell
-                .dispatch(&command, &fixture.index)
-                .expect("registered");
+            fixture.dispatch(&command).expect("registered");
         }
 
         for project in fixture.listed() {
@@ -755,22 +1189,18 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and lightcode implements two. Each
+    /// Roughly twenty command types exist and lightcode implements four. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]
     fn an_unimplemented_or_malformed_command_is_refused_by_name() {
-        let shell = Shell::new(Database::in_memory().expect("an in-memory database"));
-        let index = Index::new();
+        let fixture = Fixture::new();
 
-        let refusal = shell
-            .dispatch(
-                &json!({"type": "thread.create", "commandId": "c", "threadId": "t"}),
-                &index,
-            )
-            .expect_err("threads arrive in ticket 10");
+        let refusal = fixture
+            .dispatch(&json!({"type": "thread.archive", "commandId": "c", "threadId": "t"}))
+            .expect_err("archiving is not implemented");
         assert!(
-            refusal.message().contains("thread.create"),
+            refusal.message().contains("thread.archive"),
             "{}",
             refusal.message()
         );
@@ -780,13 +1210,13 @@ mod tests {
         );
         assert_eq!(refusal.to_error()["message"], refusal.message());
 
-        let refusal = shell
-            .dispatch(&json!({}), &index)
+        let refusal = fixture
+            .dispatch(&json!({}))
             .expect_err("no type at all");
         assert!(refusal.message().contains("type"), "{}", refusal.message());
 
-        let refusal = shell
-            .dispatch(&json!({"type": "project.create", "projectId": "p"}), &index)
+        let refusal = fixture
+            .dispatch(&json!({"type": "project.create", "projectId": "p"}))
             .expect_err("no workspace root");
         assert!(
             refusal.message().contains("project.create") && refusal.message().contains("malformed"),
@@ -794,13 +1224,247 @@ mod tests {
             refusal.message()
         );
 
-        let refusal = shell
-            .dispatch(&json!({"type": "project.delete", "projectId": "   "}), &index)
+        let refusal = fixture
+            .dispatch(&json!({"type": "project.delete", "projectId": "   "}))
             .expect_err("a blank id");
         assert!(
             refusal.message().contains("projectId"),
             "{}",
             refusal.message()
+        );
+
+        let refusal = fixture
+            .dispatch(&json!({"type": "thread.create", "commandId": "c", "threadId": "t"}))
+            .expect_err("a thread needs a project and a model");
+        assert!(
+            refusal.message().contains("thread.create") && refusal.message().contains("malformed"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    // -- threads -------------------------------------------------------------
+
+    /// A conversation needs a project that exists, because the whole of what a
+    /// thread does is run an agent in that project's folder.
+    #[test]
+    fn a_thread_is_registered_against_a_project_and_joins_the_shell_snapshot() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("workspace");
+        fixture.add("project-1", &folder).expect("registered");
+
+        let answer = fixture
+            .add_thread("thread-1", "project-1")
+            .expect("the project is there");
+        assert!(answer["sequence"].as_i64().expect("a sequence") > 1);
+
+        let threads = fixture.listed_threads();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["id"], "thread-1");
+        assert_eq!(threads[0]["projectId"], "project-1");
+        assert_eq!(threads[0]["session"], Value::Null, "nothing is running yet");
+        assert_eq!(threads[0]["latestTurn"], Value::Null);
+    }
+
+    /// A thread against nothing is a conversation that could never take a turn,
+    /// and the message names the project so the developer knows which one is
+    /// missing rather than that "something" is.
+    #[test]
+    fn a_thread_for_an_unregistered_project_is_refused_by_name() {
+        let fixture = Fixture::new();
+
+        let refusal = fixture
+            .add_thread("thread-1", "never-registered")
+            .expect_err("there is no such project");
+        assert!(
+            refusal.message().contains("never-registered"),
+            "{}",
+            refusal.message()
+        );
+        assert!(fixture.listed_threads().is_empty());
+    }
+
+    /// A blank title is the folder's, the same way a project's is. A
+    /// conversation called "" would be unreachable in the thread list.
+    #[test]
+    fn a_thread_with_no_title_takes_the_projects() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("my-project");
+        fixture.add("project-1", &folder).expect("registered");
+
+        fixture
+            .dispatch(&json!({
+                "type": "thread.create",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "projectId": "project-1",
+                "title": "  ",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": Value::Null,
+                "worktreePath": Value::Null,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+            .expect("registered");
+
+        assert_eq!(fixture.listed_threads()[0]["title"], "my-project");
+    }
+
+    /// The composer's own path: a new conversation reaches this server for the
+    /// first time as a turn carrying the thread it wants created. A server that
+    /// only implemented `thread.create` would answer the real UI's first message
+    /// with "there is no such thread".
+    #[tokio::test]
+    async fn a_turn_creates_the_thread_it_was_sent_for() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("workspace");
+        fixture.add("project-1", &folder).expect("registered");
+
+        let answer = fixture
+            .dispatch(&json!({
+                "type": "thread.turn.start",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "message": {
+                    "messageId": "message-1",
+                    "role": "user",
+                    "text": "hello",
+                    "attachments": [],
+                },
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "bootstrap": {
+                    "createThread": {
+                        "projectId": "project-1",
+                        "title": "A conversation",
+                        "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
+                        "runtimeMode": "full-access",
+                        "interactionMode": "default",
+                        "branch": Value::Null,
+                        "worktreePath": Value::Null,
+                        "createdAt": "2026-07-26T00:23:04.909Z",
+                    },
+                },
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+            .expect("the turn is accepted");
+
+        assert!(answer["sequence"].as_i64().expect("a sequence") > 0);
+
+        let thread = fixture
+            .shell
+            .threads()
+            .get("thread-1")
+            .expect("the turn created it");
+        // The developer's own message is in the transcript before anything the
+        // agent could say about it, and the session says it is starting — which
+        // is the acknowledgement the ticket asks to be immediate.
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].role, "user");
+        assert_eq!(thread.messages[0].text, "hello");
+        assert_eq!(
+            thread.session.as_ref().map(|session| session.status),
+            Some("starting")
+        );
+        assert_eq!(
+            thread.latest_turn.as_ref().map(|turn| turn.state),
+            Some("running")
+        );
+
+        fixture.shell.threads().shutdown().await;
+    }
+
+    /// A turn for a thread nobody created and that asks for none to be created
+    /// is refused rather than quietly starting a conversation with no project
+    /// behind it.
+    #[test]
+    fn a_turn_for_an_unknown_thread_with_no_bootstrap_is_refused() {
+        let fixture = Fixture::new();
+
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.turn.start",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "message": {"messageId": "m", "role": "user", "text": "hello", "attachments": []},
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+            .expect_err("there is no such thread");
+        assert!(
+            refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// The declared divergence for threads. The composer asks for a worktree
+    /// when the project is in worktree mode; running the turn in the project
+    /// root instead would put the agent's changes somewhere the developer did
+    /// not ask for, so it is refused rather than approximated.
+    #[test]
+    fn a_turn_that_wants_a_worktree_is_refused_rather_than_run_in_the_project_root() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("workspace");
+        fixture.add("project-1", &folder).expect("registered");
+        fixture.add_thread("thread-1", "project-1").expect("created");
+
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.turn.start",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "message": {"messageId": "m", "role": "user", "text": "hello", "attachments": []},
+                "bootstrap": {
+                    "prepareWorktree": {
+                        "projectCwd": folder,
+                        "baseBranch": "main",
+                    },
+                },
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+            .expect_err("worktrees are not implemented");
+        assert!(
+            refusal.message().contains("worktree"),
+            "{}",
+            refusal.message()
+        );
+
+        let thread = fixture.shell.threads().get("thread-1").expect("the thread");
+        assert!(
+            thread.messages.is_empty(),
+            "a refused turn must not leave the prompt in the transcript"
+        );
+    }
+
+    /// Projects and threads share one counter, because they share one
+    /// subscription and a client folds both against one cursor. Two counters
+    /// would have a thread's events overtake a project's and the client would
+    /// drop whichever fell behind.
+    #[test]
+    fn projects_and_threads_are_numbered_from_the_same_counter() {
+        let fixture = Fixture::new();
+        let first = fixture.folder("first");
+        let second = fixture.folder("second");
+
+        let project = fixture.add("project-1", &first).expect("registered");
+        let thread = fixture
+            .add_thread("thread-1", "project-1")
+            .expect("created");
+        let later = fixture.add("project-2", &second).expect("registered");
+
+        let (project, thread, later) = (
+            project["sequence"].as_i64().expect("a sequence"),
+            thread["sequence"].as_i64().expect("a sequence"),
+            later["sequence"].as_i64().expect("a sequence"),
+        );
+        assert!(
+            project < thread && thread < later,
+            "{project}, {thread}, {later} are not one increasing log"
+        );
+        assert_eq!(
+            fixture.snapshot()["snapshot"]["snapshotSequence"],
+            json!(later)
         );
     }
 }
