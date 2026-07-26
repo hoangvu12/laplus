@@ -1,0 +1,24 @@
+# t3code is a vendored upstream checkout with its own .git — reference only, never committed here.
+t3code/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node (apps/web dev server during the spike)
+node_modules/
+dist/
+.vite/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Raw, unredacted proxy recordings. Curated fixtures live in fixtures/socket-wire/;
+# these hold live session tokens and are working scratch (see docs/socket-wire-format.md).
+.scratch/wire-capture/raw/
+
+# Local
+.env
+.env.local
+.DS_Store
