@@ -7,8 +7,23 @@
   "transcript": [
     {
       "role": "assistant",
-      "text": "partial answer, [tool_use: Read][?]",
-      "from_deltas": false
+      "text": "partial answer, ",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "text",
+          "text": "partial answer, "
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_synthetic",
+          "name": "Read",
+          "input": {}
+        },
+        {
+          "type": "unknown"
+        }
+      ]
     }
   ],
   "live_text": "",
@@ -20,6 +35,6 @@
     "duration_ms": 1234,
     "total_cost_usd": 0.01
   },
-  "unknown_events": 2,
+  "unknown_events": 3,
   "parse_errors": 1
 }

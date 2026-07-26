@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lightcode_server::protocol::SessionState;
+use lightcode_server::protocol::{ContentBlock, SessionState};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-cli")
@@ -151,6 +151,37 @@ fn the_captures_cover_the_wire_format() {
             .count();
         *totals.entry("unknown events").or_default() += state.unknown_events;
         *totals.entry("parse errors").or_default() += state.parse_errors;
+
+        // Ticket 12's cases, counted rather than asserted per file: what matters
+        // is that the capture set as a whole reaches a tool call, a result that
+        // failed, a session that made several calls, and the reasoning between
+        // them. A set that narrowed to one happy read would otherwise still pass.
+        //
+        // Every key is seeded, and that is the whole of whether this works: a
+        // counter only inserted where the thing occurs *disappears from `totals`*
+        // when the last capture containing it is deleted, and a key that is not
+        // there cannot be reported as uncovered.
+        let mut counted = |path: &'static str, by: usize| {
+            *totals.entry(path).or_default() += by;
+        };
+        let mut calls = 0;
+        let (mut results, mut failures, mut thoughts) = (0, 0, 0);
+        for block in state.transcript.iter().flat_map(|turn| turn.content.iter()) {
+            match block {
+                ContentBlock::ToolUse { .. } => calls += 1,
+                ContentBlock::ToolResult { is_error, .. } => {
+                    results += 1;
+                    failures += usize::from(*is_error);
+                }
+                ContentBlock::Thinking { .. } => thoughts += 1,
+                _ => {}
+            }
+        }
+        counted("tool calls", calls);
+        counted("tool results", results);
+        counted("failed tool calls", failures);
+        counted("thinking blocks", thoughts);
+        counted("sessions making several tool calls", usize::from(calls > 1));
     }
 
     let uncovered: Vec<&&str> = totals

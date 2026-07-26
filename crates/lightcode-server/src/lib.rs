@@ -30,7 +30,8 @@
 //!
 //! The two formats meet in exactly one place. [`agent`] runs the `claude`
 //! subprocess, [`threads`] holds a conversation as the UI reads one,
-//! [`transcripts`] writes one down behind the stream that is producing it, and
+//! [`transcripts`] writes one down behind the stream that is producing it,
+//! [`worklog`] says how a tool call and a pause to reason look to the UI, and
 //! [`turn`] is the join: it folds what the agent said with [`protocol`] and
 //! publishes it as what the UI reads. Keeping the join to one file is what makes
 //! "the agent's format moved" and "the UI's contract moved" separate failures.
@@ -58,5 +59,6 @@ pub mod transcripts;
 pub mod turn;
 pub mod watcher;
 pub mod wire;
+pub mod worklog;
 
 pub use server::{Server, ServerState, StartupFailure};

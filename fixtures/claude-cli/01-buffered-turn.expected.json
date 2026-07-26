@@ -8,7 +8,13 @@
     {
       "role": "assistant",
       "text": "hello",
-      "from_deltas": false
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
     }
   ],
   "live_text": "",

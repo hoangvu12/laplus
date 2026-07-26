@@ -139,6 +139,19 @@ const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX thread_activities_in_order ON thread_activities (thread_id, ordinal);
     "#,
+    // v3 — ticket 12, the position the client sorts the work log by.
+    r#"
+    -- The sequence the activity was announced under. `ordinal` is already the
+    -- position in this server's own list; this is the number the *client* orders
+    -- the work log by (`session-logic.ts`, `compareActivitiesByOrder`), and the
+    -- reason it has to be stored rather than derived is that the client's fallback
+    -- is a millisecond timestamp. See `crate::threads::Activity::sequence`.
+    --
+    -- Nullable, and rows written before this migration keep a NULL: they are older
+    -- than anything this build will number, and the client sorts an activity with
+    -- no sequence ahead of one with — which is where they belong.
+    ALTER TABLE thread_activities ADD COLUMN sequence INTEGER;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -668,7 +681,7 @@ impl Database {
         )?;
         let activities: Vec<(String, Activity)> = query(
             &transaction,
-            "SELECT thread_id, id, tone, kind, summary, payload, turn_id, created_at \
+            "SELECT thread_id, id, tone, kind, summary, payload, turn_id, sequence, created_at \
              FROM thread_activities ORDER BY thread_id ASC, ordinal ASC",
             activity_from_row,
             "read the work logs",
@@ -926,8 +939,9 @@ fn upsert_activity(
     transaction
         .execute(
             "INSERT INTO thread_activities \
-                (thread_id, id, ordinal, tone, kind, summary, payload, turn_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                (thread_id, id, ordinal, tone, kind, summary, payload, turn_id, sequence, \
+                 created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT (thread_id, id) DO UPDATE SET \
                 ordinal = excluded.ordinal, \
                 tone = excluded.tone, \
@@ -942,6 +956,7 @@ fn upsert_activity(
                 activity.summary,
                 activity.payload.to_string(),
                 activity.turn_id,
+                activity.sequence,
                 activity.created_at,
             ],
         )
@@ -1057,7 +1072,8 @@ fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Activity)> {
             summary: row.get(4)?,
             payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
             turn_id: row.get(6)?,
-            created_at: row.get(7)?,
+            sequence: row.get(7)?,
+            created_at: row.get(8)?,
         },
     ))
 }
@@ -1476,15 +1492,48 @@ mod tests {
                 updated_at: "2026-07-26T00:23:07.000Z".to_string(),
             },
         ];
-        let activities = vec![Activity {
-            id: "activity-1".to_string(),
-            tone: "info",
-            kind: "turn.completed".to_string(),
-            summary: "Turn completed in 2.0s · $0.0795 · end_turn".to_string(),
-            payload: serde_json::json!({"durationMs": 2008, "isError": false}),
-            turn_id: Some("turn-1".to_string()),
-            created_at: "2026-07-26T00:23:07.108Z".to_string(),
-        }];
+        // One of each tone this server writes, because the stored tone comes back
+        // through [`crate::threads::tone`] and a value it did not map would come
+        // back as `info` — a tool row that lost its affordances, restored silently
+        // wrong.
+        let activities = vec![
+            Activity {
+                id: "activity-1".to_string(),
+                tone: "info",
+                kind: "turn.completed".to_string(),
+                summary: "Turn completed in 2.0s · $0.0795 · end_turn".to_string(),
+                payload: serde_json::json!({"durationMs": 2008, "isError": false}),
+                turn_id: Some("turn-1".to_string()),
+                sequence: Some(7),
+                created_at: "2026-07-26T00:23:07.108Z".to_string(),
+            },
+            Activity {
+                id: "activity-2".to_string(),
+                tone: "tool",
+                kind: "tool.completed".to_string(),
+                summary: "Tool call".to_string(),
+                payload: serde_json::json!({
+                    "itemType": "dynamic_tool_call",
+                    "status": "failed",
+                    "data": {"toolCallId": "toolu_1"},
+                }),
+                turn_id: Some("turn-1".to_string()),
+                sequence: Some(8),
+                created_at: "2026-07-26T00:23:07.109Z".to_string(),
+            },
+            Activity {
+                id: "activity-3".to_string(),
+                tone: "error",
+                kind: "session.failed".to_string(),
+                summary: "The agent could not be started.".to_string(),
+                payload: serde_json::json!({"detail": "The agent could not be started."}),
+                turn_id: None,
+                // No sequence, which is what a row written before the column
+                // existed comes back as.
+                sequence: None,
+                created_at: "2026-07-26T00:23:07.110Z".to_string(),
+            },
+        ];
 
         let mut writes = vec![Write::Thread(Box::new(thread.clone()))];
         for (ordinal, message) in messages.iter().enumerate() {
@@ -1494,11 +1543,13 @@ mod tests {
                 message: message.clone(),
             });
         }
-        writes.push(Write::Activity {
-            thread_id: "thread-1".to_string(),
-            ordinal: 0,
-            activity: activities[0].clone(),
-        });
+        for (ordinal, activity) in activities.iter().enumerate() {
+            writes.push(Write::Activity {
+                thread_id: "thread-1".to_string(),
+                ordinal,
+                activity: Box::new(activity.clone()),
+            });
+        }
         fixture.database.transcribe(&writes).expect("stores");
 
         assert_eq!(

@@ -1,0 +1,81 @@
+{
+  "session_id": "32c4aba3-a0db-4283-82c7-f680c53fc377",
+  "model": "claude-haiku-4-5-20251001",
+  "cwd": "C:\\Users\\ADMIN\\AppData\\Local\\Temp\\toolfail",
+  "permission_mode": "bypassPermissions",
+  "tool_count": 32,
+  "transcript": [
+    {
+      "role": "assistant",
+      "text": "",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "The user wants me to read a file called `missing.txt` in the current directory. If it fails, I should reply with just the word \"gone\" and not retry or look around.\n\nThe current working directory is `C:\\Users\\ADMIN\\AppData\\Local\\Temp\\toolfail`.\n\nLet me read the file at that path."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_0184T5LxDBav8NCr8AaYTFF3",
+          "name": "Read",
+          "input": {
+            "file_path": "C:\\Users\\ADMIN\\AppData\\Local\\Temp\\toolfail\\missing.txt"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "text": "",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_0184T5LxDBav8NCr8AaYTFF3",
+          "content": "File does not exist. Note: your current working directory is C:\\Users\\ADMIN\\AppData\\Local\\Temp\\toolfail.",
+          "is_error": true
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "The file doesn't exist. The user said if it fails, reply with the single word \"gone\". I should not retry or look around. So I just respond with:"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "gone",
+      "from_deltas": true,
+      "content": [
+        {
+          "type": "text",
+          "text": "gone"
+        }
+      ]
+    }
+  ],
+  "live_text": "",
+  "streaming": false,
+  "last_result": {
+    "is_error": false,
+    "stop_reason": "end_turn",
+    "num_turns": 2,
+    "duration_ms": 5867,
+    "total_cost_usd": 0.0151476
+  },
+  "unknown_events": 0,
+  "parse_errors": 0
+}

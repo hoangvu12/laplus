@@ -62,9 +62,11 @@
 //!   last turn went is worth having — and [`Thread::restored`] moves a turn that
 //!   was still `running` to `interrupted`, because the app stopped in the middle
 //!   of it and nothing is going to finish it.
-//! - **Tool use, approvals, checkpoints, proposed plans.** `activities`,
-//!   `checkpoints` and `proposedPlans` are present and empty except for the two
-//!   activities a turn produces here; tickets 12, 13 and 20 fill them.
+//! - **Approvals, checkpoints, proposed plans.** `checkpoints` and
+//!   `proposedPlans` are present and empty; tickets 13 and 20 fill them.
+//!   `activities` holds a turn's own bookkeeping and, since ticket 12, its tool
+//!   calls and the reasoning between them — see [`crate::worklog`], which owns
+//!   what those rows look like.
 //! - **Worktrees.** `branch` and `worktreePath` are carried and never acted on.
 //!   A `thread.turn.start` that asks for a worktree to be prepared is refused by
 //!   name rather than silently run in the project root — see
@@ -160,15 +162,17 @@ pub struct Conversation {
     pub activities: Vec<Activity>,
 }
 
-/// A stored tone, back as one of the two this server produces.
+/// A stored tone, back as one of the three this server produces.
 ///
 /// [`Activity::tone`] is a `&'static str` because every value it can hold is a
-/// literal in this file — `info` from [`Activity::info`] and `error` from
-/// [`Activity::failed`]. So the round trip is lossless for everything that can
-/// be written, and anything else is a row this build did not put there.
+/// literal in this file — `info` from [`Activity::info`], `error` from
+/// [`Activity::failed`] and `tool` from [`Activity::tool`]. So the round trip is
+/// lossless for everything that can be written, and anything else is a row this
+/// build did not put there.
 pub fn tone(stored: &str) -> &'static str {
     match stored {
         "error" => "error",
+        "tool" => "tool",
         _ => "info",
     }
 }
@@ -211,6 +215,22 @@ pub struct Activity {
     pub summary: String,
     pub payload: Value,
     pub turn_id: Option<String>,
+    /// Where this row sits in the work log, from the same counter that numbers
+    /// the event announcing it.
+    ///
+    /// `None` until [`Threads::apply`] takes a number — an activity is built
+    /// before it is published, and there is nothing honest to put here until then.
+    ///
+    /// It is what the client *sorts the work log by* when it is present
+    /// (`compareActivitiesByOrder`), and the whole reason it has to be present is
+    /// that the fallback is `createdAt`, which is a millisecond. Two rows inside
+    /// one millisecond fall through to a rank that puts every `.updated` before
+    /// every `.completed` — so a turn whose tool calls landed close together would
+    /// have its invocations gathered at the front, away from the results they pair
+    /// with, and the work log collapses a pair only when the two are *adjacent*.
+    /// The same argument [`crate::store`] makes for storing a message's `ordinal`
+    /// rather than trusting its timestamp.
+    pub sequence: Option<i64>,
     pub created_at: String,
 }
 
@@ -271,9 +291,9 @@ impl Thread {
     ///
     /// All three are `false` here and each is a later ticket's: approvals are
     /// ticket 13, the user-input questions that go with them are the same, and a
-    /// proposed plan needs plan mode, which is ticket 12's tool round-trips at
-    /// the earliest. A `true` any of them could not be acted on would put a badge
-    /// on a thread with nothing behind it.
+    /// proposed plan needs `ExitPlanMode` to be answered rather than merely
+    /// reported, which is the same ticket. A `true` any of them could not be acted
+    /// on would put a badge on a thread with nothing behind it.
     pub fn to_shell_value(&self) -> Value {
         json!({
             "id": self.id,
@@ -398,7 +418,22 @@ impl Activity {
             summary: summary.to_string(),
             payload,
             turn_id,
+            sequence: None,
             created_at: now_iso(),
+        }
+    }
+
+    /// A step the agent took, rather than something the server has to report.
+    ///
+    /// `tool` is the contract's own tone for this and the UI reads it as one:
+    /// a row with the tool's affordances, and — the part that matters for a call
+    /// that *failed* — styled as a step that did not work rather than as an error
+    /// in this server (`session-logic.ts`, `showDestructiveRowStyle`). Which of
+    /// the two it was is in the payload's `status`; see [`crate::worklog`].
+    pub fn tool(kind: &str, summary: &str, payload: Value, turn_id: Option<String>) -> Activity {
+        Activity {
+            tone: "tool",
+            ..Activity::info(kind, summary, payload, turn_id)
         }
     }
 
@@ -415,12 +450,13 @@ impl Activity {
             // `summary` alone renders as a heading with nothing under it.
             payload: json!({"detail": summary}),
             turn_id: None,
+            sequence: None,
             created_at: now_iso(),
         }
     }
 
     fn to_value(&self) -> Value {
-        json!({
+        let mut activity = json!({
             "id": self.id,
             "tone": self.tone,
             "kind": self.kind,
@@ -428,7 +464,14 @@ impl Activity {
             "payload": self.payload,
             "turnId": self.turn_id,
             "createdAt": self.created_at,
-        })
+        });
+        // `Schema.optional`, not `Schema.NullOr` — so an absent sequence is an
+        // absent *key*. A `null` would fail the client's decode of the whole
+        // activity, and the ordering rule beside it tests for `!== undefined`.
+        if let Some(sequence) = self.sequence {
+            activity["sequence"] = json!(sequence);
+        }
+        activity
     }
 }
 
@@ -764,7 +807,7 @@ impl Threads {
         let commit = self.inner.sequences.commit();
         let sequence = commit.sequence();
         let occurred_at = now_iso();
-        let payload = self.fold(thread, &change, &occurred_at);
+        let payload = self.fold(thread, &change, sequence, &occurred_at);
         thread.updated_at = occurred_at.clone();
 
         let event = thread_event(sequence, thread_id, change.event_type(), payload, &occurred_at);
@@ -797,7 +840,11 @@ impl Threads {
     /// whose stored thread disagreed with the client's fold would show one
     /// transcript to a client that watched the whole turn and a different one to
     /// a client that arrived late and took a snapshot.
-    fn fold(&self, thread: &mut Thread, change: &Change, at: &str) -> Value {
+    ///
+    /// `sequence` is the number the change is being announced under. Only an
+    /// activity keeps it — see [`Activity::sequence`] — and it is passed in rather
+    /// than read here because [`Threads::apply`] holds the log open around both.
+    fn fold(&self, thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Value {
         match change {
             Change::UserMessage {
                 message_id,
@@ -875,10 +922,19 @@ impl Threads {
                 })
             }
             Change::Activity(activity) => {
-                thread.activities.push(activity.clone());
+                // Numbered as it is folded in, so the row the client sorts by
+                // sequence and the row a late client finds in the snapshot are the
+                // same row. Set here rather than at construction because a caller
+                // building an activity has no number to give it.
+                let appended = Activity {
+                    sequence: Some(sequence),
+                    ..activity.clone()
+                };
+                let described = appended.to_value();
+                thread.activities.push(appended);
                 json!({
                     "threadId": thread.id,
-                    "activity": activity.to_value(),
+                    "activity": described,
                 })
             }
         }
@@ -1307,7 +1363,7 @@ fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
             writes.push(Write::Activity {
                 thread_id: thread.id.clone(),
                 ordinal,
-                activity: activity.clone(),
+                activity: Box::new(activity.clone()),
             });
         }
     }
@@ -1325,8 +1381,9 @@ fn at<T>(items: &[T], wanted: impl Fn(&T) -> bool) -> Option<(usize, &T)> {
 /// `threadReducer.ts`'s rule, and the subtle half of it is why a completed
 /// assistant message does *not* end the turn: a provider may send several of
 /// them in one turn — commentary between tool calls — so the turn stays running
-/// until the session says otherwise. Ticket 12's tool round-trips are exactly
-/// the case that breaks if this settles early.
+/// until the session says otherwise. A turn that uses a tool is exactly the case
+/// that breaks if this settles early, and the CLI emits one buffered message per
+/// content block, so such a turn produces several of them as a matter of course.
 fn bind_assistant_message(
     latest: Option<LatestTurn>,
     session: Option<&Session>,
@@ -1774,6 +1831,7 @@ mod tests {
                 summary: "started".to_string(),
                 payload: json!({}),
                 turn_id: None,
+                sequence: None,
                 created_at: now_iso(),
             }),
         );
@@ -1789,10 +1847,54 @@ mod tests {
         );
     }
 
+    /// An activity is numbered with the sequence its own event was announced
+    /// under, and the number reaches the client on the activity itself.
+    ///
+    /// The client sorts the work log by it and falls back to `createdAt` — a
+    /// millisecond — when it is absent, so an unnumbered pair of rows landing inside
+    /// one millisecond is re-ordered by a rank that puts every `.updated` before
+    /// every `.completed`. That separates a tool invocation from its result, and the
+    /// work log only collapses the two when they are *adjacent*.
+    #[test]
+    fn an_activity_is_numbered_with_the_sequence_it_was_announced_under() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        let appended = |kind: &str| {
+            Change::Activity(Activity::tool(kind, "Tool call", json!({}), None))
+        };
+        let first = threads
+            .apply("thread-1", appended("tool.updated"))
+            .expect("applied");
+        let second = threads
+            .apply("thread-1", appended("tool.completed"))
+            .expect("applied");
+        assert!(first < second, "{first} then {second}");
+
+        // The number the change was announced under is the number on the row a
+        // client arriving late is handed. The two have to agree, or which order a
+        // developer sees depends on when they opened the conversation —
+        // `socket_tools.rs` drives the same number off the events themselves.
+        let thread = threads.get("thread-1").expect("the thread");
+        assert_eq!(
+            thread
+                .activities
+                .iter()
+                .map(|activity| activity.sequence)
+                .collect::<Vec<Option<i64>>>(),
+            vec![Some(first), Some(second)]
+        );
+        assert_eq!(
+            thread.activities[0].to_value()["sequence"],
+            json!(first),
+            "the number has to reach the client, not merely be held here"
+        );
+    }
+
     /// A turn does not end when the assistant stops talking — a provider sends
     /// several messages in one turn — it ends when the session leaves `running`.
-    /// Getting this wrong settles a turn in the middle of itself, which is the
-    /// failure ticket 12's tool round-trips would hit first.
+    /// Getting this wrong settles a turn in the middle of itself, which is what a
+    /// turn that narrates before it calls a tool would hit first.
     #[test]
     fn a_turn_ends_when_the_session_does_rather_than_at_the_last_message() {
         let (threads, _shell) = threads();

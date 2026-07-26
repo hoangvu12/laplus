@@ -79,10 +79,14 @@ pub enum Write {
         message: Message,
     },
     /// An activity at a position in the work log.
+    ///
+    /// Boxed for the reason [`Write::Thread`] is, and it became the reason once an
+    /// activity carried a payload, a kind, a summary and a sequence: it is now the
+    /// member every other one would be padded out to.
     Activity {
         thread_id: String,
         ordinal: usize,
-        activity: Activity,
+        activity: Box<Activity>,
     },
     /// The `claude` session this conversation is being held in — the handle
     /// `--resume` is given after a restart.

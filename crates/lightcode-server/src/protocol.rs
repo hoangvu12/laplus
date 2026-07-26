@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Wire format
@@ -76,21 +77,116 @@ pub struct MessageEnvelope {
 #[derive(Debug, Deserialize)]
 pub struct Message {
     pub role: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "readable_blocks")]
     pub content: Vec<ContentBlock>,
     #[serde(default)]
     pub stop_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// The message's blocks, with anything this build cannot read reduced to
+/// [`ContentBlock::Unknown`].
+///
+/// Needed because `#[serde(other)]` catches an unrecognized `type` and nothing
+/// else: a `tool_use` with the *id missing* is a recognized tag whose fields do
+/// not fit, and without this the whole line fails to parse — so a block that
+/// drifted would cost the reply beside it. The module's own rule is that a format
+/// change has the blast radius of one file; this makes it the blast radius of one
+/// block.
+fn readable_blocks<'de, D>(deserializer: D) -> Result<Vec<ContentBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// `untagged` tries the real block first and falls back to swallowing
+    /// whatever was there, which is the only way to say "unreadable" without
+    /// knowing in advance how it will be unreadable.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Readable {
+        Block(ContentBlock),
+        Unreadable(serde::de::IgnoredAny),
+    }
+
+    Ok(Vec::<Readable>::deserialize(deserializer)?
+        .into_iter()
+        .map(|block| match block {
+            Readable::Block(block) => block,
+            Readable::Unreadable(_) => ContentBlock::Unknown,
+        })
+        .collect())
+}
+
+/// One block of a message's content.
+///
+/// Ticket 10 needed only the text and reduced everything else to a placeholder.
+/// Ticket 12 needs the rest, because a tool call *is* these fields: the id is
+/// what pairs an invocation with its result, the name is what the developer reads,
+/// and the input is what they need to see it was given.
+///
+/// Two things are deliberately not read:
+///
+/// - **A thinking block's `signature`.** It is a few hundred bytes of opaque
+///   base64 that only the API has any use for, and nothing here forwards a
+///   thinking block back to it.
+/// - **`server_tool_use` and `mcp_tool_use`.** Both are tool calls the *API*
+///   runs, so their results come back as their own block types rather than as a
+///   `tool_result` in the next user message — an invocation this server could
+///   announce and never settle. No capture contains one; when one does, it
+///   arrives here as [`ContentBlock::Unknown`] and is counted as drift, which is
+///   the honest answer until there is something to pair it with.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    Thinking {},
-    ToolUse { name: String },
-    ToolResult {},
+    Text {
+        text: String,
+    },
+    /// The model reasoning before it answered.
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    /// The agent invoking a tool. `input` is whatever that tool's schema says,
+    /// so it is carried verbatim rather than typed.
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    /// What the tool returned, in the *next* message and with the role `user` —
+    /// the Messages API's shape, and the reason [`SessionState::reduce`] folds a
+    /// user message rather than ignoring it.
+    ///
+    /// `content` is a string on the captures here and is permitted to be an array
+    /// of blocks, so it too is carried verbatim; [`text_content`] is how it
+    /// becomes something to show.
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: Value,
+        #[serde(default)]
+        is_error: bool,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// A `tool_result`'s content as text.
+///
+/// The Messages API permits a string or an array of blocks, and the CLI produces
+/// both — a string for a file read, an array when a tool returns images beside its
+/// text. Anything that is not text contributes nothing, because there is nowhere
+/// in this contract's work log to render it.
+pub fn text_content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type") == Some(&Value::String("text".to_string())))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<&str>>()
+            .join(""),
+        _ => String::new(),
+    }
 }
 
 /// Verbatim Messages API streaming events, delivered under `--include-partial-messages`.
@@ -169,13 +265,32 @@ pub struct SessionState {
     pub counts: BTreeMap<String, usize>,
 }
 
+/// One complete message the agent buffered, as the driver has to publish it.
+///
+/// The CLI emits one of these **per content block** rather than one per API
+/// message — `fixtures/claude-cli/04-tool-use.ndjson` shows a single
+/// `message_start` producing an `assistant` line for its thinking block and
+/// another for its tool call — so a turn that uses a tool arrives here as several
+/// of these, in the order the blocks closed. That order is what makes the work
+/// log's order right without anything having to sort it.
 #[derive(Debug, Serialize)]
 pub struct Turn {
     pub role: String,
+    /// The message's *visible* text and nothing else.
+    ///
+    /// Derivable from `content`, and kept beside it because this is the string
+    /// that has to equal the delta accumulation for `from_deltas` to mean
+    /// anything, and the string the driver puts in the transcript. Before ticket
+    /// 12 it also carried `[thinking]` and `[tool_use: Read]` placeholders for the
+    /// blocks it could not describe — which put both in the developer's chat
+    /// bubble, verbatim.
     pub text: String,
     /// True when the text came from accumulated deltas rather than the
     /// buffered `assistant` event — see `reduce`'s reconcile step.
     pub from_deltas: bool,
+    /// Every block the message carried, in order. What the driver reads to find
+    /// the tool calls, their results and the reasoning between them.
+    pub content: Vec<ContentBlock>,
 }
 
 /// What folding one line changed, for a caller that has to tell somebody.
@@ -318,13 +433,15 @@ impl SessionState {
 
             Event::Assistant(env) => {
                 self.bump("assistant");
+                self.note_unreadable_blocks(&env.message.content);
                 // Reconcile: the buffered message is authoritative.
-                let text = flatten(&env.message);
+                let text = visible(&env.message);
                 let from_deltas = !self.live_text.is_empty() && self.live_text == text;
                 self.transcript.push(Turn {
                     role: env.message.role,
                     text,
                     from_deltas,
+                    content: env.message.content,
                 });
                 self.live_text.clear();
                 Folded::Turn {
@@ -332,13 +449,20 @@ impl SessionState {
                 }
             }
 
+            // Folded rather than dropped, and not because this server asked for
+            // the developer's own turns back — it does not pass
+            // `--replay-user-messages`. A **tool result** arrives as a user
+            // message, which is the Messages API's shape, so this is the only
+            // place a tool call can be seen to have returned.
             Event::User(env) => {
                 self.bump("user");
-                let text = flatten(&env.message);
+                self.note_unreadable_blocks(&env.message.content);
+                let text = visible(&env.message);
                 self.transcript.push(Turn {
                     role: env.message.role,
                     text,
                     from_deltas: false,
+                    content: env.message.content,
                 });
                 Folded::Turn {
                     index: self.transcript.len() - 1,
@@ -376,24 +500,55 @@ impl SessionState {
         self.bump("PARSE_ERROR");
     }
 
+    /// Count the blocks in a message this build could not read.
+    ///
+    /// A block arrives as [`ContentBlock::Unknown`] either because its `type` is
+    /// one this build does not know — `server_tool_use` — or because a type it does
+    /// know did not carry the fields that make it usable. Either way the driver
+    /// publishes nothing for it, so without a count the only account of a format
+    /// change would be a row missing from a work log nobody was watching. This is
+    /// the same drift number an unrecognized event type feeds, and `turn.completed`
+    /// carries the total to where a developer is already looking.
+    ///
+    /// Before ticket 12 an unreadable block was *visible* instead: the flattened
+    /// text carried a `[?]` where it had been. Counting it is what replaces that.
+    fn note_unreadable_blocks(&mut self, content: &[ContentBlock]) {
+        let unreadable = content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::Unknown))
+            .count();
+        if unreadable > 0 {
+            self.unknown_events += unreadable;
+            *self
+                .counts
+                .entry("content_block/UNKNOWN".to_string())
+                .or_insert(0) += unreadable;
+        }
+    }
+
     /// What the UI would render right now for the in-flight turn.
     pub fn visible_text(&self) -> &str {
         &self.live_text
     }
 }
 
-fn flatten(message: &Message) -> String {
-    let mut out = String::new();
-    for block in &message.content {
-        match block {
-            ContentBlock::Text { text } => out.push_str(text),
-            ContentBlock::ToolUse { name } => out.push_str(&format!("[tool_use: {name}]")),
-            ContentBlock::Thinking {} => out.push_str("[thinking]"),
-            ContentBlock::ToolResult {} => out.push_str("[tool_result]"),
-            ContentBlock::Unknown => out.push_str("[?]"),
-        }
-    }
-    out
+/// A message's visible text: its text blocks, joined, and nothing else.
+///
+/// Everything else the message carried is on [`Turn::content`] for the driver to
+/// publish as what it actually is. Describing those blocks *in the text* — which
+/// is what this used to do, with `[thinking]` and `[tool_use: Read]` placeholders
+/// — put the model's reasoning and its tool arguments in the developer's chat
+/// bubble as prose, and made the reply the transcript held not the reply the agent
+/// gave.
+fn visible(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Build the stdin line for a user turn. The CLI reads NDJSON on stdin under
@@ -416,6 +571,8 @@ pub fn user_message_line(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn fold(lines: &[&str]) -> SessionState {
@@ -483,7 +640,154 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi "},{"type":"holograph"}]}}"#,
         ]);
 
-        assert_eq!(state.transcript[0].text, "hi [?]");
+        // The text is the message's text and nothing else. A block this build
+        // cannot describe is on `content` as `Unknown`, where the driver ignores
+        // it — rather than described *in the reply*, which is where a `[?]`
+        // placeholder used to put it.
+        assert_eq!(state.transcript[0].text, "hi ");
+        assert_eq!(
+            state.transcript[0].content,
+            vec![
+                ContentBlock::Text {
+                    text: "hi ".to_string()
+                },
+                ContentBlock::Unknown,
+            ]
+        );
+        // And it is counted, because that placeholder was the only account of it
+        // there used to be. A block the driver silently skips is drift, and drift
+        // is a number here rather than a row nobody noticed was missing.
+        assert_eq!(state.unknown_events, 1);
+    }
+
+    // -- tool use ------------------------------------------------------------
+    //
+    // Whole captured tool-use sessions are covered by the golden files. What
+    // lives here is the shape of one block, because that is what the driver
+    // matches on, and the degradation no capture contains.
+
+    /// The three fields a tool call is: the id that pairs it with its result, the
+    /// name the developer reads, and the input they need to see it was given.
+    #[test]
+    fn a_tool_call_carries_its_id_its_name_and_its_input() {
+        let state = fold(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"note.txt"},"caller":{"type":"direct"}}]}}"#,
+        ]);
+
+        assert_eq!(
+            state.transcript[0].content,
+            vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "Read".to_string(),
+                input: json!({"file_path": "note.txt"}),
+            }]
+        );
+        // And nothing of it reaches the reply. A message that is only a tool call
+        // has no text, which is what stops it appearing as an empty chat bubble.
+        assert_eq!(state.transcript[0].text, "");
+    }
+
+    /// A result names the call it answers and says whether the tool failed. Both
+    /// come off the block itself, and `is_error` is *absent* on a call that went
+    /// well — so the successful case is the one that has to default correctly.
+    ///
+    /// A result arrives with the role `user`, which is why it has to be reported as
+    /// something rather than skipped: this server does not pass
+    /// `--replay-user-messages`, so a user message is never the developer's own
+    /// turn coming back.
+    #[test]
+    fn a_tool_result_names_its_call_and_whether_it_failed() {
+        let state = fold(&[
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"1\tthe answer is 42\n"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"File does not exist.","is_error":true}]}}"#,
+        ]);
+
+        assert_eq!(
+            state.transcript[0].content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: json!("1\tthe answer is 42\n"),
+                is_error: false,
+            }]
+        );
+        assert_eq!(
+            state.transcript[1].content,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_2".to_string(),
+                content: json!("File does not exist."),
+                is_error: true,
+            }]
+        );
+        // And neither is the user talking, so neither is the user's text.
+        assert_eq!(state.transcript[0].text, "");
+        assert_eq!(state.transcript[1].text, "");
+    }
+
+    /// The model's reasoning, without the signature beside it — a few hundred
+    /// bytes of base64 nothing here forwards anywhere.
+    #[test]
+    fn a_thinking_block_carries_the_reasoning_and_not_the_signature() {
+        let state = fold(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"read the file first","signature":"Ev8CCpMBCBAY"}]}}"#,
+        ]);
+
+        assert_eq!(
+            state.transcript[0].content,
+            vec![ContentBlock::Thinking {
+                thinking: "read the file first".to_string()
+            }]
+        );
+        assert_eq!(state.transcript[0].text, "");
+    }
+
+    /// A `tool_result`'s content is a string on every capture here and is
+    /// permitted to be an array of blocks. Both have to become the same kind of
+    /// answer, and anything that is not text contributes nothing — there is
+    /// nowhere in the work log to render it.
+    #[test]
+    fn a_results_content_reads_as_text_whichever_shape_it_arrived_in() {
+        assert_eq!(text_content(&json!("plain output")), "plain output");
+        assert_eq!(
+            text_content(&json!([
+                {"type": "text", "text": "first "},
+                {"type": "image", "source": {}},
+                {"type": "text", "text": "second"},
+            ])),
+            "first second"
+        );
+        assert_eq!(text_content(&Value::Null), "");
+        assert_eq!(text_content(&json!({"unexpected": true})), "");
+    }
+
+    /// A tool call missing the fields that make it one is drift rather than a
+    /// half-built call: publishing an invocation with no id would announce
+    /// something no result could ever be paired with.
+    ///
+    /// The cost of it is a *block*, not the message around it — `#[serde(other)]`
+    /// catches an unrecognized `type` and nothing else, so without the fallback the
+    /// whole line would fail to parse and take the reply beside it.
+    #[test]
+    fn a_tool_block_without_the_fields_that_pair_it_is_drift() {
+        let state = fold(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still said"},{"type":"tool_use","name":"Read"},{"type":"tool_result","content":"x"}]}}"#,
+        ]);
+
+        assert_eq!(
+            state.transcript[0].content,
+            vec![
+                ContentBlock::Text {
+                    text: "still said".to_string()
+                },
+                ContentBlock::Unknown,
+                ContentBlock::Unknown,
+            ],
+            "a block that cannot be paired must not look like one that can"
+        );
+        assert_eq!(
+            state.transcript[0].text, "still said",
+            "a drifted block cost the reply beside it"
+        );
+        assert_eq!((state.unknown_events, state.parse_errors), (2, 0));
     }
 
     #[test]

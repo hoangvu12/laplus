@@ -115,6 +115,31 @@ pub fn assistant_sends(events: &[Value]) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// Every activity, in the order it was published — the work log as the UI folds
+/// one.
+pub fn activities(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .collect()
+}
+
+/// Every activity of these kinds, in order. What a test asserting the *shape* of
+/// a turn wants: the session's own bookkeeping is not the subject, so it is left
+/// out rather than asserted around.
+pub fn activities_of<'a>(events: &'a [Value], kinds: &[&str]) -> Vec<&'a Value> {
+    activities(events)
+        .into_iter()
+        .filter(|activity| {
+            activity["kind"]
+                .as_str()
+                .is_some_and(|kind| kinds.contains(&kind))
+        })
+        .collect()
+}
+
 /// The first activity of this kind.
 pub fn activity<'a>(events: &'a [Value], kind: &str) -> &'a Value {
     find_activity(events, kind)

@@ -27,7 +27,10 @@
 //! |---|---|
 //! | `system`/`init` | an activity naming the model, the permission mode and the tool count |
 //! | a text delta | `thread.message-sent` with `streaming: true` — the client appends it |
-//! | a buffered `assistant` message | `thread.message-sent` with `streaming: false` — the client replaces with it |
+//! | a buffered `assistant` message's text | `thread.message-sent` with `streaming: false` — the client replaces with it |
+//! | a `tool_use` block | a `tool.updated` activity naming the tool and its input |
+//! | a `tool_result` block | a `tool.completed` activity, paired to it by the agent's own id |
+//! | a `thinking` block | a `task.progress` activity, which the UI renders as thinking |
 //! | `result` | an activity carrying the duration and the cost, and the session is ready again |
 //!
 //! The second and third rows *are* accumulate-and-reconcile. Nothing decides
@@ -38,6 +41,27 @@
 //! Nothing in that table makes the session `running`, and that is deliberate:
 //! `init` is printed once for the whole conversation, so the transition belongs
 //! to the prompt being sent rather than to anything the agent says.
+//!
+//! ## Tool use is read off the buffered messages, not off the stream
+//!
+//! The stream announces a tool call twice — once as a `content_block_start` with
+//! the arguments still arriving, and again as the buffered `assistant` message
+//! once the block has closed — and this file reads the second. That is the same
+//! reconciliation rule the text follows, applied to the one thing it matters most
+//! for: deltas are best-effort and may be shed, and a *shed tool call* would be a
+//! step the developer never saw the agent take. The buffered message always
+//! arrives, and it arrives with the input whole rather than as partial JSON this
+//! file would have to reassemble.
+//!
+//! What it costs is announcing the call when the block closes rather than when it
+//! opens, which is a moment before the tool runs rather than a moment after the
+//! model decided to run it. What it buys is that the pair is never half-published.
+//!
+//! The order of the rows follows from the same choice, and needs no sorting: the
+//! CLI closes one block before announcing the next, so folding lines in the order
+//! they arrive puts the work log in the order the work happened. `worklog`'s
+//! module documentation covers the rest — what the rows look like, and why they
+//! are the kinds they are.
 //!
 //! ## Continuity is the agent's, and this is where the handle on it is kept
 //!
@@ -62,14 +86,17 @@
 //! the agent has forgotten would leave the developer talking to something that
 //! cannot see the transcript in front of them.
 
+use std::collections::HashMap;
+
 use serde_json::json;
 
 use crate::agent::{permission_mode_for, Agent, Launch};
 use crate::clock::now_iso;
 use crate::config::ClaudeSettings;
 use crate::process::Search;
-use crate::protocol::{Folded, SessionState};
+use crate::protocol::{ContentBlock, Folded, SessionState};
 use crate::threads::{Activity, Change, Prompt, Session, Thread, Threads};
+use crate::worklog::{Call, Returned};
 
 /// Everything a session needs to start an agent, gathered while the thread is
 /// known and carried into the task that will need it.
@@ -169,6 +196,7 @@ async fn drive(
                 turn = Some(InFlight {
                     turn_id: prompt.turn_id.clone(),
                     assistant_message_id: None,
+                    tools: HashMap::new(),
                 });
                 // The turn is under way, and *this* is where the session enters
                 // `running` — not the agent's `init` line, which a long-lived
@@ -295,9 +323,17 @@ struct InFlight {
     turn_id: String,
     /// Minted at the first piece of assistant text and cleared when that message
     /// completes, so a turn that produces several messages — commentary between
-    /// tool calls, which ticket 12 brings — gives each its own id rather than
-    /// appending them all into one.
+    /// tool calls — gives each its own id rather than appending them all into one.
     assistant_message_id: Option<String>,
+    /// Tool calls announced and not yet answered, by the id the agent minted.
+    ///
+    /// The pairing has to be remembered because the two halves arrive in
+    /// different messages and only the first one says what the tool was: a
+    /// `tool_result` carries an id, a payload and nothing else. Per turn rather
+    /// than per session, because a call is always answered within the turn that
+    /// made it — and a turn that ended with one outstanding has nothing left to
+    /// answer it.
+    tools: HashMap<String, Call>,
 }
 
 /// Resolve the binary and start the agent, or say why not.
@@ -386,24 +422,86 @@ fn publish(
         Folded::Turn { index } => {
             let Some(active) = turn.as_mut() else { return };
             let completed = &folding.transcript[index];
-            // Only the assistant's. The CLI echoes the user's turn back under
-            // `--replay-user-messages`, which this server does not ask for, and
-            // publishing one would put the prompt in the transcript twice.
-            if completed.role != "assistant" {
-                return;
+
+            // Only the assistant's text is the conversation, and only when there
+            // is some — or when deltas have already put some on screen under an id
+            // that has not been closed. A message that is nothing but a tool call
+            // or a pause to reason would otherwise arrive as an empty chat bubble:
+            // the CLI emits one buffered message per *content block*, so a turn
+            // that uses a tool produces several of them and most carry no text at
+            // all. The second half of the condition is what stops the skip going
+            // too far the other way — a reply that streamed and then buffered
+            // nothing still owes the client the non-streaming send that settles it,
+            // or the message would stay `streaming` for the life of the thread.
+            //
+            // The developer's own turn is not echoed back: that needs
+            // `--replay-user-messages`, which this server does not pass. What does
+            // arrive with the role `user` is a tool result, and that is work
+            // rather than something said — it is published below, as work.
+            let owes_a_message =
+                !completed.text.is_empty() || active.assistant_message_id.is_some();
+            if completed.role == "assistant" && owes_a_message {
+                let message_id = active
+                    .assistant_message_id
+                    .take()
+                    .unwrap_or_else(crate::threads::fresh_message_id);
+                threads.apply(
+                    &start.thread_id,
+                    Change::AssistantMessage {
+                        message_id,
+                        turn_id: active.turn_id.clone(),
+                        text: completed.text.clone(),
+                    },
+                );
             }
-            let message_id = active
-                .assistant_message_id
-                .take()
-                .unwrap_or_else(crate::threads::fresh_message_id);
-            threads.apply(
-                &start.thread_id,
-                Change::AssistantMessage {
-                    message_id,
-                    turn_id: active.turn_id.clone(),
-                    text: completed.text.clone(),
-                },
-            );
+
+            // Everything the message carried besides its text, in the order it
+            // carried it — which is the order the developer saw it happen, because
+            // the CLI closes a block before announcing the next.
+            for block in &completed.content {
+                let change = match block {
+                    ContentBlock::Thinking { thinking } => {
+                        crate::worklog::thinking(thinking, Some(active.turn_id.clone()))
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        let call = Call {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        };
+                        let invoked = call.invoked(Some(active.turn_id.clone()));
+                        // Held until the result names this id: the result carries
+                        // the id and nothing else, so what the tool *was* and what
+                        // it was *given* only exists on this side of the pair.
+                        active.tools.insert(id.clone(), call);
+                        Some(invoked)
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        let call = active
+                            .tools
+                            .remove(tool_use_id)
+                            .unwrap_or_else(|| Call::untracked(tool_use_id));
+                        Some(call.returned(
+                            Returned {
+                                content,
+                                failed: *is_error,
+                            },
+                            Some(active.turn_id.clone()),
+                        ))
+                    }
+                    // The text is already in the transcript, and a block this
+                    // build cannot read is drift with nothing to show for it.
+                    ContentBlock::Text { .. } | ContentBlock::Unknown => None,
+                };
+
+                if let Some(activity) = change {
+                    threads.apply(&start.thread_id, Change::Activity(activity));
+                }
+            }
         }
 
         Folded::Completed => {
