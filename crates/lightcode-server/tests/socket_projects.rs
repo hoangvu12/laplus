@@ -95,21 +95,10 @@ async fn listed(server: &TestServer) -> Vec<Value> {
 /// machine-readable, so this string is the whole diagnostic the UI can show —
 /// which is why every test that refuses something asserts on it.
 fn refusal(outcome: Outcome) -> String {
-    match outcome {
-        Outcome::Failure(cause) => {
-            assert_eq!(cause.len(), 1, "one cause entry: {cause:?}");
-            assert_eq!(cause[0]["_tag"], "Fail");
-            assert_eq!(
-                cause[0]["error"]["_tag"], "OrchestrationDispatchCommandError",
-                "the error must be one the method declares, or the client cannot decode it"
-            );
-            cause[0]["error"]["message"]
-                .as_str()
-                .unwrap_or_else(|| panic!("a message: {cause:?}"))
-                .to_string()
-        }
-        other => panic!("expected a typed failure, got {other:?}"),
-    }
+    outcome.expect_declared("OrchestrationDispatchCommandError")["message"]
+        .as_str()
+        .expect("a message")
+        .to_string()
 }
 
 /// The ticket's first line: a folder is added and appears in the project list.

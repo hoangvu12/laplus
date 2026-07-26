@@ -20,12 +20,13 @@
 //! changes to it, [`http`] holds the two plain HTTP answers the UI needs
 //! before it will open a socket at all, [`rpc`] maps a method tag to an
 //! answer, [`subscriptions`] streams the answers that are not a single value,
-//! and [`server`] is the endpoint and the connection loop that ties them
-//! together.
+//! [`filesystem`] reads the disk for the folder picker and the file tree, and
+//! [`server`] is the endpoint and the connection loop that ties them together.
 
 pub mod auth;
 pub mod config;
 pub mod config_store;
+pub mod filesystem;
 pub mod http;
 pub mod orchestration;
 pub mod projects;

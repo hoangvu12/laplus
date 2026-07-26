@@ -385,6 +385,34 @@ impl Outcome {
             other => panic!("expected a success exit, got {other:?}"),
         }
     }
+
+    /// The typed error from a refused call, checked to be one the method
+    /// declares.
+    ///
+    /// The three assertions are the ones every refusal has to pass, and each is
+    /// a distinct way of failing the client. An error that is not `Fail` is not
+    /// a refusal at all; one whose `_tag` is not in the method's declared union
+    /// fails to decode and costs the call; and the message is often the whole
+    /// diagnostic the UI can show, so an absent one leaves the user with
+    /// nothing.
+    pub fn expect_declared(self, tag: &str) -> Value {
+        match self {
+            Outcome::Failure(cause) => {
+                assert_eq!(cause.len(), 1, "one cause entry: {cause:?}");
+                assert_eq!(cause[0]["_tag"], "Fail");
+                assert_eq!(
+                    cause[0]["error"]["_tag"], tag,
+                    "the error must be one the method declares, or the client cannot decode it"
+                );
+                assert!(
+                    cause[0]["error"]["message"].is_string(),
+                    "a refusal owes the user a sentence: {cause:?}"
+                );
+                cause[0]["error"].clone()
+            }
+            other => panic!("expected a typed failure, got {other:?}"),
+        }
+    }
 }
 
 impl SocketClient {

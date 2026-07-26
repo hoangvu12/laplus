@@ -1,20 +1,25 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Four are implemented — the
+//! The vocabulary is roughly sixty methods. Six are implemented — the
 //! configuration the UI fetches before it can do anything else and the
-//! subscription that keeps it current, plus the command that writes the project
-//! registry and the subscription that *is* the project list — and every other
-//! tag lands in the unknown-method path, which is itself part of the contract
-//! and is pinned by a capture.
+//! subscription that keeps it current, the command that writes the project
+//! registry and the subscription that *is* the project list, and the two that
+//! read the disk for the folder picker and the file tree — and every other tag
+//! lands in the unknown-method path, which is itself part of the contract and
+//! is pinned by a capture.
 //!
-//! Nothing in a `Request` says whether the answer will be one value or a
-//! stream of them; that is knowledge the method name carries and the client
-//! already has. [`Answer`] is where the two part company.
+//! Nothing in a `Request` says whether the answer will be one value, a stream
+//! of them, or a value that is not ready yet; that is knowledge the method name
+//! carries and the client already has. [`Answer`] is where the three part
+//! company.
+
+use std::fmt;
 
 use serde_json::Value;
 
 use crate::config_store::ConfigStore;
-use crate::orchestration::{self, CommandError, Shell};
+use crate::filesystem::{self, Browse, ListEntries};
+use crate::orchestration::{self, Shell};
 use crate::subscriptions::EventSource;
 
 /// The tag the UI sends first, and the tag it re-sends as a liveness probe
@@ -40,22 +45,72 @@ pub struct Services {
 /// What a method answers with.
 #[derive(Debug)]
 pub enum Answer {
-    /// One value, one `Exit`. The whole of a unary call.
+    /// One value, one `Exit`. The whole of a unary call, answered from memory.
     Value(Value),
     /// A stream of values, chunked until the client cancels it.
     Stream(EventSource),
+    /// One value, but not yet — work that has to touch the world before it can
+    /// say anything. See [`Deferred`].
+    Deferred(Deferred),
+}
+
+/// A unary answer that has to be produced somewhere other than the read loop.
+///
+/// The connection loop reads frames one at a time and answers each before
+/// taking the next, which is right while every method answers from memory: the
+/// waiting is nil and the ordering is free. Walking a repository of twenty-five
+/// thousand files is not nil. Answering that inline would hold the socket's
+/// only reader for the length of the walk, and the `Ack` that releases a
+/// subscription's next chunk, the `Ping` the UI sends every five seconds, and
+/// every other call the window makes would all queue behind it — the file tree
+/// would arrive and the rest of the app would have stopped.
+///
+/// So the method hands back the work instead of the answer, and
+/// [`crate::server`] runs it on a blocking thread that writes the `Exit`
+/// itself. Correlation on this wire is by `requestId` and never by order, so
+/// answering out of order is not merely tolerable — it is what the reference
+/// server does.
+///
+/// Blocking rather than `async`: this is disk work, and there is no
+/// non-blocking way to enumerate a directory. Pretending otherwise with an
+/// `async` wrapper would move the same stall onto a runtime worker.
+///
+/// `Err` carries the method's own declared error, already in the shape the
+/// client decodes — the same thing [`DispatchError::to_error`] produces, which
+/// is why the two meet at [`ServerMessage::failure`](crate::wire::ServerMessage).
+pub struct Deferred(Box<dyn FnOnce() -> Result<Value, Value> + Send>);
+
+impl Deferred {
+    pub fn new(work: impl FnOnce() -> Result<Value, Value> + Send + 'static) -> Deferred {
+        Deferred(Box::new(work))
+    }
+
+    pub fn run(self) -> Result<Value, Value> {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for Deferred {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Deferred")
+    }
 }
 
 /// Why a call produced no value.
+///
+/// Two cases and not one per method: dispatch has no business enumerating the
+/// error type of every method it routes to. What it needs to distinguish is
+/// "there is no such method", which is the server's own answer, from "the
+/// method answered and the answer was a refusal", which is the method's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchError {
     /// No method is wired to this tag.
     UnknownMethod(String),
     /// The method ran and refused. Unlike [`DispatchError::UnknownMethod`],
-    /// this is an error the method *declares*, so the client decodes it against
-    /// the contract and shows it to the user rather than treating the response
-    /// as broken.
-    Command(CommandError),
+    /// this is an error the method *declares*, already in the shape the client
+    /// decodes against the contract, so it is shown to the user rather than
+    /// treated as a broken response.
+    Declared(Value),
 }
 
 impl DispatchError {
@@ -94,7 +149,7 @@ impl DispatchError {
                 "method": tag,
                 "message": format!("Method not implemented by this server: {tag}"),
             }),
-            DispatchError::Command(error) => error.to_error(),
+            DispatchError::Declared(error) => error.clone(),
         }
     }
 }
@@ -114,8 +169,18 @@ pub fn dispatch(
             .shell
             .dispatch(payload)
             .map(Answer::Value)
-            .map_err(DispatchError::Command),
+            .map_err(|refusal| DispatchError::Declared(refusal.to_error())),
         orchestration::SUBSCRIBE_SHELL => Ok(Answer::Stream(services.shell.subscribe(payload))),
+        // Both filesystem methods read their payload here and do their work
+        // elsewhere. Reading is arithmetic on a string, so a malformed call is
+        // refused immediately rather than after a thread has been found for it;
+        // everything after that is disk.
+        filesystem::BROWSE => Browse::read(payload)
+            .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
+            .map_err(DispatchError::Declared),
+        filesystem::LIST_ENTRIES => ListEntries::read(payload)
+            .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
+            .map_err(DispatchError::Declared),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -169,25 +234,55 @@ mod tests {
         }
     }
 
-    /// A command that the shell refuses fails its own call with the error the
-    /// method declares — not with the unknown-method error, which would tell
-    /// the client the server cannot add projects at all.
+    /// A method that refuses fails its own call with the error *it* declares —
+    /// not with the unknown-method error, which would tell the client the
+    /// server cannot add projects or read directories at all.
     #[test]
-    fn a_refused_command_fails_with_the_methods_own_declared_error() {
+    fn a_refused_call_fails_with_the_methods_own_declared_error() {
         let services = services();
-        let error = dispatch(
-            &services,
-            orchestration::DISPATCH_COMMAND,
-            &json!({"type": "project.create", "projectId": "p", "workspaceRoot": "  "}),
-        )
-        .expect_err("a blank workspace root");
 
-        assert!(matches!(error, DispatchError::Command(_)));
-        assert_eq!(
-            error.to_error()["_tag"],
-            "OrchestrationDispatchCommandError"
-        );
-        assert!(error.to_error()["message"].is_string());
+        for (tag, payload, expected) in [
+            (
+                orchestration::DISPATCH_COMMAND,
+                json!({"type": "project.create", "projectId": "p", "workspaceRoot": "  "}),
+                "OrchestrationDispatchCommandError",
+            ),
+            (filesystem::BROWSE, json!({}), "FilesystemBrowseError"),
+            (
+                filesystem::LIST_ENTRIES,
+                json!({"cwd": "  "}),
+                "ProjectListEntriesError",
+            ),
+        ] {
+            let error = dispatch(&services, tag, &payload).expect_err("a refusal");
+
+            assert!(matches!(error, DispatchError::Declared(_)), "{tag}");
+            assert_eq!(error.to_error()["_tag"], expected, "{tag}");
+            assert!(error.to_error()["message"].is_string(), "{tag}");
+        }
+    }
+
+    /// The two filesystem methods answer with work rather than a value. That is
+    /// the whole of what dispatch decides about them — where the work runs is
+    /// [`crate::server`]'s business.
+    #[test]
+    fn the_filesystem_methods_answer_with_deferred_work() {
+        let services = services();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().to_string_lossy().into_owned();
+
+        for (tag, payload) in [
+            (filesystem::BROWSE, json!({"partialPath": path})),
+            (filesystem::LIST_ENTRIES, json!({"cwd": path})),
+        ] {
+            let answer = dispatch(&services, tag, &payload).expect("dispatches");
+            match answer {
+                Answer::Deferred(work) => {
+                    work.run().unwrap_or_else(|error| panic!("{tag}: {error}"));
+                }
+                other => panic!("{tag} answered with {other:?}"),
+            }
+        }
     }
 
     /// The tag has to survive into the error, because it is the only thing

@@ -162,7 +162,12 @@ pub enum Rejection {
 }
 
 impl Rejection {
-    fn from_io(path: String, error: &std::io::Error) -> Rejection {
+    /// What an `io::Error` about a folder means, said once.
+    ///
+    /// `pub(crate)` for [`crate::filesystem`], which meets the same folder
+    /// going wrong in the same ways one step later — the walk can find a
+    /// workspace root gone that [`WorkspaceRoot::check`] had just opened.
+    pub(crate) fn from_io(path: String, error: &std::io::Error) -> Rejection {
         match error.kind() {
             std::io::ErrorKind::NotFound => Rejection::Missing(path),
             std::io::ErrorKind::PermissionDenied => Rejection::NotReadable(path),
@@ -195,7 +200,12 @@ impl Rejection {
 
 /// `~` and `~/…`, which a user typing a path expects to work and which the
 /// upstream server expands too (`expandHomePath` in its `WorkspacePaths`).
-fn expand_home(path: &str) -> PathBuf {
+///
+/// Shared with [`crate::filesystem`], which meets the same paths one step
+/// earlier — the folder picker is where a user types `~/` in the first place,
+/// and a picker and a registry that disagreed about what it meant would offer a
+/// folder that could not then be added.
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     expand_tilde(path, home_dir())
 }
 

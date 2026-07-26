@@ -19,9 +19,13 @@
 //! does, and a client that assumed otherwise would already be broken against
 //! it.
 //!
-//! Unary calls are still answered inline, in arrival order. Both implemented
-//! methods answer from memory, so there is nothing yet for a call to wait on;
-//! the first method that has to wait is the one that should spawn.
+//! A unary call that answers from memory is still answered inline, in arrival
+//! order — the waiting is nil and the ordering is free. A call that has to wait
+//! on the world is not: it comes back from dispatch as
+//! [`Answer::Deferred`](crate::rpc::Answer) and is run on a blocking thread
+//! that writes its own `Exit`, so the read loop stays free to take the next
+//! frame. Ticket 06's file tree is the first method that needed this, and the
+//! reason is spelled out on [`crate::rpc::Deferred`].
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::ControlFlow;
@@ -41,7 +45,7 @@ use crate::auth::{self, Credential, UpgradeRequest};
 use crate::config::ServerConfig;
 use crate::config_store::ConfigStore;
 use crate::orchestration::Shell;
-use crate::rpc::{Answer, Services};
+use crate::rpc::{Answer, Deferred, Services};
 use crate::store::{Database, StorageError};
 use crate::subscriptions::Subscriptions;
 use crate::wire::{Cause, ClientMessage, Exit, ServerMessage};
@@ -354,6 +358,14 @@ impl Connection {
                         self.subscriptions.start(id, source).await;
                         ControlFlow::Continue(())
                     }
+                    // Off the read loop, on a thread that may block. Nothing is
+                    // written here either — the task answers under the same
+                    // `requestId` whenever it is done, which is what lets the
+                    // client keep talking meanwhile.
+                    Ok(Answer::Deferred(work)) => {
+                        self.defer(id, work);
+                        ControlFlow::Continue(())
+                    }
                     // An `Exit`/`Failure` under the caller's own `requestId`,
                     // *not* the bare `Defect` the reference server sends. A
                     // `Defect` carries no id and the client fails every pending
@@ -400,6 +412,32 @@ impl Connection {
                 ControlFlow::Continue(())
             }
         }
+    }
+
+    /// Run one deferred call on a blocking thread and let it answer itself.
+    ///
+    /// Nothing here tracks the task. It holds a clone of the frame queue and
+    /// nothing else, so when the connection goes the queue closes and the send
+    /// fails; the work then finishes into nowhere and the thread is returned.
+    /// A cancellation is the same story from the other side — an `Interrupt`
+    /// for a unary call is already ignored (see [`Connection::handle`]), and
+    /// the client has dropped the entry, so the late `Exit` lands on an id it
+    /// no longer knows.
+    ///
+    /// The bound on all of that is [`crate::filesystem::MAX_ENTRIES`]: the work
+    /// is finite whether or not anyone is still listening.
+    fn defer(&self, request_id: String, work: Deferred) {
+        let frames = self.frames.clone();
+        tokio::task::spawn_blocking(move || {
+            let message = match work.run() {
+                Ok(value) => ServerMessage::success(request_id, value),
+                Err(error) => ServerMessage::failure(request_id, error),
+            };
+            // `blocking_send` and not `try_send`: a client that is behind
+            // should make this thread wait, not lose its answer. It is a
+            // blocking thread, which is the one place waiting is free.
+            let _ = frames.blocking_send(message.to_frame());
+        });
     }
 
     /// Queue one frame. The send fails only once the writer has gone, which
@@ -552,6 +590,24 @@ mod tests {
             written
         }
 
+        /// Wait for the next frame from the queue, whoever wrote it.
+        ///
+        /// [`Loopback::feed`] drains what is already there, which is right for
+        /// a frame the read loop wrote before returning. A deferred call's
+        /// answer comes from a thread, so the only honest way to read it is to
+        /// wait — with a bound, because "never arrives" is the failure this is
+        /// most likely to catch.
+        async fn next_queued(&mut self) -> serde_json::Value {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.queued.recv(),
+            )
+            .await
+            .expect("a frame arrives within the timeout")
+            .expect("the queue is still open");
+            serde_json::from_str(&frame).expect("valid json")
+        }
+
         /// Feed one frame in and take the single reply it owed.
         async fn reply_to(&mut self, text: &str) -> serde_json::Value {
             let written = self.feed(text).await;
@@ -657,6 +713,32 @@ mod tests {
                 .is_empty(),
             "a second cancellation must not put a second exit on the same id"
         );
+    }
+
+    /// A deferred call owes nothing to the frame the request arrived on. It is
+    /// answered later, under the same `requestId`, by whoever ran it — which is
+    /// the whole mechanism, seen from the read loop's side.
+    #[tokio::test]
+    async fn a_deferred_request_is_answered_by_its_own_task_rather_than_inline() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let mut loopback = Loopback::new();
+
+        let immediate = loopback
+            .feed(&format!(
+                r#"{{"_tag":"Request","id":"9","tag":"projects.listEntries","payload":{{"cwd":{}}},"headers":[]}}"#,
+                json!(directory.path().to_string_lossy())
+            ))
+            .await;
+        assert!(
+            immediate.is_empty(),
+            "the read loop answered inline and was not free to take the next frame: {immediate:#?}"
+        );
+
+        let answer = loopback.next_queued().await;
+        assert_eq!(answer["_tag"], "Exit");
+        assert_eq!(answer["requestId"], "9");
+        assert_eq!(answer["exit"]["_tag"], "Success");
+        assert_eq!(answer["exit"]["value"]["entries"], json!([]));
     }
 
     #[tokio::test]
