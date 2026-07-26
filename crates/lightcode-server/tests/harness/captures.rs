@@ -73,15 +73,7 @@ impl Capture {
     /// carries the same id — the same correlation a real client does, rather
     /// than trusting the order the recording happens to be in.
     pub fn response_to(&self, tag: &str) -> Value {
-        let request_id = self
-            .frames()
-            .find(|(direction, frame)| {
-                *direction == Direction::ClientToServer
-                    && frame["_tag"] == "Request"
-                    && frame["tag"] == tag
-            })
-            .map(|(_, frame)| frame["id"].clone())
-            .unwrap_or_else(|| panic!("no request for {tag} in {}", self.name));
+        let request_id = self.request_id_for(tag);
 
         self.frames()
             .find(|(direction, frame)| {
@@ -91,6 +83,35 @@ impl Capture {
             })
             .map(|(_, frame)| frame)
             .unwrap_or_else(|| panic!("no exit for {tag} in {}", self.name))
+    }
+
+    /// Every `Chunk` the reference server sent for the first call to `tag`,
+    /// in order, as whole frames.
+    ///
+    /// Correlated by `requestId` the same way [`Capture::response_to`] is,
+    /// which matters more here than it does there: a subscription's chunks are
+    /// interleaved with other calls' answers in `01-browser-session.ndjson`.
+    pub fn chunks_to(&self, tag: &str) -> Vec<Value> {
+        let request_id = self.request_id_for(tag);
+        self.frames()
+            .filter(|(direction, frame)| {
+                *direction == Direction::ServerToClient
+                    && frame["_tag"] == "Chunk"
+                    && frame["requestId"] == request_id
+            })
+            .map(|(_, frame)| frame)
+            .collect()
+    }
+
+    fn request_id_for(&self, tag: &str) -> Value {
+        self.frames()
+            .find(|(direction, frame)| {
+                *direction == Direction::ClientToServer
+                    && frame["_tag"] == "Request"
+                    && frame["tag"] == tag
+            })
+            .map(|(_, frame)| frame["id"].clone())
+            .unwrap_or_else(|| panic!("no request for {tag} in {}", self.name))
     }
 
     /// The first frame the server sent with this `_tag`.

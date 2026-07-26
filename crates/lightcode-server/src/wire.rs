@@ -81,9 +81,9 @@ pub enum ServerMessage {
     /// One batch of stream values. `values` is non-empty and **does batch**;
     /// a conforming client iterates it rather than assuming one value.
     ///
-    /// Nothing emits this yet — ticket 04 brings the first subscription — but
-    /// it is part of the vocabulary and is pinned by the fixtures, so it is
-    /// spelled out here with the rest.
+    /// Emitted by [`crate::subscriptions`], which is also where the batching
+    /// policy lives — a batch here is whatever accumulated behind the client's
+    /// outstanding `Ack`.
     Chunk {
         #[serde(rename = "requestId")]
         request_id: String,

@@ -346,16 +346,27 @@ throughout, as `cwd` values the UI genuinely sends.
 Observed but not understood, or not observed at all. Recorded rather than
 guessed at.
 
-1. **What bounds a `Chunk` batch?** Batches of 1 and 2 values were captured. The
-   maximum batch size, and whether it is time- or count-driven, is unknown. A
-   client must handle any size; a server needs a policy and does not have one
-   yet. (The reference server coalesces shell events over a 50 ms / 512-item
-   window — `t3code/apps/server/src/ws.ts` — but no capture exercised the
-   ceiling, so the observed maximum remains 2.)
-2. **How deep is the `Ack` window?** That the server stops at one un-acked chunk
-   is settled (see *`Ack` is load-bearing*). Whether one is the fixed window or
-   simply all this workload produced was not established: no capture generated
-   two changes while an `Ack` was outstanding.
+1. **What bounds a `Chunk` batch?** Still unknown *of the reference server*:
+   batches of 1 and 2 values were captured, and whether its maximum is time- or
+   count-driven was never established. (It coalesces shell events over a 50 ms
+   / 512-item window — `t3code/apps/server/src/ws.ts` — but no capture
+   exercised the ceiling, so the observed maximum remains 2.)
+
+   **lightcode now has a policy, chosen in ticket 04:** a batch is whatever has
+   accumulated behind the outstanding `Ack`, capped at 64 values — so it is
+   count-driven, and the count is the same one that bounds the backlog. Those
+   being the same number is what makes 64 the true maximum: a subscriber that
+   falls further behind than that is sent one fresh snapshot instead of its
+   backlog, so no chunk can ever carry more. See
+   `crates/lightcode-server/src/subscriptions.rs`.
+2. **How deep is the `Ack` window?** That the reference server stops at one
+   un-acked chunk is settled (see *`Ack` is load-bearing*). Whether one is its
+   fixed window or simply all this workload produced was not established: no
+   capture generated two changes while an `Ack` was outstanding.
+
+   **lightcode's window is exactly one**, which is the conservative reading —
+   a client written against a window of one works against any deeper window,
+   and the reverse is not true.
 3. **`Eof`, `ClientEnd` and `ClientProtocolError` were never seen.** The
    `effect/unstable/rpc` vocabulary defines all three. Whether the UI can ever
    provoke them is unknown; the Rust server currently has no reason to emit
@@ -389,6 +400,12 @@ guessed at.
 5. **Does a subscription ever end in `Exit`/`Success`?** Every termination
    captured was client-initiated and came back as `Failure`/`Interrupt`. Natural
    completion of a server-side stream was never observed.
+
+   Still open, and lightcode has not had to answer it: the configuration
+   subscription ticket 04 implements never ends by itself, so every stream it
+   serves ends the captured way. A later subscription that *can* complete —
+   a thread that finishes, a terminal that exits — is where this has to be
+   settled.
 6. **What happens to the user-driven surface?** `01-browser-session.ndjson` is
    the boot sequence only; no capture drives the UI through opening a file,
    starting a thread or running a turn. Nothing in the framing suggests those

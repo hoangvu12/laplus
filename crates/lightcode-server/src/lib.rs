@@ -16,17 +16,21 @@
 //!
 //! Around them: [`auth`] decides whether a socket upgrade may proceed,
 //! [`config`] builds the `server.getConfig` payload the UI fetches before it
-//! can do anything else, [`http`] holds the two plain HTTP answers the UI needs
-//! before it will open a socket at all, [`rpc`] maps a method tag to a
-//! response, and [`server`] is the endpoint and the connection loop that ties
-//! them together.
+//! can do anything else and [`config_store`] holds the one in force plus the
+//! changes to it, [`http`] holds the two plain HTTP answers the UI needs
+//! before it will open a socket at all, [`rpc`] maps a method tag to an
+//! answer, [`subscriptions`] streams the answers that are not a single value,
+//! and [`server`] is the endpoint and the connection loop that ties them
+//! together.
 
 pub mod auth;
 pub mod config;
+pub mod config_store;
 pub mod http;
 pub mod protocol;
 pub mod rpc;
 pub mod server;
+pub mod subscriptions;
 pub mod wire;
 
 pub use server::{Server, ServerState};

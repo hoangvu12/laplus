@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use lightcode_server::config::ServerConfig;
+use lightcode_server::config_store::ConfigChange;
 use lightcode_server::Server;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -88,6 +89,29 @@ impl TestServer {
         }
     }
 
+    /// Subscriptions the server is currently pumping, across every
+    /// connection. The subscription half of [`TestServer::live_connections`],
+    /// and how "resources are released on unsubscribe" is observed from
+    /// outside.
+    pub fn live_subscriptions(&self) -> usize {
+        self.server.state().live_subscriptions()
+    }
+
+    /// Wait for the subscription gauge to reach `expected`, or fail saying
+    /// what it was. Same reasoning as [`TestServer::await_live_connections`]:
+    /// a pump is torn down by its own task, a moment after whatever ended it.
+    pub async fn await_live_subscriptions(&self, expected: usize) {
+        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        while self.live_subscriptions() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live subscriptions stayed at {} instead of settling to {expected}",
+                self.live_subscriptions()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub fn unrecognized_messages(&self) -> usize {
         self.server.state().unrecognized_messages()
     }
@@ -98,7 +122,24 @@ impl TestServer {
 
     /// The config the server will answer `server.getConfig` with.
     pub fn config(&self) -> Value {
-        self.server.state().config().to_value()
+        self.server.state().config().current().to_value()
+    }
+
+    /// Make a server-side configuration change, as a later ticket's provider
+    /// registry or settings writer will. This is the *cause* a subscriber
+    /// observes; nothing about the assertion reaches into the server.
+    pub fn change_config(&self, change: ConfigChange) {
+        self.server.state().config().apply(change);
+    }
+
+    /// A settings change that alters one visible flag. The cheapest real
+    /// change to make, and the one most tests want.
+    pub fn toggle_a_setting(&self) -> bool {
+        let mut settings = self.server.state().config().current().settings.clone();
+        settings.enable_assistant_streaming = !settings.enable_assistant_streaming;
+        let now = settings.enable_assistant_streaming;
+        self.change_config(ConfigChange::Settings(Box::new(settings)));
+        now
     }
 
     /// Connect the way a non-browser client does: a `wsTicket`, no `Origin`.
@@ -358,21 +399,85 @@ impl SocketClient {
 
     /// Wait for the answer to an already-sent request.
     pub async fn await_outcome(&mut self, request_id: &str) -> Outcome {
+        let frame = self.take_frame(|frame| answers(frame, request_id)).await;
+        outcome(frame)
+    }
+
+    /// The next frame matching `wanted`, reading until one arrives.
+    ///
+    /// Frames that do not match are buffered rather than dropped, which is the
+    /// whole reason this exists: the reference server answers concurrent calls
+    /// out of order and interleaves a subscription's chunks with everything
+    /// else the connection is doing, so a client that consumed frames in
+    /// arrival order would lose the ones it was not waiting for.
+    async fn take_frame(&mut self, wanted: impl Fn(&Value) -> bool) -> Value {
         loop {
-            if let Some(index) = self
-                .buffered
-                .iter()
-                .position(|frame| answers(frame, request_id))
-            {
-                return outcome(self.buffered.remove(index));
+            if let Some(index) = self.buffered.iter().position(&wanted) {
+                return self.buffered.remove(index);
             }
 
             let frame = self.recv().await;
-            if answers(&frame, request_id) {
-                return outcome(frame);
+            if wanted(&frame) {
+                return frame;
             }
             self.buffered.push(frame);
         }
+    }
+
+    /// Open a subscription and return its request id.
+    ///
+    /// There is no `subscribe` verb on this wire — a subscription is an
+    /// ordinary `Request` — so this is [`SocketClient::send_request`] under a
+    /// name that says what the caller means.
+    pub async fn subscribe(&mut self, tag: &str, payload: Value) -> String {
+        self.send_request(tag, payload).await
+    }
+
+    /// Acknowledge a chunk, releasing the server to send the next one.
+    ///
+    /// Not optional: the server holds at most one un-acknowledged chunk per
+    /// request, so a test that forgets this simply stops receiving.
+    pub async fn ack(&mut self, request_id: &str) {
+        self.send(json!({"_tag": "Ack", "requestId": request_id})).await;
+    }
+
+    /// Cancel a call. For a subscription this is the unsubscribe.
+    pub async fn interrupt(&mut self, request_id: &str) {
+        self.send(json!({"_tag": "Interrupt", "requestId": request_id}))
+            .await;
+    }
+
+    /// The next frame that concerns `request_id`, whole — a `Chunk` or the
+    /// terminal `Exit`.
+    pub async fn next_frame_for(&mut self, request_id: &str) -> Value {
+        self.take_frame(|frame| concerns(frame, request_id)).await
+    }
+
+    /// The `values` of the next `Chunk` for `request_id`.
+    ///
+    /// Deliberately does **not** acknowledge. `Ack` is load-bearing on this
+    /// wire — the server stops after one un-acknowledged chunk — so a test
+    /// that wants to keep receiving has to say so, the same way the UI does.
+    pub async fn next_chunk(&mut self, request_id: &str) -> Vec<Value> {
+        let frame = self.next_frame_for(request_id).await;
+        assert_eq!(
+            frame["_tag"],
+            json!("Chunk"),
+            "expected a chunk for {request_id}, the stream ended instead: {frame}"
+        );
+        frame["values"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a chunk's values are an array: {frame}"))
+            .clone()
+    }
+
+    /// The single value of the next chunk, acknowledged. `values` genuinely
+    /// batches, so a test that expects one value says so.
+    pub async fn next_event(&mut self, request_id: &str) -> Value {
+        let values = self.next_chunk(request_id).await;
+        self.ack(request_id).await;
+        assert_eq!(values.len(), 1, "expected a single value, got {values:#?}");
+        values.into_iter().next().expect("a value")
     }
 
     /// `Ping` and the `Pong` that answers it.
@@ -427,6 +532,13 @@ impl SocketClient {
     pub async fn close(mut self) {
         let _ = self.socket.close(None).await;
     }
+
+    /// Vanish without a close handshake — a dropped TCP connection, which is
+    /// what a killed browser tab or a lost network looks like from the
+    /// server's side.
+    pub fn abandon(self) {
+        drop(self);
+    }
 }
 
 /// Does this frame answer `request_id`? A `Defect` answers everything, because
@@ -437,6 +549,13 @@ fn answers(frame: &Value, request_id: &str) -> bool {
         Some("Defect") => true,
         _ => false,
     }
+}
+
+/// Is this frame about `request_id` at all — a `Chunk` or an `Exit`?
+fn concerns(frame: &Value, request_id: &str) -> bool {
+    matches!(frame["_tag"].as_str(), Some("Chunk") | Some("Exit"))
+        && frame["requestId"] == json!(request_id)
+        || answers(frame, request_id)
 }
 
 fn outcome(frame: Value) -> Outcome {

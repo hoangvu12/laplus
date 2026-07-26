@@ -1,17 +1,36 @@
-//! Method dispatch: a request tag in, a response value out.
+//! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. This ticket implements one —
-//! `server.getConfig`, the call the UI makes before it can do anything else —
-//! and every other tag lands in the unknown-method path, which is itself part
-//! of the contract and is pinned by a capture.
+//! The vocabulary is roughly sixty methods. Two are implemented — the
+//! configuration the UI fetches before it can do anything else, and the
+//! subscription that keeps it current — and every other tag lands in the
+//! unknown-method path, which is itself part of the contract and is pinned by
+//! a capture.
+//!
+//! Nothing in a `Request` says whether the answer will be one value or a
+//! stream of them; that is knowledge the method name carries and the client
+//! already has. [`Answer`] is where the two part company.
 
 use serde_json::Value;
 
-use crate::config::ServerConfig;
+use crate::config_store::ConfigStore;
+use crate::subscriptions::EventSource;
 
 /// The tag the UI sends first, and the tag it re-sends as a liveness probe
 /// when the server does not advertise `connectionProbe`.
 pub const SERVER_GET_CONFIG: &str = "server.getConfig";
+
+/// The configuration subscription — the simplest of the eight the UI opens,
+/// and the one ticket 04 proves the streaming mechanism on.
+pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
+
+/// What a method answers with.
+#[derive(Debug)]
+pub enum Answer {
+    /// One value, one `Exit`. The whole of a unary call.
+    Value(Value),
+    /// A stream of values, chunked until the client cancels it.
+    Stream(EventSource),
+}
 
 /// Why a call produced no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,11 +81,18 @@ impl DispatchError {
 
 /// Answer one call.
 ///
-/// Takes the config directly rather than the whole server state because that
-/// is all any implemented method reads today. Later tickets widen it.
-pub fn dispatch(config: &ServerConfig, tag: &str, _payload: &Value) -> Result<Value, DispatchError> {
+/// Takes the configuration store rather than the whole server state because
+/// that is all any implemented method reads today. Later tickets widen it.
+pub fn dispatch(
+    config: &ConfigStore,
+    tag: &str,
+    _payload: &Value,
+) -> Result<Answer, DispatchError> {
     match tag {
-        SERVER_GET_CONFIG => Ok(config.to_value()),
+        SERVER_GET_CONFIG => Ok(Answer::Value(config.current().to_value())),
+        // The payload is an empty struct in the contract, so there is nothing
+        // to read out of it and nothing that can be wrong with it.
+        SUBSCRIBE_SERVER_CONFIG => Ok(Answer::Stream(config.subscribe())),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -74,30 +100,51 @@ pub fn dispatch(config: &ServerConfig, tag: &str, _payload: &Value) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
     use serde_json::json;
+
+    fn store() -> ConfigStore {
+        ConfigStore::new(ServerConfig::detect())
+    }
+
+    fn value(answer: Answer) -> Value {
+        match answer {
+            Answer::Value(value) => value,
+            other => panic!("expected a unary answer, got {other:?}"),
+        }
+    }
 
     #[test]
     fn get_config_returns_the_config() {
-        let config = ServerConfig::detect();
-        let value = dispatch(&config, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
-        assert_eq!(value, config.to_value());
+        let config = store();
+        let answer = dispatch(&config, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
+        assert_eq!(value(answer), config.current().to_value());
     }
 
     /// The client re-sends `server.getConfig` as its liveness probe, so a
     /// second call has to answer identically rather than consume anything.
     #[test]
     fn get_config_is_repeatable() {
-        let config = ServerConfig::detect();
+        let config = store();
         let first = dispatch(&config, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
         let second = dispatch(&config, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
-        assert_eq!(first, second);
+        assert_eq!(value(first), value(second));
+    }
+
+    /// A subscription is dispatched by the same path as a unary call and only
+    /// parts company at the answer.
+    #[test]
+    fn the_configuration_subscription_answers_with_a_stream() {
+        let config = store();
+        let answer = dispatch(&config, SUBSCRIBE_SERVER_CONFIG, &json!({})).expect("dispatches");
+        assert!(matches!(answer, Answer::Stream(_)));
     }
 
     /// The tag has to survive into the error, because it is the only thing
     /// that tells a developer which of the sixty methods is missing.
     #[test]
     fn an_unknown_tag_becomes_a_typed_error_naming_the_method() {
-        let config = ServerConfig::detect();
+        let config = store();
         let error = dispatch(&config, "orchestration.subscribeShell", &json!({}))
             .expect_err("not implemented");
         assert_eq!(

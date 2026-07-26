@@ -112,11 +112,13 @@ const MISSING: &[Declared] = &[
     },
     Declared {
         path: "/shellResumeCompletionMarker",
-        because: "no shell subscription until ticket 04, so no catch-up marker to advertise",
+        because: "ticket 04 streams the configuration only; the shell subscription \
+                  and its catch-up marker belong to the orchestration tickets",
     },
     Declared {
         path: "/threadResumeCompletionMarker",
-        because: "no thread subscription until ticket 04, so no catch-up marker to advertise",
+        because: "ticket 04 streams the configuration only; the thread subscription \
+                  and its catch-up marker belong to the orchestration tickets",
     },
 ];
 
@@ -158,6 +160,107 @@ const UNCOMPARED: &[Declared] = &[
         because: "empty in the capture too — no custom models were configured",
     },
 ];
+
+/// The whole subscription lifecycle, frame by frame, against
+/// `04-streaming-subscription.ndjson` — the minimal recording of one: request,
+/// chunk, acknowledgement, interrupt, terminal exit.
+///
+/// The captured subscription is `subscribeTerminalMetadata`, which lightcode
+/// does not implement; what is compared is the *framing*, which is the same
+/// for every subscription on this wire and is the thing ticket 04 exists to
+/// prove. The payload inside the chunk is the next test's business.
+#[tokio::test]
+async fn the_subscription_lifecycle_matches_the_capture() {
+    let capture = Capture::load("04-streaming-subscription");
+    let captured_chunk = capture.server_frame("Chunk");
+    let captured_exit = capture.server_frame("Exit");
+
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let subscription = client.subscribe("subscribeServerConfig", json!({})).await;
+    let live_chunk = client.next_frame_for(&subscription).await;
+    client.ack(&subscription).await;
+    client.interrupt(&subscription).await;
+    let live_exit = client.next_frame_for(&subscription).await;
+
+    // The capture's client and ours both open their subscription on id "0".
+    assert_eq!(captured_chunk["requestId"], json!("0"));
+    assert_eq!(live_chunk["requestId"], captured_chunk["requestId"]);
+    assert_eq!(live_exit["requestId"], captured_exit["requestId"]);
+
+    // No key beyond the ones the capture shows, either frame.
+    assert_eq!(keys(&live_chunk), keys(&captured_chunk));
+    assert_eq!(keys(&live_chunk), vec!["_tag", "requestId", "values"]);
+    assert_eq!(keys(&live_exit), keys(&captured_exit));
+
+    // Values batch — a client iterates them — and the capture's one chunk
+    // carried a single value, as ours does here.
+    assert_eq!(live_chunk["values"].as_array().map(Vec::len), Some(1));
+
+    // A client-initiated unsubscribe ends as a *failure* with an interrupt
+    // cause, not a success. The `fiberId` differs — it names a runtime object
+    // on the machine that produced it — but its type does not.
+    assert_eq!(live_exit["exit"]["_tag"], captured_exit["exit"]["_tag"]);
+    assert_eq!(live_exit["exit"]["_tag"], json!("Failure"));
+    let live_cause = &live_exit["exit"]["cause"];
+    let captured_cause = &captured_exit["exit"]["cause"];
+    assert_eq!(live_cause.as_array().map(Vec::len), Some(1));
+    assert_eq!(keys(&live_cause[0]), keys(&captured_cause[0]));
+    assert_eq!(live_cause[0]["_tag"], captured_cause[0]["_tag"]);
+    assert_eq!(live_cause[0]["_tag"], json!("Interrupt"));
+    assert!(live_cause[0]["fiberId"].is_u64() && captured_cause[0]["fiberId"].is_u64());
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// The `subscribeServerConfig` snapshot, against the one the reference server
+/// pushed to the real UI during its boot sequence.
+///
+/// The config inside diverges exactly as `server.getConfig` does — it is the
+/// same payload — so the declared lists above are reused rather than
+/// duplicated. That is the point: if a later ticket fills `providers` in one
+/// place and not the other, one of these two tests fails.
+#[tokio::test]
+async fn the_config_snapshot_chunk_conforms_to_the_capture() {
+    let capture = Capture::load("01-browser-session");
+    let chunks = capture.chunks_to("subscribeServerConfig");
+    assert_eq!(chunks.len(), 1, "the boot capture holds one config chunk");
+    let captured = &chunks[0]["values"][0];
+
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    let subscription = client.subscribe("subscribeServerConfig", json!({})).await;
+    let live = client.next_event(&subscription).await;
+
+    // The envelope around the config: the client dispatches on `type` and
+    // refuses a `version` it does not know.
+    assert_eq!(live["version"], captured["version"]);
+    assert_eq!(live["type"], captured["type"]);
+    assert_eq!(live["type"], json!("snapshot"));
+    assert_eq!(keys(&live), keys(captured));
+
+    let differences = compare(&captured["config"], &live["config"]);
+    assert_declared("missing fields", &differences.missing, MISSING);
+    assert_declared("added fields", &differences.added, ADDED);
+    assert_declared("retyped fields", &differences.retyped, RETYPED);
+    assert_declared("uncompared arrays", &differences.uncompared, UNCOMPARED);
+
+    client.close().await;
+    server.stop().await;
+}
+
+fn keys(value: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("an object, got {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    keys
+}
 
 /// The keepalive, which the UI sends every ~5 s for the life of the
 /// connection. Byte-for-byte, because there is nothing in it that could

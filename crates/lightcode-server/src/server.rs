@@ -6,14 +6,26 @@
 //! handshake either: the socket opens and the client's first frame is already
 //! a `Request`.
 //!
-//! Requests are answered in arrival order. The protocol does not require that
-//! (correlation is by `requestId`, and the reference server genuinely answers
-//! out of order), it is simply what a single implemented method needs. The
-//! first method that has to wait on something is the one that should make this
-//! concurrent.
+//! A connection is three parts, and the split is what streaming needs:
+//!
+//! - a **read loop**, which owns the incoming half and the subscription
+//!   registry, and is the only thing that touches either;
+//! - a **frame queue**, which everything writes into;
+//! - a **writer task**, which owns the outgoing half and drains the queue.
+//!
+//! The sink has one owner because a subscription's pump and the read loop both
+//! produce frames. Correlation is by `requestId` rather than by order, so
+//! interleaving them is not merely tolerable — it is what the reference server
+//! does, and a client that assumed otherwise would already be broken against
+//! it.
+//!
+//! Unary calls are still answered inline, in arrival order. Both implemented
+//! methods answer from memory, so there is nothing yet for a call to wait on;
+//! the first method that has to wait is the one that should spawn.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -23,38 +35,57 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::auth::{self, Credential, UpgradeRequest};
 use crate::config::ServerConfig;
+use crate::config_store::ConfigStore;
+use crate::subscriptions::Subscriptions;
+use crate::wire::{Cause, ClientMessage, Exit, ServerMessage};
 use crate::{http, rpc};
-use crate::wire::{ClientMessage, ServerMessage};
+use crate::rpc::Answer;
+
+/// How many frames may be waiting for the socket before whoever produced them
+/// has to wait too.
+///
+/// This is the second half of the bound on a slow client. The first is
+/// [`crate::subscriptions::BACKLOG`], which caps what one subscription will
+/// hold; this caps what the connection will hold across all of them. A pump
+/// blocked here is simply not producing, which is the correct response to a
+/// client that is not reading.
+const FRAME_QUEUE: usize = 64;
 
 /// Everything a connection can read. One instance, shared by every socket.
 #[derive(Debug)]
 pub struct ServerState {
-    config: ServerConfig,
+    config: ConfigStore,
     /// Flipped once when the server is asked to stop. Open sockets watch it,
     /// because `axum`'s graceful shutdown waits for connections to end and a
     /// long-lived socket never would on its own.
     shutdown: watch::Receiver<bool>,
     live_connections: AtomicUsize,
+    /// Shared with every connection's registry rather than owned by it, so
+    /// the number is the server's and not one socket's.
+    live_subscriptions: Arc<AtomicUsize>,
+    fiber_ids: AtomicU64,
     unrecognized_messages: AtomicUsize,
     unparseable_frames: AtomicUsize,
 }
 
 impl ServerState {
-    fn new(config: ServerConfig, shutdown: watch::Receiver<bool>) -> Self {
+    fn new(config: ConfigStore, shutdown: watch::Receiver<bool>) -> Self {
         ServerState {
             config,
             shutdown,
             live_connections: AtomicUsize::new(0),
+            live_subscriptions: Arc::new(AtomicUsize::new(0)),
+            fiber_ids: AtomicU64::new(1),
             unrecognized_messages: AtomicUsize::new(0),
             unparseable_frames: AtomicUsize::new(0),
         }
     }
 
-    pub fn config(&self) -> &ServerConfig {
+    pub fn config(&self) -> &ConfigStore {
         &self.config
     }
 
@@ -63,6 +94,29 @@ impl ServerState {
     /// and it is the number to look at when the app feels stuck.
     pub fn live_connections(&self) -> usize {
         self.live_connections.load(Ordering::Relaxed)
+    }
+
+    /// Subscriptions currently being pumped, across every connection. The
+    /// streaming half of the same accounting: a subscription outlives the call
+    /// that opened it, so this is where a stream that was never released shows
+    /// up.
+    pub fn live_subscriptions(&self) -> usize {
+        self.live_subscriptions.load(Ordering::Relaxed)
+    }
+
+    fn subscription_gauge(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.live_subscriptions)
+    }
+
+    /// The id to name in an `Interrupt` cause.
+    ///
+    /// The reference server puts a real runtime fiber id here (2494, 1836 in
+    /// the captures). lightcode has no fibers, so this is the nearest true
+    /// thing: a distinct number per cancelled call, which is what a fiber id
+    /// is from the client's side. The client decodes it and does not act on
+    /// it — the `_tag` is what tells it the stream ended normally.
+    fn next_fiber_id(&self) -> u64 {
+        self.fiber_ids.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Frames whose `_tag` this build does not know. The socket's half of the
@@ -103,7 +157,10 @@ impl Server {
 
     pub async fn bind_with(port: u16, config: ServerConfig) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
-        let state = Arc::new(ServerState::new(config, shutdown.subscribe()));
+        let state = Arc::new(ServerState::new(
+            ConfigStore::new(config),
+            shutdown.subscribe(),
+        ));
 
         let app = Router::new()
             .route("/ws", get(upgrade))
@@ -168,11 +225,13 @@ impl Server {
 }
 
 async fn environment_descriptor(State(state): State<Arc<ServerState>>) -> Response {
-    Json(http::environment_descriptor(state.config()).clone()).into_response()
+    let config = state.config().current();
+    Json(http::environment_descriptor(&config).clone()).into_response()
 }
 
 async fn auth_session(State(state): State<Arc<ServerState>>) -> Response {
-    Json(http::auth_session_state(state.config()).to_value()).into_response()
+    let config = state.config().current();
+    Json(http::auth_session_state(&config).to_value()).into_response()
 }
 
 async fn upgrade(
@@ -208,83 +267,176 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// One connection's state, minus the socket: what it is streaming, and where
+/// its frames go.
+///
+/// Separating it from the socket is what lets the frame vocabulary be driven
+/// without one — see this module's tests — and it keeps the three things that
+/// every frame needs from travelling as three arguments.
+struct Connection {
+    state: Arc<ServerState>,
+    subscriptions: Subscriptions,
+    frames: mpsc::Sender<String>,
+}
+
+impl Connection {
+    fn new(state: Arc<ServerState>, frames: mpsc::Sender<String>) -> Connection {
+        let subscriptions = Subscriptions::new(state.subscription_gauge(), frames.clone());
+        Connection {
+            state,
+            subscriptions,
+            frames,
+        }
+    }
+
+    /// Handle one text frame, writing whatever it owes the client into the
+    /// frame queue. Breaks only when the connection is gone.
+    async fn handle(&mut self, text: &str) -> ControlFlow<()> {
+        let message = match ClientMessage::parse(text) {
+            Ok(message) => message,
+            Err(error) => {
+                self.state.unparseable_frames.fetch_add(1, Ordering::Relaxed);
+                eprintln!("lightcode: unparseable socket frame: {error}");
+                return ControlFlow::Continue(());
+            }
+        };
+
+        match message {
+            ClientMessage::Request { id, tag, payload } => {
+                match rpc::dispatch(self.state.config(), &tag, &payload) {
+                    Ok(Answer::Value(value)) => self.send(ServerMessage::success(id, value)).await,
+                    // A subscription's first chunk comes from its own task, so
+                    // there is nothing to write here. The `Request` is answered
+                    // eventually — by the terminal `Exit` when it ends.
+                    Ok(Answer::Stream(source)) => {
+                        self.subscriptions.start(id, source).await;
+                        ControlFlow::Continue(())
+                    }
+                    // An `Exit`/`Failure` under the caller's own `requestId`,
+                    // *not* the bare `Defect` the reference server sends. A
+                    // `Defect` carries no id and the client fails every pending
+                    // request and open subscription on the socket when it sees
+                    // one — see `DispatchError::to_error` for the evidence and
+                    // the reasoning.
+                    Err(error) => {
+                        self.send(ServerMessage::failure(id, error.to_error()))
+                            .await
+                    }
+                }
+            }
+            ClientMessage::Ping => self.send(ServerMessage::Pong).await,
+            // Back-pressure: release the pump to send its next chunk. Silent,
+            // and silent for an id nothing is streaming.
+            ClientMessage::Ack { request_id } => {
+                self.subscriptions.acknowledge(&request_id);
+                ControlFlow::Continue(())
+            }
+            ClientMessage::Interrupt { request_id } => {
+                if self.subscriptions.interrupt(&request_id).await {
+                    // A client-initiated unsubscribe ends as a *failure* with
+                    // an interrupt cause rather than a success — the captured
+                    // behaviour, which a client reads as a normal end.
+                    let exit = Exit::Failure {
+                        cause: vec![Cause::Interrupt {
+                            fiber_id: self.state.next_fiber_id(),
+                        }],
+                    };
+                    self.send(ServerMessage::Exit { request_id, exit }).await
+                } else {
+                    // Cancelling something that is not streaming: a unary call
+                    // that has already been answered, or a cancellation that
+                    // lost a race with the stream's own end. Ordinary traffic,
+                    // and answering it would put a second `Exit` on an id that
+                    // already has one.
+                    ControlFlow::Continue(())
+                }
+            }
+            ClientMessage::Unrecognized => {
+                self.state
+                    .unrecognized_messages
+                    .fetch_add(1, Ordering::Relaxed);
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    /// Queue one frame. The send fails only once the writer has gone, which
+    /// means the socket has.
+    async fn send(&self, message: ServerMessage) -> ControlFlow<()> {
+        match self.frames.send(message.to_frame()).await {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
+        }
+    }
+
+    /// Release everything this connection holds, in the order that matters.
+    ///
+    /// Stopping the pumps first means no chunk can be queued behind the close
+    /// frame; dropping the last sender afterwards is what tells the writer
+    /// there is nothing more coming, and a pump still holding a clone would
+    /// leave it waiting forever.
+    async fn close(self) {
+        self.subscriptions.shutdown().await;
+        drop(self.frames);
+    }
+}
+
 async fn connection(socket: WebSocket, state: Arc<ServerState>, credential: Credential) {
     let _live = LiveConnection::open(&state);
     let _ = credential; // recorded at the upgrade; nothing verifies it in v1.
 
     let mut shutdown = state.shutdown.clone();
     let (mut outgoing, mut incoming) = socket.split();
+    let (frames, mut queued) = mpsc::channel::<String>(FRAME_QUEUE);
+
+    // One owner for the sink, because the read loop and every subscription
+    // pump produce frames for it.
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = queued.recv().await {
+            if outgoing.send(Message::Text(frame.into())).await.is_err() {
+                return;
+            }
+        }
+        // The queue closes when the read loop has finished and released every
+        // pump. A close frame here is redundant if the client left first and
+        // fails harmlessly if it did; it is the courtesy that matters when the
+        // *server* is the one stopping.
+        let _ = outgoing.send(Message::Close(None)).await;
+    });
+
+    let mut connection = Connection::new(Arc::clone(&state), frames);
 
     loop {
         let frame = tokio::select! {
-            _ = shutdown.changed() => {
-                let _ = outgoing.send(Message::Close(None)).await;
-                break;
-            }
+            _ = shutdown.changed() => break,
             frame = incoming.next() => frame,
         };
 
         let frame = match frame {
             Some(Ok(frame)) => frame,
             // A reset connection is how a closing browser tab often looks.
-            // Nothing to report and nothing to clean up but this task.
+            // Nothing to report, and the cleanup below is the same either way.
             Some(Err(_)) | None => break,
         };
 
-        let reply = match frame {
-            Message::Text(text) => handle_frame(&state, text.as_str()),
+        match frame {
+            Message::Text(text) => {
+                if connection.handle(text.as_str()).await.is_break() {
+                    break;
+                }
+            }
             Message::Close(_) => break,
             // Every captured frame was text; the vocabulary has no binary
             // member. Ignore rather than close, so a stray frame is not fatal.
-            Message::Binary(_) => None,
+            Message::Binary(_) => {}
             // WebSocket-level control frames. Distinct from the JSON `Ping`
             // the UI sends every ~5 s, and answered by the library.
-            Message::Ping(_) | Message::Pong(_) => None,
-        };
-
-        if let Some(reply) = reply {
-            if outgoing.send(Message::Text(reply.into())).await.is_err() {
-                break;
-            }
+            Message::Ping(_) | Message::Pong(_) => {}
         }
     }
-}
 
-/// Handle one text frame. `None` means "nothing to say", which is the right
-/// answer for `Ack` and `Interrupt` while no method streams.
-fn handle_frame(state: &ServerState, text: &str) -> Option<String> {
-    let message = match ClientMessage::parse(text) {
-        Ok(message) => message,
-        Err(error) => {
-            state.unparseable_frames.fetch_add(1, Ordering::Relaxed);
-            eprintln!("lightcode: unparseable socket frame: {error}");
-            return None;
-        }
-    };
-
-    match message {
-        ClientMessage::Request { id, tag, payload } => {
-            Some(match rpc::dispatch(state.config(), &tag, &payload) {
-                Ok(value) => ServerMessage::success(id, value).to_frame(),
-                // An `Exit`/`Failure` under the caller's own `requestId`,
-                // *not* the bare `Defect` the reference server sends. A
-                // `Defect` carries no id and the client fails every pending
-                // request and open subscription on the socket when it sees
-                // one — see `DispatchError::to_error` for the evidence and
-                // the reasoning.
-                Err(error) => ServerMessage::failure(id, error.to_error()).to_frame(),
-            })
-        }
-        ClientMessage::Ping => Some(ServerMessage::Pong.to_frame()),
-        // Back-pressure and cancellation for streams. Nothing streams yet, so
-        // an `Ack` has nothing to release and an `Interrupt` has nothing to
-        // cancel. Both are still normal traffic and must not be errors.
-        ClientMessage::Ack { .. } | ClientMessage::Interrupt { .. } => None,
-        ClientMessage::Unrecognized => {
-            state.unrecognized_messages.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
+    connection.close().await;
+    let _ = writer.await;
 }
 
 /// Keeps the live-connection gauge honest whichever way the loop exits —
@@ -311,71 +463,187 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn state() -> ServerState {
-        ServerState::new(ServerConfig::detect(), watch::channel(false).1)
+    /// The real [`Connection`] with the socket taken off the end: frames go in
+    /// as text and come back out of the queue.
+    ///
+    /// The streaming behaviour is not tested here — a pump writes from its own
+    /// task, so reading the queue immediately afterwards would be a race, and
+    /// `tests/socket_streaming.rs` drives it through a real socket where the
+    /// waiting is honest. What is left here is the frame-by-frame vocabulary,
+    /// which is worth having fast and precise.
+    struct Loopback {
+        connection: Connection,
+        queued: mpsc::Receiver<String>,
     }
 
-    #[test]
-    fn a_request_for_an_implemented_method_is_answered_with_a_success_exit() {
-        let state = state();
-        let reply = handle_frame(
-            &state,
-            r#"{"_tag":"Request","id":"7","tag":"server.getConfig","payload":{},"headers":[]}"#,
-        )
-        .expect("a reply");
+    impl Loopback {
+        fn new() -> Loopback {
+            let state = Arc::new(ServerState::new(
+                ConfigStore::new(ServerConfig::detect()),
+                watch::channel(false).1,
+            ));
+            let (frames, queued) = mpsc::channel(FRAME_QUEUE);
+            Loopback {
+                connection: Connection::new(state, frames),
+                queued,
+            }
+        }
 
-        let value: serde_json::Value = serde_json::from_str(&reply).expect("valid json");
-        assert_eq!(value["_tag"], "Exit");
-        assert_eq!(value["requestId"], "7");
-        assert_eq!(value["exit"]["_tag"], "Success");
-        assert_eq!(value["exit"]["value"], state.config().to_value());
+        fn state(&self) -> &ServerState {
+            &self.connection.state
+        }
+
+        /// Feed one frame in and take everything it wrote back.
+        async fn feed(&mut self, text: &str) -> Vec<serde_json::Value> {
+            let flow = self.connection.handle(text).await;
+            assert!(flow.is_continue(), "the connection was dropped on {text}");
+
+            let mut written = Vec::new();
+            while let Ok(frame) = self.queued.try_recv() {
+                written.push(serde_json::from_str(&frame).expect("valid json"));
+            }
+            written
+        }
+
+        /// Feed one frame in and take the single reply it owed.
+        async fn reply_to(&mut self, text: &str) -> serde_json::Value {
+            let written = self.feed(text).await;
+            assert_eq!(written.len(), 1, "expected one reply, got {written:#?}");
+            written.into_iter().next().expect("a reply")
+        }
+
+        /// Feed one frame in and take the single `Exit` it produced.
+        ///
+        /// Unlike [`Loopback::reply_to`] this tolerates a chunk arriving
+        /// alongside: a pump writes when it is scheduled, so which of two
+        /// frames a snapshot lands behind is genuinely not determined. That it
+        /// is exactly one `Exit` is.
+        async fn exit_from(&mut self, text: &str) -> serde_json::Value {
+            let written = self.feed(text).await;
+            let exits: Vec<serde_json::Value> = written
+                .iter()
+                .filter(|frame| frame["_tag"] == "Exit")
+                .cloned()
+                .collect();
+            assert_eq!(exits.len(), 1, "expected one exit, got {written:#?}");
+            exits.into_iter().next().expect("an exit")
+        }
     }
 
-    #[test]
-    fn ping_is_answered_with_pong() {
+    #[tokio::test]
+    async fn a_request_for_an_implemented_method_is_answered_with_a_success_exit() {
+        let mut loopback = Loopback::new();
+        let reply = loopback
+            .reply_to(
+                r#"{"_tag":"Request","id":"7","tag":"server.getConfig","payload":{},"headers":[]}"#,
+            )
+            .await;
+
+        assert_eq!(reply["_tag"], "Exit");
+        assert_eq!(reply["requestId"], "7");
+        assert_eq!(reply["exit"]["_tag"], "Success");
         assert_eq!(
-            handle_frame(&state(), r#"{"_tag":"Ping"}"#).as_deref(),
-            Some(r#"{"_tag":"Pong"}"#)
+            reply["exit"]["value"],
+            loopback.state().config().current().to_value()
         );
     }
 
-    #[test]
-    fn ack_and_interrupt_are_accepted_silently() {
-        let state = state();
-        assert!(handle_frame(&state, r#"{"_tag":"Ack","requestId":"1"}"#).is_none());
-        assert!(handle_frame(&state, r#"{"_tag":"Interrupt","requestId":"1"}"#).is_none());
-        assert_eq!(state.unrecognized_messages(), 0);
-        assert_eq!(state.unparseable_frames(), 0);
+    #[tokio::test]
+    async fn ping_is_answered_with_pong() {
+        let mut loopback = Loopback::new();
+        assert_eq!(
+            loopback.reply_to(r#"{"_tag":"Ping"}"#).await,
+            json!({"_tag": "Pong"})
+        );
     }
 
-    #[test]
-    fn an_unrecognised_frame_is_counted_rather_than_answered() {
-        let state = state();
-        assert!(handle_frame(&state, r#"{"_tag":"Eof","requestId":"0"}"#).is_none());
-        assert_eq!(state.unrecognized_messages(), 1);
-        assert_eq!(state.unparseable_frames(), 0);
+    /// Neither is an error, and neither owes the client a frame when there is
+    /// no stream behind the id.
+    #[tokio::test]
+    async fn ack_and_interrupt_for_nothing_are_accepted_silently() {
+        let mut loopback = Loopback::new();
+        assert!(loopback
+            .feed(r#"{"_tag":"Ack","requestId":"1"}"#)
+            .await
+            .is_empty());
+        assert!(loopback
+            .feed(r#"{"_tag":"Interrupt","requestId":"1"}"#)
+            .await
+            .is_empty());
+        assert_eq!(loopback.state().unrecognized_messages(), 0);
+        assert_eq!(loopback.state().unparseable_frames(), 0);
     }
 
-    #[test]
-    fn a_malformed_frame_is_counted_rather_than_answered() {
-        let state = state();
-        assert!(handle_frame(&state, "{not json").is_none());
-        assert_eq!(state.unparseable_frames(), 1);
-        assert_eq!(state.unrecognized_messages(), 0);
+    /// A subscription is answered by its own task, so the request itself is
+    /// silent — and the registry, not the reply, is where it shows up.
+    #[tokio::test]
+    async fn a_subscription_request_is_registered_rather_than_answered() {
+        let mut loopback = Loopback::new();
+        let written = loopback
+            .feed(
+                r#"{"_tag":"Request","id":"3","tag":"subscribeServerConfig","payload":{},"headers":[]}"#,
+            )
+            .await;
+
+        assert!(
+            written.iter().all(|frame| frame["_tag"] == "Chunk"),
+            "a subscription owes no immediate reply, only chunks: {written:#?}"
+        );
+        assert_eq!(loopback.connection.subscriptions.len(), 1);
+        assert_eq!(loopback.state().live_subscriptions(), 1);
+
+        // And cancelling it produces the terminal exit, once.
+        let exit = loopback
+            .exit_from(r#"{"_tag":"Interrupt","requestId":"3"}"#)
+            .await;
+        assert_eq!(exit["_tag"], "Exit");
+        assert_eq!(exit["requestId"], "3");
+        assert_eq!(exit["exit"]["_tag"], "Failure");
+        assert_eq!(exit["exit"]["cause"][0]["_tag"], "Interrupt");
+        assert!(exit["exit"]["cause"][0]["fiberId"].is_u64());
+        assert_eq!(loopback.state().live_subscriptions(), 0);
+
+        assert!(
+            loopback
+                .feed(r#"{"_tag":"Interrupt","requestId":"3"}"#)
+                .await
+                .is_empty(),
+            "a second cancellation must not put a second exit on the same id"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_frame_is_counted_rather_than_answered() {
+        let mut loopback = Loopback::new();
+        assert!(loopback
+            .feed(r#"{"_tag":"Eof","requestId":"0"}"#)
+            .await
+            .is_empty());
+        assert_eq!(loopback.state().unrecognized_messages(), 1);
+        assert_eq!(loopback.state().unparseable_frames(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_frame_is_counted_rather_than_answered() {
+        let mut loopback = Loopback::new();
+        assert!(loopback.feed("{not json").await.is_empty());
+        assert_eq!(loopback.state().unparseable_frames(), 1);
+        assert_eq!(loopback.state().unrecognized_messages(), 0);
     }
 
     /// The failure has to arrive under the caller's `requestId`, so it fails
     /// one call rather than the whole session.
-    #[test]
-    fn an_unimplemented_method_fails_only_its_own_request() {
-        let reply = handle_frame(
-            &state(),
-            r#"{"_tag":"Request","id":"1","tag":"no.such.method","payload":{},"headers":[]}"#,
-        )
-        .expect("a reply");
+    #[tokio::test]
+    async fn an_unimplemented_method_fails_only_its_own_request() {
+        let mut loopback = Loopback::new();
+        let reply = loopback
+            .reply_to(
+                r#"{"_tag":"Request","id":"1","tag":"no.such.method","payload":{},"headers":[]}"#,
+            )
+            .await;
 
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&reply).expect("valid json"),
+            reply,
             json!({
                 "_tag": "Exit",
                 "requestId": "1",
@@ -392,5 +660,28 @@ mod tests {
                 },
             })
         );
+    }
+
+    /// Each cancelled call gets its own id, the way a fiber id is distinct per
+    /// fiber. Nothing depends on the value, but a constant would be a lie
+    /// about what it names.
+    #[tokio::test]
+    async fn each_cancellation_names_a_distinct_fiber() {
+        let mut loopback = Loopback::new();
+        let mut seen = Vec::new();
+
+        for id in ["0", "1"] {
+            loopback
+                .feed(&format!(
+                    r#"{{"_tag":"Request","id":"{id}","tag":"subscribeServerConfig","payload":{{}},"headers":[]}}"#
+                ))
+                .await;
+            let exit = loopback
+                .exit_from(&format!(r#"{{"_tag":"Interrupt","requestId":"{id}"}}"#))
+                .await;
+            seen.push(exit["exit"]["cause"][0]["fiberId"].clone());
+        }
+
+        assert_ne!(seen[0], seen[1]);
     }
 }
