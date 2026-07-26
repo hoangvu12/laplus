@@ -1,0 +1,25 @@
+{
+  "session_id": "63e5dcd4-771f-4892-9a41-90e1761faa52",
+  "model": "claude-opus-5[1m]",
+  "cwd": "C:\\Users\\ADMIN\\Desktop\\nguyenvu\\lightcode",
+  "permission_mode": "default",
+  "tool_count": 32,
+  "transcript": [
+    {
+      "role": "assistant",
+      "text": "hello",
+      "from_deltas": false
+    }
+  ],
+  "live_text": "",
+  "streaming": false,
+  "last_result": {
+    "is_error": false,
+    "stop_reason": "end_turn",
+    "num_turns": 1,
+    "duration_ms": 1958,
+    "total_cost_usd": 0.079322
+  },
+  "unknown_events": 0,
+  "parse_errors": 0
+}

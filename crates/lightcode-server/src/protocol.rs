@@ -1,20 +1,20 @@
 //! The `claude` CLI stdio wire format, as a pure module.
 //!
-//! THE QUESTION THIS ANSWERS (see ../README.md): does the `claude` CLI's
-//! stdio protocol bend to Rust cleanly enough to drive t3code's UI from a
-//! Rust server, or does it fight us hard enough to abandon Option 3?
+//! This module parses one NDJSON line into an [`Event`] and folds events into a
+//! [`SessionState`]. It is pure: no I/O, no printing, no process handling. The
+//! agent driver that spawns `claude` and pumps its stdio owns all of that and
+//! feeds lines in here.
 //!
-//! This module is the part worth keeping. It is pure: no I/O, no terminal
-//! code, no printing. It parses one NDJSON line into an `Event`, and folds
-//! events into a `SessionState`. The TUI in main.rs is the throwaway shell.
+//! Isolating the wire format is the mitigation for the CLI-drift risk: when the
+//! format shifts, the blast radius is this file, and `tests/protocol_golden.rs`
+//! tells you it shifted before any server code notices.
 //!
-//! Isolating the wire format here is also the mitigation for Risk #1 in
-//! HANDOFF-rust-server-tauri.md: when the CLI's format shifts, the blast
-//! radius is this file.
+//! Lifted from `spike-claude-protocol/src/protocol.rs`, whose README records the
+//! evidence behind the shapes below.
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Wire format
@@ -141,7 +141,13 @@ pub fn parse_line(line: &str) -> Result<Event, serde_json::Error> {
 // State
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+/// The folded view of one `claude` session.
+///
+/// Everything here is what a client could observe, with one exception:
+/// `counts` is per-event-type bookkeeping for diagnostics and is deliberately
+/// left out of the serialized form, so the golden tests pin outcomes rather
+/// than the reducer's internal tallies.
+#[derive(Debug, Default, Serialize)]
 pub struct SessionState {
     pub session_id: Option<String>,
     pub model: Option<String>,
@@ -159,10 +165,11 @@ pub struct SessionState {
     /// Protocol-drift telemetry: event types we did not recognize.
     pub unknown_events: usize,
     pub parse_errors: usize,
+    #[serde(skip)]
     pub counts: BTreeMap<String, usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Turn {
     pub role: String,
     pub text: String,
@@ -171,7 +178,7 @@ pub struct Turn {
     pub from_deltas: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct ResultSummary {
     pub is_error: bool,
     pub stop_reason: Option<String>,
@@ -187,6 +194,22 @@ impl SessionState {
 
     fn bump(&mut self, key: &str) {
         *self.counts.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    /// Fold one raw NDJSON line, malformed ones included.
+    ///
+    /// This is the entry point a stdio pump wants: a blank line is nothing (the
+    /// CLI's output ends with one), and a line that does not parse is counted
+    /// rather than returned, because one bad line must not end a session any
+    /// more than one unrecognized event type does.
+    pub fn fold_line(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        match parse_line(line) {
+            Ok(event) => self.reduce(event),
+            Err(_) => self.note_parse_error(),
+        }
     }
 
     /// Fold one event into the state.
@@ -312,4 +335,104 @@ pub fn user_message_line(text: &str) -> String {
         "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
     })
     .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// Whole captured sessions are covered by the golden files in
+// `tests/protocol_golden.rs`. What lives here is the degradation behaviour that
+// no real capture contains, because a healthy CLI never emits it.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fold(lines: &[&str]) -> SessionState {
+        let mut state = SessionState::new();
+        for line in lines {
+            state.fold_line(line);
+        }
+        state
+    }
+
+    #[test]
+    fn unrecognized_event_type_becomes_a_drift_count() {
+        let state = fold(&[r#"{"type":"telemetry_event","payload":{"x":1}}"#]);
+
+        assert_eq!(state.unknown_events, 1);
+        assert_eq!(state.parse_errors, 0);
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn unrecognized_stream_event_becomes_a_drift_count() {
+        let state = fold(&[
+            r#"{"type":"stream_event","event":{"type":"citation_delta","index":0}}"#,
+        ]);
+
+        assert_eq!(state.unknown_events, 1);
+        assert_eq!(state.parse_errors, 0);
+    }
+
+    #[test]
+    fn malformed_line_becomes_a_parse_error_count() {
+        let state = fold(&["{not json", "", "   "]);
+
+        assert_eq!(state.parse_errors, 1);
+        assert_eq!(state.unknown_events, 0);
+    }
+
+    #[test]
+    fn a_session_keeps_folding_across_drift_and_malformed_lines() {
+        let state = fold(&[
+            r#"{"type":"telemetry_event"}"#,
+            "}{",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still here"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn"}"#,
+        ]);
+
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].text, "still here");
+        assert_eq!(
+            state.last_result.as_ref().and_then(|r| r.stop_reason.clone()),
+            Some("end_turn".to_string())
+        );
+        assert_eq!((state.unknown_events, state.parse_errors), (1, 1));
+    }
+
+    #[test]
+    fn an_unrecognized_content_block_still_yields_a_turn() {
+        let state = fold(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi "},{"type":"holograph"}]}}"#,
+        ]);
+
+        assert_eq!(state.transcript[0].text, "hi [?]");
+    }
+
+    #[test]
+    fn the_buffered_message_replaces_the_delta_accumulation() {
+        let state = fold(&[
+            r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ]);
+
+        // Deltas were shed mid-turn; the buffered message wins and says so.
+        assert_eq!(state.transcript[0].text, "hello");
+        assert!(!state.transcript[0].from_deltas);
+        assert_eq!(state.visible_text(), "");
+    }
+
+    #[test]
+    fn deltas_that_agree_with_the_buffered_message_are_recorded_as_agreeing() {
+        let state = fold(&[
+            r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        ]);
+
+        assert!(state.transcript[0].from_deltas);
+    }
 }

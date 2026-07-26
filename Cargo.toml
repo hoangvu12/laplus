@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/lightcode-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-tungstenite = "0.29"
+
+[workspace.lints.rust]
+# The server shells out, spawns children and drives a socket; none of that needs
+# `unsafe`. Forbidding it here keeps that true as the workspace grows.
+unsafe_code = "forbid"

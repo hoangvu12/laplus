@@ -1,15 +1,21 @@
 # spike-claude-protocol — THROWAWAY PROTOTYPE
 
-**Status: the question is answered. PASS.**
+**Status: the question is answered. PASS. The code is gone.**
 
-## Run it
+This write-up is all that remains, and it is kept as reference material: it
+records the CLI flags that constitute the protocol, the evidence behind the
+shapes, and an explicit account of what the spike did not prove.
 
-```sh
-cargo run
-```
+The code was resolved as the spike itself proposed under "What to keep, what to
+throw away":
 
-Type a prompt and press Enter. `/raw` toggles the raw event log, `/q` quits.
-Requires `claude` on PATH.
+- `src/protocol.rs` was lifted to `crates/lightcode-server/src/protocol.rs`,
+  where the golden-file tests in `tests/protocol_golden.rs` now hold it to the
+  captures. Those captures are committed at `fixtures/claude-cli/`.
+- `src/main.rs` — the terminal shell it was driven by hand from — was deleted
+  rather than ported, along with the spike's `Cargo.toml`.
+
+The raw NDJSON used as primary source below is still at `../.scratch/`.
 
 ## The question
 

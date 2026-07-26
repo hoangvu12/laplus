@@ -2,10 +2,19 @@
 
 A Rust server + Tauri shell that drives the `claude` CLI directly, reusing
 t3code's `apps/web` UI. See `HANDOFF-rust-server-tauri.md` for the plan and
-`spike-claude-protocol/README.md` for the STEP 1 protocol spike that gates it.
+`spike-claude-protocol/README.md` for the STEP 1 protocol spike that gated it
+(answered; its code now lives in the workspace).
 
 `t3code/` is a vendored upstream checkout with its own `.git` — reference only,
 never committed here (see `.gitignore`).
+
+## Layout
+
+- `crates/lightcode-server/` — the server. Cargo workspace root is the repo root.
+- `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
+  what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
+- `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.
+- `.scratch/` — tracker files (see below) and raw capture evidence.
 
 ## Agent skills
 

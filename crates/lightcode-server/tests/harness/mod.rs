@@ -1,0 +1,457 @@
+//! The socket test harness: start a server, connect a client, drive methods.
+//!
+//! This is the project's **primary test seam**. The spec puts the bulk of
+//! testing here rather than giving each subsystem its own seam, because this
+//! is the genuine contract with the UI — filesystem, projects, provider,
+//! orchestration, terminal and git are all meant to be exercised through it.
+//! Ticket 03 builds it for one method; every later ticket adds calls, not
+//! plumbing.
+//!
+//! Three things it deliberately does:
+//!
+//! - **Speaks a different WebSocket implementation from the server.** The
+//!   server is `axum`/`tungstenite`-on-the-inside; the client here is
+//!   `tokio-tungstenite` driven directly. A passing test means two stacks
+//!   agree on the framing.
+//! - **Correlates by `requestId`, never by arrival order.** The reference
+//!   server answers concurrent calls out of order and a conforming client must
+//!   cope, so the harness copes — otherwise it would quietly bake in an
+//!   assumption the real UI does not make.
+//! - **Times every read out.** A protocol bug usually presents as "nothing
+//!   arrives". Without a timeout that is a hung suite instead of a failure.
+
+#![allow(dead_code)]
+
+pub mod captures;
+pub mod shape;
+
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use lightcode_server::config::ServerConfig;
+use lightcode_server::Server;
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+/// How long any single read may take before the test fails instead of hanging.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A server bound to a free loopback port, with the sockets it hands out.
+pub struct TestServer {
+    server: Server,
+}
+
+impl TestServer {
+    pub async fn start() -> TestServer {
+        TestServer::start_with(ServerConfig::detect()).await
+    }
+
+    pub async fn start_with(config: ServerConfig) -> TestServer {
+        let server = Server::bind_with(0, config)
+            .await
+            .expect("server binds to a free loopback port");
+        TestServer { server }
+    }
+
+    pub fn ws_url(&self) -> String {
+        self.server.ws_url()
+    }
+
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.server.local_addr()
+    }
+
+    /// Sockets currently open, as the server counts them. Used to check that
+    /// disconnecting leaves nothing behind.
+    pub fn live_connections(&self) -> usize {
+        self.server.state().live_connections()
+    }
+
+    /// Wait for the gauge to reach `expected`, or fail saying what it was.
+    ///
+    /// A closed socket is torn down by the connection's own task, so the
+    /// count drops a moment after the client stops caring. Polling is the
+    /// honest way to observe that without pretending it is synchronous.
+    pub async fn await_live_connections(&self, expected: usize) {
+        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        while self.live_connections() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live connections stayed at {} instead of settling to {expected}",
+                self.live_connections()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub fn unrecognized_messages(&self) -> usize {
+        self.server.state().unrecognized_messages()
+    }
+
+    pub fn unparseable_frames(&self) -> usize {
+        self.server.state().unparseable_frames()
+    }
+
+    /// The config the server will answer `server.getConfig` with.
+    pub fn config(&self) -> Value {
+        self.server.state().config().to_value()
+    }
+
+    /// Connect the way a non-browser client does: a `wsTicket`, no `Origin`.
+    pub async fn connect(&self) -> SocketClient {
+        self.connect_as(ClientIdentity::ticket())
+            .await
+            .expect("upgrade is accepted")
+    }
+
+    pub async fn connect_as(&self, identity: ClientIdentity) -> Result<SocketClient, Refusal> {
+        let mut url = self.ws_url();
+        if let Some(ticket) = &identity.ticket {
+            url.push_str("?wsTicket=");
+            url.push_str(ticket);
+        }
+
+        let mut request = url
+            .into_client_request()
+            .expect("the server's own url is a valid websocket request");
+        for (name, value) in [
+            ("origin", identity.origin.as_deref()),
+            ("cookie", identity.cookie.as_deref()),
+            ("authorization", identity.authorization.as_deref()),
+        ] {
+            if let Some(value) = value {
+                request.headers_mut().insert(
+                    name,
+                    value.parse().expect("header value is valid ascii"),
+                );
+            }
+        }
+
+        match connect_async(request).await {
+            Ok((socket, _response)) => Ok(SocketClient {
+                socket,
+                next_id: 0,
+                buffered: Vec::new(),
+            }),
+            Err(WsError::Http(response)) => {
+                let body = response
+                    .body()
+                    .as_ref()
+                    .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                    .unwrap_or(Value::Null);
+                Err(Refusal {
+                    status: response.status().as_u16(),
+                    body,
+                })
+            }
+            Err(error) => panic!("connecting failed for a non-http reason: {error}"),
+        }
+    }
+
+    /// A plain `GET`, for the two endpoints the UI hits before it opens a
+    /// socket. Raw HTTP rather than a client library, for the same reason
+    /// [`TestServer::raw_upgrade`] is: no dependency, and nothing between the
+    /// assertion and the bytes.
+    pub async fn get(&self, path: &str) -> HttpResponse {
+        let raw = self
+            .raw_request(&format!(
+                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                self.addr()
+            ))
+            .await;
+
+        let (head, body) = raw
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("no header/body boundary in: {raw}"));
+
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status code in: {head}"));
+
+        HttpResponse {
+            status,
+            head: head.to_string(),
+            body: serde_json::from_str(body).unwrap_or(Value::Null),
+        }
+    }
+
+    /// Perform the upgrade by hand and return the raw response head.
+    ///
+    /// Some of what ticket 01 pinned is in the handshake itself rather than in
+    /// any frame — that `permessage-deflate` is declined, that no subprotocol
+    /// is negotiated. A WebSocket library normalises those away, so the only
+    /// way to assert them is to speak HTTP directly.
+    pub async fn raw_upgrade(&self, request_head: &str) -> String {
+        // A 101 leaves the connection open, so stop at the blank line rather
+        // than waiting for an end that never comes.
+        self.raw_exchange(request_head, StopAt::EndOfHead).await
+    }
+
+    /// Send a request and read until the server closes. Only safe with
+    /// `Connection: close`.
+    pub async fn raw_request(&self, request_head: &str) -> String {
+        self.raw_exchange(request_head, StopAt::EndOfStream).await
+    }
+
+    async fn raw_exchange(&self, request_head: &str, stop: StopAt) -> String {
+        let mut stream = TcpStream::connect(self.addr())
+            .await
+            .expect("connects to the listener");
+        stream
+            .write_all(request_head.as_bytes())
+            .await
+            .expect("writes the request");
+
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .expect("the server answers within the timeout")
+                .expect("reads from the socket");
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if stop == StopAt::EndOfHead
+                && response.windows(4).any(|window| window == b"\r\n\r\n")
+            {
+                break;
+            }
+        }
+
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    pub async fn stop(self) {
+        self.server.shutdown().await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopAt {
+    EndOfHead,
+    EndOfStream,
+}
+
+/// A plain HTTP response, with its body parsed as JSON when it is JSON.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub head: String,
+    pub body: Value,
+}
+
+/// What a client presents at the upgrade.
+#[derive(Debug, Default, Clone)]
+pub struct ClientIdentity {
+    pub ticket: Option<String>,
+    pub origin: Option<String>,
+    pub cookie: Option<String>,
+    pub authorization: Option<String>,
+}
+
+impl ClientIdentity {
+    /// Nothing at all — the permissive path.
+    pub fn anonymous() -> Self {
+        ClientIdentity::default()
+    }
+
+    /// The shape a non-browser client sends, as captured in
+    /// `fixtures/socket-wire/02-request-response.ndjson`.
+    pub fn ticket() -> Self {
+        ClientIdentity {
+            ticket: Some("eyJ2IjoxLCJraW5kIjoid2Vic29ja2V0In0.c2lnbmF0dXJl".to_string()),
+            ..ClientIdentity::default()
+        }
+    }
+
+    /// The shape the browser UI sends: a session cookie and a loopback origin.
+    pub fn browser() -> Self {
+        ClientIdentity {
+            cookie: Some("t3_session=eyJ2IjoxLCJraW5kIjoic2Vzc2lvbiJ9.c2lnbmF0dXJl".to_string()),
+            origin: Some("http://127.0.0.1".to_string()),
+            ..ClientIdentity::default()
+        }
+    }
+
+    pub fn with_origin(mut self, origin: &str) -> Self {
+        self.origin = Some(origin.to_string());
+        self
+    }
+}
+
+/// A refused upgrade: the socket never opened.
+#[derive(Debug, Clone)]
+pub struct Refusal {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// One open socket, and the request-id space that belongs to it.
+#[derive(Debug)]
+pub struct SocketClient {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    next_id: u64,
+    /// Frames that arrived while waiting for a different `requestId`. Kept so
+    /// out-of-order answers are not lost, which is the whole point of
+    /// correlating rather than assuming FIFO.
+    buffered: Vec<Value>,
+}
+
+/// What a call came back as. A `Defect` is a distinct outcome rather than an
+/// error case because it carries no `requestId` and therefore is not, strictly,
+/// an answer to anything.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    Success(Value),
+    Failure(Vec<Value>),
+    Defect(Value),
+}
+
+impl Outcome {
+    /// The success value, or a panic naming what came back instead.
+    pub fn expect_success(self) -> Value {
+        match self {
+            Outcome::Success(value) => value,
+            other => panic!("expected a success exit, got {other:?}"),
+        }
+    }
+}
+
+impl SocketClient {
+    /// Send a `Request` and wait for its answer, correlating by `requestId`.
+    pub async fn call(&mut self, tag: &str, payload: Value) -> Outcome {
+        let id = self.send_request(tag, payload).await;
+        self.await_outcome(&id).await
+    }
+
+    /// Send a `Request` and return the answering frame untouched, envelope and
+    /// all. Conformance tests compare envelopes, not just payloads.
+    pub async fn call_raw(&mut self, tag: &str, payload: Value) -> Value {
+        self.send_request(tag, payload).await;
+        self.recv().await
+    }
+
+    /// Send a `Request` without waiting, returning its id. For driving
+    /// concurrent calls.
+    pub async fn send_request(&mut self, tag: &str, payload: Value) -> String {
+        let id = self.next_id.to_string();
+        self.next_id += 1;
+        self.send(json!({
+            "_tag": "Request",
+            "id": id,
+            "tag": tag,
+            "payload": payload,
+            "headers": [],
+        }))
+        .await;
+        id
+    }
+
+    /// Wait for the answer to an already-sent request.
+    pub async fn await_outcome(&mut self, request_id: &str) -> Outcome {
+        loop {
+            if let Some(index) = self
+                .buffered
+                .iter()
+                .position(|frame| answers(frame, request_id))
+            {
+                return outcome(self.buffered.remove(index));
+            }
+
+            let frame = self.recv().await;
+            if answers(&frame, request_id) {
+                return outcome(frame);
+            }
+            self.buffered.push(frame);
+        }
+    }
+
+    /// `Ping` and the `Pong` that answers it.
+    pub async fn ping(&mut self) -> Value {
+        self.send(json!({"_tag": "Ping"})).await;
+        self.recv().await
+    }
+
+    /// Send a frame exactly as given. For malformed and unrecognised frames,
+    /// which the typed helpers cannot express.
+    pub async fn send(&mut self, frame: Value) {
+        self.send_text(&frame.to_string()).await;
+    }
+
+    pub async fn send_text(&mut self, text: &str) {
+        self.socket
+            .send(Message::Text(text.into()))
+            .await
+            .expect("sends a text frame");
+    }
+
+    /// The next frame, whatever it is.
+    pub async fn recv(&mut self) -> Value {
+        loop {
+            let frame = tokio::time::timeout(READ_TIMEOUT, self.socket.next())
+                .await
+                .expect("a frame arrives within the timeout")
+                .expect("the socket is still open")
+                .expect("the frame is readable");
+
+            match frame {
+                Message::Text(text) => {
+                    return serde_json::from_str(text.as_str())
+                        .unwrap_or_else(|error| panic!("frame is not json: {error}: {text}"))
+                }
+                Message::Binary(bytes) => panic!("unexpected binary frame of {} bytes", bytes.len()),
+                Message::Close(frame) => panic!("server closed the socket: {frame:?}"),
+                // Control frames the library handles; keep reading.
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+            }
+        }
+    }
+
+    /// Assert nothing more arrives for a while. Used to check that a frame the
+    /// server should ignore really is ignored.
+    pub async fn expect_silence(&mut self, how_long: Duration) {
+        if let Ok(Some(frame)) = tokio::time::timeout(how_long, self.socket.next()).await {
+            panic!("expected silence, got {frame:?}");
+        }
+    }
+
+    pub async fn close(mut self) {
+        let _ = self.socket.close(None).await;
+    }
+}
+
+/// Does this frame answer `request_id`? A `Defect` answers everything, because
+/// it carries no id and no `Exit` will follow.
+fn answers(frame: &Value, request_id: &str) -> bool {
+    match frame["_tag"].as_str() {
+        Some("Exit") => frame["requestId"] == json!(request_id),
+        Some("Defect") => true,
+        _ => false,
+    }
+}
+
+fn outcome(frame: Value) -> Outcome {
+    match frame["_tag"].as_str() {
+        Some("Defect") => Outcome::Defect(frame["defect"].clone()),
+        Some("Exit") => match frame["exit"]["_tag"].as_str() {
+            Some("Success") => Outcome::Success(frame["exit"]["value"].clone()),
+            Some("Failure") => Outcome::Failure(
+                frame["exit"]["cause"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            other => panic!("unknown exit tag {other:?} in {frame}"),
+        },
+        other => panic!("frame {other:?} is not an answer: {frame}"),
+    }
+}

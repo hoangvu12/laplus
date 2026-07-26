@@ -360,9 +360,32 @@ guessed at.
    `effect/unstable/rpc` vocabulary defines all three. Whether the UI can ever
    provoke them is unknown; the Rust server currently has no reason to emit
    them.
-4. **`Defect` carries no `requestId`.** The pending request is left with no
-   terminal `Exit`. Whether the client times it out, leaks it, or tears down the
-   connection was not determined — only that the server does not answer it.
+4. ~~**`Defect` carries no `requestId`.**~~ **Answered in ticket 03 — it tears
+   the session down.** The client handles the frame as
+   `clearEntries(Exit.die(message.defect))`
+   (`effect/unstable/rpc/RpcClient.ts`, `effect@4.0.0-beta.78` in the vendored
+   checkout), which fails *every* in-flight request and *every* open
+   subscription on that socket with a die rather than a typed failure. The
+   connection supervisor then reconnects on a 1/2/4/8/16-second backoff.
+
+   An `Exit` is scoped by comparison: `decodeExit(...)` is wrapped in
+   `matchCauseEffect`, so even an error payload that fails to decode is written
+   back under the same `requestId` and nothing else is touched.
+
+   This is why **lightcode does not send `Defect`**, and it is the one place
+   the Rust server deliberately does not follow a capture. The reference server
+   can afford `Defect` because it implements every tag its client sends, so one
+   only ever answers a tag no real client uses; lightcode implements a fraction
+   of the vocabulary while it is being built, so `Defect` would be the normal
+   answer to the UI's own boot sequence. Unimplemented methods come back as
+   `Exit`/`Failure` with a `Fail` cause carrying a
+   `ServerMethodNotImplementedError`. See
+   `crates/lightcode-server/src/rpc.rs` and
+   `crates/lightcode-server/tests/socket_conformance.rs`, which pins both the
+   captured behaviour and the divergence.
+
+   Read from source, not captured — no recording provoked a `Defect` against
+   the real UI.
 5. **Does a subscription ever end in `Exit`/`Success`?** Every termination
    captured was client-initiated and came back as `Failure`/`Interrupt`. Natural
    completion of a server-side stream was never observed.

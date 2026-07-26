@@ -1,0 +1,167 @@
+//! Golden-file tests for the `claude` CLI wire format — the project's drift
+//! detector.
+//!
+//! Every `*.ndjson` under `fixtures/claude-cli/` is folded line by line through
+//! a fresh `SessionState`, and the resulting state is compared against its
+//! `*.expected.json` sibling. When a `claude` release moves the format,
+//! re-capturing and re-running this says *the CLI moved* — directly, with no
+//! server to stand up and no server logic to disentangle the failure from.
+//!
+//! Adding a capture takes no test code changes: drop the `.ndjson` in, run
+//! `UPDATE_GOLDEN=1 cargo test -p lightcode-server`, read the minted
+//! `.expected.json` to check it says what you meant, and commit both.
+
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use lightcode_server::protocol::SessionState;
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-cli")
+}
+
+fn captures() -> Vec<PathBuf> {
+    let dir = fixtures_dir();
+    let entries =
+        fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()));
+
+    let mut paths: Vec<PathBuf> = entries
+        .map(|entry| entry.expect("directory entry").path())
+        .filter(|path| path.extension() == Some(OsStr::new("ndjson")))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Fold a whole capture the way the agent driver will: one line at a time,
+/// malformed lines included.
+fn fold(capture: &str) -> SessionState {
+    let mut state = SessionState::new();
+    for line in capture.lines() {
+        state.fold_line(line);
+    }
+    state
+}
+
+fn render(state: &SessionState) -> String {
+    let mut json = serde_json::to_string_pretty(state).expect("state serializes");
+    json.push('\n');
+    json
+}
+
+/// Line endings are not the thing under test — a capture or golden file that
+/// round-tripped through a CRLF checkout should not read as protocol drift.
+fn normalize(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+#[test]
+fn every_capture_folds_to_its_golden_state() {
+    let captures = captures();
+    assert!(
+        !captures.is_empty(),
+        "no captures in {} — the drift detector has nothing to detect drift against",
+        fixtures_dir().display()
+    );
+
+    let updating = std::env::var_os("UPDATE_GOLDEN").is_some();
+    let mut failures: Vec<String> = Vec::new();
+
+    for capture_path in captures {
+        let golden_path = capture_path.with_extension("expected.json");
+        let name = capture_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("<capture>")
+            .to_string();
+
+        let capture = fs::read_to_string(&capture_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", capture_path.display()));
+        let actual = render(&fold(&capture));
+
+        if updating {
+            fs::write(&golden_path, &actual)
+                .unwrap_or_else(|e| panic!("writing {}: {e}", golden_path.display()));
+            continue;
+        }
+
+        match fs::read_to_string(&golden_path) {
+            Ok(expected) if normalize(&expected) == actual => {}
+            Ok(expected) => failures.push(format!(
+                "{name} folded to a different state than {}:\n--- expected ---\n{}\n--- actual ---\n{actual}",
+                golden_path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("<golden>"),
+                normalize(&expected)
+            )),
+            Err(_) => failures.push(format!(
+                "{name} has no golden file. Mint it with `UPDATE_GOLDEN=1 cargo test -p lightcode-server`, then read it before committing.\n--- would be ---\n{actual}"
+            )),
+        }
+    }
+
+    assert!(failures.is_empty(), "\n\n{}\n", failures.join("\n\n"));
+}
+
+/// A golden file with no capture beside it is a capture someone deleted and a
+/// stale expectation left behind — quiet loss of coverage, so it fails loudly.
+#[test]
+fn every_golden_file_has_a_capture() {
+    let dir = fixtures_dir();
+    let orphans: Vec<String> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+        .map(|entry| entry.expect("directory entry").path())
+        .filter_map(|path| {
+            let name = path.file_name().and_then(OsStr::to_str)?;
+            let stem = name.strip_suffix(".expected.json")?;
+            Some((name.to_string(), dir.join(format!("{stem}.ndjson"))))
+        })
+        .filter(|(_, capture)| !capture.exists())
+        .map(|(name, _)| name)
+        .collect();
+
+    assert!(orphans.is_empty(), "golden files with no capture: {orphans:?}");
+}
+
+/// The captures exist to exercise the reducer, so at least one of them has to
+/// reach each of the wire format's interesting paths. Without this, a capture
+/// set could quietly narrow to one boring session and still pass everything.
+#[test]
+fn the_captures_cover_the_wire_format() {
+    let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+
+    for capture_path in captures() {
+        let capture = fs::read_to_string(&capture_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", capture_path.display()));
+        let state = fold(&capture);
+
+        *totals.entry("sessions initialized").or_default() +=
+            usize::from(state.session_id.is_some());
+        *totals.entry("assistant turns").or_default() += state.transcript.len();
+        *totals.entry("results").or_default() += usize::from(state.last_result.is_some());
+        *totals.entry("streamed turns").or_default() +=
+            usize::from(state.counts.contains_key("stream/content_block_delta"));
+        *totals.entry("turns reconciled from deltas").or_default() += state
+            .transcript
+            .iter()
+            .filter(|turn| turn.from_deltas)
+            .count();
+        *totals.entry("unknown events").or_default() += state.unknown_events;
+        *totals.entry("parse errors").or_default() += state.parse_errors;
+    }
+
+    let uncovered: Vec<&&str> = totals
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(path, _)| path)
+        .collect();
+
+    assert!(
+        uncovered.is_empty(),
+        "no capture in {} exercises: {uncovered:?}",
+        fixtures_dir().display()
+    );
+}
