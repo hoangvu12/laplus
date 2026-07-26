@@ -126,6 +126,22 @@ pub struct ScriptedAgent {
 /// instantaneously.
 pub const PAUSE: &str = "<pause>";
 
+/// A place where the agent stops until the server writes it a line, and records
+/// what it was written.
+///
+/// The real CLI does this at exactly one point: having asked permission, it
+/// waits. Nothing else it sends needs a reply, so nothing else in a script needs
+/// this — and [`ScriptedAgent::replaying`] inserts one after every
+/// `control_request` in a recording for that reason.
+///
+/// **The line is not required.** If the server closes stdin instead of answering,
+/// the script carries on with the rest of the recording rather than stopping,
+/// which is what the CLI itself does: the permission stream closes, the tool
+/// comes back as an abort, and the turn finishes. See
+/// `fixtures/claude-cli/09-permission-unanswered.ndjson`, where that is the
+/// recorded behaviour being replayed.
+pub const AWAIT_ANSWER: &str = "<answer>";
+
 /// A file every scripted agent writes into whatever directory it was started
 /// in, on every turn.
 ///
@@ -159,7 +175,25 @@ impl ScriptedAgent {
         let recorded = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
 
-        ScriptedAgent::emitting(&recorded.lines().collect::<Vec<&str>>())
+        ScriptedAgent::emitting(&replayable(&recorded))
+    }
+
+    /// Replay a capture for the first turn, then a script of your own for every
+    /// turn after it.
+    ///
+    /// For what a single recording cannot show: that the conversation *continues*
+    /// after whatever the recording was of. Replaying the same capture twice
+    /// would have the agent ask permission again on the follow-up, which is a
+    /// second question rather than an answer to "did the session survive the
+    /// first one".
+    pub fn replaying_then(capture: &str, later: &[&str]) -> ScriptedAgent {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/claude-cli")
+            .join(format!("{capture}.ndjson"));
+        let recorded = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+
+        ScriptedAgent::per_turn(&[replayable(&recorded), later.to_vec()])
     }
 
     /// Replay lines written for the occasion, for every turn.
@@ -200,15 +234,15 @@ impl ScriptedAgent {
             directory: tempfile::tempdir().expect("a temporary directory"),
         };
 
-        // Each turn is split into segments at a `PAUSE`, so a script can be slow
-        // in the middle of a turn as well as different from one turn to the next.
-        let scripted: Vec<Vec<&[&str]>> = turns
-            .iter()
-            .map(|lines| lines.as_ref().split(|line| *line == PAUSE).collect())
-            .collect();
+        // Each turn is split into segments at a marker, so a script can stop in
+        // the middle of a turn as well as differ from one turn to the next. The
+        // marker is kept with the segment it precedes, because *which* stop it
+        // was decides what the script does there — sleep, or wait to be answered.
+        let scripted: Vec<Vec<Segment<'_>>> =
+            turns.iter().map(|lines| segments(lines.as_ref())).collect();
         for (turn, segments) in scripted.iter().enumerate() {
             for (index, segment) in segments.iter().enumerate() {
-                let mut text = segment.join("\n");
+                let mut text = segment.lines.join("\n");
                 text.push('\n');
                 std::fs::write(agent.directory.path().join(segment_name(turn, index)), text)
                     .expect("writes a script segment");
@@ -250,6 +284,18 @@ impl ScriptedAgent {
     /// `--resume` is the whole of ticket 11's continuity mechanism.
     pub fn arguments(&self) -> Vec<String> {
         self.logged(ARGUMENTS_LOG)
+    }
+
+    /// Every line the server wrote to this agent at an [`AWAIT_ANSWER`], in
+    /// order.
+    ///
+    /// The only way to see what the *agent* was told from outside the server, and
+    /// the assertion the approval and rejection tests turn on: an approval row in
+    /// the work log says what the developer clicked, and this says what the agent
+    /// received. A server that published the first and sent the second wrongly
+    /// would pass every other assertion in the suite.
+    pub fn answers(&self) -> Vec<String> {
+        self.logged(ANSWERS_LOG)
     }
 
     /// The sessions this agent was asked to resume, in the order it was asked.
@@ -299,14 +345,14 @@ impl ScriptedAgent {
     /// The turn counter lives in the process, so which script a turn gets is also
     /// an answer to "was this the same process as last time". See
     /// [`ScriptedAgent::per_turn`].
-    fn script(&self, turns: &[Vec<&[&str]>], on_resume: OnResume) -> String {
+    fn script(&self, turns: &[Vec<Segment<'_>>], on_resume: OnResume) -> String {
         match cfg!(windows) {
             true => self.batch(turns, on_resume),
             false => self.shell(turns, on_resume),
         }
     }
 
-    fn batch(&self, turns: &[Vec<&[&str]>], on_resume: OnResume) -> String {
+    fn batch(&self, turns: &[Vec<Segment<'_>>], on_resume: OnResume) -> String {
         // Every redirection here leads its command. `>>file echo %*` rather than
         // `echo %*>>file`, because a `%*` ending in a digit turns the digit into
         // a file-descriptor number and `--resume abc1>>log` would redirect fd 1
@@ -332,12 +378,21 @@ impl ScriptedAgent {
                 false => format!("if \"%TURN%\"==\"{turn}\" call :turn-{turn}\r\n"),
             });
             bodies.push_str(&format!("\r\n:turn-{turn}\r\n"));
-            for index in 0..turns[turn - 1].len() {
-                if index > 0 {
+            for (index, segment) in turns[turn - 1].iter().enumerate() {
+                match segment.after {
                     // A second, in the platform's idiom for sleeping without a
                     // console: `timeout` needs one, and `powershell -c
                     // Start-Sleep` costs more to start than it sleeps for.
-                    bodies.push_str("ping -n 2 127.0.0.1 >nul\r\n");
+                    Some(Stop::Pause) => bodies.push_str("ping -n 2 127.0.0.1 >nul\r\n"),
+                    // `set /p` leaves the variable undefined at EOF, which is how
+                    // "the server closed stdin instead of answering" arrives here.
+                    // The script carries on either way — see [`AWAIT_ANSWER`].
+                    Some(Stop::Answer) => bodies.push_str(&format!(
+                        "set \"ANSWER=\"\r\n\
+                         set /p ANSWER=\r\n\
+                         if defined ANSWER >>\"%~dp0{ANSWERS_LOG}\" echo %ANSWER%\r\n"
+                    )),
+                    None => {}
                 }
                 bodies.push_str(&format!("type \"%~dp0{}\"\r\n", segment_name(turn - 1, index)));
             }
@@ -376,7 +431,7 @@ impl ScriptedAgent {
         )
     }
 
-    fn shell(&self, turns: &[Vec<&[&str]>], on_resume: OnResume) -> String {
+    fn shell(&self, turns: &[Vec<Segment<'_>>], on_resume: OnResume) -> String {
         let refusal = match on_resume {
             OnResume::Continue => String::new(),
             OnResume::Refuse => format!(
@@ -397,9 +452,18 @@ impl ScriptedAgent {
                 true => "    *)\n".to_string(),
                 false => format!("    {turn})\n"),
             });
-            for index in 0..turns[turn - 1].len() {
-                if index > 0 {
-                    cases.push_str("      sleep 1\n");
+            for (index, segment) in turns[turn - 1].iter().enumerate() {
+                match segment.after {
+                    Some(Stop::Pause) => cases.push_str("      sleep 1\n"),
+                    // `read` fails at EOF, which is how "the server closed stdin
+                    // instead of answering" arrives here. The script carries on
+                    // either way — see [`AWAIT_ANSWER`].
+                    Some(Stop::Answer) => cases.push_str(&format!(
+                        "      if IFS= read -r answer; then\n\
+                         \x20       printf '%s\\n' \"$answer\" >> \"$here/{ANSWERS_LOG}\"\n\
+                         \x20     fi\n"
+                    )),
+                    None => {}
                 }
                 cases.push_str(&format!(
                     "      cat \"$here/{}\"\n",
@@ -435,6 +499,76 @@ fn segment_name(turn: usize, index: usize) -> String {
     format!("turn-{turn}-segment-{index}.ndjson")
 }
 
+/// One run of lines the agent prints without stopping, and what it does *before*
+/// printing them.
+///
+/// The stop is attached to the segment that follows it rather than to the one
+/// before, because that is the direction the script reads: reach this segment,
+/// first do the thing, then print.
+struct Segment<'a> {
+    after: Option<Stop>,
+    lines: &'a [&'a str],
+}
+
+/// The two kinds of stop a script can contain.
+#[derive(Debug, Clone, Copy)]
+enum Stop {
+    Pause,
+    Answer,
+}
+
+/// Split one turn's lines at the markers, keeping which marker each split was.
+fn segments<'a>(lines: &'a [&'a str]) -> Vec<Segment<'a>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut after = None;
+    for (index, line) in lines.iter().enumerate() {
+        let stop = match *line {
+            PAUSE => Stop::Pause,
+            AWAIT_ANSWER => Stop::Answer,
+            _ => continue,
+        };
+        segments.push(Segment {
+            after,
+            lines: &lines[start..index],
+        });
+        after = Some(stop);
+        start = index + 1;
+    }
+    segments.push(Segment {
+        after,
+        lines: &lines[start..],
+    });
+    segments
+}
+
+/// A recording, as a script.
+///
+/// A recording is a monologue with one exception: where the CLI asked permission
+/// it stopped, and everything after that line is what happened *because of the
+/// answer*. So the replay stops there too — emitting the rest without waiting
+/// would have the agent react to a decision that had not been made.
+fn replayable(recorded: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in recorded.lines() {
+        lines.push(line);
+        if asks_permission(line) {
+            lines.push(AWAIT_ANSWER);
+        }
+    }
+    lines
+}
+
+/// Is this recorded line the CLI asking permission?
+///
+/// Read rather than matched on as a string: `control_request` appears inside a
+/// recorded `tool_result` in at least one capture, and a stop inserted there
+/// would wait for an answer nobody was going to send.
+fn asks_permission(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|event| event["type"] == "control_request")
+}
+
 /// One line per process the agent script has started, beside the script itself.
 /// Read by [`ScriptedAgent::starts`].
 const STARTS_LOG: &str = "starts.log";
@@ -442,6 +576,10 @@ const STARTS_LOG: &str = "starts.log";
 /// One line per process, holding the arguments it was given. Read by
 /// [`ScriptedAgent::arguments`].
 const ARGUMENTS_LOG: &str = "args.log";
+
+/// One line per answer the server wrote at an [`AWAIT_ANSWER`]. Read by
+/// [`ScriptedAgent::answers`].
+const ANSWERS_LOG: &str = "answers.log";
 
 /// What an agent says when it will not resume a conversation.
 ///

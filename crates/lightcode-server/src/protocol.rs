@@ -39,10 +39,157 @@ pub enum Event {
     /// A verbatim Messages API SSE event, for token-level rendering.
     StreamEvent { event: StreamEvent },
     RateLimitEvent(serde_json::Value),
+    /// The CLI asking its host something, over the same stdout the events arrive
+    /// on. The only line that expects a reply, and the only one the conversation
+    /// stops for until it gets one.
+    ControlRequest {
+        request_id: String,
+        request: Ask,
+    },
     /// Terminal event for the turn.
     Result(ResultEvent),
     #[serde(other)]
     Unknown,
+}
+
+/// What a `control_request` is asking.
+///
+/// The CLI has several — `hook_callback`, `mcp_message`, `elicitation`,
+/// `request_user_dialog`, `oauth_token_refresh` — and this server registers for
+/// exactly one by passing `--permission-prompt-tool stdio` and nothing else.
+/// Everything else arrives as [`Ask::Other`] and is counted as drift, which is
+/// the honest report for a question with no answer: a request this build made up
+/// an answer to would be worse than one it admits it cannot take.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum Ask {
+    CanUseTool(Box<Permission>),
+    #[serde(other)]
+    Other,
+}
+
+/// The agent asking to use a tool, and everything needed to answer.
+///
+/// Recorded rather than read off a contract: `fixtures/claude-cli/07`–`10` are
+/// real requests from `claude` 2.1.220, and the optionality below is theirs —
+/// only `tool_name` and `input` were present on every one.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct Permission {
+    /// The envelope's `request_id`, copied in by [`SessionState::reduce`] so a
+    /// request is one thing rather than two.
+    ///
+    /// Never read from the body: the id lives on the envelope, and a body that
+    /// carried one of its own would be describing a different request.
+    #[serde(default, skip_deserializing)]
+    pub request_id: String,
+    pub tool_name: String,
+    /// What the tool would be run with. Sent back verbatim on an approval —
+    /// `updatedInput` is where a host that wanted to *edit* the call would put
+    /// its edit, and this server does not.
+    #[serde(default)]
+    pub input: Value,
+    /// The `tool_use` block this permission is for, when the CLI names one.
+    ///
+    /// What joins the approval row to the tool row beside it in the work log.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// The CLI's own one-line summary of what is being asked — `note.txt` for a
+    /// `Write`. Shown in preference to anything this server could derive.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Permission updates the CLI suggests if the developer wants to stop being
+    /// asked. Carried verbatim and handed straight back on "always allow", which
+    /// is the whole of how that answer works — see [`Answer::Allow`].
+    #[serde(default, rename = "permission_suggestions")]
+    pub suggestions: Vec<Value>,
+}
+
+/// What the developer decided, in the CLI's own vocabulary.
+///
+/// Deliberately *not* the client's — the UI offers four decisions
+/// (`accept`, `acceptForSession`, `decline`, `cancel`) and the wire has two
+/// behaviours with a modifier on each. Translating between them is
+/// [`crate::orchestration`]'s job, so that this module stays a description of
+/// what `claude` accepts and nothing else.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    /// Let the tool run.
+    Allow {
+        /// The input to run with — the request's own, unedited.
+        input: Value,
+        /// Permission updates for the CLI to apply, which is what stops it
+        /// asking again. Empty means "this once".
+        remember: Vec<Value>,
+    },
+    /// Do not let the tool run. The message reaches the model as the tool's
+    /// result, so it is what the agent is told rather than only what the
+    /// developer clicked.
+    Deny {
+        message: String,
+        /// Stop the turn as well as the tool.
+        interrupt: bool,
+    },
+}
+
+impl Answer {
+    /// What the CLI records this decision as, for its own telemetry.
+    ///
+    /// It asks hosts that actually prompt a person to say what happened rather
+    /// than leave it unset, and lightcode is one — every answer here came from a
+    /// developer clicking something.
+    fn classification(&self) -> &'static str {
+        match self {
+            Answer::Allow { remember, .. } if remember.is_empty() => "user_temporary",
+            Answer::Allow { .. } => "user_permanent",
+            Answer::Deny { .. } => "user_reject",
+        }
+    }
+}
+
+/// Build the stdin line answering one `control_request`.
+///
+/// The second half of the outbound protocol, beside [`user_message_line`]. The
+/// envelope is doubly nested — a `control_response` carrying a `success` result
+/// carrying the permission decision — which is the CLI's shape rather than a
+/// choice here; the same envelope with `"subtype": "error"` is how a host says it
+/// could not answer at all.
+pub fn control_response_line(request_id: &str, answer: &Answer) -> String {
+    let mut decision = match answer {
+        Answer::Allow { input, remember } => {
+            let mut allow = serde_json::json!({
+                "behavior": "allow",
+                "updatedInput": input,
+            });
+            // Absent rather than empty: the CLI types this as an optional array,
+            // and `[]` is a claim that nothing should be remembered rather than
+            // the absence of a claim.
+            if !remember.is_empty() {
+                allow["updatedPermissions"] = Value::Array(remember.clone());
+            }
+            allow
+        }
+        Answer::Deny { message, interrupt } => {
+            let mut deny = serde_json::json!({
+                "behavior": "deny",
+                "message": message,
+            });
+            if *interrupt {
+                deny["interrupt"] = Value::Bool(true);
+            }
+            deny
+        }
+    };
+    decision["decisionClassification"] = Value::String(answer.classification().to_string());
+
+    serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": decision,
+        },
+    })
+    .to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +404,13 @@ pub struct SessionState {
     pub live_text: String,
     pub streaming: bool,
 
+    /// Every permission the agent has asked for, in the order it asked.
+    ///
+    /// Kept rather than only reported, for the same reason `transcript` is: the
+    /// driver reads the request back out by index, and a golden file that showed
+    /// the requests is how a change to their shape becomes visible.
+    pub permissions: Vec<Permission>,
+
     pub last_result: Option<ResultSummary>,
     /// Protocol-drift telemetry: event types we did not recognize.
     pub unknown_events: usize,
@@ -320,6 +474,10 @@ pub enum Folded {
     /// A complete message joined `transcript` at this index. Reading it there
     /// gives the role, the authoritative text, and whether the deltas agreed.
     Turn { index: usize },
+    /// The agent is waiting for permission before it can go on. The request
+    /// joined `permissions` at this index; answering it is
+    /// [`control_response_line`], and until something does the agent is stopped.
+    PermissionRequested { index: usize },
     /// The terminal `result` for the turn. `last_result` holds the duration and
     /// the cost.
     Completed,
@@ -484,6 +642,31 @@ impl SessionState {
 
             Event::RateLimitEvent(_) => {
                 self.bump("rate_limit_event");
+                Folded::Nothing
+            }
+
+            // The one line the agent stops for. Nothing else it says needs a
+            // reply, and nothing else it says leaves the turn unable to
+            // continue until one arrives.
+            Event::ControlRequest {
+                request_id,
+                request: Ask::CanUseTool(asked),
+            } => {
+                self.bump("control_request/can_use_tool");
+                self.permissions.push(Permission {
+                    request_id,
+                    ..*asked
+                });
+                Folded::PermissionRequested {
+                    index: self.permissions.len() - 1,
+                }
+            }
+            Event::ControlRequest {
+                request: Ask::Other,
+                ..
+            } => {
+                self.bump("control_request/UNKNOWN");
+                self.unknown_events += 1;
                 Folded::Nothing
             }
 
@@ -788,6 +971,165 @@ mod tests {
             "a drifted block cost the reply beside it"
         );
         assert_eq!((state.unknown_events, state.parse_errors), (2, 0));
+    }
+
+    // -- permission requests --------------------------------------------------
+    //
+    // The one place the CLI *asks* rather than tells, and the only inbound
+    // message this server sends besides a turn. Whole captured sessions are in
+    // the golden files; what lives here is the shape of one request and the
+    // shape of each answer, because those are what the driver matches on and
+    // writes back.
+
+    /// The fields a permission request is, off
+    /// `fixtures/claude-cli/08-permission-declined.ndjson`: the id the answer has
+    /// to name, the tool, what it was given, and the call it will become.
+    #[test]
+    fn a_permission_request_carries_the_id_the_answer_names_and_the_call_it_is_for() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Write","display_name":"Write","input":{"file_path":"note.txt","content":"hello"},"description":"note.txt","permission_suggestions":[{"type":"setMode","mode":"acceptEdits","destination":"session"}],"tool_use_id":"toolu_1"}}"#,
+        );
+
+        assert_eq!(told, Folded::PermissionRequested { index: 0 });
+        let asked = &state.permissions[0];
+        assert_eq!(asked.request_id, "req-1");
+        assert_eq!(asked.tool_name, "Write");
+        assert_eq!(asked.tool_use_id.as_deref(), Some("toolu_1"));
+        assert_eq!(asked.description.as_deref(), Some("note.txt"));
+        assert_eq!(asked.input["file_path"], "note.txt");
+        // Carried verbatim, because this is what an "always allow" answer sends
+        // back — see `Answer::Allow`.
+        assert_eq!(
+            asked.suggestions,
+            vec![json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"})]
+        );
+    }
+
+    /// A request with only the fields the CLI guarantees. `description`,
+    /// `tool_use_id` and the suggestions are all optional on the wire, and a
+    /// request missing them still has to be answerable — an unanswered one wedges
+    /// the turn.
+    #[test]
+    fn a_permission_request_with_only_its_required_fields_is_still_one() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#,
+        );
+
+        assert_eq!(told, Folded::PermissionRequested { index: 0 });
+        assert_eq!(state.permissions[0].tool_use_id, None);
+        assert_eq!(state.permissions[0].description, None);
+        assert!(state.permissions[0].suggestions.is_empty());
+    }
+
+    /// A control request this build cannot act on is drift rather than a
+    /// permission nobody answers. The CLI sends several — `hook_callback`,
+    /// `mcp_message`, `request_user_dialog` — and each of them is a question this
+    /// server has no answer for, so counting them is the honest report.
+    #[test]
+    fn a_control_request_that_is_not_a_permission_is_counted_rather_than_asked() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_request","request_id":"req-3","request":{"subtype":"request_user_dialog","dialog_kind":"plan"}}"#,
+        );
+
+        assert_eq!(told, Folded::Nothing);
+        assert!(state.permissions.is_empty());
+        assert_eq!(state.unknown_events, 1);
+    }
+
+    /// The three answers, as the CLI's own schema spells them. Each was recorded
+    /// against the real binary before it was written down here — see
+    /// `fixtures/claude-cli/07`, `08` and `10`.
+    #[test]
+    fn each_answer_is_the_control_response_the_cli_expects() {
+        let approved = Answer::Allow {
+            input: json!({"file_path": "note.txt"}),
+            remember: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_response_line("req-1", &approved)).unwrap(),
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "req-1",
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": {"file_path": "note.txt"},
+                        "decisionClassification": "user_temporary",
+                    },
+                },
+            })
+        );
+
+        // "Always allow this session" is the request's own suggestions handed
+        // back. The CLI applies them itself, which is what stops it asking again.
+        let for_the_session = Answer::Allow {
+            input: json!({"file_path": "note.txt"}),
+            remember: vec![json!({"type": "setMode", "mode": "acceptEdits", "destination": "session"})],
+        };
+        let line: Value =
+            serde_json::from_str(&control_response_line("req-1", &for_the_session)).unwrap();
+        assert_eq!(
+            line["response"]["response"]["updatedPermissions"],
+            json!([{"type": "setMode", "mode": "acceptEdits", "destination": "session"}])
+        );
+        assert_eq!(
+            line["response"]["response"]["decisionClassification"],
+            "user_permanent"
+        );
+
+        let declined = Answer::Deny {
+            message: "The developer declined this action.".to_string(),
+            interrupt: false,
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&control_response_line("req-1", &declined)).unwrap(),
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "req-1",
+                    "response": {
+                        "behavior": "deny",
+                        "message": "The developer declined this action.",
+                        "decisionClassification": "user_reject",
+                    },
+                },
+            })
+        );
+
+        // Cancelling the turn is a denial that also stops the agent, which is one
+        // flag on the same answer rather than a second mechanism.
+        let cancelled = Answer::Deny {
+            message: "The developer cancelled the turn.".to_string(),
+            interrupt: true,
+        };
+        let line: Value =
+            serde_json::from_str(&control_response_line("req-1", &cancelled)).unwrap();
+        assert_eq!(line["response"]["response"]["interrupt"], json!(true));
+    }
+
+    /// An allow with no `updatedPermissions` must not carry the key at all: the
+    /// CLI's schema types it as an optional array, and an empty one is a claim
+    /// that nothing should be remembered rather than the absence of a claim.
+    #[test]
+    fn an_allow_that_remembers_nothing_says_nothing_about_permissions() {
+        let line: Value = serde_json::from_str(&control_response_line(
+            "req-1",
+            &Answer::Allow {
+                input: Value::Null,
+                remember: Vec::new(),
+            },
+        ))
+        .unwrap();
+
+        assert!(
+            line["response"]["response"].get("updatedPermissions").is_none(),
+            "{line}"
+        );
     }
 
     #[test]

@@ -41,6 +41,15 @@ pub fn create_project(id: &str, folder: &Path) -> Value {
 /// the thread it wants created. A server that implemented only `thread.create`
 /// would answer the real UI's first message with "there is no such thread".
 pub fn start_turn(thread_id: &str, message_id: &str, text: &str) -> Value {
+    start_turn_in(thread_id, message_id, text, "full-access")
+}
+
+/// The same, with the composer's runtime-mode picker set to something else.
+///
+/// Every other test wants `full-access` because it wants the turn to run without
+/// being asked about. Ticket 13's want `approval-required`, which is the mode
+/// whose whole meaning is that the agent asks.
+pub fn start_turn_in(thread_id: &str, message_id: &str, text: &str, runtime_mode: &str) -> Value {
     json!({
         "type": "thread.turn.start",
         "commandId": format!("test:turn:{message_id}"),
@@ -53,14 +62,14 @@ pub fn start_turn(thread_id: &str, message_id: &str, text: &str) -> Value {
         },
         "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
         "titleSeed": "A conversation",
-        "runtimeMode": "full-access",
+        "runtimeMode": runtime_mode,
         "interactionMode": "default",
         "bootstrap": {
             "createThread": {
                 "projectId": "project-1",
                 "title": "A conversation",
                 "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
-                "runtimeMode": "full-access",
+                "runtimeMode": runtime_mode,
                 "interactionMode": "default",
                 "branch": Value::Null,
                 "worktreePath": Value::Null,
@@ -86,6 +95,21 @@ pub fn follow_up(thread_id: &str, message_id: &str, text: &str) -> Value {
         },
         "runtimeMode": "full-access",
         "interactionMode": "default",
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
+/// The `thread.approval.respond` the composer's approval buttons send.
+///
+/// `decision` is one of `accept`, `acceptForSession`, `decline`, `cancel` —
+/// the four in `ComposerPendingApprovalActions.tsx`, in the client's spelling.
+pub fn respond_to_approval(thread_id: &str, request_id: &str, decision: &str) -> Value {
+    json!({
+        "type": "thread.approval.respond",
+        "commandId": format!("test:approval:{request_id}"),
+        "threadId": thread_id,
+        "requestId": request_id,
+        "decision": decision,
         "createdAt": "2026-07-26T00:23:04.909Z",
     })
 }
@@ -240,6 +264,27 @@ impl SocketClient {
             }
         })
         .await
+    }
+
+    /// Read the turn out up to and including the agent asking for permission,
+    /// and hand back the id the answer has to name.
+    ///
+    /// The turn does not settle here — that is the whole point of a permission
+    /// request — so [`SocketClient::events_through_the_turn`] would wait for an
+    /// ending that only arrives once somebody has decided.
+    pub async fn events_until_permission(&mut self, subscription: &str) -> (Vec<Value>, String) {
+        let events = self
+            .values_until(subscription, |item| {
+                item["event"]["payload"]["activity"]["kind"] == "approval.requested"
+            })
+            .await;
+
+        let request_id = activity(&events, "approval.requested")["payload"]["activity"]["payload"]
+            ["requestId"]
+            .as_str()
+            .expect("a request the client can answer names an id")
+            .to_string();
+        (events, request_id)
     }
 
     /// Subscribe to a thread and take the snapshot it opens with.

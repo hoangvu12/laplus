@@ -182,6 +182,31 @@ fn the_captures_cover_the_wire_format() {
         counted("failed tool calls", failures);
         counted("thinking blocks", thoughts);
         counted("sessions making several tool calls", usize::from(calls > 1));
+
+        // Ticket 13's, counted the same way and for the same reason. The three
+        // the ticket names — approval, rejection and no answer — are three
+        // *recordings* rather than three shapes, so what a fold can check is that
+        // the capture set still contains a request at all and that a request is
+        // still answerable: an approval sends the input back and a
+        // session-wide one sends the suggestions back, so a request carrying
+        // neither would leave both decisions with nothing to say.
+        counted("permission requests", state.permissions.len());
+        counted(
+            "permission requests naming their tool call",
+            state
+                .permissions
+                .iter()
+                .filter(|asked| asked.tool_use_id.is_some())
+                .count(),
+        );
+        counted(
+            "permission requests offering a way to stop asking",
+            state
+                .permissions
+                .iter()
+                .filter(|asked| !asked.suggestions.is_empty())
+                .count(),
+        );
     }
 
     let uncovered: Vec<&&str> = totals

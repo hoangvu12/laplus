@@ -147,6 +147,7 @@ enum Command {
     DeleteProject { project_id: String },
     CreateThread(CreateThread),
     StartTurn(Box<StartTurn>),
+    RespondToApproval(RespondToApproval),
 }
 
 /// A command that was not carried out, as the client will read it.
@@ -271,9 +272,59 @@ impl Shell {
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
             Command::CreateThread(create) => self.create_thread(&create)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
+            Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
         };
 
         Ok(json!({ "sequence": sequence }))
+    }
+
+    /// Hand the developer's permission decision to the agent waiting on it.
+    ///
+    /// **Answers with the log position rather than with a number of its own**, and
+    /// that is the one thing about this command worth arguing. Every other command
+    /// here commits something and answers with the number it committed at; this one
+    /// commits nothing, because the events it causes — the resolution row, and
+    /// whatever the agent does next — are published by the driver once the decision
+    /// has actually reached the child. Taking a sequence here would number a change
+    /// that had not happened, and the client drops anything at or below the number
+    /// it holds, so the row that *did* happen could be dropped as stale.
+    ///
+    /// What the client needs from the answer is whether the decision landed, and
+    /// that it gets: a decision with no session behind it is a typed failure with a
+    /// sentence, which the composer shows.
+    fn respond_to_approval(&self, respond: &RespondToApproval) -> Result<i64, CommandError> {
+        // Refused here rather than in the driver, because this is where there is
+        // still a client listening. A decision this server cannot read is not
+        // rounded to the nearest one it can: the nearest one might be the one that
+        // runs something.
+        let decision = crate::worklog::Decision::parse(&respond.decision).ok_or_else(|| {
+            CommandError::new(format!(
+                "'{}' is not a permission decision this server understands.",
+                respond.decision
+            ))
+        })?;
+
+        if let Err(why) = self.inner.threads.answer(
+            &respond.thread_id,
+            threads::Answered {
+                request_id: respond.request_id.clone(),
+                decision,
+            },
+        ) {
+            // There is no session, so there is nothing to settle the request the
+            // developer is looking at — and the panel is folded out of *stored*
+            // activities, so without this it comes back with the conversation
+            // every time and the composer stays disabled forever. Saying so is
+            // the only thing that can close it. The command still fails, because
+            // it did.
+            self.inner.threads.apply(
+                &respond.thread_id,
+                Change::Activity(crate::worklog::unanswerable(&respond.request_id)),
+            );
+            return Err(CommandError::new(why));
+        }
+
+        Ok(self.inner.sequences.current())
     }
 
     /// Register a conversation.
@@ -818,6 +869,19 @@ struct Bootstrap {
     prepare_worktree: Option<Value>,
 }
 
+/// `thread.approval.respond` — the developer answering the agent.
+///
+/// `decision` is a string rather than an enum here so that an unreadable one is
+/// refused with a message naming it, instead of failing the whole command's
+/// deserialization with serde's own account of which variants it knows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondToApproval {
+    thread_id: String,
+    request_id: String,
+    decision: String,
+}
+
 impl StartTurn {
     fn prepares_a_worktree(&self) -> bool {
         self.bootstrap
@@ -875,7 +939,7 @@ impl Command {
     ///
     /// The `type` is taken by hand before the rest is deserialized so that an
     /// unimplemented command names itself in the refusal. The contract carries
-    /// roughly twenty command types and lightcode implements two, so "which
+    /// roughly twenty command types and lightcode implements five, so "which
     /// one" is the most useful thing a message can say during the build-out.
     fn parse(payload: &Value) -> Result<Command, CommandError> {
         let kind = payload
@@ -918,6 +982,14 @@ impl Command {
                     },
                     ..start
                 })))
+            }
+            "thread.approval.respond" => {
+                let respond: RespondToApproval = read(payload, kind)?;
+                Ok(Command::RespondToApproval(RespondToApproval {
+                    thread_id: non_blank(respond.thread_id, "threadId", kind)?,
+                    request_id: non_blank(respond.request_id, "requestId", kind)?,
+                    ..respond
+                }))
             }
             unimplemented => Err(CommandError::new(format!(
                 "Command not implemented by this server: {unimplemented}"
@@ -1277,7 +1349,7 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and lightcode implements four. Each
+    /// Roughly twenty command types exist and lightcode implements five. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]

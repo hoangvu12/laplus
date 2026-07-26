@@ -31,7 +31,12 @@
 //! | a `tool_use` block | a `tool.updated` activity naming the tool and its input |
 //! | a `tool_result` block | a `tool.completed` activity, paired to it by the agent's own id |
 //! | a `thinking` block | a `task.progress` activity, which the UI renders as thinking |
+//! | a `control_request` asking to use a tool | an `approval.requested` activity, which is the client's pending-approval panel |
 //! | `result` | an activity carrying the duration and the cost, and the session is ready again |
+//!
+//! and one row that goes the other way: a `thread.approval.respond` command
+//! becomes a `control_response` on the agent's stdin, and an `approval.resolved`
+//! activity that closes the panel.
 //!
 //! The second and third rows *are* accumulate-and-reconcile. Nothing decides
 //! between them here: [`crate::protocol::Folded`] says which of the two a line
@@ -62,6 +67,36 @@
 //! they arrive puts the work log in the order the work happened. `worklog`'s
 //! module documentation covers the rest — what the rows look like, and why they
 //! are the kinds they are.
+//!
+//! ## A permission request is the one thing the agent waits for
+//!
+//! Everything else in the table above is the agent talking. A `control_request`
+//! is the agent *asking*, and it has stopped until it is answered — so the loop
+//! polls the decision channel unconditionally, where it deliberately does not
+//! poll for a second prompt while one is in flight. A decision deferred behind a
+//! queued turn would be the deadlock the ticket is about.
+//!
+//! Three things follow from the agent being stopped rather than merely busy:
+//!
+//! - **The request is remembered here, not in the fold.** The client answers by
+//!   naming an id; what has to go back to the CLI is the whole request, because
+//!   an approval carries the input the tool will run with. [`Driving`] is where
+//!   the two are joined.
+//! - **The agent is written to before the resolution is published.** The panel
+//!   closing is what the developer sees; the write is what unsticks the
+//!   conversation. Publishing first would risk a closed panel over a session
+//!   still stopped.
+//! - **Whatever is still outstanding when the driver ends is closed.** The
+//!   client's panel is folded out of `approval.requested` minus
+//!   `approval.resolved` and those activities are *stored*, so a request left
+//!   open would be a composer the developer cannot type into — after a restart as
+//!   well as before one. Ending the driver settles them as cancelled, which is
+//!   what actually happened.
+//!
+//! An unanswered request costs a tool call and nothing else: closing the agent's
+//! stdin closes the permission stream with it, the CLI abandons the request, and
+//! the turn finishes. `fixtures/claude-cli/09-permission-unanswered.ndjson` is a
+//! recording of exactly that, and [`crate::agent`] documents the mechanism.
 //!
 //! ## Continuity is the agent's, and this is where the handle on it is kept
 //!
@@ -94,9 +129,9 @@ use crate::agent::{permission_mode_for, Agent, Launch};
 use crate::clock::now_iso;
 use crate::config::ClaudeSettings;
 use crate::process::Search;
-use crate::protocol::{ContentBlock, Folded, SessionState};
-use crate::threads::{Activity, Change, Prompt, Session, Thread, Threads};
-use crate::worklog::{Call, Returned};
+use crate::protocol::{ContentBlock, Folded, Permission, SessionState};
+use crate::threads::{Activity, Answered, Change, Prompt, Session, Thread, Threads};
+use crate::worklog::{Call, Decision, Returned};
 
 /// Everything a session needs to start an agent, gathered while the thread is
 /// known and carried into the task that will need it.
@@ -127,8 +162,8 @@ pub struct Start {
 pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
-    let prompts = threads.attach(&start.thread_id, move |incoming| {
-        tokio::spawn(drive(driving, starting, incoming))
+    let prompts = threads.attach(&start.thread_id, move |incoming, decisions| {
+        tokio::spawn(drive(driving, starting, incoming, decisions))
     });
 
     prompts.try_send(prompt).map_err(|error| match error {
@@ -142,11 +177,13 @@ pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), Stri
     })
 }
 
-/// The session: start an agent, feed it turns, publish what it says, reap it.
+/// The session: start an agent, feed it turns and decisions, publish what it
+/// says, reap it.
 async fn drive(
     threads: Threads,
     start: Start,
     mut prompts: tokio::sync::mpsc::Receiver<Prompt>,
+    mut decisions: tokio::sync::mpsc::Receiver<Answered>,
 ) {
     let mut agent = match open(&start).await {
         Ok(agent) => agent,
@@ -175,7 +212,10 @@ async fn drive(
     };
 
     let mut folding = SessionState::new();
-    let mut turn: Option<InFlight> = None;
+    let mut driving = Driving {
+        turn: None,
+        outstanding: HashMap::new(),
+    };
     // A turn that arrived while another was still running. Held rather than
     // sent: sending it would orphan the turn in flight — that turn would never
     // settle, and the finished one's duration and cost would be attributed to
@@ -184,16 +224,21 @@ async fn drive(
     // False once the prompt channel has closed. The agent is then told there
     // will be no more turns and the loop keeps draining what it still owes.
     let mut accepting = true;
+    // False once the decision channel has closed, which is the same moment —
+    // both ends live on the thread's `Live`. Tracked separately anyway, because
+    // a closed channel yields `None` forever and a `select!` arm that kept
+    // polling one would spin.
+    let mut answering = true;
 
     loop {
         // Whatever is waiting goes next, as soon as the turn before it is done.
-        if accepting && turn.is_none() {
+        if accepting && driving.turn.is_none() {
             if let Some(prompt) = waiting.take() {
                 if let Err(error) = agent.send(&prompt.text).await {
                     eprintln!("lightcode: cannot send a turn to the agent: {error}");
                     break;
                 }
-                turn = Some(InFlight {
+                driving.turn = Some(InFlight {
                     turn_id: prompt.turn_id.clone(),
                     assistant_message_id: None,
                     tools: HashMap::new(),
@@ -214,24 +259,50 @@ async fn drive(
         // shutdown mid-turn still closes the agent's input promptly. What it is
         // not allowed to do is take a second prompt before the first has been
         // dealt with, which is what `PROMPT_QUEUE` is behind it for.
+        //
+        // A decision is polled under no such condition, and that asymmetry is the
+        // point: the agent has *stopped* until one arrives, so anything that
+        // deferred it would be the deadlock this ticket is about.
         let next = tokio::select! {
             line = agent.next_line() => Next::Line(line),
+            decision = decisions.recv(), if answering => Next::Answer(decision),
             prompt = prompts.recv(), if accepting && waiting.is_none() => Next::Prompt(prompt),
         };
 
         match next {
             Next::Line(Some(line)) => {
-                publish(&threads, &start, &mut folding, &mut turn, &line);
+                publish(&threads, &start, &mut folding, &mut driving, &line);
             }
             // The agent stopped producing: it exited, or its output was
             // abandoned. Either way there is nothing more to publish.
             Next::Line(None) => break,
+            Next::Answer(Some(answered)) => {
+                answer(&threads, &start, &mut agent, &mut driving, answered).await;
+            }
+            Next::Answer(None) => answering = false,
             Next::Prompt(Some(prompt)) => waiting = Some(prompt),
             Next::Prompt(None) => {
                 accepting = false;
                 agent.close_input();
             }
         }
+    }
+
+    // Whatever the agent was still waiting on is never going to be answered now,
+    // and the client derives its pending-approval panel from these two kinds
+    // alone — so a request left open here is a composer the developer cannot type
+    // into, for the life of the conversation and across every restart after it.
+    // Closing them is what makes "the session remains usable" true of the way a
+    // session actually ends.
+    for asked in driving.take_outstanding() {
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(crate::worklog::resolved(
+                &asked,
+                Decision::Cancel,
+                driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+            )),
+        );
     }
 
     // Reaped first, and the complaint comes back from the reaping. A session that
@@ -255,7 +326,7 @@ async fn drive(
     // A turn still in flight when the agent went is a turn that will never
     // finish, and saying "stopped" would let it sit in the UI as running
     // forever. Which of the two it is decides how the client settles the turn.
-    let unfinished = turn.is_some();
+    let unfinished = driving.turn.is_some();
     threads.apply(
         &start.thread_id,
         Change::Session(Session {
@@ -296,12 +367,107 @@ fn resume_refused(session_id: &str, complaint: Option<&str>) -> String {
     why
 }
 
-/// Which of the two sources the loop heard from. A named value rather than
-/// bodies inside `select!`, because sending to the agent needs the same mutable
+/// Which of the three sources the loop heard from. A named value rather than
+/// bodies inside `select!`, because writing to the agent needs the same mutable
 /// borrow the line future is holding until the select is over.
 enum Next {
     Line(Option<String>),
     Prompt(Option<Prompt>),
+    Answer(Option<Answered>),
+}
+
+/// What the driver knows that the fold does not.
+///
+/// Both fields are things only this side of the pair ever saw: the fold knows a
+/// permission was *asked*, and this knows it has not been answered and which turn
+/// to attribute the answer to.
+struct Driving {
+    /// The turn the agent is currently working on.
+    turn: Option<InFlight>,
+    /// Permission requests published and not yet answered, by the id the client
+    /// answers with.
+    ///
+    /// Per session rather than per turn, unlike the tool calls beside them, and
+    /// for the opposite reason: a tool call that outlived its turn has nothing
+    /// left to answer it, while a permission that outlives its turn is a *panel
+    /// the developer is still looking at*. Settling one is a thing that has to
+    /// happen, so it must not be dropped with the turn.
+    outstanding: HashMap<String, Permission>,
+}
+
+impl Driving {
+    /// Take every request still waiting, so the caller can close it.
+    fn take_outstanding(&mut self) -> Vec<Permission> {
+        let mut open: Vec<Permission> = std::mem::take(&mut self.outstanding)
+            .into_values()
+            .collect();
+        // A map has no order and these become rows in a work log. Ordered by the
+        // id the agent minted, which is at least the same every run.
+        open.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        open
+    }
+}
+
+/// Tell the agent what the developer decided, and say so in the conversation.
+///
+/// The agent is written to *first*, because that is the half with something
+/// waiting on it: a decision published but not delivered would close the panel
+/// on a conversation that is still stopped. If the write fails the row still goes
+/// up — as a failure — because the alternative is a panel the developer can never
+/// clear.
+async fn answer(
+    threads: &Threads,
+    start: &Start,
+    agent: &mut Agent,
+    driving: &mut Driving,
+    answered: Answered,
+) {
+    // An id this session never asked about, or asked about and has already been
+    // answered on. Said the one way the client recognises as "this request is
+    // gone", so a panel left behind by a session that died without settling is
+    // cleared by the first attempt to answer it rather than being permanent.
+    let Some(asked) = driving.outstanding.remove(&answered.request_id) else {
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(crate::worklog::unanswerable(&answered.request_id)),
+        );
+        return;
+    };
+
+    let sent = agent
+        .answer(&asked.request_id, &answered.decision.answer(&asked))
+        .await;
+    let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+
+    // Reported as a *session* failure rather than as an unanswerable request:
+    // the request was real and this server knew it, and what went wrong is that
+    // the agent stopped reading. The resolution below closes the panel either
+    // way, which is why this does not have to.
+    if let Err(error) = sent {
+        eprintln!("lightcode: cannot answer a permission request: {error}");
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(Activity::failed(
+                "session.failed",
+                &format!(
+                    "The decision could not be sent to the agent, which is no longer reading: \
+                     {error}"
+                ),
+            )),
+        );
+    }
+
+    // Published either way, and after the write either way. This is what closes
+    // the panel, and a decision that reached the agent and was never recorded
+    // would leave the developer asked a second time about work already under way.
+    threads.apply(
+        &start.thread_id,
+        Change::Activity(crate::worklog::resolved(
+            &asked,
+            answered.decision,
+            turn_id,
+        )),
+    );
 }
 
 /// The session is working on this turn.
@@ -368,11 +534,35 @@ fn publish(
     threads: &Threads,
     start: &Start,
     folding: &mut SessionState,
-    turn: &mut Option<InFlight>,
+    driving: &mut Driving,
     line: &str,
 ) {
+    let turn = &mut driving.turn;
     match folding.fold_line(line) {
         Folded::Nothing => {}
+
+        // The agent has stopped and is waiting for the developer. The row is what
+        // raises the question — the client's pending-approval panel is folded out
+        // of these — and the copy beside it is what makes the answer possible,
+        // because the answer names an id and the *request* is what has to be sent
+        // back with it.
+        //
+        // The session stays `running` throughout, deliberately. It is true — the
+        // turn has not ended — and it is also the only thing that can be said:
+        // `OrchestrationSessionStatus` has no `waiting`, and a status outside that
+        // union fails the client's decode of the whole session. What tells the
+        // developer they are being waited on is the panel.
+        Folded::PermissionRequested { index } => {
+            let asked = folding.permissions[index].clone();
+            threads.apply(
+                &start.thread_id,
+                Change::Activity(crate::worklog::requested(
+                    &asked,
+                    turn.as_ref().map(|turn| turn.turn_id.clone()),
+                )),
+            );
+            driving.outstanding.insert(asked.request_id.clone(), asked);
+        }
 
         // The agent announcing itself. Once per process rather than per turn, so
         // this only ever appends the activity; the session's `running` comes

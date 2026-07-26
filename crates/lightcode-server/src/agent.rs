@@ -11,6 +11,17 @@
 //! the same split the crate keeps everywhere: a format change has a blast radius
 //! of one pure file, and the process handling is not in it.
 //!
+//! ## Two kinds of line go out, and the second one has the agent waiting
+//!
+//! [`Agent::send`] is a turn. [`Agent::answer`] is a permission decision, and it
+//! is different in kind rather than in content: the agent has *stopped* until it
+//! arrives. Both are one line and both are flushed, and the reason for flushing
+//! is the same in both cases and merely more urgent in the second.
+//!
+//! What makes an answer possible at all is [`PERMISSION_PROMPT_TOOL`], which is
+//! passed on every session and tells the CLI to ask this stdio pair rather than
+//! an MCP server.
+//!
 //! ## Why the output is read by a task rather than by whoever wants it
 //!
 //! A child that is writing has to be read, or it blocks on a pipe nobody is
@@ -32,6 +43,14 @@
 //! drops the writer first and only kills if the child has not gone by the
 //! deadline. Killing first would be simpler and would lose the tail of the
 //! output for no reason.
+//!
+//! It is also what unwedges an agent stopped on a permission nobody answered.
+//! Closing stdin closes the permission stream with it, and the CLI abandons the
+//! request rather than waiting on it — the tool comes back as
+//! `Tool permission request failed: AbortError: Tool permission stream closed`,
+//! the turn finishes, and the child exits on its own.
+//! `fixtures/claude-cli/09-permission-unanswered.ndjson` is that, recorded. So an
+//! unanswered request costs a tool call and never a process.
 //!
 //! `kill_on_drop` is set as well. It is not the mechanism — [`Agent::stop`] is —
 //! but a panic unwinding past an `Agent` must not leave a `claude` running, and
@@ -64,6 +83,24 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// How often a stopping agent looks to see whether the child has gone.
 const EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// The `--permission-prompt-tool` value that routes permission prompts onto this
+/// stdio pair instead of into an MCP server.
+///
+/// The flag is documented as taking "an MCP tool to use for permission prompts",
+/// and `stdio` is the reserved name that means "ask me, here" — it is what the
+/// Agent SDK passes when a host supplies a `canUseTool` callback, and it is
+/// hidden from `--help`. So this is the one string in the crate read off the
+/// binary rather than off documentation, and
+/// `fixtures/claude-cli/07-permission-approved.ndjson` is the recording that
+/// proves it does what it says.
+///
+/// Passed on every session rather than only for the mode that asks. What the flag
+/// selects is *where a prompt goes*, not whether there is one — that is
+/// `--permission-mode`'s job, and under `bypassPermissions` the CLI never asks
+/// and this channel stays silent. Making it conditional would mean a mode the
+/// developer changed mid-conversation could leave a running agent unable to ask.
+const PERMISSION_PROMPT_TOOL: &str = "stdio";
 
 /// Everything that varies between one agent and the next.
 ///
@@ -100,9 +137,9 @@ pub struct Launch {
 /// Upstream's table (`ClaudeAdapter.ts:3510`) verbatim, including its one
 /// omission: `approval-required` maps to nothing, because upstream expresses it
 /// by *not* passing the flag and answering the CLI's permission callback
-/// instead. lightcode has no such callback until ticket 13, so this server sends
-/// no flag for it either and the CLI's own default applies — which is right for
-/// a turn that uses no tools, and is ticket 13's to make right for one that does.
+/// instead. This server now does the same — the callback is
+/// [`PERMISSION_PROMPT_TOOL`] — so the CLI's own default applies and its default
+/// is to ask. Which is what `approval-required` means.
 pub fn permission_mode_for(runtime_mode: &str) -> Option<&'static str> {
     match runtime_mode {
         "auto-accept-edits" => Some("acceptEdits"),
@@ -161,6 +198,9 @@ impl Agent {
             .arg("stream-json")
             .arg("--include-partial-messages")
             .arg("--verbose")
+            // Where a permission prompt goes. See [`PERMISSION_PROMPT_TOOL`].
+            .arg("--permission-prompt-tool")
+            .arg(PERMISSION_PROMPT_TOOL)
             .current_dir(&launch.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -236,18 +276,38 @@ impl Agent {
     }
 
     /// Send one user turn.
-    ///
-    /// The whole of the outbound protocol: one JSON object on one line. Flushed
-    /// rather than left to the buffer, because the agent is waiting for it and
-    /// a prompt that sat in a write buffer would look exactly like a hang.
     pub async fn send(&mut self, text: &str) -> std::io::Result<()> {
+        self.write_line(crate::protocol::user_message_line(text))
+            .await
+    }
+
+    /// Answer a permission request the agent is waiting on.
+    ///
+    /// The other half of the outbound protocol, and the half with a deadline: the
+    /// agent has stopped mid-turn and will not go on until this lands, so a write
+    /// that failed here is a wedged conversation rather than a lost message. The
+    /// caller reports it; this only says so.
+    pub async fn answer(
+        &mut self,
+        request_id: &str,
+        answer: &crate::protocol::Answer,
+    ) -> std::io::Result<()> {
+        self.write_line(crate::protocol::control_response_line(request_id, answer))
+            .await
+    }
+
+    /// One JSON object on one line, which is the whole of what this server ever
+    /// says to the agent.
+    ///
+    /// Flushed rather than left to the buffer, because the agent is waiting for
+    /// it and a line that sat in a write buffer would look exactly like a hang.
+    async fn write_line(&mut self, mut line: String) -> std::io::Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "the agent's input has already been closed",
             )
         })?;
-        let mut line = crate::protocol::user_message_line(text);
         line.push('\n');
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await
@@ -356,7 +416,8 @@ mod tests {
         assert_eq!(
             permission_mode_for("approval-required"),
             None,
-            "upstream expresses this by omitting the flag, and so does this"
+            "upstream expresses this by omitting the flag, and so does this — the \
+             CLI's own default is to ask, and asking is what the mode means"
         );
         assert_eq!(permission_mode_for("something-later"), None);
     }

@@ -96,6 +96,16 @@ pub const SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
 /// started cannot absorb prompts forever.
 const PROMPT_QUEUE: usize = 8;
 
+/// How many permission decisions may be waiting for a driver that has not read
+/// them yet.
+///
+/// A separate channel from the prompts rather than a second kind of message on
+/// one, and that is the whole reason it exists: a turn is queued *behind* the
+/// turn in flight, and an answer is owed to the turn in flight. Sharing a channel
+/// would put the answer behind a prompt the driver is deliberately not reading
+/// yet, which is a conversation waiting on a decision that has already been made.
+const ANSWER_QUEUE: usize = 8;
+
 // ---------------------------------------------------------------------------
 // What a thread is
 // ---------------------------------------------------------------------------
@@ -289,11 +299,13 @@ impl Thread {
     /// The `OrchestrationThreadShell` the project list carries — the same thread
     /// without its transcript, plus the three flags the inbox sorts on.
     ///
-    /// All three are `false` here and each is a later ticket's: approvals are
-    /// ticket 13, the user-input questions that go with them are the same, and a
-    /// proposed plan needs `ExitPlanMode` to be answered rather than merely
-    /// reported, which is the same ticket. A `true` any of them could not be acted
-    /// on would put a badge on a thread with nothing behind it.
+    /// The first is now real: a thread the agent has asked permission on raises
+    /// its hand in the thread list, which is what makes a conversation waiting on
+    /// the developer findable from another one. The other two stay `false` and
+    /// each is a later ticket's — the user-input questions an `AskUserQuestion`
+    /// raises, and a proposed plan, which needs `ExitPlanMode` answered rather
+    /// than merely reported. A `true` neither could be acted on would put a badge
+    /// on a thread with nothing behind it.
     pub fn to_shell_value(&self) -> Value {
         json!({
             "id": self.id,
@@ -312,7 +324,13 @@ impl Thread {
             "settledAt": Value::Null,
             "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
             "latestUserMessageAt": self.latest_user_message_at,
-            "hasPendingApprovals": false,
+            // Derived from the work log rather than counted beside it, because
+            // the client derives its own panel from the same rows — a counter
+            // kept here would be a second answer to one question, and the two
+            // would agree until they did not. Linear in the work log, and only
+            // for the shell summary, which a delta and an activity both skip
+            // ([`Change::reaches_the_shell`]).
+            "hasPendingApprovals": !crate::worklog::unanswered(&self.activities).is_empty(),
             "hasPendingUserInput": false,
             "hasActionableProposedPlan": false,
         })
@@ -433,6 +451,24 @@ impl Activity {
     pub fn tool(kind: &str, summary: &str, payload: Value, turn_id: Option<String>) -> Activity {
         Activity {
             tone: "tool",
+            ..Activity::info(kind, summary, payload, turn_id)
+        }
+    }
+
+    /// The agent asking to be allowed to do something, or the answer to one.
+    ///
+    /// `approval` is one of the contract's four tones and the only one this
+    /// server does not otherwise use. The UI renders the *row* as an ordinary
+    /// info row (`session-logic.ts`, `toDerivedWorkLogEntry`), so the tone earns
+    /// its place elsewhere: it is what says a row is about a decision rather than
+    /// about work, which is what the tone vocabulary is for and what a later
+    /// reader of the transcript needs.
+    ///
+    /// The panel itself is driven by the `kind` and by `payload.requestId` — see
+    /// [`crate::worklog`], where both are built.
+    pub fn approval(kind: &str, summary: &str, payload: Value, turn_id: Option<String>) -> Activity {
+        Activity {
+            tone: "approval",
             ..Activity::info(kind, summary, payload, turn_id)
         }
     }
@@ -639,6 +675,7 @@ struct Entry {
 #[derive(Debug)]
 struct Live {
     prompts: mpsc::Sender<Prompt>,
+    answers: mpsc::Sender<Answered>,
     task: JoinHandle<()>,
 }
 
@@ -670,6 +707,17 @@ pub struct Reconciliation {
 pub struct Prompt {
     pub turn_id: String,
     pub text: String,
+}
+
+/// One permission decision on its way to the agent waiting for it.
+///
+/// The id rather than the request: the driver holds what was asked, because it
+/// is the only thing that saw the question, and the client answers by naming the
+/// id it was shown.
+#[derive(Debug, Clone)]
+pub struct Answered {
+    pub request_id: String,
+    pub decision: crate::worklog::Decision,
 }
 
 impl Threads {
@@ -1224,7 +1272,7 @@ impl Threads {
     pub fn attach(
         &self,
         thread_id: &str,
-        start: impl FnOnce(mpsc::Receiver<Prompt>) -> JoinHandle<()>,
+        start: impl FnOnce(mpsc::Receiver<Prompt>, mpsc::Receiver<Answered>) -> JoinHandle<()>,
     ) -> mpsc::Sender<Prompt> {
         let entry = self.entry(thread_id);
         let mut live = lock(&entry.live);
@@ -1233,12 +1281,50 @@ impl Threads {
         }
 
         let (prompts, incoming) = mpsc::channel(PROMPT_QUEUE);
+        let (answers, decisions) = mpsc::channel(ANSWER_QUEUE);
         self.inner.live_agents.fetch_add(1, Ordering::Relaxed);
         *live = Some(Live {
             prompts: prompts.clone(),
-            task: start(incoming),
+            answers,
+            task: start(incoming, decisions),
         });
         prompts
+    }
+
+    /// Hand a permission decision to the agent that is waiting on it.
+    ///
+    /// Refused, with a sentence, when there is nothing waiting: a decision with
+    /// no session behind it is one the developer is about to be told did not
+    /// land, which is a great deal better than an approval that quietly reached
+    /// nothing. Whether the *request* is one this session knows is the driver's
+    /// question, because the driver is what saw it asked.
+    ///
+    /// Synchronous, like [`Threads::attach`] and for the same reason: it is
+    /// called from the socket's read loop, which has to stay free for the next
+    /// frame.
+    pub fn answer(&self, thread_id: &str, answered: Answered) -> Result<(), String> {
+        let entry = self
+            .find(thread_id)
+            .ok_or_else(|| format!("There is no conversation '{thread_id}' on this server."))?;
+        let live = lock(&entry.live);
+        let Some(running) = live.as_ref() else {
+            return Err(
+                "No agent is running for this conversation, so there is no permission request \
+                 left to answer."
+                    .to_string(),
+            );
+        };
+
+        running.answers.try_send(answered).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                "The agent has not read the decisions already sent to it, so this one was not \
+                 queued."
+                    .to_string()
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                "The agent session has ended and could not be given this decision.".to_string()
+            }
+        })
     }
 
     /// Called by the driver when its agent has gone, so the next turn starts a

@@ -19,6 +19,7 @@
   ],
   "live_text": "",
   "streaming": false,
+  "permissions": [],
   "last_result": {
     "is_error": false,
     "stop_reason": "end_turn",

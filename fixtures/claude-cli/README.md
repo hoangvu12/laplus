@@ -15,6 +15,11 @@ against what the CLI actually said. That gives a capture two jobs — the reduce
 is held to it, and the server is driven by it — and it is why re-capturing after
 a `claude` release is worth doing even when the golden files still match.
 
+A capture containing a `control_request` is replayed with a stop where the
+request is: the CLI waits there for an answer, and everything after that line in
+the recording happened *because of* the answer. Playing it straight through would
+have the stand-in react to a decision nobody had made.
+
 ## The captures
 
 | File | Provenance | What it covers |
@@ -25,11 +30,48 @@ a `claude` release is worth doing even when the golden files still match.
 | `04-tool-use.ndjson` | Recorded, ticket 12 | One tool call end to end: reasoning, a `tool_use`, its `tool_result` as a `user` message, more reasoning, then the reply |
 | `05-tool-failure.ndjson` | Recorded, ticket 12 | The same shape with `"is_error": true` on the result — a `Read` of a file that is not there |
 | `06-several-tool-calls.ndjson` | Recorded, ticket 12 | Two calls in one turn, each answered before the next is announced |
+| `07-permission-approved.ndjson` | Recorded, ticket 13 | A `control_request` asking to use `Write`, approved — the tool then succeeds |
+| `08-permission-declined.ndjson` | Recorded, ticket 13 | The same request declined: the tool result carries the refusal, and the agent answers anyway |
+| `09-permission-unanswered.ndjson` | Recorded, ticket 13 | The same request left hanging until stdin closed — the CLI abandons it and finishes the turn |
+| `10-permission-for-the-session.ndjson` | Recorded, ticket 13 | Approved with the CLI's own permission suggestion handed back: two `Write` calls, one request |
 
 The `.scratch/*.ndjson` originals stay where they are as raw evidence; these are
-the committed, test-facing copies. `04`–`06` were recorded straight into
+the committed, test-facing copies. `04`–`10` were recorded straight into
 `fixtures/` against `claude-haiku-4-5`, with the same flags
 [`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes.
+
+## What `07`–`10` settled
+
+The CLI's permission channel is not in `--help` and not in any contract this
+repository has. What these four record is that it exists and what it is:
+
+- **The prompt arrives as a `control_request` on stdout**, with
+  `"subtype": "can_use_tool"`, and the CLI **stops** until a `control_response`
+  comes back on stdin. It only does so when started with
+  `--permission-prompt-tool stdio` — a hidden flag whose documented description
+  is "MCP tool to use for permission prompts", where `stdio` is the reserved name
+  meaning "ask me, here".
+- **The request names the `tool_use` block it is for**, so the approval row and
+  the tool row are visibly the same piece of work.
+- **It carries `permission_suggestions`**, which are permission updates the CLI
+  is offering to apply. Handing them straight back as `updatedPermissions` is the
+  whole of how "always allow this session" works, and `10` is the proof: two
+  `Write` calls, one request.
+- **A denial returns control cleanly.** `08`'s tool result is the deny message
+  with `"is_error": true`, the agent reads it and answers, and the turn ends
+  `"is_error": false`. A rejection is not a failed turn.
+- **An unanswered request costs a tool call and nothing else.** In `09` the
+  permission stream closes with stdin and the tool comes back as
+  `Tool permission request failed: AbortError`; the CLI retries twice, gives up,
+  and finishes the turn normally. Nothing hangs and nothing is orphaned.
+
+One thing they do *not* record, because no capture can: what this server sent.
+The answer travels on stdin, and the assertions about it live in
+`tests/socket_permissions.rs`, which reads the lines the agent was written.
+
+`tools/permission-capture/record.mjs` is how they were made and how to make them
+again; a permission capture cannot be produced by hand, because everything after
+the request is a consequence of the answer.
 
 ## What `04`–`06` settled that no amount of reading could
 
