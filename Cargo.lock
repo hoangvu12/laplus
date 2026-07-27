@@ -1699,6 +1699,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "laplus-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "notify",
+ "portable-pty",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "laplus-shell"
+version = "0.1.0"
+dependencies = [
+ "laplus-server",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1728,33 +1755,6 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "lightcode-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures-util",
- "notify",
- "portable-pty",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
-name = "lightcode-shell"
-version = "0.1.0"
-dependencies = [
- "lightcode-server",
- "serde_json",
- "tauri",
- "tauri-build",
- "tokio",
 ]
 
 [[package]]

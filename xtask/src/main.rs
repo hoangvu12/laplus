@@ -1,11 +1,11 @@
 //! The build that measures itself.
 //!
-//! lightcode exists for one number. The spec puts it plainly — "the artifact is
+//! laplus exists for one number. The spec puts it plainly — "the artifact is
 //! measured at every build, and 20–30 MB is the target against upstream's 318 MB
 //! Windows installer" — and ticket 24 turns that into work: the measurement
 //! "becomes part of the build rather than a thing someone checks occasionally".
 //!
-//! So `cargo xtask release` is how a release of lightcode is made. It produces
+//! So `cargo xtask release` is how a release of laplus is made. It produces
 //! the installer and, in the same run, weighs it, weighs what it installs,
 //! counts the Rust, checks that upstream's licence still ships, and writes
 //! `docs/artifact-size.md`. Building without measuring is not offered here,
@@ -29,7 +29,7 @@
 //!   ├─ cargo tauri build           → target/release/bundle/nsis/*-setup.exe
 //!   ├─ weigh the installer and the binary
 //!   ├─ weigh what is installed     → payload, or a real install with the flag
-//!   ├─ count crates/lightcode-server/src
+//!   ├─ count crates/laplus-server/src
 //!   └─ docs/artifact-size.md, and the same thing on stdout
 //! ```
 //!
@@ -50,8 +50,8 @@ use std::process::{Command, ExitCode};
 
 use report::Measurements;
 
-const SHELL: &str = "crates/lightcode-shell";
-const SERVER_SOURCE: &str = "crates/lightcode-server/src";
+const SHELL: &str = "crates/laplus-shell";
+const SERVER_SOURCE: &str = "crates/laplus-server/src";
 const REPORT: &str = "docs/artifact-size.md";
 const USAGE: &str = "usage: cargo xtask release [--measure-install]";
 
@@ -107,7 +107,7 @@ fn release(measure_install: bool) -> Result<String, String> {
     run(Command::new("cargo").arg("tauri").arg("build").current_dir(root.join(SHELL)))?;
 
     let installer = installer_path(&root)?;
-    let binary = root.join("target/release/lightcode.exe");
+    let binary = root.join("target/release/laplus.exe");
 
     let measured = Measurements {
         installer: weigh(&installer)?,

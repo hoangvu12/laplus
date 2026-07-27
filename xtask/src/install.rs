@@ -1,9 +1,9 @@
-//! Where lightcode installs, and what it costs a disk.
+//! Where laplus installs, and what it costs a disk.
 //!
 //! One module for both because ticket 30 was what happens when they are two.
-//! Tauri's NSIS default put the application in `%LOCALAPPDATA%\lightcode` and
-//! `lightcode_server::config::data_dir` put the developer's database in
-//! `%LOCALAPPDATA%\lightcode`; neither default was wrong on its own and
+//! Tauri's NSIS default put the application in `%LOCALAPPDATA%\laplus` and
+//! `laplus_server::config::data_dir` put the developer's database in
+//! `%LOCALAPPDATA%\laplus`; neither default was wrong on its own and
 //! nothing pointed at the other, so it took a real install to see. Everything
 //! in this repository that knows where the installer writes is now here, and
 //! [`redirected`] is checked by `cargo test` and again before every release
@@ -22,14 +22,14 @@ use crate::tree::walk;
 use crate::{run, weigh};
 
 /// Tauri's NSIS writes an ordinary uninstall key under the **product name** —
-/// `lightcode`, not the bundle identifier.
-const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\lightcode";
+/// `laplus`, not the bundle identifier.
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\laplus";
 
 /// The directory a per-user install is moved into, under `%LOCALAPPDATA%`.
 ///
 /// Where per-user applications more usually go, and the point of it here is
-/// the one thing it is *not*: `%LOCALAPPDATA%\lightcode`, which is
-/// `lightcode_server::config::data_dir` and holds `state.sqlite`,
+/// the one thing it is *not*: `%LOCALAPPDATA%\laplus`, which is
+/// `laplus_server::config::data_dir` and holds `state.sqlite`,
 /// `keybindings.json` and `logs/`.
 const PROGRAMS: &str = "Programs";
 
@@ -37,7 +37,7 @@ const PROGRAMS: &str = "Programs";
 /// `${PRODUCTNAME}` and takes it from `tauri.conf.json`, so this is the same
 /// name as in [`UNINSTALL_KEY`] and for the same reason: what the *bundle*
 /// calls this application, resolved.
-const PRODUCT: &str = "lightcode";
+const PRODUCT: &str = "laplus";
 
 /// The NSIS template that puts it there, relative to the shell crate.
 pub const TEMPLATE: &str = "nsis/installer.nsi";
@@ -45,9 +45,9 @@ pub const TEMPLATE: &str = "nsis/installer.nsi";
 /// The second half of the patch, and the half that reads like a detail.
 ///
 /// `RestorePreviousInstallLocation` puts `$INSTDIR` back to whatever
-/// `Software\lightcode\lightcode` remembers, and an uninstall leaves that value
+/// `Software\laplus\laplus` remembers, and an uninstall leaves that value
 /// behind unless the "delete application data" checkbox was ticked. So a
-/// machine that installed lightcode once keeps installing it in the same place
+/// machine that installed laplus once keeps installing it in the same place
 /// no matter what the default says. Guarding the restore on the binary still
 /// being there is what makes the moved default reach anybody.
 const RESTORE_GUARD: &str = r#"${AndIf} ${FileExists} "$4\${MAINBINARYNAME}.exe""#;
@@ -60,7 +60,7 @@ fn moved_default() -> String {
     format!(r#"StrCpy $INSTDIR "$LOCALAPPDATA\{PROGRAMS}\${{PRODUCTNAME}}""#)
 }
 
-/// What has gone wrong with where lightcode installs.
+/// What has gone wrong with where laplus installs.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Astray {
     /// `tauri.conf.json` no longer names the vendored template, so the bundler
@@ -85,7 +85,7 @@ pub enum Astray {
     DefaultNotMoved,
     /// The default moved and the template restores a remembered install
     /// location without checking that anything is installed at it — so on any
-    /// machine that has ever installed lightcode, the move has no effect. The
+    /// machine that has ever installed laplus, the move has no effect. The
     /// failure that reads as a fix, and the one that was actually measured.
     RestoreUnguarded,
 }
@@ -132,16 +132,16 @@ pub fn redirected(config: &str, template: &str) -> Result<(), Astray> {
 /// Install, weigh what landed, and put the machine back as it was.
 pub fn measure(installer: &Path) -> Result<Footprint, String> {
     // This never runs an uninstaller it did not cause. Silently removing the
-    // copy of lightcode a developer actually uses, in order to print a size,
+    // copy of laplus a developer actually uses, in order to print a size,
     // is not a trade a build tool gets to make — and an install over an
     // install is also a directory holding two builds' files, which is not the
     // thing the report claims to have weighed.
     if let Some(existing) = installed_at() {
         return Err(format!(
-            "lightcode is already installed at {}.\n\
+            "laplus is already installed at {}.\n\
              \n\
              This installs, weighs the directory, and uninstalls again — which here would \
-             mean weighing a mixture of two builds and then removing a copy of lightcode \
+             mean weighing a mixture of two builds and then removing a copy of laplus \
              this build did not put there.\n\
              \n\
              Uninstall it first ({}) and run this again, or drop --measure-install to \
@@ -212,7 +212,7 @@ pub fn measure(installer: &Path) -> Result<Footprint, String> {
     })
 }
 
-/// Where lightcode is installed, if it is.
+/// Where laplus is installed, if it is.
 ///
 /// Asked of the uninstall key rather than assumed, which is shorter than
 /// reproducing NSIS's default and reads a per-machine install too — hence both
@@ -297,7 +297,7 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = r#"{
-      "productName": "lightcode",
+      "productName": "laplus",
       "bundle": {
         "windows": {
           "nsis": { "template": "nsis/installer.nsi" }
@@ -313,13 +313,13 @@ mod tests {
     /// The one that will actually catch something. A release build checks this
     /// too, but a release build is three minutes and a decision, and `cargo
     /// test` is where someone finds out that an edit to `tauri.conf.json` or a
-    /// re-vendoring of the template put lightcode back on top of the database.
+    /// re-vendoring of the template put laplus back on top of the database.
     #[test]
     fn the_installer_this_repository_ships_writes_outside_the_data_directory() {
         let shell = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask is in the workspace")
-            .join("crates/lightcode-shell");
+            .join("crates/laplus-shell");
 
         let config =
             std::fs::read_to_string(shell.join("tauri.conf.json")).expect("the shell's bundle configuration");
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn a_bundle_this_module_no_longer_describes_is_refused_rather_than_assumed() {
         assert_eq!(
-            redirected(&CONFIG.replace("lightcode", "lamplight"), &patched()),
+            redirected(&CONFIG.replace("laplus", "lamplight"), &patched()),
             Err(Astray::ProductRenamed)
         );
         assert_eq!(
@@ -378,7 +378,7 @@ mod tests {
 
     /// Half the patch is not half the fix. A moved default with upstream's
     /// unguarded restore behind it installs into the data directory on every
-    /// machine that has ever installed lightcode — which is a fix that reads
+    /// machine that has ever installed laplus — which is a fix that reads
     /// as done and was measured doing nothing.
     #[test]
     fn moving_the_default_without_guarding_the_restore_is_not_a_redirection() {

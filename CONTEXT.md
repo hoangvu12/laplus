@@ -1,6 +1,6 @@
 # Context
 
-lightcode's domain language. One term per entry, as the code uses it.
+laplus's domain language. One term per entry, as the code uses it.
 
 Two vocabularies meet in this project and it is worth naming which is which:
 the **agent protocol** is what the `claude` CLI speaks, the **contract** is what
@@ -251,21 +251,30 @@ names anything. Reaping happens at the second, never the first.
 
 ## Shell
 
-**Shell** — lightcode as a desktop application: a window, and the server
-running inside the same process. `crates/lightcode-shell`. The server is a
+**Shell** — laplus as a desktop application: a window, and the server
+running inside the same process. `crates/laplus-shell`. The server is a
 library to it, not a service it talks to, which is why closing the window is
 what reaps the agents.
 
 **laplus** — the UI, as a repository this project owns: a fork of t3code, cloned
 beside this one. Where the window's contents are changed, and the answer to
-"can we fix that in the client?", which used to be no. See ADR-0012.
+"can we fix that in the client?", which used to be no. See ADR-0012. Also, since
+the rename, what this whole product is called.
+
+**lightcode** — what laplus was called until ticket 30 closed. Retired from the
+live code entirely, and deliberately *not* rewritten anywhere it is a record of
+something: `fixtures/` are captures of real traffic and the paths inside them
+happened, `.scratch/` tickets and `docs/adr/` are dated statements of what was
+decided at the time, and editing either would make them claim to be evidence of
+things that never occurred. So roughly sixty mentions survive on purpose. If a
+mention is in code, configuration or living documentation, it is a bug.
 
 **Bundle** — laplus's built web application, `laplus/apps/web/dist`, as it
 reaches the executable: a table of names and bytes generated at build time.
 Source maps are the one thing dropped, and they are two thirds of it.
 
 **Upstream** — `pingdotgg/t3code`. Still the origin of every line of the UI and
-of the contract, and still the thing lightcode is measured against — but now a
+of the contract, and still the thing laplus is measured against — but now a
 remote to merge from rather than a checkout to read.
 
 **Assets** — the bundle as the server holds it, and the rules for answering a
@@ -290,9 +299,9 @@ The window is pointed at `http://127.0.0.1:4773/`, so the port is part of what
 the browser scopes `localStorage` by — and `localStorage` is where the UI keeps
 the developer's layout, drafts and open thread. See ADR-0010.
 
-**Install directory** — `%LOCALAPPDATA%\Programs\lightcode`, where the
+**Install directory** — `%LOCALAPPDATA%\Programs\laplus`, where the
 installer writes. Named separately from the **data directory** —
-`%LOCALAPPDATA%\lightcode`, `config::data_dir`, which holds `state.sqlite`,
+`%LOCALAPPDATA%\laplus`, `config::data_dir`, which holds `state.sqlite`,
 `keybindings.json` and `logs/` — because until ticket 30 they were one
 directory and nothing in either half said so. Moving the install is what
 separated them; the data has not moved. See ADR-0013.

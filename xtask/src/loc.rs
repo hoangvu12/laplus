@@ -389,7 +389,7 @@ mod tests {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask is in the workspace")
-            .join("crates/lightcode-server/src");
+            .join("crates/laplus-server/src");
 
         let measured = breakdown_tree(&source).expect("the server's sources are readable");
 

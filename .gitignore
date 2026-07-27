@@ -12,7 +12,7 @@ dist/
 
 # Tauri. `gen/schemas` is written by `tauri-build` on every build from the
 # capability files beside it, so it is output rather than source.
-crates/lightcode-shell/gen/
+crates/laplus-shell/gen/
 
 # Raw, unredacted proxy recordings. Curated fixtures live in fixtures/socket-wire/;
 # these hold live session tokens and are working scratch (see docs/socket-wire-format.md).

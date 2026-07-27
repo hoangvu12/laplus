@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lightcode-server", "crates/lightcode-shell", "xtask"]
+members = ["crates/laplus-server", "crates/laplus-shell", "xtask"]
 # `cargo build` and `cargo test` with no `-p` build the server and not the shell.
 #
 # The shell embeds `../laplus/apps/web/dist` — a second repository, needing a
@@ -9,7 +9,7 @@ members = ["crates/lightcode-server", "crates/lightcode-shell", "xtask"]
 # came from a vendored checkout (ticket 23) and is more true now that it comes
 # from somewhere else entirely (ticket 32). This is how it stays contained: the
 # shell has the dependency because it must, and nothing else inherits it.
-# `cargo build -p lightcode-shell` asks for the application and gets a legible
+# `cargo build -p laplus-shell` asks for the application and gets a legible
 # failure — with the two commands that fix it — if the bundle is not there.
 #
 # It also keeps the suite quick. The shell pulls in Tauri, which is a thousand
@@ -18,7 +18,7 @@ members = ["crates/lightcode-server", "crates/lightcode-shell", "xtask"]
 # `xtask` is in the default set on purpose, unlike the shell: it depends on
 # nothing, and the arithmetic that decides whether this project achieved what it
 # set out to should be checked by the same `cargo test` as everything else.
-default-members = ["crates/lightcode-server", "xtask"]
+default-members = ["crates/laplus-server", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

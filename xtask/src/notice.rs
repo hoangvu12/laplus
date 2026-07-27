@@ -69,7 +69,7 @@ mod tests {
 
     const CONFIG: &str = r#"{
       "bundle": {
-        "copyright": "lightcode. UI derived from t3code, Copyright (c) T3 Tools, Inc., MIT licence.",
+        "copyright": "laplus. UI derived from t3code, Copyright (c) T3 Tools, Inc., MIT licence.",
         "licenseFile": "../../THIRD_PARTY_NOTICES.md",
         "resources": { "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md" }
       }
@@ -117,7 +117,7 @@ mod tests {
             .parent()
             .expect("xtask is in the workspace");
 
-        let config = std::fs::read_to_string(root.join("crates/lightcode-shell/tauri.conf.json"))
+        let config = std::fs::read_to_string(root.join("crates/laplus-shell/tauri.conf.json"))
             .expect("the shell's bundle configuration");
         let text = std::fs::read_to_string(root.join(NOTICE)).expect("the notice");
 

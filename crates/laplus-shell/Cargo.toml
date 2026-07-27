@@ -1,0 +1,31 @@
+[package]
+name = "laplus-shell"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# `laplus` rather than `laplus-shell`: this is the application, and its
+# name is what a developer sees in the task manager and on a shortcut.
+[[bin]]
+name = "laplus"
+path = "src/main.rs"
+
+[dependencies]
+# The window and the webview, and nothing else. Default features off for the
+# same reason the size spike measured with them off: what is not linked is not
+# downloaded. `wry` is the webview binding itself — on Windows a thin layer over
+# WebView2, which is the operating system's own and ships with it.
+tauri = { version = "2", default-features = false, features = ["wry"] }
+laplus-server = { path = "../laplus-server" }
+tokio.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", default-features = false }
+# To read one field out of upstream's `package.json` — the version the embedded
+# UI was built as, which ticket 26 makes this server's own. A build dependency
+# is not linked into the artifact, and hand-rolling the read would mean deciding
+# what to do about escapes and comments in somebody else's file.
+serde_json.workspace = true

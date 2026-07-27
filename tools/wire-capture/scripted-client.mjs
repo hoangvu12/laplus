@@ -125,7 +125,7 @@ const scenarios = {
   // the server has no handler for.
   async error({ request, waitFor }) {
     request("0", "projects.readFile", {
-      cwd: "C:\\lightcode-wire-capture-does-not-exist",
+      cwd: "C:\\laplus-wire-capture-does-not-exist",
       relativePath: "missing.txt",
     });
     await waitFor(isExit("0"));

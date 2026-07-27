@@ -50,7 +50,7 @@ if (!DECISIONS.has(decision) || !out) {
 // the first attempt at this recording came back with no request in it. A `Write`
 // always asks in the default permission mode.
 const prompt = rest.join(" ") || "Create a file called note.txt containing the word hello";
-const cwd = mkdtempSync(join(tmpdir(), "lightcode-perm-"));
+const cwd = mkdtempSync(join(tmpdir(), "laplus-perm-"));
 const log = createWriteStream(out);
 
 const child = spawn(

@@ -1,20 +1,28 @@
-# lightcode
+# laplus — the server and the shell
 
 A Rust server + Tauri shell that drives the `claude` CLI directly, wearing the
-`apps/web` UI from **laplus**. See `HANDOFF-rust-server-tauri.md` for the plan
-and `spike-claude-protocol/README.md` for the STEP 1 protocol spike that gated
-it (answered; its code now lives in the workspace).
+`apps/web` UI from the laplus UI repository. See `HANDOFF-rust-server-tauri.md`
+for the plan and `spike-claude-protocol/README.md` for the STEP 1 protocol spike
+that gated it (answered; its code now lives in the workspace).
 
-## The UI lives in another repository
+**This project was called `lightcode` until the rename.** Every ticket in
+`.scratch/`, every ADR, and every capture in `fixtures/` was written under that
+name and still says it — see the **lightcode** entry in `CONTEXT.md`. Nothing in
+the live code does.
 
-`laplus` — <https://github.com/hoangvu12/laplus>, this project's fork of
-`pingdotgg/t3code` — is cloned **beside** this repo, not inside it:
+## The UI lives in another repository, for now
+
+The UI repository — <https://github.com/hoangvu12/laplus>, this project's fork
+of `pingdotgg/t3code` — is cloned **beside** this one, not inside it:
 
 ```
 nguyenvu/
-├── lightcode/   ← here. the Rust server, the shell, the tickets
+├── lightcode/   ← this checkout: the Rust server, the shell, the tickets
 └── laplus/      ← the UI. `apps/web` builds the bundle the shell embeds
 ```
+
+Both are being merged into the UI repository, with this tree becoming `server/`
+there. Until that lands, the two directory names above are what is on disk.
 
 The shell's build script reads `../laplus/apps/web/dist`, and says what to clone
 if it is not there. Building it is `pnpm install && pnpm --filter @t3tools/web
@@ -33,15 +41,15 @@ gitignored, nothing builds from it any more, and it is worth keeping only as the
 
 ## Layout
 
-- `crates/lightcode-server/` — the server. Cargo workspace root is the repo root.
-- `crates/lightcode-shell/` — the desktop application: a Tauri window with the
+- `crates/laplus-server/` — the server. Cargo workspace root is the repo root.
+- `crates/laplus-shell/` — the desktop application: a Tauri window with the
   server running inside it. Its build script embeds `../laplus/apps/web/dist`,
   so it needs that checkout built. **It is not a default workspace member**
   for exactly that reason: `cargo build` and `cargo test` cover the server only,
-  and the shell is asked for by name (`cargo run -p lightcode-shell`,
-  `cargo test -p lightcode-shell`). `nsis/installer.nsi` is tauri-bundler's
-  installer template, vendored and changed in two places so that lightcode
-  installs into `%LOCALAPPDATA%\Programs\lightcode` rather than on top of its
+  and the shell is asked for by name (`cargo run -p laplus-shell`,
+  `cargo test -p laplus-shell`). `nsis/installer.nsi` is tauri-bundler's
+  installer template, vendored and changed in two places so that laplus
+  installs into `%LOCALAPPDATA%\Programs\laplus` rather than on top of its
   own database — ticket 30 and `docs/adr/0013`. **Re-vendor it by hand when
   tauri-cli is upgraded**; its header says how, and `cargo test -p xtask` fails
   if either change goes missing.
@@ -49,7 +57,7 @@ gitignored, nothing builds from it any more, and it is worth keeping only as the
   installer *and* measures it, because the project exists for that number. Writes
   `docs/artifact-size.md`. `--measure-install` additionally installs, weighs and
   uninstalls, which is opt-in because it touches the machine — and refuses if
-  lightcode is already installed, rather than uninstalling someone's copy.
+  laplus is already installed, rather than uninstalling someone's copy.
   **Needs `cargo install tauri-cli --version "^2" --locked` first**: the Tauri
   CLI is not a workspace dependency and cannot be one, and the first release
   build downloads NSIS, so a fresh clone needs that command and a network before
@@ -57,7 +65,7 @@ gitignored, nothing builds from it any more, and it is worth keeping only as the
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.
-- `tools/ui-driver/` — a headless browser pointed at a running lightcode, over
+- `tools/ui-driver/` — a headless browser pointed at a running laplus, over
   the DevTools protocol. The other end of the same wire: `wire-capture` records
   what the *reference server* answers, this drives what the *real client* does,
   and it is the only way the UI half of this application can be checked. Has a

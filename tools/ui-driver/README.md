@@ -1,6 +1,6 @@
 # Driving the real UI
 
-A headless browser pointed at a running lightcode, over the Chrome DevTools
+A headless browser pointed at a running laplus, over the Chrome DevTools
 Protocol. Written for **ticket 28**, which could not be diagnosed any other way:
 the server was correct, every event was correct, and the only place the bug
 existed was in what the client did with them.
@@ -21,8 +21,8 @@ before reaching for Tauri's devtools feature.
 Build and launch the shell — it is what carries the bundle:
 
 ```
-cargo build -p lightcode-shell --release
-./target/release/lightcode.exe &
+cargo build -p laplus-shell --release
+./target/release/laplus.exe &
 node tools/ui-driver/repro.mjs 40
 ```
 
@@ -41,12 +41,12 @@ the one file here that is *not* general: it names the thread id and the sidebar
 row from the machine ticket 28 was found on, and wants both changed before it
 means anything elsewhere.
 
-## Looking at a change without closing the lightcode already open
+## Looking at a change without closing the laplus already open
 
 Start a second one somewhere else, and point the probe at it:
 
 ```
-LOCALAPPDATA=/tmp/lc-probe LIGHTCODE_PORT=4774 ./target/release/lightcode.exe &
+LOCALAPPDATA=/tmp/lc-probe LAPLUS_PORT=4774 ./target/release/laplus.exe &
 node tools/ui-driver/probe-boot.mjs http://127.0.0.1:4774/
 ```
 
@@ -58,8 +58,8 @@ new port the UI has forgotten every banner that was ever dismissed, which is the
 state ticket 26 was about.
 
 Ticket 26 also found the reason this recipe is needed at all: a running
-`lightcode.exe` holds a **lock on its own file**, so `cargo build -p
-lightcode-shell` cannot relink while one is up — it fails with `Access is
+`laplus.exe` holds a **lock on its own file**, so `cargo build -p
+laplus-shell` cannot relink while one is up — it fails with `Access is
 denied. (os error 5)`. `--release` writes a different file, which is the way past
 it that does not involve closing somebody's window.
 

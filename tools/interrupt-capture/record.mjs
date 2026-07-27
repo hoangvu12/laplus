@@ -78,7 +78,7 @@ const prompts = {
 /** The correction sent after an interrupt, in `continue` mode. */
 const FOLLOW_UP = "Never mind the essay. Just say the word 'stopped' and nothing else.";
 const prompt = rest.join(" ") || prompts[subject];
-const cwd = mkdtempSync(join(tmpdir(), "lightcode-interrupt-"));
+const cwd = mkdtempSync(join(tmpdir(), "laplus-interrupt-"));
 const log = createWriteStream(out);
 
 const child = spawn(

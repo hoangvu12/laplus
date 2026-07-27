@@ -1,4 +1,4 @@
-// Minimal CDP driver: launch headless Chrome, attach to the lightcode UI, and
+// Minimal CDP driver: launch headless Chrome, attach to the laplus UI, and
 // expose (a) the DOM as text, (b) the console, (c) every WebSocket frame the
 // client sends and receives. Ticket 28 needs the third one most.
 

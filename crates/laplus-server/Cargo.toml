@@ -1,0 +1,28 @@
+[package]
+name = "laplus-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+futures-util.workspace = true
+notify.workspace = true
+portable-pty.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# A throwaway directory per test, removed on drop. The registry's tests need a
+# real path on disk to add as a project and a real file to be refused, so there
+# is nothing to fake here — only somewhere safe to put it.
+tempfile.workspace = true
+# The test harness's socket client. Deliberately a different implementation
+# from the server's, so a passing test means two stacks agree on the framing
+# rather than one stack agreeing with itself.
+tokio-tungstenite.workspace = true

@@ -4,7 +4,7 @@ What the t3code UI actually sends and receives over its one WebSocket endpoint,
 recorded from the reference TypeScript server rather than inferred from type
 definitions. Every claim below is backed by a fixture in `fixtures/socket-wire/`.
 
-The transport framing is lightcode's primary risk: it is undocumented and comes
+The transport framing is laplus's primary risk: it is undocumented and comes
 from `effect/unstable/rpc`, an explicitly *unstable* module. This document and
 its fixtures are what later work conforms to.
 
@@ -21,7 +21,7 @@ scripted RPC client     ─┘        (tools/wire-capture/proxy.mjs)
    downloads on first use; the install takes several minutes.
 2. Start the server against a throwaway data directory so nothing touches a
    real installation:
-   `T3CODE_HOME=$TEMP/lightcode-wire-home node apps/server/src/bin.ts --port 3773 --host 127.0.0.1 --no-browser`
+   `T3CODE_HOME=$TEMP/laplus-wire-home node apps/server/src/bin.ts --port 3773 --host 127.0.0.1 --no-browser`
    It logs `Listening on http://127.0.0.1:3773` and a one-time pairing URL.
 3. Start the recording proxy:
    `node tools/wire-capture/proxy.mjs --listen 3999 --upstream 127.0.0.1:3773 --out-dir .scratch/wire-capture/raw --label capture`
@@ -352,19 +352,19 @@ guessed at.
    / 512-item window — `t3code/apps/server/src/ws.ts` — but no capture
    exercised the ceiling, so the observed maximum remains 2.)
 
-   **lightcode now has a policy, chosen in ticket 04:** a batch is whatever has
+   **laplus now has a policy, chosen in ticket 04:** a batch is whatever has
    accumulated behind the outstanding `Ack`, capped at 64 values — so it is
    count-driven, and the count is the same one that bounds the backlog. Those
    being the same number is what makes 64 the true maximum: a subscriber that
    falls further behind than that is sent one fresh snapshot instead of its
    backlog, so no chunk can ever carry more. See
-   `crates/lightcode-server/src/subscriptions.rs`.
+   `crates/laplus-server/src/subscriptions.rs`.
 2. **How deep is the `Ack` window?** That the reference server stops at one
    un-acked chunk is settled (see *`Ack` is load-bearing*). Whether one is its
    fixed window or simply all this workload produced was not established: no
    capture generated two changes while an `Ack` was outstanding.
 
-   **lightcode's window is exactly one**, which is the conservative reading —
+   **laplus's window is exactly one**, which is the conservative reading —
    a client written against a window of one works against any deeper window,
    and the reverse is not true.
 3. **`Eof`, `ClientEnd` and `ClientProtocolError` were never seen.** The
@@ -383,16 +383,16 @@ guessed at.
    `matchCauseEffect`, so even an error payload that fails to decode is written
    back under the same `requestId` and nothing else is touched.
 
-   This is why **lightcode does not send `Defect`**, and it is the one place
+   This is why **laplus does not send `Defect`**, and it is the one place
    the Rust server deliberately does not follow a capture. The reference server
    can afford `Defect` because it implements every tag its client sends, so one
-   only ever answers a tag no real client uses; lightcode implements a fraction
+   only ever answers a tag no real client uses; laplus implements a fraction
    of the vocabulary while it is being built, so `Defect` would be the normal
    answer to the UI's own boot sequence. Unimplemented methods come back as
    `Exit`/`Failure` with a `Fail` cause carrying a
    `ServerMethodNotImplementedError`. See
-   `crates/lightcode-server/src/rpc.rs` and
-   `crates/lightcode-server/tests/socket_conformance.rs`, which pins both the
+   `crates/laplus-server/src/rpc.rs` and
+   `crates/laplus-server/tests/socket_conformance.rs`, which pins both the
    captured behaviour and the divergence.
 
    Read from source, not captured — no recording provoked a `Defect` against
@@ -401,11 +401,11 @@ guessed at.
    captured was client-initiated and came back as `Failure`/`Interrupt`. Natural
    completion of a server-side stream was never observed.
 
-   Still open, and lightcode has still not had to answer it. Ticket 17 was the
+   Still open, and laplus has still not had to answer it. Ticket 17 was the
    first candidate — a terminal whose shell exits — and it turned out not to be
    one: an exited terminal is still a terminal, showing what it said and what it
    exited with, so `terminal.attach` stays open and ends the captured way when
-   the client unsubscribes. Every stream lightcode serves is of that shape, so
+   the client unsubscribes. Every stream laplus serves is of that shape, so
    the question is deferred rather than resolved.
 6. **What happens to the user-driven surface?** `01-browser-session.ndjson` is
    the boot sequence only; no capture drives the UI through opening a file,

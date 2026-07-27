@@ -1,10 +1,10 @@
 # Third-party notices
 
-lightcode's window shows a user interface it did not write. About 80% of the
+laplus's window shows a user interface it did not write. About 80% of the
 shipped artifact by size is upstream's built web bundle, reused as-is, and the
 licence it is offered under requires its notice to travel with it. This file is
 that notice. It is shown by the installer and installed alongside the
-application, so a copy of lightcode always carries it.
+application, so a copy of laplus always carries it.
 
 ## t3code
 

@@ -1,8 +1,8 @@
 // First look: does the UI boot at all under headless Chrome, and what does it
 // say on the socket while it does?
 //
-// Takes the URL as an argument, defaulting to the port lightcode serves on. A
-// second lightcode on a second port — `LIGHTCODE_PORT=4774`, and a `LOCALAPPDATA`
+// Takes the URL as an argument, defaulting to the port laplus serves on. A
+// second laplus on a second port — `LAPLUS_PORT=4774`, and a `LOCALAPPDATA`
 // of its own for a fresh profile — is how a change can be looked at without
 // closing the one already running.
 import { launch, frameLog, consoleLog, poll } from "./cdp.mjs";
