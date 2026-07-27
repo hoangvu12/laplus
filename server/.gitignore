@@ -1,0 +1,28 @@
+# t3code is a vendored upstream checkout with its own .git — reference only, never committed here.
+t3code/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node (apps/web dev server during the spike)
+node_modules/
+dist/
+.vite/
+
+# Tauri. `gen/schemas` is written by `tauri-build` on every build from the
+# capability files beside it, so it is output rather than source.
+crates/laplus-shell/gen/
+
+# Raw, unredacted proxy recordings. Curated fixtures live in fixtures/socket-wire/;
+# these hold live session tokens and are working scratch (see docs/socket-wire-format.md).
+.scratch/wire-capture/raw/
+
+# One run's worth of socket frames from tools/ui-driver/repro.mjs, rewritten on
+# every run. Output, not evidence — and it is a transcript of a live session.
+tools/ui-driver/frames.log
+
+# Local
+.env
+.env.local
+.DS_Store

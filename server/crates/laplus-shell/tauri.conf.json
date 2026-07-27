@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "laplus",
+  "version": "0.1.0",
+  "identifier": "com.laplus.desktop",
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "copyright": "laplus. UI derived from t3code, Copyright (c) T3 Tools, Inc., MIT licence.",
+    "licenseFile": "../../THIRD_PARTY_NOTICES.md",
+    "resources": { "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md" },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "template": "nsis/installer.nsi"
+      }
+    }
+  }
+}
