@@ -57,8 +57,8 @@ mod harness;
 
 use harness::agent::{ScriptedAgent, AWAIT_ANSWER, PAUSE, WORKING_DIRECTORY_MARKER};
 use harness::conversation::{
-    activity, assistant_sends, find_activity, follow_up, interrupt_turn, last_session,
-    start_turn_for,
+    activity, assistant_sends, create_thread, find_activity, follow_up, interrupt_turn,
+    last_session, start_turn_for,
 };
 use harness::workspace::Workspace;
 use harness::{SocketClient, TestServer};
@@ -179,8 +179,15 @@ impl Pair {
 
         let first = client.open_conversation(&workspace, "thread-1").await;
         // The project is already registered; a second conversation in it is a
-        // second subscription and nothing else.
-        let second = client.watch_conversation("thread-2", true).await;
+        // second thread and a second subscription, and nothing else.
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                create_thread("project-1", "thread-2"),
+            )
+            .await
+            .expect_success();
+        let second = client.watch_conversation("thread-2").await;
 
         Pair {
             server,

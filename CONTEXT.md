@@ -26,6 +26,36 @@ calls, thinking, permission requests and their resolutions. `crate::worklog`.
 
 **Activity** — one row in the work log.
 
+**Snapshot** — a subscription's opening description of the world, and the thing
+every event after it is a *diff against*. Not an optimisation and not merely the
+first chunk: the client folds an event only into state it already holds, so a
+subscription that opens without a snapshot has its whole contents discarded on
+arrival, silently. Ticket 28 was that, for a whole turn. The question to ask of
+any subscription here is never "are the events right" but "does the client have
+anything to fold them into".
+
+**Resume** — a subscription from a client that says it already holds the
+conversation, by sending `afterSequence`. The one case that is *not* refused for
+a thread this server does not have, because a client with its own copy can still
+draw it and an empty snapshot would be a claim that copy is wrong.
+`crate::threads::Watch::resuming`.
+
+Only the cursor's *presence* is read. Its value is ignored, and what that costs
+depends on the case: for a conversation this server holds, the client asked for
+the tail after its cursor and gets the whole thing as a snapshot instead — more
+bytes than the reference server sends, and correct, because a snapshot replaces
+what the client holds rather than being folded into it. For one this server does
+not hold there is nothing to send either way.
+
+**Draft** — a conversation the client has made up and the server has never heard
+of. Where every new conversation starts: the composer mints the id, and the
+thread reaches this server only when the first turn is dispatched carrying
+`bootstrap.createThread`. Not a state this server stores — it is precisely the
+absence of one, which is why a subscription to a draft is refused rather than
+opened. The opposite of a **resume**: a draft is a client with an id and nothing
+else, a resume is a client with the conversation and no need of us to prove it
+exists.
+
 ## Lifecycle
 
 **Session status** — what the agent process is doing. The contract's seven:

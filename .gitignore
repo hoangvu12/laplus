@@ -18,6 +18,10 @@ crates/lightcode-shell/gen/
 # these hold live session tokens and are working scratch (see docs/socket-wire-format.md).
 .scratch/wire-capture/raw/
 
+# One run's worth of socket frames from tools/ui-driver/repro.mjs, rewritten on
+# every run. Output, not evidence — and it is a transcript of a live session.
+tools/ui-driver/frames.log
+
 # Local
 .env
 .env.local

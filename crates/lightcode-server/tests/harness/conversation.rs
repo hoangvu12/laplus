@@ -32,6 +32,30 @@ pub fn create_project(id: &str, folder: &Path) -> Value {
     })
 }
 
+/// The `thread.create` the client-runtime sends when a conversation is started
+/// somewhere other than the composer's draft — and what these tests use to get a
+/// thread to watch.
+///
+/// The fields are `bootstrap.createThread`'s, so a thread created this way and a
+/// thread bootstrapped by a first turn are the same thread. See
+/// [`SocketClient::open_conversation_in`] for why the tests create it up front
+/// rather than watching a draft.
+pub fn create_thread(project_id: &str, thread_id: &str) -> Value {
+    json!({
+        "type": "thread.create",
+        "commandId": format!("test:thread:{thread_id}"),
+        "threadId": thread_id,
+        "projectId": project_id,
+        "title": "A conversation",
+        "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5"},
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "branch": Value::Null,
+        "worktreePath": Value::Null,
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
 /// The `thread.turn.start` the composer sends for the first message of a new
 /// conversation.
 ///
@@ -231,8 +255,7 @@ pub fn last_session<'a>(events: &'a [Value], events_of: &str) -> &'a Value {
 }
 
 impl SocketClient {
-    /// Register a project and open the thread subscription, as the UI does before
-    /// the developer has typed anything.
+    /// Register a project, create the conversation, and open its subscription.
     pub async fn open_conversation(&mut self, workspace: &Workspace, thread_id: &str) -> String {
         self.open_conversation_in(workspace, "project-1", thread_id)
             .await
@@ -244,6 +267,31 @@ impl SocketClient {
     /// second *folder*: `project.create` refuses a root another project already
     /// holds, so "two conversations in different projects" is two workspaces as
     /// well as two ids.
+    ///
+    /// ## Why the thread is created before it is watched
+    ///
+    /// This used to subscribe to a *draft* — an id the server had never heard of
+    /// — because that is what the composer does, and then let the first turn's
+    /// `bootstrap.createThread` bring the thread into being under a subscription
+    /// that was already open. The server allowed it. **The real client cannot
+    /// use it**: `client-runtime/state/threads.ts` folds an event only into a
+    /// thread it already holds, and only a snapshot gives it one, so every event
+    /// of that first turn was discarded and the window spun forever. That is
+    /// ticket 28, and [`lightcode_server::threads::Threads::subscribe`] now
+    /// refuses a thread that does not exist, exactly as the reference server
+    /// does.
+    ///
+    /// So a draft is no longer something a subscription can be *held open*
+    /// across, here or anywhere. The client's answer is to retry every 250ms
+    /// until the thread exists; these tests take the deterministic road instead
+    /// and create the thread first, which leaves every event of the turn — the
+    /// subject of nearly every test here — arriving live on the subscription as
+    /// before. Only `thread.created` itself moves out of the stream and into the
+    /// opening snapshot.
+    ///
+    /// What that road does not cover is the composer's own path, where the first
+    /// turn creates the thread. `socket_turn.rs` keeps one test on it, driven the
+    /// way the real client drives it.
     pub async fn open_conversation_in(
         &mut self,
         workspace: &Workspace,
@@ -256,19 +304,22 @@ impl SocketClient {
         )
         .await
         .expect_success();
+        self.call(
+            "orchestration.dispatchCommand",
+            create_thread(project_id, thread_id),
+        )
+        .await
+        .expect_success();
 
-        self.watch_conversation(thread_id, true).await
+        self.watch_conversation(thread_id).await
     }
 
-    /// Open the thread subscription for a conversation whose project is already
-    /// registered — a second window, or the same window after a restart.
+    /// Open the thread subscription for a conversation the server holds — a
+    /// second window, or the same window after a restart.
     ///
-    /// `expect_draft` says which opening chunk this is: a conversation the server
-    /// has never heard of describes itself as *nothing*, because an empty snapshot
-    /// would be a positive claim that the conversation is empty and would wipe
-    /// what the composer is optimistically showing. A restored one opens with its
-    /// transcript.
-    pub async fn watch_conversation(&mut self, thread_id: &str, expect_draft: bool) -> String {
+    /// It opens with the conversation, always. A subscription that opened with
+    /// anything else would be one the real client renders nothing from.
+    pub async fn watch_conversation(&mut self, thread_id: &str) -> String {
         let subscription = self
             .subscribe(
                 "orchestration.subscribeThread",
@@ -278,20 +329,66 @@ impl SocketClient {
 
         let opening = self.next_chunk(&subscription).await;
         self.ack(&subscription).await;
-        match expect_draft {
-            true => assert_eq!(
-                opening,
-                vec![json!({"kind": "synchronized"})],
-                "a subscription to a draft must open without claiming the thread is empty"
-            ),
-            false => assert_eq!(
-                opening.first().map(|item| item["kind"].clone()),
-                Some(json!("snapshot")),
-                "a conversation the server holds must open with it: {opening:#?}"
-            ),
-        }
+        assert_eq!(
+            opening.first().map(|item| item["kind"].clone()),
+            Some(json!("snapshot")),
+            "a conversation the server holds must open with it: {opening:#?}"
+        );
 
         subscription
+    }
+
+    /// Watch a conversation the way the composer does: keep asking until the
+    /// thread exists.
+    ///
+    /// The client's own loop, at the client's own cadence
+    /// (`subscribeDynamic`'s `retryExpectedFailureAfter: "250 millis"`), made
+    /// faster because nothing here is waiting on a person. Used by the tests
+    /// that drive the draft path end to end.
+    pub async fn watch_draft(&mut self, thread_id: &str) -> String {
+        for _ in 0..200 {
+            let request = self
+                .send_request(
+                    "orchestration.subscribeThread",
+                    json!({"threadId": thread_id, "requestCompletionMarker": true}),
+                )
+                .await;
+            match self.first_chunk_or_failure(&request).await {
+                Some(opening) => {
+                    self.ack(&request).await;
+                    assert_eq!(
+                        opening.first().map(|item| item["kind"].clone()),
+                        Some(json!("snapshot")),
+                        "the retry that finds the thread opens with it: {opening:#?}"
+                    );
+                    return request;
+                }
+                None => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+        panic!("the thread {thread_id} never came into existence");
+    }
+
+    /// The opening chunk, or `None` if the subscription was refused instead.
+    ///
+    /// A refusal ends the call, so the frame is the terminal `Exit` rather than
+    /// a `Chunk` — which is how the client tells "not yet" from "here it is".
+    async fn first_chunk_or_failure(&mut self, request_id: &str) -> Option<Vec<Value>> {
+        let frame = self.next_frame_for(request_id).await;
+        if frame["_tag"] != json!("Chunk") {
+            assert_eq!(
+                frame["exit"]["cause"][0]["error"]["_tag"],
+                json!("OrchestrationGetSnapshotError"),
+                "a thread that does not exist yet is refused by name: {frame}"
+            );
+            return None;
+        }
+        Some(
+            frame["values"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a chunk's values are an array: {frame}"))
+                .clone(),
+        )
     }
 
     /// Read the turn out of a thread subscription, up to and including the session

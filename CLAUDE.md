@@ -20,6 +20,11 @@ never committed here (see `.gitignore`).
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.
+- `tools/ui-driver/` — a headless browser pointed at a running lightcode, over
+  the DevTools protocol. The other end of the same wire: `wire-capture` records
+  what the *reference server* answers, this drives what the *real client* does,
+  and it is the only way the UI half of this application can be checked. Has a
+  README.
 - `.scratch/` — tracker files (see below) and raw capture evidence.
 
 ## Agent skills

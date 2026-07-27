@@ -321,7 +321,7 @@ async fn a_restored_conversation_is_continued_by_resuming_the_agents_own_session
     let mut client = restarted.connect().await;
     // Not a draft this time: the conversation is on disk, so its subscription
     // opens with it.
-    let subscription = client.watch_conversation("thread-1", false).await;
+    let subscription = client.watch_conversation("thread-1").await;
 
     client
         .call(
@@ -405,7 +405,7 @@ async fn a_resume_the_agent_will_not_honour_is_explained_and_leaves_the_transcri
 
     let restarted = TestServer::start_at_with_agent(&database, &agent.configured()).await;
     let mut client = restarted.connect().await;
-    let subscription = client.watch_conversation("thread-1", false).await;
+    let subscription = client.watch_conversation("thread-1").await;
 
     // The turn is still accepted — the failure is not the client's — and the
     // refusal arrives in the conversation.

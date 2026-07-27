@@ -703,7 +703,7 @@ async fn a_decision_for_a_conversation_with_no_session_still_clears_the_panel() 
 
     let restarted = TestServer::start_at_with_agent(&database, &agent.configured()).await;
     let mut client = restarted.connect().await;
-    let subscription = client.watch_conversation("thread-1", false).await;
+    let subscription = client.watch_conversation("thread-1").await;
 
     let refused = client
         .call(

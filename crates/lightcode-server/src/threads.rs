@@ -8,12 +8,20 @@
 //!
 //! ```text
 //! C>S Request  orchestration.subscribeThread  {"threadId":"…"}
-//! S>C Chunk    {"kind":"snapshot","snapshot":{"snapshotSequence":4,"thread":{…}}}
+//! S>C Exit     Failure  OrchestrationGetSnapshotError — no such thread, yet
 //! C>S Request  orchestration.dispatchCommand  {"type":"thread.turn.start",…}
 //! S>C Exit     Success {"sequence":5}
+//! C>S Request  orchestration.subscribeThread  {"threadId":"…"}   (the retry)
+//! S>C Chunk    {"kind":"snapshot","snapshot":{"snapshotSequence":5,"thread":{…}}}
 //! S>C Chunk    {"kind":"event","event":{"sequence":6,"type":"thread.message-sent",…}}
 //! S>C Chunk    {"kind":"event","event":{"sequence":7,"type":"thread.message-sent",…}}
 //! ```
+//!
+//! The refusal at the top is not a failure mode; it is the first half of how a
+//! new conversation begins, and [`Threads::subscribe`] is where it is explained.
+//! A **snapshot is what makes a subscription mean anything**: the client folds an
+//! event only into a thread it already holds, so a stream that never opened with
+//! one is a stream it silently discards. Ticket 28.
 //!
 //! ## Streaming is two kinds of `thread.message-sent`, and the client knows which
 //!
@@ -89,6 +97,71 @@ use crate::transcripts::{Transcripts, Write};
 
 /// The subscription that *is* one conversation.
 pub const SUBSCRIBE_THREAD: &str = "orchestration.subscribeThread";
+
+/// A validated `orchestration.subscribeThread` call.
+///
+/// Read by hand rather than deserialized, because there are three fields and
+/// only one of them can make the call unanswerable here: a subscription to a
+/// blank thread id would open a stream against a conversation nothing can name.
+/// Whether the *named* thread can be answered for is [`Threads::subscribe`]'s
+/// question, not this one's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watch {
+    thread_id: String,
+    /// Whether the client asked to be told when it has the whole conversation.
+    wants_marker: bool,
+    /// Whether the client says it already holds this conversation.
+    ///
+    /// `afterSequence` is the client's cursor: "I have it up to here, send me
+    /// what came after". Its *presence* is what this server reads, and what it
+    /// means is the thing ticket 28 turned on — a client that sends one has a
+    /// thread to fold events into, and a client that does not has nothing, and
+    /// must be sent a snapshot or shown nothing at all.
+    ///
+    /// So it decides whether an absent thread is a refusal. Refusing a resume
+    /// would take a conversation the client can still draw from its own cache
+    /// and replace it with an error, and the reference server does not: with a
+    /// cursor it replays from the log and never asks whether the thread is there
+    /// (`apps/server/src/ws.ts`), which is why the boot capture's
+    /// `synchronized`-only opening — the one this server used to give *every*
+    /// subscription — is an answer to a resume and to nothing else. See
+    /// `fixtures/socket-wire/01-browser-session.ndjson`, request `3`.
+    ///
+    /// The cursor's *value* is not read, and what that costs depends on which
+    /// case it is. For a thread this server holds, the client asked for the tail
+    /// after its cursor and is sent the whole conversation as a snapshot
+    /// instead: more bytes than upstream would send, and correct, because a
+    /// snapshot replaces what the client holds rather than being folded into it.
+    /// For a thread this server does not hold there is nothing to send either
+    /// way, and the opening carries no snapshot at all — which is the one case
+    /// where saying nothing is the whole point, since an empty snapshot would be
+    /// a claim that the client's own copy is wrong.
+    resuming: bool,
+}
+
+impl Watch {
+    /// Read the payload, or refuse with the error the method declares.
+    pub fn read(payload: &Value) -> Result<Watch, Value> {
+        let thread_id = payload
+            .get("threadId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(Watch {
+            thread_id: crate::rpc::non_blank(
+                thread_id,
+                "OrchestrationGetSnapshotError",
+                "thread id",
+            )?,
+            wants_marker: payload
+                .get("requestCompletionMarker")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            resuming: payload
+                .get("afterSequence")
+                .is_some_and(|cursor| !cursor.is_null()),
+        })
+    }
+}
 
 /// How many user turns may be waiting for an agent that has not read them yet.
 ///
@@ -777,11 +850,16 @@ struct Inner {
 struct Entry {
     /// `None` until the thread is created.
     ///
-    /// A slot exists before the thread does because the UI subscribes first: a
-    /// new conversation is a client-side draft, and the server hears about it
-    /// only when the first turn is dispatched with a `bootstrap.createThread`.
-    /// A subscription opened against a draft therefore has to be a subscription
-    /// to something that is not there yet, rather than a refusal.
+    /// A slot can exist before the thread does, because [`Threads::entry`]
+    /// allocates one for any id it is asked to write against and the id arrives
+    /// before the thread: a new conversation is a client-side draft, and the
+    /// server hears about it only when the first turn is dispatched with a
+    /// `bootstrap.createThread`.
+    ///
+    /// A *subscription* used to be one of the things that allocates one and
+    /// mostly no longer is — see [`Threads::subscribe`], which refuses an absent
+    /// thread rather than opening on the empty slot it had just made, unless the
+    /// client says it holds the conversation already.
     state: Mutex<Option<Thread>>,
     events: broadcast::Sender<Value>,
     /// The running agent's end of the conversation, while there is one.
@@ -918,15 +996,18 @@ impl Threads {
     /// The slot for this thread, making one if the thread has not been created
     /// yet.
     ///
-    /// Only for callers that are about to *put something in it* — a subscription
-    /// that will need somewhere to hear from, or a turn that is about to create
-    /// the thread. A question about a thread uses [`Threads::find`], which does
-    /// not: a query that quietly allocated would let any id a client mentions
-    /// leak a slot.
+    /// Mostly for callers that are about to *put something in it* — a turn that
+    /// is about to create the thread. A question about a thread uses
+    /// [`Threads::find`], which does not: a query that quietly allocated would
+    /// let any id a client mentions leak a slot.
     ///
-    /// What is left unreaped is the slot for a draft that was subscribed to and
-    /// never sent, which is a few hundred bytes per abandoned draft for the life
-    /// of the process.
+    /// Ticket 28 moved subscriptions across that line, and left one behind.
+    /// A plain [`Threads::subscribe`] is now a question and asks; a **resume**
+    /// still allocates, because it is owed the events an absent conversation
+    /// would produce and they arrive on this slot's channel. So a composer
+    /// sitting on a draft it never sends costs nothing, where before it left a
+    /// slot behind for the life of the process — and the real client
+    /// re-subscribes to that draft four times a second.
     fn entry(&self, thread_id: &str) -> Arc<Entry> {
         let mut open = self.lock();
         Arc::clone(open.entry(thread_id.to_string()).or_insert_with(|| {
@@ -1276,8 +1357,58 @@ impl Threads {
 
     /// Open an `orchestration.subscribeThread` subscription: the thread now,
     /// then every change to it.
-    pub fn subscribe(&self, thread_id: &str, wants_marker: bool) -> EventSource {
-        let entry = self.entry(thread_id);
+    ///
+    /// **A thread this server has never heard of is refused, not opened.** The
+    /// UI subscribes to a draft before the first prompt has created it, so this
+    /// is the common case rather than an edge one — and it is the whole of
+    /// ticket 28. A stream that opens on an absent thread and then narrates its
+    /// creation is *silently discarded by the real client*: `threads.ts`
+    /// (`applyItem`) drops every event while it holds no thread, because it has
+    /// no state to fold one into, and only a `snapshot` can give it that state.
+    /// So the pane sat on `Working for 3m 22s` while the server streamed it a
+    /// correct and complete account of a turn it had already finished.
+    ///
+    /// Refusing is what the reference server does (`apps/server/src/ws.ts`,
+    /// `Thread ${input.threadId} was not found`) and what the client is written
+    /// for: `subscribeDynamic` is given `retryExpectedFailureAfter: "250 millis"`
+    /// for this subscription, so a refusal is not an error to a draft pane but a
+    /// *poll* — the retry that lands after the first prompt creates the thread
+    /// opens with a snapshot, and the conversation appears.
+    ///
+    /// The refusal must therefore be a **declared** error. A defect would fail
+    /// every other subscription on the socket rather than this one — see
+    /// [`crate::rpc::DispatchError::error_value`].
+    ///
+    /// A [resume](Watch::resuming) is the exception, and the reason it exists is
+    /// the same rule read the other way: a client that sent a cursor already
+    /// holds the conversation, so it has somewhere to put an event and nothing
+    /// to be refused for.
+    pub fn subscribe(&self, call: &Watch) -> Result<EventSource, Value> {
+        let thread_id = call.thread_id.as_str();
+        // Asked for rather than allocated, so that a draft nobody ever sends
+        // does not leak a slot on the strength of having been looked at.
+        let held = self
+            .find(thread_id)
+            .filter(|entry| lock(&entry.state).is_some());
+        let entry = match held {
+            Some(entry) => entry,
+            // A resume does allocate, and it is the one caller that allocates
+            // without putting anything in the slot — see [`Threads::entry`]. It
+            // has to: the client is owed the events this conversation produces
+            // if it turns up, and they will arrive on this slot's channel or
+            // nowhere. That leaves a slot behind for a resume of a thread that
+            // never exists, which is a few hundred bytes and needs a client that
+            // holds a conversation this server does not.
+            None if call.resuming => self.entry(thread_id),
+            // Nothing to describe and nobody who can draw it: say so, and be
+            // asked again.
+            None => {
+                return Err(crate::rpc::declared(
+                    "OrchestrationGetSnapshotError",
+                    format_args!("Thread {thread_id} was not found"),
+                ))
+            }
+        };
         // Subscribed to before the description closure is handed over, so a
         // change landing between here and the pump's first read arrives as an
         // event rather than falling into the gap — the same ordering
@@ -1285,16 +1416,16 @@ impl Threads {
         // same way, by a client that drops anything at or below what it holds.
         let updates = entry.events.subscribe();
         let sequences = self.inner.sequences.clone();
-        let marker_owed = AtomicBool::new(wants_marker);
+        let marker_owed = AtomicBool::new(call.wants_marker);
 
-        EventSource::new(
+        Ok(EventSource::new(
             move || {
                 let mut items = Vec::new();
-                // A thread that does not exist yet describes itself as nothing
-                // rather than as an empty thread. The UI subscribes to a draft
-                // before the server has heard of it, and an empty snapshot would
-                // be a claim that the conversation is empty — which would wipe
-                // the messages the composer is optimistically showing.
+                // Still conditional, and no longer for the same reason. The
+                // thread existed when the subscription opened — unless this is a
+                // resume, which is allowed not to — and this closure runs again
+                // whenever a subscriber falls a whole backlog behind, by which
+                // point the thread may also have been deleted.
                 if let Some(thread) = lock(&entry.state).as_ref() {
                     items.push(json!({
                         "kind": "snapshot",
@@ -1310,7 +1441,7 @@ impl Threads {
                 items
             },
             updates,
-        )
+        ))
     }
 
     /// Every thread, as the project list carries them.
@@ -1954,7 +2085,7 @@ fn process_stamp() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn threads() -> (Threads, broadcast::Receiver<Value>) {
@@ -1968,7 +2099,27 @@ mod tests {
         )
     }
 
-    fn a_thread(id: &str) -> Thread {
+    /// A composer opening a conversation: it holds nothing and expects to be
+    /// sent everything.
+    fn a_watch(id: &str) -> Watch {
+        Watch {
+            thread_id: id.to_string(),
+            wants_marker: true,
+            resuming: false,
+        }
+    }
+
+    /// A client that already holds the conversation and wants what came after.
+    fn a_resume(id: &str) -> Watch {
+        Watch {
+            resuming: true,
+            ..a_watch(id)
+        }
+    }
+
+    /// The least conversation there can be. Shared with `crate::rpc`'s tests,
+    /// which need one to subscribe to and have no other way to make one.
+    pub(crate) fn a_thread(id: &str) -> Thread {
         Thread {
             id: id.to_string(),
             project_id: "project-1".to_string(),
@@ -2361,27 +2512,69 @@ mod tests {
         );
     }
 
-    /// A thread the server has never heard of is a draft the UI is showing. Its
-    /// subscription has to open and stay silent rather than fail, and it has to
-    /// be the *same* subscription that carries the thread once a turn creates it.
+    /// A thread the server has never heard of is a draft the UI is showing, and
+    /// its subscription is **refused** — the whole of ticket 28.
+    ///
+    /// This test used to assert the opposite: that the subscription opened and
+    /// stayed silent until a turn created the thread. It did open, and the
+    /// events did arrive, and the window rendered none of them, because a client
+    /// that never received a snapshot has nothing to fold an event into. The
+    /// refusal is what makes the client ask again.
     #[test]
-    fn a_subscription_opened_before_the_thread_exists_carries_it_when_it_does() {
+    fn a_subscription_to_a_thread_that_does_not_exist_is_refused() {
         let (threads, _shell) = threads();
-        let source = threads.subscribe("thread-1", true);
 
-        let opening = source.describe();
-        assert_eq!(
-            opening,
-            vec![json!({"kind": "synchronized"})],
-            "a draft describes itself as nothing, not as an empty conversation"
+        let refusal = threads
+            .subscribe(&a_watch("thread-1"))
+            .expect_err("a draft has no conversation to describe");
+        assert_eq!(refusal["_tag"], "OrchestrationGetSnapshotError");
+        assert!(
+            refusal["message"]
+                .as_str()
+                .expect("a message")
+                .contains("thread-1"),
+            "the refusal names the thread: {refusal}"
         );
 
+        // And the retry that lands after the first prompt created it opens with
+        // the conversation, which is what the client renders.
         threads.create(a_thread("thread-1")).expect("created");
-        let described = threads.subscribe("thread-1", false).describe();
-        assert_eq!(described.len(), 1);
+        let described = threads
+            .subscribe(&a_watch("thread-1"))
+            .expect("the thread exists now")
+            .describe();
         assert_eq!(described[0]["kind"], "snapshot");
         assert_eq!(described[0]["snapshot"]["thread"]["id"], "thread-1");
         assert!(described[0]["snapshot"]["snapshotSequence"].is_i64());
+        // The conversation first and the marker after it: the client is told it
+        // is synchronized once there is something to be synchronized with.
+        assert_eq!(
+            described.iter().map(|item| &item["kind"]).collect::<Vec<_>>(),
+            vec!["snapshot", "synchronized"],
+            "{described:#?}"
+        );
+    }
+
+    /// A client resuming a conversation *it* still holds is not refused, even
+    /// though this server no longer has one — a registry that was reset under a
+    /// browser that kept its cache.
+    ///
+    /// The refusal exists to make a client that has nothing ask again. This one
+    /// has something, so it is given the feed and left to draw what it holds,
+    /// which is what the reference server does with a cursor in hand.
+    #[test]
+    fn a_resume_is_opened_even_for_a_thread_this_server_does_not_have() {
+        let (threads, _shell) = threads();
+
+        let opening = threads
+            .subscribe(&a_resume("thread-1"))
+            .expect("a resume is not refused")
+            .describe();
+        assert_eq!(
+            opening,
+            vec![json!({"kind": "synchronized"})],
+            "there is nothing to describe, and saying so falsely would wipe the client's copy"
+        );
     }
 
     /// The snapshot is taken at the highest number handed out, so every event
@@ -2392,7 +2585,10 @@ mod tests {
         let (threads, _shell) = threads();
         threads.create(a_thread("thread-1")).expect("created");
 
-        let snapshot = threads.subscribe("thread-1", false).describe();
+        let snapshot = threads
+            .subscribe(&a_watch("thread-1"))
+            .expect("the thread exists")
+            .describe();
         let taken_at = snapshot[0]["snapshot"]["snapshotSequence"]
             .as_i64()
             .expect("a sequence");

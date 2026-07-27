@@ -41,33 +41,7 @@ use crate::refs::{self, CreateRef, Init, ListRefs, SwitchRef};
 use crate::settings;
 use crate::subscriptions::EventSource;
 use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
-use crate::threads;
-
-/// The payload of an `orchestration.subscribeThread`.
-///
-/// Read by hand rather than deserialized, because there are two fields and one
-/// of them decides whether the call is answerable at all — a subscription to a
-/// blank thread id would open a stream against a conversation nothing can name.
-struct SubscribeThread {
-    thread_id: String,
-    wants_marker: bool,
-}
-
-impl SubscribeThread {
-    fn read(payload: &Value) -> Result<SubscribeThread, Value> {
-        let thread_id = payload
-            .get("threadId")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        Ok(SubscribeThread {
-            thread_id: non_blank(thread_id, "OrchestrationGetSnapshotError", "thread id")?,
-            wants_marker: payload
-                .get("requestCompletionMarker")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        })
-    }
-}
+use crate::threads::{self, Watch};
 
 /// The tag the UI sends first, and the tag it re-sends as a liveness probe
 /// when the server does not advertise `connectionProbe`.
@@ -267,15 +241,9 @@ pub fn dispatch(
             .map(Answer::Value)
             .map_err(|refusal| DispatchError::Declared(refusal.to_error())),
         orchestration::SUBSCRIBE_SHELL => Ok(Answer::Stream(services.shell.subscribe(payload))),
-        threads::SUBSCRIBE_THREAD => SubscribeThread::read(payload)
-            .map(|call| {
-                Answer::Stream(
-                    services
-                        .shell
-                        .threads()
-                        .subscribe(&call.thread_id, call.wants_marker),
-                )
-            })
+        threads::SUBSCRIBE_THREAD => Watch::read(payload)
+            .and_then(|call| services.shell.threads().subscribe(&call))
+            .map(Answer::Stream)
             .map_err(DispatchError::Declared),
         // Every method that touches a disk reads its payload here and does its
         // work elsewhere. Reading is arithmetic on a string, so a malformed
@@ -466,6 +434,7 @@ mod tests {
     use super::*;
     use crate::config::ServerConfig;
     use crate::store::Database;
+    use crate::threads::tests::a_thread;
     use serde_json::json;
 
     fn services() -> Services {
@@ -508,12 +477,19 @@ mod tests {
     #[test]
     fn the_subscriptions_answer_with_a_stream() {
         let services = services();
+        // Against a thread that exists, because a subscription to one that does
+        // not is a refusal rather than a stream — see
+        // [`a_refused_call_fails_with_the_methods_own_declared_error`], which
+        // holds that half, and [`crate::threads::Threads::subscribe`] for why.
+        services
+            .shell
+            .threads()
+            .create(a_thread("thread-1"))
+            .expect("created");
+
         for (tag, payload) in [
             (SUBSCRIBE_SERVER_CONFIG, json!({})),
             (orchestration::SUBSCRIBE_SHELL, json!({})),
-            // Against a thread that does not exist, because that is what the UI
-            // opens first: a new conversation is a client-side draft until its
-            // first turn reaches this server.
             (threads::SUBSCRIBE_THREAD, json!({"threadId": "thread-1"})),
             (terminal::SUBSCRIBE_METADATA, json!({})),
         ] {
@@ -544,6 +520,14 @@ mod tests {
             (
                 threads::SUBSCRIBE_THREAD,
                 json!({}),
+                "OrchestrationGetSnapshotError",
+            ),
+            // The draft the composer opens on. Ticket 28: this has to be the
+            // *declared* error, because the client reads a refusal as "ask me
+            // again in 250ms" and a defect as "this whole socket is broken".
+            (
+                threads::SUBSCRIBE_THREAD,
+                json!({"threadId": "a-thread-nothing-created"}),
                 "OrchestrationGetSnapshotError",
             ),
         ] {

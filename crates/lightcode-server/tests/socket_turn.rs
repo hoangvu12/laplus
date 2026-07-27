@@ -30,6 +30,14 @@
 //! such thread", so every turn here goes through the bootstrap the way the UI's
 //! own does.
 //!
+//! What these tests do **not** do is watch the draft across its creation, and
+//! that is ticket 28: a subscription to a thread the server does not have is
+//! refused, because a client that is never sent a snapshot renders nothing from
+//! the events that follow one. So the thread is created before it is watched —
+//! see `SocketClient::open_conversation_in` — and
+//! `a_draft_becomes_the_conversation_the_composer_is_watching` below is the one
+//! test that drives the composer's path in full, refusal and retry included.
+//!
 //! Those payloads, and the helpers that read a conversation back off the wire,
 //! live in `harness::conversation` — shared with `socket_continuity.rs`, because
 //! two copies of "what the real UI sends" would be two chances for a test to keep
@@ -38,11 +46,146 @@
 mod harness;
 
 use harness::agent::{ScriptedAgent, PAUSE, WORKING_DIRECTORY_MARKER};
-use harness::conversation::{activity, assistant_sends, follow_up, kinds, start_turn};
+use harness::conversation::{
+    activity, assistant_sends, create_project, follow_up, kinds, start_turn,
+};
 use harness::workspace::Workspace;
 use harness::TestServer;
 use lightcode_server::threads::Reconciliation;
 use serde_json::{json, Value};
+
+/// **Ticket 28.** The composer's own path, driven the way the real client drives
+/// it: a conversation that does not exist is watched, refused, and watched again
+/// until the first turn brings it into being.
+///
+/// The bug this pins was not that the events were wrong. Every event of the turn
+/// was correct, in order, and on the subscription the composer had open — and
+/// the window rendered none of it and sat on `Working for 3m 22s` against a turn
+/// that finished in 5.4 seconds. `client-runtime/state/threads.ts` folds an
+/// event only into a thread it already holds, and the only thing that gives it
+/// one is a **snapshot**. A subscription that opened on a thread the server did
+/// not have never sent one, so every event was dropped on arrival.
+///
+/// So what has to be true is not "the events arrive" — they always did — but
+/// that the first thing the composer's subscription ever carries is a snapshot.
+/// The refusal is what makes that happen: the client retries an expected failure
+/// every 250ms (`subscribeDynamic`), and the retry that lands after the turn
+/// created the thread opens with the conversation in it.
+#[tokio::test]
+async fn a_draft_becomes_the_conversation_the_composer_is_watching() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+
+    // The composer, before the developer has typed anything: a thread id it
+    // minted itself, which this server has never heard of.
+    // Refused as a *declared* error: the client reads one of those as "ask again
+    // in 250ms", and a defect as "this whole socket is broken".
+    let refused = client
+        .call(
+            "orchestration.subscribeThread",
+            json!({"threadId": "thread-1"}),
+        )
+        .await
+        .expect_declared("OrchestrationGetSnapshotError");
+    assert!(
+        refused["message"]
+            .as_str()
+            .expect("a message")
+            .contains("thread-1"),
+        "the refusal names the thread: {refused}"
+    );
+
+    // The developer types. The thread reaches the server for the first time as
+    // the turn that wants it created.
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "say ok"),
+        )
+        .await
+        .expect_success();
+
+    // And the retry finds it. `watch_draft` asserts the opening is a snapshot,
+    // which is the whole of the fix: without one the client has nothing to fold
+    // the rest of the turn into.
+    let subscription = client.watch_draft("thread-1").await;
+    let events = client.events_through_the_turn(&subscription).await;
+
+    // The turn finishes on the subscription the composer is holding, so the
+    // spinner has something to stop for.
+    let settled = events
+        .iter()
+        .rfind(|item| item["event"]["type"] == "thread.session-set")
+        .expect("the session settled");
+    assert_eq!(settled["event"]["payload"]["session"]["status"], "ready");
+
+    // And the reply is there to be drawn, whether it arrived in the snapshot or
+    // as events after it — which is the difference between the two the client
+    // cannot see, and must not have to.
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await;
+    let messages = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("messages");
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert_eq!(messages[0]["text"], "say ok");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["text"], "ok");
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// The other half of the same rule: a client that says it already holds the
+/// conversation is **not** refused, even for a thread this server has never had.
+///
+/// A browser keeps its cache in `localStorage` and this server keeps its
+/// conversations in a registry, and the two can be reset independently — a fresh
+/// database under a window that still has the thread is exactly the case. The
+/// refusal is there to make a client with nothing to draw ask again; this one has
+/// something to draw, so it gets the feed and is left to draw it.
+///
+/// It is also what `fixtures/socket-wire/01-browser-session.ndjson` captured the
+/// reference server doing: request `3` carries `afterSequence` and is answered
+/// with `synchronized` and no snapshot.
+#[tokio::test]
+async fn a_resume_of_a_thread_this_server_does_not_have_is_answered_not_refused() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let subscription = client
+        .subscribe(
+            "orchestration.subscribeThread",
+            json!({
+                "threadId": "a-thread-only-the-client-remembers",
+                "afterSequence": 2,
+                "requestCompletionMarker": true,
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        client.next_chunk(&subscription).await,
+        vec![json!({"kind": "synchronized"})],
+        "an empty snapshot would be a claim that the client's own copy is wrong"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
 
 /// The whole ticket in one test: a prompt goes in, the reply comes back token by
 /// token, and the transcript ends holding what the agent actually said.
@@ -77,15 +220,20 @@ async fn a_prompt_streams_a_reply_and_ends_with_the_buffered_message() {
 
     // The whole shape of a turn, in order. The client folds these into the
     // conversation, so their order *is* what the developer sees happen.
+    //
+    // It begins at the prompt rather than at `thread.created`, because the
+    // thread exists before it is watched — see
+    // [`SocketClient::open_conversation_in`], and
+    // `a_draft_becomes_the_conversation_the_composer_is_watching` below for the
+    // composer's own path, where the turn creates it.
     let seen = kinds(&events);
-    assert_eq!(seen[0], "thread.created", "{seen:?}");
-    assert_eq!(seen[1], "thread.message-sent", "{seen:?}");
-    assert_eq!(seen[2], "thread.turn-start-requested", "{seen:?}");
+    assert_eq!(seen[0], "thread.message-sent", "{seen:?}");
+    assert_eq!(seen[1], "thread.turn-start-requested", "{seen:?}");
     assert_eq!(*seen.last().expect("an end"), "thread.session-set");
 
     // The developer's own prompt is in the transcript before anything the agent
     // said about it.
-    let prompt = &events[1]["event"]["payload"];
+    let prompt = &events[0]["event"]["payload"];
     assert_eq!(prompt["role"], "user");
     assert_eq!(prompt["text"], "say ok");
     assert_eq!(prompt["streaming"], json!(false));
