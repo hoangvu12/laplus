@@ -63,6 +63,31 @@ concludes the feed is dead. Acknowledging it, the created event arrives
 immediately. Anyone re-opening this should read that module before writing a
 client.
 
+## What is still on this machine
+
+**The conversation above is still in the registry** — thread
+`0ea19ef1-d1d2-4745-875b-a4c0ef996950`, project `lightcode`, in
+`%LOCALAPPDATA%\lightcode\state.sqlite`. Both turns, both replies, both
+checkpoints. So the first experiments cost **no agent turn at all**: the data
+that should render is already there to be rendered.
+
+**Start with the cheapest discriminator, which is free:** open that thread from
+the sidebar in a fresh window and see whether it draws the four messages.
+
+- If it **renders**, the bug is specific to the draft-becomes-real transition —
+  the pane the composer was on never followed the thread the turn created, and
+  the question is which id it is watching.
+- If it **stays blank**, the thread subscription is broken generally, which is a
+  much bigger fish and easier to chase.
+
+This was attempted here and not answered: the sidebar's project was collapsed,
+so the click landed on nothing. It is one click away for whoever picks this up.
+
+**A socket probe needs two things**, both learned the hard way above. It must
+send `{"_tag":"Ack","requestId":"<id>"}` after every chunk or the feed stalls
+after one. And in .NET it must not cancel a pending `ReceiveAsync` to implement a
+timeout — that aborts the whole WebSocket; poll the task instead.
+
 ## Where to look next
 
 The client's own view, which nothing above has. Two ways in, and the second is
