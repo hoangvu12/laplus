@@ -19,6 +19,9 @@
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "template": "nsis/installer.nsi"
       }
     }
   }

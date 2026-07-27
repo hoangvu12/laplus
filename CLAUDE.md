@@ -39,7 +39,12 @@ gitignored, nothing builds from it any more, and it is worth keeping only as the
   so it needs that checkout built. **It is not a default workspace member**
   for exactly that reason: `cargo build` and `cargo test` cover the server only,
   and the shell is asked for by name (`cargo run -p lightcode-shell`,
-  `cargo test -p lightcode-shell`).
+  `cargo test -p lightcode-shell`). `nsis/installer.nsi` is tauri-bundler's
+  installer template, vendored and changed in two places so that lightcode
+  installs into `%LOCALAPPDATA%\Programs\lightcode` rather than on top of its
+  own database — ticket 30 and `docs/adr/0013`. **Re-vendor it by hand when
+  tauri-cli is upgraded**; its header says how, and `cargo test -p xtask` fails
+  if either change goes missing.
 - `xtask/` — how a release is made: `cargo xtask release` builds the Windows
   installer *and* measures it, because the project exists for that number. Writes
   `docs/artifact-size.md`. `--measure-install` additionally installs, weighs and

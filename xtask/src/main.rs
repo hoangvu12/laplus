@@ -25,6 +25,7 @@
 //! cargo xtask release [--measure-install]
 //!   │
 //!   ├─ refuse now if upstream's licence is not shipping
+//!   ├─ refuse now if the installer would write into the data directory
 //!   ├─ cargo tauri build           → target/release/bundle/nsis/*-setup.exe
 //!   ├─ weigh the installer and the binary
 //!   ├─ weigh what is installed     → payload, or a real install with the flag
@@ -94,6 +95,14 @@ fn release(measure_install: bool) -> Result<String, String> {
     let text = read(&root.join(notice::NOTICE))?;
     notice::retained(&config, &text)
         .map_err(|missing| format!("upstream's licence is not in the artifact: {missing:?}"))?;
+
+    // The same argument, for the same reason. An installer that writes over a
+    // developer's database is a reason not to hand it to anyone, and this is
+    // three seconds against the three minutes of finding out afterwards.
+    let template = read(&root.join(SHELL).join(install::TEMPLATE))?;
+    install::redirected(&config, &template).map_err(|astray| {
+        format!("this build would install on top of the developer's data (ticket 30): {astray:?}")
+    })?;
 
     run(Command::new("cargo").arg("tauri").arg("build").current_dir(root.join(SHELL)))?;
 

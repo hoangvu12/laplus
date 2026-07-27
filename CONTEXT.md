@@ -290,6 +290,13 @@ The window is pointed at `http://127.0.0.1:4773/`, so the port is part of what
 the browser scopes `localStorage` by — and `localStorage` is where the UI keeps
 the developer's layout, drafts and open thread. See ADR-0010.
 
+**Install directory** — `%LOCALAPPDATA%\Programs\lightcode`, where the
+installer writes. Named separately from the **data directory** —
+`%LOCALAPPDATA%\lightcode`, `config::data_dir`, which holds `state.sqlite`,
+`keybindings.json` and `logs/` — because until ticket 30 they were one
+directory and nothing in either half said so. Moving the install is what
+separated them; the data has not moved. See ADR-0013.
+
 ## Measuring the artifact
 
 The vocabulary of `cargo xtask release`, which exists because the project has a
@@ -298,14 +305,15 @@ bundle above and nothing else, which is why the command is `release`.
 
 **Artifact** — what a developer ends up with. Three figures rather than one, and
 they differ by more than rounding: the **installer** is what they download
-(5.04 MB, LZMA-compressed), the **footprint** is what it leaves on their disk
-(24.27 MB), and the **binary** is the application alone. The spec's "under
+(5.06 MB, LZMA-compressed), the **footprint** is what it leaves on their disk
+(24.33 MB), and the **binary** is the application alone. The spec's "under
 ~30 MB" story is about the first.
 
 **Footprint** — a directory, weighed. Measured two ways and it says which:
-**installed** ran the real installer and weighed what appeared, **payload**
-weighed the files the bundle ships without installing anything. Only the first
-is the truth; the second is what runs when the machine has not been volunteered.
+**installed** ran the real installer and weighed the **install directory** it
+made, **payload** weighed the files the bundle ships without installing
+anything. Only the first is the truth; the second is what runs when the machine
+has not been volunteered.
 
 **Target** — 20–30 MB, against upstream's 318 MB **baseline**. Only the ceiling
 can be *missed*; coming in under the floor is the project working, not a fault,

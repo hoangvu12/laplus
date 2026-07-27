@@ -56,9 +56,9 @@ pub fn render(measured: &Measurements) -> String {
         measured.installed.files,
         match measured.installed.source {
             Source::Installed =>
-                "what the installer left on disk, measured by running it and weighing what \
-                 it added — anything already in that directory is a developer's own state \
-                 and not this artifact",
+                "what the installer left on disk, measured by running it and weighing the \
+                 directory it made — which holds this artifact and nothing else, since \
+                 ticket 30 moved the install out of the one a developer's own state is in",
             Source::Payload =>
                 "what the bundle ships, weighed where it was built without installing it, \
                  so it does not count the uninstaller NSIS writes",
@@ -231,7 +231,7 @@ mod tests {
         let mut measured = measurements(5 * MB);
         measured.installed.source = Source::Installed;
         let real = render(&measured);
-        assert!(real.contains("running it and weighing what it added"), "{real}");
+        assert!(real.contains("running it and weighing the directory it made"), "{real}");
 
         measured.installed.source = Source::Payload;
         let inferred = render(&measured);
