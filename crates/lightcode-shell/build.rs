@@ -1,5 +1,5 @@
-//! Turn upstream's built web bundle into a table of names and bytes that live
-//! in the executable.
+//! Turn laplus's built web bundle into a table of names and bytes that live in
+//! the executable.
 //!
 //! Ticket 23 asks for a UI served "from the embedded application rather than a
 //! development server", and this is the embedding. There is no crate for it
@@ -8,12 +8,18 @@
 //! two things an off-the-shelf embedder would not give — a filter, and a failure
 //! that says what to do.
 //!
+//! **The bundle comes from a repository this project owns.** Ticket 32 replaced
+//! the read-only t3code checkout with `laplus`, our fork of it, living beside
+//! this one. What that changes here is only the path and the sentence in the
+//! failure — but it changes what a stale `dist/` *means*, from a vendoring
+//! detail into a bug in this project. See `docs/adr/0012`.
+//!
 //! **Source maps are excluded.** `dist/` is 54 MB, of which 37 MB is `.map`
-//! files: debug data for vendored JavaScript this project does not debug, which
-//! nothing loads unless a developer opens the devtools. Shipping them would put
-//! the artifact at three times the 20–30 MB target on its own. Everything else
-//! upstream built is shipped exactly as built — trimming the bundle itself is a
-//! change to vendored code that ticket 24 records as needing its own decision.
+//! files: debug data this project does not debug, which nothing loads unless a
+//! developer opens the devtools. Shipping them would put the artifact at three
+//! times the 20–30 MB target on its own. Everything else is shipped exactly as
+//! built — trimming the bundle is now a change we *may* make (ticket 24's open
+//! question) rather than one we cannot.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,9 +38,12 @@ fn main() {
         panic!(
             "no web assets under {}.\n\
              \n\
-             lightcode's window shows upstream's built UI, which lives in the vendored\n\
-             t3code checkout and is not committed to this repository. Build it there\n\
-             (`pnpm install && pnpm --filter @t3tools/web build` in t3code/) and try again.\n\
+             lightcode's window shows laplus's built UI. laplus is this project's fork of\n\
+             t3code and lives beside this repository, not inside it:\n\
+             \n\
+                 git clone https://github.com/hoangvu12/laplus.git\n\
+                 cd laplus && pnpm install && pnpm --filter @t3tools/web build\n\
+             \n\
              The server itself needs none of this: `cargo run -p lightcode-server` is a\n\
              socket endpoint with no window.",
             bundle.display()
@@ -57,7 +66,7 @@ fn main() {
 
     writeln!(
         generated,
-        "\n/// The version `t3code/apps/web/package.json` gives the bundle above.\n\
+        "\n/// The version `laplus/apps/web/package.json` gives the bundle above.\n\
          /// Ticket 26: the server reports this as its own, because it is the\n\
          /// number that UI compares against.\npub static VERSION: &str = {:?};",
         bundle_version(&manifest)
@@ -70,11 +79,14 @@ fn main() {
     tauri_build::build();
 }
 
-/// Where upstream's `dist/` is, relative to this crate.
+/// Where laplus's `dist/` is, relative to this crate.
 ///
-/// A path rather than a search: `t3code/` is a vendored checkout at a known
-/// place in this repository, and looking for it anywhere else would mean
-/// embedding whatever happened to be lying around.
+/// A path rather than a search, and still one after ticket 32 moved it outside
+/// this repository: a checkout at a known place is something a developer can be
+/// told to make, where looking around for a `dist/` would mean embedding
+/// whatever happened to be lying about. The cost of it being a *sibling* is that
+/// this path now assumes a layout rather than describing one, which is why the
+/// failure above prints the two commands that produce it.
 fn bundle_directory() -> PathBuf {
     web_directory().join("dist")
 }
@@ -84,9 +96,12 @@ fn bundle_directory() -> PathBuf {
 fn web_directory() -> PathBuf {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets this"));
     manifest
+        // crates/lightcode-shell -> crates -> lightcode -> the directory both
+        // checkouts sit in.
         .join("..")
         .join("..")
-        .join("t3code")
+        .join("..")
+        .join("laplus")
         .join("apps")
         .join("web")
 }

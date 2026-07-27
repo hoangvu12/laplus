@@ -256,9 +256,17 @@ running inside the same process. `crates/lightcode-shell`. The server is a
 library to it, not a service it talks to, which is why closing the window is
 what reaps the agents.
 
-**Bundle** — upstream's built web application, `t3code/apps/web/dist`, as it
+**laplus** — the UI, as a repository this project owns: a fork of t3code, cloned
+beside this one. Where the window's contents are changed, and the answer to
+"can we fix that in the client?", which used to be no. See ADR-0012.
+
+**Bundle** — laplus's built web application, `laplus/apps/web/dist`, as it
 reaches the executable: a table of names and bytes generated at build time.
 Source maps are the one thing dropped, and they are two thirds of it.
+
+**Upstream** — `pingdotgg/t3code`. Still the origin of every line of the UI and
+of the contract, and still the thing lightcode is measured against — but now a
+remote to merge from rather than a checkout to read.
 
 **Assets** — the bundle as the server holds it, and the rules for answering a
 request from it. `crate::ui::Assets`. Empty for every server but the shell's,

@@ -32,7 +32,7 @@ or leave the banner and accept the click.
 server that ships no UI keeps the crate's.**
 
 `lightcode-shell`'s build script reads `version` from
-`t3code/apps/web/package.json` — the file `dist/` was built from — and emits it
+`laplus/apps/web/package.json` — the file `dist/` was built from — and emits it
 beside the asset table. It travels with the bytes in `ui::Assets`, and
 `Server::bind_with` applies it through `ServerConfig::serving_ui_version`, which
 is where the reasoning is written down for the next reader.
@@ -53,12 +53,17 @@ client and server were compared and found to match.
   banner, the new one does not.
 - **`serverVersion` no longer names the server.** Anything that wants to know
   which lightcode is running cannot ask this field in the shell — it will hear
-  the UI's number. Nothing reads it that way today; the field's readers are the
-  client's connection catalogue and this banner.
-- **The advertised version is coupled to vendored code.** A `pnpm` build in
-  `t3code/` can change what the shell reports. The coupling was already paid —
-  the shell cannot build without that checkout — and a second file read from it
-  adds no new dependency.
+  the UI's number. The field has six readers in the UI: three are this banner
+  (`ChatView`, and twice in `ConnectionsSettings`), and the other three pass it
+  to `resolveServerBackedAppStageLabel`, which tests it against
+  `/-nightly\.\d{8}\.\d+$/` and nothing else. Neither number matches that, so
+  those three are unaffected — but they are the shape of what this field is
+  *for*, and the next one like them may not be so easy to satisfy.
+- **The advertised version is coupled to the UI's repository.** A `pnpm` build
+  in `laplus/` changes what the shell reports. That was a coupling to *vendored*
+  code when this was written; ticket 32 made it a coupling to a repository this
+  project owns, which is a smaller thing to worry about and a larger thing to
+  remember.
 - **A build with `APP_VERSION` set would put the banner back.** Vite prefers that
   environment variable over `package.json`, and the build script cannot see it.
   `the_version_reported_is_the_one_the_ui_compares_against` in the shell's tests

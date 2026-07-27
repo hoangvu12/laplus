@@ -3,13 +3,14 @@ resolver = "2"
 members = ["crates/lightcode-server", "crates/lightcode-shell", "xtask"]
 # `cargo build` and `cargo test` with no `-p` build the server and not the shell.
 #
-# The shell embeds `t3code/apps/web/dist`, and `t3code/` is a vendored checkout
-# that is gitignored and needs a `pnpm` build of its own. Leaving the shell in
-# the default set would mean a fresh clone could not run the suite at all — and
-# the spec is explicit that upstream is "reference material only, never a build
-# dependency". This is how both stay true: the shell has the dependency because
-# it must, and nothing else inherits it. `cargo build -p lightcode-shell` asks
-# for the application and gets a legible failure if the bundle is not there.
+# The shell embeds `../laplus/apps/web/dist` — a second repository, needing a
+# `pnpm` build of its own. Leaving the shell in the default set would mean a
+# fresh clone could not run the suite at all, which was true when that bundle
+# came from a vendored checkout (ticket 23) and is more true now that it comes
+# from somewhere else entirely (ticket 32). This is how it stays contained: the
+# shell has the dependency because it must, and nothing else inherits it.
+# `cargo build -p lightcode-shell` asks for the application and gets a legible
+# failure — with the two commands that fix it — if the bundle is not there.
 #
 # It also keeps the suite quick. The shell pulls in Tauri, which is a thousand
 # crates the server's tests have no use for.

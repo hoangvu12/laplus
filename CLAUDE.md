@@ -1,19 +1,42 @@
 # lightcode
 
-A Rust server + Tauri shell that drives the `claude` CLI directly, reusing
-t3code's `apps/web` UI. See `HANDOFF-rust-server-tauri.md` for the plan and
-`spike-claude-protocol/README.md` for the STEP 1 protocol spike that gated it
-(answered; its code now lives in the workspace).
+A Rust server + Tauri shell that drives the `claude` CLI directly, wearing the
+`apps/web` UI from **laplus**. See `HANDOFF-rust-server-tauri.md` for the plan
+and `spike-claude-protocol/README.md` for the STEP 1 protocol spike that gated
+it (answered; its code now lives in the workspace).
 
-`t3code/` is a vendored upstream checkout with its own `.git` — reference only,
-never committed here (see `.gitignore`).
+## The UI lives in another repository
+
+`laplus` — <https://github.com/hoangvu12/laplus>, this project's fork of
+`pingdotgg/t3code` — is cloned **beside** this repo, not inside it:
+
+```
+nguyenvu/
+├── lightcode/   ← here. the Rust server, the shell, the tickets
+└── laplus/      ← the UI. `apps/web` builds the bundle the shell embeds
+```
+
+The shell's build script reads `../laplus/apps/web/dist`, and says what to clone
+if it is not there. Building it is `pnpm install && pnpm --filter @t3tools/web
+build` in `laplus/`. Ticket 32 and `docs/adr/0012` are why it is a fork we own
+rather than the read-only checkout it used to be; the short version is that
+three tickets were all "the client does something we cannot change".
+
+Upstream is a remote of that repo (`upstream`, push disabled), so a sync is a
+`git merge` there rather than a re-vendoring here. Its `@t3tools/*` package scope
+is deliberately **not** renamed — it appears in 1,069 files, and renaming it
+would conflict with upstream on nearly every merge.
+
+`t3code/` may still be present here as the old depth-1 read-only checkout. It is
+gitignored, nothing builds from it any more, and it is worth keeping only as the
+*unmodified* upstream UI that user story 57 asks to connect to this server.
 
 ## Layout
 
 - `crates/lightcode-server/` — the server. Cargo workspace root is the repo root.
 - `crates/lightcode-shell/` — the desktop application: a Tauri window with the
-  server running inside it. Its build script embeds `t3code/apps/web/dist`, so
-  it needs the vendored checkout built. **It is not a default workspace member**
+  server running inside it. Its build script embeds `../laplus/apps/web/dist`,
+  so it needs that checkout built. **It is not a default workspace member**
   for exactly that reason: `cargo build` and `cargo test` cover the server only,
   and the shell is asked for by name (`cargo run -p lightcode-shell`,
   `cargo test -p lightcode-shell`).
