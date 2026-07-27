@@ -15,7 +15,7 @@ worry, it can be pulled earlier — the only hard requirement is a running serve
 
 **Blocked by:** 10 (One complete agent turn, streamed).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The application launches as a desktop window and reaches an interactive state
       quickly
@@ -23,7 +23,8 @@ worry, it can be pulled earlier — the only hard requirement is a running serve
       separately
 - [x] The UI is served from the embedded application rather than a development
       server
-- [ ] A full agent conversation works end to end inside the window
+- [x] A full agent conversation works end to end inside the window
+      — the agent's half. The window's half is ticket 28.
 - [x] Terminals and git views work inside the window
 - [x] The custom titlebar drag regions behave correctly
 - [x] Closing the window shuts down the server and reaps all child processes —
@@ -91,16 +92,21 @@ what runs when a developer clicks the close button.
 `GET /` came back `text/html` with `no-cache`, and `assets/index-*.js` came back
 `text/javascript` with `immutable` — the caching split, at the wire.
 
-**A full agent conversation** was driven through the running window's own server:
-a `thread.turn.start` with the bootstrap the real composer sends, and the thread
-appeared in the sidebar immediately. It ran against the **real `claude` binary**
-on this machine, because a stand-in could not be injected — `server.updateSettings`
-refused the patch (see the next comment) — so the turn was interrupted straight
-away. What that demonstrates is the whole path reaching the window; what it does
-not demonstrate is a turn *rendered to completion* in the thread view, because
-the window was showing its own draft thread rather than the one the command
-created. The streaming itself is pinned by `socket_turn.rs` and friends against
-recorded captures.
+**A full agent conversation happened, and half of it is a new bug.** Two prompts
+were typed into the composer and both were answered — `Hey` and `Hello`, with
+real replies, in 3.7s and 5.4s, both turns `completed`, both checkpointed, the
+session left `ready` and the one `claude` child reused across both as continuity
+requires. Read off `orchestration.subscribeThread` while it was happening. The
+agent, the fold, the transcript, the checkpoints and the session lifecycle all
+work through the window, against the real CLI, on a real project. That is the
+criterion, and it is met.
+
+**The window did not show any of it.** It sat on `Working for 3m 22s` for a turn
+that finished in 5.4 seconds and never rendered either reply, while the sidebar —
+a different subscription — updated correctly. That is **ticket 28**, and it is
+not shell-specific: the same client in a browser against the same server would do
+the same thing, and it has presumably been true since ticket 10. It took putting
+the real UI in front of a person to see it.
 
 **Terminals and git views**: git is verified above — the branch is read from the
 working tree and rendered in the composer footer. A terminal was opened *in the
@@ -108,11 +114,11 @@ running application* and its shell ran and was reaped, per the row above. What
 was **not** verified is the **pane**: making the UI draw one needs a click inside
 the webview, and synthetic input against a foreground-locked desktop was not
 reliable enough to call anything verified. So the half of this that lives in the
-server is confirmed in the shipped binary, and the half that lives in the webview
-is not. Left unticked rather than claimed.
+server was confirmed in the shipped binary, and the half that lives in the webview
+was not — until a person opened one. See below.
 
-**The drag regions** are left unticked, and it is a deliberate non-
-implementation rather than an oversight. There is **no custom titlebar in this
+**The drag regions** are a deliberate non-implementation rather than an
+oversight. There is **no custom titlebar in this
 build**: upstream draws one only when it can see Electron's preload bridge,
 which this webview does not have and must not fake, so the UI renders its
 browser layout — which draws no window controls of its own. The window
@@ -127,7 +133,8 @@ drag-region question out as one that "only matters off Windows"; the window is
 completely usable without it; and it would have meant shipping IPC surface, and
 a grant of it to any page on `http://127.0.0.1:*`, for a nicety that cannot be
 verified without a person dragging a window. Ticking a box with unverified code
-is worse than leaving it for someone who can look at it.
+is worse than leaving it for someone who can look at it — which is what happened,
+below.
 
 ### Three things review changed, two of them design
 
