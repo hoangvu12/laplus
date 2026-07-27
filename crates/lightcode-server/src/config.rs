@@ -9,14 +9,15 @@
 //! response against a live one and requires each divergence to be declared, so
 //! the list below is enforced rather than aspirational.
 //!
-//! What is deliberately empty, and who fills it:
+//! What was deliberately empty here is now filled, and by two modules rather
+//! than this one: [`crate::keybindings`] compiles `keybindings` and the issues
+//! found reading them, and [`crate::settings`] reads `settings` off the disk
+//! over the defaults below. Both are I/O and this file is not, which is the
+//! whole of why they are elsewhere — what stays here is what a setting *is* and
+//! what one is worth when nobody has chosen.
 //!
-//! | Field | Filled by |
-//! |---|---|
-//! | `keybindings` | ticket 22 — settings and keybindings |
-//! | `settings.textGenerationModelSelection` | ticket 22 — it is a stored preference, not something the CLI can be asked |
-//!
-//! `providers` is a third, and its emptiness is a *state* rather than a gap:
+//! `providers` is the one that is still empty, and its emptiness is a *state*
+//! rather than a gap:
 //! ticket 09 fills it, but from [`crate::provider::refresh`] rather than from
 //! here. Assembling this payload starts no child process, so the first
 //! `server.getConfig` is answered without waiting on an agent that may not exist,
@@ -42,6 +43,18 @@ pub struct ServerConfig {
     /// The directory the server was started in. The UI shows it and uses it as
     /// the default working directory for a new project.
     pub cwd: String,
+    /// Where this server keeps the developer's own files — `keybindings.json`,
+    /// `settings.json`, the logs and the registry.
+    ///
+    /// **Not on the wire**, which is why it is skipped rather than named in
+    /// camel case: the contract has no such field, and
+    /// `tests/socket_conformance.rs` would report it as an undeclared addition.
+    /// It is here rather than passed beside the config because the two things
+    /// that *are* on the wire — `keybindingsConfigPath` and the logs directory —
+    /// are derived from it, and a server whose advertised path and real path
+    /// could differ would send the developer to edit a file nothing reads.
+    #[serde(skip)]
+    pub preferences: PathBuf,
     pub keybindings_config_path: String,
     pub keybindings: Vec<ResolvedKeybinding>,
     pub issues: Vec<ConfigIssue>,
@@ -103,15 +116,23 @@ pub struct AuthDescriptor {
 }
 
 /// A resolved keybinding: the compiled form the UI consumes, not the `mod+b`
-/// source form.
-#[derive(Debug, Clone, Serialize)]
+/// source form. [`crate::keybindings`] is what turns one into the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedKeybinding {
     pub command: String,
     pub shortcut: KeybindingShortcut,
+    /// The parsed `when` expression, for a binding that has one.
+    ///
+    /// **Absent rather than null** when the binding is unconditional: the
+    /// contract types it `Schema.optional`, and a `null` would decode as a
+    /// `when` whose type is neither of the four the union allows — which costs
+    /// the whole keybindings array, not the one rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_ast: Option<crate::keybindings::WhenNode>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeybindingShortcut {
     pub key: String,
@@ -122,13 +143,31 @@ pub struct KeybindingShortcut {
     pub mod_key: bool,
 }
 
-/// A problem found while assembling this config — a malformed keybindings
-/// file, and nothing else so far. Surfaced in the UI rather than logged.
-#[derive(Debug, Clone, Serialize)]
+/// A problem found while assembling this config. Surfaced in the UI rather than
+/// logged, because it is a thing the developer can go and fix.
+///
+/// **`kind` is one of two literals, not a label.** `ServerConfigIssue` in
+/// `server.ts` is a closed union — `keybindings.malformed-config` and
+/// `keybindings.invalid-entry`, the second carrying the entry's `index` — and
+/// `ServerConfig.issues` is an array of it. So a `kind` of this server's own
+/// invention would not be an oddly-named row: it would fail the client's decode
+/// of the **whole `server.getConfig` payload**, and the app would not open at
+/// all. On a broken keybindings file. Which is the one case this field exists
+/// for.
+///
+/// [`crate::keybindings`] is the only thing that builds one, and that follows
+/// from the same fact: there is no member of the union for a settings problem,
+/// so [`crate::settings`] logs instead. See its `load`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigIssue {
-    pub kind: String,
+    pub kind: &'static str,
     pub message: String,
+    /// Which entry of the file was refused — required by
+    /// `keybindings.invalid-entry` and absent from the other member, so it is
+    /// skipped rather than sent as null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
 }
 
 /// A configured provider instance: what the UI shows in its picker and routes a
@@ -217,7 +256,7 @@ pub struct Observability {
     pub otlp_metrics_enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// On, where upstream defaults it off.
@@ -239,6 +278,24 @@ pub struct Settings {
     pub default_thread_env_mode: &'static str,
     pub new_worktrees_start_from_origin: bool,
     pub add_project_base_directory: String,
+    /// Which model generates text the developer did not ask for — a thread
+    /// title, a commit message.
+    ///
+    /// **Sent rather than left absent, and that is ticket 22's doing.** The
+    /// contract's decoding default is `{instanceId: "codex", model:
+    /// "gpt-5.6-luna"}`, so a client filling it in for itself would name an
+    /// instance and a model v1 does not ship — and the first feature to want
+    /// generated text would ask a provider that is not there. Naming the one
+    /// instance this server has costs nothing and cannot be wrong.
+    ///
+    /// Nothing reads it yet: thread titles and commit messages are later
+    /// tickets. It is stored because a settings panel that forgets what the
+    /// developer chose is worse than one with a control that is not wired up.
+    ///
+    /// JSON rather than a struct for the reason [`crate::threads`] keeps a
+    /// thread's own selection as JSON: nothing here reads into it, so a mirrored
+    /// shape would be one more thing to keep in step for no query it enables.
+    pub text_generation_model_selection: serde_json::Value,
     pub providers: ProviderSettings,
     pub provider_instances: serde_json::Map<String, serde_json::Value>,
     pub observability: ObservabilitySettings,
@@ -247,13 +304,13 @@ pub struct Settings {
 /// Only the one driver v1 ships. Upstream's struct has five keys, each with a
 /// decoding default, so the four lightcode does not implement are simply
 /// absent rather than described as disabled.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSettings {
     pub claude_agent: ClaudeSettings,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeSettings {
     pub enabled: bool,
@@ -267,7 +324,7 @@ pub struct ClaudeSettings {
     pub custom_models: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObservabilitySettings {
     pub otlp_traces_url: String,
@@ -284,9 +341,21 @@ impl ServerConfig {
     /// where the agent is wedged. See [`crate::provider::refresh`], which is the
     /// part that does wait, off the startup path.
     pub fn detect() -> Self {
-        let data_dir = data_dir();
+        ServerConfig::detect_in(data_dir())
+    }
 
+    /// The same, keeping the developer's files somewhere the caller chose.
+    ///
+    /// The seam the suite uses, and it is not test-only for the same reason
+    /// [`crate::Server::bind_with`] is not: ticket 23's shell wants to decide
+    /// where the app's state lives. It has to be an argument rather than an
+    /// environment variable, because `LOCALAPPDATA` is process-global mutable
+    /// state — a test that set it would be setting it for every test running
+    /// beside it, and a suite that wrote to the developer's real configuration
+    /// would be a suite nobody could run twice.
+    pub fn detect_in(data_dir: PathBuf) -> Self {
         ServerConfig {
+            preferences: data_dir.clone(),
             environment: EnvironmentDescriptor {
                 environment_id: "local".to_string(),
                 label: machine_label(),
@@ -335,6 +404,12 @@ impl ServerConfig {
                 default_thread_env_mode: "local",
                 new_worktrees_start_from_origin: true,
                 add_project_base_directory: String::new(),
+                // The cheapest model this server offers, because the work is
+                // a thread title rather than the developer's own turn.
+                text_generation_model_selection: serde_json::json!({
+                    "instanceId": crate::provider::INSTANCE_ID,
+                    "model": "claude-haiku-4-5",
+                }),
                 providers: ProviderSettings {
                     claude_agent: ClaudeSettings {
                         enabled: true,

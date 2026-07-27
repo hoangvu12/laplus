@@ -53,6 +53,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// A server bound to a free loopback port, with the sockets it hands out.
 pub struct TestServer {
     server: Server,
+    /// The developer's configuration, somewhere throwaway.
+    ///
+    /// **Every** server here gets one, and it is not optional: since ticket 22
+    /// the server reads `settings.json` and `keybindings.json` at startup and
+    /// writes them back when they change. A suite that let those default to the
+    /// real data directory would read whatever this machine's developer had
+    /// configured — so the same test would pass here and fail there — and, far
+    /// worse, would *overwrite* it. Removed on drop, like the workspaces.
+    ///
+    /// `None` only for [`TestServer::start_configured_in`], where the *test*
+    /// owns the directory because it is about to start a second server on it.
+    _preferences: Option<tempfile::TempDir>,
 }
 
 impl TestServer {
@@ -60,11 +72,34 @@ impl TestServer {
     /// that is not about persistence wants: nothing is shared between tests,
     /// and the developer's own project list is never touched.
     pub async fn start() -> TestServer {
-        TestServer::start_with(ServerConfig::detect()).await
+        TestServer::start_on(None, Database::in_memory().expect("an in-memory database")).await
     }
 
+    /// A server started from a configuration the test built.
+    ///
+    /// The configuration's `preferences` is replaced with a throwaway
+    /// directory whatever the caller set, for the reason [`TestServer`]'s own
+    /// field gives. A test that wants to *drive* the preferences directory —
+    /// one about settings surviving a restart — uses
+    /// [`TestServer::start_configured_in`].
     pub async fn start_with(config: ServerConfig) -> TestServer {
-        TestServer::start_on(config, Database::in_memory().expect("an in-memory database")).await
+        TestServer::start_on(Some(config), Database::in_memory().expect("an in-memory database"))
+            .await
+    }
+
+    /// A server keeping the developer's configuration in `preferences`.
+    ///
+    /// Start a second one on the same directory and that is a restart, which is
+    /// how "settings survive a restart" is driven without a second process —
+    /// the same shape as [`TestServer::start_at`] for the registry.
+    pub async fn start_configured_in(preferences: &Path) -> TestServer {
+        let config = ServerConfig::detect_in(preferences.to_path_buf());
+        TestServer {
+            server: Server::bind_with(0, config, Database::in_memory().expect("a database"))
+                .await
+                .expect("server binds to a free loopback port"),
+            _preferences: None,
+        }
     }
 
     /// A server that will start `binary` when a turn is dispatched.
@@ -84,11 +119,7 @@ impl TestServer {
     /// and that is a restart — which is how the "survives a restart" test is
     /// driven without a second process.
     pub async fn start_at(database: &Path) -> TestServer {
-        TestServer::start_on(
-            ServerConfig::detect(),
-            Database::open(database).expect("the database opens"),
-        )
-        .await
+        TestServer::start_on(None, Database::open(database).expect("the database opens")).await
     }
 
     /// A restart that can also take a turn: a registry on disk *and* an agent to
@@ -101,14 +132,29 @@ impl TestServer {
     pub async fn start_at_with_agent(database: &Path, binary: &str) -> TestServer {
         let mut config = ServerConfig::detect();
         config.settings.providers.claude_agent.binary_path = binary.to_string();
-        TestServer::start_on(config, Database::open(database).expect("the database opens")).await
+        TestServer::start_on(Some(config), Database::open(database).expect("the database opens"))
+            .await
     }
 
-    async fn start_on(config: ServerConfig, database: Database) -> TestServer {
+    /// The one place a server here is actually started.
+    ///
+    /// Whatever the caller's configuration said about where the developer's
+    /// files live is **overwritten** with a throwaway directory. See
+    /// [`TestServer`]'s own field: this is the seam that keeps the suite off the
+    /// developer's real `settings.json`, and it is here rather than at each call
+    /// site so that a test added later cannot forget it.
+    async fn start_on(config: Option<ServerConfig>, database: Database) -> TestServer {
+        let preferences = tempfile::tempdir().expect("a temporary directory");
+        let mut config = config.unwrap_or_else(ServerConfig::detect);
+        config.preferences = preferences.path().to_path_buf();
+
         let server = Server::bind_with(0, config, database)
             .await
             .expect("server binds to a free loopback port");
-        TestServer { server }
+        TestServer {
+            server,
+            _preferences: Some(preferences),
+        }
     }
 
     pub fn ws_url(&self) -> String {

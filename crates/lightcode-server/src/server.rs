@@ -245,7 +245,10 @@ impl Server {
         // and the status are kept fresh by it.
         let index = Index::new();
         let services = Services {
-            config: ConfigStore::new(config),
+            // `opening` rather than `new`: what the developer configured last
+            // time is read in here, and a file that will not read is an issue
+            // in the payload rather than a server that will not start.
+            config: ConfigStore::opening(config),
             shell: Shell::new(database),
             repositories: Repositories::new(&index),
             index,

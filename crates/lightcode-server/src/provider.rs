@@ -493,9 +493,9 @@ const BUILT_IN_MODELS: &[BuiltIn] = &[
 /// nothing about. Both are defensible — theirs keeps the picker full, this keeps
 /// it truthful — and this one is chosen because a slug that cannot work is worse
 /// than a shorter list.
-fn models(version: Option<&str>) -> Vec<ProviderModel> {
+fn models(version: Option<&str>, custom: &[String]) -> Vec<ProviderModel> {
     let installed = version.and_then(parse_version);
-    BUILT_IN_MODELS
+    let mut models: Vec<ProviderModel> = BUILT_IN_MODELS
         .iter()
         .filter(|model| match model.since {
             None => true,
@@ -507,7 +507,27 @@ fn models(version: Option<&str>) -> Vec<ProviderModel> {
             is_custom: false,
             capabilities: None,
         })
-        .collect()
+        .collect();
+
+    // The developer's own slugs, from `settings.providers.claudeAgent.customModels`
+    // — ticket 22's "including model selection". **After** the built-in ones and
+    // never version-gated, and both follow from what a custom model *is*: this
+    // server has no table to check it against, so it is offered on the
+    // developer's word, and the UI's default is the first non-custom entry — so
+    // adding one at the front would silently change what a new conversation
+    // starts with.
+    models.extend(custom.iter().filter(|slug| !slug.trim().is_empty()).map(|slug| {
+        ProviderModel {
+            slug: slug.trim().to_string(),
+            // No display name to give: the developer typed a slug, and inventing
+            // a prettier version of it would show them something they did not
+            // write.
+            name: slug.trim().to_string(),
+            is_custom: true,
+            capabilities: None,
+        }
+    }));
+    models
 }
 
 /// What to tell a developer whose CLI is too old for part of the table.
@@ -786,7 +806,7 @@ fn snapshot(
         display_name: DISPLAY_NAME.to_string(),
         enabled: settings.enabled,
         installed: installed == Installed::Yes,
-        models: models(version.as_deref()),
+        models: models(version.as_deref(), &settings.custom_models),
         version,
         status,
         message,
@@ -1110,7 +1130,7 @@ mod tests {
     #[test]
     fn the_models_offered_are_gated_on_the_version_that_answered() {
         let slugs = |version: Option<&str>| -> Vec<String> {
-            models(version).into_iter().map(|model| model.slug).collect()
+            models(version, &[]).into_iter().map(|model| model.slug).collect()
         };
 
         let old = slugs(Some("2.1.100"));
@@ -1139,7 +1159,7 @@ mod tests {
     /// its own hardcoded default.
     #[test]
     fn an_unknown_version_offers_only_the_models_that_need_no_version() {
-        let offered = models(None);
+        let offered = models(None, &[]);
 
         assert!(!offered.is_empty());
         assert!(offered.iter().all(|model| BUILT_IN_MODELS

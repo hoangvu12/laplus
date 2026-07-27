@@ -155,6 +155,36 @@ A convention where git has no answer, never a guess where it has none.
 `origin/main` beside `main` is a row that says nothing, so the picker does not
 show one unless the client asks (`includeMatchingRemoteRefs`).
 
+## Settings and keybindings
+
+**Preferences** — the directory this server keeps the developer's own files in:
+`settings.json`, `keybindings.json`, the logs and the registry. On
+`ServerConfig` and deliberately off the wire; the paths that *are* on the wire
+are derived from it.
+
+**Patch** — a settings change, every field optional, where an absent field means
+**unchanged** rather than "set to the default". What `server.updateSettings`
+takes, and also how a stored file is read: one is all-or-nothing so a refusal
+changes nothing, the other is per-field so a key from another build costs only
+itself. `crate::settings`.
+
+**Rule** and **resolved keybinding** — the two forms of a binding. A rule is
+what a person writes and what is in the file (`mod+shift+d`); a resolved
+keybinding is what the UI consumes — the shortcut split into the flags a
+`KeyboardEvent` carries, and the `when` expression parsed into a tree. Compiling
+one into the other is `crate::keybindings`, because the client holds no file.
+
+**Merge by command** — a custom rule replaces the default for the *same
+command*, however either is spelled. What makes rebinding one shortcut leave the
+other forty alone, and what makes removing one bring its default back rather
+than leaving nothing.
+
+**Issue** — something that went wrong assembling the configuration, shown in the
+UI rather than logged. Its `kind` is one of two literals the contract names, not
+a label: `ServerConfig.issues` is an array of a closed union, so an invented kind
+fails the client's decode of the whole payload — which is why a settings problem
+is logged instead, having no member of its own.
+
 ## Terminal
 
 **Terminal** — one shell in a project's folder, named by the client and unique

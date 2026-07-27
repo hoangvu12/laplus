@@ -126,26 +126,6 @@ const MISSING: &[Declared] = &[
         because: "thread.snooze / thread.unsnooze are not implemented",
     },
     Declared {
-        path: "/settings/textGenerationModelSelection",
-        // Ticket 03 expected ticket 09 to fill this "once model slugs are known
-        // from the CLI". There is no such call: the CLI has no way to be asked
-        // what models it accepts, and upstream hardcodes the list — which
-        // `provider::BUILT_IN_MODELS` now does too. What is left is a *stored
-        // preference* over those slugs, which is a settings feature.
-        //
-        // It cannot simply be left absent forever, and the reason is worth
-        // recording where the next ticket will find it: the field's decoding
-        // default in `settings.ts` is
-        // `{instanceId: "codex", model: DEFAULT_GIT_TEXT_GENERATION_MODEL}`, so a
-        // client filling it in names an instance v1 does not ship. Nothing reads
-        // it yet — thread titles and commit messages are later tickets — but
-        // whichever ticket wants text generation has to send this rather than
-        // inherit the default.
-        because: "a stored preference over the model slugs, not something the CLI can \
-                  be asked; ticket 22 owns settings, and nothing reads it until a \
-                  ticket wants generated titles",
-    },
-    Declared {
         path: "/providers/0/continuation",
         because: "`groupKey` is how threads are grouped for resumption; ticket 11 \
                   owns multi-turn continuity",
@@ -230,10 +210,6 @@ const UNCOMPARED: &[Declared] = &[
     Declared {
         path: "/auth/bootstrapMethods[]",
         because: "lightcode has no pairing flow to bootstrap through",
-    },
-    Declared {
-        path: "/keybindings[]",
-        because: "ticket 22 owns keybindings",
     },
     Declared {
         path: "/issues[]",

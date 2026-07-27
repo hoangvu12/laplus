@@ -104,6 +104,11 @@ impl ConfigChange {
 }
 
 impl ConfigStore {
+    /// A store over the configuration exactly as given, touching no disk.
+    ///
+    /// What the unit tests of everything *around* the configuration want. The
+    /// server uses [`ConfigStore::opening`], which is this plus the developer's
+    /// own two files.
     pub fn new(config: ServerConfig) -> ConfigStore {
         ConfigStore {
             inner: Arc::new(Inner {
@@ -111,6 +116,26 @@ impl ConfigStore {
                 updates: broadcast::channel(BACKLOG).0,
             }),
         }
+    }
+
+    /// The same, with what the developer configured last time read in over it.
+    ///
+    /// **Nothing here can fail**, which is ticket 22's criterion rather than a
+    /// convenience: a settings file the app refused to start on is one the
+    /// developer cannot open the app to fix. Both readers answer with the
+    /// defaults and a [`ConfigIssue`] instead, and the issues land in the same
+    /// list a malformed keybinding lands in — which the UI already renders.
+    pub fn opening(config: ServerConfig) -> ConfigStore {
+        let mut config = config;
+        let keybindings = crate::keybindings::load(&config.preferences);
+
+        config.settings = crate::settings::load(&config.preferences, config.settings.clone());
+        config.keybindings = keybindings.keybindings;
+        // Only the keybindings file can put a row here — `ServerConfigIssue` has
+        // no member for a settings problem, and one invented for it would fail
+        // the client's decode of this whole payload. See `crate::settings::load`.
+        config.issues = keybindings.issues;
+        ConfigStore::new(config)
     }
 
     /// The configuration in force. An `Arc` rather than a guard so a reader
@@ -142,6 +167,83 @@ impl ConfigStore {
         // full — so this cannot deadlock, and it is what makes concurrent
         // changes announce themselves in the order they were applied.
         let _ = self.inner.updates.send(event);
+    }
+
+    /// Change the settings, write them down, then publish them.
+    ///
+    /// The settings half of [`ConfigStore::rebind`], with the same division of
+    /// labour: [`crate::settings`] knows what a patch means and this knows that
+    /// only one of them happens at a time. `change` returns the sentence for a
+    /// patch it will not apply, and **the store is not touched when it does** —
+    /// which is the criterion "invalid settings are rejected with a message,
+    /// leaving the previous values intact", enforced by the lock rather than by
+    /// each caller remembering.
+    pub fn reconfigure(
+        &self,
+        change: impl FnOnce(&mut crate::config::Settings) -> Result<(), String>,
+    ) -> Result<Value, Value> {
+        let mut current = self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut settings = current.settings.clone();
+        crate::settings::reconfigure(&current.preferences, &mut settings, change)?;
+
+        let mut next = (**current).clone();
+        next.settings = settings.clone();
+        *current = Arc::new(next);
+
+        let answer = serde_json::to_value(&settings).unwrap_or(Value::Null);
+        let _ = self
+            .inner
+            .updates
+            .send(ConfigChange::Settings(Box::new(settings)).to_event());
+        Ok(answer)
+    }
+
+    /// Change the developer's keybindings file, then publish what it now says.
+    ///
+    /// **One rebind at a time**, and that is the whole reason this lives here
+    /// rather than in [`crate::keybindings`]: the file is read, changed and
+    /// written back, and two of those interleaving would lose one developer's
+    /// edit under the other's. The lock this takes is the same one
+    /// [`ConfigStore::apply`] takes, so a rebind and a settings change also
+    /// cannot announce themselves out of order.
+    ///
+    /// The module owns the *format*; this owns the *ordering*. Neither knows
+    /// the other's half.
+    pub fn rebind(
+        &self,
+        change: impl FnOnce(&mut Vec<crate::keybindings::Rule>),
+    ) -> Result<Value, Value> {
+        let directory = self.current().preferences.clone();
+        let mut current = self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let loaded = crate::keybindings::rebind(&directory, change)?;
+        let answer = crate::keybindings::to_result(&loaded);
+
+        let mut next = (**current).clone();
+        next.keybindings = loaded.keybindings.clone();
+        next.issues = loaded.issues.clone();
+        *current = Arc::new(next);
+
+        // Under the write lock, like every other announcement here — see
+        // [`ConfigStore::apply`], whose reasoning this shares rather than
+        // repeats.
+        let _ = self.inner.updates.send(
+            ConfigChange::Keybindings {
+                keybindings: loaded.keybindings,
+                issues: loaded.issues,
+            }
+            .to_event(),
+        );
+        Ok(answer)
     }
 
     /// Open a subscription: the configuration now, then every change to it.

@@ -35,8 +35,10 @@ use crate::editor::{self, OpenInEditor};
 use crate::files::{self, ReadFile, WriteFile};
 use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::git::{self, Repositories, StatusCall};
+use crate::keybindings::{self, Upsert};
 use crate::orchestration::{self, Shell};
 use crate::refs::{self, CreateRef, Init, ListRefs, SwitchRef};
+use crate::settings;
 use crate::subscriptions::EventSource;
 use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
 use crate::threads;
@@ -384,6 +386,26 @@ pub fn dispatch(
         checkpoints::GET_FULL_THREAD_DIFF => Diff::read_thread(payload)
             .map(|call| deferred_in(&services.shell, |shell| call.run(shell)))
             .map_err(DispatchError::Declared),
+        // Reading the settings is reading memory — they were loaded at startup
+        // and every change since has gone through the store — so it answers on
+        // the read loop. The payload is an empty struct in the contract.
+        settings::GET => Ok(Answer::Value(
+            serde_json::to_value(&services.config.current().settings).unwrap_or(Value::Null),
+        )),
+        // The three that write a file do not. Small work, but a disk that is
+        // busy is bounded by nothing this server controls, and the read loop
+        // owes the next frame.
+        settings::UPDATE => settings::Update::read(payload, &services.config.current().preferences)
+            .map(|call| deferred_over(&services.config, |config| call.run(config)))
+            .map_err(DispatchError::Declared),
+        keybindings::UPSERT => Upsert::read(payload, &services.config.current().preferences)
+            .map(|call| deferred_over(&services.config, |config| call.run(config)))
+            .map_err(DispatchError::Declared),
+        keybindings::REMOVE => {
+            keybindings::Remove::read(payload, &services.config.current().preferences)
+                .map(|call| deferred_over(&services.config, |config| call.run(config)))
+                .map_err(DispatchError::Declared)
+        }
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -424,6 +446,19 @@ fn deferred_in(
 ) -> Answer {
     let shell = shell.clone();
     Answer::Deferred(Deferred::new(move || work(&shell)))
+}
+
+/// Defer work that changes what the developer configured.
+///
+/// The fourth of the same family. The store outlives the call — a subscription
+/// is still describing the configuration long afterwards — and is cloned for the
+/// reason the others are.
+fn deferred_over(
+    config: &ConfigStore,
+    work: impl FnOnce(&ConfigStore) -> Result<Value, Value> + Send + 'static,
+) -> Answer {
+    let config = config.clone();
+    Answer::Deferred(Deferred::new(move || work(&config)))
 }
 
 #[cfg(test)]
