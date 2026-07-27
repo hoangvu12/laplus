@@ -31,7 +31,7 @@ use crate::files::{self, ReadFile, WriteFile};
 use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::orchestration::{self, Shell};
 use crate::subscriptions::EventSource;
-use crate::terminal::{self, Attach, Resize, Terminals, WriteInput};
+use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
 use crate::threads;
 
 /// The payload of an `orchestration.subscribeThread`.
@@ -308,6 +308,26 @@ pub fn dispatch(
             .and_then(|call| services.terminals.resize(&call))
             .map(Answer::Value)
             .map_err(DispatchError::Declared),
+        // Clearing is arithmetic on a string it already holds, so it answers
+        // from the read loop like a write does.
+        terminal::CLEAR => Clear::read(payload)
+            .and_then(|call| services.terminals.clear(&call))
+            .map(Answer::Value)
+            .map_err(DispatchError::Declared),
+        // Restarting and closing both end a process and wait for it, which is
+        // the one thing a read loop must never do.
+        terminal::RESTART => Restart::read(payload)
+            .map(|call| {
+                let terminals = services.terminals.clone();
+                Answer::Deferred(Deferred::new(move || terminals.restart(&call)))
+            })
+            .map_err(DispatchError::Declared),
+        terminal::CLOSE => Close::read(payload)
+            .map(|call| {
+                let terminals = services.terminals.clone();
+                Answer::Deferred(Deferred::new(move || terminals.close(&call)))
+            })
+            .map_err(DispatchError::Declared),
         // The payload is an empty struct in the contract, like the
         // configuration subscription's.
         terminal::SUBSCRIBE_METADATA => Ok(Answer::Stream(services.terminals.subscribe_metadata())),
@@ -433,6 +453,7 @@ mod tests {
             (terminal::ATTACH, json!({})),
             (terminal::WRITE, json!({"data": "ls\r"})),
             (terminal::RESIZE, json!({"cols": 80, "rows": 24})),
+            (terminal::CLEAR, json!({})),
         ] {
             let payload = {
                 let mut payload = payload;
@@ -472,6 +493,36 @@ mod tests {
                 other => panic!("{tag} answered with {other:?}"),
             }
         }
+    }
+
+    /// The two terminal calls that end a process answer with work rather than a
+    /// value, and that is not a preference: both wait for a shell to die and for
+    /// the threads driving its pty to be joined, which on the connection's read
+    /// loop would stop every other call on that connection.
+    #[test]
+    fn the_terminal_calls_that_end_a_process_answer_with_deferred_work() {
+        let services = services();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let named = json!({
+            "threadId": "thread-1",
+            "terminalId": "term-1",
+            "cwd": directory.path().to_string_lossy(),
+            "cols": 80,
+            "rows": 24,
+        });
+
+        for tag in [terminal::CLOSE, terminal::RESTART] {
+            let answer = dispatch(&services, tag, &named).expect("dispatches");
+            assert!(matches!(answer, Answer::Deferred(_)), "{tag} answered inline");
+        }
+
+        // …and clearing does not, because it is arithmetic on a string the
+        // registry already holds.
+        let answer = dispatch(&services, terminal::CLEAR, &named);
+        assert!(
+            matches!(answer, Err(DispatchError::Declared(_))),
+            "a clear of a terminal that is not there is answered where it is asked"
+        );
     }
 
     /// The tag has to survive into the error, because it is the only thing

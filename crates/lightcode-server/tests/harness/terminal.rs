@@ -139,6 +139,44 @@ impl Pane {
             .await
     }
 
+    /// Forget what this terminal has shown.
+    pub async fn clear(&self, client: &mut SocketClient) -> super::Outcome {
+        client.call("terminal.clear", self.named()).await
+    }
+
+    /// Put a new shell in this terminal.
+    pub async fn restart(
+        &self,
+        client: &mut SocketClient,
+        cwd: &std::path::Path,
+        cols: u64,
+        rows: u64,
+    ) -> super::Outcome {
+        let mut payload = Pane::opening(cwd, cols, rows);
+        payload["threadId"] = json!(self.thread_id);
+        payload["terminalId"] = json!(self.terminal_id);
+        client.call("terminal.restart", payload).await
+    }
+
+    /// End this terminal and reap what was in it.
+    pub async fn close(&self, client: &mut SocketClient) -> super::Outcome {
+        client.call("terminal.close", self.named()).await
+    }
+
+    /// Leave the pane, as navigating somewhere else in the app does.
+    ///
+    /// The subscription ends and the terminal does not — that separation is the
+    /// whole of what "navigating away and back" means on this wire, so this
+    /// consumes the pane and reattaching means opening a new one.
+    pub async fn detach(self, client: &mut SocketClient) {
+        client.interrupt(&self.attachment).await;
+        client.await_outcome(&self.attachment).await;
+    }
+
+    fn named(&self) -> Value {
+        json!({"threadId": self.thread_id, "terminalId": self.terminal_id})
+    }
+
     /// Read until the shell has said `wanted`, answering whatever it asks along
     /// the way.
     pub async fn wait_for(&mut self, client: &mut SocketClient, wanted: &str) {
@@ -155,19 +193,25 @@ impl Pane {
 
     /// Read until the terminal reports that its shell has gone.
     pub async fn wait_for_exit(&mut self, client: &mut SocketClient) -> Value {
+        self.wait_for_notice(client, "exited").await
+    }
+
+    /// Read until the terminal says something of this kind — anything that is
+    /// not output: `exited`, `closed`, `cleared`, `restarted`, `error`.
+    pub async fn wait_for_notice(&mut self, client: &mut SocketClient, kind: &str) -> Value {
         let deadline = Instant::now() + PATIENCE;
         loop {
-            if let Some(exit) = self
+            if let Some(notice) = self
                 .notices
                 .iter()
-                .find(|notice| notice["type"] == "exited")
+                .find(|notice| notice["type"] == kind)
                 .cloned()
             {
-                return exit;
+                return notice;
             }
             assert!(
                 Instant::now() < deadline,
-                "the shell's exit was never reported. What arrived:\n{:#?}",
+                "the terminal never said {kind:?}. What arrived:\n{:#?}",
                 self.notices
             );
             self.pump(client).await;
@@ -242,6 +286,22 @@ impl Pane {
                     self.type_in(client, CURSOR_REPORT).await.expect_success();
                 }
             }
+            // The two events that *replace* the buffer rather than adding to
+            // it, folded exactly as the client's own reducer folds them
+            // (`applyTerminalAttachStreamEvent`). A harness that only appended
+            // would show a restarted terminal's dead shell and a cleared one's
+            // cleared output, and every assertion about either would pass for
+            // the wrong reason.
+            Some("restarted") => {
+                let snapshot = value["snapshot"].clone();
+                self.screen = snapshot["history"].as_str().unwrap_or_default().to_string();
+                self.snapshots.push(snapshot);
+                self.notices.push(value);
+            }
+            Some("cleared") => {
+                self.screen.clear();
+                self.notices.push(value);
+            }
             _ => self.notices.push(value),
         }
     }
@@ -297,6 +357,57 @@ pub fn reported_size(text: &str, cols: u64, rows: u64) -> bool {
 /// A command that exits the shell.
 pub fn quit() -> String {
     "exit".to_string()
+}
+
+/// Roughly how long [`slow_work`] takes and how often [`endless_child`] ticks.
+/// One second on both platforms, because `ping` is the only delay `cmd.exe` has
+/// and it counts in whole seconds.
+pub const TICK: Duration = Duration::from_secs(1);
+
+/// A command that waits a few seconds and *then* prints `marker`.
+///
+/// What "a process still running while detached continues" needs: the marker
+/// cannot already be on the screen when the pane goes away, so its arrival is
+/// evidence the shell kept working with nothing listening.
+pub fn slow_work(marker: &str, ticks: u32) -> String {
+    match cfg!(windows) {
+        // `ping -n N` sends N packets a second apart, so it waits N-1 seconds.
+        true => format!("ping -n {} 127.0.0.1 >nul & echo {marker}", ticks + 1),
+        false => format!("sleep {ticks}; echo {marker}"),
+    }
+}
+
+/// A script that runs forever in a process of its own, appending a line to
+/// `log` every [`TICK`], and the command that starts it.
+///
+/// Two things make this the shape it is. It has to be a **child process** — a
+/// batch file typed at a `cmd.exe` prompt is interpreted by that same
+/// `cmd.exe`, so `cmd /c` is what makes a second process — and it has to leave
+/// evidence *outside* the terminal, because the terminal is the thing being
+/// closed. A file that stops growing is that evidence.
+pub fn endless_child(directory: &std::path::Path, log: &str) -> String {
+    let log = directory.join(log).display().to_string();
+    let (name, script, interpreter) = match cfg!(windows) {
+        true => (
+            "endless-child.cmd",
+            format!("@echo off\r\n:again\r\necho tick>>\"{log}\"\r\nping -n 2 127.0.0.1 >nul\r\ngoto again\r\n"),
+            "cmd /c",
+        ),
+        false => (
+            "endless-child.sh",
+            format!("while true; do echo tick >> \"{log}\"; sleep 1; done\n"),
+            "sh",
+        ),
+    };
+
+    let path = directory.join(name);
+    std::fs::write(&path, script).expect("writes the script");
+    format!("{interpreter} \"{}\"", path.display())
+}
+
+/// How long a file has been, or zero if it is not there yet.
+pub fn length(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|file| file.len()).unwrap_or(0)
 }
 
 /// The SGR sequence that sets the foreground to red. What "colour arrived"

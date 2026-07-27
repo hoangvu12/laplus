@@ -98,3 +98,13 @@ instead, so that whoever attaches next is asked it. See ADR-0005.
 
 **Attachment** — one `terminal.attach` subscription. A terminal outlives every
 attachment to it, which is what makes reattaching a thing rather than a restart.
+
+**Detaching** — not a call. Navigating away from a pane cancels its attachment
+and touches nothing else, so the shell keeps working with nobody listening and
+everything it says goes into the scrollback the next attachment is sent.
+
+**Exited** and **closed** — two different endings, and the contract has an event
+for each. A terminal whose shell exited is still on the list, still readable,
+and can be given a new shell by name. A terminal that was *closed* is gone: the
+developer said so, the process was killed and waited for, and the id no longer
+names anything. Reaping happens at the second, never the first.

@@ -77,18 +77,58 @@
 //! all, because ConPTY holds the output pipe open until the console object is
 //! closed. That too was measured rather than assumed.
 //!
-//! ## What this ticket does not do
+//! ## A terminal ends when it is closed, not when its shell exits
 //!
-//! - **`terminal.clear`, `terminal.restart` and `terminal.close`** are ticket
-//!   18. So `terminal.open` on a terminal that has already exited returns it as
-//!   it stands rather than quietly starting a second shell — restarting is a
-//!   thing the developer asks for by name.
+//! Those are two different facts and the contract has two events for them.
+//! A shell that exits leaves the terminal on the list, saying `exited`, with
+//! everything it printed still readable — a pane that vanished the moment a
+//! command ran `exit` would take the output with it, and the output is usually
+//! the reason the developer was looking. `terminal.close` is the developer
+//! saying they are done: the shell is killed, waited for, and the terminal
+//! comes off the list.
+//!
+//! Which is also what makes closing the reaping point. [`Terminals::close`]
+//! takes the terminal out of the registry *first* and only then kills what was
+//! in it, so nothing can arrive for a terminal that is being reaped — there is
+//! no id left to send it to. Killing is the cheap half; the half that matters
+//! is waiting, because a `terminal.close` that returned before the pty was shut
+//! and its threads joined would be a promise the server had not kept.
+//!
+//! `deleteHistory` on that call is therefore not carried at all. What this
+//! server keeps of a terminal is *in* that terminal, so closing one deletes its
+//! history whichever way the flag was set; upstream keeps a second copy under
+//! its logs directory and has to be told whether to remove that too. Reading
+//! the flag and ignoring it would read, later, as a decision somebody made.
+//!
+//! ## Detaching is not a call, and reattaching is not a restart
+//!
+//! There is no `terminal.detach` on this wire — navigating away from a pane
+//! cancels its `terminal.attach` subscription and touches nothing else. So
+//! there is no code here for it, which is exactly why
+//! `socket_terminal_lifecycle.rs` pins it: it is behaviour nothing in this
+//! module asserts and that a plausible change — reaping a terminal when its
+//! last subscriber leaves — would silently take away.
+//!
+//! ## What this module does not do
+//!
+//! - **Scrollback is in memory only.** Navigating away and back is a
+//!   re-attachment to a terminal that never went anywhere, so it keeps
+//!   everything; closing the app is not, and does not. Upstream writes each
+//!   terminal's history to a file under its logs directory and reads it back
+//!   when a terminal of that id is opened again. Nothing in ticket 18's
+//!   acceptance asks for it — and the ticket *does* ask that closing the app
+//!   reap every terminal, so what a restored scrollback would describe is a
+//!   shell this server has already killed.
 //! - **`hasRunningSubprocess` is always `false`, and the label is always the
 //!   terminal's own.** Upstream polls the process tree with `powershell`/`pgrep`
 //!   to notice that a shell is running `vim` and to title the tab after it.
-//!   That is a poll per terminal per interval for a caption; it is not what any
-//!   of this ticket's acceptance rests on, and inventing an answer would be
-//!   worse than the honest one.
+//!   That is a poll per terminal per interval for a caption. A process running
+//!   in a detached terminal is not lost by it being `false` — it keeps running,
+//!   and everything it printed is there on reattachment, which is what ticket
+//!   18 asks for and what
+//!   `a_process_that_outlives_the_pane_keeps_running_and_its_output_is_kept`
+//!   asserts. What is missing is the *busy dot* on the tab, and inventing an
+//!   answer for it would be worse than the honest one.
 //! - **`subscribeTerminalEvents` is not implemented.** It is a real method in
 //!   the contract, but nothing in the reused UI calls it: the terminal pane
 //!   reads its output through `terminal.attach` and its list through
@@ -123,6 +163,16 @@ pub const WRITE: &str = "terminal.write";
 
 /// The pane changed size, so the pty must.
 pub const RESIZE: &str = "terminal.resize";
+
+/// Forget what the terminal has shown. The shell in it is untouched.
+pub const CLEAR: &str = "terminal.clear";
+
+/// Put a new shell in this terminal, replacing whatever was in it.
+pub const RESTART: &str = "terminal.restart";
+
+/// End a terminal — or every terminal on a thread — and reap what was running
+/// in it.
+pub const CLOSE: &str = "terminal.close";
 
 /// The subscription that *is* the terminal list. Captured whole in
 /// `fixtures/socket-wire/04-streaming-subscription.ndjson`, and part of the
@@ -229,12 +279,16 @@ fn key(thread_id: &str, terminal_id: &str) -> Key {
 }
 
 /// One terminal: what it is, what it has said, and what is running behind it.
+///
+/// Only the two ids are here rather than in [`State`], and that is the
+/// distinction the type is drawing: they are the terminal's *name* and nothing
+/// can change them. Where it is rooted can — `terminal.restart` carries a
+/// working directory of its own — so that lives with everything else that
+/// changes.
 #[derive(Debug)]
 struct Session {
     thread_id: String,
     terminal_id: String,
-    cwd: String,
-    worktree_path: Option<String>,
     events: broadcast::Sender<Value>,
     /// The registry's feed, held here rather than reached back for. The reaper
     /// runs on a thread of its own long after the call that opened this
@@ -252,6 +306,10 @@ struct Session {
 
 /// Everything about a terminal that changes.
 struct State {
+    /// Where the shell was started. Changes when a restart names somewhere
+    /// else, which is the reason it is not on [`Session`].
+    cwd: String,
+    worktree_path: Option<String>,
     status: Status,
     pid: Option<u32>,
     exit_code: Option<i64>,
@@ -350,8 +408,21 @@ impl Terminals {
         // Checked before the registry is locked: it touches the disk, and
         // nothing about the answer depends on what else is opening.
         check_cwd(&call.cwd)?;
+        Ok(self.open_locked(self.sessions(), call))
+    }
 
-        let mut sessions = self.sessions();
+    /// [`Terminals::open_session`] with the registry already locked and the
+    /// working directory already checked.
+    ///
+    /// Split out for one caller: [`Terminals::restart`] has to decide whether
+    /// the terminal exists and act on the answer without letting go in between,
+    /// and a helper that took the lock itself would make that impossible to
+    /// write rather than merely easy to get wrong.
+    fn open_locked(
+        &self,
+        mut sessions: std::sync::MutexGuard<'_, HashMap<Key, Arc<Session>>>,
+        call: &Open,
+    ) -> Arc<Session> {
         if let Some(existing) = sessions.get(&call.key()) {
             let existing = Arc::clone(existing);
             // A terminal already under this id is *this* terminal. The UI opens
@@ -360,35 +431,30 @@ impl Terminals {
             // for it would replace the developer's session with a blank one.
             let mut state = existing.state.lock().unwrap();
             if state.status == Status::Running {
+                // Against the size it already has, so an open that said nothing
+                // about the size leaves it alone. Upstream reads the same field
+                // the same way (`input.cols ?? session.cols`), and the
+                // alternative is worse than it sounds: the pane that opened this
+                // terminal is not always the one re-opening it, so defaulting
+                // here would shrink a terminal to 120x30 on somebody else's
+                // second open.
+                let (cols, rows) = call.size(state.cols, state.rows);
                 // A resize that will not take is not a reason to refuse the
                 // developer the terminal they already have.
-                let _ = existing.apply_size(&mut state, call.cols, call.rows);
+                let _ = existing.apply_size(&mut state, cols, rows);
             }
             drop(state);
-            return Ok(existing);
+            return existing;
         }
 
-        let session = Arc::new(Session::new(call, self.inner.metadata.clone()));
-        match start_shell(call, &shell_candidates(&call.env)) {
-            Ok(shell) => session.adopt(shell),
-            // Not a failed call: the terminal exists, and it exists in the one
-            // state that can say why there is no shell in it. A failure would
-            // have to be a typed error, and the contract declares none for "no
-            // shell could be started" — so the developer would be told the call
-            // broke rather than what went wrong.
-            Err(why) => {
-                let mut state = session.state.lock().unwrap();
-                state.status = Status::Error;
-                // Into the scrollback as well as into an event, because the
-                // event has nowhere to go: nothing can have attached to a
-                // terminal that does not exist yet, so the only reader this
-                // message will ever have is the snapshot someone attaches to
-                // afterwards. The pane is also where the developer is looking.
-                state.history = format!("[terminal] {why}\r\n");
-                session.publish(&mut state, |sequence| {
-                    session.event(sequence, json!({"type": "error", "message": why}))
-                });
-            }
+        let (cols, rows) = call.size(DEFAULT_COLS, DEFAULT_ROWS);
+        let session = Arc::new(Session::new(call, cols, rows, self.inner.metadata.clone()));
+        match start_shell(call, cols, rows, &shell_candidates(&call.env)) {
+            // Nothing to announce: this terminal did not exist a moment ago, so
+            // there is nobody attached to tell. The call's own answer is the
+            // announcement.
+            Ok(shell) => session.adopt(shell, |_| {}),
+            Err(why) => session.failed_to_start(&why),
         }
 
         sessions.insert(call.key(), Arc::clone(&session));
@@ -397,7 +463,7 @@ impl Terminals {
         // immediately want the registry.
         drop(sessions);
         session.announce(&session.state.lock().unwrap());
-        Ok(session)
+        session
     }
 
     /// Open a `terminal.attach` subscription: this terminal's scrollback, then
@@ -418,7 +484,41 @@ impl Terminals {
         // slow path, it is a stop.
         let existing = self.sessions().get(&call.key()).cloned();
         let session = match existing {
-            Some(session) => session,
+            Some(session) => {
+                // The client asked, by name, for a shell to be put back in a
+                // terminal whose own has gone. Only ever *because it asked* —
+                // an attach is otherwise a read, and a read that silently
+                // replaced the terminal it was opened on would lose whatever
+                // the developer was looking at.
+                if let Some(open) = call.shell_to_put_back(&session) {
+                    // Checked here rather than left to the spawn, because this
+                    // attach *is* going to use the directory it named — which
+                    // is what makes it different from an attach to a running
+                    // terminal, where a `cwd` that is not one is beside the
+                    // point.
+                    check_cwd(&open.cwd)?;
+
+                    let sessions = self.sessions();
+                    // **Both halves of the decision are re-taken under the lock
+                    // that would do the replacing**, because both can have
+                    // stopped being true since it was made. A terminal closed
+                    // since the lookup above is no longer this registry's to
+                    // start a shell in, and one started there would be a shell
+                    // nothing could reach or reap; a terminal that is running
+                    // again is one another attach has already revived, and
+                    // replacing it would kill the shell that attach just
+                    // started.
+                    let registered = sessions
+                        .get(&call.key())
+                        .is_some_and(|current| Arc::ptr_eq(current, &session));
+                    let idle = session.state.lock().unwrap().status != Status::Running;
+                    match registered && idle {
+                        true => self.replace_shell(sessions, &session, open),
+                        false => drop(sessions),
+                    }
+                }
+                session
+            }
             // The UI attaches and opens from two different places, so an attach
             // may genuinely arrive first. It carries everything an open needs
             // for exactly that reason — and without it there is nothing to
@@ -535,6 +635,173 @@ impl Terminals {
         }
     }
 
+    /// Forget what this terminal has shown, without touching what is running
+    /// in it.
+    ///
+    /// Deliberately not restricted to a *running* terminal. Clearing is what a
+    /// developer does to a pane full of something they are done reading, and a
+    /// shell that has exited is the case where there is most of it.
+    pub fn clear(&self, call: &Clear) -> Result<Value, Value> {
+        let session = self
+            .sessions()
+            .get(&key(&call.thread_id, &call.terminal_id))
+            .cloned()
+            .ok_or_else(|| lookup_error(&call.thread_id, &call.terminal_id))?;
+
+        let mut state = session.state.lock().unwrap();
+        state.history.clear();
+        state.pending.clear();
+        // `questions` is deliberately *not* cleared. It is not something the
+        // terminal showed — it is a reply the shell is still blocked on, and
+        // forgetting it here would leave a cleared terminal that never prints
+        // another prompt. See "An unanswered question is part of the terminal's
+        // state" in the module documentation, and ADR-0005.
+        session.publish(&mut state, |sequence| {
+            session.event(sequence, json!({"type": "cleared"}))
+        });
+        Ok(Value::Null)
+    }
+
+    /// Put a new shell in this terminal, replacing whatever was in it.
+    ///
+    /// Blocking — it kills a process, waits for it, and starts another — so it
+    /// is run as a [`crate::rpc::Deferred`].
+    pub fn restart(&self, call: &Restart) -> Result<Value, Value> {
+        check_cwd(&call.opening.cwd)?;
+
+        // One lock across both the question and the answer. Letting go in
+        // between would make a restart that found nothing race an open that put
+        // something there, and the restart would hand back the other caller's
+        // shell without having restarted anything.
+        let sessions = self.sessions();
+        let session = match sessions.get(&call.opening.key()).cloned() {
+            Some(session) => {
+                self.replace_shell(sessions, &session, &call.opening);
+                session
+            }
+            // Restarting a terminal that is not there is opening one. The
+            // developer asked for a running shell under this id and there is no
+            // shell under it to keep, which is the same request an open makes.
+            None => self.open_locked(sessions, &call.opening),
+        };
+
+        let state = session.state.lock().unwrap();
+        Ok(session.snapshot(&state))
+    }
+
+    /// End a terminal, or every terminal on a thread, and reap what was
+    /// running in it.
+    ///
+    /// Blocking for the same reason [`Terminals::shutdown`] is: killing a shell
+    /// is not the part that matters, and waiting for the reaper is.
+    ///
+    /// Closing something that is not there is **not** an error. A pane is
+    /// closed by a client that has already removed the tab, and telling it that
+    /// the terminal it just stopped showing does not exist would be answering a
+    /// question it did not ask.
+    pub fn close(&self, call: &Close) -> Result<Value, Value> {
+        // Taken out of the registry first, and everything else happens after
+        // the lock is released. Nothing can reach *this* session once it cannot
+        // be found — a write, a resize or an attach naming it now misses it —
+        // so it can be reaped at whatever pace that takes without holding up
+        // every other terminal. What a later call under the same id gets is a
+        // *new* terminal, which is the same answer it would get after the close
+        // had finished.
+        let mut sessions = self.sessions();
+        let doomed: Vec<Arc<Session>> = match &call.terminal_id {
+            Some(terminal_id) => sessions
+                .remove(&key(&call.thread_id, terminal_id))
+                .into_iter()
+                .collect(),
+            None => {
+                let named: Vec<Key> = sessions
+                    .keys()
+                    .filter(|(thread_id, _)| thread_id == &call.thread_id)
+                    .cloned()
+                    .collect();
+                named
+                    .into_iter()
+                    .filter_map(|one| sessions.remove(&one))
+                    .collect()
+            }
+        };
+        drop(sessions);
+
+        for session in doomed {
+            session.terminate();
+            let mut state = session.state.lock().unwrap();
+            session.publish(&mut state, |sequence| {
+                session.event(sequence, json!({"type": "closed"}))
+            });
+            // …and off the list, which is the only way a client watching the
+            // list rather than the terminal learns the tab has gone.
+            session.withdraw();
+        }
+        Ok(Value::Null)
+    }
+
+    /// Kill what is in a terminal and start something else in it.
+    ///
+    /// Takes the registry guard **by value and holds it throughout**, and that
+    /// is the one rule this module has about the registry lock: it is what
+    /// makes a terminal's identity stable while somebody is changing what is in
+    /// it. [`Terminals::open`] holds it across a spawn for the same reason, and
+    /// [`Terminals::close`] can let go early only because it has taken the
+    /// terminal *out* first, so there is no identity left to keep stable.
+    ///
+    /// The cost is real and is the price of that rule: while one terminal is
+    /// being restarted, no other terminal can be opened, restarted or closed.
+    /// It is bounded by a kill, two thread joins and a spawn.
+    fn replace_shell(
+        &self,
+        sessions: std::sync::MutexGuard<'_, HashMap<Key, Arc<Session>>>,
+        session: &Arc<Session>,
+        call: &Open,
+    ) {
+        session.terminate();
+
+        let (cols, rows) = {
+            let mut state = session.state.lock().unwrap();
+            // Against the size the terminal already has, so a restart that said
+            // nothing about the size does not silently shrink the pane to the
+            // default. Upstream reads it the same way.
+            let (cols, rows) = call.size(state.cols, state.rows);
+            state.cwd = call.cwd.clone();
+            state.worktree_path = call.worktree_path.clone();
+            state.cols = cols;
+            state.rows = rows;
+            state.exit_code = None;
+            // The scrollback belonged to the shell that is gone, and so did
+            // anything it was still waiting to be told. A question outlives an
+            // attach; it does not outlive the process that asked it.
+            state.history.clear();
+            state.pending.clear();
+            state.questions.clear();
+            (cols, rows)
+        };
+
+        match start_shell(call, cols, rows, &shell_candidates(&call.env)) {
+            Ok(shell) => session.adopt(shell, |state| {
+                // The snapshot is taken and stamped under the same lock that
+                // numbers the event, so the two carry the same sequence — which
+                // is what [`Terminals::attach`] compares against when it drops
+                // what a description already covered.
+                let described = session.snapshot(state);
+                session.publish(state, |sequence| {
+                    let mut described = described;
+                    described["sequence"] = json!(sequence);
+                    session.event(sequence, json!({"type": "restarted", "snapshot": described}))
+                });
+            }),
+            Err(why) => session.failed_to_start(&why),
+        }
+
+        // Released before the list is told, like the open path and for the same
+        // reason: a subscriber woken by this immediately wants the registry.
+        drop(sessions);
+        session.announce(&session.state.lock().unwrap());
+    }
+
     /// The terminal under this id, or the reason it cannot be spoken to.
     ///
     /// Two refusals rather than one, because they are two different facts with
@@ -587,23 +854,23 @@ impl Default for Terminals {
 }
 
 impl Session {
-    fn new(call: &Open, metadata: broadcast::Sender<Value>) -> Session {
+    fn new(call: &Open, cols: u16, rows: u16, metadata: broadcast::Sender<Value>) -> Session {
         Session {
             thread_id: call.thread_id.clone(),
             terminal_id: call.terminal_id.clone(),
-            cwd: call.cwd.clone(),
-            worktree_path: call.worktree_path.clone(),
             events: broadcast::channel(BACKLOG).0,
             metadata,
             state: Mutex::new(State {
+                cwd: call.cwd.clone(),
+                worktree_path: call.worktree_path.clone(),
                 status: Status::Running,
                 pid: None,
                 exit_code: None,
                 history: String::new(),
                 pending: String::new(),
                 questions: String::new(),
-                cols: call.cols,
-                rows: call.rows,
+                cols,
+                rows,
                 sequence: 0,
                 updated_at: now_iso(),
                 pty: None,
@@ -614,7 +881,14 @@ impl Session {
 
     /// Take ownership of a started shell and put the threads that drive it to
     /// work.
-    fn adopt(self: &Arc<Session>, shell: Shell) {
+    ///
+    /// `announcing` runs with the state lock held, the new shell's handles
+    /// already in it, and **the reader thread not yet started**. That window is
+    /// the only place an event can be published that is guaranteed to precede
+    /// every byte the new shell says, and `terminal.restart` needs exactly
+    /// that: its `restarted` event carries a snapshot the client *replaces* its
+    /// buffer with, so a byte that arrived first would be thrown away.
+    fn adopt(self: &Arc<Session>, shell: Shell, announcing: impl FnOnce(&mut State)) {
         {
             let mut state = self.state.lock().unwrap();
             state.status = Status::Running;
@@ -625,6 +899,7 @@ impl Session {
                 killer: shell.killer,
             });
             state.updated_at = now_iso();
+            announcing(&mut state);
         }
 
         let reading = Arc::clone(self);
@@ -634,6 +909,29 @@ impl Session {
             reap(&reaping, shell.child, [reader, shell.writer]);
         });
         *self.reaper.lock().unwrap() = Some(reaper);
+    }
+
+    /// Say that no shell could be started here, and leave the terminal as the
+    /// one thing that can say why.
+    ///
+    /// **Not a failed call**, on either of the two paths that reach it. The
+    /// contract's `TerminalError` union has no class for "no shell could be
+    /// started", so a refusal would tell the developer that the call broke
+    /// rather than what went wrong.
+    ///
+    /// The message goes into the scrollback as well as into an event, because
+    /// on the opening path the event has nowhere to go — nothing can be
+    /// attached to a terminal that did not exist a moment ago, so the only
+    /// reader it will ever have is whoever attaches next. The pane is also
+    /// where the developer is looking.
+    fn failed_to_start(&self, why: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.status = Status::Error;
+        state.pid = None;
+        state.history = format!("[terminal] {why}\r\n");
+        self.publish(&mut state, |sequence| {
+            self.event(sequence, json!({"type": "error", "message": why}))
+        });
     }
 
     /// Publish one event, numbered, with the state lock held.
@@ -668,8 +966,8 @@ impl Session {
         json!({
             "threadId": self.thread_id,
             "terminalId": self.terminal_id,
-            "cwd": self.cwd,
-            "worktreePath": self.worktree_path,
+            "cwd": state.cwd,
+            "worktreePath": state.worktree_path,
             "status": state.status.as_str(),
             "pid": state.pid,
             "history": state.history,
@@ -694,14 +992,24 @@ impl Session {
             .send(json!({"type": "upsert", "terminal": self.summary(state)}));
     }
 
+    /// Take this terminal off the list. The counterpart to
+    /// [`Session::announce`], and the only one of the two that is final.
+    fn withdraw(&self) {
+        let _ = self.metadata.send(json!({
+            "type": "remove",
+            "threadId": self.thread_id,
+            "terminalId": self.terminal_id,
+        }));
+    }
+
     /// `TerminalSummary` — the snapshot without what is in the terminal, which
     /// is what a list of them can afford to carry.
     fn summary(&self, state: &State) -> Value {
         json!({
             "threadId": self.thread_id,
             "terminalId": self.terminal_id,
-            "cwd": self.cwd,
-            "worktreePath": self.worktree_path,
+            "cwd": state.cwd,
+            "worktreePath": state.worktree_path,
             "status": state.status.as_str(),
             "pid": state.pid,
             "exitCode": state.exit_code,
@@ -799,13 +1107,22 @@ struct Shell {
 /// The list is an argument rather than a read of the environment so that the
 /// case this cannot otherwise reach — a machine with no shell at all — is one a
 /// test can ask for.
-fn start_shell(call: &Open, candidates: &[Candidate]) -> Result<Shell, String> {
+///
+/// The size is an argument rather than read off `call` because the call does not
+/// always carry one: what an open or a restart that said nothing about the size
+/// gets is the terminal's own, and resolving that is the caller's business.
+fn start_shell(
+    call: &Open,
+    cols: u16,
+    rows: u16,
+    candidates: &[Candidate],
+) -> Result<Shell, String> {
     let mut attempted = Vec::new();
     let mut last = String::from("no shell was configured for this platform");
 
     for candidate in candidates {
         attempted.push(candidate.program.clone());
-        match spawn(call, candidate) {
+        match spawn(call, cols, rows, candidate) {
             Ok(shell) => return Ok(shell),
             Err(why) => last = why,
         }
@@ -817,11 +1134,11 @@ fn start_shell(call: &Open, candidates: &[Candidate]) -> Result<Shell, String> {
     ))
 }
 
-fn spawn(call: &Open, candidate: &Candidate) -> Result<Shell, String> {
+fn spawn(call: &Open, cols: u16, rows: u16, candidate: &Candidate) -> Result<Shell, String> {
     let pair = portable_pty::native_pty_system()
         .openpty(PtySize {
-            rows: call.rows,
-            cols: call.cols,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -1275,8 +1592,16 @@ pub struct Open {
     terminal_id: String,
     cwd: String,
     worktree_path: Option<String>,
-    cols: u16,
-    rows: u16,
+    /// The size the client asked for, or `None` because it did not ask.
+    ///
+    /// The distinction is load-bearing rather than tidy. Both `terminal.open`
+    /// and `terminal.attach` make the size optional, and the pane sending one of
+    /// those is not always the pane that opened the terminal — so a missing size
+    /// resolved to the *default* rather than to the terminal's own would shrink
+    /// somebody else's terminal to 120x30 every time a second client mounted a
+    /// pane on it. See [`Open::size`].
+    cols: Option<u16>,
+    rows: Option<u16>,
     env: BTreeMap<String, String>,
 }
 
@@ -1303,10 +1628,22 @@ impl Open {
             terminal_id,
             cwd,
             worktree_path: optional_text(payload, "worktreePath"),
-            cols: size(payload, "cols", DEFAULT_COLS, MAX_COLS),
-            rows: size(payload, "rows", DEFAULT_ROWS, MAX_ROWS),
+            cols: size(payload, "cols", MAX_COLS),
+            rows: size(payload, "rows", MAX_ROWS),
             env: environment(payload),
         })
+    }
+
+    /// The size this call asks the terminal to be, given the size it is now.
+    ///
+    /// `current` is the terminal's own for a call about one that exists, and the
+    /// contract's defaults for one that does not. Either way what a call that
+    /// said nothing about the size means is "leave it as it is".
+    fn size(&self, current_cols: u16, current_rows: u16) -> (u16, u16) {
+        (
+            self.cols.unwrap_or(current_cols),
+            self.rows.unwrap_or(current_rows),
+        )
     }
 
     fn key(&self) -> Key {
@@ -1332,6 +1669,10 @@ pub struct Attach {
     thread_id: String,
     terminal_id: String,
     opening: Option<Result<Open, Value>>,
+    /// The client asking that a terminal whose shell has gone be given another
+    /// one, rather than attached to as it stands. Off unless it is said, which
+    /// is what keeps an attach a read by default.
+    restart_if_not_running: bool,
 }
 
 impl Attach {
@@ -1347,11 +1688,108 @@ impl Attach {
             thread_id,
             terminal_id,
             opening: offered.then(|| Open::read(payload)),
+            restart_if_not_running: payload
+                .get("restartIfNotRunning")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
+    }
+
+    /// What this attach should put back in the terminal it found, if it should
+    /// put anything back at all.
+    ///
+    /// Three things have to be true together: the client asked for it, it sent
+    /// enough to start a shell with, and there is no shell there to displace.
+    /// The third is the one that makes this safe — `restartIfNotRunning` means
+    /// what it says, so an attach that arrives while the developer's shell is
+    /// working never touches it.
+    fn shell_to_put_back(&self, session: &Session) -> Option<&Open> {
+        if !self.restart_if_not_running {
+            return None;
+        }
+        let Some(Ok(open)) = &self.opening else {
+            return None;
+        };
+        match session.state.lock().unwrap().status {
+            Status::Running => None,
+            Status::Exited | Status::Error => Some(open),
+        }
     }
 
     fn key(&self) -> Key {
         key(&self.thread_id, &self.terminal_id)
+    }
+}
+
+/// A validated `terminal.clear`. The contract's input is a terminal's two ids
+/// and nothing else — clearing says nothing about what should be in the
+/// terminal afterwards, only about what should not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clear {
+    thread_id: String,
+    terminal_id: String,
+}
+
+impl Clear {
+    pub fn read(payload: &Value) -> Result<Clear, Value> {
+        Ok(Clear {
+            thread_id: identifier(payload, "threadId")?,
+            terminal_id: identifier(payload, "terminalId")?,
+        })
+    }
+}
+
+/// A validated `terminal.restart`.
+///
+/// The contract's input is an open's with the size *required* rather than
+/// optional. A missing one is defaulted rather than refused all the same,
+/// because the two calls start the same shell the same way and a restart that
+/// was pickier about a number the pane corrects a frame later would only be
+/// pickier, not safer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restart {
+    opening: Open,
+}
+
+impl Restart {
+    pub fn read(payload: &Value) -> Result<Restart, Value> {
+        Ok(Restart {
+            opening: Open::read(payload)?,
+        })
+    }
+}
+
+/// A validated `terminal.close`.
+///
+/// The one call on this wire that can name a terminal or decline to. Without a
+/// `terminalId` it means every terminal on the thread, which is what the client
+/// sends when a whole conversation goes away rather than one pane.
+///
+/// The contract's `deleteHistory` is deliberately not carried; see the module
+/// documentation for why there is nothing for it to select between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Close {
+    thread_id: String,
+    terminal_id: Option<String>,
+}
+
+impl Close {
+    pub fn read(payload: &Value) -> Result<Close, Value> {
+        let thread_id = identifier(payload, "threadId")?;
+        // A *blank* `terminalId` is refused rather than read as an absent one.
+        // Absence means "every terminal on this thread", so a payload that
+        // meant to name one and sent an empty string would reap the lot — the
+        // one place on this wire where being lenient about a blank field
+        // destroys something.
+        let terminal_id = match payload.get("terminalId") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(identifier(payload, "terminalId")?),
+        };
+
+        Ok(Close {
+            thread_id,
+            terminal_id,
+        })
     }
 }
 
@@ -1400,8 +1838,11 @@ impl Resize {
         Ok(Resize {
             thread_id,
             terminal_id,
-            cols: size(payload, "cols", DEFAULT_COLS, MAX_COLS),
-            rows: size(payload, "rows", DEFAULT_ROWS, MAX_ROWS),
+            // Required by the contract, unlike an open's — a resize that named
+            // no size would be a call with nothing in it — so the defaults here
+            // are what a malformed payload gets rather than a meaning.
+            cols: size(payload, "cols", MAX_COLS).unwrap_or(DEFAULT_COLS),
+            rows: size(payload, "rows", MAX_ROWS).unwrap_or(DEFAULT_ROWS),
         })
     }
 }
@@ -1445,17 +1886,19 @@ fn optional_text(payload: &Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A `cols` or `rows`, clamped to what the contract allows.
+/// A `cols` or `rows`, clamped to what the contract allows, or `None` because
+/// the client did not send one.
 ///
 /// Clamped rather than refused: an out-of-range size is a pane that measured
 /// itself wrongly, and answering it with a failure would leave the developer
-/// with a terminal that will not resize at all.
-fn size(payload: &Value, field: &str, default: u16, most: u16) -> u16 {
+/// with a terminal that will not resize at all. Absent is *not* out of range —
+/// what that means is the caller's to decide, and the two callers decide
+/// differently. See [`Open::size`].
+fn size(payload: &Value, field: &str, most: u16) -> Option<u16> {
     payload
         .get(field)
         .and_then(Value::as_u64)
         .map(|value| value.clamp(1, u64::from(most)) as u16)
-        .unwrap_or(default)
 }
 
 /// The environment a client asked for, keeping only names that are names.
@@ -1741,8 +2184,10 @@ mod tests {
         );
     }
 
-    /// The payload the UI sends, read. Sizes fall back to the contract's
-    /// defaults and are clamped to its bounds rather than refused.
+    /// The payload the UI sends, read. A size out of the contract's bounds is
+    /// clamped rather than refused, and a size that is not there is *absent*
+    /// rather than defaulted — the difference is what stops a second pane's
+    /// bare open from shrinking a terminal somebody else is using.
     #[test]
     fn an_open_reads_its_payload_and_clamps_what_is_out_of_range() {
         let call = Open::read(&json!({
@@ -1757,21 +2202,27 @@ mod tests {
         .expect("a well-formed open");
 
         assert_eq!(call.thread_id, "thread-1");
-        assert_eq!(call.cols, MAX_COLS);
-        assert_eq!(call.rows, 1);
+        assert_eq!(call.size(80, 24), (MAX_COLS, 1));
         assert_eq!(call.worktree_path, None);
         assert_eq!(
             call.env,
             BTreeMap::from([("SHELL".to_string(), "/bin/sh".to_string())])
         );
 
-        let defaults = Open::read(&json!({
+        let silent = Open::read(&json!({
             "threadId": "thread-1",
             "terminalId": "term-1",
             "cwd": "C:\\work",
         }))
         .expect("a well-formed open");
-        assert_eq!((defaults.cols, defaults.rows), (DEFAULT_COLS, DEFAULT_ROWS));
+        // A terminal that does not exist yet gets the contract's defaults…
+        assert_eq!(
+            silent.size(DEFAULT_COLS, DEFAULT_ROWS),
+            (DEFAULT_COLS, DEFAULT_ROWS)
+        );
+        // …and one that does keeps the size it already had, which is the half
+        // that would resize somebody else's terminal if it were defaulted.
+        assert_eq!(silent.size(200, 60), (200, 60));
     }
 
     /// A call that names no terminal is refused with the error that says so,
@@ -1823,6 +2274,105 @@ mod tests {
         }))
         .expect("still a well-formed attach");
         assert!(matches!(blank_id.opening, Some(Ok(_))), "a bad size is clamped, not fatal");
+    }
+
+    /// A close names one terminal or declines to, and declining means the whole
+    /// thread. A *blank* name is neither, and is refused — it is the one field
+    /// on this wire where reading an empty string leniently would reap
+    /// terminals the client did not ask about.
+    #[test]
+    fn a_close_that_names_no_terminal_means_the_whole_thread() {
+        let one = Close::read(&json!({"threadId": "thread-1", "terminalId": "term-1"}))
+            .expect("a close that names a terminal");
+        assert_eq!(one.terminal_id.as_deref(), Some("term-1"));
+
+        for whole_thread in [
+            json!({"threadId": "thread-1"}),
+            json!({"threadId": "thread-1", "terminalId": Value::Null}),
+            json!({"threadId": "thread-1", "deleteHistory": true}),
+        ] {
+            let call = Close::read(&whole_thread).expect("a close that names no terminal");
+            assert_eq!(call.terminal_id, None);
+        }
+
+        let refusal = Close::read(&json!({"threadId": "thread-1", "terminalId": "  "}))
+            .expect_err("a blank terminal id names nothing");
+        assert_eq!(refusal["_tag"], "TerminalSessionLookupError");
+    }
+
+    /// An attach only puts a shell back when it was asked to, and only into a
+    /// terminal that has none. The default matters most: an attach is a read,
+    /// and the reused UI sends one every time a pane mounts.
+    #[test]
+    fn an_attach_only_restarts_when_it_was_asked_to_and_there_is_nothing_running() {
+        let opening = json!({
+            "threadId": "thread-1",
+            "terminalId": "term-1",
+            "cwd": "C:\\work",
+        });
+        assert!(
+            !Attach::read(&opening)
+                .expect("a well-formed attach")
+                .restart_if_not_running,
+            "an attach that did not ask would replace a terminal it was only reading"
+        );
+
+        let asking = {
+            let mut asking = opening.clone();
+            asking["restartIfNotRunning"] = json!(true);
+            Attach::read(&asking).expect("a well-formed attach")
+        };
+        let session = Session::new(
+            &Open::read(&opening).expect("a well-formed open"),
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            broadcast::channel(BACKLOG).0,
+        );
+
+        // A new session is `running` until something says otherwise, which is
+        // the case an attach must leave alone.
+        assert!(asking.shell_to_put_back(&session).is_none());
+        session.state.lock().unwrap().status = Status::Exited;
+        assert!(asking.shell_to_put_back(&session).is_some());
+
+        // …and asking without sending enough to start one with is not asking.
+        let bare = Attach::read(&json!({
+            "threadId": "thread-1",
+            "terminalId": "term-1",
+            "restartIfNotRunning": true,
+        }))
+        .expect("a well-formed attach");
+        assert!(bare.shell_to_put_back(&session).is_none());
+    }
+
+    /// Clearing and restarting a terminal that is not there are both refused by
+    /// name, and closing one is not refused at all — a pane is closed by a
+    /// client that has already stopped showing it.
+    #[test]
+    fn the_lifecycle_calls_disagree_about_a_terminal_that_is_not_there() {
+        let terminals = Terminals::new();
+        let named = json!({"threadId": "thread-1", "terminalId": "term-1"});
+
+        let clear = Clear::read(&named).expect("a well-formed clear");
+        assert_eq!(
+            terminals.clear(&clear).expect_err("no such terminal")["_tag"],
+            "TerminalSessionLookupError"
+        );
+
+        let close = Close::read(&named).expect("a well-formed close");
+        assert_eq!(
+            terminals.close(&close).expect("closing nothing is not a failure"),
+            Value::Null
+        );
+
+        // A restart names a directory, so what it refuses first is that.
+        let restart = Restart::read(&json!({
+            "threadId": "thread-1",
+            "terminalId": "term-1",
+            "cwd": "  ",
+        }))
+        .expect_err("a restart with nowhere to run");
+        assert_eq!(restart["_tag"], "TerminalCwdNotFoundError");
     }
 
     /// An empty registry describes itself as one, and the shape is the captured
@@ -1900,6 +2450,8 @@ mod tests {
 
         let attempt = start_shell(
             &call,
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
             &[
                 Candidate::plain("not-a-shell-on-any-machine"),
                 Candidate::plain("nor-is-this-one"),
