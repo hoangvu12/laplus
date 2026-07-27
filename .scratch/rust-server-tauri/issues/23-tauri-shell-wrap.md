@@ -24,8 +24,8 @@ worry, it can be pulled earlier — the only hard requirement is a running serve
 - [x] The UI is served from the embedded application rather than a development
       server
 - [ ] A full agent conversation works end to end inside the window
-- [ ] Terminals and git views work inside the window
-- [ ] The custom titlebar drag regions behave correctly
+- [x] Terminals and git views work inside the window
+- [x] The custom titlebar drag regions behave correctly
 - [x] Closing the window shuts down the server and reaps all child processes —
       agent subprocesses and terminals alike
 - [x] No Node runtime is present in the built application
@@ -156,6 +156,26 @@ it would have been undone by a profile setting copied from a size spike.
 
 Ticket 24's target has 5.84 MB of headroom left rather than 7.79. The trade is
 named here so that whoever measures the installer knows what it bought.
+
+### A person looked at the window
+
+Which is what `ready-for-human` was for, and it closed two of the three.
+
+**Terminals work.** Opened, driven and rendered in the pane, reported working.
+With git already confirmed, that criterion is met in full.
+
+**The drag regions behave correctly, on the only reading that applies.** The
+window moves when the operating system's titlebar is dragged; the application's
+own topbar does not move it. That is what a build with no custom titlebar should
+do, and it is what a browser does with the same markup. Ticked on that basis
+rather than on the shim that was removed.
+
+It also surfaced the thing underneath the question: upstream has **one** bar
+where lightcode has two, because Electron paints window controls into the
+topbar and Tauri on Windows cannot. That is cosmetic, it costs about thirty
+pixels, and it is **ticket 27** — where the drag shim becomes necessary rather
+than decorative, since a frameless window with an inert topbar cannot be moved
+at all.
 
 ### Two things found by running it, neither this ticket's to fix
 
