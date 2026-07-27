@@ -21,17 +21,16 @@ responses are compared to what the reference server produced for the same calls.
 **Blocked by:** 01 (Capture the socket wire format), 02 (Cargo workspace and
 protocol module).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The server listens on loopback and accepts a socket upgrade
 - [x] The client's credential shape is accepted at upgrade; connections from
       non-local origins are rejected
-- [ ] The configuration method returns a payload the real UI accepts —
-      *conformant to the capture and to the contract, but never decoded by the
-      real UI; see comments*
-- [ ] The unmodified UI connects, completes its initial handshake, and remains
-      connected without erroring or retrying — *blocked on tickets 04 and 23;
-      see comments*
+- [x] The configuration method returns a payload the real UI accepts — watched,
+      in the shell and under the driver; see comments
+- [x] The unmodified UI connects, completes its initial handshake, and remains
+      connected without erroring or retrying — watched; the one retry loop in
+      the log is the contract's own draft poll, see comments
 - [x] Responses match the ticket 01 captures for the same calls — structurally
       enforced, with three declared divergences; see the caveat in comments on
       what the check does and does not cover
@@ -214,3 +213,58 @@ confirm no error and no retry loop, tick two boxes.
 
 Kept at `ready-for-human` because looking at a window is the work. It should be
 quick, and it is the last thing standing between this ticket and `done`.
+
+**2026-07-27 — done.** Watched, both ways: `cargo run -p lightcode-shell` for the
+window, and `node tools/ui-driver/probe-boot.mjs` for the frame log the eye
+cannot produce. The tracer bullet has now hit the real client.
+
+### The configuration payload
+
+The window renders four independently-sourced parts of it: the version-skew
+banner (from `environment.serverVersion`), `Claude Fable 5` in the model picker
+(so `providers` decoded and the version gate ran), `master` / `Current checkout`
+(vcs), and the thread list with timestamps. A payload the client merely tolerated
+would not populate four surfaces.
+
+On the wire: one `server.getConfig` answered `Exit`/`Success`, and
+`subscribeServerConfig` then streamed the same document as a `Chunk` — so the
+payload decodes both as a response and as a subscription value.
+
+### The retry loop in the log, which is not one
+
+The frame log shows `orchestration.subscribeThread` for one thread id refused
+with `OrchestrationGetSnapshotError` and re-sent about four times a second, from
+request id 17 to 38 and still going when the probe ended. **This is the contract
+working, not a defect**, and it is worth writing down because it will alarm the
+next person to run this.
+
+That id is the *draft* — the "New thread" pane that was open. Six threads in the
+sidebar, seven `subscribeThread` calls, six snapshots, one refusal. The client is
+given `retryExpectedFailureAfter: "250 millis"` for this subscription, so a
+refusal is a **poll**, not an error: the retry that lands after the first prompt
+creates the thread opens with a snapshot. `Threads::subscribe` documents all of
+this, refusing is what the reference server does, and opening the stream instead
+is the whole of ticket 28. The `traceId` is identical across every retry and only
+`spanId` changes, which is the tell that it is one logical subscription polling
+rather than fresh requests.
+
+### What the log positively establishes
+
+- **One** `getConfig`, never repeated — so no reconnect backoff.
+- **No `Defect` anywhere.** Every failure came back as a scoped `Exit`/`Failure`
+  under its own `requestId`. This ticket's one deliberate divergence from the
+  capture, argued from source, is now observed against the real client.
+- `Ping` → `Pong` six seconds in: the connection is alive at the end.
+- Every streaming subscription `Ack`ed — back-pressure is real.
+- Four unimplemented methods (`subscribeServerLifecycle`, `assets.createUrl`,
+  `subscribeDiscoveredLocalServers`, `server.discoverSourceControl`) returned
+  declared errors and the client carried on rendering. That is this ticket's
+  sixth criterion, confirmed live rather than by unit test.
+
+### The one new finding, filed as ticket 31
+
+The UI asks for the shell snapshot and every thread snapshot over **HTTP** first
+and only falls back to the socket when that 404s, which it does here on every
+one. It degrades correctly and nothing is broken. Filed separately because it is
+a gap in `src/http.rs` — the code this ticket's own comments call its least
+well-founded — and not a transport problem.
