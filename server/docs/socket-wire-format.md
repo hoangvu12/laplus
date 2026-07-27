@@ -5,7 +5,7 @@ recorded from the reference TypeScript server rather than inferred from type
 definitions. Every claim below is backed by a fixture in `fixtures/socket-wire/`.
 
 The transport framing is laplus's primary risk: it is undocumented and comes
-from `effect/unstable/rpc`, an explicitly *unstable* module. This document and
+from `effect/unstable/rpc`, an explicitly _unstable_ module. This document and
 its fixtures are what later work conforms to.
 
 ## How the captures were made
@@ -39,7 +39,7 @@ scripted RPC client     ─┘        (tools/wire-capture/proxy.mjs)
    scenario is the one that produces stream deltas and the back-pressure
    evidence.
 6. Curate the raw recordings into fixtures with `tools/wire-capture/curate.mjs`
-   (see *What is redacted* below). The raw recordings stay in
+   (see _What is redacted_ below). The raw recordings stay in
    `.scratch/wire-capture/raw/`, which is gitignored because it holds live
    session tokens.
 
@@ -86,10 +86,10 @@ The client presents a credential in one of two shapes, and the server accepts
 either. Both are `base64url(claims).base64url(signature)` — two segments, not
 three-segment JWTs.
 
-| Shape | Where | Claims observed | Used by |
-|---|---|---|---|
-| `t3_session` cookie | `Cookie` request header | `v, kind, sid, sub, scopes, method, iat, exp` | the browser UI (`kind: "session"`, `method: "browser-session-cookie"`) |
-| `wsTicket` query parameter | `GET /ws?wsTicket=…` | `v, kind, sid, iat, exp` | non-browser clients (`kind: "websocket"`, ~5 min TTL) |
+| Shape                      | Where                   | Claims observed                               | Used by                                                                |
+| -------------------------- | ----------------------- | --------------------------------------------- | ---------------------------------------------------------------------- |
+| `t3_session` cookie        | `Cookie` request header | `v, kind, sid, sub, scopes, method, iat, exp` | the browser UI (`kind: "session"`, `method: "browser-session-cookie"`) |
+| `wsTicket` query parameter | `GET /ws?wsTicket=…`    | `v, kind, sid, iat, exp`                      | non-browser clients (`kind: "websocket"`, ~5 min TTL)                  |
 
 A third shape, an `Authorization: Bearer` header, is accepted by the reference
 server's `authenticateWebSocketUpgrade` (read from
@@ -119,7 +119,7 @@ every fixture has `frames: 1`. The two largest captured messages are a
 79,972-byte `subscribeServerConfig` snapshot chunk and the 79,953-byte
 `server.getConfig` response, and both arrived as one frame with `FIN` set. No
 binary frames were observed. There is no length prefix, no delimiter and no
-envelope of any kind above the WebSocket frame: the framing *is* the WebSocket
+envelope of any kind above the WebSocket frame: the framing _is_ the WebSocket
 framing.
 
 Client frames are masked and server frames are not, per the RFC. The `ws-frame`
@@ -136,9 +136,16 @@ Six message tags were observed. All are discriminated by `_tag`.
 streaming subscriptions; nothing in the envelope distinguishes them.
 
 ```json
-{"_tag":"Request","id":"0","tag":"server.getConfig","payload":{},
- "traceId":"1091713e6fd4a7ca567589e5537d499a","spanId":"9f2023d48d079987",
- "sampled":true,"headers":[]}
+{
+  "_tag": "Request",
+  "id": "0",
+  "tag": "server.getConfig",
+  "payload": {},
+  "traceId": "1091713e6fd4a7ca567589e5537d499a",
+  "spanId": "9f2023d48d079987",
+  "sampled": true,
+  "headers": []
+}
 ```
 
 - `id` is a **decimal string**, assigned by the client, starting at `"0"` and
@@ -151,8 +158,8 @@ streaming subscriptions; nothing in the envelope distinguishes them.
   scripted client omits them and the server is content.
 
 **`Ack`** — `{"_tag":"Ack","requestId":"1"}`. Streaming back-pressure, not call
-completion, and **genuine back-pressure rather than an advisory** — see *`Ack` is
-load-bearing* below. The UI sent exactly one `Ack` per `Chunk` received, for
+completion, and **genuine back-pressure rather than an advisory** — see _`Ack` is
+load-bearing_ below. The UI sent exactly one `Ack` per `Chunk` received, for
 every subscription.
 
 **`Interrupt`** — `{"_tag":"Interrupt","requestId":"0"}`. Cancels an in-flight
@@ -169,7 +176,7 @@ call; this is how a subscription is unsubscribed.
 {"_tag":"Exit","requestId":"0","exit":{"_tag":"Success","value":{ … }}}
 ```
 
-Failure, carrying a *cause array*:
+Failure, carrying a _cause array_:
 
 ```json
 {"_tag":"Exit","requestId":"0","exit":{"_tag":"Failure","cause":[
@@ -188,7 +195,7 @@ type. An unknown method tag produces one, and note that it carries **no
 `requestId`** — the caller's request is left without an `Exit`:
 
 ```json
-{"_tag":"Defect","defect":"Unknown request tag: no.such.method"}
+{ "_tag": "Defect", "defect": "Unknown request tag: no.such.method" }
 ```
 
 **`Pong`** — `{"_tag":"Pong"}`, in reply to `Ping`.
@@ -206,11 +213,11 @@ client that assumed FIFO would already be broken against the reference server.
 Errors are not a separate message type. A failure is an `Exit` whose `exit._tag`
 is `"Failure"` and whose `cause` is an **array** of entries, each one of:
 
-| Entry | Meaning | Observed |
-|---|---|---|
-| `{"_tag":"Fail","error":{…}}` | a declared, typed error | ✔ `03-typed-error.ndjson` |
-| `{"_tag":"Interrupt","fiberId":2494}` | the call was cancelled | ✔ `04-streaming-subscription.ndjson` |
-| `{"_tag":"Die","defect":…}` | an undeclared defect | not observed in an `Exit` |
+| Entry                                 | Meaning                 | Observed                             |
+| ------------------------------------- | ----------------------- | ------------------------------------ |
+| `{"_tag":"Fail","error":{…}}`         | a declared, typed error | ✔ `03-typed-error.ndjson`            |
+| `{"_tag":"Interrupt","fiberId":2494}` | the call was cancelled  | ✔ `04-streaming-subscription.ndjson` |
+| `{"_tag":"Die","defect":…}`           | an undeclared defect    | not observed in an `Exit`            |
 
 The typed error inside `Fail` is itself `_tag`-discriminated — here
 `ProjectReadFileError` — and carries the contract's declared fields plus a
@@ -266,7 +273,7 @@ demonstrates this deliberately:
 
 A Rust server that ignores `Ack` and pushes freely will not fail visibly against
 the UI — the UI acknowledges everything — but it changes the memory profile of a
-busy subscription from bounded to unbounded. A Rust *client* that fails to `Ack`
+busy subscription from bounded to unbounded. A Rust _client_ that fails to `Ack`
 will simply stop receiving after one chunk.
 
 This fixture is also the only capture of a subscription emitting real deltas
@@ -301,52 +308,74 @@ projects.readFile / assets.createUrl / server.discoverSourceControl / vcs.listRe
 
 ## The fixtures
 
-| File | What it holds |
-|---|---|
-| `01-browser-session.ndjson` | The unmodified UI's **boot sequence**: upgrade, `server.getConfig`, six subscriptions, four concurrent unary calls answered out of order, then the idle keepalive/poll loop. It is what the UI does on connect; it is not a record of a user driving the app. |
-| `02-request-response.ndjson` | A single successful `server.getConfig` request/response, plus `Ping`/`Pong`. |
-| `03-typed-error.ndjson` | A `projects.readFile` that fails with a typed `ProjectReadFileError`, and an unknown method tag answered with `Defect`. |
-| `04-streaming-subscription.ndjson` | The minimal subscription lifecycle: first chunk, `Ack`, client `Interrupt`, terminal `Exit`. |
-| `05-orchestration-and-backpressure.ndjson` | The orchestration surface driven end to end: shell subscription, snapshot, a withheld `Ack` stalling the stream across a committed change, then `project-upserted` and `project-removed` deltas and an `Interrupt`. |
-| `06-upgrade-rejected.ndjson` | An upgrade attempt with no credential: `401` and its JSON body; the socket never opens. |
+| File                                       | What it holds                                                                                                                                                                                                                                                 |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-browser-session.ndjson`                | The unmodified UI's **boot sequence**: upgrade, `server.getConfig`, six subscriptions, four concurrent unary calls answered out of order, then the idle keepalive/poll loop. It is what the UI does on connect; it is not a record of a user driving the app. |
+| `02-request-response.ndjson`               | A single successful `server.getConfig` request/response, plus `Ping`/`Pong`.                                                                                                                                                                                  |
+| `03-typed-error.ndjson`                    | A `projects.readFile` that fails with a typed `ProjectReadFileError`, and an unknown method tag answered with `Defect`.                                                                                                                                       |
+| `04-streaming-subscription.ndjson`         | The minimal subscription lifecycle: first chunk, `Ack`, client `Interrupt`, terminal `Exit`.                                                                                                                                                                  |
+| `05-orchestration-and-backpressure.ndjson` | The orchestration surface driven end to end: shell subscription, snapshot, a withheld `Ack` stalling the stream across a committed change, then `project-upserted` and `project-removed` deltas and an `Interrupt`.                                           |
+| `06-upgrade-rejected.ndjson`               | An upgrade attempt with no credential: `401` and its JSON body; the socket never opens.                                                                                                                                                                       |
 
 Each line is one record, of these types:
 
-| Record | Carries |
-|---|---|
-| `connection-opened` | the client's remote address |
-| `http-request` | the upgrade request's `method`, `target`, `headers` and raw `head` |
-| `http-response` | the response `statusLine`, `headers` and raw `head` |
-| `http-response-body` | the body of a **refused** upgrade (a 101 has none) |
-| `ws-frame` | one WebSocket frame's `fin`, `rsv`, `opcode`, `masked`, `payloadLen` |
-| `ws-message` | the assembled payload as `text` — the bytes as they crossed the wire |
-| `error` | a transport failure, e.g. the client resetting the connection |
-| `connection-closed` | which side ended it |
+| Record               | Carries                                                              |
+| -------------------- | -------------------------------------------------------------------- |
+| `connection-opened`  | the client's remote address                                          |
+| `http-request`       | the upgrade request's `method`, `target`, `headers` and raw `head`   |
+| `http-response`      | the response `statusLine`, `headers` and raw `head`                  |
+| `http-response-body` | the body of a **refused** upgrade (a 101 has none)                   |
+| `ws-frame`           | one WebSocket frame's `fin`, `rsv`, `opcode`, `masked`, `payloadLen` |
+| `ws-message`         | the assembled payload as `text` — the bytes as they crossed the wire |
+| `error`              | a transport failure, e.g. the client resetting the connection        |
+| `connection-closed`  | which side ended it                                                  |
 
 Every record also carries `seq` (order within the connection) and `tMs`
 (milliseconds since the connection opened).
 
 ### What is redacted
 
-Only the credentials presented at upgrade. The `t3_session` cookie value and the
-`wsTicket` query parameter are replaced by a marker naming the token's claim
-names and length, so the shape the permissive local handshake must accept stays
-legible while the signed value does not enter the repository. Nothing else is
-altered: `ws-frame` and `ws-message` records pass through byte-for-byte.
+Two things: the credentials presented at upgrade, and account email addresses.
 
-One signed value does remain, deliberately: the `assets.createUrl` response in
-`01-browser-session.ndjson` contains a signed asset grant. It is a server
+**Upgrade credentials.** The `t3_session` cookie value and the `wsTicket` query
+parameter are replaced by a marker naming the token's claim names and length, so
+the shape the permissive local handshake must accept stays legible while the
+signed value does not enter the repository.
+
+**Account emails.** A provider's `auth.email` names a person, and this
+repository is public, so every address is masked to `redacted-<digest>` at the
+same domain — `curate.mjs`, `maskEmail`. This is the one redaction that reaches
+_inside_ a frame, so `ws-message` text is no longer byte-for-byte what crossed
+the wire. Two properties limit the damage, and both are tested:
+
+- **The mask is the same width as the address it replaces**, so every
+  `payloadLen` in these fixtures is still the frame's true byte count, and the
+  sizes quoted above are still these files' sizes.
+- **One account masks identically everywhere and two accounts stay two
+  accounts**, because the mask is a digest of the address, so a fixture that
+  distinguished two provider logins still does.
+
+Addresses that already name nobody are left alone — anything at a `.invalid` or
+`.example` domain, which includes the `…@laplus.invalid` git author the server
+mints for its own checkpoint commits.
+
+Nothing else is altered; `ws-frame` records pass through untouched.
+
+Two exposures remain, deliberately. The `assets.createUrl` response in
+`01-browser-session.ndjson` contains a signed asset grant: it is a server
 response and therefore part of the protocol surface being documented, it expired
 an hour after capture, and it grants nothing beyond a favicon path on the
-machine that produced it. Local absolute paths (`C:\Users\ADMIN\…`) also appear
-throughout, as `cwd` values the UI genuinely sends.
+machine that produced it. And local absolute paths (`C:\Users\ADMIN\…`) appear
+throughout, as `cwd` values the UI genuinely sends — they name a directory
+layout rather than a person, and they are load-bearing evidence of what the
+client puts on the wire.
 
 ## Open questions
 
 Observed but not understood, or not observed at all. Recorded rather than
 guessed at.
 
-1. **What bounds a `Chunk` batch?** Still unknown *of the reference server*:
+1. **What bounds a `Chunk` batch?** Still unknown _of the reference server_:
    batches of 1 and 2 values were captured, and whether its maximum is time- or
    count-driven was never established. (It coalesces shell events over a 50 ms
    / 512-item window — `t3code/apps/server/src/ws.ts` — but no capture
@@ -359,14 +388,16 @@ guessed at.
    falls further behind than that is sent one fresh snapshot instead of its
    backlog, so no chunk can ever carry more. See
    `crates/laplus-server/src/subscriptions.rs`.
+
 2. **How deep is the `Ack` window?** That the reference server stops at one
-   un-acked chunk is settled (see *`Ack` is load-bearing*). Whether one is its
+   un-acked chunk is settled (see _`Ack` is load-bearing_). Whether one is its
    fixed window or simply all this workload produced was not established: no
    capture generated two changes while an `Ack` was outstanding.
 
    **laplus's window is exactly one**, which is the conservative reading —
    a client written against a window of one works against any deeper window,
    and the reverse is not true.
+
 3. **`Eof`, `ClientEnd` and `ClientProtocolError` were never seen.** The
    `effect/unstable/rpc` vocabulary defines all three. Whether the UI can ever
    provoke them is unknown; the Rust server currently has no reason to emit
@@ -375,7 +406,7 @@ guessed at.
    the session down.** The client handles the frame as
    `clearEntries(Exit.die(message.defect))`
    (`effect/unstable/rpc/RpcClient.ts`, `effect@4.0.0-beta.78` in the vendored
-   checkout), which fails *every* in-flight request and *every* open
+   checkout), which fails _every_ in-flight request and _every_ open
    subscription on that socket with a die rather than a typed failure. The
    connection supervisor then reconnects on a 1/2/4/8/16-second backoff.
 
@@ -397,6 +428,7 @@ guessed at.
 
    Read from source, not captured — no recording provoked a `Defect` against
    the real UI.
+
 5. **Does a subscription ever end in `Exit`/`Success`?** Every termination
    captured was client-initiated and came back as `Failure`/`Interrupt`. Natural
    completion of a server-side stream was never observed.
@@ -407,6 +439,7 @@ guessed at.
    exited with, so `terminal.attach` stays open and ends the captured way when
    the client unsubscribes. Every stream laplus serves is of that shape, so
    the question is deferred rather than resolved.
+
 6. **What happens to the user-driven surface?** `01-browser-session.ndjson` is
    the boot sequence only; no capture drives the UI through opening a file,
    starting a thread or running a turn. Nothing in the framing suggests those

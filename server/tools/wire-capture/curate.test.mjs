@@ -6,7 +6,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { describeToken, credentialSubstitutions, curateRecord } from "./curate.mjs";
+import {
+  describeToken,
+  credentialSubstitutions,
+  curateRecord,
+  maskEmail,
+  maskEmails,
+} from "./curate.mjs";
 
 /** Build a token shaped like the ones the reference server issues. */
 function signedToken(claims, signature = "s1gn4tur3") {
@@ -75,7 +81,10 @@ test("redacts a Set-Cookie the server sends back", () => {
     head: `HTTP/1.1 200 OK\r\nSet-Cookie: t3_session=${sessionToken}; Path=/; HttpOnly\r\n\r\n`,
   });
   assert.ok(!JSON.stringify(curated).includes(sessionToken));
-  assert.match(curated.headers["set-cookie"], /^t3_session=<redacted:signed .*>; Path=\/; HttpOnly$/);
+  assert.match(
+    curated.headers["set-cookie"],
+    /^t3_session=<redacted:signed .*>; Path=\/; HttpOnly$/,
+  );
 });
 
 test("leaves short cookie values alone rather than corrupting the head", () => {
@@ -107,4 +116,79 @@ test("drops the decoded mirror of a text frame but keeps the wire text", () => {
 test("leaves frame records alone", () => {
   const frame = { type: "ws-frame", dir: "client-to-server", opcode: 1, payloadLen: 42 };
   assert.deepEqual(curateRecord(frame), frame);
+});
+
+test("masks an email without changing its width", () => {
+  // The width is the whole point: `payloadLen` is the frame's byte count, and a
+  // mask of a different size would quietly make it wrong.
+  for (const email of ["a@b.co", "someone@gmail.com", "first.last+tag@a-long-domain.example.org"]) {
+    assert.equal(maskEmail(email).length, email.length, email);
+  }
+});
+
+test("masks an email to something that is not the email", () => {
+  // A local part wide enough for the prefix and a digit of the digest. Every
+  // address in this file is invented — a test for redaction is a poor place to
+  // record a real one.
+  const masked = maskEmail("individual@gmail.com");
+  assert.ok(!masked.includes("individual"), "the local part survived masking");
+  assert.match(masked, /^redacted-[0-9a-f]@gmail\.com$/);
+});
+
+test("masks a local part too short to hold the prefix by truncating it", () => {
+  // A blunter mask than the digest one, but still a mask: nothing of the
+  // original survives, and the width is what the width has to be.
+  const masked = maskEmail("someone@gmail.com");
+  assert.equal(masked, "redacte@gmail.com");
+  assert.ok(!masked.includes("someone"));
+});
+
+test("masks one address the same way everywhere and two addresses differently", () => {
+  assert.equal(maskEmail("someone@gmail.com"), maskEmail("someone@gmail.com"));
+  assert.notEqual(maskEmail("someone@gmail.com"), maskEmail("anyone@gmail.com"));
+});
+
+test("leaves addresses that already name nobody alone", () => {
+  // The server mints these itself as a git author; masking them would churn a
+  // fixture without protecting anyone.
+  for (const email of [
+    "checkpoints@laplus.invalid",
+    "tests@laplus.invalid",
+    "a@example.com",
+    "a@mail.example.com",
+    "a@acme.example",
+  ]) {
+    assert.equal(maskEmails(email), email);
+  }
+});
+
+test("does not mistake somebody's domain for a reserved one", () => {
+  assert.notEqual(maskEmails("a@notexample.com"), "a@notexample.com");
+});
+
+test("masks an address inside a frame payload and leaves the rest verbatim", () => {
+  const text =
+    '{"auth":{"status":"authenticated","type":"Claude Max","email":"someone@gmail.com"},"v":"2.1.220"}';
+  const curated = curateRecord({
+    type: "ws-message",
+    dir: "server-to-client",
+    payloadLen: text.length,
+    text,
+  });
+
+  assert.ok(!curated.text.includes("someone@gmail.com"), "the address survived curation");
+  assert.equal(curated.text.length, curated.payloadLen, "payloadLen stopped being the byte count");
+  assert.ok(curated.text.includes('"type":"Claude Max"'), "the payload is otherwise untouched");
+  assert.ok(curated.text.includes('"v":"2.1.220"'));
+});
+
+test("masks an address in an HTTP head as well as a frame", () => {
+  const curated = curateRecord({
+    type: "http-response",
+    statusLine: "HTTP/1.1 200 OK",
+    headers: { "x-account": "someone@gmail.com" },
+    head: "HTTP/1.1 200 OK\r\nX-Account: someone@gmail.com\r\n\r\n",
+  });
+  assert.ok(!JSON.stringify(curated).includes("someone@gmail.com"));
+  assert.ok(curated.head.includes("HTTP/1.1 200 OK"), "the raw head is otherwise preserved");
 });
