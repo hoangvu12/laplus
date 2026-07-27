@@ -77,6 +77,35 @@ the NSIS installer figure, a clean-machine install, and launching where the
 WebView2 runtime is absent. 21.25 MB is a genuine upper bound on the download,
 since NSIS only compresses — gzip alone takes the same `.exe` to 6.31 MB.
 
+### The real shell now exists, and weighs 24.16 MB
+
+Ticket 23 built it, so the figure above is no longer a spike's. `cargo build
+--release -p lightcode-shell` produces one `lightcode.exe` at **24.16 MB** —
+against the spike's 21.25 MB for a stub. Still inside the 20–30 MB target, still
+about 13× smaller than upstream's 318 MB, with **5.84 MB of headroom**.
+
+The gap to the spike is two things, and only one of them is code. The real
+server's full surface is part of it; the rest is **1.95 MB** of unwinding tables,
+because ticket 23 dropped `panic = "abort"` from the shipped profile on purpose.
+Aborting orphans the agent processes and shells on any panic, which is the leak
+ticket 23 is required to prevent. That reasoning is in the root `Cargo.toml`
+beside the setting; this ticket should not quietly put it back to make a number
+look better.
+
+The shipped profile is now the workspace's own `[profile.release]`, so this
+figure is what an ordinary release build gives and needs no reproducing by hand.
+
+What this ticket still has to do is unchanged: the NSIS installer figure, the
+installed-on-disk footprint, a clean-machine install and a machine with no
+WebView2. `cargo tauri` is still not installed. `bundle.targets` and
+`webviewInstallMode: downloadBootstrapper` are configured in
+`crates/lightcode-shell/tauri.conf.json` and untried.
+
+The copyright item has a start: `bundle.copyright` in that file carries
+upstream's MIT notice. Whether that is *enough* — `THIRD_PARTY_NOTICES.md` and
+the `LICENSE` file are both in the vendored checkout and neither is shipped — is
+this ticket's to settle.
+
 ### This ticket must be told which line count to report
 
 The checklist item above says to report the Rust server's line count against the

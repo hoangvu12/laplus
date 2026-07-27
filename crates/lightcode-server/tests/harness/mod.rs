@@ -39,6 +39,7 @@ use lightcode_server::config::ProviderState;
 use lightcode_server::process::Search;
 use lightcode_server::store::Database;
 use lightcode_server::threads::Reconciliation;
+use lightcode_server::ui::Assets;
 use lightcode_server::Server;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,7 +73,23 @@ impl TestServer {
     /// that is not about persistence wants: nothing is shared between tests,
     /// and the developer's own project list is never touched.
     pub async fn start() -> TestServer {
-        TestServer::start_on(None, Database::in_memory().expect("an in-memory database")).await
+        TestServer::start_on(
+            None,
+            Database::in_memory().expect("an in-memory database"),
+            Assets::none(),
+        )
+        .await
+    }
+
+    /// A server that also serves a UI, as the shell's does.
+    ///
+    /// The bundle is the caller's — four files rather than four hundred. What
+    /// is being driven is the *policy* in [`lightcode_server::ui`] reaching the
+    /// wire: the real assets are the shell's, and putting them here would make
+    /// every test build carry 17 MB.
+    pub async fn start_serving(assets: Assets) -> TestServer {
+        TestServer::start_on(None, Database::in_memory().expect("an in-memory database"), assets)
+            .await
     }
 
     /// A server started from a configuration the test built.
@@ -83,8 +100,12 @@ impl TestServer {
     /// one about settings surviving a restart — uses
     /// [`TestServer::start_configured_in`].
     pub async fn start_with(config: ServerConfig) -> TestServer {
-        TestServer::start_on(Some(config), Database::in_memory().expect("an in-memory database"))
-            .await
+        TestServer::start_on(
+            Some(config),
+            Database::in_memory().expect("an in-memory database"),
+            Assets::none(),
+        )
+        .await
     }
 
     /// A server keeping the developer's configuration in `preferences`.
@@ -95,7 +116,7 @@ impl TestServer {
     pub async fn start_configured_in(preferences: &Path) -> TestServer {
         let config = ServerConfig::detect_in(preferences.to_path_buf());
         TestServer {
-            server: Server::bind_with(0, config, Database::in_memory().expect("a database"))
+            server: Server::bind_with(0, config, Database::in_memory().expect("a database"), Assets::none())
                 .await
                 .expect("server binds to a free loopback port"),
             _preferences: None,
@@ -119,7 +140,12 @@ impl TestServer {
     /// and that is a restart — which is how the "survives a restart" test is
     /// driven without a second process.
     pub async fn start_at(database: &Path) -> TestServer {
-        TestServer::start_on(None, Database::open(database).expect("the database opens")).await
+        TestServer::start_on(
+            None,
+            Database::open(database).expect("the database opens"),
+            Assets::none(),
+        )
+        .await
     }
 
     /// A restart that can also take a turn: a registry on disk *and* an agent to
@@ -132,8 +158,12 @@ impl TestServer {
     pub async fn start_at_with_agent(database: &Path, binary: &str) -> TestServer {
         let mut config = ServerConfig::detect();
         config.settings.providers.claude_agent.binary_path = binary.to_string();
-        TestServer::start_on(Some(config), Database::open(database).expect("the database opens"))
-            .await
+        TestServer::start_on(
+            Some(config),
+            Database::open(database).expect("the database opens"),
+            Assets::none(),
+        )
+        .await
     }
 
     /// The one place a server here is actually started.
@@ -143,12 +173,16 @@ impl TestServer {
     /// [`TestServer`]'s own field: this is the seam that keeps the suite off the
     /// developer's real `settings.json`, and it is here rather than at each call
     /// site so that a test added later cannot forget it.
-    async fn start_on(config: Option<ServerConfig>, database: Database) -> TestServer {
+    async fn start_on(
+        config: Option<ServerConfig>,
+        database: Database,
+        assets: Assets,
+    ) -> TestServer {
         let preferences = tempfile::tempdir().expect("a temporary directory");
         let mut config = config.unwrap_or_else(ServerConfig::detect);
         config.preferences = preferences.path().to_path_buf();
 
-        let server = Server::bind_with(0, config, database)
+        let server = Server::bind_with(0, config, database, assets)
             .await
             .expect("server binds to a free loopback port");
         TestServer {
@@ -425,6 +459,7 @@ impl TestServer {
             status,
             head: head.to_string(),
             body: serde_json::from_str(body).unwrap_or(Value::Null),
+            text: body.to_string(),
         }
     }
 
@@ -493,6 +528,21 @@ pub struct HttpResponse {
     pub status: u16,
     pub head: String,
     pub body: Value,
+    /// The body as it arrived. What the UI's own files are checked against —
+    /// they are HTML and JavaScript, so [`HttpResponse::body`] is `Null` for
+    /// every one of them.
+    pub text: String,
+}
+
+impl HttpResponse {
+    /// One response header by name, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+    }
 }
 
 /// What a client presents at the upgrade.

@@ -1,0 +1,26 @@
+[package]
+name = "lightcode-shell"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# `lightcode` rather than `lightcode-shell`: this is the application, and its
+# name is what a developer sees in the task manager and on a shortcut.
+[[bin]]
+name = "lightcode"
+path = "src/main.rs"
+
+[dependencies]
+# The window and the webview, and nothing else. Default features off for the
+# same reason the size spike measured with them off: what is not linked is not
+# downloaded. `wry` is the webview binding itself — on Windows a thin layer over
+# WebView2, which is the operating system's own and ships with it.
+tauri = { version = "2", default-features = false, features = ["wry"] }
+lightcode-server = { path = "../lightcode-server" }
+tokio.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", default-features = false }

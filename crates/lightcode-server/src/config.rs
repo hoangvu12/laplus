@@ -392,7 +392,7 @@ impl ServerConfig {
             providers: Vec::new(),
             available_editors: crate::editor::available(),
             observability: Observability {
-                logs_directory_path: display_path(data_dir.join("logs"), "logs"),
+                logs_directory_path: display_path(data_dir.join(LOGS), LOGS),
                 local_tracing_enabled: false,
                 otlp_traces_enabled: false,
                 otlp_metrics_enabled: false,
@@ -431,6 +431,20 @@ impl ServerConfig {
     pub fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("server config serializes")
     }
+}
+
+/// The directory name the developer is pointed at for logs, inside the
+/// preferences directory. One spelling, because the config tells the UI where it
+/// is and the shell writes into it.
+const LOGS: &str = "logs";
+
+/// Where lightcode's logs go on this machine.
+///
+/// The same directory `observability.logsDirectoryPath` names in the payload,
+/// resolved without a running server — which is what the shell needs, because
+/// the failures it has to report are the ones that happen instead of a server.
+pub fn logs_dir() -> PathBuf {
+    data_dir().join(LOGS)
 }
 
 /// Where lightcode keeps its own files: keybindings, logs, and — since ticket
@@ -493,6 +507,67 @@ fn display_path(path: PathBuf, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ticket 23's "application state is stored in the appropriate per-user
+    /// location", checked where the answer is decided.
+    ///
+    /// Read-only on purpose. The branches below take their base from process
+    /// environment variables, which are global and mutable, and a test that set
+    /// one would be setting it for every test running beside it — the reason
+    /// [`super::ServerConfig::detect_in`] takes a directory instead of reading
+    /// one. So this asserts against the machine as it is: whatever base this
+    /// platform advertises, lightcode's files are *inside* it, under a name of
+    /// its own, and never beside the executable.
+    #[test]
+    fn the_developers_files_live_under_this_users_own_directory() {
+        let directory = data_dir();
+
+        let name = directory.file_name().and_then(|name| name.to_str());
+        assert!(
+            matches!(name, Some("lightcode" | ".lightcode")),
+            "the directory should be named for the app: {}",
+            directory.display()
+        );
+
+        let base = ["LOCALAPPDATA", "APPDATA", "XDG_DATA_HOME", "USERPROFILE", "HOME"]
+            .iter()
+            .find_map(|name| non_empty_env(name));
+        let Some(base) = base else {
+            // A machine with none of them. The fallback is relative and that is
+            // all there is to say about it.
+            return;
+        };
+
+        assert!(
+            directory.is_absolute(),
+            "{} should be an absolute path",
+            directory.display()
+        );
+        assert!(
+            directory.starts_with(&base),
+            "{} should be under {base}",
+            directory.display()
+        );
+        assert!(
+            crate::store::default_path().starts_with(&directory),
+            "the registry should live with the rest of the developer's files"
+        );
+        assert!(
+            logs_dir().starts_with(&directory),
+            "so should the logs"
+        );
+    }
+
+    /// The shell writes a startup failure into this directory before any server
+    /// exists to say where it is, so the two answers have to be the same one.
+    #[test]
+    fn the_logs_directory_the_shell_writes_to_is_the_one_the_config_advertises() {
+        let config = ServerConfig::detect();
+        assert_eq!(
+            config.observability.logs_directory_path,
+            logs_dir().to_string_lossy()
+        );
+    }
 
     /// The contract types a good half of this payload as `TrimmedNonEmptyString`.
     /// An empty one decodes as a schema failure on the client, which the UI

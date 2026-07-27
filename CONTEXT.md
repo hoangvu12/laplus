@@ -218,3 +218,28 @@ for each. A terminal whose shell exited is still on the list, still readable,
 and can be given a new shell by name. A terminal that was *closed* is gone: the
 developer said so, the process was killed and waited for, and the id no longer
 names anything. Reaping happens at the second, never the first.
+
+## Shell
+
+**Shell** — lightcode as a desktop application: a window, and the server
+running inside the same process. `crates/lightcode-shell`. The server is a
+library to it, not a service it talks to, which is why closing the window is
+what reaps the agents.
+
+**Bundle** — upstream's built web application, `t3code/apps/web/dist`, as it
+reaches the executable: a table of names and bytes generated at build time.
+Source maps are the one thing dropped, and they are two thirds of it.
+
+**Assets** — the bundle as the server holds it, and the rules for answering a
+request from it. `crate::ui::Assets`. Empty for every server but the shell's,
+which is what keeps a UI out of the test binaries and out of the plain server.
+
+**Entry point** — `index.html`, and the answer to any path that looks like one
+of the UI's own **routes** rather than a file. The UI routes in the browser, so
+`/settings` is a path this server has never heard of and must not 404. A missing
+*file* still must.
+
+**Origin** — scheme, host and port together, and the reason the port is fixed.
+The window is pointed at `http://127.0.0.1:4773/`, so the port is part of what
+the browser scopes `localStorage` by — and `localStorage` is where the UI keeps
+the developer's layout, drafts and open thread. See ADR-0010.

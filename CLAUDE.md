@@ -11,6 +11,12 @@ never committed here (see `.gitignore`).
 ## Layout
 
 - `crates/lightcode-server/` — the server. Cargo workspace root is the repo root.
+- `crates/lightcode-shell/` — the desktop application: a Tauri window with the
+  server running inside it. Its build script embeds `t3code/apps/web/dist`, so
+  it needs the vendored checkout built. **It is not a default workspace member**
+  for exactly that reason: `cargo build` and `cargo test` cover the server only,
+  and the shell is asked for by name (`cargo run -p lightcode-shell`,
+  `cargo test -p lightcode-shell`).
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.

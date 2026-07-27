@@ -336,13 +336,18 @@ mod tests {
     }
 
     /// The check matches on **host** and ignores the scheme, which cuts the
-    /// opposite way from what you would guess, and ticket 23 walks straight
-    /// into it: `tauri://localhost` is accepted because its host is
-    /// `localhost`, while `http://tauri.localhost` — the origin Tauri v2
-    /// actually uses on Windows — is refused, because `tauri.localhost` is
-    /// neither `localhost` nor a `127.0.0.0/8` address. Pinned as a test
-    /// rather than left as a note, so ticket 23 finds out by reading a failure
-    /// rather than by guessing.
+    /// opposite way from what you would guess: `tauri://localhost` is accepted
+    /// because its host is `localhost`, while `http://tauri.localhost` — the
+    /// origin Tauri v2 actually uses on Windows — is refused, because
+    /// `tauri.localhost` is neither `localhost` nor a `127.0.0.0/8` address.
+    ///
+    /// This was pinned so that ticket 23 would find out by reading a failure
+    /// rather than by guessing, and it did its job: ticket 23 serves the UI
+    /// from this server instead (see [`crate::ui`]), so the window's origin is
+    /// the loopback address it was already pointed at and this stays as it is.
+    /// The refusal below is not a gap waiting to be widened — widening it would
+    /// widen it for a real browser too, and a page on `tauri.localhost` is not
+    /// a page on this machine.
     #[test]
     fn the_origin_check_matches_on_host_and_ignores_the_scheme() {
         assert!(
@@ -359,7 +364,7 @@ mod tests {
                 ..request()
             })
             .is_err(),
-            "tauri.localhost is a different host, and is refused until ticket 23 widens this"
+            "tauri.localhost is a different host, and is refused"
         );
     }
 

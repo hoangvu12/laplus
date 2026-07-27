@@ -36,7 +36,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{RawQuery, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
@@ -52,6 +52,7 @@ use crate::rpc::{Answer, Deferred, Services};
 use crate::store::{Database, StorageError};
 use crate::subscriptions::Subscriptions;
 use crate::terminal::Terminals;
+use crate::ui::Assets;
 use crate::wire::{Cause, ClientMessage, Exit, ServerMessage};
 use crate::{http, rpc};
 
@@ -69,6 +70,11 @@ const FRAME_QUEUE: usize = 64;
 #[derive(Debug)]
 pub struct ServerState {
     services: Services,
+    /// The UI, if this server was given one. Empty for the plain binary and for
+    /// every server the suite starts; the shell is the only caller that brings
+    /// a bundle. See [`crate::ui`] for why the assets are served from here at
+    /// all rather than from the webview's own scheme handler.
+    ui: Assets,
     /// Flipped once when the server is asked to stop. Open sockets watch it,
     /// because `axum`'s graceful shutdown waits for connections to end and a
     /// long-lived socket never would on its own.
@@ -83,9 +89,10 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    fn new(services: Services, shutdown: watch::Receiver<bool>) -> Self {
+    fn new(services: Services, ui: Assets, shutdown: watch::Receiver<bool>) -> Self {
         ServerState {
             services,
+            ui,
             shutdown,
             live_connections: AtomicUsize::new(0),
             live_subscriptions: Arc::new(AtomicUsize::new(0)),
@@ -214,10 +221,15 @@ impl Server {
     ///
     /// Loopback is not a default here, it is the security model: v1 has no
     /// identity store, so reachability *is* the boundary.
-    pub async fn bind(port: u16) -> Result<Server, StartupFailure> {
+    ///
+    /// `ui` is the web bundle to serve, or [`Assets::none`] for a server that
+    /// only answers calls. The shell passes one; the plain binary does not,
+    /// which is what keeps `cargo run` a socket endpoint the real UI can be
+    /// pointed at from a development server.
+    pub async fn bind(port: u16, ui: Assets) -> Result<Server, StartupFailure> {
         let database =
             Database::open(&crate::store::default_path()).map_err(StartupFailure::Database)?;
-        let server = Server::bind_with(port, ServerConfig::detect(), database)
+        let server = Server::bind_with(port, ServerConfig::detect(), database, ui)
             .await
             .map_err(|error| StartupFailure::Listen { port, error })?;
         server.probe_provider();
@@ -238,6 +250,7 @@ impl Server {
         port: u16,
         config: ServerConfig,
         database: Database,
+        ui: Assets,
     ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         // The index is built first because the working trees listen to its
@@ -254,7 +267,7 @@ impl Server {
             index,
             terminals: Terminals::new(),
         };
-        let state = Arc::new(ServerState::new(services, shutdown.subscribe()));
+        let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe()));
 
         let app = Router::new()
             .route("/ws", get(upgrade))
@@ -262,6 +275,17 @@ impl Server {
             // all. See `crate::http`.
             .route("/.well-known/t3/environment", get(environment_descriptor))
             .route("/api/auth/session", get(auth_session))
+            // Last, and only for paths nothing above matched: the UI itself.
+            // A route wins over a fallback, so attaching a bundle cannot move
+            // an answer the client already decodes — which is the property
+            // `tests/http_ui.rs` pins.
+            //
+            // `any` rather than `get`, and the method checked inside: a
+            // `get`-only fallback answers a `POST` with 405, which tells the
+            // client the path exists. Nothing here exists that is not a file,
+            // so every method that is not a read is the same 404 as a path
+            // that is not there.
+            .fallback(any(asset))
             .with_state(Arc::clone(&state));
 
         let listener =
@@ -297,6 +321,12 @@ impl Server {
     /// The URL the UI connects to.
     pub fn ws_url(&self) -> String {
         format!("ws://{}/ws", self.local_addr)
+    }
+
+    /// The URL the UI is *at*. What the shell points its window at, and the
+    /// origin every request the window makes will carry.
+    pub fn http_url(&self) -> String {
+        format!("http://{}/", self.local_addr)
     }
 
     pub fn state(&self) -> &Arc<ServerState> {
@@ -373,6 +403,37 @@ async fn environment_descriptor(State(state): State<Arc<ServerState>>) -> Respon
 async fn auth_session(State(state): State<Arc<ServerState>>) -> Response {
     let config = state.config().current();
     Json(http::auth_session_state(&config).to_value()).into_response()
+}
+
+/// Everything the routes above did not answer: a file of the UI, the page
+/// standing in for one of its own routes, or a 404.
+///
+/// The bytes are copied on the way out. They are `&'static` in the shell and
+/// could be handed to the body without one, at the cost of putting `axum`'s
+/// `Bytes` into [`crate::ui`] and so the web framework into the policy — which
+/// [`crate::auth`] and [`crate::http`] are both deliberately free of. What it
+/// buys is one copy of at most a few megabytes, once per window, over loopback.
+async fn asset(
+    State(state): State<Arc<ServerState>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> Response {
+    // `HEAD` is the same answer without the body, which `axum` takes care of.
+    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    match state.ui.resolve(uri.path()) {
+        Some(asset) => (
+            [
+                (header::CONTENT_TYPE, asset.content_type),
+                (header::CACHE_CONTROL, asset.caching.header()),
+            ],
+            asset.bytes.to_vec(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn upgrade(
@@ -664,6 +725,7 @@ mod tests {
                     index,
                     terminals: Terminals::new(),
                 },
+                Assets::none(),
                 watch::channel(false).1,
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
