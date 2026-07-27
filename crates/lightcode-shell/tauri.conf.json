@@ -14,6 +14,8 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "copyright": "lightcode. UI derived from t3code, Copyright (c) T3 Tools, Inc., MIT licence.",
+    "licenseFile": "../../THIRD_PARTY_NOTICES.md",
+    "resources": { "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md" },
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"

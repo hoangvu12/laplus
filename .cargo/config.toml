@@ -1,0 +1,3 @@
+# `cargo xtask release` is how a release of lightcode is made. See `xtask/src/main.rs`.
+[alias]
+xtask = "run --quiet --package xtask --"

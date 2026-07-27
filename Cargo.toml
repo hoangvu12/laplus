@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lightcode-server", "crates/lightcode-shell"]
+members = ["crates/lightcode-server", "crates/lightcode-shell", "xtask"]
 # `cargo build` and `cargo test` with no `-p` build the server and not the shell.
 #
 # The shell embeds `t3code/apps/web/dist`, and `t3code/` is a vendored checkout
@@ -13,7 +13,11 @@ members = ["crates/lightcode-server", "crates/lightcode-shell"]
 #
 # It also keeps the suite quick. The shell pulls in Tauri, which is a thousand
 # crates the server's tests have no use for.
-default-members = ["crates/lightcode-server"]
+#
+# `xtask` is in the default set on purpose, unlike the shell: it depends on
+# nothing, and the arithmetic that decides whether this project achieved what it
+# set out to should be checked by the same `cargo test` as everything else.
+default-members = ["crates/lightcode-server", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

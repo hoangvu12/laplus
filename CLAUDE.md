@@ -17,6 +17,15 @@ never committed here (see `.gitignore`).
   for exactly that reason: `cargo build` and `cargo test` cover the server only,
   and the shell is asked for by name (`cargo run -p lightcode-shell`,
   `cargo test -p lightcode-shell`).
+- `xtask/` — how a release is made: `cargo xtask release` builds the Windows
+  installer *and* measures it, because the project exists for that number. Writes
+  `docs/artifact-size.md`. `--measure-install` additionally installs, weighs and
+  uninstalls, which is opt-in because it touches the machine — and refuses if
+  lightcode is already installed, rather than uninstalling someone's copy.
+  **Needs `cargo install tauri-cli --version "^2" --locked` first**: the Tauri
+  CLI is not a workspace dependency and cannot be one, and the first release
+  build downloads NSIS, so a fresh clone needs that command and a network before
+  it can produce an installer. Nothing else in the repo needs either.
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.

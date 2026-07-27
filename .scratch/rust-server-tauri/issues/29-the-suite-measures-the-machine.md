@@ -76,3 +76,22 @@ Separately, and not this repo's fault: piping `cargo test` into `head` kills
 cargo mid-run and orphans the `git` children it had spawned, which then slow the
 *next* run. Several of the confusing failures above were self-inflicted that way.
 Redirect to a file and grep the file.
+
+### Seen again, on a diff that touches none of it
+
+Ticket 24 hit this and paid the tax the ticket above predicts. Its changes are a
+new `xtask` crate, a licence file and two lines of bundle configuration — nothing
+the server can see — and `socket_branches` came back **6 of 19 failed**, all
+`a frame arrives within the timeout`. Re-run alone: **4 of 19 failed**, a
+different four. Re-run with `--test-threads=1`: **19 of 19 passed** in 55.98s.
+
+The load was real and self-inflicted in a way worth naming, because ticket 24's
+work makes it likelier rather than rarer: `cargo tauri build` had been run four
+times in that session, each a three-minute release build of a thousand Tauri
+crates. Anyone measuring the artifact is by definition on a machine that has just
+been compiling hard, so the ticket whose job is to build releases is the ticket
+most likely to meet this — and to spend its time deciding whether it broke the
+git suite.
+
+Which is the cost this ticket is about, quantified once more: three runs to
+conclude "no".
