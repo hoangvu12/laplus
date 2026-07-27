@@ -10,7 +10,7 @@ Two independent defaults met: Tauri's NSIS per-user install path is
 `%LOCALAPPDATA%\lightcode`. Neither is wrong on its own and nothing points at
 the other, which is why it took a real install to see.
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 Found by ticket 24, on this machine, by installing the built artifact and
 looking at what was in the directory afterwards.
@@ -53,3 +53,34 @@ makes the uninstaller honest. They are not exclusive.
 
 Ticket 24 did not act on this: it is not a size question, and changing where a
 developer's database lives is not something to slip into a measuring run.
+
+## Comments
+
+### 2026-07-27 — triage. Option 1 now; option 2 is a separate decision
+
+**Move the install**, to `%LOCALAPPDATA%\Programs\lightcode`. It is where
+per-user applications more usually go, it separates the two directories, and it
+touches nobody's existing data — which is the whole reason to prefer it over
+moving `data_dir()`. Ticket 23's "application state is stored in the appropriate
+per-user location" stays true rather than needing revisiting.
+
+**What this deliberately does not fix, and the ticket must say so when it
+lands:** the uninstaller's "delete application data" checkbox still points at
+`%LOCALAPPDATA%\com.lightcode.desktop`, which lightcode still never writes to.
+After option 1 the checkbox is *still* a no-op. That is the safe direction to
+fail in — a user who ticks it keeps their conversations rather than losing them
+silently — but it is a control that lies about what it does, and shipping it
+knowingly is a choice rather than an oversight. Record it in the ticket, not just
+here.
+
+Option 2 — moving `data_dir()` to `%LOCALAPPDATA%\com.lightcode.desktop`, which
+is what would make that checkbox mean what it says — needs a migration for every
+existing install and is the larger call. Not folded in here. If it is ever taken,
+the migration is the whole of the work; the path change is one line.
+
+**One thing to verify rather than assume:** that `RMDir "$INSTDIR"` is
+non-recursive is what currently protects the database, and after this change the
+install directory no longer holds it, so that protection stops mattering — which
+is good. But confirm the new install path is what NSIS actually uses before
+trusting it; the ticket above exists precisely because two defaults were assumed
+to point at different places and did not.

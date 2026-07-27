@@ -7,7 +7,7 @@ own topbar. t3code has only the topbar, with the window controls drawn into its
 right-hand end — so the app starts about thirty pixels higher and looks like one
 piece rather than a web page in a frame.
 
-**Status:** needs-triage
+**Status:** wontfix
 
 **Found by:** ticket 23, once a person looked at the window. Dragging the
 topbar does nothing and dragging the OS titlebar works, which is correct for
@@ -47,3 +47,25 @@ The migration document costs the whole window-chrome area at months, but that is
 for parity across three platforms with menus, theming and window state. One bar
 on Windows is a much smaller thing hiding inside that number, and worth scoping
 on its own before it inherits the estimate.
+
+## Comments
+
+### 2026-07-27 — triage. Not v1
+
+`wontfix`, and the label is doing a specific job here: this ticket describes
+something real and visible, so left open it reads as an outstanding defect in
+the most obvious surface of the application. It is not one. The window is
+completely usable, the spec already puts the drag-region question out of scope,
+and the three changes named above have to land together or each makes the
+application worse on its own.
+
+The deciding argument is the second bullet. Faking `window.desktopBridge` to get
+upstream's titlebar path to draw would make the UI believe it is in Electron
+*everywhere else* — every other call behind that gate would go to a bridge that
+is not there. That is a large, diffuse risk taken on for thirty pixels.
+
+**This is "not v1", not "never".** Reopen it when there is a person willing to
+watch a window while it is built, and take the drag-region script that ticket 23
+wrote and removed as the starting point rather than rediscovering the need for
+it. Nothing else in the tracker depends on this, so it can come back at any time
+without unblocking anything.

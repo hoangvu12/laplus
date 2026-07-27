@@ -7,7 +7,7 @@ server 0.1.0. Relaunch the server with the copied command to sync them." above
 the composer, on every launch, in a fresh profile. Nothing is wrong; there is one
 process and it is this one.
 
-**Status:** needs-triage
+**Status:** ready-for-agent
 
 **Found by:** ticket 23, the first time the real UI was run against this server in
 a window. It has presumably been true since ticket 03 and nobody could see it.
@@ -43,3 +43,27 @@ Not decided here; this needs a call rather than a patch.
 Whichever is chosen, this is the kind of thing that will keep surfacing — the
 hard fork means every field the client interprets rather than displays is a place
 upstream's assumptions leak through.
+
+## Comments
+
+### 2026-07-27 — triage. Option 2, with a fallback for the bare server
+
+**Take the version from the bundle at build time.** The shell's build script
+already reads `t3code/apps/web/dist`; read the number from the `package.json`
+beside it and report that as `serverVersion`. Where there is no bundle to read —
+the plain `lightcode-server` binary — fall back to `env!("CARGO_PKG_VERSION")`,
+which is the honest answer for a server that is not claiming to match any
+particular UI.
+
+Chosen over the alternatives because option 1 puts a lie in a field, and option 3
+leaves the first screen a new user sees carrying advice they cannot act on. The
+coupling that option 2 costs is real but already paid: the shell cannot build
+without the vendored checkout, so a build script that reads a second file from
+`dist/` adds no new dependency.
+
+What this ticket should be honest about when it lands: the banner is silenced
+because the two numbers are made equal, not because a real skew is now detected.
+Version skew between this server and its embedded UI is not a thing that can
+happen — they ship in one binary — so the check is vestigial here rather than
+satisfied. Say so where the value is set, or the next person will read it as a
+working comparison.

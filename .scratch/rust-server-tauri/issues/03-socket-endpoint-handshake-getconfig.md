@@ -189,3 +189,28 @@ and a way to serve `apps/web/dist` should close these two boxes by eye.**
 - `src/http.rs` is the least well-founded code in this ticket. Ticket 01's proxy
   recorded `/ws` connections only, so those two endpoints are written from the
   contract with no capture behind them.
+
+**2026-07-27 — triage.** Both blockers named above are now `done`, and this
+ticket has been sitting on stale ones.
+
+The two open criteria were left to "the first person to have both ticket 04 and a
+way to serve `apps/web/dist`". Ticket 04 is done; ticket 23 built the shell that
+serves the bundle. So the condition this ticket was waiting for has been met, and
+nothing here is blocked any more.
+
+There is also indirect evidence the criteria are already satisfied: **ticket 26
+exists because someone read a version-skew banner above the composer in a real
+window.** The UI cannot render that banner without completing its boot — it
+comes from `versionSkew.ts` comparing `environment.serverVersion` against its own,
+which requires a `server.getConfig` response the client actually decoded. That is
+most of criterion 3, and a UI that stayed connected long enough to be looked at is
+most of criterion 4.
+
+Deliberately **not** ticking the boxes on that reasoning. The whole point of
+those two criteria is that they are the ones nobody has watched, and closing them
+by inference from a *different* ticket's screenshot is the same move this ticket
+already refused once. What is needed is small: launch the shell, watch the boot,
+confirm no error and no retry loop, tick two boxes.
+
+Kept at `ready-for-human` because looking at a window is the work. It should be
+quick, and it is the last thing standing between this ticket and `done`.
