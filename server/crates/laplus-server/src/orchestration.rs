@@ -709,7 +709,22 @@ impl Shell {
     }
 
     fn snapshot(&self) -> Result<Value, StorageError> {
-        Ok(snapshot_event(
+        Ok(json!({
+            "kind": "snapshot",
+            "snapshot": self.shell_snapshot()?,
+        }))
+    }
+
+    /// The `OrchestrationShellSnapshot` on its own, with no stream envelope
+    /// around it.
+    ///
+    /// The body of `GET /api/orchestration/shell` (ticket 31), and the same
+    /// object the subscription's opening chunk carries under `snapshot`. One
+    /// builder for both, because the client takes whichever of the two it can
+    /// get and two builders would let the shell a developer sees depend on
+    /// which transport won.
+    pub fn shell_snapshot(&self) -> Result<Value, StorageError> {
+        Ok(shell_snapshot(
             &self.inner.database.registry()?,
             &self.inner.threads,
             self.inner.sequences.current(),
@@ -734,7 +749,8 @@ fn unavailable(attempting: &'static str) -> impl Fn(StorageError) -> CommandErro
     move |error| CommandError::new(format!("Could not {attempting}: {error}"))
 }
 
-/// The opening chunk of a shell subscription: every project and every thread.
+/// Every project and every thread: what a shell subscription opens with, and
+/// what `GET /api/orchestration/shell` answers with.
 ///
 /// `snapshotSequence` is the log position rather than the registry's stored one.
 /// They differ as soon as a conversation is under way — a turn advances the log
@@ -744,24 +760,21 @@ fn unavailable(attempting: &'static str) -> impl Fn(StorageError) -> CommandErro
 ///
 /// `updatedAt` is the later of the registry's own timestamp and the newest
 /// thread's, because the field describes the shell rather than either half of it.
-fn snapshot_event(registry: &Registry, threads: &Threads, sequence: i64) -> Value {
+fn shell_snapshot(registry: &Registry, threads: &Threads, sequence: i64) -> Value {
     let updated_at = threads
         .latest_change()
         .filter(|latest| latest > &registry.updated_at)
         .unwrap_or_else(|| registry.updated_at.clone());
 
     json!({
-        "kind": "snapshot",
-        "snapshot": {
-            "snapshotSequence": sequence,
-            "projects": registry
-                .projects
-                .iter()
-                .map(Project::to_value)
-                .collect::<Vec<Value>>(),
-            "threads": threads.shell_summaries(),
-            "updatedAt": updated_at,
-        },
+        "snapshotSequence": sequence,
+        "projects": registry
+            .projects
+            .iter()
+            .map(Project::to_value)
+            .collect::<Vec<Value>>(),
+        "threads": threads.shell_summaries(),
+        "updatedAt": updated_at,
     })
 }
 
@@ -1274,6 +1287,28 @@ mod tests {
         // The client sent a blank title, so the folder names the project.
         assert_eq!(projects[0]["title"], "my-project");
         assert_eq!(projects[0]["createdAt"], "2026-07-26T00:23:04.909Z");
+    }
+
+    /// Ticket 31's `GET /api/orchestration/shell` answers with exactly what the
+    /// subscription's opening chunk carries under `snapshot`, envelope removed.
+    /// The client takes whichever of the two it can get, so one builder is the
+    /// only way the shell it draws cannot depend on which transport won.
+    #[test]
+    fn the_route_and_the_subscription_describe_the_shell_identically() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("both-ways");
+        fixture.add("project-1", &folder).expect("registered");
+        fixture
+            .add_thread("thread-1", "project-1")
+            .expect("registered");
+
+        let over_http = fixture
+            .shell
+            .shell_snapshot()
+            .expect("the registry is readable");
+        assert_eq!(over_http, fixture.snapshot()["snapshot"]);
+        assert_eq!(over_http["projects"][0]["id"], "project-1");
+        assert_eq!(over_http["threads"][0]["id"], "thread-1");
     }
 
     #[test]

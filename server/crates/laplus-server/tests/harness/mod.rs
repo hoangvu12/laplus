@@ -406,20 +406,11 @@ impl TestServer {
     }
 
     pub async fn connect_as(&self, identity: ClientIdentity) -> Result<SocketClient, Refusal> {
-        let mut url = self.ws_url();
-        if let Some(ticket) = &identity.ticket {
-            url.push_str("?wsTicket=");
-            url.push_str(ticket);
-        }
-
-        let mut request = url
+        let mut request = identity
+            .ticketed(&self.ws_url())
             .into_client_request()
             .expect("the server's own url is a valid websocket request");
-        for (name, value) in [
-            ("origin", identity.origin.as_deref()),
-            ("cookie", identity.cookie.as_deref()),
-            ("authorization", identity.authorization.as_deref()),
-        ] {
+        for (name, value) in identity.headers() {
             if let Some(value) = value {
                 request.headers_mut().insert(
                     name,
@@ -449,17 +440,30 @@ impl TestServer {
         }
     }
 
-    /// A plain `GET`, for the two endpoints the UI hits before it opens a
-    /// socket. Raw HTTP rather than a client library, for the same reason
-    /// [`TestServer::raw_upgrade`] is: no dependency, and nothing between the
-    /// assertion and the bytes.
+    /// A plain `GET` presenting nothing. Raw HTTP rather than a client library,
+    /// for the same reason [`TestServer::raw_upgrade`] is: no dependency, and
+    /// nothing between the assertion and the bytes.
     pub async fn get(&self, path: &str) -> HttpResponse {
-        let raw = self
-            .raw_request(&format!(
-                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                self.addr()
-            ))
-            .await;
+        self.get_as(path, &ClientIdentity::anonymous()).await
+    }
+
+    /// A `GET` presenting what a client presents.
+    ///
+    /// The same [`ClientIdentity`] the socket upgrade takes, because ticket 31's
+    /// two snapshot routes accept exactly what the upgrade accepts — so a test
+    /// that shows a credential reading a snapshot and the same credential
+    /// opening a socket is showing it with one vocabulary rather than two.
+    pub async fn get_as(&self, path: &str, identity: &ClientIdentity) -> HttpResponse {
+        let mut request = format!("GET {}", identity.ticketed(path));
+        request.push_str(&format!(" HTTP/1.1\r\nHost: {}\r\n", self.addr()));
+        for (name, value) in identity.headers() {
+            if let Some(value) = value {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+        }
+        request.push_str("Connection: close\r\n\r\n");
+
+        let raw = self.raw_request(&request).await;
 
         let (head, body) = raw
             .split_once("\r\n\r\n")
@@ -595,9 +599,45 @@ impl ClientIdentity {
         }
     }
 
+    /// The shape a remote-attached client sends: a bearer token and no cookie.
+    pub fn bearer() -> Self {
+        ClientIdentity {
+            authorization: Some("Bearer eyJ2IjoxLCJraW5kIjoiYWNjZXNzIn0.c2lnbmF0dXJl".to_string()),
+            ..ClientIdentity::default()
+        }
+    }
+
     pub fn with_origin(mut self, origin: &str) -> Self {
         self.origin = Some(origin.to_string());
         self
+    }
+
+    /// The url or path with the ticket appended, if there is one.
+    ///
+    /// The browser cannot set headers on a WebSocket, which is why the ticket
+    /// travels in the query string and why this is not simply another header.
+    fn ticketed(&self, target: &str) -> String {
+        match &self.ticket {
+            Some(ticket) => {
+                let separator = if target.contains('?') { '&' } else { '?' };
+                format!("{target}{separator}wsTicket={ticket}")
+            }
+            None => target.to_string(),
+        }
+    }
+
+    /// The three headers a credential can arrive in, present or not.
+    ///
+    /// Shared by [`TestServer::connect_as`] and [`TestServer::get_as`], because
+    /// the two snapshot routes accept exactly what the upgrade accepts and a
+    /// second copy of this list is a second chance for them to stop doing so
+    /// without a test noticing.
+    fn headers(&self) -> [(&'static str, Option<&str>); 3] {
+        [
+            ("origin", self.origin.as_deref()),
+            ("cookie", self.cookie.as_deref()),
+            ("authorization", self.authorization.as_deref()),
+        ]
     }
 }
 

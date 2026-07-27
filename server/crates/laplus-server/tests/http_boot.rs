@@ -123,15 +123,19 @@ async fn neither_endpoint_requires_a_credential() {
     server.stop().await;
 }
 
-/// Everything else is still a 404 rather than something inventive. The UI's
-/// boot also reaches for `/api/orchestration/shell`, which is explicitly
-/// best-effort on the client — it times out after six seconds and falls back
-/// to the socket — so a clean 404 is the right answer until ticket 04.
+/// Everything else is still a 404 rather than something inventive. The
+/// contract declares a great deal this server does not implement, and a route
+/// invented to fill one of those gaps would be a guess the client then has to
+/// decode.
+///
+/// `/api/orchestration/shell` used to be on this list. It is answered now — see
+/// `http_orchestration.rs` — because the UI asks for it on every load and takes
+/// the socket fallback when it 404s.
 #[tokio::test]
 async fn an_unimplemented_http_route_is_a_plain_404() {
     let server = TestServer::start().await;
 
-    for path in ["/", "/api/orchestration/shell", "/api/auth/browser-session"] {
+    for path in ["/", "/api/orchestration/snapshot", "/api/auth/browser-session"] {
         let response = server.get(path).await;
         assert_eq!(response.status, 404, "{path} should be a 404");
     }

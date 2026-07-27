@@ -1,10 +1,13 @@
 //! The socket endpoint: one `GET /ws` on loopback, and the connection loop
 //! behind it.
 //!
-//! There is no REST surface. Everything the UI does goes through this one
-//! endpoint, and — per ticket 01's captures — there is no transport-level
-//! handshake either: the socket opens and the client's first frame is already
-//! a `Request`.
+//! Everything the UI *does* goes through this one endpoint, and — per ticket
+//! 01's captures — there is no transport-level handshake either: the socket
+//! opens and the client's first frame is already a `Request`. The handful of
+//! plain `GET`s routed beside it are not a REST surface: two are the boot
+//! handshake and two answer with payloads this socket already carries, so that
+//! the client's HTTP fast path stops being a guaranteed miss. All four are
+//! [`crate::http`]'s, and none of them is a way to *change* anything.
 //!
 //! A connection is three parts, and the split is what streaming needs:
 //!
@@ -33,7 +36,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{RawQuery, State, WebSocketUpgrade};
+use axum::extract::{Path, RawQuery, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -41,7 +44,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 
-use crate::auth::{self, Credential, UpgradeRequest};
+use crate::auth::{self, AuthInvalidBody, Credential, Rejection, UpgradeRequest};
 use crate::config::ServerConfig;
 use crate::config_store::ConfigStore;
 use crate::filesystem::Index;
@@ -284,6 +287,16 @@ impl Server {
             // all. See `crate::http`.
             .route("/.well-known/t3/environment", get(environment_descriptor))
             .route("/api/auth/session", get(auth_session))
+            // The two the UI asks for *instead of* the socket, and falls back
+            // to the socket without. Real routes rather than fallback paths for
+            // a second reason beyond answering them: `/api/orchestration/…` has
+            // no extension, so the asset fallback would otherwise hand a thread
+            // id to the UI's own router and answer a `fetch` with an HTML page.
+            .route("/api/orchestration/shell", get(shell_snapshot))
+            .route(
+                "/api/orchestration/threads/{threadId}",
+                get(thread_snapshot),
+            )
             // Last, and only for paths nothing above matched: the UI itself.
             // A route wins over a fallback, so attaching a bundle cannot move
             // an answer the client already decodes — which is the property
@@ -414,6 +427,91 @@ async fn auth_session(State(state): State<Arc<ServerState>>) -> Response {
     Json(http::auth_session_state(&config).to_value()).into_response()
 }
 
+/// `GET /api/orchestration/shell` — the project list, over HTTP.
+///
+/// The same object the shell subscription opens with. Answered from the
+/// registry, which is a read of two tables and the one thing here that can
+/// fail.
+async fn shell_snapshot(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(refused) = authorized(query.as_deref(), &headers) {
+        return refused;
+    }
+
+    match state.services.shell.shell_snapshot() {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => {
+            // Said out loud, because the client's answer to a failed fetch is
+            // to fall back to the socket — where the subscription is about to
+            // fail to describe the registry for the same reason and be just as
+            // quiet about it.
+            eprintln!("laplus: cannot describe the project registry over HTTP: {error}");
+            refuse(http::shell_snapshot_unavailable())
+        }
+    }
+}
+
+/// `GET /api/orchestration/threads/{threadId}` — one conversation, over HTTP.
+///
+/// Answered from memory, so the only outcome besides the snapshot is that this
+/// server does not hold the thread — which is the ordinary case for a "New
+/// thread" pane, and a typed 404 rather than a bare one for exactly that
+/// reason. See [`crate::http::thread_not_found`].
+async fn thread_snapshot(
+    State(state): State<Arc<ServerState>>,
+    Path(thread_id): Path<String>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(refused) = authorized(query.as_deref(), &headers) {
+        return refused;
+    }
+
+    match state.services.shell.threads().detail_snapshot(&thread_id) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => refuse(http::thread_not_found()),
+    }
+}
+
+/// May this request read a snapshot? The 401 to return if not.
+///
+/// **Exactly [`auth::authorize`], and deliberately nothing more** —
+/// `docs/adr/0015`, which is where this is argued rather than summarised. These
+/// routes answer with data the socket already carries, so a credential good
+/// enough to open the socket that was not good enough to read a snapshot would
+/// simply send the client back to the socket — the failed round trip ticket 31
+/// exists to remove. That cuts both ways: the one thing `authorize` refuses, a
+/// non-local origin, is refused here too, and it matters more here than at the
+/// upgrade, because a `fetch` from a page elsewhere is a page elsewhere asking
+/// the user's own browser for their project list.
+///
+/// Which credential shape arrived is not recorded, unlike at the upgrade, where
+/// it travels with the connection. There is no connection here to carry it and
+/// nothing that reads it in v1.
+fn authorized(query: Option<&str>, headers: &HeaderMap) -> Result<(), Response> {
+    auth::authorize(presented(query, headers))
+        .map(|_shape| ())
+        .map_err(|rejection| {
+            // No `Access-Control-Allow-Origin` here, unlike the upgrade's own
+            // 401. There it lets a browser read the body rather than reporting
+            // a CORS error for a handshake it cannot see into; here the refused
+            // request *is* the cross-origin one, and helping it read the answer
+            // would be the only thing this refusal gives away.
+            (StatusCode::UNAUTHORIZED, refused(rejection)).into_response()
+        })
+}
+
+fn refuse(refusal: http::Refusal) -> Response {
+    (
+        StatusCode::from_u16(refusal.status).expect("the contract's statuses are valid"),
+        Json(refusal.to_value()),
+    )
+        .into_response()
+}
+
 /// Everything the routes above did not answer: a file of the UI, the page
 /// standing in for one of its own routes, or a 404.
 ///
@@ -451,27 +549,43 @@ async fn upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let request = UpgradeRequest {
-        query: query.as_deref(),
-        origin: header_str(&headers, header::ORIGIN),
-        authorization: header_str(&headers, header::AUTHORIZATION),
-        cookie: header_str(&headers, header::COOKIE),
-    };
-
-    match auth::authorize(request) {
+    match auth::authorize(presented(query.as_deref(), &headers)) {
         Ok(credential) => ws.on_upgrade(move |socket| connection(socket, state, credential)),
-        Err(rejection) => {
-            eprintln!("laplus: {} (traceId {})", rejection.detail, rejection.trace_id);
-            (
-                StatusCode::UNAUTHORIZED,
-                // The reference server sets this on the same refusal. Keeping
-                // it means a browser reads the body rather than a CORS error.
-                [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-                Json(rejection.body()),
-            )
-                .into_response()
-        }
+        Err(rejection) => (
+            StatusCode::UNAUTHORIZED,
+            // The reference server sets this on the same refusal. Keeping it
+            // means a browser reads the body rather than a CORS error — the
+            // one difference from how the snapshot routes answer the identical
+            // refusal, and [`authorized`] says why.
+            [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+            refused(rejection),
+        )
+            .into_response(),
     }
+}
+
+/// What the client presented, read off an `axum` request.
+///
+/// Here rather than in [`crate::auth`] because this is the one place the web
+/// framework meets the policy. [`UpgradeRequest`] takes strings precisely so
+/// the decision can be made and tested without a `HeaderMap`, and a
+/// constructor over one would undo that.
+fn presented<'a>(query: Option<&'a str>, headers: &'a HeaderMap) -> UpgradeRequest<'a> {
+    UpgradeRequest {
+        query,
+        origin: header_str(headers, header::ORIGIN),
+        authorization: header_str(headers, header::AUTHORIZATION),
+        cookie: header_str(headers, header::COOKIE),
+    }
+}
+
+/// Write a refusal to the log and hand back the body the client decodes.
+///
+/// The status and any headers are the caller's, because they are the only
+/// thing the two callers disagree about.
+fn refused(rejection: Rejection) -> Json<AuthInvalidBody> {
+    eprintln!("laplus: {} (traceId {})", rejection.detail, rejection.trace_id);
+    Json(rejection.body())
 }
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {

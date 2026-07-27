@@ -20,6 +20,16 @@
 //! `authenticateWebSocketUpgrade`, in its precedence order: the `wsTicket`
 //! query parameter first, then the `Authorization` header, then the
 //! `t3_session` cookie.
+//!
+//! **[`authorize`] has a second caller since ticket 31**: the two orchestration
+//! snapshot routes in [`crate::http`]. They are not upgrades, but they must
+//! accept exactly what an upgrade accepts — they answer with data the socket
+//! already carries, so a credential good enough to open the socket that was not
+//! good enough to read a snapshot would send the client back to the socket
+//! fallback, which is the round trip that ticket exists to remove. Permissive
+//! includes *absent*: the real client sends no credential at all on a primary
+//! local connection. `docs/adr/0015` is that decision in full, including why
+//! the contract's "missing credential means 401" could not be honoured here.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -218,7 +228,11 @@ fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
 /// This is a diagnostic handle, not a secret: it exists so a refusal the user
 /// sees can be found in the log. `RandomState` is seeded from the OS per
 /// instance, which is ample for that and avoids a dependency for it.
-fn trace_id() -> String {
+///
+/// Shared with [`crate::http`], because every error in the contract's
+/// `EnvironmentHttpCommonError` union carries one of these and they all have to
+/// look alike.
+pub(crate) fn trace_id() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
 

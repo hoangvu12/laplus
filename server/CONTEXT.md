@@ -26,13 +26,21 @@ calls, thinking, permission requests and their resolutions. `crate::worklog`.
 
 **Activity** — one row in the work log.
 
-**Snapshot** — a subscription's opening description of the world, and the thing
-every event after it is a _diff against_. Not an optimisation and not merely the
-first chunk: the client folds an event only into state it already holds, so a
-subscription that opens without a snapshot has its whole contents discarded on
-arrival, silently. Ticket 28 was that, for a whole turn. The question to ask of
-any subscription here is never "are the events right" but "does the client have
-anything to fold them into".
+**Snapshot** — a description of the world that every event after it is a _diff
+against_. Not an optimisation and not merely a first chunk: the client folds an
+event only into state it already holds, so a subscription that opens without a
+snapshot has its whole contents discarded on arrival, silently. Ticket 28 was
+that, for a whole turn. The question to ask of any subscription here is never
+"are the events right" but "does the client have anything to fold them into".
+
+A snapshot reaches the client two ways, and ticket 31 is why the second exists.
+A subscription **opens** with one, wrapped in a `{"kind":"snapshot"}` envelope;
+`GET /api/orchestration/shell` and `GET /api/orchestration/threads/{threadId}`
+answer with the **same object, unwrapped**, which the client prefers because it
+compresses and stays off the socket. Each is built once —
+`Shell::shell_snapshot`, `Threads::detail_snapshot` — and both transports call
+the builder, because the client takes whichever answer it gets first and two
+builders would let the world it draws depend on which one that was.
 
 **Resume** — a subscription from a client that says it already holds the
 conversation, by sending `afterSequence`. The one case that is _not_ refused for

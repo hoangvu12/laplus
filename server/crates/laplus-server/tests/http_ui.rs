@@ -110,14 +110,24 @@ async fn a_missing_file_is_a_404_rather_than_the_page() {
 }
 
 /// Attaching a UI must not change a single answer the client already decodes.
-/// The two boot endpoints are real routes and win over the fallback; anything
-/// under `/api` this server has not implemented stays the plain 404
-/// `http_boot.rs` pins.
+/// The server's own routes win over the fallback; anything under `/api` this
+/// server has not implemented stays the plain 404 `http_boot.rs` pins.
+///
+/// The orchestration routes are here because they are the ones this matters
+/// most for. Their paths have no extension, so without a route of their own the
+/// fallback would read `/api/orchestration/threads/1a2b` as one of the UI's
+/// client-side routes and answer a `fetch` with an HTML page — which is what
+/// `laplus_server::ui`'s `SERVER_SURFACE` prefix list is for, and it is checked
+/// from both sides.
 #[tokio::test]
 async fn the_servers_own_answers_are_not_shadowed_by_the_ui() {
     let server = TestServer::start_serving(bundle()).await;
 
-    for path in ["/.well-known/t3/environment", "/api/auth/session"] {
+    for path in [
+        "/.well-known/t3/environment",
+        "/api/auth/session",
+        "/api/orchestration/shell",
+    ] {
         let response = server.get(path).await;
         assert_eq!(response.status, 200, "{path}");
         assert!(
@@ -127,8 +137,21 @@ async fn the_servers_own_answers_are_not_shadowed_by_the_ui() {
         );
     }
 
-    for path in ["/api/orchestration/shell", "/.well-known/openid-configuration"] {
-        assert_eq!(server.get(path).await.status, 404, "{path} should stay a 404");
+    // A thread this server does not hold, and an unimplemented sibling: both
+    // 404, and neither is the page.
+    for path in [
+        "/api/orchestration/threads/1a2b",
+        "/api/orchestration/threads/",
+        "/api/orchestration/snapshot",
+        "/.well-known/openid-configuration",
+    ] {
+        let response = server.get(path).await;
+        assert_eq!(response.status, 404, "{path} should stay a 404");
+        assert!(
+            !response.text.contains("<!doctype html>"),
+            "{path} was answered with the UI: {}",
+            response.text
+        );
     }
 
     server.stop().await;

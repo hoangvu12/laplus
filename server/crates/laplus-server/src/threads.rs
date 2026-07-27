@@ -1429,10 +1429,7 @@ impl Threads {
                 if let Some(thread) = lock(&entry.state).as_ref() {
                     items.push(json!({
                         "kind": "snapshot",
-                        "snapshot": {
-                            "snapshotSequence": sequences.current(),
-                            "thread": thread.to_detail_value(),
-                        },
+                        "snapshot": detail_snapshot(thread, &sequences),
                     }));
                 }
                 if marker_owed.swap(false, Ordering::Relaxed) {
@@ -1442,6 +1439,20 @@ impl Threads {
             },
             updates,
         ))
+    }
+
+    /// One conversation as `GET /api/orchestration/threads/{threadId}` answers
+    /// with it, or `None` for a thread this server does not hold.
+    ///
+    /// The HTTP half of ticket 31, and the same value the subscription above
+    /// opens with — the builder is shared, so the two cannot drift. `None` is
+    /// the route's typed `thread_not_found`, and it is the common case rather
+    /// than an edge one: a "New thread" pane asks for a draft's snapshot four
+    /// times a second before the first prompt brings the thread into being.
+    pub fn detail_snapshot(&self, thread_id: &str) -> Option<Value> {
+        let entry = self.find(thread_id)?;
+        let state = lock(&entry.state);
+        Some(detail_snapshot(state.as_ref()?, &self.inner.sequences))
     }
 
     /// Every thread, as the project list carries them.
@@ -1990,6 +2001,21 @@ fn settle(latest: Option<LatestTurn>, session: &Session) -> Option<LatestTurn> {
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
+
+/// One conversation and the log position it was read at — the contract's
+/// `OrchestrationThreadDetailSnapshot`.
+///
+/// Lifted out of [`Threads::subscribe`]'s description closure by ticket 31,
+/// because the HTTP route and the socket answer with the same object and the
+/// client uses whichever of the two it gets. The sequence is read here rather
+/// than passed in so that it is taken at the same moment as the thread, which
+/// is what makes it safe for the client to fold events from.
+fn detail_snapshot(thread: &Thread, sequences: &Sequences) -> Value {
+    json!({
+        "snapshotSequence": sequences.current(),
+        "thread": thread.to_detail_value(),
+    })
+}
 
 fn created_event(sequence: i64, thread: &Thread) -> Value {
     thread_event(
@@ -2574,6 +2600,40 @@ pub(crate) mod tests {
             opening,
             vec![json!({"kind": "synchronized"})],
             "there is nothing to describe, and saying so falsely would wipe the client's copy"
+        );
+    }
+
+    /// Ticket 31's HTTP route and the subscription describe a conversation with
+    /// the same builder, so the client cannot be shown two versions of it
+    /// depending on which transport answered first.
+    ///
+    /// The absent cases are the ones worth naming. A thread nobody has
+    /// mentioned has no slot; a thread a *resume* mentioned has an empty one —
+    /// and both have to read as "not here", because a snapshot of an empty slot
+    /// would be this server claiming a conversation the client still holds is
+    /// gone.
+    #[test]
+    fn the_route_and_the_subscription_describe_a_thread_identically() {
+        let (threads, _shell) = threads();
+
+        assert_eq!(threads.detail_snapshot("thread-1"), None);
+        threads
+            .subscribe(&a_resume("thread-1"))
+            .expect("a resume allocates the slot without filling it");
+        assert_eq!(
+            threads.detail_snapshot("thread-1"),
+            None,
+            "an empty slot is not a conversation"
+        );
+
+        threads.create(a_thread("thread-1")).expect("created");
+        let over_socket = threads
+            .subscribe(&a_watch("thread-1"))
+            .expect("the thread exists")
+            .describe();
+        assert_eq!(
+            threads.detail_snapshot("thread-1"),
+            Some(over_socket[0]["snapshot"].clone())
         );
     }
 
