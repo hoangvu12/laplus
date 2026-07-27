@@ -14,7 +14,7 @@
 //!
 //! | Field | Filled by |
 //! |---|---|
-//! | `repositoryIdentity` | tickets 19–21 — git, which is where a repository's canonical identity comes from |
+//! | `repositoryIdentity` | nothing yet. Tickets 19–21 named it, and having built them it is not theirs: it is a *registry* field — the repository's canonical root, its metadata path and how fresh both are — rather than anything `crate::git` or `crate::refs` is asked for, and `VcsRepositoryIdentity` wants an observation clock none of them has |
 //! | `defaultModelSelection` | ticket 22 — the slugs exist as of ticket 09 (`crate::provider`), but a *per-project* default is a stored preference |
 //! | `scripts` | not in v1's scope at all; the contract requires the key |
 
@@ -120,6 +120,15 @@ impl WorkspaceRoot {
 
     pub fn display(&self) -> &str {
         &self.display
+    }
+
+    /// The folder as a path, which is what every caller that runs something in
+    /// it actually wants. Always [`WorkspaceRoot::display`] and never
+    /// [`WorkspaceRoot::canonical`]: the canonical form is a registry key, and
+    /// on Windows it is case-folded and may be a form the developer would not
+    /// recognise in an error message.
+    pub fn path(&self) -> &Path {
+        Path::new(&self.display)
     }
 
     pub fn canonical(&self) -> &str {

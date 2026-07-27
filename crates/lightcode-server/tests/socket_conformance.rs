@@ -418,6 +418,45 @@ async fn the_working_tree_status_snapshot_conforms_to_the_capture() {
     server.stop().await;
 }
 
+/// The `vcs.listRefs` answer, against the one the reference server gave the
+/// real UI when it opened the branch picker.
+///
+/// The captured repository was on `main`, checked out in its own worktree, with
+/// an `origin` — and the answer named one ref. That last part is the load-bearing
+/// one: `origin/main` and `origin/HEAD` both existed and neither was listed,
+/// which is what fixes the default meaning of `includeMatchingRemoteRefs` and of
+/// a symbolic remote ref. **There are no declared divergences here**, so any
+/// difference at all fails.
+#[tokio::test]
+async fn the_branch_listing_conforms_to_the_capture() {
+    let capture = Capture::load("01-browser-session");
+    let captured = capture.response_to("vcs.listRefs");
+    let captured = &captured["exit"]["value"];
+    assert_eq!(captured["totalCount"], json!(1), "{captured}");
+
+    let workspace = harness::workspace::Workspace::with(&["src/main.rs"]);
+    workspace.init_repository().commit("first");
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    let live = client
+        .call("vcs.listRefs", json!({"cwd": workspace.cwd(), "limit": 100}))
+        .await
+        .expect_success();
+
+    // The state being compared, asserted rather than assumed: a listing with no
+    // refs in it would have no element shape and would pass by saying nothing.
+    assert_eq!(live["totalCount"], json!(1), "{live}");
+
+    let differences = compare(captured, &live);
+    assert_declared("missing fields", &differences.missing, &[]);
+    assert_declared("added fields", &differences.added, &[]);
+    assert_declared("retyped fields", &differences.retyped, &[]);
+    assert_declared("uncompared arrays", &differences.uncompared, &[]);
+
+    client.close().await;
+    server.stop().await;
+}
+
 fn keys(value: &serde_json::Value) -> Vec<&str> {
     let mut keys: Vec<&str> = value
         .as_object()
@@ -587,6 +626,20 @@ fn the_captures_still_hold_what_conformance_is_checked_against() {
     assert_eq!(
         request_response.server_frame("Pong"),
         json!({"_tag": "Pong"})
+    );
+
+    let browser_session = Capture::load("01-browser-session");
+    assert_eq!(
+        browser_session.chunks_to("subscribeVcsStatus")[0]["values"][0]["_tag"],
+        "snapshot"
+    );
+    assert_eq!(
+        browser_session.response_to("vcs.listRefs")["exit"]["value"]["refs"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the branch listing is compared element by element; a capture with no refs \
+         in it would compare nothing"
     );
 
     let typed_error = Capture::load("03-typed-error");

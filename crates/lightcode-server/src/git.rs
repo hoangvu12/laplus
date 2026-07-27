@@ -169,15 +169,8 @@ impl StatusCall {
     pub fn read(payload: &Value, operation: &'static str) -> Result<StatusCall, Value> {
         let read: StatusPayload = serde_json::from_value(payload.clone())
             .map_err(|error| Unavailable::malformed(error).to_error(operation, ""))?;
-        let cwd = read.cwd.trim();
-        if cwd.is_empty() {
-            return Err(Unavailable::Unusable {
-                detail: "This call needs a workspace root; none was given.".to_string(),
-            }
-            .to_error(operation, ""));
-        }
         Ok(StatusCall {
-            cwd: cwd.to_string(),
+            cwd: workspace(&read.cwd).map_err(|why| why.to_error(operation, ""))?,
             operation,
         })
     }
@@ -237,7 +230,7 @@ struct Repository {
 
 impl Repository {
     fn path(&self) -> &Path {
-        Path::new(self.root.display())
+        self.root.path()
     }
 }
 
@@ -313,13 +306,29 @@ impl Repositories {
     /// told, so pressing refresh and watching the panel cannot disagree.
     pub fn refresh(&self, call: &StatusCall) -> Result<Value, Value> {
         let root = call.root()?;
-        let status = read(Path::new(root.display()))
+        let status = read(root.path())
             .map_err(|why| why.to_error(call.operation, &call.cwd))?;
 
         if let Some(repository) = self.inner.find(root.canonical()) {
             publish(&repository, &status);
         }
         Ok(status.to_result())
+    }
+
+    /// Say that something *this server* did has changed a working tree.
+    ///
+    /// The same door a file change comes through, opened from the inside. A
+    /// switch moves `HEAD` and an init makes a `.git`, and the watcher would
+    /// notice both eventually — but "eventually" is what makes "switch, then
+    /// read the panel" a race, and a call that knows it changed the tree has no
+    /// reason to wait to be told. A workspace nobody is keeping is nobody's
+    /// panel, so there is nothing to say and this does nothing.
+    ///
+    /// See ADR-0006 for why this marks rather than reads.
+    pub fn disturb(&self, root: &WorkspaceRoot) {
+        if let Some(repository) = self.inner.find(root.canonical()) {
+            mark_stale(&repository);
+        }
     }
 
     /// How many workspaces are having their status kept. The gauge that says a
@@ -541,8 +550,24 @@ pub enum Unavailable {
     },
 }
 
+/// The `cwd` every git-shaped call takes, trimmed.
+///
+/// One function rather than one per call site because the sentence is the same
+/// refusal every time, and a `cwd` of `""` is not merely useless — it means the
+/// *server process's* own directory to every path API there is, so letting one
+/// through would run git somewhere nobody asked about.
+pub(crate) fn workspace(raw: &str) -> Result<String, Unavailable> {
+    let cwd = raw.trim();
+    if cwd.is_empty() {
+        return Err(Unavailable::Unusable {
+            detail: "This call needs a workspace root; none was given.".to_string(),
+        });
+    }
+    Ok(cwd.to_string())
+}
+
 impl Unavailable {
-    fn malformed(error: serde_json::Error) -> Unavailable {
+    pub(crate) fn malformed(error: serde_json::Error) -> Unavailable {
         Unavailable::Unusable {
             detail: format!("This call is malformed: {error}"),
         }
@@ -633,7 +658,7 @@ pub fn output(root: &Path, arguments: &[&str]) -> Result<Output, Unavailable> {
 }
 
 /// Run one `git` and take its standard output as text, or say why not.
-fn text(root: &Path, arguments: &[&str]) -> Result<String, Unavailable> {
+pub(crate) fn text(root: &Path, arguments: &[&str]) -> Result<String, Unavailable> {
     let output = output(root, arguments)?;
     if !output.status.success() {
         return Err(refusal(&output));
@@ -641,15 +666,57 @@ fn text(root: &Path, arguments: &[&str]) -> Result<String, Unavailable> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn refusal(output: &Output) -> Unavailable {
+/// How many lines of git's own complaint are carried to the developer.
+///
+/// Whole lines rather than the first one, because the line a refused
+/// `git switch` is worth reading is its *last*: the first names the problem in
+/// the abstract, the middle ones name the files in the way, and the last says
+/// to commit or stash them. See ADR-0007. Bounded because a switch blocked by a
+/// thousand files would otherwise put a thousand paths in an error frame.
+const KEPT_LINES: usize = 20;
+
+/// And how much of them, for the case where the lines themselves are long —
+/// twenty paths on Windows can be twenty times two hundred and sixty
+/// characters.
+const KEPT_CHARACTERS: usize = 2_000;
+
+/// What git said when it would not do the thing.
+///
+/// Git's own words, because they are the only thing that says what is wrong:
+/// a repository mid-rebase, a version too old for an option, a switch that
+/// would overwrite work. Nothing here interprets them — [`is_not_a_repository`]
+/// is the single exception, and it exists because that one case is not a
+/// failure at all.
+pub(crate) fn refusal(output: &Output) -> Unavailable {
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut detail: String = stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .take(KEPT_LINES)
+        .collect::<Vec<&str>>()
+        .join("\n");
+    if detail.is_empty() {
+        detail = "git refused without saying why.".to_string();
+    }
+    if detail.chars().count() > KEPT_CHARACTERS {
+        detail = detail.chars().take(KEPT_CHARACTERS).collect::<String>() + "…";
+    }
     Unavailable::Refused {
-        detail: stderr
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("git refused without saying why.")
-            .to_string(),
+        detail,
         exit_code: output.status.code(),
+    }
+}
+
+/// Is this refusal the one that means "there is no repository here"?
+///
+/// The one place anything reads git's prose, and the reason [`output`] pins
+/// `LC_ALL=C`: a translated message would make every non-English machine report
+/// a perfectly ordinary folder as a broken repository.
+pub(crate) fn is_not_a_repository(refused: &Unavailable) -> bool {
+    match refused {
+        Unavailable::Refused { detail, .. } => detail.contains("not a git repository"),
+        _ => false,
     }
 }
 
@@ -800,10 +867,8 @@ fn read(root: &Path) -> Result<Status, Unavailable> {
     )?;
     if !porcelain.status.success() {
         let refused = refusal(&porcelain);
-        if let Unavailable::Refused { detail, .. } = &refused {
-            if detail.contains("not a git repository") {
-                return Ok(Status::not_a_repository());
-            }
+        if is_not_a_repository(&refused) {
+            return Ok(Status::not_a_repository());
         }
         return Err(refused);
     }
@@ -1151,7 +1216,7 @@ fn added_lines(path: &Path, budget: &mut u64) -> u64 {
 /// the contract's word and it has no configuration behind it in git — there is
 /// no such thing as a default remote for a repository, only a default for a
 /// branch — so this is the convention every git front end uses.
-fn primary_remote(root: &Path) -> Option<String> {
+pub(crate) fn primary_remote(root: &Path) -> Option<String> {
     let listed = text(root, &["remote"]).ok()?;
     let mut names = listed.lines().map(str::trim).filter(|name| !name.is_empty());
     let first = names.next()?.to_string();
@@ -1169,7 +1234,7 @@ fn primary_remote(root: &Path) -> Option<String> {
 /// the convention left, so whichever of `main` and `master` actually exists is
 /// taken, and a repository with neither has no default branch rather than a
 /// guessed one.
-fn default_ref(root: &Path, primary: Option<&str>) -> Option<String> {
+pub(crate) fn default_ref(root: &Path, primary: Option<&str>) -> Option<String> {
     if let Some(primary) = primary {
         if let Ok(pointed) = text(
             root,

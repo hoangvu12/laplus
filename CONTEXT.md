@@ -97,6 +97,33 @@ becomes one read.
 `crate::git::Repositories`. Bounded at the same number as watched workspaces,
 because a status that cannot be watched cannot stay true.
 
+**Disturb** — telling a kept working tree it is stale because *this server*
+just changed it, rather than waiting for the watcher to notice. What a switch
+and an init do. The same door a file change comes through, opened from the
+inside; see ADR-0006 for why it marks rather than reads.
+
+## Refs
+
+**Ref** — a branch, in the contract's word. The UI says `refName` everywhere
+because a git branch and a jj bookmark are the same field to it, and this
+server keeps the word rather than translating it back. `crate::refs`.
+
+Not every ref is a branch: a **remote ref** (`origin/main`) is a record of
+where a branch was on a remote, and is not something a working tree can be
+*on*. Switching to one means making the local branch that tracks it.
+
+**Current** — the ref this workspace has checked out. A property of a place,
+not of a repository: the same branch is current in one worktree and merely
+**checked out** in another, and only one of those can be switched away from.
+
+**Default ref** — what a repository considers its trunk: the remote's recorded
+`HEAD` if there is one, and otherwise whichever of `main` and `master` exists.
+A convention where git has no answer, never a guess where it has none.
+
+**Fold** — dropping a remote ref that has a local branch of the same name.
+`origin/main` beside `main` is a row that says nothing, so the picker does not
+show one unless the client asks (`includeMatchingRemoteRefs`).
+
 ## Terminal
 
 **Terminal** — one shell in a project's folder, named by the client and unique

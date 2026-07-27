@@ -1,6 +1,6 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Eighteen are implemented — the
+//! The vocabulary is roughly sixty methods. Twenty-two are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
 //! registry and starts a conversation, the subscription that *is* the project
@@ -8,9 +8,11 @@
 //! names on disk for the picker, the tree and the `@` mention, the two that open
 //! and save one of those files, the one that hands a file to the developer's
 //! own editor, the five that open a terminal, read it, type into it, resize
-//! it and list them, and the two that say what has changed in the working tree
-//! and keep saying it — and every other tag lands in the unknown-method path,
-//! which is itself part of the contract and is pinned by a capture.
+//! it and list them, the two that say what has changed in the working tree
+//! and keep saying it, and the four that list the branches, move between them,
+//! make one and make the repository a project has not got yet — and every other
+//! tag lands in the unknown-method path, which is itself part of the contract
+//! and is pinned by a capture.
 //!
 //! Nothing in a `Request` says whether the answer will be one value, a stream
 //! of them, or a value that is not ready yet; that is knowledge the method name
@@ -32,6 +34,7 @@ use crate::files::{self, ReadFile, WriteFile};
 use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::git::{self, Repositories, StatusCall};
 use crate::orchestration::{self, Shell};
+use crate::refs::{self, CreateRef, Init, ListRefs, SwitchRef};
 use crate::subscriptions::EventSource;
 use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
 use crate::threads;
@@ -353,6 +356,22 @@ pub fn dispatch(
                 Answer::Deferred(Deferred::new(move || repositories.refresh(&call)))
             })
             .map_err(DispatchError::Declared),
+        // The four branch methods. All of them run git and none of them
+        // streams, so all of them are deferred — and the three that change
+        // something take the registry with them, because a working tree they
+        // moved is one a panel is still describing from before.
+        refs::LIST_REFS => ListRefs::read(payload)
+            .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
+            .map_err(DispatchError::Declared),
+        refs::CREATE_REF => CreateRef::read(payload)
+            .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
+            .map_err(DispatchError::Declared),
+        refs::SWITCH_REF => SwitchRef::read(payload)
+            .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
+            .map_err(DispatchError::Declared),
+        refs::INIT => Init::read(payload)
+            .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
+            .map_err(DispatchError::Declared),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -368,6 +387,18 @@ fn deferred_with(
 ) -> Answer {
     let index = index.clone();
     Answer::Deferred(Deferred::new(move || work(&index)))
+}
+
+/// Defer work that changes a working tree the server is keeping a status for.
+///
+/// The registry outlives the call for the same reason the index does, and is
+/// cloned for the same reason.
+fn deferred_on(
+    repositories: &Repositories,
+    work: impl FnOnce(&Repositories) -> Result<Value, Value> + Send + 'static,
+) -> Answer {
+    let repositories = repositories.clone();
+    Answer::Deferred(Deferred::new(move || work(&repositories)))
 }
 
 #[cfg(test)]
