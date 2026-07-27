@@ -19,6 +19,95 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// What a call is correlated by, in the shape the client wrote it.
+///
+/// `effect/unstable/rpc` types this as `string | number` and means it: the
+/// client that produced `fixtures/socket-wire/` sent decimal strings, and
+/// clients built on `effect` 4.0.0-beta.102 send numbers. Ticket 33 is what
+/// happened when this was a `String` — a numeric id failed to decode, so the
+/// request was dropped as malformed and the UI waited forever for an `Exit`
+/// that was never coming.
+///
+/// Two properties, and the second is the one that is easy to miss:
+///
+/// - **Equality is by value, not by spelling.** `0` and `"0"` are one id, so a
+///   subscription opened with one can be acknowledged with the other. Nothing
+///   observed does that; answering the request a client *meant* is still better
+///   than answering neither.
+/// - **The spelling is preserved for the reply.** The client keys its in-flight
+///   calls by the id it sent, so an `Exit` carrying `"0"` for a request of `0`
+///   is one nothing is waiting for. What arrives is what goes back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestId {
+    Text(String),
+    Number(serde_json::Number),
+}
+
+impl RequestId {
+    /// The id as one canonical string — what equality, hashing and every log
+    /// line use, and the reason `0` and `"0"` cannot be told apart by anything
+    /// but serialization.
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            RequestId::Text(text) => std::borrow::Cow::Borrowed(text),
+            RequestId::Number(number) => std::borrow::Cow::Owned(number.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.key())
+    }
+}
+
+impl PartialEq for RequestId {
+    fn eq(&self, other: &RequestId) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for RequestId {}
+
+impl std::hash::Hash for RequestId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+/// So a test or a caller holding the captured spelling can compare without
+/// building one.
+impl PartialEq<str> for RequestId {
+    fn eq(&self, other: &str) -> bool {
+        self.key() == other
+    }
+}
+
+impl PartialEq<&str> for RequestId {
+    fn eq(&self, other: &&str) -> bool {
+        self.key() == *other
+    }
+}
+
+impl From<&str> for RequestId {
+    fn from(text: &str) -> RequestId {
+        RequestId::Text(text.to_string())
+    }
+}
+
+impl From<String> for RequestId {
+    fn from(text: String) -> RequestId {
+        RequestId::Text(text)
+    }
+}
+
+impl From<u64> for RequestId {
+    fn from(number: u64) -> RequestId {
+        RequestId::Number(number.into())
+    }
+}
+
 /// A message from the client.
 ///
 /// `_tag`-discriminated, like everything on this wire. An unrecognised tag
@@ -31,9 +120,9 @@ pub enum ClientMessage {
     /// Starts a call. Used identically for unary methods and for streaming
     /// subscriptions — nothing in the envelope distinguishes them.
     Request {
-        /// Client-assigned, a decimal string, unique within the connection.
-        /// Unary calls and subscriptions share one id space.
-        id: String,
+        /// Client-assigned, unique within the connection. Unary calls and
+        /// subscriptions share one id space.
+        id: RequestId,
         /// The method name, e.g. `server.getConfig`.
         tag: String,
         #[serde(default)]
@@ -44,12 +133,12 @@ pub enum ClientMessage {
     /// see `docs/socket-wire-format.md`.
     Ack {
         #[serde(rename = "requestId")]
-        request_id: String,
+        request_id: RequestId,
     },
     /// Cancels an in-flight call. This is how a subscription unsubscribes.
     Interrupt {
         #[serde(rename = "requestId")]
-        request_id: String,
+        request_id: RequestId,
     },
     /// Keepalive. The UI sends one every ~5 s.
     Ping,
@@ -75,7 +164,7 @@ pub enum ServerMessage {
     /// one, except the unknown-method case — see [`ServerMessage::Defect`].
     Exit {
         #[serde(rename = "requestId")]
-        request_id: String,
+        request_id: RequestId,
         exit: Exit,
     },
     /// One batch of stream values. `values` is non-empty and **does batch**;
@@ -86,7 +175,7 @@ pub enum ServerMessage {
     /// outstanding `Ack`.
     Chunk {
         #[serde(rename = "requestId")]
-        request_id: String,
+        request_id: RequestId,
         values: Vec<Value>,
     },
     /// A connection-level failure not attributable to a declared error type.
@@ -129,7 +218,7 @@ pub enum Cause {
 
 impl ServerMessage {
     /// A successful unary response.
-    pub fn success(request_id: impl Into<String>, value: Value) -> Self {
+    pub fn success(request_id: impl Into<RequestId>, value: Value) -> Self {
         ServerMessage::Exit {
             request_id: request_id.into(),
             exit: Exit::Success { value },
@@ -137,7 +226,7 @@ impl ServerMessage {
     }
 
     /// A typed-error response: `Exit`/`Failure` with a single `Fail` cause.
-    pub fn failure(request_id: impl Into<String>, error: Value) -> Self {
+    pub fn failure(request_id: impl Into<RequestId>, error: Value) -> Self {
         ServerMessage::Exit {
             request_id: request_id.into(),
             exit: Exit::Failure {
@@ -194,6 +283,72 @@ mod tests {
         let interrupt =
             ClientMessage::parse(r#"{"_tag":"Interrupt","requestId":"0"}"#).expect("parses");
         assert!(matches!(interrupt, ClientMessage::Interrupt { request_id } if request_id == "0"));
+    }
+
+    /// Ticket 33. Every capture in `fixtures/socket-wire/` has a string id
+    /// because the client that made them sent strings; `RequestId` in
+    /// `effect/unstable/rpc` is `string | number`, and current clients send
+    /// numbers. A server that took only the captured half answered nothing at
+    /// all — no `Exit`, no error, the request simply gone.
+    #[test]
+    fn a_request_id_may_be_a_number() {
+        let frame = r#"{"_tag":"Request","id":0,"tag":"server.getConfig","payload":{},"headers":[]}"#;
+
+        match ClientMessage::parse(frame).expect("parses") {
+            ClientMessage::Request { id, tag, .. } => {
+                assert_eq!(id, RequestId::from(0));
+                assert_eq!(tag, "server.getConfig");
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+
+        let ack = ClientMessage::parse(r#"{"_tag":"Ack","requestId":7}"#).expect("parses");
+        assert!(matches!(ack, ClientMessage::Ack { request_id } if request_id == RequestId::from(7)));
+
+        let interrupt =
+            ClientMessage::parse(r#"{"_tag":"Interrupt","requestId":7}"#).expect("parses");
+        assert!(
+            matches!(interrupt, ClientMessage::Interrupt { request_id } if request_id == RequestId::from(7))
+        );
+    }
+
+    /// Correlation is the whole job of this field, so two ids that differ only
+    /// in how they were written are one id. A client will not mix them; if one
+    /// did, answering the request it meant beats answering neither.
+    #[test]
+    fn the_same_id_written_two_ways_is_the_same_id() {
+        assert_eq!(RequestId::from(0), RequestId::from("0"));
+
+        let mut ids = std::collections::HashSet::new();
+        ids.insert(RequestId::from(0));
+        assert!(
+            ids.contains(&RequestId::from("0")),
+            "a map keyed by request id has to agree with equality"
+        );
+    }
+
+    /// The other half of ticket 33, and the half that is easy to miss: the
+    /// client keys its in-flight calls by the id it sent, so an answer of `"0"`
+    /// to a request of `0` is an answer nothing is waiting for.
+    #[test]
+    fn a_reply_carries_the_id_in_the_shape_it_arrived_in() {
+        assert_eq!(
+            ServerMessage::success(RequestId::from(0), json!({"ok": true})).to_frame(),
+            r#"{"_tag":"Exit","requestId":0,"exit":{"_tag":"Success","value":{"ok":true}}}"#
+        );
+        assert_eq!(
+            ServerMessage::success(RequestId::from("0"), json!({"ok": true})).to_frame(),
+            r#"{"_tag":"Exit","requestId":"0","exit":{"_tag":"Success","value":{"ok":true}}}"#
+        );
+
+        assert_eq!(
+            ServerMessage::Chunk {
+                request_id: RequestId::from(3),
+                values: vec![json!({"type": "snapshot"})],
+            }
+            .to_frame(),
+            r#"{"_tag":"Chunk","requestId":3,"values":[{"type":"snapshot"}]}"#
+        );
     }
 
     /// `Eof`, `ClientEnd` and `ClientProtocolError` are in the upstream

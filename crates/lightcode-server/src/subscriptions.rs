@@ -39,7 +39,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::wire::ServerMessage;
+use crate::wire::{RequestId, ServerMessage};
 
 /// How many published events a subscriber may fall behind before its backlog
 /// is thrown away and replaced with a fresh snapshot.
@@ -160,7 +160,7 @@ impl fmt::Debug for EventSource {
 /// the connection makes that the default rather than something to remember.
 #[derive(Debug)]
 pub struct Subscriptions {
-    open: HashMap<String, Open>,
+    open: HashMap<RequestId, Open>,
     live: Arc<AtomicUsize>,
     frames: mpsc::Sender<String>,
 }
@@ -193,7 +193,7 @@ impl Subscriptions {
     }
 
     /// Open a subscription under `request_id` and start streaming it.
-    pub async fn start(&mut self, request_id: String, source: EventSource) {
+    pub async fn start(&mut self, request_id: RequestId, source: EventSource) {
         let (acks, acknowledged) = mpsc::channel(1);
         let live = LiveSubscription::open(&self.live);
         let pump = tokio::spawn(pump(
@@ -221,7 +221,7 @@ impl Subscriptions {
     /// An acknowledgement for something that is not streaming is ignored, not
     /// an error: it can legitimately race the end of a stream, and the client
     /// has no way to know it lost.
-    pub fn acknowledge(&self, request_id: &str) {
+    pub fn acknowledge(&self, request_id: &RequestId) {
         if let Some(open) = self.open.get(request_id) {
             // One slot, because the pump only ever waits for one. A duplicate
             // acknowledgement has nowhere to go and is dropped rather than
@@ -234,7 +234,7 @@ impl Subscriptions {
     /// caller knows to write the terminal `Exit` — a cancelled unary call, or
     /// a cancellation that lost a race with the stream's own end, must not
     /// produce a second answer for the same id.
-    pub async fn interrupt(&mut self, request_id: &str) -> bool {
+    pub async fn interrupt(&mut self, request_id: &RequestId) -> bool {
         match self.open.remove(request_id) {
             Some(open) => {
                 open.stop().await;
@@ -279,7 +279,7 @@ impl Drop for Subscriptions {
 /// come from. Neither is an extra feature layered on top; they are the same
 /// property seen from two sides.
 async fn pump(
-    request_id: String,
+    request_id: RequestId,
     mut source: EventSource,
     frames: mpsc::Sender<String>,
     mut acknowledged: mpsc::Receiver<()>,
@@ -386,7 +386,7 @@ mod tests {
         let mut subscriptions = Subscriptions::new(Arc::clone(&live), frames);
 
         let (source, _) = counting_source(&updates);
-        subscriptions.start("0".to_string(), source).await;
+        subscriptions.start(RequestId::from("0"), source).await;
         assert_eq!(live.load(Ordering::Relaxed), 1);
 
         let snapshot = written.recv().await.expect("a snapshot chunk");
@@ -396,7 +396,7 @@ mod tests {
         let _ = updates.send(json!({"update": 1}));
         assert!(written.try_recv().is_err());
 
-        subscriptions.acknowledge("0");
+        subscriptions.acknowledge(&RequestId::from("0"));
         let update = written.recv().await.expect("the held update");
         assert_eq!(chunk_values(&update), vec![json!({"update": 1})]);
 
@@ -413,13 +413,13 @@ mod tests {
         let mut subscriptions = Subscriptions::new(Arc::new(AtomicUsize::new(0)), frames);
 
         let (source, _) = counting_source(&updates);
-        subscriptions.start("0".to_string(), source).await;
+        subscriptions.start(RequestId::from("0"), source).await;
         written.recv().await.expect("a snapshot chunk");
 
         for index in 0..3 {
             let _ = updates.send(json!({"update": index}));
         }
-        subscriptions.acknowledge("0");
+        subscriptions.acknowledge(&RequestId::from("0"));
 
         let batch = chunk_values(&written.recv().await.expect("a batch"));
         assert_eq!(
@@ -444,14 +444,14 @@ mod tests {
         let mut subscriptions = Subscriptions::new(Arc::new(AtomicUsize::new(0)), frames);
 
         let (source, resyncs) = counting_source(&updates);
-        subscriptions.start("0".to_string(), source).await;
+        subscriptions.start(RequestId::from("0"), source).await;
         written.recv().await.expect("a snapshot chunk");
         assert_eq!(resyncs.load(Ordering::Relaxed), 1);
 
         for index in 0..(BACKLOG * 2 + 1) {
             let _ = updates.send(json!({"update": index}));
         }
-        subscriptions.acknowledge("0");
+        subscriptions.acknowledge(&RequestId::from("0"));
 
         let resync = chunk_values(&written.recv().await.expect("a resynchronisation"));
         assert_eq!(resync, vec![json!({"snapshot": 1})]);
@@ -461,7 +461,7 @@ mod tests {
         // receiver is fast-forwarded to the oldest value it still holds, so a
         // resync that only re-describes the world would then deliver the very
         // events it was sent instead of.
-        subscriptions.acknowledge("0");
+        subscriptions.acknowledge(&RequestId::from("0"));
         let _ = updates.send(json!({"update": "after"}));
         let next = chunk_values(&written.recv().await.expect("the next update"));
         assert_eq!(
@@ -484,17 +484,17 @@ mod tests {
 
         for id in ["0", "1"] {
             let (source, _) = counting_source(&updates);
-            subscriptions.start(id.to_string(), source).await;
+            subscriptions.start(RequestId::from(id), source).await;
             written.recv().await.expect("a snapshot chunk");
         }
         assert_eq!(live.load(Ordering::Relaxed), 2);
 
-        assert!(subscriptions.interrupt("0").await);
+        assert!(subscriptions.interrupt(&RequestId::from("0")).await);
         assert_eq!(live.load(Ordering::Relaxed), 1);
         assert_eq!(subscriptions.len(), 1);
 
         // The survivor still streams, and the departed one no longer does.
-        subscriptions.acknowledge("1");
+        subscriptions.acknowledge(&RequestId::from("1"));
         let _ = updates.send(json!({"update": 0}));
         let held = written.recv().await.expect("the survivor's update");
         assert_eq!(chunk_values(&held), vec![json!({"update": 0})]);
@@ -511,8 +511,8 @@ mod tests {
         let (frames, _written) = mpsc::channel(BACKLOG);
         let mut subscriptions = Subscriptions::new(Arc::new(AtomicUsize::new(0)), frames);
 
-        subscriptions.acknowledge("41");
-        assert!(!subscriptions.interrupt("41").await);
+        subscriptions.acknowledge(&RequestId::from("41"));
+        assert!(!subscriptions.interrupt(&RequestId::from("41")).await);
         assert!(subscriptions.is_empty());
     }
 }

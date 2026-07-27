@@ -53,7 +53,7 @@ use crate::store::{Database, StorageError};
 use crate::subscriptions::Subscriptions;
 use crate::terminal::Terminals;
 use crate::ui::Assets;
-use crate::wire::{Cause, ClientMessage, Exit, ServerMessage};
+use crate::wire::{Cause, ClientMessage, Exit, RequestId, ServerMessage};
 use crate::{http, rpc};
 
 /// How many frames may be waiting for the socket before whoever produced them
@@ -591,7 +591,7 @@ impl Connection {
     ///
     /// The bound on all of that is [`crate::filesystem::MAX_ENTRIES`]: the work
     /// is finite whether or not anyone is still listening.
-    fn defer(&self, request_id: String, work: Deferred) {
+    fn defer(&self, request_id: RequestId, work: Deferred) {
         let frames = self.frames.clone();
         tokio::task::spawn_blocking(move || {
             let message = match work.run() {

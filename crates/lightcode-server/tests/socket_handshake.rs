@@ -381,6 +381,87 @@ async fn the_upgrade_declines_compression_and_negotiates_no_subprotocol() {
     server.stop().await;
 }
 
+/// Ticket 33, at the boundary rather than at the type. Every capture in
+/// `fixtures/socket-wire/` has a string request id, so a server written from
+/// them alone requires one — and a current Effect client sends numbers, which
+/// this server dropped as malformed. The symptom was the worst kind: no error,
+/// no `Exit`, a UI holding an open socket and waiting forever.
+#[tokio::test]
+async fn a_request_whose_id_is_a_number_is_answered() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    client
+        .send(json!({
+            "_tag": "Request",
+            "id": 0,
+            "tag": "server.getConfig",
+            "payload": {},
+            "headers": [],
+        }))
+        .await;
+    let frame = client.recv().await;
+
+    assert_eq!(frame["_tag"], json!("Exit"), "{frame}");
+    assert!(
+        frame["exit"]["value"]["environment"].is_object(),
+        "a numeric id should be answered with the same config as a string one: {frame}"
+    );
+    // The client keys its in-flight calls by the id it sent, so `"0"` here
+    // would be an answer nothing is waiting for — the same silence, later.
+    assert_eq!(
+        frame["requestId"],
+        json!(0),
+        "the id has to come back the way it was sent: {frame}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// The streaming half of the same: a subscription opened with a numeric id has
+/// to be one that `Ack` and `Interrupt` can name.
+#[tokio::test]
+async fn a_subscription_opened_with_a_numeric_id_can_be_fed_and_cancelled() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    client
+        .send(json!({
+            "_tag": "Request",
+            "id": 4,
+            "tag": "subscribeServerConfig",
+            "payload": {},
+            "headers": [],
+        }))
+        .await;
+
+    let snapshot = client.recv().await;
+    assert_eq!(snapshot["_tag"], json!("Chunk"), "{snapshot}");
+    assert_eq!(snapshot["requestId"], json!(4), "{snapshot}");
+
+    // An `Ack` the registry cannot match is a stream that stops after one
+    // chunk, which is ticket 28's shape of bug and invisible from here — so
+    // this asserts on the cancellation, which the acknowledged stream must
+    // still be alive to report.
+    client.send(json!({"_tag": "Ack", "requestId": 4})).await;
+    client
+        .send(json!({"_tag": "Interrupt", "requestId": 4}))
+        .await;
+
+    let exit = client.recv().await;
+    assert_eq!(exit["_tag"], json!("Exit"), "{exit}");
+    assert_eq!(exit["requestId"], json!(4), "{exit}");
+    assert_eq!(
+        exit["exit"]["cause"][0]["_tag"],
+        json!("Interrupt"),
+        "a cancelled subscription ends as an interrupt: {exit}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
 /// Shutting the server down closes open sockets rather than waiting on them.
 /// Without this the Tauri shell would hang on quit whenever the webview still
 /// held a connection — which is always.
