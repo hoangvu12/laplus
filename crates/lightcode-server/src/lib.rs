@@ -23,9 +23,11 @@
 //! [`filesystem`] enumerates names on disk for the folder picker, the file
 //! tree and the search behind them, [`watcher`] tells it when something it has
 //! already enumerated has changed underneath, [`files`] opens and saves what
-//! those names point at, [`editor`] hands one to the developer's own editor,
-//! [`provider`] finds the agent binary and reports what it found, [`process`]
-//! is how all three of those start a program and where they look for one,
+//! those names point at, [`git`] says which of them have changed and keeps
+//! saying it while the agent works, [`editor`] hands one to the developer's
+//! own editor, [`provider`] finds the agent binary and reports what it found,
+//! [`process`] is how all four of those start a program and where they look
+//! for one,
 //! [`terminal`] runs a shell in a project's folder and pipes it to the pane the
 //! developer typed into, and [`server`] is the endpoint and the connection loop
 //! that ties them together.
@@ -55,6 +57,7 @@ pub mod config_store;
 pub mod editor;
 pub mod files;
 pub mod filesystem;
+pub mod git;
 pub mod http;
 pub mod orchestration;
 pub mod process;

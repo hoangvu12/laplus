@@ -600,7 +600,7 @@ fn normalise_query(query: &str) -> String {
 /// caller who actually needs it. **That is where the coalescing comes from**:
 /// a thousand changes and one search cost one scan, however fast the thousand
 /// arrived, because forgetting something that is already forgotten is free.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Index {
     /// Keyed by [`WorkspaceRoot::canonical`], so two spellings of one folder
     /// share a scan rather than each paying for their own.
@@ -609,10 +609,21 @@ pub struct Index {
     /// on `scans` and nothing on the `Index` itself, so the two do not keep
     /// each other alive.
     watcher: Watcher,
+    /// Everything else that wants to hear about a change — [`crate::git`] is
+    /// the only one. See [`Index::on_change`].
+    listeners: Listeners,
 }
 
 /// The last scan of each workspace, shared with the watcher's callback.
 type Scans = Arc<Mutex<HashMap<String, Arc<Listing>>>>;
+
+/// Something other than the scans that wants to hear about a change. The
+/// arguments are [`crate::watcher`]'s: the workspace's key, and the changed path
+/// relative to its root.
+type Listener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// What else the one watcher tells, beyond the scans it was built for.
+type Listeners = Arc<Mutex<Vec<Listener>>>;
 
 impl Default for Index {
     fn default() -> Index {
@@ -620,14 +631,68 @@ impl Default for Index {
     }
 }
 
+impl std::fmt::Debug for Index {
+    /// The counts rather than the contents, and by hand because a listener is a
+    /// closure and closures have no `Debug`. What is printed is the same
+    /// judgement [`Watcher`]'s own `Debug` makes: this reaches every dispatch
+    /// trace through [`crate::rpc::Services`], and the developer's project
+    /// directories are not something to scatter through a log.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Index")
+            .field("scans", &lock(&self.scans).len())
+            .field("watcher", &self.watcher)
+            .field("listeners", &lock_listeners(&self.listeners).len())
+            .finish()
+    }
+}
+
 impl Index {
     pub fn new() -> Index {
         let scans = Scans::default();
+        let listeners = Listeners::default();
         let held = Arc::clone(&scans);
+        let told = Arc::clone(&listeners);
         Index {
-            watcher: Watcher::new(move |key: &str, relative: &str| changed(&held, key, relative)),
+            watcher: Watcher::new(move |key: &str, relative: &str| {
+                changed(&held, key, relative);
+                for listener in lock_listeners(&told).iter() {
+                    listener(key, relative);
+                }
+            }),
             scans,
+            listeners,
         }
+    }
+
+    /// Tell `listener` about every change the one watcher reports, alongside
+    /// the scans it was built for.
+    ///
+    /// There is a single [`Watcher`] in the process on purpose — see that
+    /// module's first section — so a second subsystem that needs to hear about
+    /// changes registers here rather than starting a watcher of its own, which
+    /// would double the handles held on every workspace to hear the same
+    /// events twice.
+    ///
+    /// **A listener must not reach back into this index**, because it is
+    /// called with the listener registry held. Registration happens once at
+    /// startup and the list is read on every event, so cloning it per event
+    /// would be an allocation on the busiest path there is.
+    pub fn on_change(&self, listener: impl Fn(&str, &str) + Send + Sync + 'static) {
+        lock_listeners(&self.listeners).push(Arc::new(listener));
+    }
+
+    /// Watch a workspace without scanning it.
+    ///
+    /// [`Index::rescan`] is the usual way a workspace comes to be watched, and
+    /// it watches because it has a scan to keep fresh. A subscriber to
+    /// something *other* than the file tree — [`crate::git`] — has its own
+    /// reason to want the events and no scan to go with it, so it says so
+    /// here. Idempotent, and it counts as a use for the eviction order the
+    /// same way a listing does.
+    pub fn observe(&self, root: &WorkspaceRoot) {
+        self.watcher
+            .watch(root.canonical(), Path::new(root.display()));
     }
 
     /// Scan now, keep the result, and watch the workspace it came from.
@@ -724,6 +789,15 @@ fn changed(scans: &Scans, key: &str, relative: &str) {
 /// the same reasoning, and the same choice, as [`crate::watcher`]'s own lock.
 fn lock(scans: &Scans) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Listing>>> {
     scans.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The same tolerance for the listener registry, and for the same reason: a
+/// `Vec` is not left half-written by a panic, and refusing to read it again
+/// would silently stop git status refreshing for the rest of the session.
+fn lock_listeners(listeners: &Listeners) -> std::sync::MutexGuard<'_, Vec<Listener>> {
+    listeners
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// What a workspace holds, as the file tree reads it.
@@ -889,10 +963,14 @@ fn tracked(root: &Path) -> Option<Vec<String>> {
 }
 
 /// Run one `git` and take its output, or `None` if it did not succeed.
+///
+/// The spawning itself is [`crate::git::output`], which is where the flags
+/// every `git` this server runs needs — no console window, no optional locks,
+/// untranslated messages — are decided once. Here the *reason* a call did not
+/// answer is genuinely not wanted: git absent and this folder not being a
+/// repository lead to the same fallback walk.
 fn git(root: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
-    let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(root).args(arguments);
-    let output = crate::process::without_a_console(&mut command).output().ok()?;
+    let output = crate::git::output(root, arguments).ok()?;
     output.status.success().then_some(output.stdout)
 }
 

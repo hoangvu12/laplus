@@ -75,6 +75,28 @@ authoritative and replaces the accumulation. Whether the two agreed is recorded.
 **Join** — a place where the agent protocol and the contract meet. `crate::turn`
 is the declared one; `crate::worklog` is a second.
 
+## Working tree
+
+**Working tree status** — what has changed in a project's folder, as the UI
+reads it: the branch, the changed files with their line counts, and how the
+branch stands against its tracking ref. `crate::git`. The contract calls the two
+halves **local** and **remote**; here they are read together, because neither
+costs a network.
+
+**Read** — running git and turning what it says into a status. The unit of work
+this subsystem does; everything else is about when to do one.
+
+**Stale** — a working tree that has changed since the last read started. What a
+file change produces; a read is what clears it. The distinction is load-bearing
+— see ADR-0006.
+
+**Coalescing window** — the pause before each read, in which a burst of changes
+becomes one read.
+
+**Kept** — a working tree the server is holding a status for and watching.
+`crate::git::Repositories`. Bounded at the same number as watched workspaces,
+because a status that cannot be watched cannot stay true.
+
 ## Terminal
 
 **Terminal** — one shell in a project's folder, named by the client and unique

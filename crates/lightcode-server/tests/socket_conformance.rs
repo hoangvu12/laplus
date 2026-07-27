@@ -353,6 +353,71 @@ async fn the_config_snapshot_chunk_conforms_to_the_capture() {
     server.stop().await;
 }
 
+/// Divergences in the working tree status snapshot. Both are ticket 19's, and
+/// both are named in `lightcode_server::git`.
+const STATUS_MISSING: &[Declared] = &[Declared {
+    path: "/local/sourceControlProvider",
+    because: "source-control hosting is out of v1's scope, and this field is a \
+              label derived from the remote's URL for GitHub, GitLab and the \
+              rest. The contract makes it optional.",
+}];
+
+const STATUS_RETYPED: &[Declared] = &[Declared {
+    path: "/remote",
+    because: "the reference server's remote half costs a network round trip, so \
+              it sends the snapshot with a null remote and follows with a \
+              remoteUpdated. lightcode's ahead/behind come from the tracking \
+              ref, which is local and read at the same instant as the rest — so \
+              there is nothing to follow with and the snapshot carries it.",
+}];
+
+const STATUS_UNCOMPARED: &[Declared] = &[Declared {
+    path: "/local/workingTree/files[]",
+    because: "the captured repository was clean, so its file list is empty and \
+              has no element shape to compare against.",
+}];
+
+/// The `subscribeVcsStatus` snapshot, against the one the reference server
+/// pushed to the real UI during its boot sequence.
+///
+/// This is the only capture of a working tree status there is, which makes it
+/// the only external check that ticket 19's payload is one the UI can decode.
+/// The repository is this test's own, so what is compared is shape.
+#[tokio::test]
+async fn the_working_tree_status_snapshot_conforms_to_the_capture() {
+    let capture = Capture::load("01-browser-session");
+    let chunks = capture.chunks_to("subscribeVcsStatus");
+    let captured = &chunks[0]["values"][0];
+    assert_eq!(captured["_tag"], json!("snapshot"));
+
+    let workspace = harness::workspace::Workspace::with(&["src/main.rs"]);
+    workspace.init_repository().commit("first");
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    let subscription = client
+        .subscribe("subscribeVcsStatus", json!({"cwd": workspace.cwd()}))
+        .await;
+    let live = client.next_event(&subscription).await;
+
+    // The client dispatches the stream's events on `_tag`, so the envelope has
+    // to match before anything inside it is worth comparing.
+    assert_eq!(live["_tag"], captured["_tag"]);
+    assert_eq!(keys(&live), keys(captured));
+
+    let differences = compare(captured, &live);
+    assert_declared("missing fields", &differences.missing, STATUS_MISSING);
+    assert_declared("added fields", &differences.added, &[]);
+    assert_declared("retyped fields", &differences.retyped, STATUS_RETYPED);
+    assert_declared(
+        "uncompared arrays",
+        &differences.uncompared,
+        STATUS_UNCOMPARED,
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
 fn keys(value: &serde_json::Value) -> Vec<&str> {
     let mut keys: Vec<&str> = value
         .as_object()

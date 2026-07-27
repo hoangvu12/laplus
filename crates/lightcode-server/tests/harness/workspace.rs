@@ -65,17 +65,65 @@ impl Workspace {
     /// Make this workspace a git repository.
     ///
     /// The scan asks git what is in a project, so a test about ignore
-    /// semantics has to have one. Not skippable: the spec commits to shelling
-    /// out to `git`, so a machine without it cannot run this suite anyway.
+    /// semantics has to have one, and so does every test about status. Not
+    /// skippable: the spec commits to shelling out to `git`, so a machine
+    /// without it cannot run this suite anyway.
+    ///
+    /// Four things are pinned rather than inherited from the machine, because
+    /// each of them is something a developer's own global configuration can set
+    /// and each would change what a test observes:
+    ///
+    /// - **the initial branch**, so a test may assert a branch by name;
+    /// - **an identity**, without which `git commit` refuses;
+    /// - **no signing**, because a machine configured to sign every commit
+    ///   would prompt for a key inside a test;
+    /// - **no line-ending translation**, because a status counts lines and
+    ///   `core.autocrlf` changes how many there are.
     pub fn init_repository(&self) -> &Workspace {
-        let output = std::process::Command::new("git")
+        self.git(&["init", "-b", "main"]);
+        self.git(&["config", "user.name", "lightcode tests"]);
+        self.git(&["config", "user.email", "tests@lightcode.invalid"]);
+        self.git(&["config", "commit.gpgsign", "false"]);
+        self.git(&["config", "core.autocrlf", "false"]);
+        self
+    }
+
+    /// Run one `git` in this workspace, failing the test if it refuses.
+    pub fn git(&self, arguments: &[&str]) -> String {
+        let output = self.try_git(arguments);
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Run one `git` and hand back whatever happened.
+    ///
+    /// For the commands a test *wants* to fail: a merge that conflicts is how a
+    /// repository is put into the mid-merge state, and it exits non-zero when it
+    /// works.
+    pub fn try_git(&self, arguments: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
             .arg("-C")
             .arg(self.path())
-            .arg("init")
+            .args(arguments)
             .output()
-            .expect("git runs");
-        assert!(output.status.success(), "git init failed");
+            .expect("git runs")
+    }
+
+    /// Commit everything in the workspace. The thing a status is measured
+    /// against.
+    pub fn commit(&self, message: &str) -> &Workspace {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-m", message]);
         self
+    }
+
+    /// Delete a file, the way a developer or an agent would.
+    pub fn remove(&self, path: &str) {
+        std::fs::remove_file(self.path().join(path)).expect("removes the file");
     }
 }
 

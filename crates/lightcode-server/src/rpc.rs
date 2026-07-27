@@ -1,14 +1,15 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Sixteen are implemented — the
+//! The vocabulary is roughly sixty methods. Eighteen are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
 //! registry and starts a conversation, the subscription that *is* the project
 //! list, the subscription that *is* one conversation, the three that enumerate
 //! names on disk for the picker, the tree and the `@` mention, the two that open
 //! and save one of those files, the one that hands a file to the developer's
-//! own editor, and the five that open a terminal, read it, type into it, resize
-//! it and list them — and every other tag lands in the unknown-method path,
+//! own editor, the five that open a terminal, read it, type into it, resize
+//! it and list them, and the two that say what has changed in the working tree
+//! and keep saying it — and every other tag lands in the unknown-method path,
 //! which is itself part of the contract and is pinned by a capture.
 //!
 //! Nothing in a `Request` says whether the answer will be one value, a stream
@@ -29,6 +30,7 @@ use crate::config_store::ConfigStore;
 use crate::editor::{self, OpenInEditor};
 use crate::files::{self, ReadFile, WriteFile};
 use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
+use crate::git::{self, Repositories, StatusCall};
 use crate::orchestration::{self, Shell};
 use crate::subscriptions::EventSource;
 use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
@@ -88,6 +90,11 @@ pub struct Services {
     /// opened it, so a per-connection registry would kill a build every time
     /// the socket blinked.
     pub terminals: Terminals,
+    /// The working trees whose status is being kept. Shared for the reason the
+    /// index is — two windows on one project are looking at one working tree —
+    /// and built from the index, because the watcher that keeps a status honest
+    /// is the same one that keeps a listing honest.
+    pub repositories: Repositories,
 }
 
 /// What a method answers with.
@@ -331,6 +338,21 @@ pub fn dispatch(
         // The payload is an empty struct in the contract, like the
         // configuration subscription's.
         terminal::SUBSCRIBE_METADATA => Ok(Answer::Stream(services.terminals.subscribe_metadata())),
+        // The status subscription answers from the read loop because it does
+        // not run git: it describes itself from the last read and the reading
+        // happens elsewhere. See [`crate::git`].
+        git::SUBSCRIBE_STATUS => StatusCall::read(payload, git::SUBSCRIBE_STATUS)
+            .and_then(|call| services.repositories.subscribe(&call))
+            .map(Answer::Stream)
+            .map_err(DispatchError::Declared),
+        // Asking for one *does* run git, which on a large repository is the
+        // longest wait any method here has.
+        git::REFRESH_STATUS => StatusCall::read(payload, git::REFRESH_STATUS)
+            .map(|call| {
+                let repositories = services.repositories.clone();
+                Answer::Deferred(Deferred::new(move || repositories.refresh(&call)))
+            })
+            .map_err(DispatchError::Declared),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -356,10 +378,12 @@ mod tests {
     use serde_json::json;
 
     fn services() -> Services {
+        let index = Index::new();
         Services {
             config: ConfigStore::new(ServerConfig::detect()),
             shell: Shell::new(Database::in_memory().expect("an in-memory database")),
-            index: Index::new(),
+            repositories: Repositories::new(&index),
+            index,
             terminals: Terminals::new(),
         }
     }
