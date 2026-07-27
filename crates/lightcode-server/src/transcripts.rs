@@ -94,6 +94,16 @@ pub enum Write {
         thread_id: String,
         session_id: String,
     },
+    /// What the working tree looked like when a turn finished.
+    ///
+    /// Stored because the *ref* it names outlives the process: the tree is in
+    /// the developer's own repository, so a conversation that came back from a
+    /// restart without its checkpoints would be one whose diffs exist and
+    /// cannot be found. Boxed for the reason [`Write::Thread`] is.
+    Checkpoint {
+        thread_id: String,
+        checkpoint: Box<crate::threads::Checkpoint>,
+    },
 }
 
 impl Write {
@@ -103,7 +113,8 @@ impl Write {
             Write::Thread(thread) => &thread.id,
             Write::Message { thread_id, .. }
             | Write::Activity { thread_id, .. }
-            | Write::AgentSession { thread_id, .. } => thread_id,
+            | Write::AgentSession { thread_id, .. }
+            | Write::Checkpoint { thread_id, .. } => thread_id,
         }
     }
 }

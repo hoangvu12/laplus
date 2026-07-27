@@ -102,6 +102,37 @@ just changed it, rather than waiting for the watcher to notice. What a switch
 and an init do. The same door a file change comes through, opened from the
 inside; see ADR-0006 for why it marks rather than reads.
 
+## Review
+
+**Checkpoint** — what a project's working tree looked like at one turn boundary,
+kept as a parentless commit under a ref of the project's own repository.
+`crate::checkpoints`. The contract's word, and the thing that makes a turn a
+point in time a diff can run to.
+
+**Baseline** — the checkpoint a turn is diffed *from*: the one taken before the
+prompt reached the agent. Turn one's baseline is turn count zero; every later
+turn's baseline is the checkpoint the turn before it ended with, which is what
+makes a conversation's checkpoints a chain rather than a set of pairs.
+
+**Turn count** — how many turns of a conversation have been recorded. Also the
+name of the checkpoint that recorded the last of them, so a turn's diff runs
+from `n - 1` to `n` and a whole conversation's from `0` to `n`.
+
+**Turn diff** and **thread diff** — one step in isolation, and the session as one
+coherent change. Two methods over one range: a thread diff is a turn diff whose
+`fromTurnCount` is zero.
+
+A checkpoint is a *photograph*, not a record of authorship — see ADR-0008. It
+does not know who changed a file, so an edit the developer made by hand between
+two turns belongs to the turn it happened during, beside the agent's own.
+
+**Checkpoint status** — how the turn a checkpoint records *went*, not whether
+recording it worked. The contract's three (`ready`, `missing`, `error`), of which
+this server sends two: the client reads the status back into the turn's state, so
+a status that disagreed with how the turn ended would relabel it. There is none
+that means interrupted, which is why a turn the developer stopped gets no
+checkpoint. `crate::turn::Ending::checkpoint_status`.
+
 ## Refs
 
 **Ref** — a branch, in the contract's word. The UI says `refName` everywhere

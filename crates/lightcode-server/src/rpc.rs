@@ -1,6 +1,6 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Twenty-two are implemented — the
+//! The vocabulary is roughly sixty methods. Twenty-four are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
 //! registry and starts a conversation, the subscription that *is* the project
@@ -9,10 +9,11 @@
 //! and save one of those files, the one that hands a file to the developer's
 //! own editor, the five that open a terminal, read it, type into it, resize
 //! it and list them, the two that say what has changed in the working tree
-//! and keep saying it, and the four that list the branches, move between them,
-//! make one and make the repository a project has not got yet — and every other
-//! tag lands in the unknown-method path, which is itself part of the contract
-//! and is pinned by a capture.
+//! and keep saying it, the four that list the branches, move between them,
+//! make one and make the repository a project has not got yet, and the two that
+//! read one turn and a whole conversation back as a diff — and every other tag
+//! lands in the unknown-method path, which is itself part of the contract and is
+//! pinned by a capture.
 //!
 //! Nothing in a `Request` says whether the answer will be one value, a stream
 //! of them, or a value that is not ready yet; that is knowledge the method name
@@ -28,6 +29,7 @@ use std::fmt;
 
 use serde_json::Value;
 
+use crate::checkpoints::{self, Diff};
 use crate::config_store::ConfigStore;
 use crate::editor::{self, OpenInEditor};
 use crate::files::{self, ReadFile, WriteFile};
@@ -372,6 +374,16 @@ pub fn dispatch(
         refs::INIT => Init::read(payload)
             .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
             .map_err(DispatchError::Declared),
+        // The two diffs. Both run git over a range of the developer's own
+        // history, so both are deferred; both take the registry with them,
+        // because a diff is asked for by thread and has to be run in the folder
+        // that thread's project is.
+        checkpoints::GET_TURN_DIFF => Diff::read_turn(payload)
+            .map(|call| deferred_in(&services.shell, |shell| call.run(shell)))
+            .map_err(DispatchError::Declared),
+        checkpoints::GET_FULL_THREAD_DIFF => Diff::read_thread(payload)
+            .map(|call| deferred_in(&services.shell, |shell| call.run(shell)))
+            .map_err(DispatchError::Declared),
         unknown => Err(DispatchError::UnknownMethod(unknown.to_string())),
     }
 }
@@ -399,6 +411,19 @@ fn deferred_on(
 ) -> Answer {
     let repositories = repositories.clone();
     Answer::Deferred(Deferred::new(move || work(&repositories)))
+}
+
+/// Defer work that has to find out which project a conversation is in.
+///
+/// The third of the same family, and cloned for the same reason: the registry
+/// outlives the call, and the deferred task cannot hold a borrow of
+/// [`Services`].
+fn deferred_in(
+    shell: &Shell,
+    work: impl FnOnce(&Shell) -> Result<Value, Value> + Send + 'static,
+) -> Answer {
+    let shell = shell.clone();
+    Answer::Deferred(Deferred::new(move || work(&shell)))
 }
 
 #[cfg(test)]
@@ -585,19 +610,69 @@ mod tests {
     #[test]
     fn an_unknown_tag_becomes_a_typed_error_naming_the_method() {
         let services = services();
-        let error = dispatch(&services, "orchestration.getTurnDiff", &json!({}))
+        let error = dispatch(&services, "orchestration.replayEvents", &json!({}))
             .expect_err("not implemented");
         assert_eq!(
             error,
-            DispatchError::UnknownMethod("orchestration.getTurnDiff".to_string())
+            DispatchError::UnknownMethod("orchestration.replayEvents".to_string())
         );
 
         let payload = error.to_error();
         assert_eq!(payload["_tag"], "ServerMethodNotImplementedError");
-        assert_eq!(payload["method"], "orchestration.getTurnDiff");
+        assert_eq!(payload["method"], "orchestration.replayEvents");
         assert!(payload["message"]
             .as_str()
             .expect("a message")
-            .contains("orchestration.getTurnDiff"));
+            .contains("orchestration.replayEvents"));
+    }
+
+    /// Both diffs run git over a range of the developer's history, so neither
+    /// may be answered where the socket's only reader is waiting for it.
+    #[test]
+    fn the_diff_methods_answer_with_deferred_work() {
+        let services = services();
+        let asked = json!({
+            "threadId": "thread-1",
+            "fromTurnCount": 0,
+            "toTurnCount": 1,
+        });
+
+        for tag in [checkpoints::GET_TURN_DIFF, checkpoints::GET_FULL_THREAD_DIFF] {
+            let answer = dispatch(&services, tag, &asked).expect("dispatches");
+            assert!(matches!(answer, Answer::Deferred(_)), "{tag} answered inline");
+        }
+    }
+
+    /// A diff for a conversation this server has never heard of is refused under
+    /// the asking method's own tag — the client decodes each against a union of
+    /// one, so the other method's error would cost the call rather than show the
+    /// sentence.
+    #[test]
+    fn a_diff_of_an_unknown_conversation_fails_with_the_methods_own_error() {
+        let services = services();
+        let asked = json!({
+            "threadId": "thread-1",
+            "fromTurnCount": 0,
+            "toTurnCount": 1,
+        });
+
+        for (tag, expected) in [
+            (
+                checkpoints::GET_TURN_DIFF,
+                "OrchestrationGetTurnDiffError",
+            ),
+            (
+                checkpoints::GET_FULL_THREAD_DIFF,
+                "OrchestrationGetFullThreadDiffError",
+            ),
+        ] {
+            let answer = dispatch(&services, tag, &asked).expect("dispatches");
+            let Answer::Deferred(work) = answer else {
+                panic!("{tag} answered inline");
+            };
+            let error = work.run().expect_err("a refusal");
+            assert_eq!(error["_tag"], expected, "{tag}");
+            assert!(error["message"].is_string(), "{tag}: {error}");
+        }
     }
 }

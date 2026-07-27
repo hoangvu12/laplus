@@ -152,6 +152,21 @@ enum Command {
     RespondToApproval(RespondToApproval),
 }
 
+/// Everything a diff of a conversation needs that is not about git.
+///
+/// See [`Shell::reviewing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reviewing {
+    /// The folder the agent was working in, and therefore the repository the
+    /// checkpoints were written into.
+    pub workspace_root: String,
+    /// The highest turn count this conversation has a checkpoint for. Zero when
+    /// it has none, which is also the baseline's own count — so "nothing has
+    /// been recorded" and "only the baseline has" read the same, and both mean
+    /// there is no turn to diff.
+    pub checkpoints: u64,
+}
+
 /// A command that was not carried out, as the client will read it.
 ///
 /// The contract's `OrchestrationDispatchCommandError` carries a message and
@@ -234,6 +249,37 @@ impl Shell {
     /// way the shell itself is.
     pub fn threads(&self) -> &Threads {
         &self.inner.threads
+    }
+
+    /// Where a conversation's checkpoints are, and how far they go.
+    ///
+    /// The one thing [`crate::checkpoints`] cannot work out for itself: a diff
+    /// is asked for by thread and has to be run in a *folder*, and the folder is
+    /// the project's, which only the registry knows. Both halves are read here
+    /// so the answer cannot be assembled from two moments — a thread whose
+    /// project was deleted between them would be a diff run somewhere else.
+    ///
+    /// Answers from memory. The conversations are already open and the projects
+    /// are a single row, so this is cheap enough to be called from the deferred
+    /// work rather than needing a moment of its own.
+    pub fn reviewing(&self, thread_id: &str) -> Result<Reviewing, CommandError> {
+        let thread = self.open_thread(thread_id)?;
+        let project = self.project(&thread.project_id)?;
+        Ok(Reviewing {
+            // The worktree when the conversation has one, the project's folder
+            // otherwise — the same rule [`crate::turn::starting`] follows for
+            // where the agent runs, and it has to be, because the tree a
+            // checkpoint recorded is the tree the agent was working in.
+            workspace_root: thread
+                .worktree_path
+                .clone()
+                .unwrap_or(project.workspace_root),
+            // Asked of the registry rather than folded out of the copy above,
+            // so that "how far has this conversation been recorded" has one
+            // answer — the same one the driver uses to decide what the next
+            // checkpoint is called.
+            checkpoints: self.inner.threads.checkpoint_count(thread_id),
+        })
     }
 
     /// Wait until every change made so far is on disk.
@@ -830,6 +876,7 @@ impl CreateThread {
             created_at,
             messages: Vec::new(),
             activities: Vec::new(),
+            checkpoints: Vec::new(),
             session: None,
             latest_turn: None,
             latest_user_message_at: None,

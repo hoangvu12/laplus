@@ -144,6 +144,34 @@ pub const PAUSE: &str = "<pause>";
 /// recorded behaviour being replayed.
 pub const AWAIT_ANSWER: &str = "<answer>";
 
+/// A place where the agent *changes the project*, the way a real one does when
+/// it edits a file.
+///
+/// Ticket 20's, and it is the only marker here that is not a stop: everything
+/// else a script can do is talk, and a diff of a turn that only talked is empty
+/// by definition. Built with [`writes`] and [`deletes`] rather than written
+/// literally, because a marker carries a path and a file's contents.
+///
+/// The path is **relative**, so it lands wherever the agent was started — which
+/// is the project's own folder, for the same reason
+/// [`WORKING_DIRECTORY_MARKER`] does. Directories are made as needed.
+const WRITES: &str = "<writes>";
+const DELETES: &str = "<deletes>";
+
+/// The field separator inside a [`WRITES`] marker. A control character, so that
+/// nothing a test would put in a path or a file collides with it.
+const FIELD: char = '\u{1}';
+
+/// A script line that has the agent create or overwrite a file mid-turn.
+pub fn writes(path: &str, contents: &str) -> String {
+    format!("{WRITES}{path}{FIELD}{contents}")
+}
+
+/// A script line that has the agent delete a file mid-turn.
+pub fn deletes(path: &str) -> String {
+    format!("{DELETES}{path}")
+}
+
 /// A place where the agent stops being a process at all: it complains on stderr
 /// and exits, in the middle of whatever it was saying.
 ///
@@ -287,6 +315,16 @@ impl ScriptedAgent {
                 text.push('\n');
                 std::fs::write(agent.directory.path().join(segment_name(turn, index)), text)
                     .expect("writes a script segment");
+                // What the agent will copy into the project when it reaches this
+                // segment. Beside the script and named after the segment, so the
+                // script needs nothing but `%~dp0` to find it.
+                if let Some(Stop::Write { contents, .. }) = &segment.after {
+                    std::fs::write(
+                        agent.directory.path().join(edit_name(turn, index)),
+                        contents,
+                    )
+                    .expect("writes an edit's contents");
+                }
             }
         }
 
@@ -431,7 +469,7 @@ impl ScriptedAgent {
             });
             bodies.push_str(&format!("\r\n:turn-{turn}\r\n"));
             for (index, segment) in turns[turn - 1].iter().enumerate() {
-                match segment.after {
+                match &segment.after {
                     // A second, in the platform's idiom for sleeping without a
                     // console: `timeout` needs one, and `powershell -c
                     // Start-Sleep` costs more to start than it sleeps for.
@@ -450,6 +488,26 @@ impl ScriptedAgent {
                     // died.
                     Some(Stop::Die) => {
                         bodies.push_str(&format!(">&2 echo {LAST_WORDS}\r\nexit 3\r\n"))
+                    }
+                    // Relative, so it lands in the project the agent was started
+                    // in. `type` copies the bytes the harness wrote, which is
+                    // the only way to get an arbitrary string past `echo`.
+                    Some(Stop::Write { path, .. }) => {
+                        if let Some(parent) = parent_of(path) {
+                            bodies.push_str(&format!(
+                                "if not exist \"{parent}\\\" mkdir \"{parent}\"\r\n"
+                            ));
+                        }
+                        bodies.push_str(&format!(
+                            ">\"{}\" type \"%~dp0{}\"\r\n",
+                            native(path),
+                            edit_name(turn - 1, index)
+                        ));
+                    }
+                    Some(Stop::Delete { path }) => {
+                        let path = native(path);
+                        bodies
+                            .push_str(&format!("if exist \"{path}\" del /f /q \"{path}\"\r\n"));
                     }
                     None => {}
                 }
@@ -520,7 +578,7 @@ impl ScriptedAgent {
                 false => format!("    {turn})\n"),
             });
             for (index, segment) in turns[turn - 1].iter().enumerate() {
-                match segment.after {
+                match &segment.after {
                     Some(Stop::Pause) => cases.push_str("      sleep 1\n"),
                     // `read` fails at EOF, which is how "the server closed stdin
                     // instead of answering" arrives here. The script carries on
@@ -532,6 +590,18 @@ impl ScriptedAgent {
                     )),
                     Some(Stop::Die) => {
                         cases.push_str(&format!("      echo \"{LAST_WORDS}\" >&2\n      exit 3\n"))
+                    }
+                    Some(Stop::Write { path, .. }) => {
+                        if let Some(parent) = parent_of(path) {
+                            cases.push_str(&format!("      mkdir -p \"{parent}\"\n"));
+                        }
+                        cases.push_str(&format!(
+                            "      cat \"$here/{}\" > \"{path}\"\n",
+                            edit_name(turn - 1, index)
+                        ));
+                    }
+                    Some(Stop::Delete { path }) => {
+                        cases.push_str(&format!("      rm -f \"{path}\"\n"));
                     }
                     None => {}
                 }
@@ -570,6 +640,35 @@ fn segment_name(turn: usize, index: usize) -> String {
     format!("turn-{turn}-segment-{index}.ndjson")
 }
 
+fn edit_name(turn: usize, index: usize) -> String {
+    format!("turn-{turn}-edit-{index}.txt")
+}
+
+/// A relative path as this platform's shell wants it spelled.
+///
+/// `cmd`'s own builtins — `mkdir`, `del` — reject forward slashes even though
+/// every Win32 call underneath them accepts both, so a path written the way a
+/// test would write it has to be turned round before it reaches one.
+fn native(path: &str) -> String {
+    match cfg!(windows) {
+        true => path.replace('/', "\\"),
+        false => path.to_string(),
+    }
+}
+
+/// The directory part of a relative path, if it has one.
+fn parent_of(path: &str) -> Option<String> {
+    let native = native(path);
+    let separator = match cfg!(windows) {
+        true => '\\',
+        false => '/',
+    };
+    native
+        .rfind(separator)
+        .map(|at| native[..at].to_string())
+        .filter(|parent| !parent.is_empty())
+}
+
 /// One run of lines the agent prints without stopping, and what it does *before*
 /// printing them.
 ///
@@ -581,13 +680,20 @@ struct Segment<'a> {
     lines: &'a [&'a str],
 }
 
-/// The three kinds of stop a script can contain. The third is not a stop the
-/// script comes back from.
-#[derive(Debug, Clone, Copy)]
+/// The kinds of interruption a script can contain. `Die` is not one the script
+/// comes back from, and the last two are not stops at all — they are the agent
+/// doing something to the project rather than waiting.
+#[derive(Debug, Clone)]
 enum Stop {
     Pause,
     Answer,
     Die,
+    /// Create or overwrite a file. The contents travel to the agent the same way
+    /// its lines do — in a file beside the script, which the script copies —
+    /// because a batch file cannot be trusted to `echo` an arbitrary string
+    /// back unchanged. See [`WRITES`].
+    Write { path: String, contents: String },
+    Delete { path: String },
 }
 
 /// Split one turn's lines at the markers, keeping which marker each split was.
@@ -600,7 +706,21 @@ fn segments<'a>(lines: &'a [&'a str]) -> Vec<Segment<'a>> {
             PAUSE => Stop::Pause,
             AWAIT_ANSWER => Stop::Answer,
             DIES => Stop::Die,
-            _ => continue,
+            edit => match edit.strip_prefix(WRITES) {
+                Some(rest) => {
+                    let (path, contents) = rest.split_once(FIELD).unwrap_or((rest, ""));
+                    Stop::Write {
+                        path: path.to_string(),
+                        contents: contents.to_string(),
+                    }
+                }
+                None => match edit.strip_prefix(DELETES) {
+                    Some(path) => Stop::Delete {
+                        path: path.to_string(),
+                    },
+                    None => continue,
+                },
+            },
         };
         segments.push(Segment {
             after,

@@ -325,6 +325,41 @@ impl SocketClient {
         .await
     }
 
+    /// Read the turn out up to and including the moment its working tree has
+    /// been recorded.
+    ///
+    /// One event later than [`SocketClient::events_through_the_turn`], and the
+    /// gap between them is real rather than an artefact: the turn settles when
+    /// the agent says it is done, and the checkpoint is written after that —
+    /// off the driver's loop, because it is a `git add -A` over the project. A
+    /// test that asked for a diff on the settle would be racing that.
+    ///
+    /// A *snapshot* carrying the checkpoint ends the read too, for the reason
+    /// the settle's own reader gives: a turn that outruns the subscription's
+    /// backlog is answered by describing the world again, and the event would
+    /// then be one of the things discarded.
+    pub async fn events_through_the_checkpoint(
+        &mut self,
+        subscription: &str,
+        turn_count: u64,
+    ) -> Vec<Value> {
+        self.values_until(subscription, |item| match item["kind"].as_str() {
+            Some("event") => {
+                item["event"]["type"] == "thread.turn-diff-completed"
+                    && item["event"]["payload"]["checkpointTurnCount"] == json!(turn_count)
+            }
+            Some("snapshot") => item["snapshot"]["thread"]["checkpoints"]
+                .as_array()
+                .is_some_and(|checkpoints| {
+                    checkpoints
+                        .iter()
+                        .any(|checkpoint| checkpoint["checkpointTurnCount"] == json!(turn_count))
+                }),
+            _ => false,
+        })
+        .await
+    }
+
     /// Read the turn out up to and including the agent asking for permission,
     /// and hand back the id the answer has to name.
     ///

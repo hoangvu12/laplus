@@ -62,11 +62,12 @@
 //!   last turn went is worth having — and [`Thread::restored`] moves a turn that
 //!   was still `running` to `interrupted`, because the app stopped in the middle
 //!   of it and nothing is going to finish it.
-//! - **Approvals, checkpoints, proposed plans.** `checkpoints` and
-//!   `proposedPlans` are present and empty; tickets 13 and 20 fill them.
-//!   `activities` holds a turn's own bookkeeping and, since ticket 12, its tool
-//!   calls and the reasoning between them — see [`crate::worklog`], which owns
-//!   what those rows look like.
+//! - **Proposed plans.** `proposedPlans` is present and empty; a later ticket
+//!   fills it. `activities` holds a turn's own bookkeeping and, since ticket 12,
+//!   its tool calls and the reasoning between them — see [`crate::worklog`],
+//!   which owns what those rows look like, and `checkpoints` holds the turns
+//!   that can be reviewed as a diff — see [`crate::checkpoints`], which owns
+//!   what is behind one.
 //! - **Worktrees.** `branch` and `worktreePath` are carried and never acted on.
 //!   A `thread.turn.start` that asks for a worktree to be prepared is refused by
 //!   name rather than silently run in the project root — see
@@ -129,6 +130,10 @@ pub struct Thread {
     pub updated_at: String,
     pub messages: Vec<Message>,
     pub activities: Vec<Activity>,
+    /// One per turn that has finished, in the order the turns happened. What
+    /// makes a turn a point in time the working tree can be diffed against —
+    /// see [`crate::checkpoints`].
+    pub checkpoints: Vec<Checkpoint>,
     pub session: Option<Session>,
     pub latest_turn: Option<LatestTurn>,
     /// When the developer last said something. On the shell summary rather than
@@ -172,6 +177,71 @@ pub struct Conversation {
     pub thread: ThreadRow,
     pub messages: Vec<Message>,
     pub activities: Vec<Activity>,
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+/// What the working tree looked like when one turn finished, as
+/// `OrchestrationCheckpointSummary`.
+///
+/// The row itself carries no diff. It is a *name* — the ref
+/// [`crate::checkpoints`] wrote the tree under, and the turn count that names
+/// the range a diff runs over — plus enough of a summary for the panel to list
+/// the turn before anyone asks for its patch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub turn_id: String,
+    /// How many turns this conversation had recorded once this one finished.
+    /// Turn one's checkpoint is 1, and the baseline taken before it is 0 — so a
+    /// turn's diff runs from `turn_count - 1` to `turn_count`.
+    pub turn_count: u64,
+    /// Where the tree is, in the project's own repository.
+    pub reference: String,
+    /// **How the turn went**, not whether the capture worked — `ready` for one
+    /// that finished, `error` for one that failed.
+    ///
+    /// That reading is the client's, and it is not a nuance: the reducer sets
+    /// `latestTurn.state` from this on every checkpoint it folds
+    /// (`threadReducer.ts`, `checkpointStatusToTurnState`). So a status that
+    /// disagreed with how the turn actually ended would relabel the turn, and
+    /// this server and the client would then be showing two different
+    /// conversations. [`crate::turn::Ending::checkpoint_status`] is where the
+    /// mapping lives, and where the third case — a turn the developer stopped,
+    /// which gets no checkpoint at all — is argued.
+    ///
+    /// The contract's `missing` is therefore never sent. It means `completed`
+    /// to the client, so the only turn it could describe is one this server
+    /// would rather not describe at all.
+    pub status: &'static str,
+    /// What the turn changed, for the row the panel shows before the developer
+    /// opens the patch. Empty when the turn changed nothing, and empty when the
+    /// summary could not be read — the patch is authoritative either way.
+    ///
+    /// Counted **without** ignoring whitespace, while the patch a developer
+    /// opens ignores it by default. The two can therefore disagree on a
+    /// reformatting turn: a file listed as `+40 −40` whose patch is empty. That
+    /// is upstream's behaviour and it is unavoidable rather than chosen — the
+    /// summary is computed once when the turn ends and the flag is chosen per
+    /// request, so there is no single count that could be right for both.
+    pub files: Vec<crate::checkpoints::Changed>,
+    pub assistant_message_id: Option<String>,
+    pub completed_at: String,
+}
+
+impl Checkpoint {
+    fn to_value(&self) -> Value {
+        json!({
+            "turnId": self.turn_id,
+            "checkpointTurnCount": self.turn_count,
+            "checkpointRef": self.reference,
+            "status": self.status,
+            "files": self.files
+                .iter()
+                .map(crate::checkpoints::Changed::to_value)
+                .collect::<Vec<Value>>(),
+            "assistantMessageId": self.assistant_message_id,
+            "completedAt": self.completed_at,
+        })
+    }
 }
 
 /// A stored tone, back as one of the three this server produces.
@@ -186,6 +256,20 @@ pub fn tone(stored: &str) -> &'static str {
         "error" => "error",
         "tool" => "tool",
         _ => "info",
+    }
+}
+
+/// A stored checkpoint status, back as one of the contract's three.
+///
+/// Same reasoning as [`tone`]: every value this build can write is a literal in
+/// this file, so the round trip is lossless for anything it put there and
+/// anything else is a row it did not. A status it cannot read is `error`, which
+/// is the one of the three that promises the developer nothing.
+pub fn checkpoint_status(stored: &str) -> &'static str {
+    match stored {
+        "ready" => "ready",
+        "missing" => "missing",
+        _ => "error",
     }
 }
 
@@ -286,7 +370,11 @@ impl Thread {
             "messages": self.messages.iter().map(Message::to_value).collect::<Vec<Value>>(),
             "proposedPlans": [],
             "activities": self.activities.iter().map(Activity::to_value).collect::<Vec<Value>>(),
-            "checkpoints": [],
+            "checkpoints": self
+                .checkpoints
+                .iter()
+                .map(Checkpoint::to_value)
+                .collect::<Vec<Value>>(),
             "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
         })
     }
@@ -394,6 +482,12 @@ impl Thread {
             updated_at: row.updated_at,
             messages: stored.messages,
             activities: stored.activities,
+            // Kept, unlike the session, and for the opposite reason: a
+            // checkpoint is a ref in the developer's repository, so it is still
+            // there after a restart and the diff it names still opens. A
+            // restored conversation the developer cannot review would be a
+            // conversation they have to re-run to see.
+            checkpoints: stored.checkpoints,
             session: None,
             latest_turn,
             latest_user_message_at: row.latest_user_message_at,
@@ -607,6 +701,14 @@ pub enum Change {
     Session(Session),
     /// Something happened worth showing. `thread.activity-appended`.
     Activity(Activity),
+    /// A turn finished and what the working tree looked like was recorded.
+    /// `thread.turn-diff-completed`.
+    ///
+    /// The event the client's reducer appends to `thread.checkpoints`, which is
+    /// the list the diff panel offers turns from. Published *after* the tree has
+    /// actually been written, never before: a row naming a ref that is not
+    /// there is a turn the developer can select and cannot open.
+    Checkpointed(Box<Checkpoint>),
 }
 
 impl Change {
@@ -617,8 +719,15 @@ impl Change {
     /// title, the session state, the latest turn — so republishing the summary
     /// per token would be the shell subscription carrying a token stream it has
     /// no use for.
+    ///
+    /// A checkpoint is in the same position for a different reason: the shell
+    /// summary does not carry `checkpoints` at all, so nothing on the list would
+    /// read one.
     fn reaches_the_shell(&self) -> bool {
-        !matches!(self, Change::AssistantDelta { .. } | Change::Activity(_))
+        !matches!(
+            self,
+            Change::AssistantDelta { .. } | Change::Activity(_) | Change::Checkpointed(_)
+        )
     }
 }
 
@@ -1036,6 +1145,45 @@ impl Threads {
                     "activity": described,
                 })
             }
+            // Keyed by the **turn**, which is the client's own key
+            // (`threadReducer.ts`, `case "thread.turn-diff-completed"`, which
+            // filters on `entry.turnId !== checkpoint.turnId`). Keying on
+            // anything else would let a second capture of one turn be one row
+            // here and two in the panel, which is the kind of disagreement a
+            // client that took a snapshot and a client that watched every event
+            // would show differently.
+            Change::Checkpointed(recorded) => {
+                // Filled in here rather than by the driver, because this is
+                // where the transcript is: the reply a turn is remembered by is
+                // its last assistant message, and the driver has already
+                // forgotten which that was — it clears the id as each message
+                // completes, so that a turn which said several things gives each
+                // its own. Upstream's reactor resolves it the same way and from
+                // the same end of the list.
+                let mut captured = (**recorded).clone();
+                if captured.assistant_message_id.is_none() {
+                    captured.assistant_message_id = thread
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| {
+                            message.role == "assistant"
+                                && message.turn_id.as_deref() == Some(captured.turn_id.as_str())
+                        })
+                        .map(|message| message.id.clone());
+                }
+                match thread
+                    .checkpoints
+                    .iter_mut()
+                    .find(|held| held.turn_id == captured.turn_id)
+                {
+                    Some(held) => *held = captured.clone(),
+                    None => thread.checkpoints.push(captured.clone()),
+                }
+                let mut payload = captured.to_value();
+                payload["threadId"] = json!(thread.id);
+                payload
+            }
         }
     }
 
@@ -1307,6 +1455,31 @@ impl Threads {
         lock(&self.find(thread_id)?.state).clone()
     }
 
+    /// How many turns of this conversation have had their working tree
+    /// recorded.
+    ///
+    /// The number a checkpoint is taken *at*: the next capture is this plus one,
+    /// and the baseline the next turn is diffed against is this. Zero for a
+    /// conversation that has never finished a turn — and zero is also the
+    /// baseline's own count, so the two read the same and mean the same thing.
+    ///
+    /// The **maximum** rather than the length, because a conversation whose
+    /// turns were recorded out of order — a capture that failed and a later one
+    /// that did not — must not have the gap counted as a turn that never
+    /// happened.
+    pub fn checkpoint_count(&self, thread_id: &str) -> u64 {
+        self.get(thread_id)
+            .map(|thread| {
+                thread
+                    .checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.turn_count)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
+
     // -- the running agent --------------------------------------------------
 
     /// Give this thread a driver, unless it already has one.
@@ -1511,6 +1684,7 @@ impl Change {
             Change::InterruptRequested { .. } => "thread.turn-interrupt-requested",
             Change::Session(_) => "thread.session-set",
             Change::Activity(_) => "thread.activity-appended",
+            Change::Checkpointed(_) => "thread.turn-diff-completed",
         }
     }
 }
@@ -1566,6 +1740,17 @@ fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
                 activity: Box::new(activity.clone()),
             });
         }
+    }
+
+    // Keyed by the turn count rather than positioned like a message or an
+    // activity, because that is what a checkpoint *is* — one row per turn, and
+    // a second capture of the same turn replaces the first. So there is no
+    // ordinal to find and nothing that can be written out of order.
+    if let Change::Checkpointed(recorded) = change {
+        writes.push(Write::Checkpoint {
+            thread_id: thread.id.clone(),
+            checkpoint: recorded.clone(),
+        });
     }
 
     writes
@@ -1797,6 +1982,7 @@ mod tests {
             updated_at: "2026-07-26T00:23:04.909Z".to_string(),
             messages: Vec::new(),
             activities: Vec::new(),
+            checkpoints: Vec::new(),
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
@@ -2352,6 +2538,7 @@ mod tests {
                 updated_at: now_iso(),
             }],
             activities: Vec::new(),
+            checkpoints: Vec::new(),
         }]);
 
         let restored = threads.get("thread-1").expect("the conversation is back");
@@ -2391,6 +2578,7 @@ mod tests {
             thread: row,
             messages: Vec::new(),
             activities: Vec::new(),
+            checkpoints: Vec::new(),
         }]);
 
         let turn = threads
@@ -2417,6 +2605,7 @@ mod tests {
             thread: finished,
             messages: Vec::new(),
             activities: Vec::new(),
+            checkpoints: Vec::new(),
         }]);
         assert_eq!(
             threads

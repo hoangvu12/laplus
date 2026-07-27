@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::projects::{Project, WorkspaceRoot};
-use crate::threads::{Activity, Conversation, LatestTurn, Message, ThreadRow};
+use crate::threads::{Activity, Checkpoint, Conversation, LatestTurn, Message, ThreadRow};
 use crate::transcripts::Write;
 
 /// The schema, one entry per version. The index is the `user_version` the
@@ -151,6 +151,33 @@ const MIGRATIONS: &[&str] = &[
     -- than anything this build will number, and the client sorts an activity with
     -- no sequence ahead of one with — which is where they belong.
     ALTER TABLE thread_activities ADD COLUMN sequence INTEGER;
+    "#,
+    // v4 — ticket 20, the turns a diff can be taken between.
+    r#"
+    -- One row per turn that finished, naming the git ref `crate::checkpoints`
+    -- recorded the working tree under. The *tree* is in the developer's own
+    -- repository and outlives this file entirely; what is here is only the name
+    -- of it, so that a conversation which came back from a restart can still
+    -- offer its turns to the diff panel.
+    CREATE TABLE thread_checkpoints (
+        thread_id      TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        -- The primary key with the thread, and it is the *turn* rather than the
+        -- turn count because that is the client's own key
+        -- (`threadReducer.ts`, `case "thread.turn-diff-completed"`). A turn
+        -- captured twice has to replace its row here for the same reason it
+        -- replaces its entry there: one turn is one row in the panel's list.
+        turn_id        TEXT NOT NULL,
+        turn_count     INTEGER NOT NULL,
+        checkpoint_ref TEXT NOT NULL,
+        status         TEXT NOT NULL,
+        -- The per-file summary, verbatim. Same reasoning as `payload` on an
+        -- activity: it is a list whose shape belongs to the contract, and
+        -- nothing here ever queries into it.
+        files          TEXT NOT NULL,
+        assistant_message_id TEXT,
+        completed_at   TEXT NOT NULL,
+        PRIMARY KEY (thread_id, turn_id)
+    ) STRICT;
     "#,
 ];
 
@@ -643,6 +670,10 @@ impl Database {
                     thread_id,
                     session_id,
                 } => remember_agent_session(&transaction, thread_id, session_id)?,
+                Write::Checkpoint {
+                    thread_id,
+                    checkpoint,
+                } => upsert_checkpoint(&transaction, thread_id, checkpoint)?,
             }
         }
 
@@ -686,6 +717,17 @@ impl Database {
             activity_from_row,
             "read the work logs",
         )?;
+        // Ordered by the turn count itself rather than by a stored position,
+        // because unlike a message or an activity a checkpoint *has* a natural
+        // order: it is which turn it is.
+        let checkpoints: Vec<(String, Checkpoint)> = query(
+            &transaction,
+            "SELECT thread_id, turn_id, turn_count, checkpoint_ref, status, files, \
+                    assistant_message_id, completed_at \
+             FROM thread_checkpoints ORDER BY thread_id ASC, turn_count ASC",
+            checkpoint_from_row,
+            "read the checkpoints",
+        )?;
 
         // Where each thread ended up, so the two ordered lists can be walked
         // once and dealt into place. A row whose thread is not here is
@@ -702,6 +744,7 @@ impl Database {
                 thread,
                 messages: Vec::new(),
                 activities: Vec::new(),
+                checkpoints: Vec::new(),
             })
             .collect();
 
@@ -713,6 +756,11 @@ impl Database {
         for (thread_id, activity) in activities {
             if let Some(index) = at.get(&thread_id) {
                 conversations[*index].activities.push(activity);
+            }
+        }
+        for (thread_id, checkpoint) in checkpoints {
+            if let Some(index) = at.get(&thread_id) {
+                conversations[*index].checkpoints.push(checkpoint);
             }
         }
 
@@ -964,6 +1012,48 @@ fn upsert_activity(
     Ok(())
 }
 
+/// Record what the working tree looked like when a turn finished.
+///
+/// An upsert on `(thread_id, turn_id)`, which is the whole of what makes a turn
+/// captured twice one row rather than two — see the table's own comment.
+fn upsert_checkpoint(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    checkpoint: &Checkpoint,
+) -> Result<(), StorageError> {
+    let files: Vec<serde_json::Value> = checkpoint
+        .files
+        .iter()
+        .map(crate::checkpoints::Changed::to_value)
+        .collect();
+    transaction
+        .execute(
+            "INSERT INTO thread_checkpoints \
+                (thread_id, turn_id, turn_count, checkpoint_ref, status, files, \
+                 assistant_message_id, completed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (thread_id, turn_id) DO UPDATE SET \
+                turn_count = excluded.turn_count, \
+                checkpoint_ref = excluded.checkpoint_ref, \
+                status = excluded.status, \
+                files = excluded.files, \
+                assistant_message_id = excluded.assistant_message_id, \
+                completed_at = excluded.completed_at",
+            rusqlite::params![
+                thread_id,
+                checkpoint.turn_id,
+                checkpoint.turn_count as i64,
+                checkpoint.reference,
+                checkpoint.status,
+                serde_json::Value::Array(files).to_string(),
+                checkpoint.assistant_message_id,
+                checkpoint.completed_at,
+            ],
+        )
+        .map_err(StorageError::while_("store the checkpoint"))?;
+    Ok(())
+}
+
 /// Record the `claude` session a conversation is being held in.
 ///
 /// Its own statement rather than part of the row upsert, because it arrives from
@@ -1076,6 +1166,28 @@ fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Activity)> {
             turn_id: row.get(6)?,
             sequence: row.get(7)?,
             created_at: row.get(8)?,
+        },
+    ))
+}
+
+fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Checkpoint)> {
+    let turn_count: i64 = row.get(2)?;
+    let status: String = row.get(4)?;
+    let files: String = row.get(5)?;
+
+    Ok((
+        row.get(0)?,
+        Checkpoint {
+            turn_id: row.get(1)?,
+            // A negative count cannot be written by this build and would be a
+            // file somebody edited by hand. Zero is the baseline, which is the
+            // one turn count that is always safe to claim.
+            turn_count: turn_count.max(0) as u64,
+            reference: row.get(3)?,
+            status: crate::threads::checkpoint_status(&status),
+            files: crate::checkpoints::changed_from_stored(&files),
+            assistant_message_id: row.get(6)?,
+            completed_at: row.get(7)?,
         },
     ))
 }
@@ -1560,6 +1672,7 @@ mod tests {
                 thread,
                 messages,
                 activities,
+                checkpoints: Vec::new(),
             }]
         );
     }

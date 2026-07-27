@@ -139,6 +139,28 @@
 //! registry takes it with no session to route it to, and the driver drops it
 //! with no turn to stop. See [`interrupt`], where the three races are named.
 //!
+//! ## A turn is also a point in time, and this is the only place that knows when
+//!
+//! Ticket 20 asks for a turn to be reviewable as a diff, and a diff needs a
+//! *before*. Nothing in git records what the working tree looked like when the
+//! developer pressed enter, so this file records it: a checkpoint is written
+//! before the prompt reaches the agent and again when the turn ends, and
+//! [`crate::checkpoints`] owns everything about how. Two properties come from
+//! the placement rather than from that module:
+//!
+//! - **The baseline is awaited before the agent is written to.** A capture
+//!   racing the agent's first edit would record a tree that already had it, and
+//!   the turn would show a diff missing its own first change.
+//! - **The ending is recorded before the next prompt is taken.** That is what
+//!   chains the checkpoints: turn two's baseline is turn one's ending, so a
+//!   conversation is a sequence of adjoining ranges with no gap for a hand edit
+//!   to fall into unattributed.
+//!
+//! Both are `await`s on a blocking thread in a loop that is otherwise reading a
+//! child's output, and both cost a `git add -A` on the project. That is the
+//! price of the feature and it is paid twice per conversation plus once per
+//! turn.
+//!
 //! ## Continuity is the agent's, and this is where the handle on it is kept
 //!
 //! Within one process there is nothing to do: the child is long-lived and the
@@ -261,6 +283,7 @@ async fn drive(
         outstanding: HashMap::new(),
         interrupts: 0,
         drift_reported: Drift::default(),
+        finished: None,
     };
     // A turn that arrived while another was still running. Held rather than
     // sent: sending it would orphan the turn in flight — that turn would never
@@ -277,9 +300,42 @@ async fn drive(
     let mut listening = true;
 
     loop {
+        // Anything already owed to the turn that just ended is dealt with before
+        // the next one is started.
+        //
+        // The `select!` below cannot do this, because when a signal and a prompt
+        // are both ready it takes either — and *which* matters here in a way it
+        // does not anywhere else. A developer whose turn finished a moment ago
+        // may have a stop click still in flight; the client sends one with no
+        // `turnId`, meaning "whatever is running". Taken now it is the no-op it
+        // was meant to be. Taken one iteration after the queued prompt, it stops
+        // a turn that had just started, which is the developer's click landing on
+        // the wrong turn.
+        //
+        // The window is real rather than theoretical: this loop `await`s a
+        // `git add -A` at the end of every turn ([`checkpoint`]), and a click
+        // during it is exactly a click after the turn the developer was watching
+        // settled.
+        while let Ok(signal) = signals.try_recv() {
+            match signal {
+                Signal::Answer(answered) => {
+                    answer(&threads, &start, &mut agent, &mut driving, answered).await
+                }
+                Signal::Interrupt { turn_id } => {
+                    interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await
+                }
+            }
+        }
+
         // Whatever is waiting goes next, as soon as the turn before it is done.
         if accepting && driving.turn.is_none() {
             if let Some(prompt) = waiting.take() {
+                // Before the agent is given the turn, which is the whole of what
+                // makes it a *baseline*: everything the agent does from the next
+                // line onwards is what this turn's diff will be against. Awaited
+                // rather than spawned for the same reason — a capture racing the
+                // agent's first edit would record a tree that already had it.
+                baseline(&threads, &start).await;
                 if let Err(error) = agent.send(&prompt.text).await {
                     eprintln!("lightcode: cannot send a turn to the agent: {error}");
                     break;
@@ -321,6 +377,13 @@ async fn drive(
         match next {
             Next::Line(Some(line)) => {
                 publish(&threads, &start, &mut folding, &mut driving, &line);
+                // The turn is over, so what the agent left behind is what this
+                // turn did. Recorded before the loop takes the next prompt,
+                // which is what makes the next turn's baseline this checkpoint
+                // rather than a tree somebody has since typed into.
+                if let Some(finished) = driving.finished.take() {
+                    checkpoint(&threads, &start, &finished).await;
+                }
             }
             // The agent stopped producing: it exited, or its output was
             // abandoned. Either way there is nothing more to publish.
@@ -453,7 +516,139 @@ async fn drive(
             updated_at: now_iso(),
         }),
     );
+
+    // A turn the agent died in the middle of still changed the working tree, and
+    // the developer's first question about a session that fell over is what it
+    // had already done. So this ending is checkpointed like any other — the only
+    // difference is that nothing published a `turn.completed` for it, which is
+    // why it cannot be caught by the loop above.
+    //
+    // As an `error`, because that is how the session above has just reported it:
+    // ADR-0004 settles a turn cut short by a dead agent as an error rather than
+    // an interruption, and a checkpoint saying anything else would move the turn
+    // back — see [`Ending::checkpoint_status`].
+    if let Some(active) = driving.turn.take() {
+        checkpoint(
+            &threads,
+            &start,
+            &Finished {
+                turn_id: active.turn_id,
+                status: "error",
+            },
+        )
+        .await;
+    }
+
     threads.detach(&start.thread_id);
+}
+
+/// Record what the working tree looks like before this conversation's next turn
+/// is given to the agent.
+///
+/// Nothing to do in the ordinary case: the checkpoint taken at the end of the
+/// previous turn *is* this turn's baseline, which is what makes a conversation's
+/// checkpoints a chain rather than a set of pairs. The cases where there is
+/// something to do are the first turn of a conversation, and the first turn
+/// after the developer ran `vcs.init` on a project that had no repository — both
+/// of which are "there is no tree recorded for turn zero yet".
+async fn baseline(threads: &Threads, start: &Start) {
+    let turn_count = threads.checkpoint_count(&start.thread_id);
+    let reference = crate::checkpoints::reference(&start.thread_id, turn_count);
+    let root = std::path::PathBuf::from(&start.workspace_root);
+
+    let recorded = tokio::task::spawn_blocking(move || {
+        if crate::checkpoints::present(&root, &reference) {
+            return Ok(());
+        }
+        crate::checkpoints::capture(&root, &reference)
+    })
+    .await;
+
+    // Logged and not said in the conversation, unlike the failure at the end of
+    // a turn. A baseline that could not be written is only visible as the turn
+    // that follows it having no diff, and *that* is the moment the developer is
+    // told — saying it twice would put two rows in the work log for one problem.
+    //
+    // A `JoinError` is the blocking pool having gone, which is the runtime
+    // shutting down. Nothing is owed to a conversation nobody is reading.
+    if let Ok(Err(why)) = recorded {
+        if !crate::git::is_not_a_repository(&why) {
+            eprintln!(
+                "lightcode: cannot record the state of {} before a turn: {}",
+                start.workspace_root,
+                why.detail()
+            );
+        }
+    }
+}
+
+/// Record what the working tree looks like now as this conversation's next
+/// checkpoint, and publish the row that offers the turn for review.
+///
+/// **A project that is not a repository is not a failure.** There is nowhere to
+/// keep a checkpoint and nothing the developer did wrong; `vcs.init` is the door
+/// out, and until they walk through it a conversation simply has no turns to
+/// diff. Every other refusal is said in the conversation, because a turn the
+/// developer cannot review is a thing they will otherwise go looking for.
+async fn checkpoint(threads: &Threads, start: &Start, finished: &Finished) {
+    let previous = threads.checkpoint_count(&start.thread_id);
+    let turn_count = previous + 1;
+    let from = crate::checkpoints::reference(&start.thread_id, previous);
+    let reference = crate::checkpoints::reference(&start.thread_id, turn_count);
+    let root = std::path::PathBuf::from(&start.workspace_root);
+
+    // On a blocking thread, like every other git in this server: it is a child
+    // process over a repository whose size is the developer's, and a runtime
+    // worker parked on one is a worker the socket is not using.
+    let taken = tokio::task::spawn_blocking({
+        let reference = reference.clone();
+        move || {
+            crate::checkpoints::capture(&root, &reference)?;
+            // Best effort, and deliberately not fatal: the summary is the line
+            // above the patch, and a turn whose tree was recorded is reviewable
+            // whether or not this could be read.
+            Ok(crate::checkpoints::changed(&root, &from, &reference).unwrap_or_default())
+        }
+    })
+    .await;
+
+    let files = match taken {
+        Ok(Ok(files)) => files,
+        Ok(Err(why)) => {
+            if !crate::git::is_not_a_repository(&why) {
+                threads.apply(
+                    &start.thread_id,
+                    Change::Activity(Activity::failed(
+                        "checkpoint.failed",
+                        &format!(
+                            "The state of the project after this turn could not be recorded, so \
+                             the turn has no diff to review: {}",
+                            why.detail()
+                        ),
+                    )),
+                );
+            }
+            return;
+        }
+        // The blocking pool is gone, which happens when the runtime is shutting
+        // down. There is nothing to say to a conversation nobody is reading.
+        Err(_) => return,
+    };
+
+    threads.apply(
+        &start.thread_id,
+        Change::Checkpointed(Box::new(crate::threads::Checkpoint {
+            turn_id: finished.turn_id.clone(),
+            turn_count,
+            reference,
+            status: finished.status,
+            files,
+            // Resolved by the fold, which is where the transcript is. See
+            // [`crate::threads::Threads::fold`].
+            assistant_message_id: None,
+            completed_at: now_iso(),
+        })),
+    );
 }
 
 /// What the developer is told when the agent went away in the middle of a turn.
@@ -538,6 +733,25 @@ struct Driving {
     /// compaction boundary — and drift there belongs to somebody. Anchoring it
     /// to the start of a turn would drop it.
     drift_reported: Drift,
+    /// A turn that has just ended and whose working tree has not been recorded
+    /// yet.
+    ///
+    /// A one-line handoff from the fold to the loop, and it exists because the
+    /// two halves cannot swap places. Recording a checkpoint is a `git` and
+    /// therefore has to happen where the loop can `await` it; knowing that a
+    /// turn ended happens where the lines are read, which is synchronous.
+    /// Written by exactly one arm of [`publish`] and taken by the loop on the
+    /// next statement, so it is never carried across an iteration.
+    finished: Option<Finished>,
+}
+
+/// A turn that ended in a way a checkpoint can describe.
+///
+/// See [`Ending::checkpoint_status`] for why the second field is what decides
+/// whether there is anything to hand over at all.
+struct Finished {
+    turn_id: String,
+    status: &'static str,
 }
 
 impl Driving {
@@ -895,6 +1109,37 @@ impl Ending {
         }
     }
 
+    /// The `OrchestrationCheckpointStatus` a checkpoint for this ending would
+    /// carry — or `None`, meaning **do not record one at all**.
+    ///
+    /// The third case is the interesting one and it is a decision, not an
+    /// omission. `status` is not a fact about the capture; it is how the turn
+    /// went, and the client reads it back as exactly that: `threadReducer.ts`,
+    /// `case "thread.turn-diff-completed"`, sets `latestTurn.state` to
+    /// `checkpointStatusToTurnState(status)` on every checkpoint it folds. That
+    /// function has three inputs and two outputs — `ready` and `missing` both
+    /// mean `completed`, `error` means `error` — so **there is no status that
+    /// means "the developer stopped this turn"**.
+    ///
+    /// A turn the developer stopped therefore gets no row, because every row it
+    /// could get would relabel it as finished — undoing the settle that ticket
+    /// 14 exists for, and leaving this server and the client disagreeing about
+    /// the same turn. The tree is not captured for one either: its changes fall
+    /// into the diff of the turn that follows, which is the honest thing for a
+    /// model built on photographs of the working tree. See ADR-0008.
+    ///
+    /// Upstream sends `missing` here (`CheckpointReactor.ts`,
+    /// `checkpointStatusFromRuntime`) and takes the relabelling; lightcode does
+    /// not, because ticket 14 made "a stopped turn reads as interrupted" a
+    /// promise this build keeps.
+    fn checkpoint_status(self) -> Option<&'static str> {
+        match self {
+            Ending::Completed => Some("ready"),
+            Ending::Failed => Some("error"),
+            Ending::Stopped => None,
+        }
+    }
+
     /// Only a failure is styled as one. A turn the developer stopped is not
     /// something that went wrong.
     fn tone(self) -> &'static str {
@@ -1190,6 +1435,15 @@ fn publish(
             let active = finished.as_ref().map(|turn| turn.turn_id.clone());
             let summary = folding.last_result.as_ref();
             let ending = Ending::of(finished.as_ref(), summary);
+            // Before the early return below, because the working tree has to be
+            // recorded whether or not this turn is still the one the session is
+            // describing. A developer who stopped the agent and typed again has
+            // *two* turns to review, and the one that just ended is the one this
+            // is about.
+            driving.finished = active
+                .clone()
+                .zip(ending.checkpoint_status())
+                .map(|(turn_id, status)| Finished { turn_id, status });
             // What has gone unread and unreported. The session's running totals
             // go in the payload beside it; the sentence gets what is new, so a
             // turn that drifted says so and the one after it does not repeat the

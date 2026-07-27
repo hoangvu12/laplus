@@ -24,7 +24,9 @@
 //! tree and the search behind them, [`watcher`] tells it when something it has
 //! already enumerated has changed underneath, [`files`] opens and saves what
 //! those names point at, [`git`] says which of them have changed and keeps
-//! saying it while the agent works, [`refs`] lists the branches, moves between
+//! saying it while the agent works, [`checkpoints`] records what the working
+//! tree looked like at each turn boundary so that a turn and a whole
+//! conversation can be read as diffs, [`refs`] lists the branches, moves between
 //! them and makes the repository a project has not got yet, [`editor`] hands
 //! one to the developer's own editor, [`provider`] finds the agent binary and
 //! reports what it found, [`process`] is how all of those start a program and
@@ -52,6 +54,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod checkpoints;
 pub mod clock;
 pub mod config;
 pub mod config_store;

@@ -426,6 +426,10 @@ fn changed(inner: &Arc<Inner>, key: &str, relative: &str) {
 ///   in volume, and neither can change a working tree status on its own.
 /// - **Lock files** are written and deleted by every git command there is,
 ///   including the ones below.
+/// - **This server's own checkpoint refs.** A checkpoint is written at the end
+///   of every turn ([`crate::checkpoints`]) and is a *record* of the working
+///   tree rather than a change to it, so a refresh triggered by one would be
+///   this subsystem answering a question its neighbour had just asked.
 ///
 /// What is deliberately kept is the rest of `.git`: `HEAD` moves when a branch
 /// is switched, `index` moves when something is staged, and `MERGE_HEAD` appears
@@ -436,7 +440,11 @@ fn affects_status(relative: &str) -> bool {
     }
     match relative.strip_prefix(".git/") {
         None => true,
-        Some(inside) => !(inside.starts_with("objects/") || inside.starts_with("logs/")),
+        Some(inside) => {
+            !(inside.starts_with("objects/")
+                || inside.starts_with("logs/")
+                || inside.starts_with(crate::checkpoints::REFS))
+        }
     }
 }
 
@@ -617,10 +625,33 @@ fn installed() -> Option<PathBuf> {
     Search::from_environment().locate("git")
 }
 
-/// Run one `git` in `root` and hand back everything it said.
+/// Run one `git` in `root` and hand back everything it said. What almost
+/// everything here wants, including [`crate::filesystem`]'s scan.
+pub fn output(root: &Path, arguments: &[&str]) -> Result<Output, Unavailable> {
+    output_with(root, arguments, &[])
+}
+
+/// The same, with environment variables of the caller's own.
 ///
-/// The one place that knows how this server starts a `git`, which is why
-/// [`crate::filesystem`]'s scan comes through here too:
+/// One caller, and it is the reason this exists rather than a second
+/// `Command::new("git")` somewhere else: a checkpoint is written through a
+/// **temporary index** and an identity of its own, both of which are set in the
+/// environment (`GIT_INDEX_FILE`, `GIT_AUTHOR_*`, `GIT_COMMITTER_*`). See
+/// [`crate::checkpoints`].
+pub fn output_with(
+    root: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &std::ffi::OsStr)],
+) -> Result<Output, Unavailable> {
+    started(root, arguments, environment)
+        .output()
+        .map_err(spawn_failure)
+}
+
+/// A `git` built and ready to run.
+///
+/// **The one place that knows how this server starts a `git`**, which is why
+/// everything above funnels through it:
 ///
 /// - **No console window**, or the Tauri shell would flash a black rectangle
 ///   every time a file changed. See [`crate::process::without_a_console`].
@@ -631,7 +662,18 @@ fn installed() -> Option<PathBuf> {
 /// - **`LC_ALL=C`**, because the one thing here that reads git's own prose is
 ///   telling "this is not a repository" from "this repository is broken", and a
 ///   translated message would make every non-English machine report the second.
-pub fn output(root: &Path, arguments: &[&str]) -> Result<Output, Unavailable> {
+///
+/// Handed out rather than run because one caller does not want
+/// [`std::process::Command::output`]: reading a whole `git diff` into memory is
+/// the one output here that is bounded by the size of the developer's change
+/// rather than by the size of their repository's *metadata*. See
+/// [`crate::checkpoints::patch`], which reads a bounded prefix and kills the
+/// child.
+pub(crate) fn started(
+    root: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
         .arg("--no-optional-locks")
@@ -640,21 +682,27 @@ pub fn output(root: &Path, arguments: &[&str]) -> Result<Output, Unavailable> {
         .args(arguments)
         .env("LC_ALL", "C")
         .env("LANGUAGE", "");
-    crate::process::without_a_console(&mut command)
-        .output()
-        .map_err(|error| match error.kind() {
-            // The one a developer can act on, and the only one that means what
-            // its sentence says. Everything else — a process table that is
-            // full, a binary the machine will not execute — is git failing to
-            // start for a reason of its own, and reporting *that* as "git is not
-            // installed" would send the developer to install something they
-            // already have.
-            std::io::ErrorKind::NotFound => Unavailable::NotInstalled,
-            _ => Unavailable::Refused {
-                detail: format!("git could not be started: {error}"),
-                exit_code: None,
-            },
-        })
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    crate::process::without_a_console(&mut command);
+    command
+}
+
+/// What a `git` that would not start means.
+pub(crate) fn spawn_failure(error: std::io::Error) -> Unavailable {
+    match error.kind() {
+        // The one a developer can act on, and the only one that means what its
+        // sentence says. Everything else — a process table that is full, a
+        // binary the machine will not execute — is git failing to start for a
+        // reason of its own, and reporting *that* as "git is not installed"
+        // would send the developer to install something they already have.
+        std::io::ErrorKind::NotFound => Unavailable::NotInstalled,
+        _ => Unavailable::Refused {
+            detail: format!("git could not be started: {error}"),
+            exit_code: None,
+        },
+    }
 }
 
 /// Run one `git` and take its standard output as text, or say why not.
@@ -1016,9 +1064,11 @@ impl Porcelain {
 ///
 /// NUL-separated, and unquoted whatever `core.quotePath` says — which is the
 /// reason for asking for `-z` in the first place, because the default quoting
-/// would mangle every non-ASCII name. Shared by the two things read here, which
-/// are different formats that agree about their framing.
-fn records(output: &[u8]) -> impl Iterator<Item = String> + '_ {
+/// would mangle every non-ASCII name. Shared by everything read that way: the
+/// two formats a status is built from, and the two a checkpoint's file summary
+/// is ([`crate::checkpoints`]). They are different formats that agree about
+/// their framing, which is exactly what this knows and they do not.
+pub(crate) fn records(output: &[u8]) -> impl Iterator<Item = String> + '_ {
     output
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -1678,6 +1728,11 @@ mod tests {
             ".git/logs/HEAD",
             ".git/index.lock",
             ".git/refs/heads/main.lock",
+            // This server's own record of a turn, which is written at the end of
+            // every one. It describes the working tree rather than changing it,
+            // so a refresh caused by one would be this module answering a
+            // question its neighbour had just asked.
+            ".git/refs/lightcode/checkpoints/6162/turn/1",
         ] {
             assert!(!affects_status(ignored), "{ignored}");
         }
