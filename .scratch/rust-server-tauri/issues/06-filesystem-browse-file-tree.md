@@ -7,7 +7,7 @@ large repository does not stall the interface.
 
 **Blocked by:** 05 (Project registry).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The filesystem can be browsed from the UI to select a folder for a new
       project

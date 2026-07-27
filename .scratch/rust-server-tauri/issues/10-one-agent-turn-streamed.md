@@ -43,7 +43,7 @@ no test-only seam is added. No test calls the real API.
 **Blocked by:** 09 (Provider configuration and agent binary resolution), 05
 (Project registry), 04 (First streaming subscription).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A prompt sent from the real UI reaches the agent and is acknowledged
       immediately — the command the real composer sends is what the suite sends,

@@ -10,7 +10,7 @@ the UI or rendering garbage.
 
 **Blocked by:** 06 (Filesystem browse and file tree).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A file opened from the tree displays its contents
 - [x] Searching by filename within a project returns matches, and returns them

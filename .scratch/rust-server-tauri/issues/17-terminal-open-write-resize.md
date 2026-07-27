@@ -6,7 +6,7 @@ correctly, and resizing the pane rewraps output the way a real terminal does.
 
 **Blocked by:** 05 (Project registry), 04 (First streaming subscription).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A terminal opens with the project directory as its working directory
 - [x] Typed input reaches the shell and output streams back

@@ -10,7 +10,7 @@ alongside the project registry.
 
 **Blocked by:** 10 (One complete agent turn, streamed).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A follow-up message in the same conversation retains prior context — one
       long-lived child takes every turn, and the evidence is the agent's own

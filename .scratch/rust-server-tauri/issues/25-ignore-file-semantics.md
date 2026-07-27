@@ -8,7 +8,7 @@ what the developer thinks is in the project.
 **Blocked by:** 06 (Filesystem browse and file tree), which is what this
 corrects.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A JavaScript project with `node_modules` renders a tree whose own source
       is complete

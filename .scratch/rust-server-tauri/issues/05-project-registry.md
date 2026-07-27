@@ -11,7 +11,7 @@ and this one establishes the store that subsequent slices extend.
 **Blocked by:** 03 (Socket endpoint, local handshake, and the configuration
 method).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A folder can be added as a project and appears in the project list
 - [x] The project list survives a server restart

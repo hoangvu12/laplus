@@ -10,7 +10,7 @@ v1.
 
 **Blocked by:** 05 (Project registry), 04 (First streaming subscription).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Working tree status shows modified, added, deleted and untracked files
 - [x] Status refreshes as files change on disk, without manual action

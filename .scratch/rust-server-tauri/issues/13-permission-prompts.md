@@ -10,7 +10,7 @@ paths need to be solid, not just the happy one.
 
 **Blocked by:** 12 (Tool-use round-trips).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A permission request from the agent surfaces in the UI describing what is
       being asked — an `approval.requested` activity carrying the `requestId`,

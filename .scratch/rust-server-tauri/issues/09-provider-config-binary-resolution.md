@@ -16,7 +16,7 @@ locatable, and is configured.
 **Blocked by:** 03 (Socket endpoint, local handshake, and the configuration
 method).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The agent binary is located on PATH without configuration on a machine where
       it is installed

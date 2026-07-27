@@ -8,7 +8,7 @@ session.
 **Blocked by:** 06 (Filesystem browse and file tree), 04 (First streaming
 subscription).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Creating a file outside the app makes it appear in the tree
 - [x] Deleting a file outside the app removes it from the tree

@@ -7,7 +7,7 @@ agent changes become reviewable.
 
 **Blocked by:** 19 (Working tree status with live refresh).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Branches are listed with the current one indicated
 - [x] Switching branches updates the working tree and the displayed status

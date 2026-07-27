@@ -10,7 +10,7 @@ reasons does not read as a hang.
 
 **Blocked by:** 10 (One complete agent turn, streamed).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] A tool invocation appears in the transcript naming the tool and its input —
       a `tool.updated` activity carrying the tool's name and its arguments, and

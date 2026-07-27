@@ -11,7 +11,7 @@ it depends on the agent session lifecycle as well as on git.
 **Blocked by:** 19 (Working tree status with live refresh), 10 (One complete agent
 turn, streamed).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The diff for a single agent turn can be viewed
 - [x] The cumulative diff for an entire conversation can be viewed

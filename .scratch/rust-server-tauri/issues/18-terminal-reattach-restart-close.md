@@ -8,7 +8,7 @@ process.
 
 **Blocked by:** 17 (Terminal: open, write, resize).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Navigating away and back reattaches to the same running session
 - [x] Scrollback from before detaching is still present after reattaching

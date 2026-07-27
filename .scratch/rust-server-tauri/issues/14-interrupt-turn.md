@@ -7,7 +7,7 @@ rather than vanishing or masquerading as a complete answer.
 
 **Blocked by:** 10 (One complete agent turn, streamed).
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] An in-flight turn can be interrupted from the UI — `thread.turn.interrupt`
       becomes a `control_request` with `{"subtype": "interrupt"}` on the agent's

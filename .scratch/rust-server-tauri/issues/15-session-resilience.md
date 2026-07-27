@@ -15,7 +15,7 @@ visible transcript.
 
 **Blocked by:** 10 (One complete agent turn, streamed).
 
-**Status:** ready-for-human
+**Status:** done
 
 **The encoder choice this ticket owned is settled: `error`.** See ADR-0004. A
 turn cut short by a dead agent is reported as a session error rather than as one
