@@ -2,7 +2,7 @@
 
 **What to build:** a socket that answers a client whose request ids are numbers.
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Found by:** ticket 32, the first time the shell was built against `laplus` at
 its own HEAD rather than the commit the vendored checkout was pinned to.
@@ -60,3 +60,26 @@ better than answering neither.
   `fixtures/socket-wire/` still conforms.
 - `Ack` and `Interrupt` correlate to a subscription opened with either form.
 - The real UI, driven headless, gets its configuration and renders the sidebar.
+
+## Comments
+
+### 2026-07-28 — agent. Done
+
+`RequestId` in `crate::wire`, parsing either shape and keeping the one it
+parsed. Equality and hashing go through a single canonical spelling, so the
+registry of open subscriptions agrees with itself whichever way an `Ack` names
+one; serialization does not, so a reply is addressed the way the request was.
+
+Small, in the end: five call sites outside `wire.rs` — `Subscriptions::{start,
+acknowledge,interrupt}`, its map, and `Server::defer`. Every existing test and
+every fixture passed untouched, which is the point worth keeping: string ids
+were never wrong, only insufficient.
+
+Two tests at the socket rather than at the type, because the type was not what
+failed here — the server was answering a frame it had already thrown away. One
+sends a numeric `Request` and requires a numeric `requestId` back; the other
+opens a subscription with a numeric id, feeds it an `Ack` and cancels it.
+
+Then the real UI: it boots, gets its configuration, and renders the project,
+its threads and the composer. Which is the whole bug, seen from the only place
+it was ever visible.
