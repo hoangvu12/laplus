@@ -36,6 +36,27 @@ never committed here (see `.gitignore`).
   README.
 - `.scratch/` — tracker files (see below) and raw capture evidence.
 
+## Running the tests
+
+`cargo test` covers the server. Two things about *how* to run it, both of which
+have already cost someone an afternoon (ticket 29):
+
+- **Use `--no-fail-fast`.** `cargo test` stops at the first failing binary, so
+  one failing lib test means no integration binary runs at all — and the summary
+  line then reads like a suite that lost two hundred tests rather than one that
+  never started them.
+- **Redirect to a file and grep the file; never pipe into `head`.** Piping kills
+  cargo mid-run and orphans the `git` children it had spawned, which then compete
+  with the *next* run. Several confusing failures have been self-inflicted this
+  way.
+
+A test in this repo **does not assert on elapsed wall-clock time.** It asserts on
+the decision the code made; timeouts exist to catch a hang, not to enforce a
+budget. `READ_TIMEOUT` in `tests/harness/mod.rs` carries the full reasoning. If
+the suite is slow on a loaded machine, `--test-threads` is the lever — raising a
+timeout until the machine passes trades a test that fails when it should not for
+one that passes when it should not.
+
 ## Agent skills
 
 ### Issue tracker

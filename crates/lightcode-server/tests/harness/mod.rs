@@ -49,7 +49,24 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 /// How long any single read may take before the test fails instead of hanging.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// **A hang detector, not a performance budget.** The distinction is the whole
+/// of ticket 29, and it is worth keeping straight before touching this number.
+///
+/// Many of these tests drive real `git` in real temporary workspaces, a dozen
+/// test binaries at a time. How long that takes is a fact about the machine, not
+/// about the server, so any value tight enough to work as a budget fails on a
+/// busy laptop against code that is perfectly correct. Worse, it fails as
+/// *`no frame within READ_TIMEOUT`* — which reads like a server that stopped
+/// answering rather than like a machine that ran out of room, and sends whoever
+/// meets it looking for a protocol bug. At five seconds that misdirection cost
+/// three separate tickets an afternoon each.
+///
+/// So this is deliberately far larger than any read should ever need. The cost
+/// of being too generous is paid only when something is genuinely wedged, once;
+/// the cost of being too tight is paid on every busy machine, forever. If the
+/// suite is uncomfortably slow, `--test-threads` is the lever — not this.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A server bound to a free loopback port, with the sockets it hands out.
 pub struct TestServer {
@@ -495,7 +512,7 @@ impl TestServer {
         loop {
             let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
                 .await
-                .expect("the server answers within the timeout")
+                .expect("no HTTP response within READ_TIMEOUT — wedged, not merely slow")
                 .expect("reads from the socket");
             if read == 0 {
                 break;
@@ -817,7 +834,7 @@ impl SocketClient {
         loop {
             let frame = tokio::time::timeout(READ_TIMEOUT, self.socket.next())
                 .await
-                .expect("a frame arrives within the timeout")
+                .expect("no frame within READ_TIMEOUT — wedged, not merely slow")
                 .expect("the socket is still open")
                 .expect("the frame is readable");
 

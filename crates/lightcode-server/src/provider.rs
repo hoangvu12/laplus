@@ -877,14 +877,21 @@ mod tests {
             Fake::saying(&format!("echo {version} (Claude Code)"))
         }
 
-        /// A binary that takes about a second to say anything. `ping` is the
-        /// platform's idiom for sleeping in a batch file without a console:
-        /// `timeout` needs one, and `powershell -c Start-Sleep` costs more to
-        /// start than it sleeps for.
+        /// A binary that takes about a second to say anything, and then says
+        /// something unmistakable. `ping` is the platform's idiom for sleeping
+        /// in a batch file without a console: `timeout` needs one, and
+        /// `powershell -c Start-Sleep` costs more to start than it sleeps for.
+        ///
+        /// It prints a version *after* the sleep so that waiting for it has a
+        /// visible consequence: a probe that sees this through to the end
+        /// returns `Version("9.9.9")`, which no correct probe can do within a
+        /// patience of milliseconds. That is what lets
+        /// [`a_binary_that_does_not_answer_is_given_up_on`] assert on a value
+        /// instead of on a stopwatch.
         fn dawdling() -> Fake {
             Fake::saying(match cfg!(windows) {
-                true => "ping -n 2 127.0.0.1 >nul",
-                false => "sleep 1",
+                true => "ping -n 2 127.0.0.1 >nul\r\necho 9.9.9 (Claude Code)",
+                false => "sleep 1\necho 9.9.9 (Claude Code)",
             })
         }
 
@@ -1107,19 +1114,42 @@ mod tests {
     /// A binary that never answers is given up on rather than holding the thread
     /// that asked. Driven with a patience of milliseconds — which is the reason
     /// `probe` takes one — against a binary that will not answer for a second.
+    ///
+    /// **The returned value is the whole assertion, and that is deliberate.**
+    /// `Probed::TimedOut` is produced in exactly one place — the deadline arm of
+    /// the poll loop — so getting it back *is* the proof that the deadline is
+    /// what ended the wait. A probe that instead waited for the child would have
+    /// broken out of that loop and read its output, and come back
+    /// `Version("9.9.9")`; the fake prints one so that the wrong behaviour has a
+    /// name rather than being inferred.
+    ///
+    /// This test used to also assert `started.elapsed() < 900ms`. That assertion
+    /// could not fail without this one failing first, since the only route to
+    /// `TimedOut` already excludes waiting for the child — so all it added was a
+    /// measurement of how long this machine takes to spawn a process, which is
+    /// why it went red under load against correct code. Ticket 29; see the
+    /// convention there before adding a wall-clock assertion anywhere in this
+    /// repo.
     #[test]
     fn a_binary_that_does_not_answer_is_given_up_on() {
         let dawdling = Fake::dawdling();
-        let started = Instant::now();
 
         assert_eq!(
             probe(&dawdling.path(), Duration::from_millis(50)),
-            Probed::TimedOut
+            Probed::TimedOut,
+            "anything else means the probe waited for the child rather than for its deadline",
         );
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "gave up after {:?}, so it waited for the child rather than for the deadline",
-            started.elapsed()
+
+        // And the other half: given patience, the same fake answers. Without
+        // this the test above could pass against a fake that says nothing at
+        // all — `TimedOut` for the wrong reason — and an assertion that cannot
+        // distinguish the two behaviours is not testing either of them. This is
+        // the second worth spending; it is what makes the first assertion mean
+        // "gave up early" rather than "did not get a version".
+        assert_eq!(
+            probe(&dawdling.path(), PROBE_TIMEOUT),
+            Probed::Version("9.9.9".to_string()),
+            "the fake must be able to answer, or timing out proves nothing",
         );
     }
 
