@@ -25,7 +25,7 @@
 //! The split with the shell is deliberate: **this module is the policy, the
 //! shell is the payload.** What a path resolves to, what content type it gets
 //! and what may be cached is decided and tested here against a handful of
-//! bytes; the real 17 MB of `laplus/apps/web/dist` is a static table generated
+//! bytes; the real 17 MB of `apps/web/dist` is a static table generated
 //! in `laplus-shell`'s build script and handed in at startup. A server crate
 //! that embedded the bundle itself would put it into every test binary, and the
 //! suite would pay for it on every build.

@@ -27,7 +27,7 @@ calls, thinking, permission requests and their resolutions. `crate::worklog`.
 **Activity** — one row in the work log.
 
 **Snapshot** — a subscription's opening description of the world, and the thing
-every event after it is a *diff against*. Not an optimisation and not merely the
+every event after it is a _diff against_. Not an optimisation and not merely the
 first chunk: the client folds an event only into state it already holds, so a
 subscription that opens without a snapshot has its whole contents discarded on
 arrival, silently. Ticket 28 was that, for a whole turn. The question to ask of
@@ -35,12 +35,12 @@ any subscription here is never "are the events right" but "does the client have
 anything to fold them into".
 
 **Resume** — a subscription from a client that says it already holds the
-conversation, by sending `afterSequence`. The one case that is *not* refused for
+conversation, by sending `afterSequence`. The one case that is _not_ refused for
 a thread this server does not have, because a client with its own copy can still
 draw it and an empty snapshot would be a claim that copy is wrong.
 `crate::threads::Watch::resuming`.
 
-Only the cursor's *presence* is read. Its value is ignored, and what that costs
+Only the cursor's _presence_ is read. Its value is ignored, and what that costs
 depends on the case: for a conversation this server holds, the client asked for
 the tail after its cursor and gets the whole thing as a snapshot instead — more
 bytes than the reference server sends, and correct, because a snapshot replaces
@@ -71,7 +71,7 @@ duration cover the whole turn. Upstream's word (`decider.settled.test.ts`,
 `threadSettled.test.ts`), kept.
 
 Note the two are not opposites of each other. `interrupted` and `stopped` are
-different *statuses* — the developer asked, versus the process went away — and
+different _statuses_ — the developer asked, versus the process went away — and
 both settle a turn as `interrupted`, because from the turn's point of view they
 are the same thing: it did not finish.
 
@@ -90,7 +90,7 @@ failures: an unrecognised event type and a line that is not JSON at all.
 session reports its total.
 
 **Compaction** — the agent summarising its own conversation to make room, and
-carrying on. A fact about what the *agent* can still see; the transcript is this
+carrying on. A fact about what the _agent_ can still see; the transcript is this
 server's own copy and is untouched by one. `crate::protocol::Compaction`.
 
 **Standing** — how the developer's account is placed against its usage limits,
@@ -127,7 +127,7 @@ becomes one read.
 `crate::git::Repositories`. Bounded at the same number as watched workspaces,
 because a status that cannot be watched cannot stay true.
 
-**Disturb** — telling a kept working tree it is stale because *this server*
+**Disturb** — telling a kept working tree it is stale because _this server_
 just changed it, rather than waiting for the watcher to notice. What a switch
 and an init do. The same door a file change comes through, opened from the
 inside; see ADR-0006 for why it marks rather than reads.
@@ -139,7 +139,7 @@ kept as a parentless commit under a ref of the project's own repository.
 `crate::checkpoints`. The contract's word, and the thing that makes a turn a
 point in time a diff can run to.
 
-**Baseline** — the checkpoint a turn is diffed *from*: the one taken before the
+**Baseline** — the checkpoint a turn is diffed _from_: the one taken before the
 prompt reached the agent. Turn one's baseline is turn count zero; every later
 turn's baseline is the checkpoint the turn before it ended with, which is what
 makes a conversation's checkpoints a chain rather than a set of pairs.
@@ -152,11 +152,11 @@ from `n - 1` to `n` and a whole conversation's from `0` to `n`.
 coherent change. Two methods over one range: a thread diff is a turn diff whose
 `fromTurnCount` is zero.
 
-A checkpoint is a *photograph*, not a record of authorship — see ADR-0008. It
+A checkpoint is a _photograph_, not a record of authorship — see ADR-0008. It
 does not know who changed a file, so an edit the developer made by hand between
 two turns belongs to the turn it happened during, beside the agent's own.
 
-**Checkpoint status** — how the turn a checkpoint records *went*, not whether
+**Checkpoint status** — how the turn a checkpoint records _went_, not whether
 recording it worked. The contract's three (`ready`, `missing`, `error`), of which
 this server sends two: the client reads the status back into the turn's state, so
 a status that disagreed with how the turn ended would relabel it. There is none
@@ -171,7 +171,7 @@ server keeps the word rather than translating it back. `crate::refs`.
 
 Not every ref is a branch: a **remote ref** (`origin/main`) is a record of
 where a branch was on a remote, and is not something a working tree can be
-*on*. Switching to one means making the local branch that tracks it.
+_on_. Switching to one means making the local branch that tracks it.
 
 **Current** — the ref this workspace has checked out. A property of a place,
 not of a repository: the same branch is current in one worktree and merely
@@ -189,7 +189,7 @@ show one unless the client asks (`includeMatchingRemoteRefs`).
 
 **Preferences** — the directory this server keeps the developer's own files in:
 `settings.json`, `keybindings.json`, the logs and the registry. On
-`ServerConfig` and deliberately off the wire; the paths that *are* on the wire
+`ServerConfig` and deliberately off the wire; the paths that _are_ on the wire
 are derived from it.
 
 **Patch** — a settings change, every field optional, where an absent field means
@@ -204,8 +204,8 @@ keybinding is what the UI consumes — the shortcut split into the flags a
 `KeyboardEvent` carries, and the `when` expression parsed into a tree. Compiling
 one into the other is `crate::keybindings`, because the client holds no file.
 
-**Merge by command** — a custom rule replaces the default for the *same
-command*, however either is spelled. What makes rebinding one shortcut leave the
+**Merge by command** — a custom rule replaces the default for the _same
+command_, however either is spelled. What makes rebinding one shortcut leave the
 other forty alone, and what makes removing one bring its default back rather
 than leaving nothing.
 
@@ -245,7 +245,7 @@ everything it says goes into the scrollback the next attachment is sent.
 
 **Exited** and **closed** — two different endings, and the contract has an event
 for each. A terminal whose shell exited is still on the list, still readable,
-and can be given a new shell by name. A terminal that was *closed* is gone: the
+and can be given a new shell by name. A terminal that was _closed_ is gone: the
 developer said so, the process was killed and waited for, and the id no longer
 names anything. Reaping happens at the second, never the first.
 
@@ -256,22 +256,22 @@ running inside the same process. `crates/laplus-shell`. The server is a
 library to it, not a service it talks to, which is why closing the window is
 what reaps the agents.
 
-**laplus** — the UI, as a repository this project owns: a fork of t3code, cloned
-beside this one. Where the window's contents are changed, and the answer to
-"can we fix that in the client?", which used to be no. See ADR-0012. Also, since
-the rename, what this whole product is called.
+**laplus** — the product, and the repository: a fork of t3code holding both
+halves of it. `apps/web` is the UI and the answer to "can we fix that in the
+client?", which used to be no (ADR-0012); `server/` is this Rust workspace, and
+was its own repository until ADR-0014. One name for all of it since the rename.
 
 **lightcode** — what laplus was called until ticket 30 closed. Retired from the
-live code entirely, and deliberately *not* rewritten anywhere it is a record of
+live code entirely, and deliberately _not_ rewritten anywhere it is a record of
 something: `fixtures/` are captures of real traffic and the paths inside them
 happened, `.scratch/` tickets and `docs/adr/` are dated statements of what was
 decided at the time, and editing either would make them claim to be evidence of
 things that never occurred. So roughly sixty mentions survive on purpose. If a
 mention is in code, configuration or living documentation, it is a bug.
 
-**Bundle** — laplus's built web application, `laplus/apps/web/dist`, as it
-reaches the executable: a table of names and bytes generated at build time.
-Source maps are the one thing dropped, and they are two thirds of it.
+**Bundle** — the built web application, `apps/web/dist`, as it reaches the
+executable: a table of names and bytes generated at build time. Source maps are
+the one thing dropped, and they are two thirds of it.
 
 **Upstream** — `pingdotgg/t3code`. Still the origin of every line of the UI and
 of the contract, and still the thing laplus is measured against — but now a
@@ -284,7 +284,7 @@ which is what keeps a UI out of the test binaries and out of the plain server.
 **Entry point** — `index.html`, and the answer to any path that looks like one
 of the UI's own **routes** rather than a file. The UI routes in the browser, so
 `/settings` is a path this server has never heard of and must not 404. A missing
-*file* still must.
+_file_ still must.
 
 **Server version** — `environment.serverVersion`, and in the shell it is the
 **bundle's** version rather than the crate's. Not a claim about the binary: the
@@ -309,13 +309,13 @@ separated them; the data has not moved. See ADR-0013.
 ## Measuring the artifact
 
 The vocabulary of `cargo xtask release`, which exists because the project has a
-number to hit. Note that **bundle** is *not* in this list: it means the web
+number to hit. Note that **bundle** is _not_ in this list: it means the web
 bundle above and nothing else, which is why the command is `release`.
 
 **Artifact** — what a developer ends up with. Three figures rather than one, and
 they differ by more than rounding: the **installer** is what they download
 (5.06 MB, LZMA-compressed), the **footprint** is what it leaves on their disk
-(24.33 MB), and the **binary** is the application alone. The spec's "under
+(24.34 MB), and the **binary** is the application alone. The spec's "under
 ~30 MB" story is about the first.
 
 **Footprint** — a directory, weighed. Measured two ways and it says which:
@@ -325,13 +325,13 @@ anything. Only the first is the truth; the second is what runs when the machine
 has not been volunteered.
 
 **Target** — 20–30 MB, against upstream's 318 MB **baseline**. Only the ceiling
-can be *missed*; coming in under the floor is the project working, not a fault,
+can be _missed_; coming in under the floor is the project working, not a fault,
 which is why `size::Verdict` has three cases and not two.
 
 **Breakdown** — a Rust source, split into total, comments, `#[cfg(test)]` unit
 tests, blank, and what is left. What is left is **production code**, and it is
 the figure set against the spec's ~20K **signal** — the total is three times
-larger, mostly prose and this server's own tests, and reporting *it* would trip
+larger, mostly prose and this server's own tests, and reporting _it_ would trip
 an alarm about scope creep that has not happened.
 
 **Balanced** — a scan that ended where a Rust file is allowed to end: outside

@@ -35,3 +35,15 @@ node_modules/
 *.log
 .env*
 !.env.example
+
+# Unredacted proxy recordings from server/tools/wire-capture. These hold live
+# session tokens, and this repository is public. The redacted, committable
+# versions live in server/fixtures/socket-wire/ — see
+# server/docs/socket-wire-format.md. Everything else under .scratch/ is tracker
+# content and is committed on purpose.
+.scratch/wire-capture/raw/
+
+# One run's worth of socket frames from server/tools/ui-driver/repro.mjs,
+# rewritten every run. Output rather than evidence, and a transcript of a live
+# session.
+server/tools/ui-driver/frames.log

@@ -8,11 +8,12 @@
 //! two things an off-the-shelf embedder would not give — a filter, and a failure
 //! that says what to do.
 //!
-//! **The bundle comes from a repository this project owns.** Ticket 32 replaced
-//! the read-only t3code checkout with `laplus`, our fork of it, living beside
-//! this one. What that changes here is only the path and the sentence in the
-//! failure — but it changes what a stale `dist/` *means*, from a vendoring
-//! detail into a bug in this project. See `docs/adr/0012`.
+//! **The bundle comes from this repository.** Ticket 32 replaced the read-only
+//! t3code checkout with a fork we own, and ADR-0014 then brought the server
+//! into that fork, so `apps/web` is now three directories up rather than a
+//! second checkout. What that changed here is a path and a sentence — but what
+//! ticket 32 changed is what a stale `dist/` *means*, from a vendoring detail
+//! into a bug in this project. See `docs/adr/0012`.
 //!
 //! **Source maps are excluded.** `dist/` is 54 MB, of which 37 MB is `.map`
 //! files: debug data this project does not debug, which nothing loads unless a
@@ -38,11 +39,10 @@ fn main() {
         panic!(
             "no web assets under {}.\n\
              \n\
-             laplus's window shows laplus's built UI. laplus is this project's fork of\n\
-             t3code and lives beside this repository, not inside it:\n\
+             This window shows `apps/web`, which is in this repository and is not\n\
+             built by cargo. Build it from the repository root:\n\
              \n\
-                 git clone https://github.com/hoangvu12/laplus.git\n\
-                 cd laplus && pnpm install && pnpm --filter @t3tools/web build\n\
+                 pnpm install && pnpm --filter @t3tools/web build\n\
              \n\
              The server itself needs none of this: `cargo run -p laplus-server` is a\n\
              socket endpoint with no window.",
@@ -66,7 +66,7 @@ fn main() {
 
     writeln!(
         generated,
-        "\n/// The version `laplus/apps/web/package.json` gives the bundle above.\n\
+        "\n/// The version `apps/web/package.json` gives the bundle above.\n\
          /// Ticket 26: the server reports this as its own, because it is the\n\
          /// number that UI compares against.\npub static VERSION: &str = {:?};",
         bundle_version(&manifest)
@@ -79,14 +79,14 @@ fn main() {
     tauri_build::build();
 }
 
-/// Where laplus's `dist/` is, relative to this crate.
+/// Where the UI's `dist/` is, relative to this crate.
 ///
-/// A path rather than a search, and still one after ticket 32 moved it outside
-/// this repository: a checkout at a known place is something a developer can be
-/// told to make, where looking around for a `dist/` would mean embedding
-/// whatever happened to be lying about. The cost of it being a *sibling* is that
-/// this path now assumes a layout rather than describing one, which is why the
-/// failure above prints the two commands that produce it.
+/// A path rather than a search: looking around for a `dist/` would mean
+/// embedding whatever happened to be lying about. Ticket 32 made this path
+/// reach outside the repository and ADR-0014 brought it back inside, which is
+/// the difference between a layout this assumes and one it describes. The
+/// failure above still prints the command that produces the bundle, because
+/// `pnpm` is not something `cargo build` will do for you.
 fn bundle_directory() -> PathBuf {
     web_directory().join("dist")
 }
@@ -96,12 +96,12 @@ fn bundle_directory() -> PathBuf {
 fn web_directory() -> PathBuf {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets this"));
     manifest
-        // crates/laplus-shell -> crates -> laplus -> the directory both
-        // checkouts sit in.
+        // server/crates/laplus-shell -> crates -> server -> the repository
+        // root, where the UI this shell wears is an ordinary sibling
+        // directory rather than a second checkout.
         .join("..")
         .join("..")
         .join("..")
-        .join("laplus")
         .join("apps")
         .join("web")
 }

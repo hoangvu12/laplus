@@ -1,8 +1,11 @@
 # laplus — the server and the shell
 
+**This file covers `server/`.** The repository root has its own `CLAUDE.md`,
+which is upstream's and is about the TypeScript side.
+
 A Rust server + Tauri shell that drives the `claude` CLI directly, wearing the
-`apps/web` UI from the laplus UI repository. See `HANDOFF-rust-server-tauri.md`
-for the plan and `spike-claude-protocol/README.md` for the STEP 1 protocol spike
+`apps/web` UI from this same repository. See `HANDOFF-rust-server-tauri.md` for
+the plan and `spike-claude-protocol/README.md` for the STEP 1 protocol spike
 that gated it (answered; its code now lives in the workspace).
 
 **This project was called `lightcode` until the rename.** Every ticket in
@@ -10,42 +13,46 @@ that gated it (answered; its code now lives in the workspace).
 name and still says it — see the **lightcode** entry in `CONTEXT.md`. Nothing in
 the live code does.
 
-## The UI lives in another repository, for now
-
-The UI repository — <https://github.com/hoangvu12/laplus>, this project's fork
-of `pingdotgg/t3code` — is cloned **beside** this one, not inside it:
+## Where this sits in the repository
 
 ```
-nguyenvu/
-├── lightcode/   ← this checkout: the Rust server, the shell, the tickets
-└── laplus/      ← the UI. `apps/web` builds the bundle the shell embeds
+laplus/
+├── apps/web        the UI this shell embeds. Upstream's, ours to edit
+├── packages/       @t3tools/{contracts,client-runtime,shared} — the contract
+├── server/         ← you are here: the Rust server, the shell, the release
+└── .scratch/       the tickets, for both halves
 ```
 
-Both are being merged into the UI repository, with this tree becoming `server/`
-there. Until that lands, the two directory names above are what is on disk.
+`apps/{server,desktop,mobile,marketing}` and `infra/` are upstream's and nothing
+here builds them — `apps/server` and `apps/desktop` are the two this project
+replaced. They are **not deleted**, because deleting paths upstream still
+maintains is what turns a merge into a fight (`docs/adr/0012`). If they are not
+in your working tree, that is `git sparse-checkout`, not a missing clone;
+`git sparse-checkout disable` brings them back.
 
-The shell's build script reads `../laplus/apps/web/dist`, and says what to clone
-if it is not there. Building it is `pnpm install && pnpm --filter @t3tools/web
-build` in `laplus/`. Ticket 32 and `docs/adr/0012` are why it is a fork we own
-rather than the read-only checkout it used to be; the short version is that
-three tickets were all "the client does something we cannot change".
+The shell's build script reads `../../../apps/web/dist` and says what to run if
+it is not there: `pnpm install && pnpm --filter @t3tools/web build`, from the
+repository root. `cargo build` will not do that for you — a stale `dist/` is a
+bug in this project rather than a vendoring detail, which is what ticket 32
+changed. `docs/adr/0014` is why the two trees are one repository.
 
-Upstream is a remote of that repo (`upstream`, push disabled), so a sync is a
-`git merge` there rather than a re-vendoring here. Its `@t3tools/*` package scope
-is deliberately **not** renamed — it appears in 1,069 files, and renaming it
-would conflict with upstream on nearly every merge.
-
-`t3code/` may still be present here as the old depth-1 read-only checkout. It is
-gitignored, nothing builds from it any more, and it is worth keeping only as the
-*unmodified* upstream UI that user story 57 asks to connect to this server.
+`upstream` is a remote of this repository (`pingdotgg/t3code`, push disabled),
+so a sync is a `git merge`. Its `@t3tools/*` package scope is deliberately
+**not** renamed — it appears in 1,069 files, and renaming it would conflict with
+upstream on nearly every merge.
 
 ## Layout
 
-- `crates/laplus-server/` — the server. Cargo workspace root is the repo root.
+All paths below are relative to `server/`, which is the Cargo workspace root —
+`Cargo.toml`, `.cargo/config.toml` and `target/` are here, not at the repository
+root, so cargo commands are run from this directory.
+
+- `crates/laplus-server/` — the server.
 - `crates/laplus-shell/` — the desktop application: a Tauri window with the
-  server running inside it. Its build script embeds `../laplus/apps/web/dist`,
-  so it needs that checkout built. **It is not a default workspace member**
-  for exactly that reason: `cargo build` and `cargo test` cover the server only,
+  server running inside it. Its build script embeds the repository's
+  `apps/web/dist`, so it needs that built by `pnpm`. **It is not a default
+  workspace member** for exactly that reason: `cargo build` and `cargo test`
+  cover the server only,
   and the shell is asked for by name (`cargo run -p laplus-shell`,
   `cargo test -p laplus-shell`). `nsis/installer.nsi` is tauri-bundler's
   installer template, vendored and changed in two places so that laplus
@@ -54,7 +61,7 @@ gitignored, nothing builds from it any more, and it is worth keeping only as the
   tauri-cli is upgraded**; its header says how, and `cargo test -p xtask` fails
   if either change goes missing.
 - `xtask/` — how a release is made: `cargo xtask release` builds the Windows
-  installer *and* measures it, because the project exists for that number. Writes
+  installer _and_ measures it, because the project exists for that number. Writes
   `docs/artifact-size.md`. `--measure-install` additionally installs, weighs and
   uninstalls, which is opt-in because it touches the machine — and refuses if
   laplus is already installed, rather than uninstalling someone's copy.
@@ -67,14 +74,17 @@ gitignored, nothing builds from it any more, and it is worth keeping only as the
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.
 - `tools/ui-driver/` — a headless browser pointed at a running laplus, over
   the DevTools protocol. The other end of the same wire: `wire-capture` records
-  what the *reference server* answers, this drives what the *real client* does,
+  what the _reference server_ answers, this drives what the _real client_ does,
   and it is the only way the UI half of this application can be checked. Has a
   README.
-- `.scratch/` — tracker files (see below) and raw capture evidence.
+- `../.scratch/` — tracker files (see below) and raw capture evidence. At the
+  repository root rather than in here, because the tickets cover the UI as much
+  as the server: 31 is a client fix, 26 was one, and 24's open question is about
+  the web bundle.
 
 ## Running the tests
 
-`cargo test` covers the server. Two things about *how* to run it, both of which
+`cargo test` covers the server. Two things about _how_ to run it, both of which
 have already cost someone an afternoon (ticket 29):
 
 - **Use `--no-fail-fast`.** `cargo test` stops at the first failing binary, so
@@ -83,7 +93,7 @@ have already cost someone an afternoon (ticket 29):
   never started them.
 - **Redirect to a file and grep the file; never pipe into `head`.** Piping kills
   cargo mid-run and orphans the `git` children it had spawned, which then compete
-  with the *next* run. Several confusing failures have been self-inflicted this
+  with the _next_ run. Several confusing failures have been self-inflicted this
   way.
 
 A test in this repo **does not assert on elapsed wall-clock time.** It asserts on
@@ -97,7 +107,7 @@ one that passes when it should not.
 
 ### Issue tracker
 
-Local markdown — issues and specs live as files under `.scratch/<feature-slug>/`; this repo has no git remote. See `docs/agents/issue-tracker.md`.
+Local markdown — issues and specs live as files under `.scratch/<feature-slug>/` at the repository root, not on GitHub. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
@@ -105,4 +115,4 @@ The five canonical roles, unchanged (`needs-triage`, `needs-info`, `ready-for-ag
 
 ### Domain docs
 
-Single-context — one `CONTEXT.md` and one `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context — one `CONTEXT.md` and one `docs/adr/`, both at the root of `server/` rather than of the repository, because they are this half's vocabulary and this half's decisions. See `docs/agents/domain.md`.

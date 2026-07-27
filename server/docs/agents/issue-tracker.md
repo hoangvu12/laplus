@@ -1,8 +1,10 @@
 # Issue tracker: Local Markdown
 
-Issues and specs (you may know a spec as a PRD) for this repo live as markdown files in `.scratch/`.
+Issues and specs (you may know a spec as a PRD) for this repo live as markdown files in `.scratch/`, at the **repository root** — not under `server/`. The tickets cover the UI as much as the server.
 
-This repo has no git remote, so the `gh` / `glab` workflows do not apply. `.scratch/` is deliberately **not** gitignored — tracker files are committed and version alongside the code.
+`.scratch/` is deliberately **not** gitignored: tracker files are committed and version alongside the code. That is the point of them, and it is why they are markdown rather than GitHub issues — a ticket and the commit that closes it move together.
+
+This repository does have remotes (`origin`, and `upstream` with push disabled), so `gh` is available. It is still not how tickets are tracked here. Do not open GitHub issues for this work.
 
 ## Conventions
 
@@ -20,8 +22,12 @@ leave them where they are. Tracker content always lives one level down, inside a
 The one exception to "`.scratch/` is not gitignored" is
 `.scratch/wire-capture/raw/`. Those are unredacted proxy recordings that contain
 live session tokens; the redacted, committable versions live in
-`fixtures/socket-wire/` (see `docs/socket-wire-format.md`). Anything else added
-under `.scratch/` is still committed by default.
+`server/fixtures/socket-wire/` (see `server/docs/socket-wire-format.md`).
+Anything else added under `.scratch/` is still committed by default.
+
+That rule lives in the **repository root** `.gitignore` since ADR-0014 — it used
+to be in the server's, which no longer sits above `.scratch/`. It matters more
+than it did: this repository is public.
 
 ## When a skill says "publish to the issue tracker"
 
