@@ -7,7 +7,7 @@ server 0.1.0. Relaunch the server with the copied command to sync them." above
 the composer, on every launch, in a fresh profile. Nothing is wrong; there is one
 process and it is this one.
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Found by:** ticket 23, the first time the real UI was run against this server in
 a window. It has presumably been true since ticket 03 and nobody could see it.
@@ -67,3 +67,42 @@ Version skew between this server and its embedded UI is not a thing that can
 happen — they ship in one binary — so the check is vestigial here rather than
 satisfied. Say so where the value is set, or the next person will read it as a
 working comparison.
+
+### 2026-07-27 — agent. Done, and looked at in the window
+
+Option 2 as triaged. The version travels **with the bundle**: the shell's build
+script reads `version` from `t3code/apps/web/package.json` and emits it beside
+the asset table, `ui::Assets` carries it, and `Server::bind_with` applies it.
+That placement is the load-bearing bit — the config and the bundle meet in
+exactly one function, so a shell that shipped a UI could not report somebody
+else's number even by forgetting to.
+
+`ServerConfig::serving_ui_version` is where the honesty note asked for above
+lives, and it says the thing directly: this removes a check rather than passing
+one. `docs/adr/0011` records the decision at the size the next fork-leak ticket
+will want.
+
+**Verified against the real UI**, since that is where the bug was and no test in
+this repo can see a banner. Two `probe-boot.mjs` runs, each in a fresh headless
+Chrome profile:
+
+| Build | `serverVersion` | Composer |
+|---|---|---|
+| The instance already running (pre-change) | `0.1.0` | "Client and server versions differ — Client 0.0.28 is connected to server 0.1.0. Relaunch the server with the copied command to sync them." |
+| This change, on `LIGHTCODE_PORT=4774` with its own `LOCALAPPDATA` | `0.0.28` | nothing above it |
+
+That second launch is also how a change to the shell can be looked at without
+closing the lightcode already open — a running `lightcode.exe` holds a lock on
+its own file, so `cargo build -p lightcode-shell` cannot even relink while one is
+up. `probe-boot.mjs` now takes the URL as an argument for it.
+
+Tests: the seam gets a unit test on each side (`ui.rs` for the bundle carrying a
+version, `config.rs` for what a server reports with and without one) and a wire
+test on both answers the client reads (`http_ui.rs` — `/.well-known/t3/environment`
+and `server.getConfig`, since a disagreement between those two would raise the
+banner just as well). The one worth knowing about is in the shell:
+`the_version_reported_is_the_one_the_ui_compares_against` reads the shipped
+JavaScript and requires the `APP_VERSION` beside it to be the number this server
+will report — because Vite prefers an `APP_VERSION` environment variable over
+`package.json`, and a `dist/` built that way would put the banner back with
+nothing else noticing.

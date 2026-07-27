@@ -24,3 +24,8 @@ tokio.workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2", default-features = false }
+# To read one field out of upstream's `package.json` — the version the embedded
+# UI was built as, which ticket 26 makes this server's own. A build dependency
+# is not linked into the artifact, and hand-rolling the read would mean deciding
+# what to do about escapes and comments in somebody else's file.
+serde_json.workspace = true

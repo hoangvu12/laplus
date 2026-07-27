@@ -1751,6 +1751,7 @@ name = "lightcode-shell"
 version = "0.1.0"
 dependencies = [
  "lightcode-server",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tokio",

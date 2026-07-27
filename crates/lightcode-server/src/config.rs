@@ -74,6 +74,9 @@ pub struct EnvironmentDescriptor {
     pub environment_id: String,
     pub label: String,
     pub platform: Platform,
+    /// What the client compares its own `APP_VERSION` against. This crate's
+    /// version by default, and the shipped UI's when there is one — see
+    /// [`ServerConfig::serving_ui_version`], which is the whole of that story.
     pub server_version: String,
     pub capabilities: Capabilities,
 }
@@ -428,6 +431,38 @@ impl ServerConfig {
         }
     }
 
+    /// Report the version of the UI this server ships, in place of the server
+    /// crate's own.
+    ///
+    /// **This does not make a version check pass; it removes one.** The UI
+    /// compares `APP_VERSION` — the number baked into its bundle at build time
+    /// — against `environment.serverVersion` by string equality, and shows a
+    /// banner offering to relaunch the server when they differ. That check is
+    /// for upstream's shape, where a long-running server is talked to by a
+    /// browser holding whatever the last deploy gave it. Here the server *is*
+    /// the UI's container: they are one executable, built together, and there
+    /// is no arrangement of the two that could produce a real skew. Reporting
+    /// `env!("CARGO_PKG_VERSION")` meant advertising `0.1.0` at a client
+    /// certain it was `0.0.28`, and every launch opened on advice — relaunch
+    /// the server to sync them — that named no action the developer could take.
+    ///
+    /// So the two numbers are made equal because they describe one artifact,
+    /// and the client's comparison is left with nothing to find. Anyone reading
+    /// a passing check here as *evidence* of anything is reading it wrongly:
+    /// ticket 26 is where the reasoning is, and the honest summary is that the
+    /// check is vestigial in lightcode rather than satisfied by it.
+    ///
+    /// A server with no bundle — the plain `lightcode-server` binary, which is
+    /// pointed at by a development server or a browser this project did not
+    /// build — never calls this and keeps the crate version, which is the true
+    /// answer for a server that is not claiming to match any particular UI.
+    ///
+    /// See `docs/adr/0011-the-server-reports-the-version-of-the-ui-it-ships.md`.
+    pub fn serving_ui_version(mut self, version: &str) -> ServerConfig {
+        self.environment.server_version = version.to_string();
+        self
+    }
+
     pub fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("server config serializes")
     }
@@ -595,6 +630,23 @@ mod tests {
             assert_eq!(text, text.trim(), "{path} is trimmed");
             assert!(!text.is_empty(), "{path} is non-empty");
         }
+    }
+
+    /// Ticket 26. A server that ships a UI answers with that UI's version, so
+    /// the client's skew banner has nothing to report; one that ships no UI
+    /// keeps this crate's version, which is the only honest answer it has.
+    #[test]
+    fn a_shipped_ui_lends_the_server_its_version_and_nothing_else_does() {
+        let plain = ServerConfig::detect();
+        assert_eq!(plain.environment.server_version, env!("CARGO_PKG_VERSION"));
+
+        let serving = ServerConfig::detect().serving_ui_version("0.0.28");
+        assert_eq!(serving.environment.server_version, "0.0.28");
+        assert_eq!(
+            serving.to_value()["environment"]["serverVersion"],
+            serde_json::json!("0.0.28"),
+            "the wire carries the number the client compares, not the one behind it"
+        );
     }
 
     /// The descriptor names the cookie the UI should send and [`crate::auth`]

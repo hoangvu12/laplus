@@ -29,7 +29,7 @@ node tools/ui-driver/repro.mjs 40
 | File | What it does |
 | --- | --- |
 | `cdp.mjs` | Launches headless Chrome, attaches, and exposes the DOM, the console, and **every WebSocket frame in both directions** |
-| `probe-boot.mjs` | Boots the UI and dumps what it says on the socket. Start here |
+| `probe-boot.mjs` | Boots the UI and dumps what it says on the socket. Start here. Takes the URL as an argument, for the second-instance recipe below |
 | `probe-open-thread.mjs` | Clicks a conversation in the sidebar and prints the pane. Ticket 28's free discriminator |
 | `repro.mjs` | Types a prompt into the composer of a new thread and watches the pane. Exit code 1 if the reply never renders |
 
@@ -40,6 +40,28 @@ Set `CHROME` if yours is not at the Windows default. `probe-open-thread.mjs` is
 the one file here that is *not* general: it names the thread id and the sidebar
 row from the machine ticket 28 was found on, and wants both changed before it
 means anything elsewhere.
+
+## Looking at a change without closing the lightcode already open
+
+Start a second one somewhere else, and point the probe at it:
+
+```
+LOCALAPPDATA=/tmp/lc-probe LIGHTCODE_PORT=4774 ./target/release/lightcode.exe &
+node tools/ui-driver/probe-boot.mjs http://127.0.0.1:4774/
+```
+
+`LOCALAPPDATA` gives it a profile of its own — an empty registry, and no share of
+the running instance's SQLite file. Copy `state.sqlite` in from the real one if
+the screen you are looking at needs a project to exist. The port is what makes it
+a **fresh browser profile** too, since `localStorage` is scoped per origin: on a
+new port the UI has forgotten every banner that was ever dismissed, which is the
+state ticket 26 was about.
+
+Ticket 26 also found the reason this recipe is needed at all: a running
+`lightcode.exe` holds a **lock on its own file**, so `cargo build -p
+lightcode-shell` cannot relink while one is up — it fails with `Access is
+denied. (os error 5)`. `--release` writes a different file, which is the way past
+it that does not involve closing somebody's window.
 
 ## The frame log is the point
 

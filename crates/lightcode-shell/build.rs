@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let bundle = bundle_directory();
+    let manifest = web_directory().join("package.json");
     println!("cargo::rerun-if-changed={}", bundle.display());
+    println!("cargo::rerun-if-changed={}", manifest.display());
 
     let mut files = Vec::new();
     collect(&bundle, &bundle, &mut files);
@@ -53,6 +55,15 @@ fn main() {
     }
     generated.push_str("];\n");
 
+    writeln!(
+        generated,
+        "\n/// The version `t3code/apps/web/package.json` gives the bundle above.\n\
+         /// Ticket 26: the server reports this as its own, because it is the\n\
+         /// number that UI compares against.\npub static VERSION: &str = {:?};",
+        bundle_version(&manifest)
+    )
+    .expect("writing to a string cannot fail");
+
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     std::fs::write(out.join("assets.rs"), generated).expect("the generated table is written");
 
@@ -65,6 +76,12 @@ fn main() {
 /// place in this repository, and looking for it anywhere else would mean
 /// embedding whatever happened to be lying around.
 fn bundle_directory() -> PathBuf {
+    web_directory().join("dist")
+}
+
+/// The web package the bundle was built from — `dist/`'s own directory, and
+/// where `package.json` is.
+fn web_directory() -> PathBuf {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets this"));
     manifest
         .join("..")
@@ -72,7 +89,56 @@ fn bundle_directory() -> PathBuf {
         .join("t3code")
         .join("apps")
         .join("web")
-        .join("dist")
+}
+
+/// What the UI calls itself: `package.json`'s `version`.
+///
+/// Ticket 26 makes this the server's advertised `serverVersion`, because the
+/// client compares that field against the same number compiled into its own
+/// bundle and offers to relaunch the server when they differ — advice that
+/// names no action when the server and the UI are one executable.
+///
+/// This is the manifest rather than the bundle because it is a number in a
+/// field rather than a needle in minified JavaScript. Vite bakes the same value
+/// in as `APP_VERSION` — unless the person who ran the build set that variable
+/// — and `the_version_reported_is_the_one_the_ui_compares_against` in `main.rs`
+/// is what checks the two did not part company.
+///
+/// A failure here is a panic rather than a fallback for the same reason the
+/// missing-bundle failure above is: a shell built with a version it had to
+/// guess would ship the banner back, silently, and the read is of a file that
+/// is necessarily there — `dist/` was built from it.
+fn bundle_version(manifest: &Path) -> String {
+    let source = std::fs::read_to_string(manifest).unwrap_or_else(|error| {
+        panic!(
+            "cannot read {}: {error}.\n\
+             \n\
+             This is upstream's web package manifest, beside the `dist/` this build\n\
+             embeds. lightcode reports the version it names as its own server version,\n\
+             so that the UI does not warn about a skew between itself and the binary\n\
+             it is part of.",
+            manifest.display()
+        )
+    });
+
+    let package = serde_json::from_str::<serde_json::Value>(&source).unwrap_or_else(|error| {
+        panic!("{} is not readable as json: {error}", manifest.display())
+    });
+
+    package
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no `version` string.\n\
+                 \n\
+                 It is what lightcode reports as its server version; without it the UI\n\
+                 would compare its own version against nothing and warn about a skew.",
+                manifest.display()
+            )
+        })
 }
 
 /// Every file under `directory`, as (bundle-relative name, absolute path).

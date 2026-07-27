@@ -269,6 +269,14 @@ of the UI's own **routes** rather than a file. The UI routes in the browser, so
 `/settings` is a path this server has never heard of and must not 404. A missing
 *file* still must.
 
+**Server version** — `environment.serverVersion`, and in the shell it is the
+**bundle's** version rather than the crate's. Not a claim about the binary: the
+client compares that field against the version compiled into its own page and
+warns about a skew, which between a UI and the executable it ships inside cannot
+happen. Made equal so the comparison finds nothing, and vestigial rather than
+satisfied. The plain server, which ships no bundle, keeps the crate version —
+there a difference is real. See ADR-0011.
+
 **Origin** — scheme, host and port together, and the reason the port is fixed.
 The window is pointed at `http://127.0.0.1:4773/`, so the port is part of what
 the browser scopes `localStorage` by — and `localStorage` is where the UI keeps

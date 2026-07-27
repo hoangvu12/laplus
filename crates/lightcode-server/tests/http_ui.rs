@@ -19,12 +19,19 @@ const PAGE: &[u8] = b"<!doctype html><title>lightcode</title><div id=root></div>
 const SCRIPT: &[u8] = b"export const app = 1";
 const ICON: &[u8] = b"\x00\x00\x01\x00 icon bytes, not text";
 
+/// What the bundle above calls itself. A number this crate's own version can
+/// never be, which is the point of it — see the version test below.
+const BUNDLE_VERSION: &str = "0.0.28";
+
 fn bundle() -> Assets {
-    Assets::from_static(&[
-        ("index.html", PAGE),
-        ("assets/index-a1b2c3.js", SCRIPT),
-        ("favicon.ico", ICON),
-    ])
+    Assets::from_static(
+        &[
+            ("index.html", PAGE),
+            ("assets/index-a1b2c3.js", SCRIPT),
+            ("favicon.ico", ICON),
+        ],
+        BUNDLE_VERSION,
+    )
 }
 
 /// The whole reason the assets are served from here rather than from Tauri's
@@ -207,6 +214,46 @@ async fn a_server_with_no_ui_still_answers_nothing_at_the_root() {
 
     assert_eq!(server.get("/").await.status, 404);
     assert_eq!(server.get("/settings").await.status, 404);
+
+    server.stop().await;
+}
+
+/// Ticket 26: the version a server reports is the version of the UI it is
+/// serving, so the client — which compares that number against the one compiled
+/// into the page this same server just sent — finds nothing to warn about.
+///
+/// Both answers are checked because the UI reads both: `/.well-known/t3/environment`
+/// on boot, and `server.getConfig` once the socket is open. A skew banner raised
+/// by whichever of the two disagreed would be no better than the one this
+/// removes.
+#[tokio::test]
+async fn a_server_serving_a_ui_reports_that_uis_version_as_its_own() {
+    let server = TestServer::start_serving(bundle()).await;
+
+    let over_http = server.get("/.well-known/t3/environment").await;
+    assert_eq!(over_http.body["serverVersion"], json!(BUNDLE_VERSION));
+
+    let mut client = server.connect().await;
+    let config = client.call("server.getConfig", json!({})).await.expect_success();
+    assert_eq!(config["environment"]["serverVersion"], json!(BUNDLE_VERSION));
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// And a server that brought no UI keeps its own version, which is the answer
+/// that means something for the plain binary — whatever is pointed at it was
+/// built somewhere else and a difference there is a real one.
+#[tokio::test]
+async fn a_server_with_no_ui_reports_its_own_version() {
+    let server = TestServer::start().await;
+
+    let descriptor = server.get("/.well-known/t3/environment").await;
+
+    assert_eq!(
+        descriptor.body["serverVersion"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
 
     server.stop().await;
 }

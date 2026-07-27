@@ -69,6 +69,15 @@ const SERVER_SURFACE: [&str; 2] = ["api/", ".well-known/"];
 #[derive(Debug, Clone, Default)]
 pub struct Assets {
     files: BTreeMap<String, Cow<'static, [u8]>>,
+    /// What the bundle calls itself — `@t3tools/web`'s `package.json` version,
+    /// which is also the `APP_VERSION` compiled into these files.
+    ///
+    /// It travels with the bytes rather than beside them because the server
+    /// reports it as its own `serverVersion`, and a bundle whose version had to
+    /// be remembered separately is one that would eventually be shipped with
+    /// somebody else's number. [`crate::config::ServerConfig::serving_ui_version`]
+    /// is where that matters and why.
+    version: Option<&'static str>,
 }
 
 /// One file, ready to be written as a response.
@@ -113,13 +122,19 @@ impl Assets {
     }
 
     /// The shell's generated table: names and bytes that live in the
-    /// executable.
-    pub fn from_static(files: &[(&'static str, &'static [u8])]) -> Assets {
+    /// executable, and the version the bundle was built as.
+    ///
+    /// The version is an argument rather than a later `with_` call because a
+    /// bundle always has one — the shell's build script reads both out of the
+    /// same directory — and the one thing this must not be is optional to
+    /// supply.
+    pub fn from_static(files: &[(&'static str, &'static [u8])], version: &'static str) -> Assets {
         Assets {
             files: files
                 .iter()
                 .map(|(path, bytes)| ((*path).to_string(), Cow::Borrowed(*bytes)))
                 .collect(),
+            version: Some(version),
         }
     }
 
@@ -127,6 +142,12 @@ impl Assets {
     /// and the whole suite live on the other side of.
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+
+    /// The version of the UI in here, or `None` for a server that brought no
+    /// UI and therefore speaks only for itself.
+    pub fn version(&self) -> Option<&'static str> {
+        self.version
     }
 
     /// Answer one `GET`, or decline it.
@@ -230,12 +251,15 @@ mod tests {
 
     /// The shape of a Vite bundle, at four files.
     fn bundle() -> Assets {
-        Assets::from_static(&[
-            ("index.html", b"<!doctype html><div id=root></div>"),
-            ("assets/index-a1b2c3.js", b"export default 1"),
-            ("assets/index-d4e5f6.css", b":root{}"),
-            ("favicon.ico", b"\x00\x00\x01\x00"),
-        ])
+        Assets::from_static(
+            &[
+                ("index.html", b"<!doctype html><div id=root></div>"),
+                ("assets/index-a1b2c3.js", b"export default 1"),
+                ("assets/index-d4e5f6.css", b":root{}"),
+                ("favicon.ico", b"\x00\x00\x01\x00"),
+            ],
+            "0.0.28",
+        )
     }
 
     #[test]
@@ -245,6 +269,14 @@ mod tests {
         assert_eq!(none.resolve("/"), None);
         assert_eq!(none.resolve("/index.html"), None);
         assert_eq!(none.resolve("/settings"), None);
+    }
+
+    /// Ticket 26: the number the server reports as its own comes from here, so
+    /// a bundle knows what it is and a server with no bundle says nothing.
+    #[test]
+    fn a_bundle_carries_its_version_and_the_absence_of_one_carries_none() {
+        assert_eq!(bundle().version(), Some("0.0.28"));
+        assert_eq!(Assets::none().version(), None);
     }
 
     #[test]
