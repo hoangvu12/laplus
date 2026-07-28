@@ -656,32 +656,15 @@ export function firstUnsuccessfulSecondaryProviderOutcome(
   return null;
 }
 
-const WSL_INSTANCE_ID_PREFIX = "wsl:";
-
-/** The distro name from a WSL backend instance id ("wsl:ubuntu" -> "ubuntu"), or null for the default. */
-export function parseWslDistroFromInstanceId(instanceId: string | undefined): string | null {
-  if (!instanceId || !instanceId.startsWith(WSL_INSTANCE_ID_PREFIX)) {
-    return null;
-  }
-  const distro = instanceId.slice(WSL_INSTANCE_ID_PREFIX.length).trim();
-  return distro.length === 0 || distro === "default" ? null : distro;
-}
-
 /**
  * A human label that distinguishes local environments by platform (so the
- * popover shows "Windows" / "WSL" rather than the account name twice). WSL is
- * identified by its backend instance id; everything else falls back to the
- * reported OS, then the environment's own label.
+ * popover shows "Windows" rather than the account name twice), falling back to
+ * the reported OS, then the environment's own label.
  */
 export function deriveEnvironmentDisplayLabel(input: {
-  readonly isWsl: boolean;
-  readonly wslDistro: string | null;
   readonly platformOs: ExecutionEnvironmentPlatformOs | undefined;
   readonly fallbackLabel: string;
 }): string {
-  if (input.isWsl) {
-    return input.wslDistro ? `WSL · ${input.wslDistro}` : "WSL";
-  }
   switch (input.platformOs) {
     case "windows":
       return "Windows";

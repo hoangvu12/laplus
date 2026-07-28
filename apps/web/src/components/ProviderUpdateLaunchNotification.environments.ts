@@ -72,8 +72,6 @@ export function useLocalEnvironmentUpdateGroups(): {
         // name, so fall back to its platform OS so the row reads "Windows"/"Linux".
         label: isPrimary
           ? deriveEnvironmentDisplayLabel({
-              isWsl: false,
-              wslDistro: null,
               platformOs: serverConfig?.environment.platform.os,
               fallbackLabel: environment.label,
             })
