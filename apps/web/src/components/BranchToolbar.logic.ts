@@ -156,13 +156,6 @@ export function resolveBranchToolbarValue(input: {
   return currentGitBranch ?? activeThreadBranch;
 }
 
-export function resolveBranchToolbarPrBranch(input: {
-  activeThreadBranch: string | null;
-  resolvedActiveBranch: string | null;
-}): string | null {
-  return input.activeThreadBranch === input.resolvedActiveBranch ? input.activeThreadBranch : null;
-}
-
 export function resolveLocalCheckoutBranchMismatch(input: {
   effectiveEnvMode: EnvMode;
   activeWorktreePath: string | null;
@@ -212,19 +205,14 @@ export function shouldIncludeBranchPickerItem(input: {
   itemValue: string;
   normalizedQuery: string;
   createBranchItemValue: string | null;
-  checkoutPullRequestItemValue: string | null;
 }): boolean {
-  const { itemValue, normalizedQuery, createBranchItemValue, checkoutPullRequestItemValue } = input;
+  const { itemValue, normalizedQuery, createBranchItemValue } = input;
 
   if (normalizedQuery.length === 0) {
     return true;
   }
 
   if (createBranchItemValue && itemValue === createBranchItemValue) {
-    return true;
-  }
-
-  if (checkoutPullRequestItemValue && itemValue === checkoutPullRequestItemValue) {
     return true;
   }
 

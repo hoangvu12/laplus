@@ -65,9 +65,11 @@
 //! arrive, and nothing for a `remoteUpdated` to carry. See
 //! [`Status::to_snapshot`].
 //!
-//! `sourceControlProvider` is left out for the same reason `pr` is null. It is
-//! optional in the contract, and it is a label — GitHub, GitLab — derived from
-//! the remote's URL, which is the surface v1 does not have.
+//! `sourceControlProvider` was left out for the same reason `pr` is null — it
+//! is a label, GitHub or GitLab, derived from the remote's URL. Ticket 71 then
+//! took the field out of the contract altogether, so there is no longer a
+//! divergence there to declare; `pr` stays because it is a field this server
+//! does send, always as null.
 //!
 //! Shapes are hand-written from `VcsStatusResult` and `VcsStatusStreamEvent` in
 //! `t3code/packages/contracts/src/git.ts`, and the error from `GitCommandError`
@@ -97,7 +99,7 @@ pub const REFRESH_STATUS: &str = "vcs.refreshStatus";
 
 /// The `_tag` both methods refuse under.
 ///
-/// `GitManagerServiceError` is a union of five and this is the one that
+/// `GitManagerServiceError` is a union of two and this is the one that
 /// describes a git command that would not answer. **No `message` is sent with
 /// it**: the class defines `message` as a getter over its declared fields, so
 /// the client composes the sentence and a server that sent one would be sending

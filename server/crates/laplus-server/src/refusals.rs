@@ -14,7 +14,7 @@
 //! label: an invented kind fails the client's decode of the whole payload."_
 //! `ServerMethodNotImplementedError` is an invented kind in exactly that sense.
 //! It is not in the contract at all — no method declares it, so no method can
-//! decode it — and answering all thirty-nine unimplemented methods with it made
+//! decode it — and answering all thirty unimplemented methods with it made
 //! every refusal illegible.
 //!
 //! So the tag is chosen **per method**, from `REFUSALS`, which is the contract's
@@ -24,10 +24,10 @@
 //!
 //! ## Why every entry says the same thing
 //!
-//! Every one of the seventy methods `rpc.ts` declares has
+//! Every one of the sixty-one methods `rpc.ts` declares has
 //! `EnvironmentAuthorizationError` in its error union — it is the union of one
-//! for fifteen of them, including all four the surface walk found, and the last
-//! member of the union for the rest. So the per-method answer happens to be
+//! for thirteen of them, including every page the surface walk found, and the
+//! last member of the union for the rest. So the per-method answer happens to be
 //! uniform today, and the table below is a column of one value: `Tag` has one
 //! variant, because the contract offers one answer.
 //!
@@ -119,7 +119,7 @@ const NOT_IMPLEMENTED: &str = "ServerMethodNotImplementedError";
 /// Every method `packages/contracts/src/rpc.ts` declares, and the error tag a
 /// refusal of it carries.
 ///
-/// All seventy, not just the ones this server has yet to implement: an
+/// All sixty-one, not just the ones this server has yet to implement: an
 /// implemented method never reaches this table, and listing only the gap would
 /// mean deleting a row every time one closes — a second place to forget. The
 /// order is the contract's own, so the two can be read side by side.
@@ -146,16 +146,10 @@ const REFUSALS: &[(&str, Tag)] = &[
     ("server.updateServer", Tag::EnvironmentAuthorization),
     ("server.getSettings", Tag::EnvironmentAuthorization),
     ("server.updateSettings", Tag::EnvironmentAuthorization),
-    ("server.discoverSourceControl", Tag::EnvironmentAuthorization),
     ("server.getTraceDiagnostics", Tag::EnvironmentAuthorization),
     ("server.getProcessDiagnostics", Tag::EnvironmentAuthorization),
     ("server.getProcessResourceHistory", Tag::EnvironmentAuthorization),
     ("server.signalProcess", Tag::EnvironmentAuthorization),
-    ("cloud.getRelayClientStatus", Tag::EnvironmentAuthorization),
-    ("cloud.installRelayClient", Tag::EnvironmentAuthorization),
-    ("sourceControl.lookupRepository", Tag::EnvironmentAuthorization),
-    ("sourceControl.cloneRepository", Tag::EnvironmentAuthorization),
-    ("sourceControl.publishRepository", Tag::EnvironmentAuthorization),
     ("projects.searchEntries", Tag::EnvironmentAuthorization),
     ("projects.listEntries", Tag::EnvironmentAuthorization),
     ("projects.readFile", Tag::EnvironmentAuthorization),
@@ -166,9 +160,6 @@ const REFUSALS: &[(&str, Tag)] = &[
     ("subscribeVcsStatus", Tag::EnvironmentAuthorization),
     ("vcs.pull", Tag::EnvironmentAuthorization),
     ("vcs.refreshStatus", Tag::EnvironmentAuthorization),
-    ("git.runStackedAction", Tag::EnvironmentAuthorization),
-    ("git.resolvePullRequest", Tag::EnvironmentAuthorization),
-    ("git.preparePullRequestThread", Tag::EnvironmentAuthorization),
     ("vcs.listRefs", Tag::EnvironmentAuthorization),
     ("vcs.createWorktree", Tag::EnvironmentAuthorization),
     ("vcs.removeWorktree", Tag::EnvironmentAuthorization),
@@ -233,8 +224,8 @@ pub fn refusal(method: &str) -> Value {
             "requiredScope": REFUSAL_SCOPE,
         }),
         // Not the contract's method, so there is no union to answer inside.
-        // `method` is the only thing that says which of the seventy a developer
-        // has mistyped, so it survives into the error.
+        // `method` is the only thing that says which of the sixty-one a
+        // developer has mistyped, so it survives into the error.
         None => json!({
             "_tag": NOT_IMPLEMENTED,
             "method": method,
@@ -302,16 +293,21 @@ mod tests {
         }
     }
 
-    /// The four the surface walk found, written out rather than derived: this
+    /// The pages the surface walk found, written out rather than derived: this
     /// is the bug the ticket is about, and a test that computes both sides
-    /// would pass against a table that had lost all four.
+    /// would pass against a table that had lost every one.
+    ///
+    /// There were four. `/settings/source-control` was the fourth, and ticket
+    /// 71 deleted the page and `server.discoverSourceControl` with it — a
+    /// method the contract no longer declares is refused with
+    /// `ServerMethodNotImplementedError`, which is right, because there is no
+    /// union left for a borrowed tag to be legible inside.
     #[test]
-    fn the_four_pages_that_showed_a_decoder_error_are_answered() {
+    fn the_pages_that_showed_a_decoder_error_are_answered() {
         for method in [
             "server.getProcessDiagnostics",
             "server.getProcessResourceHistory",
             "server.getTraceDiagnostics",
-            "server.discoverSourceControl",
         ] {
             let error = refusal(method);
             assert_eq!(error["_tag"], "EnvironmentAuthorizationError", "{method}");
@@ -338,3 +334,4 @@ mod tests {
         );
     }
 }
+

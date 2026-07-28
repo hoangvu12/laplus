@@ -55,10 +55,6 @@
       "types": "./src/state/filesystem.ts",
       "default": "./src/state/filesystem.ts"
     },
-    "./state/git": {
-      "types": "./src/state/git.ts",
-      "default": "./src/state/git.ts"
-    },
     "./state/models": {
       "types": "./src/state/models.ts",
       "default": "./src/state/models.ts"
@@ -102,10 +98,6 @@
     "./state/shell": {
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
-    },
-    "./state/source-control": {
-      "types": "./src/state/sourceControl.ts",
-      "default": "./src/state/sourceControl.ts"
     },
     "./state/terminal": {
       "types": "./src/state/terminal.ts",

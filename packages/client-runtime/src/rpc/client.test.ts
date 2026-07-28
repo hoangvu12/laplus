@@ -1,11 +1,10 @@
-import { EnvironmentId, type GitActionProgressEvent, WS_METHODS } from "@t3tools/contracts";
+import { EnvironmentId, WS_METHODS } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
-import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -21,7 +20,7 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { EnvironmentRpcRequestObserver, request, runStream, subscribe } from "./client.ts";
+import { EnvironmentRpcRequestObserver, request, subscribe } from "./client.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -29,23 +28,6 @@ const TARGET = new PrimaryConnectionTarget({
   httpBaseUrl: "https://environment.example.test",
   wsBaseUrl: "wss://environment.example.test",
 });
-
-const STACKED_ACTION = {
-  actionId: "action-1",
-  cwd: "/workspace/project",
-  action: "commit",
-} as const;
-const ACTION_STARTED: GitActionProgressEvent = {
-  ...STACKED_ACTION,
-  kind: "action_started",
-  phases: ["commit"],
-};
-const ACTION_PHASE_STARTED: GitActionProgressEvent = {
-  ...STACKED_ACTION,
-  kind: "phase_started",
-  phase: "commit",
-  label: "Committing",
-};
 
 function session(client: WsRpcProtocolClient): RpcSession.RpcSession {
   return {
@@ -111,36 +93,6 @@ describe("environment RPC", () => {
         `start:${TARGET.environmentId}:${WS_METHODS.serverProbe}`,
         `finish:${TARGET.environmentId}:${WS_METHODS.serverProbe}`,
       ]);
-    }),
-  );
-
-  it.effect("binds finite streaming commands to one active session", () =>
-    Effect.gen(function* () {
-      const firstEvents = yield* Queue.unbounded<GitActionProgressEvent>();
-      const secondEvents = yield* Queue.unbounded<GitActionProgressEvent>();
-      const firstClient = {
-        [WS_METHODS.gitRunStackedAction]: () => Stream.fromQueue(firstEvents),
-      } as unknown as WsRpcProtocolClient;
-      const secondClient = {
-        [WS_METHODS.gitRunStackedAction]: () => Stream.fromQueue(secondEvents),
-      } as unknown as WsRpcProtocolClient;
-      const { activeSession, supervisor } = yield* makeHarness();
-
-      yield* SubscriptionRef.set(activeSession, Option.some(session(firstClient)));
-      const resultFiber = yield* runStream(WS_METHODS.gitRunStackedAction, STACKED_ACTION).pipe(
-        Stream.take(2),
-        Stream.runCollect,
-        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
-        Effect.forkChild,
-      );
-      yield* Effect.yieldNow;
-
-      yield* Queue.offer(firstEvents, ACTION_STARTED);
-      yield* SubscriptionRef.set(activeSession, Option.some(session(secondClient)));
-      yield* Queue.offer(secondEvents, ACTION_PHASE_STARTED);
-      yield* Queue.offer(firstEvents, ACTION_PHASE_STARTED);
-
-      expect(yield* Fiber.join(resultFiber)).toEqual([ACTION_STARTED, ACTION_PHASE_STARTED]);
     }),
   );
 

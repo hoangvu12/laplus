@@ -1,6 +1,5 @@
 import type {
   VcsRef,
-  SourceControlProviderInfo,
   VcsStatusLocalResult,
   VcsStatusRemoteResult,
   VcsStatusResult,
@@ -8,7 +7,6 @@ import type {
 } from "@t3tools/contracts";
 import * as Arr from "effect/Array";
 import * as Result from "effect/Result";
-import { detectSourceControlProviderFromRemoteUrl } from "./sourceControl.ts";
 
 export const WORKTREE_BRANCH_PREFIX = "t3code";
 // Canonical form is `t3code/<8 hex>`. Older mobile builds generated `t3code/<uuid>`
@@ -207,12 +205,6 @@ export function dedupeRemoteBranchesWithLocalMatches(
   });
 }
 
-export function detectSourceControlProviderFromGitRemoteUrl(
-  remoteUrl: string,
-): SourceControlProviderInfo | null {
-  return detectSourceControlProviderFromRemoteUrl(remoteUrl);
-}
-
 const EMPTY_GIT_STATUS_REMOTE: VcsStatusRemoteResult = {
   hasUpstream: false,
   aheadCount: 0,
@@ -246,9 +238,6 @@ function toRemoteStatusPart(status: VcsStatusResult): VcsStatusRemoteResult {
 function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
   return {
     isRepo: status.isRepo,
-    ...(status.sourceControlProvider
-      ? { sourceControlProvider: status.sourceControlProvider }
-      : {}),
     hasPrimaryRemote: status.hasPrimaryRemote,
     isDefaultRef: status.isDefaultRef,
     refName: status.refName,

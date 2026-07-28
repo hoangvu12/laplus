@@ -15,7 +15,6 @@ import {
 } from "./filesystem.ts";
 import { AssetAccessError, AssetCreateUrlInput, AssetCreateUrlResult } from "./assets.ts";
 import {
-  GitActionProgressEvent,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
   GitCommandError,
@@ -27,14 +26,9 @@ import {
   VcsListRefsInput,
   VcsListRefsResult,
   GitManagerServiceError,
-  GitPreparePullRequestThreadInput,
-  GitPreparePullRequestThreadResult,
   VcsPullInput,
-  GitPullRequestRefInput,
   VcsPullResult,
   VcsRemoveWorktreeInput,
-  GitResolvePullRequestResult,
-  GitRunStackedActionInput,
   VcsStatusInput,
   VcsStatusResult,
   VcsStatusStreamEvent,
@@ -130,16 +124,6 @@ import {
   ServerUpsertKeybindingResult,
 } from "./server.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
-import {
-  SourceControlCloneRepositoryInput,
-  SourceControlCloneRepositoryResult,
-  SourceControlDiscoveryResult,
-  SourceControlPublishRepositoryInput,
-  SourceControlPublishRepositoryResult,
-  SourceControlRepositoryError,
-  SourceControlRepositoryInfo,
-  SourceControlRepositoryLookupInput,
-} from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 
 export const WS_METHODS = {
@@ -168,11 +152,6 @@ export const WS_METHODS = {
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
   vcsInit: "vcs.init",
-
-  // Git workflow methods
-  gitRunStackedAction: "git.runStackedAction",
-  gitResolvePullRequest: "git.resolvePullRequest",
-  gitPreparePullRequestThread: "git.preparePullRequestThread",
 
   // Review methods
   reviewGetDiffPreview: "review.getDiffPreview",
@@ -208,18 +187,12 @@ export const WS_METHODS = {
   serverRemoveKeybinding: "server.removeKeybinding",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
-  serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverSignalProcess: "server.signalProcess",
 
   // Cloud environment methods
-
-  // Source control methods
-  sourceControlLookupRepository: "sourceControl.lookupRepository",
-  sourceControlCloneRepository: "sourceControl.cloneRepository",
-  sourceControlPublishRepository: "sourceControl.publishRepository",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -294,12 +267,6 @@ export const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSetting
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
 
-export const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
-  payload: Schema.Struct({}),
-  success: SourceControlDiscoveryResult,
-  error: EnvironmentAuthorizationError,
-});
-
 export const WsServerGetTraceDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetTraceDiagnostics, {
   payload: Schema.Struct({}),
   success: ServerTraceDiagnosticsResult,
@@ -326,30 +293,6 @@ export const WsServerSignalProcessRpc = Rpc.make(WS_METHODS.serverSignalProcess,
   success: ServerSignalProcessResult,
   error: EnvironmentAuthorizationError,
 });
-
-export const WsSourceControlLookupRepositoryRpc = Rpc.make(
-  WS_METHODS.sourceControlLookupRepository,
-  {
-    payload: SourceControlRepositoryLookupInput,
-    success: SourceControlRepositoryInfo,
-    error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
-  },
-);
-
-export const WsSourceControlCloneRepositoryRpc = Rpc.make(WS_METHODS.sourceControlCloneRepository, {
-  payload: SourceControlCloneRepositoryInput,
-  success: SourceControlCloneRepositoryResult,
-  error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
-});
-
-export const WsSourceControlPublishRepositoryRpc = Rpc.make(
-  WS_METHODS.sourceControlPublishRepository,
-  {
-    payload: SourceControlPublishRepositoryInput,
-    success: SourceControlPublishRepositoryResult,
-    error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
-  },
-);
 
 export const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
   payload: ProjectSearchEntriesInput,
@@ -408,25 +351,6 @@ export const WsVcsPullRpc = Rpc.make(WS_METHODS.vcsPull, {
 export const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
   payload: VcsStatusInput,
   success: VcsStatusResult,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
-});
-
-export const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
-  payload: GitRunStackedActionInput,
-  success: GitActionProgressEvent,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
-  stream: true,
-});
-
-export const WsGitResolvePullRequestRpc = Rpc.make(WS_METHODS.gitResolvePullRequest, {
-  payload: GitPullRequestRefInput,
-  success: GitResolvePullRequestResult,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
-});
-
-export const WsGitPreparePullRequestThreadRpc = Rpc.make(WS_METHODS.gitPreparePullRequestThread, {
-  payload: GitPreparePullRequestThreadInput,
-  success: GitPreparePullRequestThreadResult,
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
@@ -688,14 +612,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRemoveKeybindingRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
-  WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerSignalProcessRpc,
-  WsSourceControlLookupRepositoryRpc,
-  WsSourceControlCloneRepositoryRpc,
-  WsSourceControlPublishRepositoryRpc,
   WsProjectsListEntriesRpc,
   WsProjectsReadFileRpc,
   WsProjectsSearchEntriesRpc,
@@ -706,9 +626,6 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
-  WsGitRunStackedActionRpc,
-  WsGitResolvePullRequestRpc,
-  WsGitPreparePullRequestThreadRpc,
   WsVcsListRefsRpc,
   WsVcsCreateWorktreeRpc,
   WsVcsRemoveWorktreeRpc,

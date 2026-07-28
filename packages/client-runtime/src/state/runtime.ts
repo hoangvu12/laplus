@@ -13,11 +13,9 @@ import {
   type EnvironmentRpcInput,
   type EnvironmentRpcStreamFailure,
   type EnvironmentRpcStreamValue,
-  type EnvironmentStreamCommandRpcTag,
   type EnvironmentSubscriptionRpcTag,
   type EnvironmentUnaryRpcTag,
   request,
-  runStream,
   subscribe,
 } from "../rpc/client.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -335,31 +333,6 @@ export function createRuntimeCommand<R, ER, W, A, E>(
   };
 }
 
-export function createRuntimeStreamCommand<R, ER, W, A, E>(
-  runtime: Atom.AtomRuntime<R, ER>,
-  options: {
-    readonly label: string;
-    readonly execute: (input: W, registry: AtomRegistry.AtomRegistry) => Stream.Stream<A, E, R>;
-    readonly scheduler?: AtomCommandScheduler;
-    readonly concurrency?: AtomCommandConcurrency<W>;
-  },
-): AtomCommand<W, A, E | ER | Cause.NoSuchElementError> {
-  const scheduler = options.scheduler ?? createAtomCommandScheduler();
-  const concurrency = options.concurrency ?? { mode: "parallel" as const };
-  return {
-    label: options.label,
-    run: (registry, input) =>
-      settleAtomCommandResult(() =>
-        scheduler.schedule(registry, concurrency, input, () => {
-          const atom = runtime
-            .atom(options.execute(input, registry))
-            .pipe(Atom.withLabel(options.label));
-          return executeAtomQuery(registry, atom, { reportDefect: false, reportFailure: false });
-        }),
-      ),
-  };
-}
-
 export function reportAtomCommandResult(
   result: AtomCommandResult<unknown, unknown>,
   options: AtomCommandOptions = {},
@@ -417,19 +390,6 @@ export function runInEnvironment<A, E, R>(
 > {
   return EnvironmentRegistry.pipe(
     Effect.flatMap((registry) => registry.run(environmentId, effect)),
-  );
-}
-
-export function runStreamInEnvironment<A, E, R>(
-  environmentId: EnvironmentIdType,
-  stream: Stream.Stream<A, E, R>,
-): Stream.Stream<
-  A,
-  E | EnvironmentNotRegisteredError,
-  EnvironmentRegistry | Exclude<R, EnvironmentSupervisor>
-> {
-  return Stream.unwrap(
-    EnvironmentRegistry.pipe(Effect.map((registry) => registry.runStream(environmentId, stream))),
   );
 }
 
@@ -530,29 +490,6 @@ export function createEnvironmentCommand<R, ER, Input, A, E>(
   });
 }
 
-function createEnvironmentStreamCommand<R, ER, Input, A, E>(
-  runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: {
-    readonly label: string;
-    readonly execute: (input: Input) => Stream.Stream<A, E, EnvironmentSupervisor | R>;
-    readonly scheduler?: AtomCommandScheduler;
-    readonly concurrency?: AtomCommandConcurrency<{
-      readonly environmentId: EnvironmentIdType;
-      readonly input: Input;
-    }>;
-  },
-) {
-  return createRuntimeStreamCommand(runtime, {
-    label: options.label,
-    ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
-    ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (target) =>
-      runStreamInEnvironment(target.environmentId, options.execute(target.input)).pipe(
-        Stream.withSpan(options.label),
-      ),
-  });
-}
-
 export function createEnvironmentRpcQueryAtomFamily<R, ER, TTag extends EnvironmentUnaryRpcTag>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
   options: {
@@ -623,29 +560,5 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
     execute: (input: EnvironmentRpcInput<TTag>) => request(options.tag, input),
-  });
-}
-
-export function createEnvironmentRpcStreamCommand<
-  R,
-  ER,
-  TTag extends EnvironmentStreamCommandRpcTag,
->(
-  runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
-  options: {
-    readonly label: string;
-    readonly tag: TTag;
-    readonly scheduler?: AtomCommandScheduler;
-    readonly concurrency?: AtomCommandConcurrency<{
-      readonly environmentId: EnvironmentIdType;
-      readonly input: EnvironmentRpcInput<TTag>;
-    }>;
-  },
-) {
-  return createEnvironmentStreamCommand(runtime, {
-    label: options.label,
-    ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
-    ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
-    execute: (input: EnvironmentRpcInput<TTag>) => runStream(options.tag, input),
   });
 }

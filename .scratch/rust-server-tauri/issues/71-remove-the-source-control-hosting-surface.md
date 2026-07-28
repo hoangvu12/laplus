@@ -5,7 +5,7 @@ or GitLab — leaving local `git` alone. Ledger §3 already decided this
 ("Source-control hosting … No GitHub/GitLab/PRs/stacked diffs/clone/publish.
 Local `git` only"), so this ticket is the removal, not the decision.
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Found by:** the 2026-07-28 cleanup pass, after commits `94da6be`
 (cloud/relay/Clerk) and `9aca0e9` (WSL). Same standard as both: ledger §3, and
@@ -167,3 +167,51 @@ breaks, rather than reading for callers. That is how `94da6be` and `9aca0e9`
 were done, and in both the compiler found consumers the greps had missed. Run
 `vp lint` afterwards for the imports and locals that typecheck cannot see — both
 prior commits needed a second pass for exactly that.
+
+### What the removal found
+
+**Seven methods, not six.** The table above lists seven rows under a heading
+that says six, and seven is right. `rpc.ts` declared 68 before this and declares
+61 after.
+
+**`the_table_is_the_contract` was already red.** Not by anything here: `94da6be`
+dropped `cloud.getRelayClientStatus` and `cloud.installRelayClient` from the
+contract and left their rows in `REFUSALS`, so the table named two methods
+`rpc.ts` did not. Both rows go with this change, which is what makes the
+acceptance criterion reachable at all. The counts in that file's own docs were
+computed against the stale table and are now recomputed: 61 declared, 30
+unimplemented, 13 whose error union is `EnvironmentAuthorizationError` alone.
+
+**The compiler found five files the ticket's consumer table did not:**
+`packages/contracts/src/ipc.ts` (the whole `sourceControl` and `git` sections of
+the local-API surface), `client-runtime`'s `state/git.ts`, `state/gitActions.ts`
+and `state/vcsAction.ts` — 1,037 lines that exist only for the stacked
+action — and `operations/projects.ts`, which carried the add-project clone
+flow's provider-readiness logic.
+
+`git.runStackedAction` was also the only **streaming command** in the contract,
+so `EnvironmentStreamCommandRpcTag` had no members left. The layer above it went
+too: `runStream`, `createEnvironmentRpcStreamCommand`,
+`createEnvironmentStreamCommand`, `createRuntimeStreamCommand` and
+`runStreamInEnvironment`. `EnvironmentRegistry.runStream` stays — it is the
+connection layer's "provide the supervisor to this stream" primitive rather than
+this feature's, and `registry.test.ts` covers it on its own account.
+
+### Two things kept, deliberately
+
+**`pr` stays in `VcsStatusResult`; `sourceControlProvider` does not.** The rule
+is that the contract describes what the server sends. `git.rs` sends `pr` and
+always sends it null; it has never sent `sourceControlProvider`, which was a
+declared divergence. So the first stays and the second goes, and the divergence
+`socket_conformance.rs` declares for it is now about the capture only.
+
+**`resolveThreadPr` stays.** The PR _badge_ was the feature — it is gone from
+the sidebar, from Sidebar v2, from the branch toolbar and from
+`ThreadStatusIndicators`. But `effectiveSettled` takes a `changeRequestState`,
+and `resolveThreadPr` is what feeds it from the still-live status. Removing it
+would have changed thread settlement, which is not this ticket's.
+
+### The aheadCount/behindCount indicator is gone, as agreed
+
+Nothing renders it now. The reversal is still the ~50 lines over
+`subscribeVcsStatus` this ticket describes, and still a separate ticket.

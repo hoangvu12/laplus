@@ -341,7 +341,8 @@ const STATUS_MISSING: &[Declared] = &[Declared {
     path: "/local/sourceControlProvider",
     because: "source-control hosting is out of v1's scope, and this field is a \
               label derived from the remote's URL for GitHub, GitLab and the \
-              rest. The contract makes it optional.",
+              rest. Ticket 71 removed it from the contract, so the capture is \
+              now the only place it appears at all.",
 }];
 
 const STATUS_RETYPED: &[Declared] = &[Declared {

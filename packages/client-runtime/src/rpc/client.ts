@@ -53,11 +53,7 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.subscribeVcsStatus
   | typeof WS_METHODS.terminalAttach;
 
-export type EnvironmentStreamCommandRpcTag = typeof WS_METHODS.gitRunStackedAction;
-
-export type EnvironmentStreamRpcTag =
-  | EnvironmentSubscriptionRpcTag
-  | EnvironmentStreamCommandRpcTag;
+export type EnvironmentStreamRpcTag = EnvironmentSubscriptionRpcTag;
 
 export type EnvironmentUnaryRpcTag = Exclude<EnvironmentRpcTag, EnvironmentStreamRpcTag>;
 const isRpcClientError = Schema.is(RpcClientError.RpcClientError);
@@ -121,30 +117,6 @@ export const request = Effect.fn("EnvironmentRpc.request")(function* <
   });
   return yield* method(input).pipe(Effect.ensuring(completeObservation));
 });
-
-export function runStream<TTag extends EnvironmentStreamCommandRpcTag>(
-  tag: TTag,
-  input: EnvironmentRpcInput<TTag>,
-): Stream.Stream<
-  EnvironmentRpcStreamValue<TTag>,
-  EnvironmentRpcStreamFailure<TTag> | EnvironmentRpcUnavailableError,
-  EnvironmentSupervisor
-> {
-  return Stream.unwrap(
-    currentSession().pipe(
-      Effect.map((session) => {
-        const method = session.client[tag] as (
-          input: EnvironmentRpcInput<TTag>,
-        ) => Stream.Stream<EnvironmentRpcStreamValue<TTag>, EnvironmentRpcStreamFailure<TTag>>;
-        return method(input);
-      }),
-    ),
-  ).pipe(
-    Stream.withSpan("EnvironmentRpc.runStream", {
-      attributes: { "rpc.method": tag },
-    }),
-  );
-}
 
 interface SubscriptionOptions<TTag extends EnvironmentSubscriptionRpcTag> {
   readonly onExpectedFailure?: (

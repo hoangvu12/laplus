@@ -71,7 +71,6 @@ function createBrowserLocalApi(): LocalApi {
       removeKeybinding: () => Promise.reject(unavailableLocalBackendError()),
       getSettings: () => Promise.reject(unavailableLocalBackendError()),
       updateSettings: () => Promise.reject(unavailableLocalBackendError()),
-      discoverSourceControl: () => Promise.reject(unavailableLocalBackendError()),
       getTraceDiagnostics: () => Promise.reject(unavailableLocalBackendError()),
       getProcessDiagnostics: () => Promise.reject(unavailableLocalBackendError()),
       getProcessResourceHistory: () => Promise.reject(unavailableLocalBackendError()),

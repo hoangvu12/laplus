@@ -11,10 +11,6 @@ import type {
   VcsRemoveWorktreeInput,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
-  GitPreparePullRequestThreadInput,
-  GitPreparePullRequestThreadResult,
-  GitPullRequestRefInput,
-  GitResolvePullRequestResult,
   VcsStatusInput,
   VcsStatusResult,
 } from "./git.ts";
@@ -103,15 +99,6 @@ import { AdvertisedEndpoint } from "./remoteAccess.ts";
 import { EditorId } from "./editor.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import type { ClientSettings, ServerSettings, ServerSettingsPatch } from "./settings.ts";
-import type {
-  SourceControlCloneRepositoryInput,
-  SourceControlCloneRepositoryResult,
-  SourceControlDiscoveryResult,
-  SourceControlPublishRepositoryInput,
-  SourceControlPublishRepositoryResult,
-  SourceControlRepositoryInfo,
-  SourceControlRepositoryLookupInput,
-} from "./sourceControl.ts";
 
 export interface ContextMenuItem<T extends string = string> {
   id: T;
@@ -1109,7 +1096,6 @@ export interface LocalApi {
     removeKeybinding: (input: ServerRemoveKeybindingInput) => Promise<ServerRemoveKeybindingResult>;
     getSettings: () => Promise<ServerSettings>;
     updateSettings: (patch: ServerSettingsPatch) => Promise<ServerSettings>;
-    discoverSourceControl: () => Promise<SourceControlDiscoveryResult>;
     getTraceDiagnostics: () => Promise<ServerTraceDiagnosticsResult>;
     getProcessDiagnostics: () => Promise<ServerProcessDiagnosticsResult>;
     getProcessResourceHistory: (
@@ -1162,17 +1148,6 @@ export interface EnvironmentApi {
   assets: {
     createUrl: (input: AssetCreateUrlInput) => Promise<AssetCreateUrlResult>;
   };
-  sourceControl: {
-    lookupRepository: (
-      input: SourceControlRepositoryLookupInput,
-    ) => Promise<SourceControlRepositoryInfo>;
-    cloneRepository: (
-      input: SourceControlCloneRepositoryInput,
-    ) => Promise<SourceControlCloneRepositoryResult>;
-    publishRepository: (
-      input: SourceControlPublishRepositoryInput,
-    ) => Promise<SourceControlPublishRepositoryResult>;
-  };
   vcs: {
     listRefs: (input: VcsListRefsInput) => Promise<VcsListRefsResult>;
     createWorktree: (input: VcsCreateWorktreeInput) => Promise<VcsCreateWorktreeResult>;
@@ -1189,12 +1164,6 @@ export interface EnvironmentApi {
         onResubscribe?: () => void;
       },
     ) => () => void;
-  };
-  git: {
-    resolvePullRequest: (input: GitPullRequestRefInput) => Promise<GitResolvePullRequestResult>;
-    preparePullRequestThread: (
-      input: GitPreparePullRequestThreadInput,
-    ) => Promise<GitPreparePullRequestThreadResult>;
   };
   review: {
     getDiffPreview: (input: ReviewDiffPreviewInput) => Promise<ReviewDiffPreviewResult>;

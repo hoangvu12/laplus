@@ -23,7 +23,6 @@ import {
 import { useComposerDraftStore, type DraftId } from "../composerDraftStore";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { readLocalApi } from "../localApi";
-import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { usePaginatedBranches } from "../state/queries";
 import { useProject, useThread } from "../state/entities";
 import { useEnvironmentQuery } from "../state/query";
@@ -31,22 +30,14 @@ import { threadEnvironment } from "../state/threads";
 import { useAtomCommand } from "../state/use-atom-command";
 import { vcsEnvironment } from "../state/vcs";
 import { cn } from "../lib/utils";
-import { parsePullRequestReference } from "../pullRequestReference";
-import { getSourceControlPresentation } from "../sourceControlPresentation";
 import {
   deriveLocalBranchNameFromRemoteRef,
-  resolveBranchToolbarPrBranch,
   resolveBranchSelectionTarget,
   resolveBranchToolbarValue,
   resolveDraftEnvModeAfterBranchChange,
   resolveEffectiveEnvMode,
   shouldIncludeBranchPickerItem,
 } from "./BranchToolbar.logic";
-import {
-  ChangeRequestStatusIcon,
-  prStatusIndicator,
-  resolveThreadPr,
-} from "./ThreadStatusIndicators";
 import { Button } from "./ui/button";
 import { Switch } from "./ui/switch";
 import {
@@ -73,7 +64,6 @@ interface BranchToolbarBranchSelectorProps {
   onActiveThreadBranchOverrideChange?: (refName: string | null) => void;
   startFromOrigin: boolean;
   onStartFromOriginChange: (startFromOrigin: boolean) => void;
-  onCheckoutPullRequestRequest?: (reference: string) => void;
   onComposerFocusRequest?: () => void;
 }
 
@@ -107,7 +97,6 @@ export function BranchToolbarBranchSelector({
   onActiveThreadBranchOverrideChange,
   startFromOrigin,
   onStartFromOriginChange,
-  onCheckoutPullRequestRequest,
   onComposerFocusRequest,
 }: BranchToolbarBranchSelectorProps) {
   const startFromOriginSwitchId = useId();
@@ -248,11 +237,6 @@ export function BranchToolbarBranchSelector({
   const isInitialBranchesLoadPending = branchRefState.isPending && branchRefState.data === null;
   const currentGitBranch =
     branchStatusQuery.data?.refName ?? refs.find((refName) => refName.current)?.name ?? null;
-  const sourceControlPresentation = useMemo(
-    () => getSourceControlPresentation(branchStatusQuery.data?.sourceControlProvider),
-    [branchStatusQuery.data?.sourceControlProvider],
-  );
-  const SourceControlIcon = sourceControlPresentation.Icon;
   const canonicalActiveBranch = resolveBranchToolbarValue({
     envMode: effectiveEnvMode,
     activeWorktreePath,
@@ -265,11 +249,8 @@ export function BranchToolbarBranchSelector({
     [refs],
   );
   const normalizedDeferredBranchQuery = deferredTrimmedBranchQuery.toLowerCase();
-  const prReference = parsePullRequestReference(trimmedBranchQuery);
   const isSelectingWorktreeBase =
     effectiveEnvMode === "worktree" && !envLocked && !activeWorktreePath;
-  const checkoutPullRequestItemValue =
-    prReference && onCheckoutPullRequestRequest ? `__checkout_pull_request__:${prReference}` : null;
   const canCreateBranch = !isSelectingWorktreeBase && trimmedBranchQuery.length > 0;
   const hasExactBranchMatch = branchByName.has(trimmedBranchQuery);
   const createBranchItemValue = canCreateBranch
@@ -280,11 +261,8 @@ export function BranchToolbarBranchSelector({
     if (createBranchItemValue && !hasExactBranchMatch) {
       items.push(createBranchItemValue);
     }
-    if (checkoutPullRequestItemValue) {
-      items.unshift(checkoutPullRequestItemValue);
-    }
     return items;
-  }, [branchNames, checkoutPullRequestItemValue, createBranchItemValue, hasExactBranchMatch]);
+  }, [branchNames, createBranchItemValue, hasExactBranchMatch]);
   const filteredBranchPickerItems = useMemo(
     () =>
       normalizedDeferredBranchQuery.length === 0
@@ -294,15 +272,9 @@ export function BranchToolbarBranchSelector({
               itemValue,
               normalizedQuery: normalizedDeferredBranchQuery,
               createBranchItemValue,
-              checkoutPullRequestItemValue,
             }),
           ),
-    [
-      branchPickerItems,
-      checkoutPullRequestItemValue,
-      createBranchItemValue,
-      normalizedDeferredBranchQuery,
-    ],
+    [branchPickerItems, createBranchItemValue, normalizedDeferredBranchQuery],
   );
   const [resolvedActiveBranch, setOptimisticBranch] = useOptimistic(
     canonicalActiveBranch,
@@ -590,53 +562,7 @@ export function BranchToolbarBranchSelector({
     resolvedActiveBranch,
   });
 
-  // PR pill shown next to the branch selector when the active branch has one.
-  const branchPr = resolveThreadPr({
-    threadBranch: resolveBranchToolbarPrBranch({
-      activeThreadBranch,
-      resolvedActiveBranch,
-    }),
-    gitStatus: branchStatusQuery.data ?? null,
-  });
-  const branchPrStatus = prStatusIndicator(branchPr, branchStatusQuery.data?.sourceControlProvider);
-  // Action-oriented tooltip (the pill opens the PR), distinct from the sidebar's
-  // state-description tooltip.
-  const branchPrTooltip = branchPr
-    ? `Open ${sourceControlPresentation.terminology.singular} #${branchPr.number} (${branchPr.state}) in browser`
-    : "";
-  const openPrLink = useOpenPrLink();
-
   function renderPickerItem(itemValue: string, index: number) {
-    if (checkoutPullRequestItemValue && itemValue === checkoutPullRequestItemValue) {
-      return (
-        <ComboboxItem
-          hideIndicator
-          key={itemValue}
-          index={index}
-          value={itemValue}
-          className="pe-2"
-          onClick={() => {
-            if (!prReference || !onCheckoutPullRequestRequest) {
-              return;
-            }
-            setIsBranchMenuOpen(false);
-            setBranchQuery("");
-            onComposerFocusRequest?.();
-            onCheckoutPullRequestRequest(prReference);
-          }}
-        >
-          <div className="flex min-w-0 items-center gap-2 py-1">
-            <SourceControlIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex min-w-0 flex-col items-start">
-              <span className="truncate font-medium">
-                Checkout {sourceControlPresentation.terminology.singular}
-              </span>
-              <span className="truncate text-muted-foreground text-xs">{prReference}</span>
-            </span>
-          </div>
-        </ComboboxItem>
-      );
-    }
     if (createBranchItemValue && itemValue === createBranchItemValue) {
       return (
         <ComboboxItem
@@ -704,27 +630,6 @@ export function BranchToolbarBranchSelector({
       value={resolvedActiveBranch}
     >
       <div className={cn("flex min-w-0 items-center gap-1", className)}>
-        {branchPr && branchPrStatus ? (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <button
-                  type="button"
-                  aria-label={branchPrTooltip}
-                  onClick={(event) => openPrLink(event, branchPrStatus.url)}
-                  className={cn(
-                    "inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[11px] font-medium tabular-nums transition-colors hover:bg-muted/60",
-                    branchPrStatus.colorClass,
-                  )}
-                />
-              }
-            >
-              <ChangeRequestStatusIcon className="size-3" />
-              <span>#{branchPr.number}</span>
-            </TooltipTrigger>
-            <TooltipPopup side="top">{branchPrTooltip}</TooltipPopup>
-          </Tooltip>
-        ) : null}
         {/* Context menu lives on the wrapper: the disabled Button has
             pointer-events-none, so the trigger itself never sees right-clicks
             while refs are loading or a branch action is pending. */}
@@ -771,11 +676,7 @@ export function BranchToolbarBranchSelector({
                 data={filteredBranchPickerItems}
                 keyExtractor={(item) => item}
                 getItemType={(item) =>
-                  item === checkoutPullRequestItemValue
-                    ? "checkout-pull-request"
-                    : item === createBranchItemValue
-                      ? "create-branch"
-                      : "branch"
+                  item === createBranchItemValue ? "create-branch" : "branch"
                 }
                 renderItem={({ item, index }) => renderPickerItem(item, index)}
                 estimatedItemSize={28}
