@@ -2,12 +2,11 @@
  * laplus's own window, told apart from a browser tab.
  *
  * **This is deliberately not `isElectron`.** That flag answers "is there an
- * Electron preload bridge on this page", and the UI spends the answer on far
- * more than window chrome: `main.tsx` selects hash history from it, and every
- * call that goes through `window.desktopBridge` or `window.nativeApi` is gated
- * on it. This webview has no such bridge, so a page that claimed to be Electron
- * would point all of those at something that is not there. That is ticket 27's
- * deciding argument, and it still holds.
+ * Electron preload bridge on this page", and every call that goes through
+ * `window.desktopBridge` or `window.nativeApi` is gated on it. This webview has
+ * no such bridge, so a page that claimed to be Electron would point all of
+ * those at something that is not there. That is ticket 27's deciding argument,
+ * and it still holds.
  *
  * What this flag claims instead is narrow and true: the page is being shown by
  * a Tauri window. `isTauri` is Tauri's own — defined on `window` by an

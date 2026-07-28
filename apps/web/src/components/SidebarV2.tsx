@@ -53,7 +53,6 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { isElectron } from "../env";
 import {
   resolveShortcutCommand,
   shortcutLabelForCommand,
@@ -2209,7 +2208,7 @@ export default function SidebarV2() {
     shortcutLabelForCommand(keybindings, "chat.new");
   return (
     <>
-      <SidebarChromeHeader isElectron={isElectron} />
+      <SidebarChromeHeader />
       <SidebarContent className="gap-0">
         <SidebarGroup className="px-2 pb-2 pt-3">
           <div className="flex items-center gap-1">

@@ -1,6 +1,5 @@
 import { type ReactNode, useEffect, useState } from "react";
 
-import { isElectron } from "~/env";
 import { useResizableWidth } from "~/hooks/useResizableWidth";
 import { cn } from "~/lib/utils";
 
@@ -28,7 +27,6 @@ export function PreviewPanelShell(props: {
   maximized?: boolean;
   children: ReactNode;
 }) {
-  const useDragRegion = isElectron && props.mode !== "sheet" && props.mode !== "embedded";
   const isInline = props.mode === "inline";
   const maxWidth = useViewportClampedMaxWidth();
   const { width, handlers } = useResizableWidth({
@@ -54,7 +52,6 @@ export function PreviewPanelShell(props: {
       data-preview-panel-maximized={props.maximized ? "true" : "false"}
     >
       {isInline && !props.maximized ? <RightPanelResizeHandle handlers={handlers} /> : null}
-      {useDragRegion ? <div className="electron-drag-region h-0 w-full" aria-hidden /> : null}
       {props.children}
     </div>
   );

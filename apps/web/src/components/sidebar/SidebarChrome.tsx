@@ -20,11 +20,7 @@ import {
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdatePill } from "./SidebarUpdatePill";
 
-export const SidebarChromeHeader = memo(function SidebarChromeHeader({
-  isElectron,
-}: {
-  isElectron: boolean;
-}) {
+export const SidebarChromeHeader = memo(function SidebarChromeHeader() {
   const stageLabel = useSidebarStageLabel();
   const backdropVariant = resolveSidebarStageBackdropVariant(stageLabel);
 
@@ -32,9 +28,7 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
     <SidebarHeader
       className={cn(
         "@container/sidebar-header relative h-[var(--workspace-topbar-height)] shrink-0 flex-row items-center px-3 py-0 md:px-0",
-        isElectron && "drag-region",
       )}
-      // The left-hand end of the same bar `drag-region` marks for Electron.
       // Unconditional because the attribute is inert without Tauri's injected
       // listener — there is nothing to gate it on in a browser. Ticket 27.
       data-tauri-drag-region="deep"

@@ -12,7 +12,6 @@ import { useCallback, useEffect, useState } from "react";
 import { useSettingsRestore } from "../components/settings/SettingsPanels";
 import { Button } from "../components/ui/button";
 import { SidebarInset } from "../components/ui/sidebar";
-import { isElectron } from "../env";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 
@@ -65,45 +64,25 @@ function SettingsContentLayout() {
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground isolate">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
-        {!isElectron && (
-          <header
-            // Ticket 27. This is the browser layout, which laplus's own window
-            // also uses, so it is the settings page's top-right corner too.
-            data-workspace-titlebar
-            data-tauri-drag-region="deep"
-            className={cn(
-              "px-3 py-2 transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none sm:px-5",
-              COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
-            )}
-          >
-            <div className="flex min-h-7 items-center gap-2 sm:min-h-6">
-              <span className="text-sm font-medium text-foreground">Settings</span>
-              {showRestoreDefaults ? (
-                <div className="ms-auto flex items-center gap-2">
-                  <RestoreDefaultsButton onRestored={handleRestored} />
-                </div>
-              ) : null}
-            </div>
-          </header>
-        )}
-
-        {isElectron && (
-          <div
-            className={cn(
-              "drag-region flex h-[52px] shrink-0 items-center px-5 transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none wco:h-[env(titlebar-area-height)] wco:pr-[calc(100vw-env(titlebar-area-width)-env(titlebar-area-x)+1em)]",
-              COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
-            )}
-          >
-            <span className="text-xs font-medium tracking-wide text-muted-foreground/70">
-              Settings
-            </span>
+        <header
+          // Ticket 27. This is the browser layout, which laplus's own window
+          // also uses, so it is the settings page's top-right corner too.
+          data-workspace-titlebar
+          data-tauri-drag-region="deep"
+          className={cn(
+            "px-3 py-2 transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none sm:px-5",
+            COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
+          )}
+        >
+          <div className="flex min-h-7 items-center gap-2 sm:min-h-6">
+            <span className="text-sm font-medium text-foreground">Settings</span>
             {showRestoreDefaults ? (
               <div className="ms-auto flex items-center gap-2">
                 <RestoreDefaultsButton onRestored={handleRestored} />
               </div>
             ) : null}
           </div>
-        )}
+        </header>
 
         <div key={restoreSignal} className="min-h-0 flex flex-1 flex-col">
           <Outlet />

@@ -38,9 +38,9 @@ describe("isDesktopShell", () => {
   });
 
   /**
-   * The distinction ticket 27 turns on. `isElectron` selects hash history and
-   * gates every call into a preload bridge; this shell has no such bridge, so
-   * the two flags must never be read off the same thing.
+   * The distinction ticket 27 turns on. `isElectron` gates every call into a
+   * preload bridge; this shell has no such bridge, so the two flags must never
+   * be read off the same thing.
    */
   it("does not key on Electron's bridge, and Electron does not turn it on", async () => {
     const { isDesktopShell } = await loadWith({
