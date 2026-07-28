@@ -1,8 +1,4 @@
-import {
-  EnvironmentId,
-  type RelayClientInstallProgressEvent,
-  WS_METHODS,
-} from "@t3tools/contracts";
+import { EnvironmentId, type GitActionProgressEvent, WS_METHODS } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -34,13 +30,21 @@ const TARGET = new PrimaryConnectionTarget({
   wsBaseUrl: "wss://environment.example.test",
 });
 
-const INSTALL_CHECKING: RelayClientInstallProgressEvent = {
-  type: "progress",
-  stage: "checking",
+const STACKED_ACTION = {
+  actionId: "action-1",
+  cwd: "/workspace/project",
+  action: "commit",
+} as const;
+const ACTION_STARTED: GitActionProgressEvent = {
+  ...STACKED_ACTION,
+  kind: "action_started",
+  phases: ["commit"],
 };
-const INSTALL_DOWNLOADING: RelayClientInstallProgressEvent = {
-  type: "progress",
-  stage: "downloading",
+const ACTION_PHASE_STARTED: GitActionProgressEvent = {
+  ...STACKED_ACTION,
+  kind: "phase_started",
+  phase: "commit",
+  label: "Committing",
 };
 
 function session(client: WsRpcProtocolClient): RpcSession.RpcSession {
@@ -81,13 +85,12 @@ describe("environment RPC", () => {
     Effect.gen(function* () {
       const observations: string[] = [];
       const client = {
-        [WS_METHODS.cloudGetRelayClientStatus]: () =>
-          Effect.succeed({ status: "available", version: "2026.6.0" }),
+        [WS_METHODS.serverProbe]: () => Effect.succeed({ ok: true }),
       } as unknown as WsRpcProtocolClient;
       const { activeSession, supervisor } = yield* makeHarness();
       yield* SubscriptionRef.set(activeSession, Option.some(session(client)));
 
-      const result = yield* request(WS_METHODS.cloudGetRelayClientStatus, {}).pipe(
+      const result = yield* request(WS_METHODS.serverProbe, {}).pipe(
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         Effect.provideService(
           EnvironmentRpcRequestObserver,
@@ -103,28 +106,28 @@ describe("environment RPC", () => {
         ),
       );
 
-      expect(result).toEqual({ status: "available", version: "2026.6.0" });
+      expect(result).toEqual({ ok: true });
       expect(observations).toEqual([
-        `start:${TARGET.environmentId}:${WS_METHODS.cloudGetRelayClientStatus}`,
-        `finish:${TARGET.environmentId}:${WS_METHODS.cloudGetRelayClientStatus}`,
+        `start:${TARGET.environmentId}:${WS_METHODS.serverProbe}`,
+        `finish:${TARGET.environmentId}:${WS_METHODS.serverProbe}`,
       ]);
     }),
   );
 
   it.effect("binds finite streaming commands to one active session", () =>
     Effect.gen(function* () {
-      const firstEvents = yield* Queue.unbounded<RelayClientInstallProgressEvent>();
-      const secondEvents = yield* Queue.unbounded<RelayClientInstallProgressEvent>();
+      const firstEvents = yield* Queue.unbounded<GitActionProgressEvent>();
+      const secondEvents = yield* Queue.unbounded<GitActionProgressEvent>();
       const firstClient = {
-        [WS_METHODS.cloudInstallRelayClient]: () => Stream.fromQueue(firstEvents),
+        [WS_METHODS.gitRunStackedAction]: () => Stream.fromQueue(firstEvents),
       } as unknown as WsRpcProtocolClient;
       const secondClient = {
-        [WS_METHODS.cloudInstallRelayClient]: () => Stream.fromQueue(secondEvents),
+        [WS_METHODS.gitRunStackedAction]: () => Stream.fromQueue(secondEvents),
       } as unknown as WsRpcProtocolClient;
       const { activeSession, supervisor } = yield* makeHarness();
 
       yield* SubscriptionRef.set(activeSession, Option.some(session(firstClient)));
-      const resultFiber = yield* runStream(WS_METHODS.cloudInstallRelayClient, {}).pipe(
+      const resultFiber = yield* runStream(WS_METHODS.gitRunStackedAction, STACKED_ACTION).pipe(
         Stream.take(2),
         Stream.runCollect,
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
@@ -132,12 +135,12 @@ describe("environment RPC", () => {
       );
       yield* Effect.yieldNow;
 
-      yield* Queue.offer(firstEvents, INSTALL_CHECKING);
+      yield* Queue.offer(firstEvents, ACTION_STARTED);
       yield* SubscriptionRef.set(activeSession, Option.some(session(secondClient)));
-      yield* Queue.offer(secondEvents, INSTALL_DOWNLOADING);
-      yield* Queue.offer(firstEvents, INSTALL_DOWNLOADING);
+      yield* Queue.offer(secondEvents, ACTION_PHASE_STARTED);
+      yield* Queue.offer(firstEvents, ACTION_PHASE_STARTED);
 
-      expect(yield* Fiber.join(resultFiber)).toEqual([INSTALL_CHECKING, INSTALL_DOWNLOADING]);
+      expect(yield* Fiber.join(resultFiber)).toEqual([ACTION_STARTED, ACTION_PHASE_STARTED]);
     }),
   );
 

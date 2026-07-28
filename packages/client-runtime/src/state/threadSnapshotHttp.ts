@@ -8,7 +8,6 @@ import { HttpClient } from "effect/unstable/http";
 
 import type { PreparedConnection } from "../connection/model.ts";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
-import { ManagedRelayDpopSigner } from "../relay/managedRelay.ts";
 import {
   executeEnvironmentHttpRequest,
   makeEnvironmentHttpApiClient,
@@ -31,7 +30,6 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
 )(function* (input: {
   readonly prepared: PreparedConnection;
   readonly threadId: ThreadId;
-  readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
   readonly timeoutMs?: number;
 }) {
   const requestUrl = environmentEndpointUrl(
@@ -39,12 +37,7 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
     `/api/orchestration/threads/${input.threadId}`,
   );
   const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
-  const headers = yield* buildEnvironmentAuthHeaders(
-    input.prepared.httpAuthorization,
-    "GET",
-    requestUrl,
-    input.signer,
-  );
+  const headers = buildEnvironmentAuthHeaders(input.prepared.httpAuthorization, "GET", requestUrl);
   return yield* executeEnvironmentHttpRequest(
     requestUrl,
     input.timeoutMs ?? DEFAULT_THREAD_SNAPSHOT_TIMEOUT_MS,
@@ -84,13 +77,9 @@ export const threadSnapshotLoaderLayer: Layer.Layer<
   ThreadSnapshotLoader,
   Effect.gen(function* () {
     const httpClient = yield* HttpClient.HttpClient;
-    // Resolve the DPoP signer optionally: it is only needed for relay/DPoP
-    // connections, so the loader must not hard-require it (bearer/primary
-    // connections work without one).
-    const signer = yield* Effect.serviceOption(ManagedRelayDpopSigner);
     return ThreadSnapshotLoader.of({
       load: (prepared: PreparedConnection, threadId: ThreadId) =>
-        fetchEnvironmentThreadSnapshot({ prepared, threadId, signer }).pipe(
+        fetchEnvironmentThreadSnapshot({ prepared, threadId }).pipe(
           Effect.map(Option.some<OrchestrationThreadDetailSnapshot>),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           // A genuinely missing thread (404) is expected — the socket

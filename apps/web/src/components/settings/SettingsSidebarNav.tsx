@@ -20,7 +20,6 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "../ui/sidebar";
-import { T3ConnectSidebarAvatar, T3ConnectSidebarSignIn } from "../clerk/T3ConnectSidebarSignIn";
 
 export type SettingsSectionPath =
   | "/settings/general"
@@ -105,22 +104,18 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="p-2">
-        <T3ConnectSidebarSignIn />
-        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1">
-          <SidebarMenu className="min-w-0">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                size="sm"
-                className="h-8 items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium text-sidebar-muted-foreground/80 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
-                onClick={handleBackClick}
-              >
-                <ArrowLeftIcon className="size-4" />
-                <span>Back</span>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
-          <T3ConnectSidebarAvatar />
-        </div>
+        <SidebarMenu className="min-w-0">
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              size="sm"
+              className="h-8 items-center gap-2 rounded-md px-2 py-1.5 text-sm font-medium text-sidebar-muted-foreground/80 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
+              onClick={handleBackClick}
+            >
+              <ArrowLeftIcon className="size-4" />
+              <span>Back</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
       </SidebarFooter>
     </>
   );

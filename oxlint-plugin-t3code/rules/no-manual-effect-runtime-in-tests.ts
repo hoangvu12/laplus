@@ -25,10 +25,8 @@ const EFFECT_RUNTIME_METHODS = new Set([
 // carry are gone with those packages: the TypeScript server is `reference/`
 // now, which the linter does not read, and there is no mobile app.
 const LEGACY_BASELINE = new Map<string, number>([
-  ["apps/web/src/cloud/dpop.test.ts", 2],
   ["apps/web/src/environments/runtime/service.addSavedEnvironment.test.ts", 1],
   ["oxlint-plugin-t3code/rules/no-manual-effect-runtime-in-tests.test.ts", 7],
-  ["packages/client-runtime/src/relay/managedRelayState.test.ts", 1],
   ["packages/client-runtime/src/wsTransport.test.ts", 2],
 ]);
 

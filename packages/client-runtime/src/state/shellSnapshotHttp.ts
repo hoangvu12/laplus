@@ -8,7 +8,6 @@ import { HttpClient } from "effect/unstable/http";
 
 import type { PreparedConnection } from "../connection/model.ts";
 import { environmentEndpointUrl } from "../environment/endpoint.ts";
-import { ManagedRelayDpopSigner } from "../relay/managedRelay.ts";
 import { executeEnvironmentHttpRequest, makeEnvironmentHttpApiClient } from "../rpc/http.ts";
 import { buildEnvironmentAuthHeaders, withEnvironmentCredentials } from "./environmentHttpAuth.ts";
 
@@ -24,19 +23,10 @@ const DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS = 6_000;
  */
 export const fetchEnvironmentShellSnapshot = Effect.fn(
   "clientRuntime.state.fetchEnvironmentShellSnapshot",
-)(function* (input: {
-  readonly prepared: PreparedConnection;
-  readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
-  readonly timeoutMs?: number;
-}) {
+)(function* (input: { readonly prepared: PreparedConnection; readonly timeoutMs?: number }) {
   const requestUrl = environmentEndpointUrl(input.prepared.httpBaseUrl, "/api/orchestration/shell");
   const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
-  const headers = yield* buildEnvironmentAuthHeaders(
-    input.prepared.httpAuthorization,
-    "GET",
-    requestUrl,
-    input.signer,
-  );
+  const headers = buildEnvironmentAuthHeaders(input.prepared.httpAuthorization, "GET", requestUrl);
   return yield* executeEnvironmentHttpRequest(
     requestUrl,
     input.timeoutMs ?? DEFAULT_SHELL_SNAPSHOT_TIMEOUT_MS,
@@ -70,12 +60,9 @@ export const shellSnapshotLoaderLayer: Layer.Layer<
   ShellSnapshotLoader,
   Effect.gen(function* () {
     const httpClient = yield* HttpClient.HttpClient;
-    // Resolve the DPoP signer optionally: it is only needed for relay/DPoP
-    // connections, so the loader must not hard-require it.
-    const signer = yield* Effect.serviceOption(ManagedRelayDpopSigner);
     return ShellSnapshotLoader.of({
       load: (prepared: PreparedConnection) =>
-        fetchEnvironmentShellSnapshot({ prepared, signer }).pipe(
+        fetchEnvironmentShellSnapshot({ prepared }).pipe(
           Effect.map(Option.some<OrchestrationShellSnapshot>),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Effect.catchCause((cause) =>

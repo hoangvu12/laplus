@@ -5,9 +5,9 @@ acceptance is "one bar rather than two", which is a thing you look at — and
 because the two most expensive mistakes in building it were both visible here
 and in nothing else.
 
-| File | |
-| --- | --- |
-| `window.png` | The whole window, captured with `tools/ui-driver/window-shot.ps1`. No operating-system titlebar above the topbar |
+| File                      |                                                                                                                                          |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `window.png`              | The whole window, captured with `tools/ui-driver/window-shot.ps1`. No operating-system titlebar above the topbar                         |
 | `topbar-right-corner.png` | The right-hand end at 4x: the header's trailing controls, the two panel toggles, then the three caption buttons, every glyph on one line |
 
 The first mistake was the buttons being 40px tall — Electron's overlay height —

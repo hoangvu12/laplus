@@ -119,7 +119,7 @@ together.
 **Ticket 23's removed script did not come back, and should not have.** The
 reopening comment above names it as the starting point; it is not one. Tauri
 ships that script itself — `tauri::window::plugin` injects a `drag.js` into every
-webview, on remote URLs too — so the topbars needed an *attribute*
+webview, on remote URLs too — so the topbars needed an _attribute_
 (`data-tauri-drag-region`) rather than a script. What ticket 23 could not verify
 was never the JavaScript; it was the capability, and that is the part this
 session could only settle by watching a window.
@@ -144,21 +144,21 @@ Two things found while building it, both of which changed the shape of the fix:
 The spacing then needed one more pass, and the reason is worth keeping: the
 topbar's right-hand padding and `--workspace-controls-right` are **derived in
 that order**. Setting the padding to the buttons' width puts the panel toggles
-*inside* the band the header reserves for them, and the two end up a pixel
+_inside_ the band the header reserves for them, and the two end up a pixel
 apart. `titlebar-boxes.mjs` is what said so — the three things in that corner
 are positioned by three different rules and which one is wrong cannot be seen by
 looking.
 
 Verified against the real window rather than a browser, by measurement:
 
-| | |
-| --- | --- |
-| drag, chat topbar | asked 40,40 → moved 40,40 |
-| drag, sidebar chrome | asked −40,−40 → moved −40,−40 |
-| minimise / maximise / restore / close | each one, from each state |
-| double-click the topbar | maximised ↔ restored |
-| right edge | resizes, 1442 → 1542 |
-| maximised | 1920x1032 at 0,0 — clear of the taskbar |
+|                                       |                                         |
+| ------------------------------------- | --------------------------------------- |
+| drag, chat topbar                     | asked 40,40 → moved 40,40               |
+| drag, sidebar chrome                  | asked −40,−40 → moved −40,−40           |
+| minimise / maximise / restore / close | each one, from each state               |
+| double-click the topbar               | maximised ↔ restored                    |
+| right edge                            | resizes, 1442 → 1542                    |
+| maximised                             | 1920x1032 at 0,0 — clear of the taskbar |
 
 `tools/ui-driver/window-{find,shot,drag,click}.ps1` are what did it, and the
 README there has the recipe. `window-find.ps1` is the one to read first: this
