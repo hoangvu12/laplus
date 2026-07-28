@@ -38,37 +38,6 @@ describe("branding", () => {
     expect(branding.APP_STAGE_LABEL).toBe("Nightly");
     expect(branding.APP_DISPLAY_NAME).toBe("T3 Code (Nightly)");
   });
-
-  it("normalizes hosted app channel metadata", async () => {
-    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "nightly");
-
-    const branding = await import("./branding");
-
-    expect(branding.HOSTED_APP_CHANNEL).toBe("nightly");
-    expect(branding.HOSTED_APP_CHANNEL_LABEL).toBe("Nightly");
-    expect(branding.APP_STAGE_LABEL).toBe("Nightly");
-    expect(branding.APP_DISPLAY_NAME).toBe("laplus (Nightly)");
-  });
-
-  it("does not label the latest hosted app channel", async () => {
-    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "latest");
-
-    const branding = await import("./branding");
-
-    expect(branding.HOSTED_APP_CHANNEL).toBe("latest");
-    expect(branding.HOSTED_APP_CHANNEL_LABEL).toBe("Latest");
-    expect(branding.APP_STAGE_LABEL).toBe("Latest");
-    expect(branding.APP_DISPLAY_NAME).toBe("laplus");
-  });
-
-  it("ignores unknown hosted app channels", async () => {
-    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "preview");
-
-    const branding = await import("./branding");
-
-    expect(branding.HOSTED_APP_CHANNEL).toBeNull();
-    expect(branding.HOSTED_APP_CHANNEL_LABEL).toBeNull();
-  });
 });
 
 describe("branding logic", () => {
