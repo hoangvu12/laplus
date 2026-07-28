@@ -1,35 +1,53 @@
-//! The permissive local handshake at the socket upgrade.
+//! Who may talk to this server: the origin half.
 //!
-//! Accounts are out of scope for v1, but the handshake *shape* is not
-//! optional: the UI presents a credential when it connects and the server has
-//! to take it. So this module answers one question — may this upgrade proceed?
-//! — and answers it without an identity store.
+//! This module answers one question — is this request *from* somewhere this
+//! server will listen to, and what did it present? — and answers it without
+//! touching a database or a web framework. The other half of the answer, does
+//! the presented credential verify, is a database read and lives in
+//! [`crate::server`] against [`crate::store`]. Neither half is sufficient
+//! alone.
 //!
-//! The policy, from the spec:
+//! The policy:
 //!
 //! - **Bind to loopback.** Done where the listener is created, not here.
-//! - **Reject non-local origins.** The one refusal this module makes. It
-//!   matters because binding to loopback does *not* stop a page on another
-//!   origin from asking the user's own browser to connect for it.
-//! - **Verify the credential against nothing.** Every shape is accepted, and
-//!   so is no credential at all. What is recorded is *which* shape arrived,
-//!   because that is the thing later work might need and the thing a capture
-//!   can be checked against.
+//! - **Refuse an origin that is neither this machine nor named by the user.**
+//!   The one refusal this module makes. It matters because binding to loopback
+//!   does *not* stop a page on another origin from asking the user's own
+//!   browser to connect on its behalf. The named hosts are
+//!   [`crate::remote_access`], which is how a phone on a tunnel gets in.
+//! - **Report what was presented, and verify none of it.** [`authorize`]
+//!   returns a [`Presented`], which is an obligation rather than a permission.
 //!
-//! The shapes come from ticket 01's captures and from the reference server's
-//! `authenticateWebSocketUpgrade`, in its precedence order: the `wsTicket`
-//! query parameter first, then the `Authorization` header, then the
+//! The credential shapes come from ticket 01's captures and from the reference
+//! server's `authenticateWebSocketUpgrade`, in its precedence order: the
+//! `wsTicket` query parameter first, then the `Authorization` header, then the
 //! `t3_session` cookie.
 //!
-//! **[`authorize`] has a second caller since ticket 31**: the two orchestration
-//! snapshot routes in [`crate::http`]. They are not upgrades, but they must
-//! accept exactly what an upgrade accepts — they answer with data the socket
-//! already carries, so a credential good enough to open the socket that was not
-//! good enough to read a snapshot would send the client back to the socket
-//! fallback, which is the round trip that ticket exists to remove. Permissive
-//! includes *absent*: the real client sends no credential at all on a primary
-//! local connection. `docs/adr/0015` is that decision in full, including why
-//! the contract's "missing credential means 401" could not be honoured here.
+//! ## This module used to accept an absent credential
+//!
+//! Until ticket 73 it did, deliberately — `docs/adr/0015`. v1 had no identity
+//! store to check one against and no pairing flow to build one on, and the
+//! reasoning held because **loopback was the boundary**: only a program already
+//! running as the user could reach the port at all, and such a program is
+//! already the user.
+//!
+//! A tunnel dissolves that reasoning rather than stretching it. `cloudflared`
+//! runs on this machine and dials `127.0.0.1`, so a request from the far side of
+//! the world arrives with the same peer address as the window's and whatever
+//! headers it cares to send. There is no signal at this layer that tells them
+//! apart. So the exemption had to go, and with it the last thing that made
+//! laplus's handshake unlike the reference server's — which has always refused
+//! a request carrying nothing (`EnvironmentAuth.ts:599-601`).
+//!
+//! The desktop window keeps working because it stopped being exempt and started
+//! carrying a credential, the way upstream's always has. See
+//! [`crate::Server::window_url`]. `docs/adr/0019` records all of this.
+//!
+//! **[`authorize`] has many callers**: the socket upgrade, the two
+//! orchestration snapshot routes, and ticket 73's own. They must all accept
+//! exactly what an upgrade accepts — a credential good enough to open the socket
+//! that was not good enough to read a snapshot would send the client back to the
+//! socket fallback, which is the round trip ticket 31 exists to remove.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -70,6 +88,8 @@ pub struct Rejection {
     /// Correlation id, echoed to the client so a refusal in the UI can be
     /// matched to a line in the log.
     pub trace_id: String,
+    /// Which of `EnvironmentAuthInvalidReason`'s two members this is.
+    reason: &'static str,
 }
 
 /// The 401 body, verbatim in shape from
@@ -89,23 +109,51 @@ impl Rejection {
         Rejection {
             detail: detail.into(),
             trace_id: trace_id(),
+            reason: "invalid_credential",
+        }
+    }
+
+    /// A credential was presented and did not verify.
+    ///
+    /// Ticket 73's routes, which are the first thing in this server that
+    /// verifies a credential against anything at all. [`authorize`] does not
+    /// build one of these: what it refuses is an origin, and it reports that
+    /// through the same `invalid_credential` for the reason
+    /// [`Rejection::body`] gives.
+    pub fn invalid_credential(detail: impl Into<String>) -> Rejection {
+        Rejection::new(detail)
+    }
+
+    /// No credential was presented where one was required.
+    ///
+    /// The union's other member, and worth telling apart from the one above:
+    /// a phone whose thirty days ran out presents a token that no longer
+    /// verifies, while a phone whose storage was cleared presents nothing. The
+    /// first should re-pair and the second should re-attach, and the client is
+    /// the only thing that can tell the user which — which is why the
+    /// distinction is on the wire and not only in the log.
+    pub fn missing_credential(detail: impl Into<String>) -> Rejection {
+        Rejection {
+            reason: "missing_credential",
+            ..Rejection::new(detail)
         }
     }
 
     /// The JSON body to return with `401 Unauthorized`.
     ///
-    /// `reason` is `invalid_credential` even though what was actually wrong
-    /// was the origin. The contract's `EnvironmentAuthInvalidReason` is a
-    /// closed union of `missing_credential | invalid_credential`, and
-    /// upstream has no origin check to have added a third member for. Reusing
-    /// the closed union keeps the body decodable by the unmodified client;
-    /// inventing a reason would not. The real cause is in
-    /// [`Rejection::detail`], which stays server-side.
+    /// For a refusal from [`authorize`], `reason` is `invalid_credential` even
+    /// though what was actually wrong was the origin. The contract's
+    /// `EnvironmentAuthInvalidReason` is a closed union of
+    /// `missing_credential | invalid_credential`, and upstream has no origin
+    /// check to have added a third member for. Reusing the closed union keeps
+    /// the body decodable by the unmodified client; inventing a reason would
+    /// not. The real cause is in [`Rejection::detail`], which stays
+    /// server-side.
     pub fn body(&self) -> AuthInvalidBody {
         AuthInvalidBody {
             tag: "EnvironmentAuthInvalidError",
             code: "auth_invalid",
-            reason: "invalid_credential",
+            reason: self.reason,
             trace_id: self.trace_id.clone(),
         }
     }
@@ -128,57 +176,134 @@ pub struct UpgradeRequest<'a> {
     pub cookie: Option<&'a str>,
 }
 
-/// Decide whether an upgrade may proceed.
-pub fn authorize(request: UpgradeRequest<'_>) -> Result<Credential, Rejection> {
+/// A credential that got past the origin check, and the token to verify it by.
+///
+/// **This module does not verify it.** Verification is a database read and
+/// [`crate::store`] is the only file that speaks SQL, so what `authorize`
+/// returns is the *obligation*: here is what arrived, here is the string, now
+/// go and check it. [`crate::server`] is where the two meet, and it is one
+/// function there — nothing else in the tree is allowed to decide it has
+/// checked enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Presented<'a> {
+    pub shape: Credential,
+    /// The credential itself. Empty exactly when `shape` is
+    /// [`Credential::Absent`].
+    pub token: &'a str,
+}
+
+/// Decide whether a request may proceed as far as having its credential checked.
+///
+/// **Every caller must then check it.** A `Presented` is not permission; see
+/// its own note. The one thing settled here is the origin, because that is the
+/// question a database cannot answer.
+///
+/// ## The rule
+///
+/// A page may reach this server if it was served from this machine, or from a
+/// host the user named in [`crate::remote_access`]. Everything else is refused
+/// before any credential is looked at.
+///
+/// **A request with no `Origin` at all passes this check**, and that is not an
+/// oversight — it is why the credential check that follows is not optional. A
+/// browser always sends `Origin` on a WebSocket upgrade and on any request that
+/// is not a `GET`, so an absent one means a client that is not a browser, which
+/// no origin rule can say anything useful about. `curl` sends whatever it likes.
+/// The origin check exists to stop *a page somewhere else* from making the
+/// user's own browser talk to this server; it has never been able to stop a
+/// program, and before ticket 73 it did not have to, because loopback was the
+/// boundary and a program on this machine is already the user.
+///
+/// A tunnel dissolves that. `cloudflared` runs on this machine and dials
+/// `127.0.0.1`, so a request that came from the far side of the world arrives
+/// looking exactly like one from the window — same peer address, and any header
+/// it likes. **Nothing at this layer can tell them apart**, which is why
+/// `docs/adr/0019` supersedes `0015` and why an absent credential is now
+/// refused rather than accepted.
+pub fn authorize<'a>(
+    request: UpgradeRequest<'a>,
+    allowed: &crate::remote_access::RemoteAccess,
+) -> Result<Presented<'a>, Rejection> {
     if let Some(origin) = request.origin {
-        if !is_local_origin(origin) {
+        if !is_admissible_origin(origin, allowed) {
             return Err(Rejection::new(format!(
-                "refused socket upgrade from non-local origin {origin}"
+                "refused a request from origin {origin}, which is neither this machine \
+                 nor named in remote-access.json"
             )));
         }
     }
 
-    Ok(credential(request))
+    Ok(presented(request))
 }
 
-fn credential(request: UpgradeRequest<'_>) -> Credential {
+fn presented(request: UpgradeRequest<'_>) -> Presented<'_> {
     if let Some(query) = request.query {
-        if query_param(query, WEBSOCKET_TICKET_QUERY_PARAM).is_some() {
-            return Credential::WebSocketTicket;
+        if let Some(ticket) = query_param(query, WEBSOCKET_TICKET_QUERY_PARAM) {
+            return Presented {
+                shape: Credential::WebSocketTicket,
+                token: ticket,
+            };
         }
     }
 
     if let Some(authorization) = request.authorization {
         if let Some(token) = authorization.strip_prefix("Bearer ") {
             if !token.trim().is_empty() {
-                return Credential::BearerToken;
+                return Presented {
+                    shape: Credential::BearerToken,
+                    token: token.trim(),
+                };
             }
         }
         if let Some(token) = authorization.strip_prefix("DPoP ") {
             if !token.trim().is_empty() {
-                return Credential::DpopToken;
+                return Presented {
+                    shape: Credential::DpopToken,
+                    token: token.trim(),
+                };
             }
         }
     }
 
     if let Some(cookie) = request.cookie {
-        if cookie_value(cookie, SESSION_COOKIE_NAME).is_some() {
-            return Credential::SessionCookie;
+        if let Some(session) = cookie_value(cookie, SESSION_COOKIE_NAME) {
+            return Presented {
+                shape: Credential::SessionCookie,
+                token: session,
+            };
         }
     }
 
-    Credential::Absent
+    Presented {
+        shape: Credential::Absent,
+        token: "",
+    }
 }
 
-/// Is this `Origin` header value a page served from this machine?
+/// Is this `Origin` one this server will hear from at all?
 ///
-/// A browser sends the literal `null` for opaque origins (`file://`,
-/// sandboxed iframes), which is not local and is refused. An absent header is
-/// handled by the caller — non-browser clients do not send one.
-fn is_local_origin(origin: &str) -> bool {
+/// This machine, or a host the user wrote down. Both halves matter: without the
+/// first the window cannot connect, and without the second a tunnel cannot.
+fn is_admissible_origin(origin: &str, allowed: &crate::remote_access::RemoteAccess) -> bool {
+    let Some(host) = origin_host(origin) else {
+        // A browser sends the literal `null` for opaque origins (`file://`,
+        // sandboxed iframes), which parses to no host and is refused.
+        return false;
+    };
+    is_loopback_host(host) || allowed.allows(host)
+}
+
+/// The host an `Origin` header names, or `None` if it names none.
+///
+/// Matches on **host** and ignores the scheme, which cuts the opposite way from
+/// what you would guess: `tauri://localhost` is local because its host is
+/// `localhost`, while `http://tauri.localhost` is not, because
+/// `tauri.localhost` is a different host. [`crate::remote_access`] matches the
+/// same way and says why for the allowlist half.
+fn origin_host(origin: &str) -> Option<&str> {
     let after_scheme = match origin.split_once("://") {
         Some((scheme, rest)) if !scheme.is_empty() => rest,
-        _ => return false,
+        _ => return None,
     };
     // Origins carry no path, but be liberal about what we accept.
     let authority = after_scheme
@@ -191,7 +316,7 @@ fn is_local_origin(origin: &str) -> bool {
         None => authority.split(':').next().unwrap_or_default(),
     };
 
-    is_loopback_host(host)
+    (!host.is_empty()).then_some(host)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -253,49 +378,83 @@ pub(crate) fn trace_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_access::RemoteAccess;
 
     fn request<'a>() -> UpgradeRequest<'a> {
         UpgradeRequest::default()
     }
 
+    /// The ordinary machine: loopback, and nothing else named.
+    fn loopback_only() -> RemoteAccess {
+        RemoteAccess::none()
+    }
+
+    /// A machine whose owner has put a tunnel in front of laplus.
+    fn tunnelled() -> RemoteAccess {
+        RemoteAccess::from_hosts(["phone.example"])
+    }
+
+    fn shape(request: UpgradeRequest<'_>, allowed: &RemoteAccess) -> Credential {
+        authorize(request, allowed).expect("admitted").shape
+    }
+
     /// The browser UI's shape, from `01-browser-session.ndjson`.
     #[test]
-    fn the_browsers_cookie_and_origin_are_accepted() {
-        let accepted = authorize(UpgradeRequest {
-            origin: Some("http://127.0.0.1:3999"),
-            cookie: Some("t3_session=eyJ2Ijox.c2ln"),
-            ..request()
-        });
-        assert_eq!(accepted.unwrap(), Credential::SessionCookie);
+    fn the_browsers_cookie_and_origin_are_admitted() {
+        let admitted = authorize(
+            UpgradeRequest {
+                origin: Some("http://127.0.0.1:3999"),
+                cookie: Some("t3_session=eyJ2Ijox.c2ln"),
+                ..request()
+            },
+            &loopback_only(),
+        )
+        .expect("admitted");
+
+        assert_eq!(admitted.shape, Credential::SessionCookie);
+        // The token travels with the shape, because the caller has to verify it
+        // and reaching back into the header to find it again would be a second
+        // reading that could disagree with this one.
+        assert_eq!(admitted.token, "eyJ2Ijox.c2ln");
     }
 
     /// The non-browser shape, from `02-request-response.ndjson`. Note it sends
     /// no `Origin` at all.
     #[test]
-    fn a_websocket_ticket_with_no_origin_is_accepted() {
-        let accepted = authorize(UpgradeRequest {
-            query: Some("wsTicket=eyJ2Ijox.c2ln"),
-            ..request()
-        });
-        assert_eq!(accepted.unwrap(), Credential::WebSocketTicket);
+    fn a_websocket_ticket_with_no_origin_is_admitted() {
+        let admitted = authorize(
+            UpgradeRequest {
+                query: Some("wsTicket=eyJ2Ijox.c2ln"),
+                ..request()
+            },
+            &loopback_only(),
+        )
+        .expect("admitted");
+
+        assert_eq!(admitted.shape, Credential::WebSocketTicket);
+        assert_eq!(admitted.token, "eyJ2Ijox.c2ln");
     }
 
     #[test]
-    fn authorization_headers_are_accepted_in_both_schemes() {
+    fn authorization_headers_are_admitted_in_both_schemes() {
         assert_eq!(
-            authorize(UpgradeRequest {
-                authorization: Some("Bearer eyJ2Ijox.c2ln"),
-                ..request()
-            })
-            .unwrap(),
+            shape(
+                UpgradeRequest {
+                    authorization: Some("Bearer eyJ2Ijox.c2ln"),
+                    ..request()
+                },
+                &loopback_only()
+            ),
             Credential::BearerToken
         );
         assert_eq!(
-            authorize(UpgradeRequest {
-                authorization: Some("DPoP eyJ2Ijox.c2ln"),
-                ..request()
-            })
-            .unwrap(),
+            shape(
+                UpgradeRequest {
+                    authorization: Some("DPoP eyJ2Ijox.c2ln"),
+                    ..request()
+                },
+                &loopback_only()
+            ),
             Credential::DpopToken
         );
     }
@@ -304,21 +463,35 @@ mod tests {
     /// server's precedence.
     #[test]
     fn the_ticket_parameter_takes_precedence() {
-        let accepted = authorize(UpgradeRequest {
-            query: Some("wsTicket=ticket"),
-            authorization: Some("Bearer token"),
-            cookie: Some("t3_session=cookie"),
-            ..request()
-        });
-        assert_eq!(accepted.unwrap(), Credential::WebSocketTicket);
+        let admitted = authorize(
+            UpgradeRequest {
+                query: Some("wsTicket=ticket"),
+                authorization: Some("Bearer token"),
+                cookie: Some("t3_session=cookie"),
+                ..request()
+            },
+            &loopback_only(),
+        )
+        .expect("admitted");
+
+        assert_eq!(admitted.shape, Credential::WebSocketTicket);
+        assert_eq!(admitted.token, "ticket");
     }
 
-    /// Permissive means permissive: no credential is still an upgrade. v1 has
-    /// nothing to check one against, and refusing would mean shipping a
-    /// pairing flow the spec puts out of scope.
+    /// **This module no longer decides whether an absent credential is
+    /// acceptable, and that is the point of ticket 73.**
+    ///
+    /// It reports `Absent` and admits the request as far as the credential
+    /// check, which then refuses it — `crate::server::authorized`. The split
+    /// exists because the two questions have different answers for
+    /// `/oauth/token`, which is how a client holding nothing comes to hold
+    /// something.
     #[test]
-    fn an_absent_credential_is_accepted_and_recorded_as_absent() {
-        assert_eq!(authorize(request()).unwrap(), Credential::Absent);
+    fn an_absent_credential_is_reported_rather_than_judged() {
+        let admitted =
+            authorize(request(), &loopback_only()).expect("the origin is not the problem");
+        assert_eq!(admitted.shape, Credential::Absent);
+        assert_eq!(admitted.token, "");
     }
 
     /// Empty values are the same as no value — this is the shape check, and an
@@ -326,31 +499,35 @@ mod tests {
     #[test]
     fn empty_credentials_are_not_mistaken_for_present_ones() {
         assert_eq!(
-            authorize(UpgradeRequest {
-                query: Some("wsTicket=&other=1"),
-                cookie: Some("t3_session= ; unrelated=x"),
-                authorization: Some("Bearer  "),
-                ..request()
-            })
-            .unwrap(),
+            shape(
+                UpgradeRequest {
+                    query: Some("wsTicket=&other=1"),
+                    cookie: Some("t3_session= ; unrelated=x"),
+                    authorization: Some("Bearer  "),
+                    ..request()
+                },
+                &loopback_only()
+            ),
             Credential::Absent
         );
     }
 
     #[test]
     fn the_session_cookie_is_found_among_others() {
-        assert_eq!(
-            authorize(UpgradeRequest {
+        let admitted = authorize(
+            UpgradeRequest {
                 cookie: Some("theme=dark; t3_session=eyJ2Ijox.c2ln; other=1"),
                 ..request()
-            })
-            .unwrap(),
-            Credential::SessionCookie
-        );
+            },
+            &loopback_only(),
+        )
+        .expect("admitted");
+        assert_eq!(admitted.shape, Credential::SessionCookie);
+        assert_eq!(admitted.token, "eyJ2Ijox.c2ln");
     }
 
     /// The check matches on **host** and ignores the scheme, which cuts the
-    /// opposite way from what you would guess: `tauri://localhost` is accepted
+    /// opposite way from what you would guess: `tauri://localhost` is admitted
     /// because its host is `localhost`, while `http://tauri.localhost` — the
     /// origin Tauri v2 actually uses on Windows — is refused, because
     /// `tauri.localhost` is neither `localhost` nor a `127.0.0.0/8` address.
@@ -359,31 +536,34 @@ mod tests {
     /// rather than by guessing, and it did its job: ticket 23 serves the UI
     /// from this server instead (see [`crate::ui`]), so the window's origin is
     /// the loopback address it was already pointed at and this stays as it is.
-    /// The refusal below is not a gap waiting to be widened — widening it would
-    /// widen it for a real browser too, and a page on `tauri.localhost` is not
-    /// a page on this machine.
     #[test]
     fn the_origin_check_matches_on_host_and_ignores_the_scheme() {
         assert!(
-            authorize(UpgradeRequest {
-                origin: Some("tauri://localhost"),
-                ..request()
-            })
+            authorize(
+                UpgradeRequest {
+                    origin: Some("tauri://localhost"),
+                    ..request()
+                },
+                &loopback_only()
+            )
             .is_ok(),
-            "a custom scheme on a loopback host is accepted"
+            "a custom scheme on a loopback host is admitted"
         );
         assert!(
-            authorize(UpgradeRequest {
-                origin: Some("http://tauri.localhost"),
-                ..request()
-            })
+            authorize(
+                UpgradeRequest {
+                    origin: Some("http://tauri.localhost"),
+                    ..request()
+                },
+                &loopback_only()
+            )
             .is_err(),
             "tauri.localhost is a different host, and is refused"
         );
     }
 
     #[test]
-    fn loopback_origins_are_accepted() {
+    fn loopback_origins_are_admitted() {
         for origin in [
             "http://127.0.0.1:3999",
             "http://127.0.0.1",
@@ -394,12 +574,15 @@ mod tests {
             "http://[::1]:1420",
         ] {
             assert!(
-                authorize(UpgradeRequest {
-                    origin: Some(origin),
-                    ..request()
-                })
+                authorize(
+                    UpgradeRequest {
+                        origin: Some(origin),
+                        ..request()
+                    },
+                    &loopback_only()
+                )
                 .is_ok(),
-                "{origin} should be accepted"
+                "{origin} should be admitted"
             );
         }
     }
@@ -407,7 +590,7 @@ mod tests {
     /// Binding to loopback does not stop a page elsewhere from asking the
     /// user's browser to connect on its behalf, which is what this refuses.
     #[test]
-    fn non_local_origins_are_refused_even_with_a_valid_looking_credential() {
+    fn unnamed_origins_are_refused_even_with_a_valid_looking_credential() {
         for origin in [
             "https://evil.example",
             "http://127.0.0.1.evil.example",
@@ -416,23 +599,83 @@ mod tests {
             "null",
             "",
         ] {
-            let refused = authorize(UpgradeRequest {
-                origin: Some(origin),
-                cookie: Some("t3_session=eyJ2Ijox.c2ln"),
-                ..request()
-            });
+            let refused = authorize(
+                UpgradeRequest {
+                    origin: Some(origin),
+                    cookie: Some("t3_session=eyJ2Ijox.c2ln"),
+                    ..request()
+                },
+                &loopback_only(),
+            );
             assert!(refused.is_err(), "{origin} should be refused");
         }
+    }
+
+    /// The tunnel case: the host the user wrote down is admitted, and nothing
+    /// else becomes admitted alongside it.
+    #[test]
+    fn a_named_host_is_admitted_and_its_neighbours_are_not() {
+        assert!(
+            authorize(
+                UpgradeRequest {
+                    origin: Some("https://phone.example"),
+                    cookie: Some("t3_session=eyJ2Ijox.c2ln"),
+                    ..request()
+                },
+                &tunnelled()
+            )
+            .is_ok(),
+            "the host named in remote-access.json is admitted"
+        );
+
+        for origin in [
+            "https://evil.example",
+            "https://evil.phone.example",
+            "https://phone.example.evil",
+        ] {
+            assert!(
+                authorize(
+                    UpgradeRequest {
+                        origin: Some(origin),
+                        cookie: Some("t3_session=eyJ2Ijox.c2ln"),
+                        ..request()
+                    },
+                    &tunnelled()
+                )
+                .is_err(),
+                "{origin} should be refused"
+            );
+        }
+    }
+
+    /// **An acceptance criterion**: an origin absent from the allowlist is
+    /// refused even holding a credential that would otherwise verify. The
+    /// origin is settled before anything looks at what was presented, so there
+    /// is no credential good enough to get past it.
+    #[test]
+    fn an_unnamed_origin_is_refused_before_its_credential_is_even_reported() {
+        let refused = authorize(
+            UpgradeRequest {
+                origin: Some("https://evil.example"),
+                query: Some("wsTicket=a-ticket-that-would-verify"),
+                ..request()
+            },
+            &tunnelled(),
+        );
+        assert!(refused.is_err());
     }
 
     /// The body the client already knows how to read — the shape captured in
     /// `06-upgrade-rejected.ndjson`.
     #[test]
     fn a_refusal_renders_the_captured_error_body() {
-        let refused = authorize(UpgradeRequest {
-            origin: Some("https://evil.example"),
-            ..request()
-        })
+        let refused = authorize(
+            UpgradeRequest {
+                origin: Some("https://evil.example"),
+                ..request()
+            },
+            &loopback_only(),
+        )
         .expect_err("refused");
 
         let body = refused.body_value();
@@ -444,6 +687,19 @@ mod tests {
             32
         );
         assert!(refused.detail.contains("evil.example"));
+    }
+
+    /// The union's other member, which only the routes build. A phone whose
+    /// storage was cleared and a phone whose session expired are different
+    /// things to tell the user.
+    #[test]
+    fn a_missing_credential_is_reported_as_its_own_reason() {
+        let refusal = Rejection::missing_credential("nothing was presented");
+        assert_eq!(refusal.body_value()["reason"], "missing_credential");
+        assert_eq!(
+            Rejection::invalid_credential("something was").body_value()["reason"],
+            "invalid_credential"
+        );
     }
 
     #[test]

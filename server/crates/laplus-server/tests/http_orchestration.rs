@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use harness::conversation::{create_project, create_thread};
 use harness::workspace::Workspace;
-use harness::{ClientIdentity, TestServer};
+use harness::TestServer;
 use serde_json::{json, Value};
 
 const THREAD: &str = "thread-1";
@@ -196,30 +196,46 @@ async fn a_thread_id_that_names_nothing_is_the_same_typed_404() {
 
 /// **A credential good enough to open the socket is good enough to read a
 /// snapshot.** Anything else and the fallback becomes the only working path
-/// again, which is the whole of what this ticket set out to stop — and for the
-/// primary local connection the real client sends no credential at all
-/// (`buildEnvironmentAuthHeaders` returns `{}` when the connection carries
-/// none), so "no credential" is not an edge case here but the case.
+/// again, which is the whole of what ticket 31 set out to stop.
+///
+/// The list is shorter since ticket 73. It used to include "nothing at all",
+/// because until then the real client sent no credential on a primary local
+/// connection and the server accepted that — so the *absence* of one was the
+/// case rather than an edge case. It is now a refusal at both the socket and
+/// these routes, which is exactly the property this test still asserts: the two
+/// answer alike. `docs/adr/0019`.
 #[tokio::test]
 async fn every_credential_that_opens_the_socket_reads_a_snapshot() {
     let server = a_server_with_a_conversation().await;
     let same_origin = format!("http://{}", server.addr());
 
-    for (what, identity) in [
-        ("nothing at all", ClientIdentity::anonymous()),
-        ("a websocket ticket", ClientIdentity::ticket()),
-        ("the browser's cookie", ClientIdentity::browser()),
-        ("a bearer token", ClientIdentity::bearer()),
-        (
-            "the window's own origin",
-            ClientIdentity::anonymous().with_origin(&same_origin),
-        ),
+    // Each shape is minted afresh for each use rather than reused across the
+    // three, because a socket ticket is **single use** — spending one on the
+    // first snapshot would leave nothing for the second, and the failure would
+    // read as "this route refuses tickets" rather than "that ticket was already
+    // spent".
+    for what in [
+        "a websocket ticket",
+        "the browser's cookie",
+        "a bearer token",
+        "the window's own origin",
     ] {
+        let identity = |server: &TestServer| match what {
+            "the browser's cookie" => Some(server.browser()),
+            "a bearer token" => Some(server.bearer()),
+            "the window's own origin" => Some(server.browser().with_origin(&same_origin)),
+            _ => None,
+        };
+
         for path in [
             "/api/orchestration/shell",
             &format!("/api/orchestration/threads/{THREAD}"),
         ] {
-            let response = server.get_as(path, &identity).await;
+            let presented = match identity(&server) {
+                Some(presented) => presented,
+                None => server.ticketed().await,
+            };
+            let response = server.get_as(path, &presented).await;
             assert_eq!(
                 response.status, 200,
                 "{path} refused {what}: {}",
@@ -227,9 +243,13 @@ async fn every_credential_that_opens_the_socket_reads_a_snapshot() {
             );
         }
 
-        // And the same identity opens a socket, which is the claim being made.
+        // And the same shape opens a socket, which is the claim being made.
+        let presented = match identity(&server) {
+            Some(presented) => presented,
+            None => server.ticketed().await,
+        };
         server
-            .connect_as(identity)
+            .connect_as(presented)
             .await
             .unwrap_or_else(|refusal| panic!("{what} was refused at the upgrade: {refusal:?}"))
             .close()
@@ -245,7 +265,7 @@ async fn every_credential_that_opens_the_socket_reads_a_snapshot() {
 #[tokio::test]
 async fn a_non_local_origin_is_refused_with_the_auth_error() {
     let server = a_server_with_a_conversation().await;
-    let elsewhere = ClientIdentity::browser().with_origin("https://evil.example");
+    let elsewhere = server.browser().with_origin("https://evil.example");
 
     for path in [
         "/api/orchestration/shell",

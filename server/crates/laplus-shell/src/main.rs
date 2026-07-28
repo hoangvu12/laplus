@@ -109,8 +109,16 @@ fn main() -> ExitCode {
         Err(failure) => return fail(&format!("{failure}")),
     };
 
-    let url = server.http_url();
-    println!("laplus: serving {url}");
+    println!("laplus: serving {}", server.http_url());
+
+    // The window opens on a URL carrying the credential it will authenticate
+    // with, in the fragment — which the browser keeps and never sends, so the
+    // credential reaches this window and nothing that merely reaches this
+    // server. `Server::window_url` is where that is argued.
+    //
+    // Falling back to the plain URL when the boot grant could not be minted
+    // opens the pairing screen rather than nothing at all.
+    let url = server.window_url().unwrap_or_else(|| server.http_url());
 
     // Taken exactly once, by whichever of the two exit events arrives first.
     let server = Mutex::new(Some(server));

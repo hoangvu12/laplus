@@ -41,6 +41,7 @@ use laplus_server::store::Database;
 use laplus_server::threads::Reconciliation;
 use laplus_server::ui::Assets;
 use laplus_server::Server;
+use tempfile::TempDir;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -82,7 +83,24 @@ pub struct TestServer {
     ///
     /// `None` only for [`TestServer::start_configured_in`], where the *test*
     /// owns the directory because it is about to start a second server on it.
-    _preferences: Option<tempfile::TempDir>,
+    _preferences: Option<TempDir>,
+    /// A live session, paired through the real routes when this handle was
+    /// built. See [`TestServer::bootstrapped`].
+    session: Session,
+}
+
+/// What the harness paired itself with at startup.
+///
+/// Three forms of the same thing, because the three shapes a credential can
+/// arrive in are themselves under test: a cookie is what a browser sends, a
+/// bearer is what a client attached from elsewhere sends, and the boot code is
+/// what both were minted from.
+#[derive(Debug, Default, Clone)]
+struct Session {
+    /// `t3_session=…`, ready to be a `Cookie` header.
+    cookie: String,
+    bearer: String,
+    boot: String,
 }
 
 /// Point the provider's Claude home at a directory that does not exist.
@@ -168,12 +186,11 @@ impl TestServer {
     pub async fn start_configured_in(preferences: &Path) -> TestServer {
         let mut config = ServerConfig::detect_in(preferences.to_path_buf());
         somewhere_that_is_not_the_developers(&mut config);
-        TestServer {
-            server: Server::bind_with(0, config, Database::in_memory().expect("a database"), Assets::none())
+        let server =
+            Server::bind_with(0, config, Database::in_memory().expect("a database"), Assets::none())
                 .await
-                .expect("server binds to a free loopback port"),
-            _preferences: None,
-        }
+                .expect("server binds to a free loopback port");
+        TestServer::bootstrapped(server, None).await
     }
 
     /// A server that will start `binary` when a turn is dispatched.
@@ -239,9 +256,157 @@ impl TestServer {
         let server = Server::bind_with(0, config, database, assets)
             .await
             .expect("server binds to a free loopback port");
-        TestServer {
+        TestServer::bootstrapped(server, Some(preferences)).await
+    }
+
+    /// Build the handle, then pair it with the server it is holding.
+    ///
+    /// **Since ticket 73 every request needs a credential that verifies**, so a
+    /// harness that presented nothing would be a harness in which no test but
+    /// the authentication ones could run. This walks the same three steps the
+    /// desktop window walks at startup — take the boot code out of the URL the
+    /// shell would open, trade it for a session — through the real routes,
+    /// against the real store. Nothing here reaches around the policy it is
+    /// setting up, which is what keeps two hundred tests from quietly proving
+    /// the wrong thing.
+    async fn bootstrapped(server: Server, preferences: Option<TempDir>) -> TestServer {
+        let mut harness = TestServer {
             server,
-            _preferences: Some(preferences),
+            _preferences: preferences,
+            session: Session::default(),
+        };
+
+        // The credential the window boots with, read off the URL the shell
+        // would point a webview at. `None` only if the machine's randomness
+        // failed, which would be a broken machine rather than a failing test.
+        let url = harness
+            .server
+            .window_url()
+            .expect("the server minted a boot credential");
+        let boot = url
+            .split_once("#token=")
+            .expect("the boot url carries a credential in its fragment")
+            .1
+            .to_string();
+
+        let opened = harness
+            .send(
+                "POST",
+                "/api/auth/browser-session",
+                &ClientIdentity::anonymous(),
+                Some(("application/json", &json!({ "credential": boot }).to_string())),
+            )
+            .await;
+        assert_eq!(
+            opened.status, 200,
+            "the harness could not open a session: {}",
+            opened.text
+        );
+        let cookie = opened
+            .header("set-cookie")
+            .expect("a session cookie")
+            .split(';')
+            .next()
+            .expect("a cookie value")
+            .to_string();
+
+        // The boot grant is re-usable — that is what lets the window survive a
+        // page reload — so the same code opens a bearer session too, which is
+        // what a client attached from somewhere else would hold.
+        let exchanged = harness
+            .send(
+                "POST",
+                "/oauth/token",
+                &ClientIdentity::anonymous(),
+                Some((
+                    "application/x-www-form-urlencoded",
+                    &format!(
+                        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+                         &subject_token={boot}\
+                         &subject_token_type=urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap\
+                         &requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token"
+                    ),
+                )),
+            )
+            .await;
+        assert_eq!(
+            exchanged.status, 200,
+            "the harness could not exchange the boot credential: {}",
+            exchanged.text
+        );
+
+        harness.session = Session {
+            boot,
+            cookie,
+            bearer: exchanged.body["access_token"]
+                .as_str()
+                .expect("an access token")
+                .to_string(),
+        };
+        harness
+    }
+
+    /// A credential this server actually minted, in the shape the browser UI
+    /// presents: a session cookie and a loopback origin.
+    ///
+    /// What [`TestServer::connect`] and [`TestServer::get`] use, so that a test
+    /// which is not about authentication does not have to think about it.
+    pub fn browser(&self) -> ClientIdentity {
+        ClientIdentity {
+            cookie: Some(self.session.cookie.clone()),
+            origin: Some(format!("http://{}", self.addr())),
+            ..ClientIdentity::default()
+        }
+    }
+
+    /// The shape a client attached from somewhere else presents: a bearer, and
+    /// no cookie and no origin.
+    pub fn bearer(&self) -> ClientIdentity {
+        ClientIdentity {
+            authorization: Some(format!("Bearer {}", self.session.bearer)),
+            ..ClientIdentity::default()
+        }
+    }
+
+    /// The credential the window booted with. Re-usable, so a test may spend it
+    /// as often as it likes — which is itself worth a test, and has one.
+    pub fn boot_credential(&self) -> &str {
+        &self.session.boot
+    }
+
+    pub fn bearer_token(&self) -> &str {
+        &self.session.bearer
+    }
+
+    /// A **fresh** socket ticket, in the query parameter the browser is forced
+    /// to use.
+    ///
+    /// Minted per call rather than held, because a ticket is single use: two
+    /// upgrades sharing one is the thing the store refuses, so a harness that
+    /// cached one would make every second connection fail for a reason that
+    /// had nothing to do with the test.
+    pub async fn ticketed(&self) -> ClientIdentity {
+        let issued = self
+            .send(
+                "POST",
+                "/api/auth/websocket-ticket",
+                &self.bearer(),
+                Some(("application/json", "")),
+            )
+            .await;
+        assert_eq!(
+            issued.status, 200,
+            "the harness could not mint a socket ticket: {}",
+            issued.text
+        );
+        ClientIdentity {
+            ticket: Some(
+                issued.body["ticket"]
+                    .as_str()
+                    .expect("a ticket")
+                    .to_string(),
+            ),
+            ..ClientIdentity::default()
         }
     }
 
@@ -439,8 +604,12 @@ impl TestServer {
     }
 
     /// Connect the way a non-browser client does: a `wsTicket`, no `Origin`.
+    ///
+    /// The ticket is a real one, minted for this call — see
+    /// [`TestServer::ticketed`]. Before ticket 73 it was an invented string,
+    /// because nothing verified it.
     pub async fn connect(&self) -> SocketClient {
-        self.connect_as(ClientIdentity::ticket())
+        self.connect_as(self.ticketed().await)
             .await
             .expect("upgrade is accepted")
     }
@@ -483,8 +652,16 @@ impl TestServer {
     /// A plain `GET` presenting nothing. Raw HTTP rather than a client library,
     /// for the same reason [`TestServer::raw_upgrade`] is: no dependency, and
     /// nothing between the assertion and the bytes.
+    /// A `GET` presenting a credential this server minted, the way the window
+    /// does.
+    ///
+    /// **Not anonymous, since ticket 73.** Two of the routes reachable this way
+    /// require a credential that verifies, and the others do not care — so
+    /// presenting one is what an ordinary request looks like, and a test that
+    /// wants to show a request with *nothing* says so with
+    /// `get_as(path, &ClientIdentity::anonymous())`.
     pub async fn get(&self, path: &str) -> HttpResponse {
-        self.get_as(path, &ClientIdentity::anonymous()).await
+        self.get_as(path, &self.browser()).await
     }
 
     /// A `GET` presenting what a client presents.
@@ -494,14 +671,87 @@ impl TestServer {
     /// that shows a credential reading a snapshot and the same credential
     /// opening a socket is showing it with one vocabulary rather than two.
     pub async fn get_as(&self, path: &str, identity: &ClientIdentity) -> HttpResponse {
-        let mut request = format!("GET {}", identity.ticketed(path));
+        self.send("GET", path, identity, None).await
+    }
+
+    /// A `POST` of a JSON body, presenting what the window presents.
+    pub async fn post_json(&self, path: &str, body: &Value) -> HttpResponse {
+        self.post_json_as(path, &self.browser(), body).await
+    }
+
+    pub async fn post_json_as(
+        &self,
+        path: &str,
+        identity: &ClientIdentity,
+        body: &Value,
+    ) -> HttpResponse {
+        self.send(
+            "POST",
+            path,
+            identity,
+            Some(("application/json", &body.to_string())),
+        )
+        .await
+    }
+
+    /// A `POST` of a form body. One route takes one — `/oauth/token`, because
+    /// RFC 6749 says so and `AuthTokenExchangeRequest` ends
+    /// `.pipe(HttpApiSchema.asFormUrlEncoded())`.
+    /// Only `/oauth/token` takes one, and it needs no credential — so this
+    /// stays anonymous where the JSON helpers do not.
+    pub async fn post_form(&self, path: &str, body: &str) -> HttpResponse {
+        self.post_form_as(path, &ClientIdentity::anonymous(), body)
+            .await
+    }
+
+    pub async fn post_form_as(
+        &self,
+        path: &str,
+        identity: &ClientIdentity,
+        body: &str,
+    ) -> HttpResponse {
+        self.send(
+            "POST",
+            path,
+            identity,
+            Some(("application/x-www-form-urlencoded", body)),
+        )
+        .await
+    }
+
+    /// A `POST` with no body at all. `/api/auth/websocket-ticket` takes none —
+    /// the contract declares no payload for it, and what it reads is the
+    /// bearer in the header.
+    pub async fn post_as(&self, path: &str, identity: &ClientIdentity) -> HttpResponse {
+        self.send("POST", path, identity, Some(("application/json", "")))
+            .await
+    }
+
+    /// One request, written by hand. Raw HTTP rather than a client library, for
+    /// the same reason [`TestServer::raw_upgrade`] is: no dependency, and
+    /// nothing between the assertion and the bytes.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        identity: &ClientIdentity,
+        body: Option<(&str, &str)>,
+    ) -> HttpResponse {
+        let mut request = format!("{method} {}", identity.ticketed(path));
         request.push_str(&format!(" HTTP/1.1\r\nHost: {}\r\n", self.addr()));
         for (name, value) in identity.headers() {
             if let Some(value) = value {
                 request.push_str(&format!("{name}: {value}\r\n"));
             }
         }
+        if let Some((content_type, payload)) = body {
+            request.push_str(&format!("Content-Type: {content_type}\r\n"));
+            request.push_str(&format!("Content-Length: {}\r\n", payload.len()));
+        }
         request.push_str("Connection: close\r\n\r\n");
+        if let Some((_, payload)) = body {
+            request.push_str(payload);
+        }
 
         let raw = self.raw_request(&request).await;
 
@@ -649,6 +899,21 @@ impl ClientIdentity {
 
     pub fn with_origin(mut self, origin: &str) -> Self {
         self.origin = Some(origin.to_string());
+        self
+    }
+
+    /// A bearer this test minted, rather than [`ClientIdentity::bearer`]'s
+    /// invented one. Ticket 73's routes are the first that care about the
+    /// difference.
+    pub fn with_bearer(mut self, token: &str) -> Self {
+        self.authorization = Some(format!("Bearer {token}"));
+        self
+    }
+
+    /// A socket ticket this test minted, in the query parameter the browser is
+    /// forced to use.
+    pub fn with_ticket(mut self, ticket: &str) -> Self {
+        self.ticket = Some(ticket.to_string());
         self
     }
 

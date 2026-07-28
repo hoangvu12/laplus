@@ -33,6 +33,27 @@ async fn main() -> ExitCode {
     };
 
     println!("laplus: listening on {}", server.ws_url());
+
+    // Printed because this binary has no window to open it in, and since
+    // ticket 73 a browser pointed here needs a credential like anything else.
+    // Without this line the quickest way to see a change would have become the
+    // one that lands on a pairing screen with nothing to type into it.
+    //
+    // The reference server prints the same URL for the same reason —
+    // `issueStartupPairingUrl`, `EnvironmentAuth.ts:911-921`.
+    //
+    // A development server serving the UI on another port is a *different
+    // origin*, so it needs the tunnel allowlist rather than this; see
+    // `laplus_server::remote_access`.
+    match server.window_url() {
+        Some(url) => println!("laplus: open {url}"),
+        None => eprintln!(
+            "laplus: no boot credential was minted, so a browser opened at {} will \
+             ask to be paired",
+            server.http_url()
+        ),
+    }
+
     server.serve_until_interrupted().await;
     ExitCode::SUCCESS
 }

@@ -39,7 +39,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, RawQuery, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
@@ -50,9 +50,10 @@ use crate::config_store::ConfigStore;
 use crate::filesystem::Index;
 use crate::git::Repositories;
 use crate::orchestration::Shell;
+use crate::pairing;
 use crate::process::Search;
 use crate::rpc::{Answer, Deferred, Services};
-use crate::store::{Database, StorageError};
+use crate::store::{Database, NewPairingLink, NewSession, StorageError};
 use crate::subscriptions::Subscriptions;
 use crate::terminal::Terminals;
 use crate::ui::Assets;
@@ -198,6 +199,14 @@ pub struct Server {
     state: Arc<ServerState>,
     shutdown: watch::Sender<bool>,
     serving: tokio::task::JoinHandle<()>,
+    /// The credential this server booted with, for [`Server::window_url`].
+    ///
+    /// `None` if minting it failed, which on a healthy machine does not happen
+    /// — it is one row and one call to the operating system's randomness. Held
+    /// rather than re-read from the database because the whole point of it is
+    /// that it never travels: the row stores it so it can be *verified*, and
+    /// this is the only copy anything reads back out.
+    boot_credential: Option<String>,
 }
 
 /// Why the server did not start.
@@ -288,6 +297,23 @@ impl Server {
         };
         let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe()));
 
+        // Minted before the listener exists, so that there is no window in
+        // which the server is answering and the credential it will admit its
+        // own window with does not yet exist.
+        //
+        // A failure here is logged and survived rather than returned. The
+        // server still starts, `window_url` answers `None`, and the developer
+        // lands on the pairing screen where they can type a code from
+        // somewhere else — which is worse than booting cleanly and much better
+        // than an application that will not open.
+        let boot_credential = match mint_boot_grant(&state) {
+            Ok(credential) => Some(credential),
+            Err(error) => {
+                eprintln!("laplus: cannot mint the credential this window boots with: {error}");
+                None
+            }
+        };
+
         let app = Router::new()
             .route("/ws", get(upgrade))
             // The two answers the UI needs before it will open the socket at
@@ -304,6 +330,23 @@ impl Server {
                 "/api/orchestration/threads/{threadId}",
                 get(thread_snapshot),
             )
+            // Ticket 73's five, in the order a phone walks them: mint a code
+            // in Settings on the PC, trade it for a bearer, trade that for a
+            // socket ticket. The last two are Settings' own view of what it has
+            // handed out.
+            //
+            // The paths are `EnvironmentAuthHttpApi`'s and not the ticket's:
+            // the ticket names `/api/auth/pairing-credential`,
+            // `/api/auth/revoke-pairing-link` and a `GET` for the ticket, and
+            // the contract says otherwise in all three places. The contract is
+            // what the client is built from, so the contract wins — recorded in
+            // the ticket's own Comments.
+            .route("/api/auth/browser-session", post(browser_session))
+            .route("/oauth/token", post(token_exchange))
+            .route("/api/auth/websocket-ticket", post(websocket_ticket))
+            .route("/api/auth/pairing-token", post(pairing_credential))
+            .route("/api/auth/pairing-links", get(pairing_links))
+            .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
             // Last, and only for paths nothing above matched: the UI itself.
             // A route wins over a fallback, so attaching a bundle cannot move
             // an answer the client already decodes — which is the property
@@ -340,6 +383,7 @@ impl Server {
             state,
             shutdown,
             serving,
+            boot_credential,
         })
     }
 
@@ -356,6 +400,38 @@ impl Server {
     /// origin every request the window makes will carry.
     pub fn http_url(&self) -> String {
         format!("http://{}/", self.local_addr)
+    }
+
+    /// The URL to open the UI *with a credential already in hand*.
+    ///
+    /// [`Server::http_url`] with the boot grant in the fragment:
+    ///
+    /// ```text
+    /// http://127.0.0.1:4773/#token=ABCD2345WXYZ
+    /// ```
+    ///
+    /// **The fragment is the whole point.** A URL fragment is never sent to the
+    /// server — the browser keeps it and hands it to the page's JavaScript — so
+    /// this credential reaches the window without ever travelling over HTTP,
+    /// and a request arriving from anywhere else cannot ask for it. That is
+    /// what makes it the equivalent of the reference server's Electron preload
+    /// hand-off (`PairingGrantStore.ts:314-330`), which laplus cannot copy
+    /// directly: its window has no channel to the shell that is not this
+    /// server. `issueStartupPairingUrl` (`EnvironmentAuth.ts:911-921`) builds
+    /// the same URL upstream, for the same reason.
+    ///
+    /// The client half already exists and is untouched: `setPairingTokenOnUrl`
+    /// and `getPairingTokenFromUrl` in `packages/shared/src/remote.ts` are what
+    /// puts a token in a fragment and reads it back, and `PairingRouteSurface`
+    /// spends it and strips it from the address bar.
+    ///
+    /// `None` when the boot grant could not be minted. The caller opens
+    /// [`Server::http_url`] instead — a window that lands on the pairing screen
+    /// is recoverable, and one that never opens is not.
+    pub fn window_url(&self) -> Option<String> {
+        self.boot_credential
+            .as_ref()
+            .map(|credential| format!("{}#token={credential}", self.http_url()))
     }
 
     pub fn state(&self) -> &Arc<ServerState> {
@@ -427,6 +503,28 @@ impl Server {
     }
 }
 
+/// Mint the credential this server will admit its own window with.
+///
+/// **Administrative scopes**, unlike a code minted for a phone. The window is
+/// the machine's own console: it manages the pairing links, which is
+/// `access:read` and `access:write`, and nothing is served by a window that
+/// cannot open its own Settings panel. The reference server grants its boot
+/// grant the same set (`PairingGrantStore.ts:318`).
+///
+/// Nothing gates on a scope in this server — see [`crate::pairing`] — so this
+/// is what the session *reports*, not what it is permitted. It matters because
+/// the UI reads the reported scopes to decide which panels to offer.
+fn mint_boot_grant(state: &ServerState) -> Result<String, Box<dyn std::error::Error>> {
+    let id = pairing::record_id()?;
+    let credential = pairing::pairing_code()?;
+    state.services.shell.database().issue_desktop_boot_grant(
+        &id,
+        &credential,
+        &pairing::administrative_scopes(),
+    )?;
+    Ok(credential)
+}
+
 async fn environment_descriptor(State(state): State<Arc<ServerState>>) -> Response {
     let config = state.config().current();
     Json(http::environment_descriptor(&config).clone()).into_response()
@@ -447,7 +545,7 @@ async fn shell_snapshot(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(refused) = authorized(query.as_deref(), &headers) {
+    if let Err(refused) = authorized(&state, query.as_deref(), &headers) {
         return refused;
     }
 
@@ -476,7 +574,7 @@ async fn thread_snapshot(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(refused) = authorized(query.as_deref(), &headers) {
+    if let Err(refused) = authorized(&state, query.as_deref(), &headers) {
         return refused;
     }
 
@@ -486,32 +584,501 @@ async fn thread_snapshot(
     }
 }
 
-/// May this request read a snapshot? The 401 to return if not.
+// --- ticket 73: the pairing routes -------------------------------------------
+//
+// Five handlers, and between them they hold no policy: what a credential is
+// belongs to `crate::pairing`, the single-use guarantee belongs to the SQL in
+// `crate::store`, and the bodies belong to `crate::http`. What is here is the
+// order those are called in and which refusal each failure wears — which is the
+// part that needs a web framework and so is the part that has to live beside
+// one.
+//
+// **Four of the six go through `authorized` and two through `origin_admitted`.**
+// The two are `/api/auth/browser-session` and `/oauth/token`, which take their
+// credential in the body because they are how a client that holds nothing comes
+// to hold something. Every other route in this file — and the socket upgrade,
+// and both snapshot routes — needs a credential that verifies.
+
+/// `POST /api/auth/browser-session` — trade a pair code for a session cookie.
 ///
-/// **Exactly [`auth::authorize`], and deliberately nothing more** —
-/// `docs/adr/0015`, which is where this is argued rather than summarised. These
-/// routes answer with data the socket already carries, so a credential good
-/// enough to open the socket that was not good enough to read a snapshot would
-/// simply send the client back to the socket — the failed round trip ticket 31
-/// exists to remove. That cuts both ways: the one thing `authorize` refuses, a
-/// non-local origin, is refused here too, and it matters more here than at the
-/// upgrade, because a `fetch` from a page elsewhere is a page elsewhere asking
-/// the user's own browser for their project list.
+/// **The route the desktop window and a phone both actually take.** A browser
+/// that loaded the app from this server is talking to its *primary*
+/// environment, and the client's primary path is `exchangeBootstrapCredential`
+/// → `client.auth.browserSession`
+/// (`apps/web/src/environments/primary/auth.ts:231-240`). `/oauth/token` below
+/// is for a client that added this machine as a *second* backend from
+/// somewhere else.
 ///
-/// Which credential shape arrived is not recorded, unlike at the upgrade, where
-/// it travels with the connection. There is no connection here to carry it and
-/// nothing that reads it in v1.
-fn authorized(query: Option<&str>, headers: &HeaderMap) -> Result<(), Response> {
-    auth::authorize(presented(query, headers))
-        .map(|_shape| ())
-        .map_err(|rejection| {
-            // No `Access-Control-Allow-Origin` here, unlike the upgrade's own
-            // 401. There it lets a browser read the body rather than reporting
-            // a CORS error for a handshake it cannot see into; here the refused
-            // request *is* the cross-origin one, and helping it read the answer
-            // would be the only thing this refusal gives away.
-            (StatusCode::UNAUTHORIZED, refused(rejection)).into_response()
-        })
+/// Ticket 73's scope list omits this route. That is a gap in the ticket: it
+/// points at `packages/client-runtime/src/authorization/remote.ts` as "the
+/// client half, already written", and that file is the remote half. The primary
+/// half is in `apps/web` and reaches for a cookie.
+///
+/// Like `/oauth/token`, the credential is in the body, so this cannot be made
+/// to require one in a header — it is how a browser with nothing gets a
+/// session.
+async fn browser_session(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(refused) = origin_admitted(&state, query.as_deref(), &headers) {
+        return refused;
+    }
+
+    let credential = match http::read_browser_session_request(&body) {
+        Ok(credential) => credential,
+        Err(problem) => {
+            eprintln!("laplus: cannot read the credential to open a browser session ({problem:?})");
+            return refuse(http::unsupported_request());
+        }
+    };
+
+    let database = state.services.shell.database();
+    let grant = match database.consume_pairing_link(&credential) {
+        Ok(Ok(grant)) => grant,
+        Ok(Err(refusal)) => {
+            return unauthorized(auth::Rejection::invalid_credential(format!(
+                "refusing to open a browser session: {}",
+                refusal.detail()
+            )));
+        }
+        Err(error) => {
+            eprintln!("laplus: cannot spend a pairing code: {error}");
+            return refuse(http::browser_session_unavailable());
+        }
+    };
+
+    let (session_id, token) = match (pairing::record_id(), pairing::opaque_token()) {
+        (Ok(session_id), Ok(token)) => (session_id, token),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("laplus: cannot mint a session token: {error}");
+            return refuse(http::browser_session_unavailable());
+        }
+    };
+
+    match database.issue_session(NewSession {
+        session_id: &session_id,
+        token: &token,
+        subject: &grant.subject,
+        scopes: &grant.scopes,
+        method: pairing::BROWSER_SESSION_METHOD,
+        label: grant.label.as_deref(),
+    }) {
+        Ok(session) => (
+            [(
+                header::SET_COOKIE,
+                http::session_cookie(&session.token, session.expires_in),
+            )],
+            Json(http::browser_session(&session)),
+        )
+            .into_response(),
+        Err(error) => {
+            eprintln!("laplus: cannot open a browser session: {error}");
+            refuse(http::browser_session_unavailable())
+        }
+    }
+}
+
+/// `POST /oauth/token` — trade a pair code for a bearer good for thirty days.
+///
+/// Its credential is in the **body** rather than the headers, so it goes
+/// through [`origin_admitted`] rather than [`authorized`] — a route that
+/// required a session would be requiring the thing it exists to issue.
+///
+/// Reached by a client that added *this machine* as a second backend from
+/// somewhere else. A browser that loaded the app from this server takes
+/// [`browser_session`] above instead.
+async fn token_exchange(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(refused) = origin_admitted(&state, query.as_deref(), &headers) {
+        return refused;
+    }
+
+    // Form-urlencoded, because `AuthTokenExchangeRequest` ends
+    // `.pipe(HttpApiSchema.asFormUrlEncoded())` and RFC 6749 says so. See
+    // `crate::http::form_fields` for why not `axum`'s `Form`.
+    let fields = http::form_fields(&body);
+    let field = |name| http::form_field(&fields, name);
+
+    if field("grant_type") != Some(pairing::TOKEN_EXCHANGE_GRANT_TYPE)
+        || field("subject_token_type") != Some(pairing::BOOTSTRAP_TOKEN_TYPE)
+        || field("requested_token_type") != Some(pairing::ACCESS_TOKEN_TYPE)
+    {
+        eprintln!("laplus: refusing a token exchange that is not the one grant this server implements");
+        return refuse(http::unsupported_request());
+    }
+
+    let credential = field("subject_token").unwrap_or_default().trim();
+    if credential.is_empty() {
+        return unauthorized(auth::Rejection::missing_credential(
+            "refusing a token exchange carrying no pairing code",
+        ));
+    }
+
+    // Read before the code is spent, so a client that asked for a scope this
+    // server does not know does not also burn its one attempt.
+    let requested = match field("scope") {
+        Some(scope) => match pairing::parse_scopes(scope) {
+            Some(scopes) => Some(scopes),
+            None => {
+                eprintln!("laplus: refusing a token exchange asking for an unreadable scope list");
+                return refuse(http::invalid_scope());
+            }
+        },
+        None => None,
+    };
+
+    let database = state.services.shell.database();
+    let grant = match database.consume_pairing_link(credential) {
+        Ok(Ok(grant)) => grant,
+        Ok(Err(refusal)) => {
+            // The three cases are told apart here and nowhere else. The
+            // contract has one 401 for all of them, so this line is the only
+            // place a user reporting "it says the code is wrong" can be
+            // answered with which of the three it actually was.
+            return unauthorized(auth::Rejection::invalid_credential(format!(
+                "refusing a token exchange: {}",
+                refusal.detail()
+            )));
+        }
+        Err(error) => {
+            eprintln!("laplus: cannot spend a pairing code: {error}");
+            return refuse(http::access_token_unavailable());
+        }
+    };
+
+    // Asking for nothing asks for everything the code granted, which is the
+    // reference server's `requestedScopes ?? grant.scopes`.
+    let scopes = requested.unwrap_or_else(|| grant.scopes.clone());
+    if !pairing::covers(&grant.scopes, &scopes) {
+        eprintln!(
+            "laplus: refusing a token exchange asking for scopes the pairing code did not grant"
+        );
+        return refuse(http::scope_not_granted());
+    }
+
+    let (session_id, token) = match (pairing::record_id(), pairing::opaque_token()) {
+        (Ok(session_id), Ok(token)) => (session_id, token),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("laplus: cannot mint a session token: {error}");
+            return refuse(http::access_token_unavailable());
+        }
+    };
+
+    match state.services.shell.database().issue_session(NewSession {
+        session_id: &session_id,
+        token: &token,
+        subject: &grant.subject,
+        scopes: &scopes,
+        method: pairing::BEARER_SESSION_METHOD,
+        label: grant.label.as_deref(),
+    }) {
+        Ok(session) => Json(http::access_token(&session)).into_response(),
+        Err(error) => {
+            eprintln!("laplus: cannot open a session: {error}");
+            refuse(http::access_token_unavailable())
+        }
+    }
+}
+
+/// `POST /api/auth/websocket-ticket` — trade a bearer for five minutes and one
+/// upgrade.
+///
+/// **`POST`, not `GET`.** Ticket 73's table says `GET`; the contract and
+/// `packages/client-runtime/src/authorization/remote.ts:81-98` both say `POST`.
+///
+/// This step exists because the browser's WebSocket API cannot set a request
+/// header, so the credential has to travel in the query string — and a
+/// thirty-day bearer in a query string ends up in a proxy log. A five-minute
+/// single-use ticket in the same log is worthless by the time anyone reads it.
+async fn websocket_ticket(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    // Minted against whatever session authorized the request — a bearer or a
+    // cookie — matching upstream's `issueWebSocketTicket(session)`. Not only a
+    // bearer: a browser holding a cookie has no reason to ask for one, because
+    // the browser attaches the cookie to the upgrade by itself, but a route
+    // that refused it would be refusing a client that had already proved
+    // exactly as much.
+    //
+    // A request that authorized with a `wsTicket` names no session, so
+    // `issue_websocket_ticket` finds nothing and this answers 401. Tickets do
+    // not beget tickets.
+    let token = match authorized(&state, query.as_deref(), &headers) {
+        Ok(presented) => presented.token,
+        Err(refused) => return refused,
+    };
+
+    let ticket = match pairing::opaque_token() {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            eprintln!("laplus: cannot mint a socket ticket: {error}");
+            return refuse(http::websocket_ticket_unavailable());
+        }
+    };
+
+    match state
+        .services
+        .shell
+        .database()
+        .issue_websocket_ticket(token, &ticket)
+    {
+        Ok(Some(issued)) => Json(http::websocket_ticket(&issued)).into_response(),
+        // The bearer did not name a live session. `issue_websocket_ticket`
+        // verifies and inserts under one lock precisely so this cannot be a
+        // caller that checked and then minted.
+        Ok(None) => unauthorized(auth::Rejection::invalid_credential(
+            "refusing to mint a socket ticket for a bearer that names no live session",
+        )),
+        Err(error) => {
+            eprintln!("laplus: cannot mint a socket ticket: {error}");
+            refuse(http::websocket_ticket_unavailable())
+        }
+    }
+}
+
+/// `POST /api/auth/pairing-token` — mint a code for the user to carry to their
+/// phone.
+///
+/// **`/pairing-token`, not the ticket's `/pairing-credential`.** The contract
+/// again.
+async fn pairing_credential(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(refused) = authorized(&state, query.as_deref(), &headers) {
+        return refused;
+    }
+
+    let request = match http::read_pairing_credential_request(&body) {
+        Ok(request) => request,
+        Err(http::PayloadProblem::InvalidScope) => {
+            eprintln!("laplus: refusing to mint a pairing code for an unreadable scope list");
+            return refuse(http::invalid_scope());
+        }
+        Err(http::PayloadProblem::Malformed) => {
+            eprintln!("laplus: refusing to mint a pairing code for a body that is not the payload");
+            return refuse(http::unsupported_request());
+        }
+    };
+
+    let (id, credential) = match (pairing::record_id(), pairing::pairing_code()) {
+        (Ok(id), Ok(credential)) => (id, credential),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("laplus: cannot mint a pairing code: {error}");
+            return refuse(http::pairing_credential_unavailable());
+        }
+    };
+
+    match state
+        .services
+        .shell
+        .database()
+        .issue_pairing_link(NewPairingLink {
+            id: &id,
+            credential: &credential,
+            method: pairing::ONE_TIME_TOKEN_METHOD,
+            scopes: &request.scopes,
+            subject: pairing::PAIRING_SUBJECT,
+            label: request.label.as_deref(),
+            ttl: pairing::PAIRING_CODE_TTL,
+            // A code minted here is read off a screen and typed into a phone.
+            // The second use of one is somebody who should not have it.
+            reusable: false,
+        }) {
+        Ok(link) => Json(http::pairing_credential(&link)).into_response(),
+        Err(error) => {
+            eprintln!("laplus: cannot mint a pairing code: {error}");
+            refuse(http::pairing_credential_unavailable())
+        }
+    }
+}
+
+/// `GET /api/auth/pairing-links` — the codes Settings can still show.
+///
+/// Live ones only: a code that was spent, revoked or has expired is not
+/// something the user can hand to a phone, and the panel's whole purpose is to
+/// let them re-read one they minted a minute ago.
+async fn pairing_links(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(refused) = authorized(&state, query.as_deref(), &headers) {
+        return refused;
+    }
+
+    match state.services.shell.database().active_pairing_links() {
+        Ok(links) => Json(http::pairing_links(&links)).into_response(),
+        Err(error) => {
+            eprintln!("laplus: cannot list the pairing codes: {error}");
+            refuse(http::pairing_links_unavailable())
+        }
+    }
+}
+
+/// `POST /api/auth/pairing-links/revoke` — take a code back.
+///
+/// **`/pairing-links/revoke`, not the ticket's `/revoke-pairing-link`.**
+///
+/// A body that will not parse is answered with the 500 rather than a 400,
+/// which is the one place these five routes cannot say what they mean:
+/// `EnvironmentScopedOperationErrors` gives this endpoint a 403 and a 500 and
+/// no `EnvironmentRequestInvalidError`, so a 400 here is a status the client
+/// cannot decode and would report as a generic failure. The real cause goes to
+/// the log, and `revoked: false` was the alternative — rejected because
+/// "nothing was revoked" is a true sentence about a request that never named
+/// anything to revoke, and it would hide the client bug completely.
+async fn revoke_pairing_link(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(refused) = authorized(&state, query.as_deref(), &headers) {
+        return refused;
+    }
+
+    let id = match http::read_revoke_pairing_link_request(&body) {
+        Ok(id) => id,
+        Err(problem) => {
+            eprintln!("laplus: cannot read which pairing code to revoke ({problem:?})");
+            return refuse(http::pairing_link_revoke_failed());
+        }
+    };
+
+    match state.services.shell.database().revoke_pairing_link(&id) {
+        // `false` for an id that names nothing, rather than a 404. The contract
+        // gives this route no `EnvironmentResourceNotFoundError`, and the state
+        // the caller wanted — that code cannot be spent — holds either way.
+        Ok(revoked) => Json(http::pairing_link_revoked(revoked)).into_response(),
+        Err(error) => {
+            eprintln!("laplus: cannot revoke the pairing code: {error}");
+            refuse(http::pairing_link_revoke_failed())
+        }
+    }
+}
+
+/// Write a 401 to the log and answer with the body the client decodes.
+///
+/// The same shape the upgrade refuses with, and deliberately: a phone that
+/// cannot mint a ticket and a phone that cannot open a socket are one failure
+/// to the person holding it.
+fn unauthorized(rejection: Rejection) -> Response {
+    (StatusCode::UNAUTHORIZED, refused(rejection)).into_response()
+}
+
+/// May this request proceed? The 401 to return if not.
+///
+/// **The whole of the check, and the only place it is made.** Both halves:
+/// [`auth::authorize`] settles the origin, and then the credential it reports
+/// is verified against [`crate::store`]. Splitting them across two functions
+/// would be splitting them across two things a future caller could forget one
+/// of.
+///
+/// Every route that is not `/oauth/token`, `/api/auth/browser-session` or a
+/// static file goes through this, and they all get the same answer — a
+/// credential good enough to open the socket that was not good enough to read a
+/// snapshot would simply send the client back to the socket, which is the
+/// failed round trip ticket 31 exists to remove.
+///
+/// ## Why a ticket is spent here and a session is not
+///
+/// A `wsTicket` is single use by construction: it rides in a query string,
+/// which is the one place in this chain a credential lands in a log, and it is
+/// worth nothing five minutes later or one upgrade later. So verifying it
+/// *consumes* it. A bearer or a cookie names a session that is meant to be
+/// presented over and over, so verifying one only reads it.
+///
+/// That makes this function's effect depend on what arrived, which is worth
+/// knowing before calling it twice on one request. Nothing does.
+fn authorized<'a>(
+    state: &ServerState,
+    query: Option<&'a str>,
+    headers: &'a HeaderMap,
+) -> Result<auth::Presented<'a>, Response> {
+    let allowed = &state.config().current().remote_access;
+    let presented = auth::authorize(presented(query, headers), allowed).map_err(|rejection| {
+        // No `Access-Control-Allow-Origin` here, unlike the upgrade's own
+        // 401. There it lets a browser read the body rather than reporting
+        // a CORS error for a handshake it cannot see into; here the refused
+        // request *is* the cross-origin one, and helping it read the answer
+        // would be the only thing this refusal gives away.
+        (StatusCode::UNAUTHORIZED, refused(rejection)).into_response()
+    })?;
+
+    let database = state.services.shell.database();
+    let verified = match presented.shape {
+        // The union's `missing_credential`, and the change ticket 73 is
+        // fundamentally about — this used to be `Ok`. See `crate::auth`.
+        auth::Credential::Absent => {
+            return Err(unauthorized(auth::Rejection::missing_credential(
+                "refusing a request that presented no credential",
+            )))
+        }
+        auth::Credential::WebSocketTicket => database.consume_websocket_ticket(presented.token),
+        auth::Credential::BearerToken | auth::Credential::SessionCookie => {
+            database.verify_session(presented.token)
+        }
+        // Advertised in the descriptor's `sessionMethods` because the shape is
+        // read at the upgrade, and refused here because this server implements
+        // no proof-of-possession — ticket 73 puts DPoP out of scope. Taking one
+        // as a bearer would be accepting a credential while ignoring the proof
+        // that is the entire point of the scheme.
+        auth::Credential::DpopToken => {
+            return Err(unauthorized(auth::Rejection::invalid_credential(
+                "refusing a DPoP credential: this server implements no proof-of-possession",
+            )))
+        }
+    };
+
+    match verified {
+        Ok(Some(_grant)) => Ok(presented),
+        Ok(None) => Err(unauthorized(auth::Rejection::invalid_credential(format!(
+            "refusing a {:?} that names no live session",
+            presented.shape
+        )))),
+        Err(error) => {
+            // A database that will not answer is not a credential that failed,
+            // and saying 401 would send the user to re-pair over a disk error.
+            eprintln!("laplus: cannot verify a credential: {error}");
+            Err(refuse(http::credential_verification_failed()))
+        }
+    }
+}
+
+/// The origin half of [`authorized`], and none of the credential half.
+///
+/// **Exactly two routes may use this**, and both for the same reason: they are
+/// how a client holding nothing comes to hold something. `/oauth/token` and
+/// `/api/auth/browser-session` take their credential in the request *body* — a
+/// pairing code — so requiring one in a header would be requiring the thing
+/// they exist to issue.
+///
+/// That is not a hole. What they accept is a pairing code, which is a
+/// credential this server minted, is single use, lives five minutes, and can be
+/// revoked. The origin check still applies, so a page on an unnamed origin
+/// cannot even reach them. What is skipped is only the *session* check, and a
+/// caller that had a session would not be here.
+fn origin_admitted(
+    state: &ServerState,
+    query: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let allowed = &state.config().current().remote_access;
+    auth::authorize(presented(query, headers), allowed)
+        .map(|_presented| ())
+        .map_err(|rejection| (StatusCode::UNAUTHORIZED, refused(rejection)).into_response())
 }
 
 fn refuse(refusal: http::Refusal) -> Response {
@@ -559,18 +1126,24 @@ async fn upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    match auth::authorize(presented(query.as_deref(), &headers)) {
-        Ok(credential) => ws.on_upgrade(move |socket| connection(socket, state, credential)),
-        Err(rejection) => (
-            StatusCode::UNAUTHORIZED,
-            // The reference server sets this on the same refusal. Keeping it
-            // means a browser reads the body rather than a CORS error — the
-            // one difference from how the snapshot routes answer the identical
-            // refusal, and [`authorized`] says why.
-            [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-            refused(rejection),
-        )
-            .into_response(),
+    // The upgrade is where a `wsTicket` is spent, so this is the call that
+    // consumes it — see [`authorized`]. A refused upgrade has therefore not
+    // spent anything, which is what lets a client retry with a fresh ticket
+    // rather than having to re-pair.
+    match authorized(&state, query.as_deref(), &headers) {
+        Ok(presented) => {
+            let credential = presented.shape;
+            ws.on_upgrade(move |socket| connection(socket, state, credential))
+        }
+        // `Access-Control-Allow-Origin` is not added here, unlike before ticket
+        // 73. The reference server sets it on this refusal so that a browser
+        // reads the body rather than a CORS error — but it did that when the
+        // only reason to refuse was the origin. Now the ordinary refusal is a
+        // credential that did not verify, and echoing `*` at every caller would
+        // let any page on any origin read the 401 it provoked. The body says
+        // nothing secret; the header is simply no longer buying anything the
+        // refused client needs.
+        Err(refusal) => refusal,
     }
 }
 

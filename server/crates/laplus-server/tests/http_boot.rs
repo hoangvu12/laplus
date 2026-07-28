@@ -130,12 +130,14 @@ async fn neither_endpoint_requires_a_credential() {
 ///
 /// `/api/orchestration/shell` used to be on this list. It is answered now — see
 /// `http_orchestration.rs` — because the UI asks for it on every load and takes
-/// the socket fallback when it 404s.
+/// the socket fallback when it 404s. `/api/auth/browser-session` left the list
+/// for ticket 73: it is how the window and a paired phone both open a session,
+/// and `http_pairing.rs` drives it.
 #[tokio::test]
 async fn an_unimplemented_http_route_is_a_plain_404() {
     let server = TestServer::start().await;
 
-    for path in ["/", "/api/orchestration/snapshot", "/api/auth/browser-session"] {
+    for path in ["/", "/api/orchestration/snapshot", "/api/auth/clients"] {
         let response = server.get(path).await;
         assert_eq!(response.status, 404, "{path} should be a 404");
     }

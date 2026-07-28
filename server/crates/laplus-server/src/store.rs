@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
+use crate::pairing::{CredentialRefusal, Grant, PairingLink, Session, WebSocketTicket};
 use crate::projects::{Project, WorkspaceRoot};
 use crate::threads::{Activity, Checkpoint, Conversation, LatestTurn, Message, ThreadRow};
 use crate::transcripts::Write;
@@ -179,6 +180,94 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (thread_id, turn_id)
     ) STRICT;
     "#,
+    // v5 — ticket 73, the credentials a phone pairs with.
+    //
+    // Follows `031_AuthAuthorizationScopes.ts` in the reference server rather
+    // than the `020_AuthAccessManagement.ts` the ticket cites: 031 drops and
+    // recreates both tables to add `scopes`, and is the shape upstream actually
+    // runs. The columns this server has no use for are left out — `role` (031
+    // replaced it with `scopes`), the DPoP thumbprint, and most of the client
+    // metadata, which belongs to a client-session list ticket 73 puts out of
+    // scope.
+    r#"
+    CREATE TABLE auth_pairing_links (
+        id          TEXT PRIMARY KEY,
+        -- UNIQUE is what makes a code single-use enforceable rather than merely
+        -- checked for: two rows sharing one would make `consumed_at` ambiguous.
+        credential  TEXT NOT NULL UNIQUE,
+        method      TEXT NOT NULL,
+        -- The granted scopes as a JSON array, verbatim. Same reasoning as
+        -- `model_selection` on a thread: nothing here ever queries into it, and
+        -- a join table would buy a shape this file has to keep in step with the
+        -- contract's for no query it enables. The *wire* form is
+        -- space-delimited (RFC 6749) and `crate::pairing` converts.
+        scopes      TEXT NOT NULL,
+        subject     TEXT NOT NULL,
+        label       TEXT,
+        created_at  TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        -- Both nullable, and both are the whole of single use: `consume` is one
+        -- conditional UPDATE that sets `consumed_at` only where it is still
+        -- NULL, so two simultaneous redemptions cannot both find it so.
+        consumed_at TEXT,
+        revoked_at  TEXT,
+        -- Zero for every code a human is handed, and 1 for the one the desktop
+        -- window is booted with.
+        --
+        -- Upstream's `remainingUses: "unbounded"`
+        -- (`PairingGrantStore.ts:314-330`), narrowed to the one case that needs
+        -- it. The window re-reads its credential out of the page URL on every
+        -- reload, so a strictly single-use boot grant would let the developer
+        -- press F5 once and then lock them out of their own window. A code
+        -- carried to a phone is the opposite: it is read aloud off a screen,
+        -- and the second use of one is somebody who should not have it.
+        --
+        -- An INTEGER rather than a nullable count, because there is no third
+        -- answer. "How many uses are left" would be a number this server never
+        -- decrements and never reads back.
+        reusable    INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+
+    CREATE INDEX auth_pairing_links_active
+        ON auth_pairing_links (revoked_at, consumed_at, expires_at);
+
+    CREATE TABLE auth_sessions (
+        session_id  TEXT PRIMARY KEY,
+        -- Upstream has no such column: it signs its sessions and reads the id
+        -- back out of the token. Ticket 73 chose rows over signatures — a row
+        -- makes revocation a single UPDATE and needs no secret to keep — and a
+        -- row has to hold the token it is looked up by. Plaintext, for the same
+        -- reason the pairing code is: see `crate::pairing::PairingLink`.
+        token       TEXT NOT NULL UNIQUE,
+        subject     TEXT NOT NULL,
+        scopes      TEXT NOT NULL,
+        method      TEXT NOT NULL,
+        label       TEXT,
+        issued_at   TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        revoked_at  TEXT
+    ) STRICT;
+
+    CREATE INDEX auth_sessions_active
+        ON auth_sessions (revoked_at, expires_at, issued_at);
+
+    -- A ticket is a session, narrowed to one upgrade and five minutes, because
+    -- the browser's WebSocket API cannot set a header and the credential has to
+    -- ride in the query string. See `crate::pairing`.
+    CREATE TABLE auth_websocket_tickets (
+        ticket      TEXT PRIMARY KEY,
+        -- Revoking a session takes its outstanding tickets with it, which is
+        -- what makes "revoke" mean revoked rather than "revoked in five
+        -- minutes".
+        session_id  TEXT NOT NULL REFERENCES auth_sessions(session_id) ON DELETE CASCADE,
+        issued_at   TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        consumed_at TEXT
+    ) STRICT;
+
+    CREATE INDEX auth_websocket_tickets_by_session
+        ON auth_websocket_tickets (session_id);
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -191,6 +280,80 @@ const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 /// other is a runtime error rather than a compile-time one.
 const PROJECT_COLUMNS: &str =
     "id, title, workspace_root, canonical_root, created_at, updated_at";
+
+/// The same rendering as [`NOW`], displaced by a lifetime.
+///
+/// The modifier is interpolated rather than bound, because SQLite takes a
+/// modifier as a literal and not as a parameter. That is safe here and only
+/// here: every caller passes one of [`crate::pairing`]'s own `&'static str`
+/// constants, and nothing user-supplied reaches it. `expiry_and_now_agree`
+/// pins that this stays the same clock as [`NOW`].
+fn expiry(ttl: &str) -> String {
+    format!("strftime('%Y-%m-%dT%H:%M:%fZ','now','{ttl}')")
+}
+
+/// The pairing link table's columns, in the order [`pairing_link_from_row`]
+/// reads them.
+const PAIRING_LINK_COLUMNS: &str = "id, credential, scopes, subject, label, created_at, expires_at";
+
+/// What [`Database::issue_pairing_link`] needs. A struct rather than six
+/// arguments, because four of them are strings and an argument list of four
+/// strings is a bug waiting for a refactor to reorder it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewPairingLink<'a> {
+    pub id: &'a str,
+    pub credential: &'a str,
+    pub method: &'a str,
+    pub scopes: &'a [String],
+    pub subject: &'a str,
+    pub label: Option<&'a str>,
+    /// How long this code lives. Five minutes for one a human carries;
+    /// [`crate::pairing::DESKTOP_BOOT_TTL`] for the window's own.
+    pub ttl: crate::pairing::Ttl,
+    /// Survives being spent. True for the boot grant and false for everything
+    /// else — see the `reusable` column's note in the migration.
+    pub reusable: bool,
+}
+
+/// What [`Database::issue_session`] needs.
+#[derive(Debug, Clone, Copy)]
+pub struct NewSession<'a> {
+    pub session_id: &'a str,
+    pub token: &'a str,
+    pub subject: &'a str,
+    pub scopes: &'a [String],
+    pub method: &'a str,
+    pub label: Option<&'a str>,
+}
+
+/// Scopes go into their column as a JSON array. See the migration's note on
+/// why this column is not a join table.
+fn encode_scope_column(scopes: &[String]) -> String {
+    serde_json::to_string(scopes).expect("a list of strings serializes")
+}
+
+/// The other half of [`encode_scope_column`].
+///
+/// A column that will not parse yields no scopes rather than an error. Nothing
+/// in this server gates on a scope — see [`crate::pairing`] — so the choice is
+/// between a session that works and reports nothing and a session that cannot
+/// be read at all, and the second one locks out a paired phone over a display
+/// string.
+fn decode_scope_column(encoded: &str) -> Vec<String> {
+    serde_json::from_str(encoded).unwrap_or_default()
+}
+
+fn pairing_link_from_row(row: &Row<'_>) -> rusqlite::Result<PairingLink> {
+    Ok(PairingLink {
+        id: row.get(0)?,
+        credential: row.get(1)?,
+        scopes: decode_scope_column(&row.get::<_, String>(2)?),
+        subject: row.get(3)?,
+        label: row.get(4)?,
+        created_at: row.get(5)?,
+        expires_at: row.get(6)?,
+    })
+}
 
 /// The thread table's columns, in the order [`thread_from_row`] reads them.
 const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mode, \
@@ -789,6 +952,425 @@ impl Database {
         }
 
         Ok(conversations)
+    }
+
+    // --- ticket 73: pairing links, sessions and socket tickets ---------------
+    //
+    // The vocabulary here is the pairing flow's, not the table's, for the same
+    // reason the registry's is: `crate::server`'s handlers ask to mint a code or
+    // spend one, and never see a statement. What is unusual about this group is
+    // that its *concurrency* is load-bearing rather than incidental — see
+    // [`Database::consume_pairing_link`] — so the SQL is where the single-use
+    // guarantee lives and cannot be moved out of.
+
+    /// Mint a pairing code. The row is the code's whole existence: there is no
+    /// in-memory half.
+    pub fn issue_pairing_link(
+        &self,
+        input: NewPairingLink<'_>,
+    ) -> Result<PairingLink, StorageError> {
+        let connection = self.lock();
+        let scopes = encode_scope_column(input.scopes);
+
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO auth_pairing_links \
+                       (id, credential, method, scopes, subject, label, created_at, expires_at, \
+                        reusable) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, {NOW}, {expiry}, ?7)",
+                    expiry = expiry(input.ttl.0)
+                ),
+                rusqlite::params![
+                    input.id,
+                    input.credential,
+                    input.method,
+                    scopes,
+                    input.subject,
+                    input.label,
+                    input.reusable,
+                ],
+            )
+            .map_err(StorageError::while_("mint a pairing code"))?;
+
+        connection
+            .query_row(
+                &format!("SELECT {PAIRING_LINK_COLUMNS} FROM auth_pairing_links WHERE id = ?1"),
+                (input.id,),
+                pairing_link_from_row,
+            )
+            .map_err(StorageError::while_("read back the pairing code"))
+    }
+
+    /// Spend a pairing code, or say why not.
+    ///
+    /// **The order of the two statements is the single-use guarantee**, and it
+    /// is the reference server's (`PairingGrantStore.consume`). The conditional
+    /// `UPDATE … RETURNING` runs *first* and does the whole check — unrevoked,
+    /// unspent, unexpired — inside one statement, so two redemptions racing each
+    /// other cannot both find `consumed_at` NULL. Only on a miss does the second
+    /// statement look at the row to say which of the three it was, and by then
+    /// the answer is only a log line. Checking first and updating second would
+    /// read the same and be a race.
+    ///
+    /// **A `reusable` row is exempt from the spending, not from the checking.**
+    /// `consumed_at` is still stamped — so Settings stops listing it and the
+    /// user is not offered a code that is not theirs to hand out — but it is not
+    /// what bars a second use. Revocation and expiry still are, which is what
+    /// keeps the boot grant a credential rather than a permanent hole: it dies
+    /// with its TTL and can be revoked like anything else. See the column's own
+    /// note in the migration.
+    pub fn consume_pairing_link(
+        &self,
+        credential: &str,
+    ) -> Result<Result<Grant, CredentialRefusal>, StorageError> {
+        let connection = self.lock();
+
+        let consumed = connection
+            .query_row(
+                &format!(
+                    "UPDATE auth_pairing_links \
+                        SET consumed_at = {NOW} \
+                      WHERE credential = ?1 \
+                        AND revoked_at IS NULL \
+                        AND (consumed_at IS NULL OR reusable = 1) \
+                        AND expires_at > {NOW} \
+                  RETURNING subject, scopes, label"
+                ),
+                (credential,),
+                |row| {
+                    Ok(Grant {
+                        subject: row.get(0)?,
+                        scopes: decode_scope_column(&row.get::<_, String>(1)?),
+                        label: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::while_("spend a pairing code"))?;
+
+        if let Some(grant) = consumed {
+            return Ok(Ok(grant));
+        }
+
+        // Diagnosis only. Nothing below decides anything the caller acts on
+        // differently — all four become the same 401 — so a row that changed
+        // under us between the two statements costs an inaccurate log line and
+        // nothing else.
+        let refusal = connection
+            .query_row(
+                &format!(
+                    "SELECT revoked_at, consumed_at, expires_at <= {NOW}, reusable \
+                       FROM auth_pairing_links WHERE credential = ?1"
+                ),
+                (credential,),
+                |row| {
+                    let revoked: Option<String> = row.get(0)?;
+                    let consumed: Option<String> = row.get(1)?;
+                    let expired: bool = row.get(2)?;
+                    let reusable: bool = row.get(3)?;
+                    Ok(if revoked.is_some() {
+                        CredentialRefusal::Revoked
+                    // A spent `reusable` row is not why the UPDATE missed — it
+                    // is exempt from that clause — so saying "already used"
+                    // here would send whoever reads the log looking for a
+                    // second redemption that never happened.
+                    } else if consumed.is_some() && !reusable {
+                        CredentialRefusal::AlreadyUsed
+                    } else if expired {
+                        CredentialRefusal::Expired
+                    } else {
+                        // Nothing was wrong with it, which means it was spent
+                        // between the two statements above.
+                        CredentialRefusal::AlreadyUsed
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::while_("diagnose a pairing code"))?
+            .unwrap_or(CredentialRefusal::Unknown);
+
+        Ok(Err(refusal))
+    }
+
+    /// The pairing codes Settings should list: minted, still good, not yet
+    /// spent — and issued to be handed to somebody.
+    ///
+    /// **The boot grant is excluded**, which is upstream's
+    /// `listPairingLinks({ excludeSubjects })` and matters for the same reason.
+    /// It is a credential the window issued to itself; offering it in a list
+    /// headed "codes you can give a device" invites the developer to hand out
+    /// the one that unlocks their own window, and to revoke it wondering why
+    /// laplus then stopped opening. It is filtered by subject rather than by
+    /// `reusable` so that the list is defined by *who a code is for*, which is
+    /// the question the panel is actually asking.
+    pub fn active_pairing_links(&self) -> Result<Vec<PairingLink>, StorageError> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {PAIRING_LINK_COLUMNS} FROM auth_pairing_links \
+                  WHERE revoked_at IS NULL AND consumed_at IS NULL AND expires_at > {NOW} \
+                    AND subject <> '{boot}' \
+                  ORDER BY created_at DESC",
+                boot = crate::pairing::DESKTOP_BOOT_SUBJECT
+            ))
+            .map_err(StorageError::while_("list pairing codes"))?;
+        let rows = statement
+            .query_map([], pairing_link_from_row)
+            .map_err(StorageError::while_("list pairing codes"))?;
+        rows.collect::<rusqlite::Result<Vec<PairingLink>>>()
+            .map_err(StorageError::while_("list pairing codes"))
+    }
+
+    /// Mint the credential the desktop window boots with, and take the previous
+    /// one out of circulation.
+    ///
+    /// One call rather than an insert beside a revoke, because the two must not
+    /// be able to half-happen: a process that seeded a new grant and failed to
+    /// retire the old one would leave yesterday's boot code live for its full
+    /// day, and a process that retired the old one and failed to seed a new one
+    /// would open a window it cannot let in.
+    ///
+    /// **Retiring the old one is why this is not simply `issue_pairing_link`.**
+    /// The boot grant outlives a page reload by design, which means it also
+    /// outlives the process unless something ends it — and a laptop that has
+    /// opened laplus fifty times should not have fifty live keys to itself
+    /// sitting in a table.
+    pub fn issue_desktop_boot_grant(
+        &self,
+        id: &str,
+        credential: &str,
+        scopes: &[String],
+    ) -> Result<(), StorageError> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(StorageError::while_("open the desktop boot grant"))?;
+
+        transaction
+            .execute(
+                &format!(
+                    "UPDATE auth_pairing_links SET revoked_at = {NOW} \
+                      WHERE subject = ?1 AND revoked_at IS NULL"
+                ),
+                (crate::pairing::DESKTOP_BOOT_SUBJECT,),
+            )
+            .map_err(StorageError::while_("retire the previous boot grant"))?;
+
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO auth_pairing_links \
+                       (id, credential, method, scopes, subject, label, created_at, expires_at, \
+                        reusable) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, {NOW}, {expiry}, 1)",
+                    expiry = expiry(crate::pairing::DESKTOP_BOOT_TTL.0)
+                ),
+                rusqlite::params![
+                    id,
+                    credential,
+                    crate::pairing::ONE_TIME_TOKEN_METHOD,
+                    encode_scope_column(scopes),
+                    crate::pairing::DESKTOP_BOOT_SUBJECT,
+                ],
+            )
+            .map_err(StorageError::while_("mint the desktop boot grant"))?;
+
+        transaction
+            .commit()
+            .map_err(StorageError::while_("commit the desktop boot grant"))
+    }
+
+    /// Withdraw a pairing code that is still capable of being spent. `false` if
+    /// there was no such live code, which is what the contract's `revoked` field
+    /// reports.
+    ///
+    /// **A spent `reusable` row can still be revoked**, and the same clause that
+    /// exempts it from [`Database::consume_pairing_link`] has to exempt it here.
+    /// Without that, stamping the boot grant on first use would make it
+    /// permanently unrevokable — the credential with the longest life would be
+    /// the one nothing could withdraw, which is precisely backwards.
+    pub fn revoke_pairing_link(&self, id: &str) -> Result<bool, StorageError> {
+        let connection = self.lock();
+        let changed = connection
+            .execute(
+                &format!(
+                    "UPDATE auth_pairing_links SET revoked_at = {NOW} \
+                      WHERE id = ?1 AND revoked_at IS NULL \
+                        AND (consumed_at IS NULL OR reusable = 1)"
+                ),
+                (id,),
+            )
+            .map_err(StorageError::while_("revoke a pairing code"))?;
+        Ok(changed > 0)
+    }
+
+    /// Open a session against a spent pairing code's grant.
+    pub fn issue_session(&self, input: NewSession<'_>) -> Result<Session, StorageError> {
+        let connection = self.lock();
+        let scopes = encode_scope_column(input.scopes);
+        let ttl = crate::pairing::SESSION_TTL.0;
+
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO auth_sessions \
+                       (session_id, token, subject, scopes, method, label, issued_at, expires_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, {NOW}, {expiry})",
+                    expiry = expiry(ttl)
+                ),
+                rusqlite::params![
+                    input.session_id,
+                    input.token,
+                    input.subject,
+                    scopes,
+                    input.method,
+                    input.label,
+                ],
+            )
+            .map_err(StorageError::while_("open a session"))?;
+
+        connection
+            .query_row(
+                // `expires_in` is computed here rather than in Rust so that it
+                // and `expires_at` come from one reading of the clock. A client
+                // that was told "30 days" and given a timestamp 40 ms earlier
+                // would refresh 40 ms late forever.
+                "SELECT session_id, token, subject, scopes, expires_at, \
+                        CAST(strftime('%s', expires_at) - strftime('%s','now') AS INTEGER) \
+                   FROM auth_sessions WHERE session_id = ?1",
+                (input.session_id,),
+                |row| {
+                    Ok(Session {
+                        session_id: row.get(0)?,
+                        token: row.get(1)?,
+                        subject: row.get(2)?,
+                        scopes: decode_scope_column(&row.get::<_, String>(3)?),
+                        expires_at: row.get(4)?,
+                        expires_in: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(StorageError::while_("read back the session"))
+    }
+
+    /// Is this bearer a live session? The subject and scopes if so.
+    pub fn verify_session(&self, token: &str) -> Result<Option<Grant>, StorageError> {
+        let connection = self.lock();
+        connection
+            .query_row(
+                &format!(
+                    "SELECT subject, scopes, label FROM auth_sessions \
+                      WHERE token = ?1 AND revoked_at IS NULL AND expires_at > {NOW}"
+                ),
+                (token,),
+                |row| {
+                    Ok(Grant {
+                        subject: row.get(0)?,
+                        scopes: decode_scope_column(&row.get::<_, String>(1)?),
+                        label: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::while_("verify a session"))
+    }
+
+    /// Mint a socket ticket against a live session.
+    ///
+    /// Takes the bearer rather than a session id so that the caller cannot mint
+    /// a ticket for a session it did not prove it holds — the verification and
+    /// the issue are one statement pair under one lock, and `None` means the
+    /// bearer was no good.
+    pub fn issue_websocket_ticket(
+        &self,
+        token: &str,
+        ticket: &str,
+    ) -> Result<Option<WebSocketTicket>, StorageError> {
+        let connection = self.lock();
+        let ttl = crate::pairing::WEBSOCKET_TICKET_TTL.0;
+
+        let session_id: Option<String> = connection
+            .query_row(
+                &format!(
+                    "SELECT session_id FROM auth_sessions \
+                      WHERE token = ?1 AND revoked_at IS NULL AND expires_at > {NOW}"
+                ),
+                (token,),
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::while_("find the session to ticket"))?;
+
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO auth_websocket_tickets (ticket, session_id, issued_at, expires_at) \
+                     VALUES (?1, ?2, {NOW}, {expiry})",
+                    expiry = expiry(ttl)
+                ),
+                (ticket, &session_id),
+            )
+            .map_err(StorageError::while_("mint a socket ticket"))?;
+
+        connection
+            .query_row(
+                "SELECT ticket, expires_at FROM auth_websocket_tickets WHERE ticket = ?1",
+                (ticket,),
+                |row| {
+                    Ok(WebSocketTicket {
+                        ticket: row.get(0)?,
+                        expires_at: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::while_("read back the socket ticket"))
+    }
+
+    /// Spend a socket ticket at the upgrade.
+    ///
+    /// Single use and the same shape as [`Database::consume_pairing_link`], for
+    /// the same reason: one conditional `UPDATE` rather than a read and a write,
+    /// so a ticket replayed from a log by someone who saw it cannot open a
+    /// second socket. The join is what makes revoking a session take its
+    /// outstanding tickets with it rather than leaving five minutes of them
+    /// valid.
+    pub fn consume_websocket_ticket(&self, ticket: &str) -> Result<Option<Grant>, StorageError> {
+        let connection = self.lock();
+        connection
+            .query_row(
+                &format!(
+                    "UPDATE auth_websocket_tickets SET consumed_at = {NOW} \
+                      WHERE ticket = ?1 \
+                        AND consumed_at IS NULL \
+                        AND expires_at > {NOW} \
+                        AND session_id IN ( \
+                              SELECT session_id FROM auth_sessions \
+                               WHERE revoked_at IS NULL AND expires_at > {NOW}) \
+                  RETURNING ( \
+                      SELECT subject FROM auth_sessions \
+                       WHERE auth_sessions.session_id = auth_websocket_tickets.session_id), \
+                      ( SELECT scopes FROM auth_sessions \
+                         WHERE auth_sessions.session_id = auth_websocket_tickets.session_id), \
+                      ( SELECT label FROM auth_sessions \
+                         WHERE auth_sessions.session_id = auth_websocket_tickets.session_id)"
+                ),
+                (ticket,),
+                |row| {
+                    Ok(Grant {
+                        subject: row.get(0)?,
+                        scopes: decode_scope_column(&row.get::<_, String>(1)?),
+                        label: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::while_("spend a socket ticket"))
     }
 
     /// A poisoned lock means a previous holder panicked mid-statement. SQLite
@@ -1864,5 +2446,474 @@ mod tests {
         assert_eq!(&updated_at[10..11], "T");
         assert_eq!(&updated_at[19..20], ".");
         assert!(updated_at.ends_with('Z'));
+    }
+
+    // --- ticket 73 ----------------------------------------------------------
+
+    /// [`expiry`] repeats [`NOW`]'s format string, which is the kind of
+    /// duplication that rots. A zero-length lifetime has to render the same
+    /// instant, or a pairing code's `created_at` and `expires_at` are being read
+    /// off two different clocks.
+    #[test]
+    fn expiry_and_now_agree_on_the_shape_of_an_instant() {
+        let database = Database::in_memory().expect("an in-memory database");
+        let connection = database.lock();
+        let (now, immediately): (String, String) = connection
+            .query_row(
+                &format!("SELECT {NOW}, {}", expiry("+0 seconds")),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("both render");
+
+        assert_eq!(now.len(), immediately.len());
+        // Same second, whatever the millisecond did in between.
+        assert_eq!(now[..19], immediately[..19]);
+        assert!(immediately.ends_with('Z'));
+    }
+
+    fn pairing_database() -> Database {
+        Database::in_memory().expect("an in-memory database")
+    }
+
+    fn mint(database: &Database, credential: &str) -> PairingLink {
+        database
+            .issue_pairing_link(NewPairingLink {
+                id: &format!("link-{credential}"),
+                credential,
+                method: crate::pairing::ONE_TIME_TOKEN_METHOD,
+                scopes: &crate::pairing::default_scopes(),
+                subject: "pairing",
+                label: Some("A phone"),
+                ttl: crate::pairing::PAIRING_CODE_TTL,
+                reusable: false,
+            })
+            .expect("the code reaches the database")
+    }
+
+    #[test]
+    fn a_minted_code_carries_its_label_and_scopes_back() {
+        let database = pairing_database();
+        let link = mint(&database, "AAAABBBBCCCC");
+
+        assert_eq!(link.credential, "AAAABBBBCCCC");
+        assert_eq!(link.label.as_deref(), Some("A phone"));
+        assert_eq!(link.scopes, crate::pairing::default_scopes());
+        assert!(link.expires_at > link.created_at);
+    }
+
+    /// The case the whole flow rests on.
+    #[test]
+    fn a_fresh_code_is_spent_once_and_the_second_attempt_fails() {
+        let database = pairing_database();
+        mint(&database, "AAAABBBBCCCC");
+
+        let first = database.consume_pairing_link("AAAABBBBCCCC").expect("reads");
+        assert_eq!(
+            first.expect("the first redemption succeeds").subject,
+            "pairing"
+        );
+
+        let second = database.consume_pairing_link("AAAABBBBCCCC").expect("reads");
+        assert_eq!(
+            second.expect_err("the second redemption fails"),
+            CredentialRefusal::AlreadyUsed
+        );
+    }
+
+    /// The boot grant's whole reason for existing: the window re-reads its
+    /// credential out of the page URL on every reload, so a strictly single-use
+    /// one would let the developer press F5 once and lock themselves out of
+    /// their own window.
+    #[test]
+    fn the_boot_grant_survives_being_spent() {
+        let database = pairing_database();
+        database
+            .issue_desktop_boot_grant("boot", "BOOTBOOTBOOT", &crate::pairing::default_scopes())
+            .expect("the boot grant reaches the database");
+
+        for attempt in 1..=3 {
+            let grant = database
+                .consume_pairing_link("BOOTBOOTBOOT")
+                .expect("reads")
+                .unwrap_or_else(|refusal| {
+                    panic!("redemption {attempt} was refused as {refusal:?}")
+                });
+            assert_eq!(grant.subject, crate::pairing::DESKTOP_BOOT_SUBJECT);
+            assert_eq!(grant.scopes, crate::pairing::default_scopes());
+        }
+    }
+
+    /// Exempt from *spending*, not from *revocation*. This is what keeps the
+    /// boot grant a credential rather than a permanent hole in the door.
+    #[test]
+    fn a_revoked_boot_grant_stops_working_despite_being_reusable() {
+        let database = pairing_database();
+        database
+            .issue_desktop_boot_grant("boot", "BOOTBOOTBOOT", &crate::pairing::default_scopes())
+            .expect("mints");
+        assert!(database.consume_pairing_link("BOOTBOOTBOOT").expect("reads").is_ok());
+
+        assert!(database.revoke_pairing_link("boot").expect("revokes"));
+
+        assert_eq!(
+            database
+                .consume_pairing_link("BOOTBOOTBOOT")
+                .expect("reads")
+                .expect_err("a revoked boot grant is refused"),
+            CredentialRefusal::Revoked
+        );
+    }
+
+    /// Booting again retires the previous grant, so a laptop that has opened
+    /// laplus fifty times does not hold fifty live keys to itself.
+    #[test]
+    fn minting_a_boot_grant_retires_the_one_before_it() {
+        let database = pairing_database();
+        let scopes = crate::pairing::default_scopes();
+        database.issue_desktop_boot_grant("boot-1", "FIRSTFIRST22", &scopes).expect("mints");
+        database.issue_desktop_boot_grant("boot-2", "SECONDSECND3", &scopes).expect("mints");
+
+        assert_eq!(
+            database
+                .consume_pairing_link("FIRSTFIRST22")
+                .expect("reads")
+                .expect_err("yesterday's boot code is dead"),
+            CredentialRefusal::Revoked
+        );
+        assert!(database.consume_pairing_link("SECONDSECND3").expect("reads").is_ok());
+    }
+
+    /// Settings must never offer the window's own credential as something to
+    /// hand to a phone — upstream's `listPairingLinks({ excludeSubjects })`. A
+    /// developer who revoked it wondering what it was would stop being able to
+    /// open laplus.
+    #[test]
+    fn the_boot_grant_is_absent_from_the_list_settings_shows() {
+        let database = pairing_database();
+        database
+            .issue_desktop_boot_grant("boot", "BOOTBOOTBOOT", &crate::pairing::default_scopes())
+            .expect("mints");
+        mint(&database, "AAAABBBBCCCC");
+
+        let listed = database.active_pairing_links().expect("lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].credential, "AAAABBBBCCCC");
+    }
+
+    /// A spent boot grant is not why a later refusal happened, so the log must
+    /// not say "already used" — that would send whoever reads it looking for a
+    /// second redemption that never occurred.
+    #[test]
+    fn a_spent_boot_grant_that_expires_is_diagnosed_as_expired() {
+        let database = pairing_database();
+        database
+            .issue_desktop_boot_grant("boot", "BOOTBOOTBOOT", &crate::pairing::default_scopes())
+            .expect("mints");
+        assert!(database.consume_pairing_link("BOOTBOOTBOOT").expect("reads").is_ok());
+
+        // Reach past the TTL rather than wait for it: this asserts on the
+        // decision the code makes, never on elapsed wall-clock.
+        database
+            .lock()
+            .execute(
+                "UPDATE auth_pairing_links SET expires_at = '2000-01-01T00:00:00.000Z' \
+                  WHERE id = 'boot'",
+                [],
+            )
+            .expect("ages the row");
+
+        assert_eq!(
+            database
+                .consume_pairing_link("BOOTBOOTBOOT")
+                .expect("reads")
+                .expect_err("an expired boot grant is refused"),
+            CredentialRefusal::Expired
+        );
+    }
+
+    #[test]
+    fn a_code_that_was_never_minted_is_unknown() {
+        let database = pairing_database();
+        assert_eq!(
+            database
+                .consume_pairing_link("NEVERMINTEDX")
+                .expect("reads")
+                .expect_err("refused"),
+            CredentialRefusal::Unknown
+        );
+    }
+
+    /// Expiry is the database's own clock, so the way to test it is to write a
+    /// row that is already old rather than to wait five minutes. Asserting on a
+    /// decision, not on elapsed wall-clock — `server/CLAUDE.md`.
+    #[test]
+    fn an_expired_code_is_refused() {
+        let database = pairing_database();
+        mint(&database, "AAAABBBBCCCC");
+        database
+            .lock()
+            .execute(
+                "UPDATE auth_pairing_links SET expires_at = '2000-01-01T00:00:00.000Z'",
+                [],
+            )
+            .expect("ages the code");
+
+        assert_eq!(
+            database
+                .consume_pairing_link("AAAABBBBCCCC")
+                .expect("reads")
+                .expect_err("refused"),
+            CredentialRefusal::Expired
+        );
+    }
+
+    #[test]
+    fn a_revoked_code_is_refused_and_leaves_the_list() {
+        let database = pairing_database();
+        let link = mint(&database, "AAAABBBBCCCC");
+
+        assert!(database.revoke_pairing_link(&link.id).expect("revokes"));
+        assert_eq!(
+            database
+                .consume_pairing_link("AAAABBBBCCCC")
+                .expect("reads")
+                .expect_err("refused"),
+            CredentialRefusal::Revoked
+        );
+        assert!(database.active_pairing_links().expect("lists").is_empty());
+    }
+
+    /// Revoking twice is not an error, it is `false` — which is what the
+    /// contract's `revoked` field reports and what a double-click produces.
+    #[test]
+    fn revoking_a_code_twice_reports_that_the_second_did_nothing() {
+        let database = pairing_database();
+        let link = mint(&database, "AAAABBBBCCCC");
+
+        assert!(database.revoke_pairing_link(&link.id).expect("revokes"));
+        assert!(!database.revoke_pairing_link(&link.id).expect("revokes"));
+        assert!(!database.revoke_pairing_link("no-such-link").expect("revokes"));
+    }
+
+    /// Settings lists what can still be used, and nothing else.
+    #[test]
+    fn the_active_list_omits_spent_expired_and_revoked_codes() {
+        let database = pairing_database();
+        mint(&database, "AAAABBBBCCCC");
+        mint(&database, "DDDDEEEEFFFF");
+        let revoked = mint(&database, "GGGGHHHHJJJJ");
+        mint(&database, "KKKKMMMMNNNN");
+
+        database
+            .consume_pairing_link("DDDDEEEEFFFF")
+            .expect("reads")
+            .expect("spent");
+        database.revoke_pairing_link(&revoked.id).expect("revokes");
+        database
+            .lock()
+            .execute(
+                "UPDATE auth_pairing_links SET expires_at = '2000-01-01T00:00:00.000Z' \
+                   WHERE credential = 'KKKKMMMMNNNN'",
+                [],
+            )
+            .expect("ages one");
+
+        let listed: Vec<String> = database
+            .active_pairing_links()
+            .expect("lists")
+            .into_iter()
+            .map(|link| link.credential)
+            .collect();
+        assert_eq!(listed, ["AAAABBBBCCCC"]);
+    }
+
+    /// **The race the ordering in [`Database::consume_pairing_link`] exists
+    /// for.** Eight threads redeem one code; exactly one may win.
+    ///
+    /// This asserts on the count and not on timing, so it is not a test that
+    /// passes because a machine was fast. A read-then-write implementation fails
+    /// it, which is the whole point of writing it.
+    #[test]
+    fn concurrent_redemptions_produce_exactly_one_grant() {
+        let database = Arc::new(pairing_database());
+        mint(&database, "AAAABBBBCCCC");
+
+        let granted = Arc::new(AtomicI64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let database = Arc::clone(&database);
+                let granted = Arc::clone(&granted);
+                scope.spawn(move || {
+                    if database
+                        .consume_pairing_link("AAAABBBBCCCC")
+                        .expect("reads")
+                        .is_ok()
+                    {
+                        granted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(granted.load(Ordering::SeqCst), 1);
+    }
+
+    fn session(database: &Database, token: &str) -> Session {
+        database
+            .issue_session(NewSession {
+                session_id: &format!("session-{token}"),
+                token,
+                subject: "pairing",
+                scopes: &crate::pairing::default_scopes(),
+                method: crate::pairing::BEARER_SESSION_METHOD,
+                label: Some("A phone"),
+            })
+            .expect("the session reaches the database")
+    }
+
+    #[test]
+    fn a_session_verifies_by_its_bearer_and_reports_a_lifetime() {
+        let database = pairing_database();
+        let opened = session(&database, "bearer-1");
+
+        // 30 days, give or take the second the test took.
+        assert!(opened.expires_in > 29 * 24 * 60 * 60);
+        assert!(opened.expires_in <= 30 * 24 * 60 * 60);
+        assert_eq!(
+            database
+                .verify_session("bearer-1")
+                .expect("reads")
+                .expect("a live session")
+                .subject,
+            "pairing"
+        );
+        assert!(database.verify_session("bearer-2").expect("reads").is_none());
+    }
+
+    #[test]
+    fn an_expired_session_does_not_verify() {
+        let database = pairing_database();
+        session(&database, "bearer-1");
+        database
+            .lock()
+            .execute(
+                "UPDATE auth_sessions SET expires_at = '2000-01-01T00:00:00.000Z'",
+                [],
+            )
+            .expect("ages the session");
+
+        assert!(database.verify_session("bearer-1").expect("reads").is_none());
+    }
+
+    #[test]
+    fn a_ticket_is_minted_from_a_live_bearer_and_spent_once() {
+        let database = pairing_database();
+        session(&database, "bearer-1");
+
+        let ticket = database
+            .issue_websocket_ticket("bearer-1", "ticket-1")
+            .expect("reads")
+            .expect("a live bearer gets a ticket");
+        assert_eq!(ticket.ticket, "ticket-1");
+
+        assert_eq!(
+            database
+                .consume_websocket_ticket("ticket-1")
+                .expect("reads")
+                .expect("the first upgrade succeeds")
+                .subject,
+            "pairing"
+        );
+        assert!(database
+            .consume_websocket_ticket("ticket-1")
+            .expect("reads")
+            .is_none());
+    }
+
+    #[test]
+    fn a_ticket_cannot_be_minted_from_a_bearer_that_does_not_verify() {
+        let database = pairing_database();
+        assert!(database
+            .issue_websocket_ticket("bearer-nope", "ticket-1")
+            .expect("reads")
+            .is_none());
+    }
+
+    /// The reason a ticket names its session rather than copying it: revoking
+    /// the session has to mean revoked, not "revoked once the outstanding
+    /// tickets run out".
+    #[test]
+    fn revoking_a_session_invalidates_its_outstanding_tickets() {
+        let database = pairing_database();
+        session(&database, "bearer-1");
+        database
+            .issue_websocket_ticket("bearer-1", "ticket-1")
+            .expect("reads")
+            .expect("a ticket");
+
+        database
+            .lock()
+            .execute(&format!("UPDATE auth_sessions SET revoked_at = {NOW}"), [])
+            .expect("revokes the session");
+
+        assert!(database
+            .consume_websocket_ticket("ticket-1")
+            .expect("reads")
+            .is_none());
+    }
+
+    #[test]
+    fn an_expired_ticket_does_not_upgrade() {
+        let database = pairing_database();
+        session(&database, "bearer-1");
+        database
+            .issue_websocket_ticket("bearer-1", "ticket-1")
+            .expect("reads")
+            .expect("a ticket");
+        database
+            .lock()
+            .execute(
+                "UPDATE auth_websocket_tickets SET expires_at = '2000-01-01T00:00:00.000Z'",
+                [],
+            )
+            .expect("ages the ticket");
+
+        assert!(database
+            .consume_websocket_ticket("ticket-1")
+            .expect("reads")
+            .is_none());
+    }
+
+    /// Same race as the pairing code's, one step later. A ticket that could be
+    /// spent twice would let anyone who read one out of a proxy log open a
+    /// second socket beside the phone's.
+    #[test]
+    fn concurrent_upgrades_on_one_ticket_produce_exactly_one_socket() {
+        let database = Arc::new(pairing_database());
+        session(&database, "bearer-1");
+        database
+            .issue_websocket_ticket("bearer-1", "ticket-1")
+            .expect("reads")
+            .expect("a ticket");
+
+        let upgraded = Arc::new(AtomicI64::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let database = Arc::clone(&database);
+                let upgraded = Arc::clone(&upgraded);
+                scope.spawn(move || {
+                    if database
+                        .consume_websocket_ticket("ticket-1")
+                        .expect("reads")
+                        .is_some()
+                    {
+                        upgraded.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(upgraded.load(Ordering::SeqCst), 1);
     }
 }

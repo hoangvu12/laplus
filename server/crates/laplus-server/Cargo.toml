@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 notify.workspace = true
 portable-pty.workspace = true
 rusqlite.workspace = true

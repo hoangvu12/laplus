@@ -1,7 +1,14 @@
 # ADR-0015 — A credential that opens the socket reads a snapshot, and nothing less will do
 
 Date: 2026-07-28
-Status: Accepted
+Status: Superseded by [ADR-0019](0019-a-tunnel-dissolves-the-loopback-boundary.md)
+
+> **What survives.** That these routes are exactly as strong as the socket, by
+> construction rather than coincidence, is still the rule — they still call one
+> function. What 0019 reverses is the posture that function _held_: an absent
+> credential is now refused. A tunnel makes a request from anywhere look like a
+> request from this machine, so "reachability is the boundary" stopped being
+> true rather than stopped being convenient.
 
 ## Context
 

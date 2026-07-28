@@ -209,30 +209,22 @@ async fn ack_and_interrupt_draw_no_reply() {
     server.stop().await;
 }
 
-/// All three credential shapes from ticket 01, plus none at all. v1 verifies
-/// none of them; what it must not do is refuse one.
+/// The credential shapes from ticket 01 that this server issues, each opening a
+/// socket that can then be called on.
+///
+/// **Rewritten by ticket 73**, and the rewrite is the point. This used to
+/// present an invented cookie, an invented ticket, an invented bearer and
+/// nothing at all, and assert that all four were accepted — which they were,
+/// because nothing was verified. Now each is a credential this server actually
+/// minted, and the invented ones have their own test below.
 #[tokio::test]
-async fn every_credential_shape_is_accepted() {
+async fn every_credential_shape_this_server_issues_opens_a_socket() {
     let server = TestServer::start().await;
 
     let identities = [
-        ("browser cookie", ClientIdentity::browser()),
-        ("websocket ticket", ClientIdentity::ticket()),
-        (
-            "bearer token",
-            ClientIdentity {
-                authorization: Some("Bearer eyJ2IjoxfQ.c2ln".to_string()),
-                ..ClientIdentity::default()
-            },
-        ),
-        (
-            "dpop token",
-            ClientIdentity {
-                authorization: Some("DPoP eyJ2IjoxfQ.c2ln".to_string()),
-                ..ClientIdentity::default()
-            },
-        ),
-        ("no credential", ClientIdentity::anonymous()),
+        ("browser cookie", server.browser()),
+        ("websocket ticket", server.ticketed().await),
+        ("bearer token", server.bearer()),
     ];
 
     for (name, identity) in identities {
@@ -250,6 +242,95 @@ async fn every_credential_shape_is_accepted() {
     server.stop().await;
 }
 
+/// The other half, and the change ticket 73 is fundamentally about: a
+/// credential this server did not issue does not open a socket, and neither
+/// does none at all.
+///
+/// Until ticket 73 every one of these was accepted — deliberately, and safely,
+/// while loopback was the boundary. `docs/adr/0019` is why that stopped being
+/// true and `crate::auth` carries the summary.
+#[tokio::test]
+async fn a_credential_this_server_did_not_issue_opens_nothing() {
+    let server = TestServer::start().await;
+
+    let identities = [
+        ("no credential at all", ClientIdentity::anonymous()),
+        (
+            "an invented cookie",
+            ClientIdentity {
+                cookie: Some("t3_session=eyJ2IjoxfQ.c2ln".to_string()),
+                ..ClientIdentity::default()
+            },
+        ),
+        (
+            "an invented ticket",
+            ClientIdentity {
+                ticket: Some("eyJ2IjoxfQ.c2ln".to_string()),
+                ..ClientIdentity::default()
+            },
+        ),
+        (
+            "an invented bearer",
+            ClientIdentity {
+                authorization: Some("Bearer eyJ2IjoxfQ.c2ln".to_string()),
+                ..ClientIdentity::default()
+            },
+        ),
+        // Advertised in the descriptor because the shape is read, and refused
+        // because this server implements no proof-of-possession. Accepting one
+        // would be taking a credential while ignoring the proof that is the
+        // whole point of the scheme.
+        (
+            "a DPoP token, which this server does not implement",
+            ClientIdentity {
+                authorization: Some("DPoP eyJ2IjoxfQ.c2ln".to_string()),
+                ..ClientIdentity::default()
+            },
+        ),
+    ];
+
+    for (name, identity) in identities {
+        let refusal = server
+            .connect_as(identity)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{name} should be refused"));
+        assert_eq!(refusal.status, 401, "{name}");
+        assert_eq!(refusal.body["_tag"], "EnvironmentAuthInvalidError", "{name}");
+    }
+
+    // Nothing was left behind by any of them.
+    server.await_live_connections(0).await;
+    server.stop().await;
+}
+
+/// A socket ticket opens one socket and not two, at the upgrade rather than at
+/// the route that minted it.
+///
+/// This is why the ticket shape exists at all: it rides in a query string,
+/// which is the one place in the chain a credential lands in a proxy log, and
+/// single use is what makes a ticket in a log worth nothing.
+#[tokio::test]
+async fn a_socket_ticket_is_spent_by_the_upgrade_that_uses_it() {
+    let server = TestServer::start().await;
+    let ticketed = server.ticketed().await;
+
+    let client = server
+        .connect_as(ticketed.clone())
+        .await
+        .expect("the first upgrade spends the ticket");
+    client.close().await;
+    server.await_live_connections(0).await;
+
+    let refusal = server
+        .connect_as(ticketed)
+        .await
+        .expect_err("the same ticket does not open a second socket");
+    assert_eq!(refusal.status, 401);
+
+    server.stop().await;
+}
+
 /// Loopback binding stops another machine reaching the server. It does not
 /// stop a page on another origin asking the user's own browser to connect for
 /// it, which is what the origin check is for.
@@ -258,7 +339,7 @@ async fn a_non_local_origin_is_refused_with_the_captured_error_body() {
     let server = TestServer::start().await;
 
     let refusal = server
-        .connect_as(ClientIdentity::browser().with_origin("https://evil.example"))
+        .connect_as(server.browser().with_origin("https://evil.example"))
         .await
         .expect_err("a non-local origin is refused");
 
@@ -286,7 +367,7 @@ async fn a_loopback_origin_is_accepted() {
 
     for origin in ["http://127.0.0.1:1420", "http://localhost:5173", "http://[::1]"] {
         let client = server
-            .connect_as(ClientIdentity::browser().with_origin(origin))
+            .connect_as(server.browser().with_origin(origin))
             .await
             .unwrap_or_else(|refusal| panic!("{origin} should be accepted, got {refusal:?}"));
         client.close().await;
@@ -357,20 +438,25 @@ async fn a_client_that_disappears_without_closing_is_reaped() {
 async fn the_upgrade_declines_compression_and_negotiates_no_subprotocol() {
     let server = TestServer::start().await;
 
-    // The browser's offer, verbatim in shape from `01-browser-session.ndjson`.
+    // The browser's offer, verbatim in shape from `01-browser-session.ndjson`
+    // — with a real session cookie, because since ticket 73 an invented one is
+    // refused before the handshake is negotiated at all.
     let head = server
         .raw_upgrade(&format!(
             "GET /ws HTTP/1.1\r\n\
-             Host: {}\r\n\
+             Host: {addr}\r\n\
              Connection: Upgrade\r\n\
              Upgrade: websocket\r\n\
-             Origin: http://{}\r\n\
+             Origin: http://{addr}\r\n\
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Key: sXlZ+AnHRboR6K8AWi8sxw==\r\n\
              Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
-             Cookie: t3_session=eyJ2IjoxfQ.c2ln\r\n\r\n",
-            server.addr(),
-            server.addr()
+             Cookie: {cookie}\r\n\r\n",
+            addr = server.addr(),
+            cookie = server
+                .browser()
+                .cookie
+                .expect("the harness paired itself at startup"),
         ))
         .await;
 

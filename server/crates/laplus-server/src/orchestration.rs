@@ -256,6 +256,18 @@ impl Shell {
         &self.inner.threads
     }
 
+    /// The database, for the one caller that wants it and is not a
+    /// conversation: ticket 73's pairing routes.
+    ///
+    /// Pairing is not the shell's business and this accessor is not pretending
+    /// it is. It is here because the shell is what *holds* the database — one
+    /// per server, opened at bind — and threading a second handle through
+    /// [`crate::server::Services`] would mean two owners of one connection for
+    /// the sake of a tidier name.
+    pub fn database(&self) -> &Database {
+        &self.inner.database
+    }
+
     /// Where a conversation's checkpoints are, and how far they go.
     ///
     /// The one thing [`crate::checkpoints`] cannot work out for itself: a diff

@@ -55,6 +55,17 @@ pub struct ServerConfig {
     /// could differ would send the developer to edit a file nothing reads.
     #[serde(skip)]
     pub preferences: PathBuf,
+    /// Which origins beyond this machine may reach this server.
+    ///
+    /// **Not on the wire**, and skipped for the same reason `preferences` is:
+    /// the contract has no such field and `tests/socket_conformance.rs` reports
+    /// an undeclared addition as a break. It rides on the config because this is
+    /// the object assembled from the machine at startup, and the allowlist is
+    /// one more thing read out of the preferences directory.
+    ///
+    /// See [`crate::remote_access`], which is where the reasoning lives.
+    #[serde(skip)]
+    pub remote_access: crate::remote_access::RemoteAccess,
     pub keybindings_config_path: String,
     pub keybindings: Vec<ResolvedKeybinding>,
     pub issues: Vec<ConfigIssue>,
@@ -108,9 +119,18 @@ pub struct Capabilities {
 #[serde(rename_all = "camelCase")]
 pub struct AuthDescriptor {
     pub policy: &'static str,
-    /// How a client can *establish* trust. laplus has no pairing flow: the
-    /// handshake is permissive and local-only, so there is nothing to bootstrap
-    /// through and the honest answer is none.
+    /// How a client can *establish* trust.
+    ///
+    /// Empty until ticket 73, which is when there was a pairing flow to name.
+    /// It says `one-time-token` and not `desktop-bootstrap`: the second is
+    /// upstream's trusted hand-off from an Electron main process to its
+    /// renderer, and laplus's window and server are one process reaching each
+    /// other over loopback, so there is nothing to hand off. See
+    /// [`crate::pairing::ONE_TIME_TOKEN_METHOD`].
+    ///
+    /// The only reader is `PairingRouteSurface`, the `/pair` page a client sees
+    /// when it is *not* yet paired — so this describes the way in for a phone
+    /// and never for the window.
     pub bootstrap_methods: Vec<&'static str>,
     /// The credential shapes accepted on an established connection. All three
     /// are taken at the upgrade — see [`crate::auth`] — though none is verified.
@@ -358,6 +378,7 @@ impl ServerConfig {
     /// would be a suite nobody could run twice.
     pub fn detect_in(data_dir: PathBuf) -> Self {
         ServerConfig {
+            remote_access: crate::remote_access::RemoteAccess::load(&data_dir),
             preferences: data_dir.clone(),
             environment: EnvironmentDescriptor {
                 environment_id: "local".to_string(),
@@ -376,7 +397,7 @@ impl ServerConfig {
             },
             auth: AuthDescriptor {
                 policy: "loopback-browser",
-                bootstrap_methods: Vec::new(),
+                bootstrap_methods: vec![crate::pairing::ONE_TIME_TOKEN_METHOD],
                 session_methods: vec![
                     "browser-session-cookie",
                     "bearer-access-token",

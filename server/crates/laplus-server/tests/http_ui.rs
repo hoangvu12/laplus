@@ -11,7 +11,7 @@
 
 mod harness;
 
-use harness::{ClientIdentity, TestServer};
+use harness::TestServer;
 use laplus_server::ui::Assets;
 use serde_json::json;
 
@@ -50,7 +50,7 @@ async fn the_page_and_the_socket_share_an_origin() {
 
     // The same origin the window will report, presented at the upgrade.
     let mut client = server
-        .connect_as(ClientIdentity::anonymous().with_origin(&origin))
+        .connect_as(server.browser().with_origin(&origin))
         .await
         .expect("the window's own origin is accepted at the upgrade");
     let config = client.call("server.getConfig", json!({})).await;

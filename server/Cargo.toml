@@ -28,6 +28,15 @@ publish = false
 [workspace.dependencies]
 axum = { version = "0.8", features = ["ws"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Ticket 73: the operating system's randomness, and nothing else. A pairing code
+# and a bearer token have to be unguessable by whoever can reach the tunnel, and
+# the two sources already in the tree are not that — `RandomState` is a hash
+# seed, and SQLite's `randomblob()` is seeded on Windows from the system time,
+# the process id and the tick count (`os_win.c`, `winRandomness`), which is
+# ample for a rowid and not for a credential. `rand` would bring a generator
+# this has no use for; `getrandom` is the syscall, and calling it here is what
+# keeps `unsafe_code = "forbid"` intact above.
+getrandom = "0.3"
 # The only way to hear about a change the app did not make. Default features are
 # kept: everything they add is target-gated to macOS, so on the platform v1 ships
 # they cost nothing, and dropping them would leave a developer running the suite

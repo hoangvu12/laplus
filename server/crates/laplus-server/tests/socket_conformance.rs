@@ -16,7 +16,7 @@ mod harness;
 use harness::agent::FakeAgent;
 use harness::captures::Capture;
 use harness::shape::{assert_declared, compare, Declared};
-use harness::{ClientIdentity, TestServer};
+use harness::TestServer;
 use laplus_server::process::Search;
 use serde_json::json;
 
@@ -207,10 +207,11 @@ const RETYPED: &[Declared] = &[Declared {
 /// side was empty. Every one is a field a later ticket fills; when it does,
 /// the declaration fails as stale and the element shape starts being compared.
 const UNCOMPARED: &[Declared] = &[
-    Declared {
-        path: "/auth/bootstrapMethods[]",
-        because: "laplus has no pairing flow to bootstrap through",
-    },
+    // `/auth/bootstrapMethods[]` was here until ticket 73, which gave this
+    // server a pairing flow to bootstrap through. It reports the same
+    // `one-time-token` the capture does, so the element shape is compared now
+    // and this declaration went stale — which is the mechanism above working
+    // rather than a thing that needed fixing.
     Declared {
         path: "/issues[]",
         because: "empty in the capture too — the reference server had no config issues either",
@@ -533,7 +534,7 @@ async fn a_refused_upgrade_matches_the_captured_401() {
 
     let server = TestServer::start().await;
     let refusal = server
-        .connect_as(ClientIdentity::browser().with_origin("https://evil.example"))
+        .connect_as(server.browser().with_origin("https://evil.example"))
         .await
         .expect_err("a non-local origin is refused");
 
