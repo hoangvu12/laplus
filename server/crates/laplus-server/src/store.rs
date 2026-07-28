@@ -305,6 +305,30 @@ impl Sequences {
     pub fn current(&self) -> i64 {
         self.watermark.load(Ordering::SeqCst)
     }
+
+    /// Whether a client's `afterSequence` cursor says it holds everything this
+    /// server has — in which case the replay it asked for is a replay of no
+    /// events, and the subscription may open without a snapshot.
+    ///
+    /// **Equality, and nothing weaker.** A cursor *behind* this number is a
+    /// replay this server cannot perform, having no log of events to replay
+    /// from; a cursor *ahead* of it is not a client that is somehow early but a
+    /// client holding a number from a previous run of this server, because the
+    /// counter is seeded from the last *durable* write and every number issued
+    /// after it was reissued at the next boot. Both want the same answer, and
+    /// it is the one this server gave every cursor before ADR-0016: the whole
+    /// snapshot, which replaces whatever the client holds.
+    ///
+    /// Safe to ask more than once, which matters because
+    /// [`crate::subscriptions::EventSource::describe`] is called again whenever
+    /// a subscriber falls a whole backlog behind. Falling behind is *itself*
+    /// what makes a cursor stale: every event on every feed carries a number
+    /// taken from here, so a subscriber that missed some cannot still be equal
+    /// to the watermark. The re-description is a snapshot without needing to
+    /// remember that it is the second one.
+    pub fn caught_up(&self, cursor: Option<i64>) -> bool {
+        cursor.is_some_and(|cursor| cursor == self.current())
+    }
 }
 
 /// Everything a shell snapshot is made of, read as one consistent picture.
@@ -1482,6 +1506,34 @@ mod tests {
         drop(held);
         assert_eq!(second.join().expect("the second writer finishes"), 2);
         assert_eq!(sequences.current(), 2);
+    }
+
+    /// The cursor rule, at its three positions. Only one of them lets a
+    /// subscription open without a snapshot, and it is the narrow one — see
+    /// ADR-0016 for why the other two cannot be treated as caught up.
+    ///
+    /// The *ahead* case is the one worth stating out loud: a number this server
+    /// has not reached is not a client running early, it is a client holding a
+    /// number from a previous run, because the counter resumes from the last
+    /// durable write and hands everything after it out again. That is why this
+    /// is equality rather than `cursor >= current`, which would have looked
+    /// like the more forgiving choice and would have left such a client
+    /// rendering a conversation nothing was going to correct.
+    #[test]
+    fn only_a_cursor_that_is_exactly_current_is_caught_up() {
+        let sequences = Sequences::from(0);
+        drop(sequences.commit());
+        drop(sequences.commit());
+        assert_eq!(sequences.current(), 2);
+
+        assert!(sequences.caught_up(Some(2)));
+        assert!(!sequences.caught_up(Some(1)), "behind");
+        assert!(!sequences.caught_up(Some(3)), "ahead: a previous run's number");
+        assert!(!sequences.caught_up(None), "a client that holds nothing");
+
+        // And the moment anything happens, the cursor that was current is not.
+        drop(sequences.commit());
+        assert!(!sequences.caught_up(Some(2)));
     }
 
     /// Two commits that took their numbers in one order and reached the database

@@ -224,6 +224,26 @@ pub fn non_blank(value: &str, tag: &str, subject: &str) -> Result<String, Value>
     Ok(trimmed.to_string())
 }
 
+/// A subscription's `afterSequence` cursor, or `None` for a client that holds
+/// nothing to resume from.
+///
+/// Both subscriptions read this field and have to read it the same way. The rule
+/// ADR-0016 states is one rule, and two readers would let `subscribeShell` and
+/// `subscribeThread` disagree about what a cursor even is before either of them
+/// got as far as comparing it.
+///
+/// The contract types it `NonNegativeInt`, so no conforming client is affected
+/// by the filter — but a client that sends nonsense is a client with no cache to
+/// go without a snapshot, and reading it as absent hands it one. Letting it
+/// through instead would open a stream with nothing to fold events into, which
+/// is ticket 28's failure exactly.
+pub fn resume_cursor(payload: &Value) -> Option<i64> {
+    payload
+        .get("afterSequence")
+        .and_then(Value::as_i64)
+        .filter(|cursor| *cursor >= 0)
+}
+
 /// Answer one call.
 pub fn dispatch(
     services: &Services,
@@ -453,6 +473,32 @@ mod tests {
             Answer::Value(value) => value,
             other => panic!("expected a unary answer, got {other:?}"),
         }
+    }
+
+    /// The cursor rule both subscriptions now share, read at the one place they
+    /// share it. `Sequences::caught_up` decides what a cursor *means*; this
+    /// decides what counts as one at all, and the two questions fail
+    /// differently: a cursor misread here does not send the wrong snapshot, it
+    /// opens a stream to a client with nothing to fold events into.
+    ///
+    /// The contract types the field `NonNegativeInt`
+    /// (`packages/contracts/src/orchestration.ts`), so every case below except
+    /// the first is a client that is already wrong. Reading those as absent is
+    /// what routes them back to ticket 28's refusal instead of a silent stream.
+    #[test]
+    fn only_a_non_negative_integer_is_a_cursor() {
+        assert_eq!(resume_cursor(&json!({"afterSequence": 4})), Some(4));
+        assert_eq!(
+            resume_cursor(&json!({"afterSequence": 0})),
+            Some(0),
+            "a client that has read an empty registry holds a real position"
+        );
+
+        assert_eq!(resume_cursor(&json!({"afterSequence": -1})), None, "negative");
+        assert_eq!(resume_cursor(&json!({"afterSequence": null})), None, "null");
+        assert_eq!(resume_cursor(&json!({"afterSequence": "3"})), None, "a string");
+        assert_eq!(resume_cursor(&json!({"afterSequence": 1.5})), None, "not whole");
+        assert_eq!(resume_cursor(&json!({})), None, "a client that holds nothing");
     }
 
     #[test]

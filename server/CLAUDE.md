@@ -28,7 +28,11 @@ here builds them — `apps/server` and `apps/desktop` are the two this project
 replaced. They are **not deleted**, because deleting paths upstream still
 maintains is what turns a merge into a fight (`docs/adr/0012`). If they are not
 in your working tree, that is `git sparse-checkout`, not a missing clone;
-`git sparse-checkout disable` brings them back.
+`git sparse-checkout disable` brings them back. They are also in the object
+store either way, so **`git show HEAD:apps/server/src/ws.ts` reads the reference
+server without changing the checkout** — worth knowing, because "not in the
+working tree" reads as unavailable and the reference implementation is often the
+only specification a divergence can be argued against.
 
 The shell's build script reads `../../../apps/web/dist` and says what to run if
 it is not there: `pnpm install && pnpm --filter @t3tools/web build`, from the

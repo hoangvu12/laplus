@@ -41,11 +41,14 @@
 //!
 //! ## What this ticket does not do
 //!
-//! - **`afterSequence` is honoured by over-answering.** The contract lets a
-//!   client with a cached snapshot ask for a replay from a sequence instead of
-//!   a fresh snapshot; laplus sends the snapshot anyway. It is a superset of
-//!   what was asked for and the client folds it as a reset, so the cost is
-//!   bandwidth on reconnect rather than correctness.
+//! - **`afterSequence` is answered at its two ends and not in between.** The
+//!   contract lets a client with a cached snapshot ask for a replay from a
+//!   sequence. A cursor that is still [`Sequences::current`] is a replay of no
+//!   events, and that is answered exactly: the opening carries no snapshot, and
+//!   for the real client — which asks for no completion marker — no chunk at
+//!   all. Any other cursor is answered with the whole snapshot, because
+//!   replaying from a position needs a log of events and this server keeps
+//!   none. See ADR-0016 for why it keeps none and why the two ends are enough.
 //! - **`commandId` is not remembered.** Upstream uses it to recognise a command
 //!   it has already run. laplus keeps no log of ids, so a re-dispatched
 //!   `project.create` is *refused* ("already exists") rather than answered with
@@ -667,11 +670,16 @@ impl Shell {
 
     /// Open an `orchestration.subscribeShell` subscription: the registry now,
     /// then every change to it.
+    ///
+    /// **A client whose cursor is still current is sent no snapshot.** See
+    /// [`Sequences::caught_up`] for the rule and ADR-0016 for why it is the
+    /// only part of `afterSequence` this server can answer.
     pub fn subscribe(&self, payload: &Value) -> EventSource {
         let wants_marker = payload
             .get("requestCompletionMarker")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let cursor = crate::rpc::resume_cursor(payload);
 
         // Subscribed to *before* the description closure is handed over, so a
         // change landing between here and the pump's first read arrives as an
@@ -686,23 +694,26 @@ impl Shell {
         let marker_owed = AtomicBool::new(wants_marker);
 
         EventSource::new(
-            move || match shell.snapshot() {
-                Ok(snapshot) => {
-                    let mut items = vec![snapshot];
-                    if marker_owed.swap(false, Ordering::Relaxed) {
-                        items.push(json!({"kind": "synchronized"}));
+            move || {
+                let mut items = Vec::new();
+                if !shell.inner.sequences.caught_up(cursor) {
+                    match shell.snapshot() {
+                        Ok(snapshot) => items.push(snapshot),
+                        // Nothing rather than an empty registry, and the marker
+                        // stays owed. An empty snapshot would be a claim that
+                        // the user has no projects, which is a worse answer than
+                        // silence — and the marker would be a claim that a
+                        // catch-up succeeded when it did not.
+                        Err(error) => {
+                            eprintln!("laplus: cannot describe the project registry: {error}");
+                            return Vec::new();
+                        }
                     }
-                    items
                 }
-                // Nothing rather than an empty registry, and the marker stays
-                // owed. An empty snapshot would be a claim that the user has no
-                // projects, which is a worse answer than silence — and the
-                // marker would be a claim that a catch-up succeeded when it did
-                // not.
-                Err(error) => {
-                    eprintln!("laplus: cannot describe the project registry: {error}");
-                    Vec::new()
+                if marker_owed.swap(false, Ordering::Relaxed) {
+                    items.push(json!({"kind": "synchronized"}));
                 }
+                items
             },
             updates,
         )
@@ -1471,9 +1482,10 @@ mod tests {
         assert_eq!(opening[0]["kind"], "snapshot");
     }
 
-    /// A client resuming from a cached snapshot asks for a replay. Answering
-    /// with the whole snapshot is a superset of that, and the point of the test
-    /// is that it is still an answer rather than a refusal.
+    /// A client resuming from a cursor this server cannot replay from asks for
+    /// a replay and is answered with the whole registry, which is a superset of
+    /// what it asked for. The point of the test is that it is an answer rather
+    /// than a refusal.
     #[test]
     fn a_resume_request_is_answered_with_a_snapshot() {
         let fixture = Fixture::new();
@@ -1489,6 +1501,101 @@ mod tests {
                 .expect("an array")
                 .len(),
             1
+        );
+    }
+
+    /// The case ADR-0016 is about, and the one every laplus window is in at
+    /// boot: `GET /api/orchestration/shell` answered a moment ago, nothing has
+    /// happened since, and the subscription opens carrying no second copy of it.
+    ///
+    /// `shell_snapshot` is read here rather than a literal, because the cursor
+    /// the real client sends is the one it read off that payload
+    /// (`packages/client-runtime/src/state/shell.ts`) and the test should fail
+    /// if the two ever stop being the same number.
+    #[test]
+    fn a_cursor_that_is_still_current_opens_without_a_snapshot() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("held");
+        fixture.add("project-1", &folder).expect("registered");
+
+        let over_http = fixture.shell.shell_snapshot().expect("a snapshot");
+        let cursor = over_http["snapshotSequence"].as_i64().expect("a sequence");
+
+        let opening = fixture
+            .shell
+            .subscribe(&json!({"afterSequence": cursor, "requestCompletionMarker": true}))
+            .describe();
+        assert_eq!(
+            opening,
+            vec![json!({"kind": "synchronized"})],
+            "the registry travelled twice: {opening:#?}"
+        );
+
+        // Without a marker there is nothing to say at all, and an empty opening
+        // is a thing this wire can carry — the pump sends no chunk for it.
+        let silent = fixture
+            .shell
+            .subscribe(&json!({"afterSequence": cursor}))
+            .describe();
+        assert!(silent.is_empty(), "{silent:#?}");
+    }
+
+    /// A cursor ahead of this server's log is a client holding a number from a
+    /// previous run: the counter resumes from the last durable write, so every
+    /// number issued after it is handed out again. Upstream guards the same case
+    /// with `replayGap < 0` (`apps/server/src/ws.ts`) and calls it invalid.
+    ///
+    /// It has to reset the client rather than reassure it, which is why
+    /// `Sequences::caught_up` is equality and not "at least".
+    #[test]
+    fn a_cursor_from_a_previous_run_is_answered_with_a_snapshot() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("stale");
+        fixture.add("project-1", &folder).expect("registered");
+        let ahead = fixture.shell.inner.sequences.current() + 1_000;
+
+        let opening = fixture
+            .shell
+            .subscribe(&json!({"afterSequence": ahead}))
+            .describe();
+        assert_eq!(opening[0]["kind"], "snapshot", "{opening:#?}");
+    }
+
+    /// The registry half of the invariant that lets the cursor be re-read rather
+    /// than remembered; `threads::tests` pins the same thing for a conversation,
+    /// and the rule is only sound if it holds on *both* feeds.
+    ///
+    /// `describe` runs again whenever a subscriber falls a whole backlog behind,
+    /// and that second description has to be a snapshot even though the first
+    /// one was skipped. Nothing tracks which call it is: every change to the
+    /// registry takes a number from `Sequences`, so falling behind is *itself*
+    /// what makes the cursor stale. This is what would fail if a registry event
+    /// were ever published without taking one, or if the caught-up test were
+    /// hoisted out of the closure and answered once.
+    #[test]
+    fn a_subscription_that_opened_caught_up_is_re_described_once_it_has_not() {
+        let fixture = Fixture::new();
+        let held = fixture.folder("held");
+        fixture.add("project-1", &held).expect("registered");
+
+        let cursor = fixture.shell.inner.sequences.current();
+        let source = fixture
+            .shell
+            .subscribe(&json!({"afterSequence": cursor, "requestCompletionMarker": true}));
+        assert_eq!(source.describe(), vec![json!({"kind": "synchronized"})]);
+
+        let later = fixture.folder("registered-later");
+        fixture.add("project-2", &later).expect("registered");
+
+        let again = source.describe();
+        assert_eq!(again[0]["kind"], "snapshot", "{again:#?}");
+        assert_eq!(
+            again[0]["snapshot"]["projects"]
+                .as_array()
+                .expect("the registry")
+                .len(),
+            2,
+            "the whole registry, not the part that was missed: {again:#?}"
         );
     }
 

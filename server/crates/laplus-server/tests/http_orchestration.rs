@@ -15,12 +15,18 @@
 
 mod harness;
 
+use std::time::Duration;
+
 use harness::conversation::{create_project, create_thread};
 use harness::workspace::Workspace;
 use harness::{ClientIdentity, TestServer};
 use serde_json::{json, Value};
 
 const THREAD: &str = "thread-1";
+
+/// Long enough that a chunk the server was going to send would have arrived.
+/// The same figure and the same reasoning as `socket_streaming.rs`.
+const SILENCE: Duration = Duration::from_millis(200);
 
 /// Register a project and a conversation over the socket, so that both
 /// snapshots have something in them.
@@ -269,6 +275,114 @@ async fn a_non_local_origin_is_refused_with_the_auth_error() {
     let response = server.get_as("/api/orchestration/shell", &elsewhere).await;
     assert_eq!(response.header("access-control-allow-origin"), None);
 
+    server.stop().await;
+}
+
+/// **The saving these routes exist for, on the wire.** Ticket 31 made the fast
+/// path work; ADR-0016 is what stops the payload travelling a second time
+/// behind it.
+///
+/// The subscription payload here is the real client's, verbatim: laplus
+/// advertises neither `shellResumeCompletionMarker` nor its thread twin, so
+/// `makeSubscribeInput` in `packages/client-runtime/src/state/shell.ts` sends
+/// the cursor alone. Nothing is owed in answer to it, so the subscription sends
+/// **no chunk at all** — and then behaves like any other, delivering the next
+/// change where a second copy of the registry used to be.
+///
+/// The silence is asserted before the change is made rather than inferred from
+/// what arrives after it, because those are two different claims and only the
+/// first one is this file's. The wait is also what makes the second half
+/// deterministic: the pump runs on its own task, so a command dispatched
+/// immediately after the subscribe can legitimately land in front of the
+/// opening description and turn it back into a snapshot.
+#[tokio::test]
+async fn a_shell_snapshot_read_over_http_does_not_travel_again_on_the_socket() {
+    let server = a_server_with_a_conversation().await;
+    let workspace = Workspace::with(&["src/main.rs"]);
+
+    let over_http = server.get("/api/orchestration/shell").await.body;
+    let mut client = server.connect().await;
+    let subscription = client
+        .subscribe(
+            "orchestration.subscribeShell",
+            json!({"afterSequence": over_http["snapshotSequence"]}),
+        )
+        .await;
+
+    client.expect_silence(SILENCE).await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-2", workspace.path()),
+        )
+        .await
+        .expect_success();
+
+    let first = client.next_chunk(&subscription).await;
+    assert_eq!(
+        first
+            .iter()
+            .map(|item| item["kind"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("project-upserted")],
+        "the registry travelled twice: {first:#?}"
+    );
+    assert_eq!(first[0]["project"]["id"], json!("project-2"));
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// The same rule on the conversation, which is the payload the ticket calls
+/// multi-KB and the reason any of this was wanted.
+///
+/// This one asks for the completion marker, which the real client does not —
+/// not to describe it, but so the test has something to read. A marker is owed
+/// once whatever else is sent, so it makes the opening observable without
+/// changing what the rule decides. That the marker still arrives is the point:
+/// the client is told it is up to date exactly when it is.
+#[tokio::test]
+async fn a_thread_snapshot_read_over_http_does_not_travel_again_on_the_socket() {
+    let server = a_server_with_a_conversation().await;
+
+    let over_http = server
+        .get(&format!("/api/orchestration/threads/{THREAD}"))
+        .await
+        .body;
+    let mut client = server.connect().await;
+    let subscription = client
+        .subscribe(
+            "orchestration.subscribeThread",
+            json!({
+                "threadId": THREAD,
+                "afterSequence": over_http["snapshotSequence"],
+                "requestCompletionMarker": true,
+            }),
+        )
+        .await;
+
+    let opening = client.next_chunk(&subscription).await;
+    assert_eq!(
+        opening,
+        vec![json!({"kind": "synchronized"})],
+        "the conversation travelled twice: {opening:#?}"
+    );
+
+    // And a cursor this server cannot replay from still gets the whole thing,
+    // because that is the only other answer it has.
+    let stale = over_http["snapshotSequence"].as_i64().expect("a sequence") - 1;
+    let refetched = client
+        .subscribe(
+            "orchestration.subscribeThread",
+            json!({"threadId": THREAD, "afterSequence": stale}),
+        )
+        .await;
+    let opening = client.next_chunk(&refetched).await;
+    assert_eq!(opening[0]["kind"], json!("snapshot"), "{opening:#?}");
+    assert_eq!(opening[0]["snapshot"], over_http);
+
+    client.close().await;
     server.stop().await;
 }
 

@@ -127,16 +127,19 @@ pub struct Watch {
     /// subscription — is an answer to a resume and to nothing else. See
     /// `fixtures/socket-wire/01-browser-session.ndjson`, request `3`.
     ///
-    /// The cursor's *value* is not read, and what that costs depends on which
-    /// case it is. For a thread this server holds, the client asked for the tail
-    /// after its cursor and is sent the whole conversation as a snapshot
-    /// instead: more bytes than upstream would send, and correct, because a
-    /// snapshot replaces what the client holds rather than being folded into it.
-    /// For a thread this server does not hold there is nothing to send either
-    /// way, and the opening carries no snapshot at all — which is the one case
-    /// where saying nothing is the whole point, since an empty snapshot would be
-    /// a claim that the client's own copy is wrong.
-    resuming: bool,
+    /// The cursor's *value* decides one thing and not the other. It cannot say
+    /// which events to replay — this server keeps no log to replay them from —
+    /// but a cursor that is still [`Sequences::caught_up`] asks for a replay of
+    /// nothing, and that this server can answer exactly, by opening with no
+    /// snapshot. Every other value is answered with the whole conversation,
+    /// which is correct because a snapshot replaces what the client holds rather
+    /// than being folded into it. See ADR-0016.
+    ///
+    /// For a thread this server does not hold there is nothing to send whatever
+    /// the value is, and the opening carries no snapshot at all — which is the
+    /// one case where saying nothing is the whole point, since an empty snapshot
+    /// would be a claim that the client's own copy is wrong.
+    after: Option<i64>,
 }
 
 impl Watch {
@@ -156,10 +159,17 @@ impl Watch {
                 .get("requestCompletionMarker")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            resuming: payload
-                .get("afterSequence")
-                .is_some_and(|cursor| !cursor.is_null()),
+            // `null` is not a cursor, and neither is a value the contract's
+            // `NonNegativeInt` would have refused. Both leave this a client that
+            // holds nothing, which is the answer that sends a snapshot.
+            after: crate::rpc::resume_cursor(payload),
         })
+    }
+
+    /// Whether the client says it already holds this conversation. The presence
+    /// of the cursor, which is the half of it ticket 28 turned on.
+    fn resuming(&self) -> bool {
+        self.after.is_some()
     }
 }
 
@@ -1379,7 +1389,7 @@ impl Threads {
     /// every other subscription on the socket rather than this one — see
     /// [`crate::rpc::DispatchError::error_value`].
     ///
-    /// A [resume](Watch::resuming) is the exception, and the reason it exists is
+    /// A [resume](Watch::after) is the exception, and the reason it exists is
     /// the same rule read the other way: a client that sent a cursor already
     /// holds the conversation, so it has somewhere to put an event and nothing
     /// to be refused for.
@@ -1399,7 +1409,7 @@ impl Threads {
             // nowhere. That leaves a slot behind for a resume of a thread that
             // never exists, which is a few hundred bytes and needs a client that
             // holds a conversation this server does not.
-            None if call.resuming => self.entry(thread_id),
+            None if call.resuming() => self.entry(thread_id),
             // Nothing to describe and nobody who can draw it: say so, and be
             // asked again.
             None => {
@@ -1417,20 +1427,24 @@ impl Threads {
         let updates = entry.events.subscribe();
         let sequences = self.inner.sequences.clone();
         let marker_owed = AtomicBool::new(call.wants_marker);
+        let cursor = call.after;
 
         Ok(EventSource::new(
             move || {
                 let mut items = Vec::new();
-                // Still conditional, and no longer for the same reason. The
-                // thread existed when the subscription opened — unless this is a
-                // resume, which is allowed not to — and this closure runs again
-                // whenever a subscriber falls a whole backlog behind, by which
-                // point the thread may also have been deleted.
-                if let Some(thread) = lock(&entry.state).as_ref() {
-                    items.push(json!({
-                        "kind": "snapshot",
-                        "snapshot": detail_snapshot(thread, &sequences),
-                    }));
+                // Conditional twice over, for two unrelated reasons. A client
+                // whose cursor is still current is owed no snapshot at all. And
+                // the thread existed when the subscription opened — unless this
+                // is a resume, which is allowed not to — but this closure runs
+                // again whenever a subscriber falls a whole backlog behind, by
+                // which point the thread may also have been deleted.
+                if !sequences.caught_up(cursor) {
+                    if let Some(thread) = lock(&entry.state).as_ref() {
+                        items.push(json!({
+                            "kind": "snapshot",
+                            "snapshot": detail_snapshot(thread, &sequences),
+                        }));
+                    }
                 }
                 if marker_owed.swap(false, Ordering::Relaxed) {
                     items.push(json!({"kind": "synchronized"}));
@@ -2131,14 +2145,28 @@ pub(crate) mod tests {
         Watch {
             thread_id: id.to_string(),
             wants_marker: true,
-            resuming: false,
+            after: None,
         }
     }
 
     /// A client that already holds the conversation and wants what came after.
+    ///
+    /// The cursor is one this fixture's log has not reached, which is the case
+    /// the tests using this helper are about: a browser that kept its cache
+    /// across a server that did not keep its threads. A cursor that *is*
+    /// current is a different rule and has its own tests.
     fn a_resume(id: &str) -> Watch {
         Watch {
-            resuming: true,
+            after: Some(7),
+            ..a_watch(id)
+        }
+    }
+
+    /// A client that holds everything this server has: the boot case, where an
+    /// HTTP snapshot was read a moment ago and nothing has happened since.
+    fn a_caught_up_resume(threads: &Threads, id: &str) -> Watch {
+        Watch {
+            after: Some(threads.inner.sequences.current()),
             ..a_watch(id)
         }
     }
@@ -2601,6 +2629,96 @@ pub(crate) mod tests {
             vec![json!({"kind": "synchronized"})],
             "there is nothing to describe, and saying so falsely would wipe the client's copy"
         );
+    }
+
+    /// The case ADR-0016 is about: the client read this conversation over HTTP
+    /// a moment ago and nothing has happened since, so the replay it asked for
+    /// is a replay of nothing and the socket carries no second copy.
+    ///
+    /// This is the whole of the saving. Everything else about the subscription
+    /// is unchanged, which is why the marker still arrives — the client is owed
+    /// "you are up to date" precisely when it is.
+    #[test]
+    fn a_cursor_that_is_still_current_opens_without_a_snapshot() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        let opening = threads
+            .subscribe(&a_caught_up_resume(&threads, "thread-1"))
+            .expect("the thread exists")
+            .describe();
+        assert_eq!(
+            opening,
+            vec![json!({"kind": "synchronized"})],
+            "the client already holds this conversation: {opening:#?}"
+        );
+    }
+
+    /// The two ways a cursor can fail to be current, and they are answered the
+    /// same way because this server can do nothing else: it keeps no log to
+    /// replay from, and a snapshot replaces whatever the client holds.
+    ///
+    /// *Behind* is an ordinary client that fell out of date between reading the
+    /// snapshot and opening the socket. *Ahead* is not an early client but one
+    /// holding a number from a previous run — the counter resumes from the last
+    /// durable write, so every number issued after it is handed out again. That
+    /// second case is the one upstream guards with `replayGap < 0`
+    /// (`apps/server/src/ws.ts`), and it is the reason this comparison is
+    /// equality rather than "at least".
+    #[test]
+    fn a_cursor_this_server_cannot_replay_from_is_answered_with_the_conversation() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        let current = threads.inner.sequences.current();
+
+        for (cursor, case) in [(current - 1, "behind"), (current + 1, "ahead")] {
+            let opening = threads
+                .subscribe(&Watch {
+                    after: Some(cursor),
+                    ..a_watch("thread-1")
+                })
+                .expect("the thread exists")
+                .describe();
+            assert_eq!(
+                opening.iter().map(|item| &item["kind"]).collect::<Vec<_>>(),
+                vec!["snapshot", "synchronized"],
+                "a cursor {case} of {current}: {opening:#?}"
+            );
+        }
+    }
+
+    /// The invariant that lets the cursor be re-read rather than remembered.
+    ///
+    /// `describe` runs again whenever a subscriber falls a whole backlog behind,
+    /// and that second description must be a snapshot even though the first one
+    /// was skipped. Nothing tracks which call this is: every event carries a
+    /// number taken from `Sequences`, so falling behind is *itself* what makes
+    /// the cursor stale. This test is what would fail if an event were ever
+    /// published without taking one.
+    #[test]
+    fn a_subscription_that_opened_caught_up_is_re_described_once_it_has_not() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        let source = threads
+            .subscribe(&a_caught_up_resume(&threads, "thread-1"))
+            .expect("the thread exists");
+        assert_eq!(source.describe(), vec![json!({"kind": "synchronized"})]);
+
+        threads
+            .apply(
+                "thread-1",
+                Change::UserMessage {
+                    message_id: "message-1".to_string(),
+                    text: "hello".to_string(),
+                    turn_id: "turn-1".to_string(),
+                },
+            )
+            .expect("applied");
+
+        let again = source.describe();
+        assert_eq!(again[0]["kind"], "snapshot", "{again:#?}");
+        assert_eq!(again[0]["snapshot"]["thread"]["id"], "thread-1");
     }
 
     /// Ticket 31's HTTP route and the subscription describe a conversation with

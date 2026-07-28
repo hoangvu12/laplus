@@ -34,26 +34,34 @@ that, for a whole turn. The question to ask of any subscription here is never
 "are the events right" but "does the client have anything to fold them into".
 
 A snapshot reaches the client two ways, and ticket 31 is why the second exists.
-A subscription **opens** with one, wrapped in a `{"kind":"snapshot"}` envelope;
-`GET /api/orchestration/shell` and `GET /api/orchestration/threads/{threadId}`
-answer with the **same object, unwrapped**, which the client prefers because it
-compresses and stays off the socket. Each is built once —
-`Shell::shell_snapshot`, `Threads::detail_snapshot` — and both transports call
-the builder, because the client takes whichever answer it gets first and two
-builders would let the world it draws depend on which one that was.
+A subscription **opens** with one unless the client is **caught up**, wrapped in
+a `{"kind":"snapshot"}` envelope; `GET /api/orchestration/shell` and
+`GET /api/orchestration/threads/{threadId}` answer with the **same object,
+unwrapped**, which the client prefers because it compresses and stays off the
+socket. Each is built once — `Shell::shell_snapshot`, `Threads::detail_snapshot`
+— and both transports call the builder, because the client takes whichever
+answer it gets first and two builders would let the world it draws depend on
+which one that was.
 
 **Resume** — a subscription from a client that says it already holds the
 conversation, by sending `afterSequence`. The one case that is _not_ refused for
 a thread this server does not have, because a client with its own copy can still
 draw it and an empty snapshot would be a claim that copy is wrong.
-`crate::threads::Watch::resuming`.
+`crate::threads::Watch`.
 
-Only the cursor's _presence_ is read. Its value is ignored, and what that costs
-depends on the case: for a conversation this server holds, the client asked for
-the tail after its cursor and gets the whole thing as a snapshot instead — more
-bytes than the reference server sends, and correct, because a snapshot replaces
-what the client holds rather than being folded into it. For one this server does
-not hold there is nothing to send either way.
+**Caught up** — a resume whose cursor is still the newest number this server has
+handed out. The replay it asks for is then a replay of no events, which is the
+one replay this server can perform: the subscription opens with no snapshot, and
+the client is left holding what it already correctly held. The boot case, and
+the whole of what an HTTP snapshot saves. `crate::store::Sequences::caught_up`.
+
+Every other cursor is answered with the whole snapshot, because replaying from a
+position needs a log of the events to replay and this server keeps none. Note
+that a cursor _ahead_ of the newest number is not a client running early but one
+holding a number from a previous run — this server's numbering resumes from its
+last durable write, so a run reissues everything the run before it did not write
+down. Both directions therefore mean the same thing, which is "I cannot tell you
+what you missed; here is everything." See ADR-0016.
 
 **Draft** — a conversation the client has made up and the server has never heard
 of. Where every new conversation starts: the composer mints the id, and the
