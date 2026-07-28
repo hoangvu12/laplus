@@ -4,7 +4,7 @@
 `server/`, and a written-down account of the eight upstream workflows this fork
 carries but has never run.
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Found by:** opening PR #2 and noticing it reported no checks at all.
 
@@ -156,3 +156,40 @@ will push to `main`, and `deploy-relay.yml` fires on any push to `main`.**
 ticket's to fix — `gh workflow disable` on the ones this project does not use is
 a decision about the fork, not a consequence of adding Rust CI — but nobody
 should be surprised by it. `server/CLAUDE.md` has been corrected to say so.
+
+### 2026-07-28 — agent. Green on the first run. Done
+
+Run [30318228631](https://github.com/hoangvu12/laplus/actions/runs/30318228631),
+triggered by `pull_request`, **6m5s**, every step green:
+
+```
+test result: ok  ×29 binaries → 708 passed, 0 failed
+```
+
+The same 708 the author's machine reports, which is the number this ticket
+existed to stop depending on. `xtask`'s NSIS checks are in that total, as
+`default-members` intends. Nothing flaked, so the `--test-threads` worry under
+"Worth settling" did not materialise — worth re-reading if it ever does, because
+raising a timeout is specifically the wrong answer.
+
+Six minutes is a cold build: `rusqlite`'s `bundled` feature compiles the SQLite
+C amalgamation from source, and `Cache cargo` had nothing to restore on a first
+run. Later runs should be substantially quicker.
+
+**One annotation, and it is not ours.** The run is decorated with
+`git.exe failed with exit code 128`, which reads like a test failure and is not
+— it is in **Post Checkout**, `actions/checkout`'s cleanup, and GitHub labels
+annotations with the _job_ name, which here is "Test".
+
+```
+fatal: No url found for submodule path
+       '.repos/alchemy-effect/.vendor/alchemy' in .gitmodules
+```
+
+The tree carries a gitlink at that path and the repository has **no
+`.gitmodules` at all**, so git cannot resolve a URL for it. It is in `main` as
+well, so it predates every commit on this branch; it is upstream's tree shape,
+inherited. It fails nothing and will decorate every `actions/checkout` run in
+this repository until someone either restores a `.gitmodules` entry or drops the
+gitlink — both of which are changes to a path upstream owns, so neither is done
+here.
