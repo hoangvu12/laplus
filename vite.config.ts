@@ -29,7 +29,10 @@ export default defineConfig({
   fmt: {
     ignorePatterns: [
       ".plans",
-      ".scratch",
+      // `.scratch` is deliberately absent. It is the issue tracker, so commits
+      // that touch nothing else are routine — and an ignore rule here makes
+      // every one of them fail the pre-commit hook with "Expected at least one
+      // target file" rather than formatting the ticket that changed.
       "dist",
       "node_modules",
       "pnpm-lock.yaml",
