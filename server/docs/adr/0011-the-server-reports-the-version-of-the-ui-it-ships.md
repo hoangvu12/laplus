@@ -8,8 +8,8 @@ Status: Accepted
 Upstream's client compares its own `APP_VERSION` — the number Vite compiles into
 the bundle — against `environment.serverVersion` from `server.getConfig`, by
 string equality (`apps/web/src/versionSkew.ts`). When they differ it raises a
-banner above the composer: *Client 0.0.28 is connected to server 0.1.0. Relaunch
-the server with the copied command to sync them.*
+banner above the composer: _Client 0.0.28 is connected to server 0.1.0. Relaunch
+the server with the copied command to sync them._
 
 That check is written for upstream's shape, where a long-running server is talked
 to by whatever browser session reaches it, and the two really can be different
@@ -43,7 +43,7 @@ built somewhere else: there, a difference is a real one.
 
 **What this is not.** The two numbers are made equal because they describe one
 artifact, not because a skew check now passes on its merits. The check is
-*vestigial* in lightcode. Nobody should read a quiet banner here as evidence that
+_vestigial_ in lightcode. Nobody should read a quiet banner here as evidence that
 client and server were compared and found to match.
 
 ## Consequences
@@ -58,9 +58,9 @@ client and server were compared and found to match.
   to `resolveServerBackedAppStageLabel`, which tests it against
   `/-nightly\.\d{8}\.\d+$/` and nothing else. Neither number matches that, so
   those three are unaffected — but they are the shape of what this field is
-  *for*, and the next one like them may not be so easy to satisfy.
+  _for_, and the next one like them may not be so easy to satisfy.
 - **The advertised version is coupled to the UI's repository.** A `pnpm` build
-  in `laplus/` changes what the shell reports. That was a coupling to *vendored*
+  in `laplus/` changes what the shell reports. That was a coupling to _vendored_
   code when this was written; ticket 32 made it a coupling to a repository this
   project owns, which is a smaller thing to worry about and a larger thing to
   remember.
@@ -73,7 +73,7 @@ client and server were compared and found to match.
   to be **asked for by name** (`cargo test -p lightcode-shell`), like everything
   else in that crate: plain `cargo test` does not build the shell, for the reason
   the workspace manifest gives.
-- **This will not be the last of them.** Every field the client *interprets*
+- **This will not be the last of them.** Every field the client _interprets_
   rather than displays is a place upstream's assumptions leak through a hard
   fork. This one was found by opening the window and looking, which is still the
   only way the UI half of this application gets checked.

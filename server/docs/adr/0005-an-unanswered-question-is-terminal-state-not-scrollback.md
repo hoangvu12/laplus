@@ -11,7 +11,7 @@ it — except for the **scrollback**, the copy it keeps so that a client which
 reconnects, or falls far enough behind that a snapshot beats catching up, has
 something to be sent.
 
-That copy is replayed *into a live emulator*. So anything in it that asks the
+That copy is replayed _into a live emulator_. So anything in it that asks the
 emulator a question would be asked again on every reattach, and answered — to a
 shell that is not waiting for an answer, which means the reply lands at the
 prompt as typing the developer did not do. Upstream strips those sequences from
@@ -34,11 +34,11 @@ mount and neither can be sure it went first.
 
 Three answers were available.
 
-| Option | Cost |
-| --- | --- |
-| Keep queries in scrollback | Every reattach injects a reply into the shell's input |
-| Have the server answer the query itself | Two answers once a real emulator attaches, and the position would be a lie about a grid the server does not keep |
-| Remember the question and re-ask it on attach | One more piece of per-terminal state, and two attached clients both answer |
+| Option                                        | Cost                                                                                                             |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Keep queries in scrollback                    | Every reattach injects a reply into the shell's input                                                            |
+| Have the server answer the query itself       | Two answers once a real emulator attaches, and the position would be a lie about a grid the server does not keep |
+| Remember the question and re-ask it on attach | One more piece of per-terminal state, and two attached clients both answer                                       |
 
 ## Decision
 
@@ -48,7 +48,7 @@ because that write is the answer.
 
 Scrollback stays clean — it is still the wrong place for a question — and the
 question still reaches the one thing that can answer it, whichever of
-`terminal.open` and `terminal.attach` arrived first. It is sent *after* the
+`terminal.open` and `terminal.attach` arrived first. It is sent _after_ the
 snapshot rather than inside it, which is what keeps the two properties separate:
 the snapshot is replayed on every re-description, the question is asked once.
 

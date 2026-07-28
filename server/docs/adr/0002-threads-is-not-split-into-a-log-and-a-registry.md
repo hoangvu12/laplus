@@ -20,7 +20,7 @@ re-derive the same proposal from the same first impression.
 **The running-agent half is not half.** Counted honestly — `Live`, `Prompt`,
 `Signal`, `Answered`, the `winding_down` and `live_agents` fields, `session`,
 `detach`, `forget` and `shutdown` — it is roughly 270 lines of 1,770. The
-impression that it is half comes from it being the *conceptually* separate half,
+impression that it is half comes from it being the _conceptually_ separate half,
 not the large one.
 
 **It is not untested.** "Zero tests" was true only of inline `#[cfg(test)]` units.

@@ -48,7 +48,7 @@ types, not a bespoke schema.** `assistant.message` is a `Message` object;
 
 This materially lowers Risk #1 in the handoff. The risk was stated as "the
 stdio wire format is not a stability-guaranteed public contract." True of the
-*envelope* — but the envelope is thin, and the part carrying the real
+_envelope_ — but the envelope is thin, and the part carrying the real
 complexity is the public, versioned Messages API schema. The unstable surface
 is much smaller than assumed.
 

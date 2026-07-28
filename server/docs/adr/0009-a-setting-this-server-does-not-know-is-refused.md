@@ -6,7 +6,7 @@ Status: Accepted
 ## Context
 
 Ticket 22 gives the developer a settings panel and a keybindings file. Both are
-*written* by this server and *read* by upstream's client, and that asymmetry is
+_written_ by this server and _read_ by upstream's client, and that asymmetry is
 where the design pressure is: a value this server is happy with but the client
 cannot decode does not degrade gracefully. Effect's schemas fail whole.
 
@@ -25,7 +25,7 @@ array of those. One unrecognised command is not an inert shortcut: it costs the
 developer all forty-one.
 
 **`ServerSettings.textGenerationModelSelection.instanceId`** is a branded slug.
-It is *stored*, and read back inside `ServerSettings` — so a bad value written
+It is _stored_, and read back inside `ServerSettings` — so a bad value written
 once poisons every `server.getSettings` **and** every `server.getConfig` until
 somebody edits the file by hand.
 
@@ -43,7 +43,7 @@ Concretely:
   settings problem has no member and is therefore **logged, not sent** — the one
   place ticket 22's "with a warning" is a log line rather than a UI row.
 - Every `command` is checked against the closed union, on the way in from the
-  socket *and* on the way in from the file. A file entry that fails is dropped
+  socket _and_ on the way in from the file. A file entry that fails is dropped
   with an `invalid-entry` issue naming its index.
 - `instanceId` is checked against the slug pattern, because it is the one field
   here whose badness outlives its own call.
@@ -51,7 +51,7 @@ Concretely:
 
 There is one deliberate exception, and it is not softness: a patch that
 **repeats** a value this server reports but cannot change —
-`enableAssistantStreaming`, `providerInstances` — succeeds. Only a *change* is
+`enableAssistantStreaming`, `providerInstances` — succeeds. Only a _change_ is
 refused. Without that, `settings.json` would be a file this server writes and
 then refuses to read back, and every setting would be forgotten at the next
 restart.
@@ -60,7 +60,7 @@ restart.
 
 - **A newer UI's new setting is refused, not absorbed.** This is the cost, and it
   is accepted on two grounds: the criterion asks for invalid settings to be
-  rejected *with a message*, and the alternative — accepting and dropping — is a
+  rejected _with a message_, and the alternative — accepting and dropping — is a
   panel that reports success and changes nothing, which is the worse failure to
   debug. The sentence names the field, so the developer can see what happened.
 - **A file may be from another build; a patch may not.** Reading `settings.json`
@@ -81,6 +81,6 @@ restart.
   so a test checks them against each other.
 - **Hand-editing `keybindings.json` still needs a restart.** The file is read at
   startup and when this server writes it; there is no watcher on it. Changes made
-  *through the app* reach every open window immediately, which is what the
+  _through the app_ reach every open window immediately, which is what the
   criterion asks for — but the path is advertised as editable, so this is a gap
   rather than a decision, and `crate::watcher` already exists to close it.

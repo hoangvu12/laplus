@@ -18,15 +18,15 @@ Target artifact size: **~20–30 MB** (vs. t3code's 318 MB Windows installer).
 
 t3code today is a **server + three frontends**. `apps/web`, `apps/mobile`, and `apps/desktop` all talk to `apps/server` over HTTP. The Electron app is a window pointed at a local instance of that server.
 
-Electron works as both browser engine *and* Node runtime (`ELECTRON_RUN_AS_NODE=1`, `apps/desktop/src/backend/DesktopBackendConfiguration.ts:351-359`), so one binary does two jobs and no separate Node is shipped.
+Electron works as both browser engine _and_ Node runtime (`ELECTRON_RUN_AS_NODE=1`, `apps/desktop/src/backend/DesktopBackendConfiguration.ts:351-359`), so one binary does two jobs and no separate Node is shipped.
 
 Three options were considered:
 
-| Option | Effort | Size | Verdict |
-|---|---|---|---|
-| 1. Prune the Electron build | weeks | 318 → ~200 MB | Cheapest; keeps all features. Fallback if 3 stalls. |
-| 2. Tauri shell + keep the TS server | 6–10 mo | ~100–220 MB | **Rejected.** Rust binary has no Node, so you must bundle `node.exe` (~35 MB) as a sidecar. Most work, least payoff. |
-| 3. **Tauri shell + Rust server (scoped)** | **2–4 mo** | **~20–30 MB** | **Chosen.** Nothing Node ships at all. |
+| Option                                    | Effort     | Size          | Verdict                                                                                                              |
+| ----------------------------------------- | ---------- | ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| 1. Prune the Electron build               | weeks      | 318 → ~200 MB | Cheapest; keeps all features. Fallback if 3 stalls.                                                                  |
+| 2. Tauri shell + keep the TS server       | 6–10 mo    | ~100–220 MB   | **Rejected.** Rust binary has no Node, so you must bundle `node.exe` (~35 MB) as a sidecar. Most work, least payoff. |
+| 3. **Tauri shell + Rust server (scoped)** | **2–4 mo** | **~20–30 MB** | **Chosen.** Nothing Node ships at all.                                                                               |
 
 Option 2's failure is the load-bearing insight: you delete 136 MB of Electron and add back 35 MB of Node, while inheriting a cross-engine QA matrix. Only rewriting the server removes the runtime entirely.
 
@@ -53,6 +53,7 @@ Known minor exception: `-webkit-app-region` drag regions appear in 8+ places for
 `packages/contracts/src/` — 31 files. For a scoped v1:
 
 **Implement:**
+
 - `filesystem.ts` — file read/write/watch
 - `git.ts` — status/diff/branch (shell out to `git`)
 - `project.ts` — workspace/project model
@@ -61,6 +62,7 @@ Known minor exception: `-webkit-app-region` drag regions appear in 8+ places for
 - `model.ts`, `editor.ts`, `keybindings.ts`, `baseSchemas.ts`
 
 **Skip for v1:**
+
 - `auth.ts` — no accounts
 - `environment.ts`, `environmentHttp.ts` — remote/Tailscale envs
 - `preview.ts`, `previewAutomation.ts` — the CDP preview subsystem (see Risks)
@@ -73,16 +75,16 @@ Corresponding server subsystems to skip: `cloud/`, `auth/`, `sourceControl/`, `p
 
 ## Proposed Rust stack
 
-| Concern | Crate |
-|---|---|
-| HTTP + WebSocket | `axum` |
-| Async runtime | `tokio` |
-| Agent CLI subprocess | `tokio::process` |
-| Terminal / PTY | `portable-pty` |
-| Database | `rusqlite` (or `sqlx`) |
-| Contract types | `serde` + `serde_json` |
-| Desktop shell | `tauri` v2 |
-| File watching | `notify` |
+| Concern              | Crate                  |
+| -------------------- | ---------------------- |
+| HTTP + WebSocket     | `axum`                 |
+| Async runtime        | `tokio`                |
+| Agent CLI subprocess | `tokio::process`       |
+| Terminal / PTY       | `portable-pty`         |
+| Database             | `rusqlite` (or `sqlx`) |
+| Contract types       | `serde` + `serde_json` |
+| Desktop shell        | `tauri` v2             |
+| File watching        | `notify`               |
 
 Windows-only to start (`webviewInstallMode: downloadBootstrapper`, documented as ~0 MB overhead). Avoids the Linux WebKitGTK problem entirely — Tauri's own AppImage docs note bundles grow "from the 2-6 MB range to 70+ MB."
 
@@ -135,7 +137,7 @@ The `claude` CLI's stdio wire format is not a stability-guaranteed public contra
 88K LOC of server exists for reasons. Resist reimplementing `cloud/`, `auth/`, multi-backend orchestration. If v1 grows past ~20K LOC of Rust, re-evaluate.
 
 **3. Effect-TS semantics.**
-`apps/server` is heavily Effect-based (structured concurrency, typed errors, resource scoping). Don't port Effect idioms literally — use Rust's own (`Result`, `?`, `tokio` tasks, RAII). Read the TS for *behavior*, not structure.
+`apps/server` is heavily Effect-based (structured concurrency, typed errors, resource scoping). Don't port Effect idioms literally — use Rust's own (`Result`, `?`, `tokio` tasks, RAII). Read the TS for _behavior_, not structure.
 
 **4. Contract drift from upstream.**
 You're pinning to t3code's contracts at a point in time. If you later want to pull UI updates from upstream, contract changes become your problem. Decide early whether this is a hard fork.

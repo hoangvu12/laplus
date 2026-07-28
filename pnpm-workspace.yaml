@@ -17,7 +17,6 @@ allowBuilds:
   electron: false
   esbuild: true
   msgpackr-extract: true
-  msw: false
   utf-8-validate: false
   workerd: false
 
@@ -105,6 +104,6 @@ peerDependencyRules:
     vite: "*"
 
 supportedArchitectures:
-  cpu: [ current, x64 ]
-  libc: [ current, glibc ]
-  os: [ current, linux ]
+  cpu: [current, x64]
+  libc: [current, glibc]
+  os: [current, linux]

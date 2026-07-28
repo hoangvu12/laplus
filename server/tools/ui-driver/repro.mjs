@@ -79,7 +79,9 @@ writeFileSync(
   new URL("./frames.log", import.meta.url),
   frames.map((f, i) => `${i}${i >= frameMark ? " *" : "  "} ${f.dir} ${f.text}`).join("\n"),
 );
-console.log(`=== ${frames.length} frames written to tools/ui-driver/frames.log (submit at #${frameMark}) ===`);
+console.log(
+  `=== ${frames.length} frames written to tools/ui-driver/frames.log (submit at #${frameMark}) ===`,
+);
 console.log("=== CONSOLE (tail) ===");
 console.log(logs.join("\n").slice(-1500));
 

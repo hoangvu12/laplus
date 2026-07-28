@@ -6,7 +6,7 @@ Status: Accepted
 ## Context
 
 Ticket 20 asks for two views: the diff of a single agent turn, and the
-cumulative diff of a whole conversation. Both need a *before*, and the developer
+cumulative diff of a whole conversation. Both need a _before_, and the developer
 has not committed anything — the whole point of the feature is reviewing work
 that is not on a branch yet. Nothing in git records what the working tree looked
 like when the developer pressed enter, so the server has to.
@@ -30,11 +30,11 @@ nothing whatever to say about one.
 
 Three shapes were available.
 
-| Option | Cost |
-| --- | --- |
-| Watch the filesystem and accumulate a per-turn change set | Needs before-and-after content for every path, which is a second copy of the working tree kept by hand; loses anything written between two watcher events; cannot survive a restart |
-| Diff the working tree against `HEAD` and subtract | Only ever answers "since the last commit", so every turn of a conversation shows the same diff; a commit mid-conversation erases every earlier turn |
-| Record the whole tree at each turn boundary, as an object git already knows how to store | One `git add -A` per turn boundary |
+| Option                                                                                   | Cost                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Watch the filesystem and accumulate a per-turn change set                                | Needs before-and-after content for every path, which is a second copy of the working tree kept by hand; loses anything written between two watcher events; cannot survive a restart |
+| Diff the working tree against `HEAD` and subtract                                        | Only ever answers "since the last commit", so every turn of a conversation shows the same diff; a commit mid-conversation erases every earlier turn                                 |
+| Record the whole tree at each turn boundary, as an object git already knows how to store | One `git add -A` per turn boundary                                                                                                                                                  |
 
 ## Decision
 
@@ -49,7 +49,7 @@ which keeps it out of `git log`, `git branch --contains` and every push.
 
 The consequence that matters is in the title. A checkpoint is a photograph of a
 folder at a moment. It does not know who changed what, and it does not need to:
-the question the diff panel asks is *what is different now*, and a photograph
+the question the diff panel asks is _what is different now_, and a photograph
 answers exactly that. So a file the developer edited by hand between two turns
 appears in the diff of the turn it happened during, alongside the agent's own
 work.
@@ -71,7 +71,7 @@ tree does not contain.
   know. That is the cost of a cold `git status`, paid once per turn boundary. It
   is affordable because a turn is a human-scale event, and it is the reason
   checkpoints are not taken more often than that. Ignored files cost nothing.
-- **There is a window at the end of a turn.** The capture happens *after* the
+- **There is a window at the end of a turn.** The capture happens _after_ the
   turn has settled, because blocking the "the agent is done" signal on a
   `git add -A` would make a large repository feel like a slow agent. An edit made
   inside that window — a fraction of a second — lands in the next turn rather
@@ -80,8 +80,9 @@ tree does not contain.
 
   The window is also the reason `crate::turn`'s loop drains its signal channel
   before starting a queued turn. A stop click arriving during a capture would
-  otherwise be handled *after* the next prompt had been sent, and would stop the
+  otherwise be handled _after_ the next prompt had been sent, and would stop the
   turn it started rather than being the no-op the client meant it as.
+
 - **A turn the developer stopped gets no checkpoint.** `status` is read by the
   client as how the turn went, not as whether the tree was recorded:
   `threadReducer.ts` sets `latestTurn.state` from

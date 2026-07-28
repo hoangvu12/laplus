@@ -9,8 +9,7 @@ import { join } from "node:path";
 
 // Whatever Chrome the machine has. Overridable because the default is one
 // machine's path, and a driver nobody else can run is not a tool.
-const CHROME =
-  process.env.CHROME ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const CHROME = process.env.CHROME ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 
 export async function launch({ url, headless = true, keepProfile = null }) {
   const profile = keepProfile ?? mkdtempSync(join(tmpdir(), "lc28-"));

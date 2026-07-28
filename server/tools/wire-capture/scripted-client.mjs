@@ -22,7 +22,8 @@ const args = Object.fromEntries(
   process.argv
     .slice(2)
     .reduce(
-      (pairs, value, index, all) => (index % 2 === 0 ? [...pairs, [value.slice(2), all[index + 1]]] : pairs),
+      (pairs, value, index, all) =>
+        index % 2 === 0 ? [...pairs, [value.slice(2), all[index + 1]]] : pairs,
       [],
     ),
 );
@@ -98,8 +99,7 @@ async function drive(script) {
       }, timeoutMs).unref?.();
     });
 
-  const request = (id, tag, payload) =>
-    send({ _tag: "Request", id, tag, payload, headers: [] });
+  const request = (id, tag, payload) => send({ _tag: "Request", id, tag, payload, headers: [] });
 
   try {
     await script({ send, request, waitFor, received });

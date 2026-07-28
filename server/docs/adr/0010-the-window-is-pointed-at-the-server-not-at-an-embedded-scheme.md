@@ -23,7 +23,7 @@ of them is worse than it first looks:
   too, on a server whose entire security model is "reachability is the
   boundary".
 - **The UI's boot fetches would miss.** `/.well-known/t3/environment` and
-  `/api/auth/session` are requested *relative*, so they would go to the scheme
+  `/api/auth/session` are requested _relative_, so they would go to the scheme
   handler and 404. The only fix is to rebuild upstream's bundle with
   `VITE_HTTP_URL` and `VITE_WS_URL` baked in — a Node build of vendored code
   this project has pinned as reference material and does not own.
@@ -63,7 +63,7 @@ Two consequences are load-bearing enough to be part of the decision:
 - **`Server` gained a parameter rather than the shell gaining a server.** Every
   caller passes `Assets::none()` except the shell. A server with no UI answers
   404 at `/` exactly as it did before, which is what keeps `http_boot.rs` true.
-- **A missing file is a 404 and a missing *route* is the page.** The distinction
+- **A missing file is a 404 and a missing _route_ is the page.** The distinction
   is drawn on whether the last path segment has an extension. Getting it wrong
   in the generous direction would serve HTML where a script was asked for, and
   the webview would run it — so the rule is deliberately mean, and the server's
@@ -73,6 +73,6 @@ Two consequences are load-bearing enough to be part of the decision:
   handing out an `axum::body::Bytes`. At most a few megabytes, once per window,
   over loopback.
 - **This is Windows-shaped reasoning.** `tauri.localhost` is the Windows
-  spelling; macOS uses `tauri://localhost`, which *would* pass the origin check.
+  spelling; macOS uses `tauri://localhost`, which _would_ pass the origin check.
   The decision still holds there — the other two problems are platform-neutral —
   but the first bullet would not be the one that decided it.

@@ -21,12 +21,12 @@ is nowhere else for a second agent to run.
 ## Decision
 
 **Same-project isolation is server-side only.** Two conversations in one project
-run in the *same folder at the same time* and may edit the same files. Last write
+run in the _same folder at the same time_ and may edit the same files. Last write
 wins. That is a limitation of this server, recorded rather than hidden, and it is
 not a defect to be fixed inside the current shape — the fix is worktrees, which
 the spec rules out.
 
-The ticket's word is *independent*, and that is what is delivered and tested:
+The ticket's word is _independent_, and that is what is delivered and tested:
 `socket_concurrency.rs::two_conversations_in_one_project_stay_independent` drives
 two threads in one project through one socket and asserts two children, two
 transcripts, two sessions and two event feeds that never carry each other's

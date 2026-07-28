@@ -39,9 +39,7 @@ const KILL_AFTER_MS = 120_000;
 
 const [decision, out, ...rest] = process.argv.slice(2);
 if (!DECISIONS.has(decision) || !out) {
-  console.error(
-    `usage: node record.mjs <${[...DECISIONS].join("|")}> <out.ndjson> [prompt]`,
-  );
+  console.error(`usage: node record.mjs <${[...DECISIONS].join("|")}> <out.ndjson> [prompt]`);
   process.exit(2);
 }
 

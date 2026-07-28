@@ -15,10 +15,6 @@
       "types": "./src/advertisedEndpoint.ts",
       "import": "./src/advertisedEndpoint.ts"
     },
-    "./agentAwareness": {
-      "types": "./src/agentAwareness.ts",
-      "import": "./src/agentAwareness.ts"
-    },
     "./git": {
       "types": "./src/git.ts",
       "import": "./src/git.ts"
@@ -43,21 +39,9 @@
       "types": "./src/shell.ts",
       "import": "./src/shell.ts"
     },
-    "./semver": {
-      "types": "./src/semver.ts",
-      "import": "./src/semver.ts"
-    },
     "./Net": {
       "types": "./src/Net.ts",
       "import": "./src/Net.ts"
-    },
-    "./DrainableWorker": {
-      "types": "./src/DrainableWorker.ts",
-      "import": "./src/DrainableWorker.ts"
-    },
-    "./KeyedCoalescingWorker": {
-      "types": "./src/KeyedCoalescingWorker.ts",
-      "import": "./src/KeyedCoalescingWorker.ts"
     },
     "./schemaJson": {
       "types": "./src/schemaJson.ts",
@@ -67,17 +51,9 @@
       "types": "./src/schemaYaml.ts",
       "import": "./src/schemaYaml.ts"
     },
-    "./toolActivity": {
-      "types": "./src/toolActivity.ts",
-      "import": "./src/toolActivity.ts"
-    },
     "./Struct": {
       "types": "./src/Struct.ts",
       "import": "./src/Struct.ts"
-    },
-    "./serverSettings": {
-      "types": "./src/serverSettings.ts",
-      "import": "./src/serverSettings.ts"
     },
     "./String": {
       "types": "./src/String.ts",
@@ -90,10 +66,6 @@
     "./t3ProjectFile": {
       "types": "./src/t3ProjectFile.ts",
       "import": "./src/t3ProjectFile.ts"
-    },
-    "./orchestrationTiming": {
-      "types": "./src/orchestrationTiming.ts",
-      "import": "./src/orchestrationTiming.ts"
     },
     "./remote": {
       "types": "./src/remote.ts",
@@ -135,10 +107,6 @@
       "types": "./src/qrCode.ts",
       "import": "./src/qrCode.ts"
     },
-    "./cliArgs": {
-      "types": "./src/cliArgs.ts",
-      "import": "./src/cliArgs.ts"
-    },
     "./connectAuth": {
       "types": "./src/connectAuth.ts",
       "import": "./src/connectAuth.ts"
@@ -163,10 +131,6 @@
       "types": "./src/terminalLabels.ts",
       "import": "./src/terminalLabels.ts"
     },
-    "./relayClient": {
-      "types": "./src/relayClient.ts",
-      "import": "./src/relayClient.ts"
-    },
     "./relayTracing": {
       "types": "./src/relayTracing.ts",
       "import": "./src/relayTracing.ts"
@@ -190,14 +154,6 @@
     "./hostProcess": {
       "types": "./src/hostProcess.ts",
       "import": "./src/hostProcess.ts"
-    },
-    "./httpReadiness": {
-      "types": "./src/httpReadiness.ts",
-      "import": "./src/httpReadiness.ts"
-    },
-    "./devHome": {
-      "types": "./src/devHome.ts",
-      "import": "./src/devHome.ts"
     },
     "./devProxy": {
       "types": "./src/devProxy.ts",

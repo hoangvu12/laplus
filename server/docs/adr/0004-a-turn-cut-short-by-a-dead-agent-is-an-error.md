@@ -13,10 +13,10 @@ publish?
 
 Two are defensible and they settle the turn differently:
 
-| Status | Settles the turn as | Carries `lastError` |
-| --- | --- | --- |
-| `stopped` | `interrupted` | no |
-| `error` | `error` | yes |
+| Status    | Settles the turn as | Carries `lastError` |
+| --------- | ------------------- | ------------------- |
+| `stopped` | `interrupted`       | no                  |
+| `error`   | `error`             | yes                 |
 
 `stopped` reads as the more literal description — the process stopped — and
 ADR-0001 made it reachable by fixing the decoder to settle it as `interrupted`,
@@ -57,6 +57,6 @@ code path from ticket 11 and for the same reason.
   it publishes any of this. A delta owes the database nothing, so a reply cut
   short otherwise had nothing on disk and stayed `streaming` forever in memory;
   settling it is what makes "reported rather than lost" true of the reply as well
-  as of the session. It is settled with an *empty* buffered message, which is the
+  as of the session. It is settled with an _empty_ buffered message, which is the
   case where the accumulation stands — so no reconciliation is recorded for a
   message that never arrived.

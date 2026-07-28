@@ -67,7 +67,7 @@ Four things about the shape are load-bearing:
   the client, which is how a fork stops being able to merge.
 - **The spec's non-goals move, and user story 57 changes character.** "The
   unmodified upstream UI connects to this server" was true by construction and
-  is now a thing to *check* — build `upstream/main` without our commits and
+  is now a thing to _check_ — build `upstream/main` without our commits and
   confirm it still boots. Worth keeping precisely because it is the tripwire for
   the previous bullet.
 - **`pnpm` is load-bearing.** It always was — `dist/` was built by hand — but it

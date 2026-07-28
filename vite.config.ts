@@ -50,6 +50,11 @@ export default defineConfig({
       "pnpm-lock.yaml",
       "reference/**",
       "server/target/**",
+      // Standalone Node scripts beside the Rust half — the recording proxy and
+      // the headless browser driver. The rules below describe the Effect
+      // TypeScript codebase, and `namespace-node-imports` in particular is a
+      // convention for it rather than a defect these files have.
+      "server/tools/**",
       "*.tsbuildinfo",
       "**/routeTree.gen.ts",
     ],

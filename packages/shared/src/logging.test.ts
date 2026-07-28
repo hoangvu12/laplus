@@ -18,6 +18,24 @@ const makeTempDirectory = (): string => {
   return directory;
 };
 
+// An over-long filename is the portable way to make `stat` fail with something
+// other than "not found" — but only on a filesystem that enforces a name-length
+// limit. Windows reports `ENOENT` for one instead, which is exactly the code the
+// sink reads as "no log file yet, size zero", so the case the test below exists
+// to distinguish cannot be provoked there at all. Probed rather than branched on
+// `process.platform`, which this repository's own lint rule forbids.
+const OVER_LONG_NAMES_ARE_REJECTED = ((): boolean => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-logging-probe-"));
+  try {
+    NodeFS.statSync(NodePath.join(directory, "a".repeat(300)));
+    return false;
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code === "ENAMETOOLONG";
+  } finally {
+    NodeFS.rmSync(directory, { recursive: true, force: true });
+  }
+})();
+
 const captureError = (run: () => unknown): unknown => {
   try {
     run();
@@ -69,16 +87,21 @@ describe("RotatingFileSink", () => {
     expect((thrown as RotatingFileSinkError).cause).toBeInstanceOf(Error);
   });
 
-  it("only treats a missing log file as an empty current size", () => {
-    const directory = makeTempDirectory();
-    const filePath = NodePath.join(directory, "a".repeat(300));
+  it.skipIf(!OVER_LONG_NAMES_ARE_REJECTED)(
+    "only treats a missing log file as an empty current size",
+    () => {
+      const directory = makeTempDirectory();
+      const filePath = NodePath.join(directory, "a".repeat(300));
 
-    const thrown = captureError(() => new RotatingFileSink({ filePath, maxBytes: 1, maxFiles: 1 }));
+      const thrown = captureError(
+        () => new RotatingFileSink({ filePath, maxBytes: 1, maxFiles: 1 }),
+      );
 
-    expect(thrown).toBeInstanceOf(RotatingFileSinkError);
-    expect(thrown).toMatchObject({ operation: "read", filePath });
-    expect((thrown as RotatingFileSinkError).cause).toMatchObject({ code: "ENAMETOOLONG" });
-  });
+      expect(thrown).toBeInstanceOf(RotatingFileSinkError);
+      expect(thrown).toMatchObject({ operation: "read", filePath });
+      expect((thrown as RotatingFileSinkError).cause).toMatchObject({ code: "ENAMETOOLONG" });
+    },
+  );
 
   it("starts an absent log file at zero bytes", () => {
     const directory = makeTempDirectory();

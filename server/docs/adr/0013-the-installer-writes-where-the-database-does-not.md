@@ -62,10 +62,10 @@ A whole template for two lines is the part that needed deciding. `bundle.windows
 has no install-path option; its only two escape hatches are this file and
 `installerHooks`, and the hooks are not one:
 
-- `NSIS_HOOK_PREINSTALL` runs *after* `SetOutPath $INSTDIR`, so a redirect from
+- `NSIS_HOOK_PREINSTALL` runs _after_ `SetOutPath $INSTDIR`, so a redirect from
   there leaves the old directory already created and the directory page already
   showing a path the installer did not use.
-- The hooks file *is* `!include`d early enough — before `InstallDir` and before
+- The hooks file _is_ `!include`d early enough — before `InstallDir` and before
   the pages are declared — but nothing it can say survives. The template
   `!define`s the install-dir symbols after the include, and `!define` on an
   existing symbol aborts the build rather than overriding it.
@@ -87,9 +87,9 @@ So the choice was between a vendored template and leaving the collision.
   is a separate decision.
 - **Upstream's template has to be re-vendored by hand on every tauri-cli
   upgrade.** Two guards, neither of which is the whole answer: `cargo test -p
-  xtask` fails if either changed line is gone or upstream's default is back, and
+xtask` fails if either changed line is gone or upstream's default is back, and
   `cargo xtask release` refuses to build in the same case. Neither can tell you
-  upstream changed something *else*, so the re-vendoring instruction in the
+  upstream changed something _else_, so the re-vendoring instruction in the
   file's header says to read the diff.
 - **`xtask::install` is now the one place that knows where lightcode installs.**
   The static check and the footprint measurement live together deliberately —
@@ -101,6 +101,6 @@ So the choice was between a vendored template and leaving the collision.
   the binary is present, so the remembered location is honoured. Nothing about
   those installs gets worse, and no data moves. Uninstalling and installing
   again is the migration, and it is the developer's to run.
-- **The footprint measurement got simpler.** It weighed *what the installer
-  added* against a snapshot taken beforehand, because the directory already had
+- **The footprint measurement got simpler.** It weighed _what the installer
+  added_ against a snapshot taken beforehand, because the directory already had
   a developer's database in it. It now weighs the directory.

@@ -15,6 +15,6 @@ When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the 
 
 Because this repo uses the local-markdown tracker, a "label" is the value of the `Status:` line near the top of an issue file — not a tracker-native label object.
 
-`done` is local to this repo and has no counterpart in the upstream five. It exists because the five are *triage* roles, all of which describe work not yet delivered; without it a finished ticket has to wear a label that misdescribes it. Reserve `ready-for-human` for its documented meaning — work that requires human implementation — not for "finished, please review".
+`done` is local to this repo and has no counterpart in the upstream five. It exists because the five are _triage_ roles, all of which describe work not yet delivered; without it a finished ticket has to wear a label that misdescribes it. Reserve `ready-for-human` for its documented meaning — work that requires human implementation — not for "finished, please review".
 
 Edit the right-hand column to match whatever vocabulary you actually use.

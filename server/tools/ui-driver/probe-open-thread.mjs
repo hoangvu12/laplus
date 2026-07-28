@@ -26,7 +26,9 @@ console.log("=== BODY TEXT ===");
 console.log(await session.evaluate(`return document.body.innerText;`));
 console.log("=== URL ===", await session.evaluate(`return location.href;`));
 console.log("=== FRAMES after click ===");
-for (const f of frames.filter((f) => f.text.includes("subscribeThread") || f.text.includes("snapshot"))) {
+for (const f of frames.filter(
+  (f) => f.text.includes("subscribeThread") || f.text.includes("snapshot"),
+)) {
   console.log(f.dir, f.text.slice(0, 240));
 }
 console.log("=== CONSOLE ===");

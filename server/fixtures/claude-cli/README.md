@@ -5,7 +5,7 @@ detector over the CLI's stdio wire format. Each `NN-<name>.ndjson` is folded
 line by line through a fresh `SessionState`; the result is compared against
 `NN-<name>.expected.json`.
 
-Sibling of `fixtures/socket-wire/`, which pins the *other* protocol — the one
+Sibling of `fixtures/socket-wire/`, which pins the _other_ protocol — the one
 the UI speaks. This directory pins the one the agent speaks.
 
 Since ticket 10 they are also **replayed**: `harness::agent::ScriptedAgent`
@@ -17,10 +17,10 @@ a `claude` release is worth doing even when the golden files still match.
 
 A capture containing a `control_request` is replayed with a stop where the
 request is: the CLI waits there for an answer, and everything after that line in
-the recording happened *because of* the answer. Playing it straight through would
+the recording happened _because of_ the answer. Playing it straight through would
 have the stand-in react to a decision nobody had made.
 
-A capture containing a `control_response` is replayed with a stop *before* it,
+A capture containing a `control_response` is replayed with a stop _before_ it,
 for the mirror-image reason: that line is the CLI answering something the server
 asked it, and the request travelled on stdin so it is not in the recording.
 Playing it straight through would have the stand-in answer a request nobody had
@@ -28,26 +28,26 @@ sent, and then abort a turn nobody had stopped.
 
 ## The captures
 
-| File | Provenance | What it covers |
-| --- | --- | --- |
-| `01-buffered-turn.ndjson` | Recorded, STEP 1 spike (`.scratch/stream-sample.ndjson`) | A turn without `--include-partial-messages`: buffered `assistant` message only, no deltas to reconcile against |
-| `02-streamed-turn.ndjson` | Recorded, STEP 1 spike (`.scratch/bidi.ndjson`) | A turn with `--include-partial-messages`: `message_start` → deltas → `message_stop`, reconciled by the buffered message that agrees with them |
-| `03-synthetic-drift.ndjson` | Hand-written | Degradation. An unrecognized top-level `type`, an unrecognized `stream_event`, an unrecognized content block, a truncated line, a blank line — none of which a healthy CLI emits, so no recording contains them |
-| `04-tool-use.ndjson` | Recorded, ticket 12 | One tool call end to end: reasoning, a `tool_use`, its `tool_result` as a `user` message, more reasoning, then the reply |
-| `05-tool-failure.ndjson` | Recorded, ticket 12 | The same shape with `"is_error": true` on the result — a `Read` of a file that is not there |
-| `06-several-tool-calls.ndjson` | Recorded, ticket 12 | Two calls in one turn, each answered before the next is announced |
-| `07-permission-approved.ndjson` | Recorded, ticket 13 | A `control_request` asking to use `Write`, approved — the tool then succeeds |
-| `08-permission-declined.ndjson` | Recorded, ticket 13 | The same request declined: the tool result carries the refusal, and the agent answers anyway |
-| `09-permission-unanswered.ndjson` | Recorded, ticket 13 | The same request left hanging until stdin closed — the CLI abandons it and finishes the turn |
-| `10-permission-for-the-session.ndjson` | Recorded, ticket 13 | Approved with the CLI's own permission suggestion handed back: two `Write` calls, one request |
-| `11-interrupted-turn.ndjson` | Recorded, ticket 14 | A reply stopped mid-sentence: the acknowledgement, the partial text handed over whole, and an aborted `result` |
-| `12-interrupt-then-continue.ndjson` | Recorded, ticket 14 | The same, and then a second turn answered normally by the same process |
-| `13-interrupt-during-tool-use.ndjson` | Recorded, ticket 14 | A stop in the middle of a run of `Write` calls, as the agent was opening the next one |
-| `14-interrupt-with-nothing-running.ndjson` | Recorded, ticket 14 | A stop sent after the turn had already ended — acknowledged, and nothing else happens |
-| `15-permission-cancelled.ndjson` | Recorded, ticket 14 | "Cancel" on a permission: a denial carrying `interrupt: true`, which ends the turn the way an interrupt does |
-| `16-error-result.ndjson` | Hand-written | A turn the agent reports as failed, with its reason in the `result`'s `errors` array — which is the only thing in a failed turn a developer can act on |
-| `17-rate-limited.ndjson` | Hand-written | Three `rate_limit_event`s — fine, close to the limit, refused — and the failed turn the third produces |
-| `18-compacted.ndjson` | Hand-written | A `system`/`compact_boundary` between two turns: the agent's memory rewritten, and the transcript deliberately unchanged by it |
+| File                                       | Provenance                                               | What it covers                                                                                                                                                                                                  |
+| ------------------------------------------ | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-buffered-turn.ndjson`                  | Recorded, STEP 1 spike (`.scratch/stream-sample.ndjson`) | A turn without `--include-partial-messages`: buffered `assistant` message only, no deltas to reconcile against                                                                                                  |
+| `02-streamed-turn.ndjson`                  | Recorded, STEP 1 spike (`.scratch/bidi.ndjson`)          | A turn with `--include-partial-messages`: `message_start` → deltas → `message_stop`, reconciled by the buffered message that agrees with them                                                                   |
+| `03-synthetic-drift.ndjson`                | Hand-written                                             | Degradation. An unrecognized top-level `type`, an unrecognized `stream_event`, an unrecognized content block, a truncated line, a blank line — none of which a healthy CLI emits, so no recording contains them |
+| `04-tool-use.ndjson`                       | Recorded, ticket 12                                      | One tool call end to end: reasoning, a `tool_use`, its `tool_result` as a `user` message, more reasoning, then the reply                                                                                        |
+| `05-tool-failure.ndjson`                   | Recorded, ticket 12                                      | The same shape with `"is_error": true` on the result — a `Read` of a file that is not there                                                                                                                     |
+| `06-several-tool-calls.ndjson`             | Recorded, ticket 12                                      | Two calls in one turn, each answered before the next is announced                                                                                                                                               |
+| `07-permission-approved.ndjson`            | Recorded, ticket 13                                      | A `control_request` asking to use `Write`, approved — the tool then succeeds                                                                                                                                    |
+| `08-permission-declined.ndjson`            | Recorded, ticket 13                                      | The same request declined: the tool result carries the refusal, and the agent answers anyway                                                                                                                    |
+| `09-permission-unanswered.ndjson`          | Recorded, ticket 13                                      | The same request left hanging until stdin closed — the CLI abandons it and finishes the turn                                                                                                                    |
+| `10-permission-for-the-session.ndjson`     | Recorded, ticket 13                                      | Approved with the CLI's own permission suggestion handed back: two `Write` calls, one request                                                                                                                   |
+| `11-interrupted-turn.ndjson`               | Recorded, ticket 14                                      | A reply stopped mid-sentence: the acknowledgement, the partial text handed over whole, and an aborted `result`                                                                                                  |
+| `12-interrupt-then-continue.ndjson`        | Recorded, ticket 14                                      | The same, and then a second turn answered normally by the same process                                                                                                                                          |
+| `13-interrupt-during-tool-use.ndjson`      | Recorded, ticket 14                                      | A stop in the middle of a run of `Write` calls, as the agent was opening the next one                                                                                                                           |
+| `14-interrupt-with-nothing-running.ndjson` | Recorded, ticket 14                                      | A stop sent after the turn had already ended — acknowledged, and nothing else happens                                                                                                                           |
+| `15-permission-cancelled.ndjson`           | Recorded, ticket 14                                      | "Cancel" on a permission: a denial carrying `interrupt: true`, which ends the turn the way an interrupt does                                                                                                    |
+| `16-error-result.ndjson`                   | Hand-written                                             | A turn the agent reports as failed, with its reason in the `result`'s `errors` array — which is the only thing in a failed turn a developer can act on                                                          |
+| `17-rate-limited.ndjson`                   | Hand-written                                             | Three `rate_limit_event`s — fine, close to the limit, refused — and the failed turn the third produces                                                                                                          |
+| `18-compacted.ndjson`                      | Hand-written                                             | A `system`/`compact_boundary` between two turns: the agent's memory rewritten, and the transcript deliberately unchanged by it                                                                                  |
 
 The `.scratch/*.ndjson` originals stay where they are as raw evidence; these are
 the committed, test-facing copies. `04`–`15` were recorded straight into
@@ -60,7 +60,7 @@ Ticket 15's three cases have one thing in common: a healthy CLI on a healthy
 account does not produce them on demand. An API failure cannot be asked for, a
 usage limit cannot be reached to order, and a compaction takes a conversation
 long enough to fill the context window — so these are hand-written, like `03`,
-and the *shapes* are read off the `claude` binary rather than guessed:
+and the _shapes_ are read off the `claude` binary rather than guessed:
 
 - **`rate_limit_event` carries `rate_limit_info`**, whose fields are the API's
   own response headers in the CLI's camel case: `status` (`allowed`,
@@ -85,7 +85,7 @@ instead, and `tests/socket_resilience.rs` is what drives it.
 The interrupt channel is not in `--help` either, and it is the same envelope as
 the permission one travelling the other way. What these five record is that it
 exists, what it is, and — the part that could not have been guessed — how a
-stopped turn *ends*:
+stopped turn _ends_:
 
 - **The request is a `control_request` on stdin** with `{"subtype": "interrupt"}`
   and an id this server mints. The CLI's schema has an optional `reason` beside
@@ -144,7 +144,7 @@ repository has. What these four record is that it exists and what it is:
   `Tool permission request failed: AbortError`; the CLI retries twice, gives up,
   and finishes the turn normally. Nothing hangs and nothing is orphaned.
 
-One thing they do *not* record, because no capture can: what this server sent.
+One thing they do _not_ record, because no capture can: what this server sent.
 The answer travels on stdin, and the assertions about it live in
 `tests/socket_permissions.rs`, which reads the lines the agent was written.
 
@@ -160,19 +160,19 @@ one of them:
 
 - **A tool result arrives as a `user` message.** Not under a tool-specific event
   type, and not gated behind `--replay-user-messages` — which this server does not
-  pass, and which is about echoing the *developer's* turns. So folding user
+  pass, and which is about echoing the _developer's_ turns. So folding user
   messages is not optional.
 - **The CLI emits one buffered `assistant` message per content block**, as the
   block closes, rather than one per API message. A turn that thinks, calls a tool
   and then answers produces four of them, three of which carry no text at all.
-  That is why the driver publishes a message only when there *is* text: otherwise
+  That is why the driver publishes a message only when there _is_ text: otherwise
   each would be an empty chat bubble.
 - **Calls and results interleave in block order** even when the model was asked
   for parallel ones — `06` is `use A`, `result A`, `use B`, `result B`. The work
   log's collapse of an invocation into its result is adjacency-based, so this is
   what makes several calls in one turn pair up without anything sorting them.
 
-Two things in `03-synthetic-drift.ndjson` deliberately do *not* register as
+Two things in `03-synthetic-drift.ndjson` deliberately do _not_ register as
 drift, and the golden file records that by omission:
 
 - `system` with an unrecognized `subtype` — the CLI adds lifecycle subtypes

@@ -5,7 +5,7 @@ Status: Accepted
 
 ## Context
 
-The working tree status is the one thing in the app that goes stale *because*
+The working tree status is the one thing in the app that goes stale _because_
 the agent is working. It is how a developer tells what the agent actually did,
 so a status that had to be asked for would be wrong exactly when it mattered —
 which is why ticket 19 asks for it to refresh on its own.
@@ -30,16 +30,16 @@ failure."
 
 The file tree solved its version of this by **forgetting**: a change drops the
 held scan and the next caller who actually needs one pays for it. That works
-because `searchEntries` is a *pull* — somebody asks, and the answer can be
-computed then. A subscription is a *push*, and there is no next caller to hand
+because `searchEntries` is a _pull_ — somebody asks, and the answer can be
+computed then. A subscription is a _push_, and there is no next caller to hand
 the cost to. So the file tree's answer does not transfer, and three were
 available.
 
-| Option | Cost |
-| --- | --- |
-| Read on every change | Thousands of `git status` runs during any build; a core pinned, and a status per file sent to a panel that renders the last one |
-| Forget on change, read when a client asks | No client asks — the whole point is that nothing asks. A subscription would go silent |
-| Mark stale, and let one reader chase the staleness | One more piece of per-repository state |
+| Option                                             | Cost                                                                                                                            |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Read on every change                               | Thousands of `git status` runs during any build; a core pinned, and a status per file sent to a panel that renders the last one |
+| Forget on change, read when a client asks          | No client asks — the whole point is that nothing asks. A subscription would go silent                                           |
+| Mark stale, and let one reader chase the staleness | One more piece of per-repository state                                                                                          |
 
 ## Decision
 
@@ -52,7 +52,7 @@ one mechanism rather than three:
 
 - **Coalescing** is the pause. A thousand changes inside one window are one
   read, because marking something that is already stale is free.
-- **No lost change** is the re-check. Staleness is cleared *before* the read
+- **No lost change** is the re-check. Staleness is cleared _before_ the read
   starts, so anything that arrives during the read marks it again and the thread
   goes round rather than exiting on a status that was already out of date.
 - **No pile-up** is the single thread. At most one read per repository is in
@@ -62,7 +62,7 @@ one mechanism rather than three:
 The subscription never runs git at all. It describes itself from the last read
 and is fed by the thread — which is what keeps a stream's snapshot off the
 critical path of a runtime worker. A subscription opened before any read has
-finished describes itself with *nothing*, because an empty status is a claim
+finished describes itself with _nothing_, because an empty status is a claim
 that the tree is clean rather than an admission that nothing is known yet.
 
 ## Consequences

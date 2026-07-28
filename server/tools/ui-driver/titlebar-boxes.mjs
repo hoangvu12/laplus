@@ -113,10 +113,14 @@ const caption = boxes.boxes.find((b) => b.label === "caption buttons");
 const toggles = boxes.boxes.find((b) => b.label === "panel toggles");
 const trailing = boxes.boxes.find((b) => b.label === "header trailing content");
 if (!caption.missing && !toggles.missing) {
-  console.log(`\ngap, panel toggles → caption buttons: ${toggles.rightEdgeAt - caption.leftEdgeAt}px`);
+  console.log(
+    `\ngap, panel toggles → caption buttons: ${toggles.rightEdgeAt - caption.leftEdgeAt}px`,
+  );
 }
 if (!toggles.missing && !trailing.missing) {
-  console.log(`gap, header content → panel toggles:  ${trailing.rightEdgeAt - toggles.leftEdgeAt}px`);
+  console.log(
+    `gap, header content → panel toggles:  ${trailing.rightEdgeAt - toggles.leftEdgeAt}px`,
+  );
 }
 
 await session.close();

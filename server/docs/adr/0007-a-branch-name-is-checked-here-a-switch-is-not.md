@@ -47,13 +47,13 @@ Two consequences, and they are the reason it is worth writing down:
   `git-check-ref-format`, and copies drift. What it buys is that a name the
   developer typed never becomes an argument — `-rf` never reaches a command
   line as a flag, `main@{yesterday}` never reaches one as a revision — and that
-  the sentence names a *branch name* rather than a ref. The drift risk is
+  the sentence names a _branch name_ rather than a ref. The drift risk is
   bounded because the rules have not changed in a decade and because a name git
   refuses and this accepts still fails, just later and with a worse message.
 - **`crate::git::refusal` keeps whole lines, not the first one.** The status
   read only ever needed the first line, because git's status failures are
   one-liners. A blocked switch is not: its first line names the problem in the
-  abstract and its *last* line is the one worth reading. So the refusal keeps
+  abstract and its _last_ line is the one worth reading. So the refusal keeps
   every non-empty line of stderr, bounded at 20 lines and 2,000 characters —
   a switch blocked by a thousand files must not put a thousand paths in an
   error frame.

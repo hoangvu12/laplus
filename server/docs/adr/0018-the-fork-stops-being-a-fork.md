@@ -49,7 +49,7 @@ first commit and no `upstream` remote:
 - **`packages/ssh` and `packages/tailscale` are dropped.** Nothing in `apps/web`
   or the three contract packages imports them; they served the relay.
 
-Two things are deliberately *not* done:
+Two things are deliberately _not_ done:
 
 - **`@t3tools/*` is still not renamed.** ADR-0012 declined it to protect merges;
   that reason is gone and the conclusion survives on its own. It appears in over
