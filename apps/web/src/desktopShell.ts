@@ -44,8 +44,27 @@ function tauri(): TauriInternals | null {
   return (window as unknown as TauriWindow).__TAURI_INTERNALS__ ?? null;
 }
 
+/**
+ * `isTauri` is Tauri's own, and a boolean rather than a predicate:
+ * `Object.defineProperty(window, 'isTauri', { value: true })` in
+ * `prepare_pending_webview`. `@tauri-apps/api`'s `isTauri()` reads the same
+ * global (`!!globalThis.isTauri`), so importing it would buy a dependency and
+ * no information.
+ *
+ * The `invoke` half is not redundant with it. This flag is read for one
+ * purpose — deciding to draw window controls — and those buttons are useless
+ * without `__TAURI_INTERNALS__`, which is what `invokeWindowCommand` reaches
+ * for. Asking `isTauri` for the claim and `__TAURI_INTERNALS__` for the ability
+ * let the two disagree, and the shape of that disagreement is three buttons
+ * that render correctly and do nothing, silently — the same failure
+ * `invokeWindowCommand` logs a console line to avoid. So the flag is the
+ * conjunction: it means "this page can command its window", not "this page
+ * believes it is Tauri".
+ */
 export const isDesktopShell =
-  typeof window !== "undefined" && (window as unknown as TauriWindow).isTauri === true;
+  typeof window !== "undefined" &&
+  (window as unknown as TauriWindow).isTauri === true &&
+  typeof tauri()?.invoke === "function";
 
 /**
  * Ask the shell to do something to its window.

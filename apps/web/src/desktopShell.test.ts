@@ -28,13 +28,36 @@ afterEach(() => {
 
 describe("isDesktopShell", () => {
   it("is true in a Tauri window, which is the global Tauri injects before any page script", async () => {
-    const { isDesktopShell } = await loadWith({ isTauri: true, __TAURI_INTERNALS__: {} });
+    const { isDesktopShell } = await loadWith({
+      isTauri: true,
+      __TAURI_INTERNALS__: { invoke: () => Promise.resolve() },
+    });
     expect(isDesktopShell).toBe(true);
   });
 
   it("is false in a browser tab", async () => {
     const { isDesktopShell } = await loadWith({});
     expect(isDesktopShell).toBe(false);
+  });
+
+  /**
+   * The two globals are asked one question between them, so they are not
+   * allowed to disagree. A page that claims Tauri without reachable internals
+   * would draw the three buttons and then swallow every click — the one
+   * outcome this gate exists to prevent, and the one with nothing to see.
+   *
+   * `isTauri` is a boolean, not a predicate
+   * (`Object.defineProperty(window, 'isTauri', { value: true })`), so a stray
+   * truthy value does not stand in for it either.
+   */
+  it("is false when the page claims Tauri but its IPC is not reachable", async () => {
+    for (const internals of [undefined, {}, { invoke: "not-callable" }]) {
+      const { isDesktopShell } = await loadWith({
+        isTauri: true,
+        ...(internals === undefined ? {} : { __TAURI_INTERNALS__: internals }),
+      });
+      expect(isDesktopShell).toBe(false);
+    }
   });
 
   /**
