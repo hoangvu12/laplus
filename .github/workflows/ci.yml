@@ -1,0 +1,66 @@
+# The TypeScript half: the UI and the three packages that carry the contract.
+#
+# Linux here, unlike `rust.yml`. Nothing in this half is platform-specific — it
+# is a browser bundle and three libraries — so the cheaper runner is the right
+# one, and the Windows-only reasoning that pins the Rust job does not apply.
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - server/**
+      - .scratch/**
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - server/**
+      - .scratch/**
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # `--frozen-lockfile` is the point of the job as much as the tests are:
+      # the catalog pins `effect` to a beta whose RPC encoding this project's
+      # server decodes by hand, so a lockfile that drifted in CI is a bug
+      # reaching the window rather than a convenience.
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Lint
+        run: pnpm lint
+
+      # Proves the bundle the shell embeds can still be produced. `build.rs`
+      # panics without it, so a break here is a break in `cargo build -p
+      # laplus-shell` that would otherwise only show up on a release machine.
+      - name: Build web bundle
+        run: pnpm build:web

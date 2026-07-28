@@ -1,0 +1,99 @@
+[workspace]
+resolver = "2"
+members = ["crates/laplus-server", "crates/laplus-shell", "xtask"]
+# `cargo build` and `cargo test` with no `-p` build the server and not the shell.
+#
+# The shell embeds `../laplus/apps/web/dist` — a second repository, needing a
+# `pnpm` build of its own. Leaving the shell in the default set would mean a
+# fresh clone could not run the suite at all, which was true when that bundle
+# came from a vendored checkout (ticket 23) and is more true now that it comes
+# from somewhere else entirely (ticket 32). This is how it stays contained: the
+# shell has the dependency because it must, and nothing else inherits it.
+# `cargo build -p laplus-shell` asks for the application and gets a legible
+# failure — with the two commands that fix it — if the bundle is not there.
+#
+# It also keeps the suite quick. The shell pulls in Tauri, which is a thousand
+# crates the server's tests have no use for.
+#
+# `xtask` is in the default set on purpose, unlike the shell: it depends on
+# nothing, and the arithmetic that decides whether this project achieved what it
+# set out to should be checked by the same `cargo test` as everything else.
+default-members = ["crates/laplus-server", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# The only way to hear about a change the app did not make. Default features are
+# kept: everything they add is target-gated to macOS, so on the platform v1 ships
+# they cost nothing, and dropping them would leave a developer running the suite
+# on a Mac without a backend at all.
+notify = "8"
+# Ticket 17: a terminal is a pseudo-terminal or it is nothing. A program only
+# emits colour, redraws a full screen, or asks for the window size when it
+# believes it is talking to a tty, so a pair of pipes would not be a smaller
+# version of this feature — it would be a different one that looks broken. On
+# Windows this is a thin wrapper over ConPTY, which ships with the operating
+# system, so what it costs the artifact is the wrapper and not an emulator.
+portable-pty = "0.9"
+# `bundled` compiles SQLite into the binary. The alternative is linking whatever
+# the machine happens to have, which on Windows is usually nothing — and a
+# desktop app that asks the user to install a database first has given up the
+# thing it exists for. The cost is roughly a megabyte against a 20–30 MB target.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  # Ticket 10: the agent is a long-lived child driven over its stdio, which
+  # needs an async child rather than `std::process` — the server cannot afford a
+  # thread parked on a blocking read for the length of a turn.
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-tungstenite = "0.29"
+
+# What a released artifact is built with, and the settings ticket 24's
+# measurement assumes. Here rather than in the shell's own manifest because
+# cargo reads profiles only from the workspace root — and because the whole
+# artifact is one binary, so tuning it anywhere else would tune half of it.
+#
+# The spike that weighed this (ticket 24's comment, branch `spike/tauri-weight`)
+# measured 2.52 MB for the server under these against 5.83 MB under cargo's
+# defaults. Comparing a tuned binary against an untuned one would have flattered
+# Tauri by 3.3 MB, so both halves are measured under these and both are built
+# with them.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+# `panic = "abort"` is the one setting from that spike deliberately *not* kept,
+# and it is the expensive omission: measured, it costs **1.95 MB** — 24.16 MB
+# against 22.21 MB with it — which is most of what tuning this profile buys back.
+#
+# It is still the right way round. This server does its work in `tokio` tasks:
+# subscription pumps, deferred filesystem calls, terminal readers. Unwinding
+# means a panic in one of those ends that task and the application carries on;
+# aborting means any panic anywhere takes the whole window down instantly,
+# running no destructor, so `Server::shutdown` never happens and the `claude`
+# processes and shells this server started are orphaned — Windows does not reap
+# a child when its parent dies. Trading 1.95 MB of a 30 MB budget for "one bug
+# does not cost the developer their session and leave an agent running" is not a
+# close call. It also keeps `cargo test --release` possible, since the test
+# harness needs to unwind.
+
+[workspace.lints.rust]
+# The server shells out, spawns children and drives a socket; none of that needs
+# `unsafe`. Forbidding it here keeps that true as the workspace grows.
+unsafe_code = "forbid"

@@ -1,0 +1,21 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Tauri. `gen/schemas` is written by `tauri-build` on every build from the
+# capability files beside it, so it is output rather than source.
+crates/laplus-shell/gen/
+
+# Two rules used to live here and are now in the repository root's .gitignore,
+# because what they protect moved out of this directory:
+#
+#   .scratch/wire-capture/raw/   the tickets are at the root now
+#   tools/ui-driver/frames.log   spelled from the root as server/tools/...
+#
+# The first matters: it keeps unredacted proxy recordings, which carry live
+# session tokens, out of a public repository.
+
+# Local
+.env
+.env.local
+.DS_Store

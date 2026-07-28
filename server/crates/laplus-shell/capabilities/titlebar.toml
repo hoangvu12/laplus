@@ -1,0 +1,46 @@
+# What the page is allowed to do to the window it is drawn in. Ticket 27.
+#
+# laplus has no native titlebar (`decorations(false)` in `main.rs`), so the
+# only way to move, maximise, minimise or close the window is the bar the UI
+# draws — `apps/web/src/components/DesktopWindowControls.tsx` for the three
+# buttons, and Tauri's own injected `drag.js` for the `data-tauri-drag-region`
+# attributes on the topbars. Both go through the IPC, and the IPC refuses
+# anything a capability has not granted.
+#
+# **The grant is to a remote origin, and that is not a mistake.** The window is
+# pointed at `http://127.0.0.1:<port>` rather than at Tauri's embedded-asset
+# scheme (ADR-0010, and `laplus_server::ui` for the reasoning), so as far as the
+# IPC is concerned this page is a website — `Origin::Remote`, matched against
+# the URL patterns below rather than against `local`. A capability without a
+# `[remote]` section would grant these commands to an origin this application
+# never loads, and every button would silently do nothing.
+#
+# The port is a wildcard because the port is a choice: `--port` and
+# `LAPLUS_PORT` both move it (`laplus_server::launch`), and a capability naming
+# 4773 would leave a developer who overrode it with a window that cannot be
+# dragged. What is *not* wildcarded is the host, which is the part that matters:
+# only a page served from this machine's loopback interface can move this
+# window. `the_capability_covers_the_origin_the_server_serves` in `main.rs`
+# checks both halves of that against the server's own address.
+identifier = "titlebar"
+description = "Lets laplus's own UI drag, maximise, minimise and close its window."
+windows = ["main"]
+
+permissions = [
+  # Tauri's injected drag script, on `data-tauri-drag-region`. `start_dragging`
+  # is the drag itself; `internal_toggle_maximize` is the double-click, which
+  # is the other half of what a titlebar does and is missed immediately when it
+  # is absent.
+  "core:window:allow-start-dragging",
+  "core:window:allow-internal-toggle-maximize",
+
+  # The three buttons, and the one question they ask: which of its two shapes
+  # the middle one should be drawn as.
+  "core:window:allow-minimize",
+  "core:window:allow-toggle-maximize",
+  "core:window:allow-close",
+  "core:window:allow-is-maximized",
+]
+
+[remote]
+urls = ["http://127.0.0.1:*"]

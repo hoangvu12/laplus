@@ -1,0 +1,36 @@
+{
+  "name": "laplus",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare": "effect-tsgo patch && vp config --no-agent",
+    "dev": "vp run --filter @t3tools/web dev",
+    "dev:server": "cargo run --manifest-path server/Cargo.toml -p laplus-server",
+    "app": "cargo run --manifest-path server/Cargo.toml -p laplus-shell",
+    "build": "vp run --filter './apps/*' --filter './packages/*' --filter './oxlint-plugin-t3code' build",
+    "build:web": "vp run --filter @t3tools/web build",
+    "typecheck": "vp run -r --concurrency-limit 2 typecheck",
+    "tc": "vp run -r --concurrency-limit 2 typecheck",
+    "test": "vp run -r test",
+    "test:server": "cargo test --manifest-path server/Cargo.toml --no-fail-fast",
+    "lint": "vp lint --report-unused-disable-directives",
+    "fmt": "vp fmt",
+    "fmt:check": "vp fmt --check",
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules apps/*/dist packages/*/dist .vite-plus apps/*/.vite-plus packages/*/.vite-plus"
+  },
+  "devDependencies": {
+    "@babel/plugin-transform-react-jsx": "7.28.6",
+    "@effect/tsgo": "catalog:",
+    "@oxlint/plugins": "^1.63.0",
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": "^24.13.1"
+  },
+  "packageManager": "pnpm@11.10.0",
+  "msw": {
+    "workerDirectory": ["apps/web/public"]
+  }
+}
