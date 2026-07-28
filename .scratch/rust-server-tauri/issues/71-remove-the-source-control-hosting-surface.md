@@ -136,19 +136,19 @@ their entries in `refusals.rs`, whose `the_table_is_the_contract` test reads
 
 ## Acceptance criteria
 
-- [ ] The six methods above are gone from `packages/contracts/src/rpc.ts` and
+- [x] The six methods above are gone from `packages/contracts/src/rpc.ts` and
       from `REFUSALS`, and `refusals::tests::the_table_is_the_contract` passes
-- [ ] No UI reaches a git host: no PR checkout, publish, clone, provider
+- [x] No UI reaches a git host: no PR checkout, publish, clone, provider
       discovery, or Commit/Push/Create-PR control
-- [ ] `/settings/source-control` is gone from the route tree and from the
+- [x] `/settings/source-control` is gone from the route tree and from the
       settings sidebar, with no dead link left behind
-- [ ] Local git still works: the branch selector, and file-change indicators over
+- [x] Local git still works: the branch selector, and file-change indicators over
       `subscribeVcsStatus` / `vcs.refreshStatus`
-- [ ] `packages/contracts/src/git.ts` keeps its local-git types
-- [ ] `vcs.createWorktree` / `vcs.removeWorktree` are untouched (ticket 64)
-- [ ] Typecheck, lint and `vp run -r test` are green across all five packages
-- [ ] `pnpm build:web` succeeds
-- [ ] The window opens and a thread still shows its branch —
+- [x] `packages/contracts/src/git.ts` keeps its local-git types
+- [x] `vcs.createWorktree` / `vcs.removeWorktree` are untouched (ticket 64)
+- [x] Typecheck, lint and `vp run -r test` are green across all five packages
+- [x] `pnpm build:web` succeeds
+- [x] The window opens and a thread still shows its branch —
       `server/tools/ui-driver/`, because a green suite is not evidence
 
 ## Comments
