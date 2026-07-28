@@ -92,6 +92,51 @@ touches it. It remains the cheap half — a version check against a source that
 already exists, committing this project to publishing nothing — and can be taken
 alone by whoever picks this up.
 
+### The UI is already written, and neither half of it can currently appear
+
+Checked rather than assumed, because "the pill already exists" is the kind of
+thing that makes this look like a smaller job than it is. **Publishing a release
+lights up nothing on its own.**
+
+**The app-update pill is bridge-driven.** `state/desktopUpdate.ts:27` and
+`sidebar/SidebarUpdatePill.tsx:73` both read `window.desktopBridge` —
+`getUpdateState` and `onUpdateState`, which are Electron preload methods. In
+laplus that object is **always `undefined`**: `laplus-shell` registers no
+`#[tauri::command]` and installs no `invoke_handler`. The absent-bridge path in
+`createDesktopUpdateStateAtom` offers `null` and then `Effect.never`, so the pill
+renders nothing, for ever, no matter what is published.
+
+**The update button is skew-driven, and skew cannot happen.**
+`ServerUpdateAction` is the component that calls `server.updateServer`, and all
+three of its call sites — `ChatView.tsx:1801`, `ConnectionsSettings.tsx:1336`
+and `:2396` — sit inside a `versionMismatch` block. `docs/adr/0011` removed
+version drift by construction: the server reports the version of the UI bundle it
+ships, so client and server always agree. Implementing `server.updateServer` and
+flipping `capabilities.serverSelfUpdate` to true would therefore produce a button
+that never renders.
+
+So self-update needs an **entry point** as well as a mechanism. Two shapes:
+
+1. **Give the window a `desktopBridge`.** A webview initialisation script
+   defining `window.desktopBridge` over `#[tauri::command]`s, backed by
+   `tauri-plugin-updater`. The pill, its states and its restart prompt then work
+   as upstream's do, because that is the interface they were written against.
+   Worth noting for ticket 73's outstanding `desktopBridge` audit: an init script
+   is injected by the webview rather than served by the server, so it _is_ the
+   trusted channel ADR-0019 said the page itself could not be — and a phone
+   browser never receives it, which is the correct answer there anyway.
+2. **Build a laplus-shaped surface** — a Settings row that checks and installs.
+   Less code than a bridge, but it diverges from the UI this fork inherited, and
+   the pill stays dead.
+
+**The provider half has no such problem.** `server.updateProvider`,
+`SidebarProviderUpdatePill`, the settings rows and the launch toast are pure RPC
+and read `ServerProvider.versionAdvisory`, which `provider.rs` deliberately does
+not send today — its module doc says why, and it is right that an absent advisory
+and an `unknown` one render identically. Send a real one and implement the
+method, and already-written UI turns on with no bridge involved. That is another
+reason to take this half first.
+
 ### What is left, in order
 
 1. **Provider advisory** (`server.updateProvider`): laplus already reads the
