@@ -107,6 +107,29 @@ the suite is slow on a loaded machine, `--test-threads` is the lever — raising
 timeout until the machine passes trades a test that fails when it should not for
 one that passes when it should not.
 
+### In CI
+
+`.github/workflows/rust.yml` runs the same `cargo test --no-fail-fast` on
+`windows-latest` for any change under `server/`. It is a **new file rather than a
+job inside upstream's `ci.yml`**, so it cannot conflict on a sync
+(`docs/adr/0012`), and it runs on Windows rather than the cheaper Linux runner
+because that is the only platform laplus ships — a Linux runner would never
+compile the crate's `cfg(windows)` blocks or the ConPTY behind `portable-pty`.
+It gates on the suite only: clippy reports without `-D warnings`, and
+`cargo fmt --check` is absent because this tree has never been rustfmt-formatted
+and fails on all 29 files. Ticket 36.
+
+**The other eight workflows here are upstream's, and this fork has never run
+one.** Actions are enabled, and `gh api repos/hoangvu12/laplus/actions/runs`
+reports zero runs in the repository's whole history — `ci.yml` should have run on
+every PR and did not, most likely because its `blacksmith-8vcpu-ubuntu-2404`
+runner label is unavailable here. Know what that dormancy is holding back before
+changing anything about it: `release.yml` is on a **three-hourly `schedule`**,
+`deploy-relay.yml` fires on any push to `main`, `mobile-eas-preview.yml` on every
+pull request, and `pr-size.yml` and `pr-vouch.yml` are `pull_request_target`, so
+they run with a write token. Most would fail for want of secrets, but they would
+fail continuously.
+
 ## Agent skills
 
 ### Issue tracker

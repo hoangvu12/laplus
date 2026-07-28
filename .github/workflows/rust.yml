@@ -1,0 +1,84 @@
+# The Rust server's test suite. Ticket 36.
+#
+# **A new file rather than a job added to `ci.yml`**, which is upstream's. This
+# repository merges from `pingdotgg/t3code` and `docs/adr/0012` is the standing
+# decision not to take changes that turn a sync into a fight — a file upstream
+# does not have cannot conflict with one it maintains.
+#
+# **Windows, not the cheaper Linux runner.** laplus ships a Windows installer and
+# nothing else, and the crate's `cfg(windows)` blocks — plus the ConPTY behind
+# `portable-pty` and the `panic = "abort"` reasoning in the workspace manifest,
+# which is argued entirely from Windows not reaping orphaned children — are
+# exactly the code a Linux runner would never compile. Testing the platform that
+# ships is worth the slower machine.
+name: Rust
+
+on:
+  pull_request:
+    paths:
+      - server/**
+      - .github/workflows/rust.yml
+  push:
+    branches:
+      - main
+    paths:
+      - server/**
+      - .github/workflows/rust.yml
+
+# A second push to a PR makes the first run pointless. Named per ref so `main`
+# and each PR cancel only themselves.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    # `server/` is the Cargo workspace root — `Cargo.toml`, `.cargo/config.toml`
+    # and `target/` are there rather than at the repository root, so every cargo
+    # command has to run from it.
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      # `--no-fail-fast` because cargo otherwise stops at the first failing
+      # binary, so one failing lib test means no integration binary runs at all
+      # — and the summary then reads like a suite that lost two hundred tests
+      # rather than one that never started them. Ticket 29 is that lesson.
+      #
+      # `cargo test` with no `-p` covers `laplus-server` and `xtask`, which is
+      # what `default-members` is for: `laplus-shell` needs a pnpm build of
+      # `apps/web/dist` and is asked for by name or not at all.
+      - name: Test
+        run: cargo test --no-fail-fast
+
+      # Reports, does not gate. One pre-existing `result_large_err` in
+      # `server.rs` would make `-D warnings` red on arrival, and a check that is
+      # red for reasons unrelated to the change under review is one everybody
+      # learns to ignore. Turn it into a gate once that is dealt with.
+      #
+      # `cargo fmt --check` is deliberately absent: this tree has never been
+      # rustfmt-formatted and fails on all 29 files, so adding it here would be
+      # a reformat of the whole server disguised as a CI change.
+      - name: Clippy
+        run: cargo clippy --all-targets
