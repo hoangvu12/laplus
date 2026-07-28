@@ -119,16 +119,26 @@ It gates on the suite only: clippy reports without `-D warnings`, and
 `cargo fmt --check` is absent because this tree has never been rustfmt-formatted
 and fails on all 29 files. Ticket 36.
 
-**The other eight workflows here are upstream's, and this fork has never run
-one.** Actions are enabled, and `gh api repos/hoangvu12/laplus/actions/runs`
-reports zero runs in the repository's whole history — `ci.yml` should have run on
-every PR and did not, most likely because its `blacksmith-8vcpu-ubuntu-2404`
-runner label is unavailable here. Know what that dormancy is holding back before
-changing anything about it: `release.yml` is on a **three-hourly `schedule`**,
-`deploy-relay.yml` fires on any push to `main`, `mobile-eas-preview.yml` on every
-pull request, and `pr-size.yml` and `pr-vouch.yml` are `pull_request_target`, so
-they run with a write token. Most would fail for want of secrets, but they would
-fail continuously.
+**The other nine workflows here are upstream's, and they are now live.** Until
+ticket 36 this fork had never run a single workflow — Actions enabled,
+`total_count: 0` across the repository's whole history. Pushing to PR #2 ended
+that, and it was the push rather than the new file that did it: `PR Size` and
+`PR Vouch` fire on `pull_request_target`, `Mobile EAS Preview` on every pull
+request, and `CI` on every pull request and every push to `main`.
+
+So the dormancy is spent, and what it was holding back now matters. Two to know
+about, both on triggers nothing here controls:
+
+- **`release.yml` is on a three-hourly `schedule`** as well as `v*.*.*` tags. It
+  builds and publishes releases.
+- **`deploy-relay.yml` fires on any push to `main`**, which includes merging a
+  pull request.
+
+Most will fail for want of secrets, which is noise rather than damage — but it
+is continuous noise, and some of it is attempts to publish. Disabling the ones
+this project does not use (`gh workflow disable`) is the obvious answer and has
+deliberately not been done here: they are upstream's files, and turning them off
+is a decision about this fork rather than a consequence of adding Rust CI.
 
 ## Agent skills
 

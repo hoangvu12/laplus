@@ -132,3 +132,27 @@ to establish and is the reason the "what would I be waking up" table exists.
 The Windows-versus-Linux question is answered in the body rather than left open,
 unlike ticket 35's — the evidence points one way and the cost of being wrong is
 a slower runner, not a divergence this project has to carry forever.
+
+### 2026-07-28 — agent. The dormancy ended on the first push
+
+The body above says the fork had never run a workflow and that adding one would
+not wake the others. The first half was true and is now history; the second was
+true about the _file_ and beside the point about the _push_.
+
+Pushing this ticket's commit to PR #2 started five runs at once — `Rust`,
+`CI`, `Mobile EAS Preview` (skipped), `PR Size` and `PR Vouch` (both green).
+Nothing about `rust.yml` caused that: those four fire on pull-request events and
+would have fired for any push to this branch. Why they had not already fired on
+PR #2's _opening_ is unexplained.
+
+One prediction did survive the test. `CI` went **queued and stayed queued**,
+which is what a job asking for a `blacksmith-8vcpu-ubuntu-2404` runner this fork
+cannot reach looks like. That was offered above as "not confirmed"; it is now
+the best-supported explanation for the whole dormant period.
+
+The practical consequence is the one worth carrying forward: **merging PR #2
+will push to `main`, and `deploy-relay.yml` fires on any push to `main`.**
+`release.yml`'s three-hourly `schedule` is also now live. Neither is this
+ticket's to fix — `gh workflow disable` on the ones this project does not use is
+a decision about the fork, not a consequence of adding Rust CI — but nobody
+should be surprised by it. `server/CLAUDE.md` has been corrected to say so.
