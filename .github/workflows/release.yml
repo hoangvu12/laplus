@@ -1,0 +1,159 @@
+# How a laplus installer reaches somebody who is not the developer.
+#
+# `cargo xtask release` already builds the artifact and weighs it; this is that
+# command run on a machine nobody has touched, with the result attached to a
+# GitHub Release. Windows only, because laplus ships one installer and nothing
+# else.
+#
+# Upstream's `release.yml` is what this borrows its shape from, and most of it
+# does not apply: five platform artifacts, an npm CLI, a Vercel deploy, a relay
+# configuration and a three-hourly nightly cron all belong to a product with a
+# hosted half and a team behind it. What transfers is the useful part — GitHub
+# Releases is the feed, and `softprops/action-gh-release` is what puts files on
+# it. The nightly cron is deliberately not copied: this fork has one maintainer
+# and a scheduled publish is noise with a version number on it.
+#
+# **Nothing here signs the artifact for Windows.** Upstream pays for Azure
+# Trusted Signing; this fork does not, so SmartScreen warns about an unknown
+# publisher on first run — as it already does for an installer built by hand.
+# `docs/adr/0020` records that, and the separate signing key a Tauri updater
+# would need, which is a different key for a different purpose.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # A dispatch builds, tests and measures without publishing anything, so the
+  # pipeline can be exercised without cutting a release nobody wanted.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, measure, publish
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # The tag is checked against the file rather than written into it.
+      # Upstream aligns its package versions to whatever version the release
+      # names, which suits a repository where the tag is the decision; here the
+      # decision is `tauri.conf.json`, because that is the number the installer
+      # and the executable's version resource carry. Rewriting it in CI would
+      # leave the tree and the published artifact permanently disagreeing.
+      #
+      # Note that this is *not* the version laplus reports in the window: that
+      # one is the UI bundle's, deliberately, and `docs/adr/0011` says why. The
+      # two numbers differ on purpose and neither is wrong.
+      - name: Check the tag against the shell's version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          configured=$(node -p "require('./server/crates/laplus-shell/tauri.conf.json').version")
+          tagged="${GITHUB_REF_NAME#v}"
+          if [[ "$configured" != "$tagged" ]]; then
+            echo "Tag $GITHUB_REF_NAME says $tagged; tauri.conf.json says $configured." >&2
+            echo "Bump the file and re-tag, rather than publishing an installer that" >&2
+            echo "reports a version no commit carries." >&2
+            exit 1
+          fi
+          echo "Releasing $configured."
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # `laplus-shell`'s build script embeds this from a fixed path and panics
+      # without it, so the bundle has to exist before any cargo command that
+      # touches the shell — which `cargo xtask release` is.
+      - name: Build web bundle
+        run: pnpm build:web
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      # A tag can point at any commit, and neither `ci.yml` nor `rust.yml` fires
+      # on one — their triggers are pull requests and pushes to `main`. So the
+      # suite runs here, or a release ships code no check has seen.
+      #
+      # The TypeScript suite is deliberately absent: its one known-red test is a
+      # 15-second timeout under parallel load that passes alone, and gating every
+      # release on a flake teaches everybody to re-run the job until it is green,
+      # which is the same as not having the gate. `ci.yml` covers that half on
+      # `main`.
+      - name: Test
+        working-directory: server
+        run: cargo test --no-fail-fast
+
+      # Not a workspace dependency and cannot be one. `Swatinem/rust-cache`
+      # caches `~/.cargo/bin`, so this compiles once per cache generation rather
+      # than once per release.
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      # `--measure-install` installs the artifact, weighs what landed on disk and
+      # uninstalls it. It is opt-in because it touches the machine, and a
+      # disposable runner is the one machine where that costs nothing.
+      #
+      # What it proves is that the installer *runs* on a Windows that has never
+      # seen laplus, and what it actually writes there — half of ticket 24's
+      # clean-machine criterion. What it does not prove is that the application
+      # launches, and it says nothing about the WebView2 bootstrapper: these
+      # images ship the runtime already, so the absent-runtime path stays untested
+      # and unticked.
+      - name: Build, measure, install and weigh
+        working-directory: server
+        run: cargo xtask release --measure-install
+
+      - name: Find the installer
+        id: artifact
+        shell: bash
+        run: |
+          installer=$(ls server/target/release/bundle/nsis/*-setup.exe)
+          echo "installer=$installer" >> "$GITHUB_OUTPUT"
+          echo "Built $installer"
+
+      # Uploaded whether or not this publishes, so a dispatch leaves something
+      # to download and the size report is readable without cutting a release.
+      - name: Upload the installer and the size report
+        uses: actions/upload-artifact@v4
+        with:
+          name: laplus-windows-installer
+          path: |
+            ${{ steps.artifact.outputs.installer }}
+            server/docs/artifact-size.md
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.artifact.outputs.installer }}
+            server/docs/artifact-size.md
+          fail_on_unmatched_files: true

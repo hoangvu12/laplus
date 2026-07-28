@@ -5,7 +5,8 @@
 **What to build:** a decision about update: provider version advisory,
 application self-update, or neither in v1.
 
-**Status:** needs-triage
+**Status:** ready-for-agent — the decision is taken (`docs/adr/0020`); what is
+left is one build. See "Where this stands".
 
 **Found by:** the 2026-07-28 parity audit, ledger M19.
 
@@ -60,3 +61,43 @@ What can be said regardless:
 - Nothing in the UI implies an update mechanism that does not exist.
 - If a version check is added, an unreachable network is not a recurring
   user-visible error.
+
+---
+
+## Where this stands
+
+**The decision is taken and recorded in `docs/adr/0020`**, with ticket 70 rather
+than separately, which is what both tickets asked for.
+
+**The release feed exists.** `.github/workflows/release.yml` publishes a Windows
+installer to a GitHub Release on a `v*.*.*` tag. That removes the reason this
+ticket was hard: "somewhere to update from" is a GitHub Release, which is
+precisely what upstream's own updater reads — their `release.yml` publishes
+electron-updater's `.yml` manifests beside the binaries and has no separate
+hosting behind it. Tauri's updater reads a static JSON manifest the same way.
+
+**Self-update is deferred, not refused.** It is unblocked the moment a first tag
+is pushed, and its remaining cost is one thing: a **minisign keypair** from
+`tauri signer generate`, whose private half the maintainer holds and whose public
+half goes in `tauri.conf.json`. That is not the same signature as Authenticode —
+upstream buys that separately through Azure Trusted Signing, it is what silences
+SmartScreen, and this fork does not have it either way. ADR-0020 separates the
+two, because conflating them is what made this look expensive.
+
+Until it is built, `capabilities.serverSelfUpdate` stays **false**, which is this
+ticket's own standard: it states the truth.
+
+**Provider advisory is still untaken and still independent.** Nothing above
+touches it. It remains the cheap half — a version check against a source that
+already exists, committing this project to publishing nothing — and can be taken
+alone by whoever picks this up.
+
+### What is left, in order
+
+1. **Provider advisory** (`server.updateProvider`): laplus already reads the
+   installed `claude` version for the model table (ticket 09) and never asks what
+   is current. An unreachable network must not become a recurring visible error.
+2. **Application self-update**, after a first release exists: the Tauri updater
+   plugin, the keypair, a manifest asset on the release, `serverSelfUpdate`
+   turned true and `server.updateServer` implemented — in that order, because the
+   capability must not claim what the plugin cannot yet do.

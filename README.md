@@ -34,6 +34,19 @@ pnpm test:server                # the Rust suite (--no-fail-fast)
 rather than at the repository root, so cargo commands run from that directory
 unless you pass `--manifest-path`.
 
+## Releasing it
+
+```sh
+cd server
+cargo xtask release            # builds the Windows installer and weighs it
+```
+
+Pushing a `v*.*.*` tag runs the same thing on CI and attaches the installer to a
+GitHub Release. The tag must match the version in
+`server/crates/laplus-shell/tauri.conf.json`. laplus does not update itself yet,
+and the installer is not code-signed, so Windows will warn about an unknown
+publisher — `server/docs/adr/0020` records both.
+
 ## Layout
 
 | Path       | What it is                                    |

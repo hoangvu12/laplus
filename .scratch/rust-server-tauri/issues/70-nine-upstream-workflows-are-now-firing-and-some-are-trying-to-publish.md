@@ -5,7 +5,7 @@
 **What to build:** a decision about which of upstream's GitHub workflows this fork
 runs.
 
-**Status:** needs-triage
+**Status:** done — overtaken; the premise is false. See "Where this stands".
 
 **Found by:** ticket 36's finding, carried into the 2026-07-28 parity audit ledger
 §5 as live and unticketed. Filing it so it stops being a footnote.
@@ -77,3 +77,35 @@ What can be said regardless:
   unaffected.
 - Whatever is decided is recorded, because the next person to notice a scheduled
   job firing will otherwise re-derive all of this.
+
+---
+
+## Where this stands
+
+**None of the above is true any more, and option 1 is moot.** Checked against the
+GitHub API on 2026-07-29 rather than assumed:
+
+| this ticket says                         | the API says                        |
+| ---------------------------------------- | ----------------------------------- |
+| nine upstream workflows, live            | **two**, `CI` and `Rust`, both ours |
+| `release.yml` on a three-hourly schedule | no `release.yml` in this history    |
+| attempts to publish                      | **zero** releases, **zero** tags    |
+
+`git log --all -- .github/workflows/release.yml` is empty: no commit in this
+repository has ever carried that file. The re-founding commit `2c9487a` left
+upstream's `.github/` behind entirely, and what exists is `ci.yml` and `rust.yml`,
+both written for this project. `deploy-relay.yml`, `mobile-eas-preview.yml`,
+`pr-vouch.yml` and the rest are upstream's and are not here.
+
+So nothing has been firing, nothing has been publishing, and there is nothing to
+disable. **`gh workflow disable` is not needed and would have nothing to act on.**
+
+The acceptance item that could be answered is answered: it is _known_ rather than
+assumed that no scheduled job can publish anything from this fork, because no
+scheduled job exists.
+
+The real question underneath — does this fork publish at all — was taken with
+ticket 66 rather than separately, as this ticket asked for. **`docs/adr/0020`**
+records it, and `.github/workflows/release.yml` is the answer: a Windows
+installer, on a `v*.*.*` tag, and nothing else. `rust.yml` is untouched, which
+was this ticket's third acceptance item.

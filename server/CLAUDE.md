@@ -81,6 +81,10 @@ root, so cargo commands are run from this directory.
   CLI is not a workspace dependency and cannot be one, and the first release
   build downloads NSIS, so a fresh clone needs that command and a network before
   it can produce an installer. Nothing else in the repo needs either.
+  `.github/workflows/release.yml` runs the same command on a Windows runner when
+  a `v*.*.*` tag is pushed, and publishes the installer to a GitHub Release —
+  the tag has to match `tauri.conf.json`'s version or the job refuses. What this
+  fork publishes, and why it does not yet update itself, is `docs/adr/0020`.
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.
