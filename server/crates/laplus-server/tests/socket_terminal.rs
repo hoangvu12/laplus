@@ -116,13 +116,25 @@ async fn resizing_a_terminal_resizes_the_pty_the_shell_is_running_in() {
     open(&mut client, &workspace, 97, 24).await;
     let mut pane = Pane::attach(&mut client, THREAD, TERMINAL, json!({})).await;
 
+    // Waited for by reading the answer, not by waiting for a marker and then
+    // reading. There was a `size_marker()` here whose Windows branch was
+    // `"Columns:"` and whose Linux branch was a single space — and a space
+    // arrives with the shell's own prompt, so on Linux this returned before
+    // `stty size` had printed anything and the assertion below read `$ `. The
+    // second half of this test already had the right shape; the first half now
+    // matches it.
     pane.run(&mut client, &report_size()).await;
-    pane.wait_for(&mut client, size_marker()).await;
-    assert!(
-        reported_size(&pane.text(), 97, 24),
-        "the shell did not see the size it was opened at:\n{}",
-        pane.text()
-    );
+    loop {
+        pane.pump(&mut client).await;
+        if reported_size(&pane.text(), 97, 24) {
+            break;
+        }
+        assert!(
+            pane.text().len() < 100_000,
+            "the shell did not see the size it was opened at:\n{}",
+            pane.text()
+        );
+    }
 
     pane.resize(&mut client, 131, 40).await.expect_success();
     let before = pane.text().len();
@@ -377,11 +389,21 @@ async fn a_flood_of_output_neither_stalls_the_socket_nor_loses_the_terminal() {
     pane.run(&mut client, &flood()).await;
     pane.wait_for(&mut client, "flood-finished").await;
 
-    // The connection is still the connection: a plain call is answered, and
-    // the terminal still takes commands.
-    assert_eq!(client.ping().await, json!({"_tag": "Pong"}));
+    // The connection is still the connection: the terminal still takes
+    // commands, and a plain call is answered.
+    //
+    // **In that order, and the order is the point.** The terminal's feed is
+    // ack-gated — `Pane::pump` acks each chunk it reads — so pinging first only
+    // worked on Windows, where ConPTY delivers the flood in small enough pieces
+    // that it has drained by the time the ping goes out. On Linux the tail is
+    // still queued, and a `Ping` sent into that gets a chunk back rather than
+    // its `Pong`. Draining through the pane first is not a workaround: it is
+    // the client half of the flow control this test is driving, and reading
+    // frames off the socket without acking them (which is what an earlier
+    // attempt at this did) stalls the feed by design rather than by fault.
     pane.run(&mut client, &echo("still-here")).await;
     pane.wait_for(&mut client, "still-here").await;
+    assert_eq!(client.ping().await, json!({"_tag": "Pong"}));
 
     client.close().await;
     server.stop().await;
@@ -579,11 +601,3 @@ fn flood() -> String {
     }
 }
 
-/// A string `report_size` prints on the way to the numbers, so a test can wait
-/// for the command to have run before reading them.
-fn size_marker() -> &'static str {
-    match cfg!(windows) {
-        true => "Columns:",
-        false => " ",
-    }
-}

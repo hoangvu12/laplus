@@ -1176,6 +1176,10 @@ impl SocketClient {
     }
 
     /// `Ping` and the `Pong` that answers it.
+    ///
+    /// Strict: the `Pong` must be the *next* frame. Every caller but one wants
+    /// that, because a pong arriving behind unexpected traffic is worth
+    /// failing on.
     pub async fn ping(&mut self) -> Value {
         self.send(json!({"_tag": "Ping"})).await;
         self.recv().await

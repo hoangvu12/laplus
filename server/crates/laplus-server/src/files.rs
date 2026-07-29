@@ -581,12 +581,26 @@ mod tests {
     }
 
     /// The tree hands back forward slashes; a user's keyboard and the
-    /// filesystem underneath may not. All three name the same file.
+    /// filesystem underneath may not. Each spelling here names the same file.
+    ///
+    /// **The backslash is Windows-only, and that is a statement about paths
+    /// rather than about test coverage.** A backslash separates directories on
+    /// Windows; everywhere else it is a perfectly legal *character in a
+    /// filename*. So `src\lib\util.rs` names this file on one platform and a
+    /// single differently-named file on the other — and a server that treated
+    /// it as a separator off Windows would make any file whose name contains a
+    /// backslash unreadable. Asserting it on Linux was asserting the wrong
+    /// thing, which is what running this suite there first showed.
     #[test]
     fn a_path_is_accepted_in_whichever_separator_it_arrives_with() {
         let directory = project(&[("src/lib/util.rs", "pub fn go() {}\n")]);
 
-        for spelling in ["src/lib/util.rs", r"src\lib\util.rs", "./src/lib/util.rs"] {
+        let mut spellings = vec!["src/lib/util.rs", "./src/lib/util.rs"];
+        if cfg!(windows) {
+            spellings.push(r"src\lib\util.rs");
+        }
+
+        for spelling in spellings {
             let result = read(directory.path(), spelling).expect(spelling);
             assert_eq!(result["relativePath"], "src/lib/util.rs", "{spelling}");
         }
@@ -647,12 +661,17 @@ mod tests {
         let outside = directory.path().parent().expect("a parent").join("secret.txt");
         std::fs::write(&outside, "not mine").expect("writes the file");
 
-        for escape in [
-            "../secret.txt",
-            r"..\secret.txt",
-            "src/../../secret.txt",
-            ".",
-        ] {
+        // The backslash climb is a climb on Windows and an ordinary filename
+        // anywhere else — see the separator test above. The three that are
+        // climbs on *every* platform are asserted on every platform, so what
+        // this test exists to protect is not weakened by leaving it out: a real
+        // `../` escape is refused on Linux, which is the thing worth knowing.
+        let mut escapes = vec!["../secret.txt", "src/../../secret.txt", "."];
+        if cfg!(windows) {
+            escapes.push(r"..\secret.txt");
+        }
+
+        for escape in escapes {
             let error = read(directory.path(), escape).expect_err(escape);
             assert_eq!(error["_tag"], "ProjectReadFileError", "{escape}");
             assert_eq!(error["failure"], "workspace_path_outside_root", "{escape}");

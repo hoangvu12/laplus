@@ -255,9 +255,49 @@ laplus's:
    checking before the guard is trusted cross-platform.
 4. **The pty.** `resizing_a_terminal_resizes_the_pty_the_shell_is_running_in`
    fails with "the shell did not see the size it was opened at" and a bare `$ `
-   captured. Undiagnosed. This is the risk named at the top of this ticket —
-   "the feature most likely to behave differently, and the one the suite can
-   only partly speak for" — and it is the one finding with real product risk.
+   captured. This was called "the one finding with real product risk" when it
+   was still undiagnosed, and it was not: `size_marker()`'s non-Windows branch
+   was a single space, and a space arrives with the shell's own prompt, so the
+   assertion read the prompt before `stty size` had printed. **The pty works on
+   Linux** — the resize really does reach the shell. Recorded because the wrong
+   guess is worth as much as the right one here: three of the four causes above
+   were tests, not code.
+
+## Where the 60 went
+
+**60 → 3**, and the three that remain are listed below rather than summarised,
+because two of them are open questions.
+
+- **40** were git 2.25 on the box. Upgraded to 2.50.1; gone.
+- **11** were one bug in two copies: `FakeAgent::reporting` and `provider`'s own
+  `Fake::reporting` wrote `echo 2.1.220 (Claude Code)` into a `#!/bin/sh`
+  script, where a bare `(` opens a subshell and dash refuses the line. Every
+  test built on those fakes was exercising a _failing_ binary while claiming to
+  exercise a reporting one — worse than a failure, because it passed on Windows
+  and lied everywhere else.
+- **4** were the `files` and `provider` platform assumptions above. The
+  backslash cases are Windows-only now; `../secret.txt` and
+  `src/../../secret.txt` stay asserted everywhere **and pass on Linux**, which
+  answers the question left open above: a real traversal _is_ refused there.
+- **2** were the pty marker and the terminal flood's pong ordering.
+
+### The three still failing on Linux
+
+1. **`a_file_written_outside_the_server_is_reported_relative_to_its_workspace`**
+   — the inotify new-subdirectory gap, deferred deliberately. Its own ticket.
+2. **`a_call_that_names_no_size_does_not_resize_the_terminal`** — **flaky**, not
+   constant: three runs in isolation gave FAILED, FAILED, ok, each in 0.02s,
+   which is far too fast for a test that opens a pty. Undiagnosed. A test that
+   fails two runs in three is worse than one that always does, because it will
+   be re-run until it passes and then believed.
+3. **`a_session_that_ends_holding_a_question_closes_it`** — **deterministic**,
+   and the one most likely to be a real fault. The scripted agent reaches
+   `DIES`, the server logs `claude: FATAL ERROR: the agent went away`, and then
+   nothing arrives for 60 seconds. What the test is protecting is stated in its
+   own doc comment: a question left open when the agent dies makes the composer
+   "unusable for the life of the conversation and across every restart after
+   it". If the server does not close that question on Linux, that is a product
+   bug and not a test one. **Undiagnosed — do not assume either way.**
 
 **The watcher deadlock, because it is the one that would have shipped.**
 `a_released_workspace_is_no_longer_watched` did not fail on Linux, it **hung**,

@@ -944,8 +944,19 @@ mod tests {
         }
 
         /// A binary that reports `version` the way the real one does.
+        ///
+        /// **The parentheses have to be quoted for `sh` and must not be for
+        /// `cmd`.** `(Claude Code)` is part of what the real CLI prints, so it
+        /// cannot just be dropped — and left bare in a `#!/bin/sh` script it is
+        /// not output at all but a subshell, which dash refuses outright:
+        /// `Syntax error: "(" unexpected`, exit status 2. Every test using this
+        /// fake therefore saw a *failing* binary rather than a reporting one.
+        /// `cmd` has no such rule and would print the quotes as text.
         fn reporting(version: &str) -> Fake {
-            Fake::saying(&format!("echo {version} (Claude Code)"))
+            Fake::saying(&match cfg!(windows) {
+                true => format!("echo {version} (Claude Code)"),
+                false => format!("echo \"{version} (Claude Code)\""),
+            })
         }
 
         /// A binary that takes about a second to say anything, and then says
@@ -962,7 +973,8 @@ mod tests {
         fn dawdling() -> Fake {
             Fake::saying(match cfg!(windows) {
                 true => "ping -n 2 127.0.0.1 >nul\r\necho 9.9.9 (Claude Code)",
-                false => "sleep 1\necho 9.9.9 (Claude Code)",
+                // Quoted for the same reason [`Fake::reporting`] quotes.
+                false => "sleep 1\necho \"9.9.9 (Claude Code)\"",
             })
         }
 
@@ -1048,7 +1060,14 @@ mod tests {
     #[test]
     fn a_configured_path_that_is_gone_falls_back_to_path() {
         let fake = Fake::reporting("2.1.220");
-        let stale = fake.directory.path().join("moved").join("claude.cmd");
+        // Named the way this platform names the binary — `Fake::path` already
+        // knows, and hardcoding `claude.cmd` meant the fallback searched `PATH`
+        // for a file by that name and, off Windows, correctly failed to find it.
+        let stale = fake
+            .directory
+            .path()
+            .join("moved")
+            .join(fake.path().file_name().expect("a file name"));
 
         assert_eq!(
             resolve(&stale.to_string_lossy(), &fake.on_path()),

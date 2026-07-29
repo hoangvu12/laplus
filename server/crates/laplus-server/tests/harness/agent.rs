@@ -27,8 +27,19 @@ pub struct FakeAgent {
 impl FakeAgent {
     /// A binary that reports `version` the way the real one does —
     /// `2.1.220 (Claude Code)`, the version followed by the product name.
+    ///
+    /// **Quoted for `sh`, bare for `cmd`.** A bare `(` in a `#!/bin/sh` script
+    /// opens a subshell rather than printing, and dash refuses the line outright
+    /// — `Syntax error: "(" unexpected`, exit status 2. Every test built on this
+    /// fake was therefore exercising a *failing* binary on Linux while claiming
+    /// to exercise a reporting one, which is a worse outcome than failing. `cmd`
+    /// has no such rule and would print the quotes as text; the two other places
+    /// in this file that write this string already escape it each way.
     pub fn reporting(version: &str) -> FakeAgent {
-        FakeAgent::saying(&format!("echo {version} (Claude Code)"))
+        FakeAgent::saying(&match cfg!(windows) {
+            true => format!("echo {version} (Claude Code)"),
+            false => format!("echo \"{version} (Claude Code)\""),
+        })
     }
 
     /// A binary that exits non-zero, like an install whose runtime is broken.
