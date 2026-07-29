@@ -43,6 +43,7 @@
     "output_tokens": 4
   },
   "context_window": 1000000,
+  "total_processed_tokens": 27406,
   "unknown_events": 0,
   "parse_errors": 0
 }

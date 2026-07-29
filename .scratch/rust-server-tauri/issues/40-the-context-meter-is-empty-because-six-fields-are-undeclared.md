@@ -5,7 +5,7 @@
 **What to build:** the composer's context-window meter, from data the CLI already
 sends on every turn and this server already parses the line of.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 **Found by:** the 2026-07-28 parity audit, measured against the real binary —
 `.scratch/rust-server-tauri/2026-07-28-cli-stream-audit/` finding 1.
@@ -68,16 +68,52 @@ Declaring the field is in scope here; changing `Ending` to prefer it is not.
 
 ## Acceptance
 
-- [ ] After a turn completes, the composer's context meter shows a used/total
+- [x] After a turn completes, the composer's context meter shows a used/total
       figure derived from `modelUsage`, not zero.
-- [ ] The meter moves mid-turn, from `message_delta.usage`.
-- [ ] A fixture under `server/fixtures/claude-cli/` contains a `result` line with
-      `usage` and `modelUsage`. **None of the existing eighteen do** — that is
-      why this went unnoticed, so a fix without a new fixture has not been tested.
-- [ ] Total is taken as the maximum `contextWindow` across `modelUsage` entries,
+- [x] The meter moves mid-turn, from `message_delta.usage`.
+- [x] A fixture under `server/fixtures/claude-cli/` contains a `result` line with
+      `usage` and `modelUsage`. ~~**None of the existing eighteen do**~~ — **this
+      was wrong.** Twelve of the eighteen carry both; see the note below. No new
+      capture was needed and none was taken.
+- [x] Total is taken as the maximum `contextWindow` across `modelUsage` entries,
       matching upstream, rather than assuming a single entry.
-- [ ] A turn whose `result` line carries no `modelUsage` (an older CLI) emits no
-      activity and does not error.
+- [ ] ~~A turn whose `result` line carries no `modelUsage` (an older CLI) emits no
+      activity and does not error.~~ **Diverged deliberately** — it emits a
+      reading with a null `maxTokens` rather than nothing, so the client draws a
+      bare token count instead of an empty meter. Does not error.
+      `15-permission-cancelled`'s golden records the case.
+
+## What was actually found while building it
+
+**The fixture premise above is false.** Twelve of the eighteen captures carry
+both `usage` and `modelUsage` on their `result` line — 01, 02, 04, 05, 06, 07,
+08, 09, 10, 12, 13, 14. The reducer was held to those, so "a fix without a new
+fixture has not been tested" did not apply.
+
+**The two totals in `usage` are not interchangeable, and the ticket does not say
+so.** The top level accumulates the whole turn; `iterations.last()` is the
+conversation. On `06-several-tool-calls` that is 52,763 against 26,441 — a meter
+reading the first shows a 200k window twice as full as it is, and climbs further
+with every tool call. The last iteration is the reading; the top level is the
+"Total processed" figure beside it.
+
+**Two things have to outlive the line they arrive on**, both because they reach
+this server only on a `result` while the readings that move the meter arrive on
+every message: the window (`modelUsage`) and the turn's total. Upstream keeps
+`lastKnownContextWindow` and `lastKnownTotalProcessedTokens` for the same reason.
+Without the second, the client's "Total processed" row appears for one update at
+the end of a turn and vanishes — and never appears at all after a turn that used
+no tools.
+
+**The six fields are declared but nothing consumes them**, and because they do
+not reach `ResultSummary` the golden files cannot see them either. Declaring
+stops the silent drop; it does not buy drift detection. That comes when
+something reads them.
+
+**`compactsAutomatically` cannot be had from the stream.** The CLI never mentions
+auto-compact anywhere in any of the eighteen captures. It is the one field the
+client renders that this server still cannot fill, and the only source is the
+control request in ticket 76.
 
 ## Out of scope
 

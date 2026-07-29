@@ -776,14 +776,18 @@ impl ResultEvent {
         // and the last one therefore *is* the conversation. The top level is the
         // turn's running total, which counts the same context once per tool call.
         let active = usage.iterations.last().unwrap_or(&usage.counts);
-        let mut reading = active.reading(self.context_window().or(known_window))?;
-        // Everything the turn processed, and only when it exceeds what the
-        // conversation is carrying — otherwise it is the same number twice.
-        reading.total_processed_tokens = usage
-            .counts
-            .total()
-            .filter(|total| *total > reading.used_tokens);
-        Some(reading)
+        // `total_processed_tokens` is left for the session to stamp — see
+        // [`SessionState::remembering`]. It outlives the line it arrived on.
+        active.reading(self.context_window().or(known_window))
+    }
+
+    /// Everything this turn processed, tool iterations included.
+    ///
+    /// The top level of `usage` rather than its last iteration: this is the one
+    /// place the *sum* is wanted rather than the conversation, because it is the
+    /// question "what did this turn cost" instead of "how full is the window".
+    pub fn total_processed(&self) -> Option<u64> {
+        self.usage.as_ref().and_then(|usage| usage.counts.total())
     }
 
     /// The largest window any model on this turn was running with.
@@ -860,6 +864,17 @@ pub struct SessionState {
     /// The reference server keeps the same thing for the same reason —
     /// `lastKnownContextWindow` in `ClaudeAdapter.ts`.
     pub context_window: Option<u64>,
+    /// What the last turn processed in total, remembered for the same reason the
+    /// window is: it arrives only on a `result`, and the readings that move the
+    /// meter in between arrive on every message.
+    ///
+    /// Without this the client's "Total processed" row appears for one reading
+    /// at the end of a turn and vanishes again — and never appears at all after
+    /// a turn that used no tools, where the total equals what the conversation
+    /// is carrying. `lastKnownTotalProcessedTokens` in `ClaudeAdapter.ts`, which
+    /// is likewise the *last* turn's figure carried forward rather than a sum
+    /// over the session.
+    pub total_processed_tokens: Option<u64>,
 
     /// Protocol-drift telemetry: event types we did not recognize.
     pub unknown_events: usize,
@@ -1003,6 +1018,24 @@ impl SessionState {
         *self.counts.entry(key.to_string()).or_insert(0) += 1;
     }
 
+    /// A fresh reading, with what the session already knows written onto it.
+    ///
+    /// Only the total belongs here: the window is folded in earlier, when the
+    /// reading is built, because it *changes the reading* — `used_tokens` is
+    /// clamped to it. The total changes nothing and is carried alongside, which
+    /// is why it can be stamped afterwards and why every reading gets it rather
+    /// than only the one that happened to arrive with it.
+    ///
+    /// Dropped when it does not exceed what the conversation is carrying, which
+    /// is the client's own rule for showing the row at all: the same number
+    /// twice tells a reader nothing.
+    fn remembering(&self, mut reading: TokenUsage) -> TokenUsage {
+        reading.total_processed_tokens = self
+            .total_processed_tokens
+            .filter(|total| *total > reading.used_tokens);
+        reading
+    }
+
     /// Fold one raw NDJSON line, malformed ones included.
     ///
     /// This is the entry point a stdio pump wants: a blank line is nothing (the
@@ -1103,7 +1136,8 @@ impl SessionState {
                     let window = self.context_window;
                     let reading = usage
                         .filter(|counts| counts.input() > 0)
-                        .and_then(|counts| counts.reading(window));
+                        .and_then(|counts| counts.reading(window))
+                        .map(|reading| self.remembering(reading));
                     if reading.is_some() {
                         self.token_usage = reading;
                     }
@@ -1131,7 +1165,8 @@ impl SessionState {
                     .message
                     .usage
                     .as_ref()
-                    .and_then(|usage| usage.reading(window));
+                    .and_then(|usage| usage.reading(window))
+                    .map(|reading| self.remembering(reading));
                 if reading.is_some() {
                     self.token_usage = reading;
                 }
@@ -1172,15 +1207,21 @@ impl SessionState {
                 self.bump("result");
                 self.streaming = false;
                 let error = r.complaint();
-                let token_usage = r.token_usage(self.context_window);
-                // Remembered before the reading is stored, so the next turn's
-                // mid-turn readings have a window to measure against. A `result`
-                // that carried no `modelUsage` leaves the last known one alone
-                // rather than forgetting it — `fixtures/claude-cli/15` is one,
+                // Both remembered *before* the reading is taken, so this turn's
+                // own figures reach this turn's reading and the next turn's
+                // mid-turn readings have something to measure against. A
+                // `result` that carried neither leaves the last known ones alone
+                // rather than forgetting them — `fixtures/claude-cli/15` is one,
                 // and forgetting would drop the meter to a bare token count.
                 if let Some(window) = r.context_window() {
                     self.context_window = Some(window);
                 }
+                if let Some(total) = r.total_processed() {
+                    self.total_processed_tokens = Some(total);
+                }
+                let token_usage = r
+                    .token_usage(self.context_window)
+                    .map(|reading| self.remembering(reading));
                 // Kept only when this line said something. A turn that failed
                 // before the API was reached reports zeroes, and letting those
                 // through would blank a meter the previous turn had filled in.
@@ -2269,6 +2310,77 @@ mod tests {
         assert_eq!(
             state.token_usage.expect("a reading").used_tokens,
             30_005
+        );
+    }
+
+    /// What a turn processed outlives the line it arrived on.
+    ///
+    /// The client draws a "Total processed" row from it, and the figure reaches
+    /// this server only on a `result` — so a reading that carried only its own
+    /// would show the row for one update at the end of a turn and drop it again
+    /// on the next message. Upstream keeps `lastKnownTotalProcessedTokens` for
+    /// exactly this, and the row is otherwise absent on a turn that used no
+    /// tools, where the total equals what the conversation is carrying.
+    #[test]
+    fn what_a_turn_processed_is_carried_onto_the_readings_after_it() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 26_000,
+                    "output_tokens": 41,
+                    "iterations": [
+                        { "input_tokens": 10, "cache_read_input_tokens": 12_000, "output_tokens": 20 },
+                        { "input_tokens": 10, "cache_read_input_tokens": 26_000, "output_tokens": 41 },
+                    ],
+                },
+                "modelUsage": { "claude-opus-5": { "contextWindow": 200_000 } },
+            })
+            .to_string(),
+        );
+        assert_eq!(state.total_processed_tokens, Some(26_051));
+
+        // The next turn's first message. It says nothing about totals, and the
+        // row survives anyway.
+        state.fold_line(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "on it" }],
+                    "usage": { "input_tokens": 10, "cache_read_input_tokens": 3_000, "output_tokens": 5 },
+                },
+            })
+            .to_string(),
+        );
+        let carried = state.token_usage.clone().expect("a reading");
+        assert_eq!(carried.used_tokens, 3_015);
+        assert_eq!(carried.total_processed_tokens, Some(26_051));
+
+        // Until the conversation grows past it, at which point the row would be
+        // the same number twice and the client drops it — so this server stops
+        // sending it rather than leaving a figure that says nothing.
+        state.fold_line(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "still going" }],
+                    "usage": { "input_tokens": 10, "cache_read_input_tokens": 90_000, "output_tokens": 5 },
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            state
+                .token_usage
+                .expect("a reading")
+                .total_processed_tokens,
+            None
         );
     }
 
