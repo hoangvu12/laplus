@@ -136,13 +136,26 @@ one that passes when it should not.
 
 ### In CI
 
-`.github/workflows/rust.yml` runs `cargo test --no-fail-fast` on
-`windows-latest` for any change under `server/`. Windows rather than the cheaper
-Linux runner because that is the only platform laplus ships — a Linux runner
-would never compile the crate's `cfg(windows)` blocks or the ConPTY behind
-`portable-pty`. It gates on the suite only: clippy reports without
-`-D warnings`, and `cargo fmt --check` is absent because this tree has never
-been rustfmt-formatted and fails on all 29 files. Ticket 36.
+`.github/workflows/rust.yml` runs `cargo test --no-fail-fast` for any change
+under `server/`, on **two runners**:
+
+- **`windows-latest`**, the whole default set — `laplus-server` and `xtask`.
+  This is the platform laplus installs on, and the only one that exercises the
+  crate's `cfg(windows)` blocks or the ConPTY behind `portable-pty`.
+- **`ubuntu-latest`**, `-p laplus-server` only. Added by ticket 05 of the
+  headless-Linux effort, because every `#[cfg(not(windows))]` twin in the crate
+  had been written and never compiled. `xtask` is left out on purpose: it builds
+  and measures a Windows installer, so its tests on Linux would be a second
+  opinion about string constants.
+
+`fail-fast: false`, so one platform going red still leaves the other's answer.
+It gates on the build and the suite only: clippy reports without `-D warnings`,
+and `cargo fmt --check` is absent because this tree has never been
+rustfmt-formatted and fails on all 29 files. Tickets 36 and 05.
+
+**What CI does not cover is the application on Linux.** No hand-driven session
+has run there — see `docs/running-headless.md`, which also carries the build
+prerequisites (a C compiler, for `rusqlite`'s bundled SQLite).
 
 **There are two workflows in this repository and both are ours** — `rust.yml`
 and `ci.yml`, the latter covering `apps/web` and the three packages on Linux.

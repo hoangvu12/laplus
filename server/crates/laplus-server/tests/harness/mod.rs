@@ -37,6 +37,7 @@ use laplus_server::config::ServerConfig;
 use laplus_server::config_store::ConfigChange;
 use laplus_server::config::ProviderState;
 use laplus_server::process::Search;
+use laplus_server::remote_access::RemoteAccess;
 use laplus_server::store::Database;
 use laplus_server::threads::Reconciliation;
 use laplus_server::ui::Assets;
@@ -184,7 +185,13 @@ impl TestServer {
     /// how "settings survive a restart" is driven without a second process —
     /// the same shape as [`TestServer::start_at`] for the registry.
     pub async fn start_configured_in(preferences: &Path) -> TestServer {
-        let mut config = ServerConfig::detect_in(preferences.to_path_buf());
+        // `detect_in` reads `remote-access.json` from the directory it is
+        // given, which here is a temporary one — so this arrives loopback-only
+        // already, unlike the `detect` path in `start_on`. Said rather than
+        // relied upon: the two entry points must agree about this, and the one
+        // that gets it for free is the one where that is easiest to miss.
+        let mut config = ServerConfig::detect_in(preferences.to_path_buf())
+            .with_remote_access(RemoteAccess::none());
         somewhere_that_is_not_the_developers(&mut config);
         let server =
             Server::bind_with(0, config, Database::in_memory().expect("a database"), Assets::none())
@@ -243,13 +250,26 @@ impl TestServer {
     /// [`TestServer`]'s own field: this is the seam that keeps the suite off the
     /// developer's real `settings.json`, and it is here rather than at each call
     /// site so that a test added later cannot forget it.
+    ///
+    /// The exposure switch is overwritten for the same reason, and it was not
+    /// until ticket 05 of the headless-Linux effort — `tests/http_boot.rs` has
+    /// the account of what that cost and now asserts it cannot recur.
+    ///
+    /// Through [`ServerConfig::with_remote_access`] rather than the field, so
+    /// that `auth.policy` — which is derived from the bind address — is settled
+    /// with it. Assigning the field alone left a loopback server advertising
+    /// `remote-reachable`. A test server listens on loopback: it is one process
+    /// talking to itself, and nothing in this suite wants a second machine to
+    /// reach it.
     async fn start_on(
         config: Option<ServerConfig>,
         database: Database,
         assets: Assets,
     ) -> TestServer {
         let preferences = tempfile::tempdir().expect("a temporary directory");
-        let mut config = config.unwrap_or_else(ServerConfig::detect);
+        let mut config = config
+            .unwrap_or_else(ServerConfig::detect)
+            .with_remote_access(RemoteAccess::none());
         config.preferences = preferences.path().to_path_buf();
         somewhere_that_is_not_the_developers(&mut config);
 

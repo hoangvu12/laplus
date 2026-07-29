@@ -396,12 +396,7 @@ impl ServerConfig {
         // (`ConnectionsSettings.tsx:3022`). The bound address has no such
         // problem: a socket cannot move under a running server, so what is
         // read here at startup is still true for as long as the value lives.
-        let policy = if crate::remote_access::is_remote_reachable_host(remote_access.bind_address())
-        {
-            "remote-reachable"
-        } else {
-            "loopback-browser"
-        };
+        let policy = policy_for(&remote_access);
         ServerConfig {
             remote_access,
             preferences: data_dir.clone(),
@@ -509,6 +504,25 @@ impl ServerConfig {
         self
     }
 
+    /// Change where this server is willing to be reached from.
+    ///
+    /// **The policy travels with it**, which is the whole reason this is a
+    /// method rather than an assignment to a public field. `auth.policy` is
+    /// *derived* from the bind address — see [`ServerConfig::detect_in`] — so a
+    /// caller that set `remote_access` on its own would leave the descriptor
+    /// describing the reachability the config no longer has. That is not
+    /// hypothetical: the test harness did exactly that, and a server bound to
+    /// loopback went on advertising `remote-reachable` to every client that
+    /// asked. Two fields, one decision, one place that can make it.
+    pub fn with_remote_access(
+        mut self,
+        remote_access: crate::remote_access::RemoteAccess,
+    ) -> ServerConfig {
+        self.auth.policy = policy_for(&remote_access);
+        self.remote_access = remote_access;
+        self
+    }
+
     pub fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("server config serializes")
     }
@@ -543,10 +557,77 @@ pub(crate) fn data_dir() -> PathBuf {
     PathBuf::from(".laplus")
 }
 
+/// Whether a client reaching this server could have come from another machine,
+/// which is what the auth descriptor's `policy` reports.
+///
+/// Settled from the *bind host* — [`ServerConfig::detect_in`] carries the full
+/// reasoning, and [`ServerConfig::with_remote_access`] is why it is a function
+/// rather than four lines inside that constructor: two callers settling this
+/// two ways is the drift the method exists to prevent.
+fn policy_for(remote_access: &crate::remote_access::RemoteAccess) -> &'static str {
+    if crate::remote_access::is_remote_reachable_host(remote_access.bind_address()) {
+        "remote-reachable"
+    } else {
+        "loopback-browser"
+    }
+}
+
+/// What this machine calls itself, for the `environment.label` the UI shows
+/// beside the connection.
+///
+/// Three sources, in the order of how much each knows about *this* box.
+/// `COMPUTERNAME` is set by Windows for every process. `HOSTNAME` is asked
+/// second and is nearly always absent off Windows — bash sets it as a *shell*
+/// variable and does not export it, so a server started by systemd, by Docker,
+/// or over `ssh host cmd` never sees it. That left `/etc/hostname`, added by
+/// ticket 05 of the headless-Linux effort: without it every headless laplus
+/// answered `"laplus"`, and a user pairing a phone against three of them would
+/// have been shown one name three times.
 fn machine_label() -> String {
     non_empty_env("COMPUTERNAME")
         .or_else(|| non_empty_env("HOSTNAME"))
+        .or_else(configured_hostname)
         .unwrap_or_else(|| "laplus".to_string())
+}
+
+/// What `hostname(1)` reads, when there is such a file to read.
+///
+/// [`None`] rather than an error on a machine that has none: the caller has a
+/// fallback, and this is a label the UI shows rather than anything load-bearing.
+///
+/// Windows returns early — it names the machine through `COMPUTERNAME`, and a
+/// bare `/etc/hostname` there would resolve against the current drive root, a
+/// path this has no business reading.
+///
+/// `cfg!` rather than a `#[cfg]` twin, which is the split this crate already
+/// makes: the attribute is for a body that *cannot* compile on the other
+/// platform — the symlink helpers in [`crate::files`], the console flag in
+/// [`crate::process`] — and `cfg!` is for a body that compiles anywhere and
+/// only needs the answer to differ, as in [`crate::editor`] and
+/// [`crate::projects`]. Nothing below is platform-specific, so there is nothing
+/// to gate out; and a body that is compiled on both runners is a body both
+/// runners type-check.
+fn configured_hostname() -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
+    hostname_in(&std::fs::read_to_string("/etc/hostname").ok()?)
+}
+
+/// The name inside `/etc/hostname`, separated from the read so the parsing can
+/// be tested without a filesystem — and so it can be tested at all on the
+/// platform this suite has always run on, which has no such file.
+///
+/// `hostname(5)` describes a configuration file rather than a value: one
+/// newline-terminated name, with `#` comments and blank lines ignored. A file
+/// with no name in it answers [`None`] and the caller falls through, which is
+/// the difference between a machine that did not say and one called "".
+fn hostname_in(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -727,5 +808,81 @@ mod tests {
         assert!(capabilities.get("connectionProbe").is_none());
         assert!(capabilities.get("threadSettlement").is_none());
         assert!(capabilities.get("threadSnooze").is_none());
+    }
+
+    /// Whatever this platform answers, the label is a name rather than an empty
+    /// string — the same read-only shape as the `data_dir` test above, and for
+    /// the same reason: these sources are process-global and a test that set
+    /// one would set it for every test beside it.
+    #[test]
+    fn this_machine_has_a_label_whatever_it_is_running_on() {
+        let label = machine_label();
+        assert_eq!(label, label.trim());
+        assert!(!label.is_empty());
+    }
+
+    /// Ticket 05 of the headless-Linux effort — not the `rust-server-tauri` 05
+    /// that `data_dir` above cites. The parsing half of
+    /// [`super::configured_hostname`], separated
+    /// from the read so it can be checked on the platform this suite has always
+    /// run on — which has no `/etc/hostname` at all.
+    ///
+    /// `hostname(5)` describes a file, not a value, and the difference shows up
+    /// on a machine whose installer left a comment above the name: a `trim()`
+    /// would advertise "# set by cloud-init" as the label the UI puts beside
+    /// the connection.
+    #[test]
+    fn the_configured_hostname_is_the_first_line_that_is_not_a_comment() {
+        assert_eq!(hostname_in("orpheus\n").as_deref(), Some("orpheus"));
+        assert_eq!(hostname_in("  orpheus  \n").as_deref(), Some("orpheus"));
+        assert_eq!(
+            hostname_in("# set by cloud-init\norpheus\n").as_deref(),
+            Some("orpheus"),
+            "a comment is ignored, not read"
+        );
+        assert_eq!(
+            hostname_in("\n\norpheus\n").as_deref(),
+            Some("orpheus"),
+            "and so is a blank line"
+        );
+
+        assert_eq!(hostname_in(""), None);
+        assert_eq!(hostname_in("   \n\n"), None);
+        assert_eq!(
+            hostname_in("# nothing but a comment\n"),
+            None,
+            "a file naming nothing is not an answer of \"\" — the caller falls \
+             through to the fallback, which is the whole point of the Option"
+        );
+    }
+
+    /// Ticket 05 of the headless-Linux effort, and the finding that made it a
+    /// ticket: `HOSTNAME` is a
+    /// *shell* variable on most Linux distributions, exported by nothing, so
+    /// both variables above answer `None` on the box this effort exists to put
+    /// a server on — and every headless laplus called itself `laplus`, which is
+    /// a label distinguishing no machine from any other at exactly the moment
+    /// there is more than one to distinguish.
+    ///
+    /// Read-only, like the `data_dir` test above and for the same reason. So it
+    /// asks the machine what it can discover and insists the label is *that*:
+    /// `COMPUTERNAME` on the Windows runner, `/etc/hostname` on the Linux one
+    /// this ticket added. A machine that can discover nothing keeps the
+    /// fallback and this has nothing to check — which is what the assertion
+    /// above it covers.
+    #[test]
+    fn a_machine_that_knows_its_own_name_is_labelled_with_it() {
+        let discoverable = non_empty_env("COMPUTERNAME")
+            .or_else(|| non_empty_env("HOSTNAME"))
+            .or_else(configured_hostname);
+        let Some(name) = discoverable else {
+            return;
+        };
+
+        assert_eq!(
+            machine_label(),
+            name,
+            "the label should name this machine rather than the product"
+        );
     }
 }

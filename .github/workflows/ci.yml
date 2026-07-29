@@ -1,8 +1,8 @@
 # The TypeScript half: the UI and the three packages that carry the contract.
 #
-# Linux here, unlike `rust.yml`. Nothing in this half is platform-specific — it
-# is a browser bundle and three libraries — so the cheaper runner is the right
-# one, and the Windows-only reasoning that pins the Rust job does not apply.
+# Linux only, unlike `rust.yml`, which runs on both. Nothing in this half is
+# platform-specific — it is a browser bundle and three libraries — so one runner
+# answers for all of them, and the cheaper one is the right one.
 name: CI
 
 on:

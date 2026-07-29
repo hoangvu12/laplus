@@ -16,7 +16,7 @@ mod harness;
 use harness::agent::FakeAgent;
 use harness::captures::Capture;
 use harness::shape::{assert_declared, compare, Declared};
-use harness::TestServer;
+use harness::{ClientIdentity, TestServer};
 use laplus_server::process::Search;
 use serde_json::json;
 
@@ -526,6 +526,11 @@ async fn an_unimplemented_method_diverges_from_the_captured_defect_on_purpose() 
 /// `reason` deliberately does not describe what was actually wrong — see
 /// `Rejection::body` for why the closed contract union leaves no better
 /// answer.
+///
+/// Refused here by presenting **nothing**, which is the refusal this server
+/// still makes. It used to be provoked with a foreign origin; `crate::auth` no
+/// longer checks one, and what this test is about is the body rather than what
+/// produced it.
 #[tokio::test]
 async fn a_refused_upgrade_matches_the_captured_401() {
     let capture = Capture::load("06-upgrade-rejected");
@@ -534,9 +539,9 @@ async fn a_refused_upgrade_matches_the_captured_401() {
 
     let server = TestServer::start().await;
     let refusal = server
-        .connect_as(server.browser().with_origin("https://evil.example"))
+        .connect_as(ClientIdentity::anonymous())
         .await
-        .expect_err("a non-local origin is refused");
+        .expect_err("an upgrade presenting no credential is refused");
 
     assert_eq!(refusal.status, 401);
 

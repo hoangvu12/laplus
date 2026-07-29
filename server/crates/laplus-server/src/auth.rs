@@ -9,14 +9,17 @@
 //!
 //! The policy:
 //!
-//! - **Bind to loopback.** Done where the listener is created, not here.
-//! - **Refuse an origin that is neither this machine nor named by the user.**
-//!   The one refusal this module makes. It matters because binding to loopback
-//!   does *not* stop a page on another origin from asking the user's own
-//!   browser to connect on its behalf. The named hosts are
-//!   [`crate::remote_access`], which is how a phone on a tunnel gets in.
+//! - **Bind to loopback**, unless the user turned that off. Done where the
+//!   listener is created, not here — [`crate::remote_access`].
 //! - **Report what was presented, and verify none of it.** [`authorize`]
 //!   returns a [`Presented`], which is an obligation rather than a permission.
+//!
+//! There is no third rule, and there used to be: this module refused an origin
+//! that was neither this machine nor named by the user, and that check has been
+//! removed. `Origin` is read off the upgrade and consulted by nothing.
+//! [`authorize`] carries the reasoning and what it gives up; this list said the
+//! opposite for a while after the code stopped doing it, which is the sort of
+//! comment that is worse than none.
 //!
 //! The credential shapes come from ticket 01's captures and from the reference
 //! server's `authenticateWebSocketUpgrade`, in its precedence order: the

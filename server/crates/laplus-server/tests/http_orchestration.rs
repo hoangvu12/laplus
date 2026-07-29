@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use harness::conversation::{create_project, create_thread};
 use harness::workspace::Workspace;
-use harness::TestServer;
+use harness::{ClientIdentity, TestServer};
 use serde_json::{json, Value};
 
 const THREAD: &str = "thread-1";
@@ -259,19 +259,35 @@ async fn every_credential_that_opens_the_socket_reads_a_snapshot() {
     server.stop().await;
 }
 
-/// The one refusal [`laplus_server::auth`] makes, reaching these routes as it
-/// reaches the upgrade. Binding to loopback does not stop a page elsewhere from
-/// asking the user's own browser to fetch the project list on its behalf.
+/// What these routes check, and what they do not.
+///
+/// **This test asserted the opposite until the origin rule was removed** — that
+/// a fetch from `evil.example` was refused with a 401. `crate::auth` reads
+/// `Origin` and consults it nowhere, so the credential is the whole boundary
+/// here exactly as it is at the upgrade, and the honest assertion is the one
+/// below: presenting nothing is refused whatever the origin, and presenting a
+/// credential this server minted is answered whatever the origin.
+///
+/// The second half is not as alarming as it first reads, and the last assertion
+/// is why: there is no `Access-Control-Allow-Origin` on the answer, so a browser
+/// hands the page a CORS error rather than the project list. A foreign *page*
+/// still cannot read this. A foreign *program* holding a stolen cookie always
+/// could, which is the posture `authorize` states plainly.
+///
+/// **Ticket 02 of the headless-Linux effort changes that last line**, on purpose
+/// — the desktop app fetching a remote server is a second origin that has to be
+/// answered. This assertion is where that change will announce itself.
 #[tokio::test]
-async fn a_non_local_origin_is_refused_with_the_auth_error() {
+async fn these_routes_check_the_credential_and_not_the_origin() {
     let server = a_server_with_a_conversation().await;
-    let elsewhere = server.browser().with_origin("https://evil.example");
+    let paths = [
+        "/api/orchestration/shell".to_string(),
+        format!("/api/orchestration/threads/{THREAD}"),
+    ];
 
-    for path in [
-        "/api/orchestration/shell",
-        &format!("/api/orchestration/threads/{THREAD}"),
-    ] {
-        let response = server.get_as(path, &elsewhere).await;
+    let elsewhere_with_nothing = ClientIdentity::anonymous().with_origin("https://evil.example");
+    for path in &paths {
+        let response = server.get_as(path, &elsewhere_with_nothing).await;
         assert_eq!(response.status, 401, "{path}");
         assert_eq!(
             response.body["_tag"],
@@ -288,12 +304,19 @@ async fn a_non_local_origin_is_refused_with_the_auth_error() {
         );
     }
 
-    // A refusal must not be readable by the page that provoked it either: the
-    // upgrade sets `Access-Control-Allow-Origin: *` on its 401 so a browser
-    // reads the body rather than a CORS error, and that is right for a socket
-    // handshake and wrong for a fetch a foreign page made.
-    let response = server.get_as("/api/orchestration/shell", &elsewhere).await;
-    assert_eq!(response.header("access-control-allow-origin"), None);
+    let elsewhere = server.browser().with_origin("https://evil.example");
+    for path in &paths {
+        let response = server.get_as(path, &elsewhere).await;
+        assert_eq!(
+            response.status, 200,
+            "{path} — the credential is what is checked"
+        );
+
+        // The answer is not readable by the page that asked for it. Nothing on
+        // this server writes a CORS header today, and that absence is doing
+        // security work here rather than being an oversight.
+        assert_eq!(response.header("access-control-allow-origin"), None, "{path}");
+    }
 
     server.stop().await;
 }

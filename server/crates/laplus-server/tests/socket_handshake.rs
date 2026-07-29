@@ -331,17 +331,27 @@ async fn a_socket_ticket_is_spent_by_the_upgrade_that_uses_it() {
     server.stop().await;
 }
 
-/// Loopback binding stops another machine reaching the server. It does not
-/// stop a page on another origin asking the user's own browser to connect for
-/// it, which is what the origin check is for.
+/// The refusal body in full, against the capture's fields.
+///
+/// **This used to be the origin test**, and asserted that a page on
+/// `evil.example` was turned away. `crate::auth` no longer checks an origin —
+/// see its `## Why there is no origin rule` — so the premise moved to the thing
+/// that *is* checked: a credential this server did not issue. The body is the
+/// same one either way, which is the point of `Rejection`'s closed union, and it
+/// is worth asserting in full somewhere rather than only by `_tag` as
+/// `a_credential_this_server_did_not_issue_opens_nothing` does across its five
+/// shapes.
 #[tokio::test]
-async fn a_non_local_origin_is_refused_with_the_captured_error_body() {
+async fn a_credential_that_does_not_verify_is_refused_with_the_captured_error_body() {
     let server = TestServer::start().await;
 
     let refusal = server
-        .connect_as(server.browser().with_origin("https://evil.example"))
+        .connect_as(ClientIdentity {
+            cookie: Some("t3_session=eyJ2IjoxfQ.c2ln".to_string()),
+            ..ClientIdentity::default()
+        })
         .await
-        .expect_err("a non-local origin is refused");
+        .expect_err("a cookie this server did not mint is refused");
 
     assert_eq!(refusal.status, 401);
     assert_eq!(refusal.body["_tag"], "EnvironmentAuthInvalidError");
@@ -361,11 +371,27 @@ async fn a_non_local_origin_is_refused_with_the_captured_error_body() {
     server.stop().await;
 }
 
+/// **The credential is the whole boundary, and the origin is not part of it.**
+///
+/// The first three are the ones the desktop window and the Vite dev server
+/// send. The fourth is the one this file used to assert a refusal for, and is
+/// here deliberately: a socket opened from `evil.example` is accepted because it
+/// carried a credential this server minted, and would be accepted from a phone
+/// on a tunnel or a tailnet for the same reason — which is what makes the
+/// headless-Linux effort possible without an allowlist to maintain.
+///
+/// What that gives up is in [`laplus_server::auth::authorize`], stated rather
+/// than implied.
 #[tokio::test]
-async fn a_loopback_origin_is_accepted() {
+async fn the_origin_a_page_came_from_is_not_what_this_server_checks() {
     let server = TestServer::start().await;
 
-    for origin in ["http://127.0.0.1:1420", "http://localhost:5173", "http://[::1]"] {
+    for origin in [
+        "http://127.0.0.1:1420",
+        "http://localhost:5173",
+        "http://[::1]",
+        "https://evil.example",
+    ] {
         let client = server
             .connect_as(server.browser().with_origin(origin))
             .await

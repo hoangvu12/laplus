@@ -11,6 +11,34 @@ mod harness;
 use harness::TestServer;
 use serde_json::json;
 
+/// Ticket 05 of the headless-Linux effort, and the cheapest test in this file.
+///
+/// A test server binds whatever its config says, and its config came from
+/// `ServerConfig::detect` — which reads the developer's real
+/// `remote-access.json`. On a machine where network access had been switched on
+/// that meant `0.0.0.0`, and two things followed, neither of them a real
+/// failure of the code under test: [`TestServer::addr`] answered with the
+/// wildcard, which Windows refuses to connect *to*, so **298 tests failed with
+/// `AddrNotAvailable`** across every HTTP and socket binary on one machine
+/// while passing everywhere else — the shape of bug that gets blamed on
+/// whatever change is under review; and every test binary raised a Windows
+/// Defender Firewall prompt, once per binary and again after every rebuild,
+/// because cargo names them by hash.
+///
+/// So the property is worth asserting rather than assuming. A test server is
+/// one process talking to itself and has no business being reachable from
+/// another machine.
+#[tokio::test]
+async fn a_test_server_is_reachable_from_this_machine_and_no_other() {
+    let server = TestServer::start().await;
+
+    assert!(
+        server.addr().ip().is_loopback(),
+        "the suite should never bind an address the network can reach, got {}",
+        server.addr()
+    );
+}
+
 /// Without this the UI never registers a connection, never starts a
 /// supervisor, and never opens the socket. The failure is swallowed and
 /// retried every three seconds, so its absence looks like a UI that simply
