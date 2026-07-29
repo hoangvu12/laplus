@@ -281,7 +281,10 @@ because two of them are open questions.
   answers the question left open above: a real traversal _is_ refused there.
 - **2** were the pty marker and the terminal flood's pong ordering.
 
-### The three still failing on Linux
+### The two still failing on Linux
+
+**Was three.** The third is diagnosed and fixed — see below — and it was a test,
+which makes four of the five causes in this ticket tests rather than code.
 
 1. **`a_file_written_outside_the_server_is_reported_relative_to_its_workspace`**
    — the inotify new-subdirectory gap, deferred deliberately. Its own ticket.
@@ -290,14 +293,59 @@ because two of them are open questions.
    which is far too fast for a test that opens a pty. Undiagnosed. A test that
    fails two runs in three is worse than one that always does, because it will
    be re-run until it passes and then believed.
-3. **`a_session_that_ends_holding_a_question_closes_it`** — **deterministic**,
-   and the one most likely to be a real fault. The scripted agent reaches
-   `DIES`, the server logs `claude: FATAL ERROR: the agent went away`, and then
-   nothing arrives for 60 seconds. What the test is protecting is stated in its
-   own doc comment: a question left open when the agent dies makes the composer
-   "unusable for the life of the conversation and across every restart after
-   it". If the server does not close that question on Linux, that is a product
-   bug and not a test one. **Undiagnosed — do not assume either way.**
+   **`a_session_that_ends_holding_a_question_closes_it` was the third, and it was
+   the harness.** It is worth writing down at length, because it was called "the one
+   most likely to be a real fault" and it was not one at all — the server does
+   exactly what the test is protecting.
+
+The symptom was as described: the agent reaches `DIES`, the server logs
+`claude: FATAL ERROR: the agent went away`, and nothing arrives for 60 seconds.
+What settled it was dumping the values the _first_ reader had already been sent.
+All eight of them arrive in **one chunk** on Linux:
+
+```
+thread.message-sent
+thread.turn-start-requested
+thread.session-set            starting
+thread.session-set            running
+thread.activity-appended      user-input.requested
+thread.activity-appended      provider.user-input.respond.failed   <- the assertion
+thread.activity-appended      session.failed
+thread.session-set            error                                <- the terminal event
+```
+
+So the question _is_ closed. `values_until` matched `user-input.requested` at the
+fifth value, returned the whole batch and kept no position in it, so
+`events_through_the_turn` then waited `READ_TIMEOUT` for a chunk whose contents
+it had already been handed. On Windows the batch splits — `cmd.exe` is slow
+enough between `type` and `exit 3` that the boundary falls in a convenient place
+— which is the whole of why this looked like a platform difference.
+
+Fixed in the harness rather than in the test: `SocketClient::unread` keeps the
+values a reader stopped short of, and `values_until` now stops _at_ its match
+instead of at the end of whatever batch the match arrived in. A test can no
+longer see a different amount of a turn depending on where the server put a chunk
+boundary, which was a latent flake in every reader built on it and not only this
+one.
+
+**Verified**, and stated exactly because the count is the evidence:
+
+- The test itself takes **0.61s on Linux**, where it used to spend 60 seconds
+  reaching `READ_TIMEOUT`. It also fails in _isolation_ before the fix, so the
+  60 seconds were never load.
+- **Windows: 883 passed, 0 failed** — unchanged, so stopping mid-batch broke no
+  reader that was relying on getting the whole batch.
+- **Linux: 881 passed, 2 failed**, and the two are the two above —
+  `a_call_that_names_no_size_does_not_resize_the_terminal` and the watcher's
+  `a_file_written_outside_the_server_is_reported_relative_to_its_workspace`.
+  881 + 2 = 883, which is the Windows total, so no test is being skipped.
+  **Linux is not green and this did not make it green** — it removed one of the
+  three failures and left the other two exactly as they were.
+
+The lesson is the one this ticket keeps relearning, so it is worth stating
+plainly: **"deterministic on Linux" is evidence about the harness at least as
+much as about the product.** A one-chunk batch is deterministic, and so is the
+reader that mishandles it.
 
 **The watcher deadlock, because it is the one that would have shipped.**
 `a_released_workspace_is_no_longer_watched` did not fail on Linux, it **hung**,

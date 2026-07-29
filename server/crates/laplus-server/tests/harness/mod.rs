@@ -29,6 +29,7 @@ pub mod shape;
 pub mod terminal;
 pub mod workspace;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -653,6 +654,7 @@ impl TestServer {
                 socket,
                 next_id: 0,
                 buffered: Vec::new(),
+                unread: HashMap::new(),
             }),
             Err(WsError::Http(response)) => {
                 let body = response
@@ -1024,6 +1026,23 @@ pub struct SocketClient {
     /// out-of-order answers are not lost, which is the whole point of
     /// correlating rather than assuming FIFO.
     buffered: Vec<Value>,
+    /// Values from a chunk that [`SocketClient::values_until`] stopped in the
+    /// middle of, per subscription.
+    ///
+    /// [`SocketClient::buffered`] one level down: that keeps whole *frames* a
+    /// reader was not waiting for, and this keeps the *values* inside a frame a
+    /// reader had not got to yet. Without it, how much of a turn a test can see
+    /// depends on where the server happened to put a chunk boundary — a reader
+    /// that stopped at its match discarded the rest of the batch, and the next
+    /// reader waited `READ_TIMEOUT` for events it had already been sent.
+    ///
+    /// That is not hypothetical: a turn whose agent dies at a question publishes
+    /// the question, the closing of it and the session's own ending fast enough
+    /// to land in one chunk, so
+    /// `socket_user_input::a_session_that_ends_holding_a_question_closes_it`
+    /// hung on Linux against a server doing exactly the right thing. It passed
+    /// on Windows only because `cmd.exe` is slow enough to split the batch.
+    unread: HashMap<String, Vec<Value>>,
 }
 
 /// What a call came back as. A `Defect` is a distinct outcome rather than an
@@ -1169,7 +1188,19 @@ impl SocketClient {
     /// Deliberately does **not** acknowledge. `Ack` is load-bearing on this
     /// wire — the server stops after one un-acknowledged chunk — so a test
     /// that wants to keep receiving has to say so, the same way the UI does.
+    /// Values a previous reader was sent but stopped short of, if any.
+    ///
+    /// Taken before the wire is read, so a reader that stops mid-chunk hands the
+    /// rest to whoever reads next instead of dropping it. See
+    /// [`SocketClient::unread`].
+    fn take_unread(&mut self, request_id: &str) -> Option<Vec<Value>> {
+        self.unread.remove(request_id)
+    }
+
     pub async fn next_chunk(&mut self, request_id: &str) -> Vec<Value> {
+        if let Some(unread) = self.take_unread(request_id) {
+            return unread;
+        }
         let frame = self.next_frame_for(request_id).await;
         assert_eq!(
             frame["_tag"],
@@ -1198,12 +1229,31 @@ impl SocketClient {
     ) -> Vec<Value> {
         let mut seen = Vec::new();
         loop {
-            let values = self.next_chunk(request_id).await;
-            self.ack(request_id).await;
-            let arrived = values.iter().any(&wanted);
-            seen.extend(values);
-            if arrived {
-                return seen;
+            // Leftovers first, and *not* acknowledged: nothing new was read, so
+            // an `Ack` here would answer a chunk this client already answered.
+            let mut values = match self.take_unread(request_id) {
+                Some(unread) => unread,
+                None => {
+                    let values = self.next_chunk(request_id).await;
+                    self.ack(request_id).await;
+                    values
+                }
+            };
+
+            // Stops *at* the match rather than at the end of the batch it came
+            // in, and what follows is kept for the next reader. The two are the
+            // same thing whenever the server put a chunk boundary there anyway,
+            // which is why this only ever showed up as a platform difference.
+            match values.iter().position(&wanted) {
+                Some(at) => {
+                    let rest = values.split_off(at + 1);
+                    seen.extend(values);
+                    if !rest.is_empty() {
+                        self.unread.insert(request_id.to_string(), rest);
+                    }
+                    return seen;
+                }
+                None => seen.extend(values),
             }
         }
     }
