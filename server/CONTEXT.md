@@ -327,10 +327,12 @@ was its own repository until ADR-0014. One name for all of it since the rename.
 **lightcode** — what laplus was called until ticket 30 closed. Retired from the
 live code entirely, and deliberately _not_ rewritten anywhere it is a record of
 something: `fixtures/` are captures of real traffic and the paths inside them
-happened, `.scratch/` tickets and `docs/adr/` are dated statements of what was
-decided at the time, and editing either would make them claim to be evidence of
-things that never occurred. So roughly sixty mentions survive on purpose. If a
-mention is in code, configuration or living documentation, it is a bug.
+happened, and `docs/adr/` are dated statements of what was decided at the time.
+Editing either would make them claim to be evidence of things that never
+occurred. (The `.scratch/` tickets were the third such record; they were deleted
+on 2026-07-29 rather than rewritten.) So the mentions that survive do so on
+purpose. If a mention is in code, configuration or living documentation, it is a
+bug.
 
 **Bundle** — the built web application, `apps/web/dist`, as it reaches the
 executable: a table of names and bytes generated at build time. Source maps are

@@ -50,8 +50,8 @@ server: …" and one that reaches an unparsed command names it — so neither ha
 guess from the page whether a click did anything. Both key on that **sentence**
 rather than on the error's `_tag`, which since ticket 39 is whatever the method
 in question declares.
-`../../.scratch/rust-server-tauri/2026-07-28-surface-walk.md` is what the first
-run found.
+The surface walk that first run produced was written up under `.scratch/` and
+deleted on 2026-07-29.
 
 Set `CHROME` if yours is not at the Windows default. `probe-open-thread.mjs` is
 the one file here that is _not_ general: it names the thread id and the sidebar

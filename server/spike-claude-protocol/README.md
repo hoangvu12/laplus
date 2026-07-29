@@ -15,7 +15,9 @@ throw away":
 - `src/main.rs` — the terminal shell it was driven by hand from — was deleted
   rather than ported, along with the spike's `Cargo.toml`.
 
-The raw NDJSON used as primary source below is still at `../.scratch/`.
+The raw NDJSON used as primary source below was at `../.scratch/` and was
+deleted on 2026-07-29. The curated copies are `../fixtures/claude-cli/01` and
+`02`.
 
 ## The question
 
@@ -86,7 +88,8 @@ last result stop=end_turn turns=1 1867ms  $0.0139  error=false
 protocol drift unknown events: 0   parse errors: 0
 ```
 
-Raw captures used as primary source are in `../.scratch/`.
+Raw captures used as primary source were in `../.scratch/`, now deleted; see
+`../fixtures/claude-cli/`.
 
 ## The design decision it settled
 

@@ -14,10 +14,11 @@ This repository has one remote, `origin`, so `gh` is available. It is still not 
 - Triage state is recorded as a `Status:` line near the top of each issue file (see `triage-labels.md` for the role strings)
 - Comments and conversation history append to the bottom of the file under a `## Comments` heading
 
-Note: `.scratch/` also holds loose protocol captures from the STEP 1 spike
-(`bidi.ndjson`, `stream-sample.ndjson`). Those are raw evidence, not tickets —
-leave them where they are. Tracker content always lives one level down, inside a
-`<feature-slug>/` directory.
+Note: the `rust-server-tauri/` feature directory — 76 tickets, a parity ledger
+and loose protocol captures from the STEP 1 spike — was deleted on 2026-07-29.
+Recover it from history if that work resumes. Tracker content always lives one
+level down, inside a `<feature-slug>/` directory; anything loose at the top of
+`.scratch/` is raw evidence, not tickets.
 
 The one exception to "`.scratch/` is not gitignored" is
 `.scratch/wire-capture/raw/`. Those are unredacted proxy recordings that contain

@@ -62,11 +62,11 @@ entirely, so SmartScreen will warn about an unknown publisher.
 | `apps/web` | the UI                                        |
 | `packages` | `@t3tools/{contracts,client-runtime,shared}`  |
 | `server`   | the Rust server, the Tauri shell, the release |
-| `.scratch` | the issue tracker and the parity ledger       |
+| `.scratch` | the issue tracker                             |
 
-Start with `AGENTS.md`, then `server/CLAUDE.md` for the Rust half.
-`.scratch/rust-server-tauri/PARITY-LEDGER.md` is what the server does and does
-not yet answer.
+Start with `AGENTS.md`, then `server/CLAUDE.md` for the Rust half. The server
+answers 26 of the 71 socket methods `packages/contracts` declares; the rest are
+not implemented yet.
 
 ## Licence
 

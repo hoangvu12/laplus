@@ -20,7 +20,7 @@ laplus/
 ├── apps/web        the UI this shell embeds
 ├── packages/       @t3tools/{contracts,client-runtime,shared} — the contract
 ├── server/         ← you are here: the Rust server, the shell, the release
-└── .scratch/       specs and audits, for both halves
+└── .scratch/       the issue tracker, for both halves
 ```
 
 **There is no reference server in the tree.** `reference/t3code-server/` held
@@ -110,9 +110,8 @@ root, so cargo commands are run from this directory.
   and it is the only way the UI half of this application can be checked. Has a
   README.
 - `../.scratch/` — tracker files (see below) and raw capture evidence. At the
-  repository root rather than in here, because the tickets cover the UI as much
-  as the server: 31 is a client fix, 26 was one, and 24's open question is about
-  the web bundle.
+  repository root rather than in here, because tickets cover the UI as much as
+  the server. Its `rust-server-tauri/` directory was deleted on 2026-07-29.
 
 ## Running the tests
 

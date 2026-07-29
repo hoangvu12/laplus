@@ -38,11 +38,11 @@ search. So:
   - `vp test run <test-files>` for focused tests. `vp run test` only when the
     affected package needs its own `test` script.
   - Run targeted formatting, lint and type checks for the affected scope.
-- **A green suite is not evidence the application works.** Every finding in
-  `.scratch/rust-server-tauri/HANDOFF-2026-07-28-using-the-app.md` was invisible
-  to a passing suite and obvious within a minute of driving the window. For any
-  user-visible change, drive it: `server/tools/ui-driver/` is a headless browser
-  pointed at a running laplus and has a README.
+- **A green suite is not evidence the application works.** A whole afternoon's
+  findings once came from driving the window for a minute, none of which a
+  passing suite had caught. For any user-visible change, drive it:
+  `server/tools/ui-driver/` is a headless browser pointed at a running laplus
+  and has a README.
 - Stop dev servers and watchers when focused verification is done.
 
 ## Package roles
@@ -52,7 +52,7 @@ search. So:
 - `packages/contracts` — effect/Schema schemas for provider events, the socket
   protocol, and model/session types. **Schema-only; no runtime logic.** This is
   the whole vocabulary the UI can speak, and the server implements a subset of
-  it — `.scratch/rust-server-tauri/PARITY-LEDGER.md` is which subset.
+  it — 26 of the 71 methods declared here.
 - `packages/shared` — runtime utilities. Explicit subpath exports
   (`@t3tools/shared/git`); no barrel index.
 - `packages/client-runtime` — shared client runtime. No root export; import an
@@ -72,3 +72,8 @@ Markdown under `.scratch/<feature-slug>/`, not GitHub Issues. Status lives in a
 `Status:` line in each file, using the five canonical roles (`needs-triage`,
 `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See
 `server/docs/agents/issue-tracker.md`.
+
+**The previous backlog is gone.** The 76 `rust-server-tauri` tickets and the rest
+of `.scratch/` were deleted on 2026-07-29 along with `reference/`; recover them
+from history if that work is picked up again. GitHub Issues are disabled on this
+repository, so what is under `.scratch/` is the whole backlog.
