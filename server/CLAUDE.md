@@ -84,7 +84,13 @@ root, so cargo commands are run from this directory.
   `.github/workflows/release.yml` runs the same command on a Windows runner when
   a `v*.*.*` tag is pushed, and publishes the installer to a GitHub Release —
   the tag has to match `tauri.conf.json`'s version or the job refuses. What this
-  fork publishes, and why it does not yet update itself, is `docs/adr/0020`.
+  fork publishes is `docs/adr/0020`.
+  **A release build now needs `TAURI_SIGNING_PRIVATE_KEY` in its environment**
+  (ticket 74): `bundle.createUpdaterArtifacts` is on, so the bundler signs what
+  it produces, and an installed laplus accepts only an update signed by the key
+  whose public half is in `tauri.conf.json`. The key lives in `~/.tauri/` and in
+  the repository secret of the same name — never in the tree, which `.gitignore`
+  enforces. Losing it strands every existing install.
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.

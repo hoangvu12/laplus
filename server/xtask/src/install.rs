@@ -78,6 +78,14 @@ pub enum Astray {
     /// which is still `${PRODUCTNAME}` and still the data directory. Refused
     /// rather than patched, because a mode nothing uses is a mode nothing
     /// checks.
+    ///
+    /// **The match is on the whole file**, so a key of this name anywhere in
+    /// `tauri.conf.json` refuses the build — and ticket 74 found one that is
+    /// unrelated: `plugins.updater.windows.installMode` is how *an update*
+    /// presents itself while it runs, not where the installer writes. That
+    /// setting was dropped rather than this check being narrowed, because its
+    /// value there was the default anyway and a guard on where somebody's
+    /// database lives is not the thing to make cleverer for a convenience.
     InstallModeChanged,
     /// The template is named but no longer moves the per-user default. What a
     /// re-vendoring from upstream looks like: the file is still there, still

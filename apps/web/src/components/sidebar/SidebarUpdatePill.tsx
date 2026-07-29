@@ -1,5 +1,6 @@
 import { DownloadIcon, RotateCwIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { useCallback, useState } from "react";
+import { getShellUpdateBridge } from "../../shellUpdate";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
@@ -70,7 +71,9 @@ export function SidebarUpdatePill() {
     state && showArm64Warning ? getArm64IntelBuildWarningDescription(state) : null;
 
   const handleAction = useCallback(() => {
-    const bridge = window.desktopBridge;
+    // laplus's own, not Electron's — see `shellUpdate.ts`, and the note in
+    // `state/desktopUpdate.ts` beside the other half of this.
+    const bridge = getShellUpdateBridge();
     if (!bridge || !state) return;
     if (disabled || action === "none") return;
 

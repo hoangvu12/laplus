@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { DesktopBridge, DesktopUpdateState } from "@t3tools/contracts";
+import { getShellUpdateBridge } from "../shellUpdate";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -23,8 +24,18 @@ export class DesktopUpdateStateReadError extends Schema.TaggedErrorClass<Desktop
   }
 }
 
+/**
+ * laplus's window rather than Electron's preload. Ticket 74.
+ *
+ * Upstream reads `window.desktopBridge` here, which is `undefined` in this
+ * application and stays that way — several unrelated features branch on it, so
+ * defining a partial one to feed this atom would tell all of them an Electron
+ * bridge is present. `shellUpdate.ts` answers the same two methods over the
+ * Tauri updater plugin, and answers `undefined` in a browser, which is what a
+ * paired phone should get.
+ */
 function getDesktopUpdateBridge(): DesktopUpdateBridge | undefined {
-  return typeof window === "undefined" ? undefined : window.desktopBridge;
+  return getShellUpdateBridge();
 }
 
 export function createDesktopUpdateStateAtom(getBridge: () => DesktopUpdateBridge | undefined) {

@@ -142,7 +142,10 @@ reason to take this half first.
 1. **Provider advisory** (`server.updateProvider`): laplus already reads the
    installed `claude` version for the model table (ticket 09) and never asks what
    is current. An unreachable network must not become a recurring visible error.
-2. **Application self-update**, after a first release exists: the Tauri updater
-   plugin, the keypair, a manifest asset on the release, `serverSelfUpdate`
-   turned true and `server.updateServer` implemented — in that order, because the
-   capability must not claim what the plugin cannot yet do.
+2. ~~**Application self-update**~~ — **taken by ticket 74**, which builds it the
+   way this section's first shape describes: the plugin, the keypair, a
+   `latest.json` on the release, and the pill fed from Tauri rather than from a
+   bridge that does not exist. `capabilities.serverSelfUpdate` and
+   `server.updateServer` stay as they are and are explicitly out of 74's scope —
+   that method means a server updating itself for a client that is elsewhere,
+   which is not what the shell replacing the application is.

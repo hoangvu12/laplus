@@ -114,6 +114,23 @@ jobs:
       - name: Install the Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
+      # A missing key is otherwise found halfway through a release build, as a
+      # signing error from a tool nobody was thinking about. Ticket 74.
+      - name: Check the signing key is present
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$KEY" ]]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is not set on this repository." >&2
+            echo "An installed laplus only accepts an update signed by the key whose" >&2
+            echo "public half is in tauri.conf.json. Without it this build cannot" >&2
+            echo "produce one, and publishing an unsigned release would strand every" >&2
+            echo "existing install on the version it has." >&2
+            exit 1
+          fi
+
       # `--measure-install` installs the artifact, weighs what landed on disk and
       # uninstalls it. It is opt-in because it touches the machine, and a
       # disposable runner is the one machine where that costs nothing.
@@ -124,8 +141,16 @@ jobs:
       # launches, and it says nothing about the WebView2 bootstrapper: these
       # images ship the runtime already, so the absent-runtime path stays untested
       # and unticked.
+      # `bundle.createUpdaterArtifacts` makes this build sign what it produces,
+      # so the key has to be in the environment of the build itself rather than
+      # of the publish. An empty password is not an oversight: the private key
+      # is the secret, and a password would be a second one to keep beside it
+      # with nothing extra to protect.
       - name: Build, measure, install and weigh
         working-directory: server
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: cargo xtask release --measure-install
 
       - name: Find the installer
@@ -136,6 +161,49 @@ jobs:
           echo "installer=$installer" >> "$GITHUB_OUTPUT"
           echo "Built $installer"
 
+      # The manifest an installed laplus reads. `plugins.updater.endpoints` in
+      # `tauri.conf.json` points at this file on the *latest* release, so it has
+      # to be attached to every release or an install checks a stale one.
+      #
+      # It is generated from the signature file rather than written by hand:
+      # whatever the bundler signed is what the manifest must name, and the two
+      # drifting apart is a download that fails its signature check on somebody
+      # else's machine, which is the worst place to find out.
+      - name: Write the update manifest
+        id: manifest
+        shell: bash
+        run: |
+          signature=$(ls server/target/release/bundle/nsis/*.sig 2>/dev/null | head -n 1)
+          if [[ -z "$signature" ]]; then
+            echo "No .sig beside the installer. bundle.createUpdaterArtifacts is off," >&2
+            echo "or the signing key was not in the build's environment." >&2
+            exit 1
+          fi
+          signed="${signature%.sig}"
+          version=$(node -p "require('./server/crates/laplus-shell/tauri.conf.json').version")
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            tag="v${version}"
+          fi
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/$(basename "$signed")"
+          node -e '
+            const fs = require("fs");
+            const [signaturePath, version, url] = process.argv.slice(1);
+            fs.writeFileSync("latest.json", JSON.stringify({
+              version,
+              notes: "See the release notes for " + version + ".",
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "windows-x86_64": {
+                  signature: fs.readFileSync(signaturePath, "utf8").trim(),
+                  url,
+                },
+              },
+            }, null, 2) + "\n");
+          ' "$signature" "$version" "$url"
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+          cat latest.json
+
       # Uploaded whether or not this publishes, so a dispatch leaves something
       # to download and the size report is readable without cutting a release.
       - name: Upload the installer and the size report
@@ -143,10 +211,15 @@ jobs:
         with:
           name: laplus-windows-installer
           path: |
-            ${{ steps.artifact.outputs.installer }}
+            server/target/release/bundle/nsis/*
+            latest.json
             server/docs/artifact-size.md
           if-no-files-found: error
 
+      # The whole bundle directory rather than the installer by name: what the
+      # updater downloads is whatever the bundler signed, and naming that by
+      # hand is how the manifest ends up pointing at a file the release does not
+      # carry.
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -154,6 +227,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            ${{ steps.artifact.outputs.installer }}
+            server/target/release/bundle/nsis/*
+            latest.json
             server/docs/artifact-size.md
           fail_on_unmatched_files: true

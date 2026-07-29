@@ -28,3 +28,18 @@ server/target/
 # rewritten every run. Output rather than evidence, and a transcript of a live
 # session.
 server/tools/ui-driver/frames.log
+
+# The updater's signing key, if anybody ever writes one here. It belongs in
+# `~/.tauri/` and in the repository's `TAURI_SIGNING_PRIVATE_KEY` secret, and
+# nowhere else: an installed laplus only accepts an update signed by the key
+# whose public half is in `tauri.conf.json`, so this file leaking is somebody
+# else able to publish an update to every install, and this file being lost is
+# every install stranded. Ticket 74.
+*.key
+*.key.pub
+
+# The updater manifest, written at the repository root by the release workflow
+# from whatever the bundler just signed. An asset of a release rather than a
+# file of this project — a committed one would be a stale copy that nothing
+# reads and somebody eventually trusts. Ticket 74.
+latest.json

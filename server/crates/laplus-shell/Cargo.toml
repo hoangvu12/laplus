@@ -19,11 +19,28 @@ path = "src/main.rs"
 # downloaded. `wry` is the webview binding itself — on Windows a thin layer over
 # WebView2, which is the operating system's own and ships with it.
 tauri = { version = "2", default-features = false, features = ["wry"] }
+# Ticket 74: how an installed laplus learns a newer one was published. This is
+# the only thing in the tree that reaches the network on its own behalf, and it
+# reaches exactly one URL — the endpoint in `tauri.conf.json`.
+#
+# **It is not free.** The plugin brings `reqwest` and a TLS stack, which the
+# artifact did not previously carry, and ticket 24's headroom inside the 20-30 MB
+# target is 5.73 MB. `cargo xtask release` weighs every build and the release
+# workflow prints the number, so a regression here is visible rather than
+# discovered later; if it ever eats the headroom, the size report is the argument
+# for reconsidering, not this comment.
+tauri-plugin-updater = "2"
 laplus-server = { path = "../laplus-server" }
+# Not used by a line of this crate, and not removable: `tauri.conf.json` now has
+# a `plugins` section, and `tauri::generate_context!` expands plugin
+# configuration into `serde_json` paths at the call site. Without it here the
+# shell does not compile, with an error that names the macro rather than the
+# reason.
+serde_json.workspace = true
 tokio.workspace = true
 
 [build-dependencies]
-tauri-build = { version = "2", default-features = false }
+tauri-build = { version = "2", default-features = false, features = [] }
 # To read one field out of upstream's `package.json` — the version the embedded
 # UI was built as, which ticket 26 makes this server's own. A build dependency
 # is not linked into the artifact, and hand-rolling the read would mean deciding

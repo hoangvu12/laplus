@@ -1,0 +1,40 @@
+# What the page is allowed to do about a newer laplus. Ticket 74.
+#
+# The same shape as `titlebar.toml` and for the same reason: the window is
+# pointed at `http://127.0.0.1:<port>` rather than at a Tauri scheme (ADR-0010),
+# so its page is a *remote* origin to the IPC and a capability without a
+# `[remote]` section would grant these commands to an origin this application
+# never loads. `the_capability_covers_the_origin_the_server_serves` in `main.rs`
+# checks that against the address the server actually produces.
+#
+# **Why the page and not the shell.** Nothing on the Rust side checks for an
+# update, because the answer has nowhere to go there — what shows it is
+# `SidebarUpdatePill`, which the UI draws, and the state it reads is
+# `DesktopUpdateState` from the contract. Driving the plugin from the page keeps
+# the state machine beside the component that renders it, and keeps this file to
+# a list of what that page may press.
+#
+# **A separate file from the titlebar's.** They are granted together and to the
+# same origin, but they answer different questions — one is "may this page move
+# its window", the other is "may this page replace this application" — and a
+# reader auditing the second should not have to read past six window commands to
+# find it.
+identifier = "updater"
+description = "Lets laplus's own UI check for, download and install a newer laplus."
+windows = ["main"]
+
+permissions = [
+  # `check` asks the endpoint in `tauri.conf.json` what the latest version is.
+  # This is the only outbound request laplus makes on its own behalf.
+  "updater:allow-check",
+  # `download` fetches the installer into a resource the page holds a handle to;
+  # `install` runs it. Two commands rather than `download_and_install`, because
+  # the pill is a two-press control: "Update available" downloads, and the
+  # button then becomes "Restart to update", which installs. Granting the
+  # combined command as well would be granting a path nothing presses.
+  "updater:allow-download",
+  "updater:allow-install",
+]
+
+[remote]
+urls = ["http://127.0.0.1:*"]

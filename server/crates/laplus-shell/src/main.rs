@@ -124,6 +124,13 @@ fn main() -> ExitCode {
     let server = Mutex::new(Some(server));
 
     let application = tauri::Builder::default()
+        // Ticket 74. The plugin is registered here and driven entirely from the
+        // page: `capabilities/updater.toml` grants its commands to the loopback
+        // origin, and `apps/web/src/desktopUpdate.bridge.ts` is what presses
+        // them. Nothing checks for an update on this side, because nothing here
+        // would have anywhere to report the answer — the pill that shows it is
+        // the UI's.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             window(app, &url)?;
             Ok(())
@@ -351,22 +358,26 @@ mod tests {
     /// This asserts against the address `Server::http_url` actually produces
     /// rather than against a copy of it, and against an overridden port as well
     /// as the default, because `--port` and `LAPLUS_PORT` both move it.
-    #[test]
-    fn the_capability_covers_the_origin_the_server_serves() {
+    /// Read a capability through Tauri's own loader rather than a copy of the
+    /// file's contents, so this is the same parse `tauri_build` makes of the
+    /// same bytes — a capability that fails to load is a build failure there and
+    /// has to be one here too, not a test that quietly asserts nothing.
+    fn capability(name: &str) -> tauri::utils::acl::capability::Capability {
         use tauri::utils::acl::capability::CapabilityFile;
 
-        // Read through Tauri's own loader rather than a copy of the file's
-        // contents, so this is the same parse `tauri_build` makes of the same
-        // bytes — a capability that fails to load is a build failure there and
-        // has to be one here too, not a test that quietly asserts nothing.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("capabilities")
-            .join("titlebar.toml");
+            .join(format!("{name}.toml"));
         let file = CapabilityFile::load(&path).expect("the capability file parses");
         let CapabilityFile::Capability(capability) = file else {
-            panic!("titlebar.toml is one capability, not a list");
+            panic!("{name}.toml is one capability, not a list");
         };
+        capability
+    }
 
+    /// Whether a capability's `[remote]` section covers a given URL, answered by
+    /// the same pattern matcher the IPC uses.
+    fn covers(capability: &tauri::utils::acl::capability::Capability, url: &str) -> bool {
         let remote = capability
             .remote
             .as_ref()
@@ -376,19 +387,59 @@ mod tests {
             .iter()
             .map(|url| url.parse().expect("a valid url pattern"))
             .collect();
-        let covers = |url: &str| {
-            let url = url.parse().expect("a valid url");
-            patterns.iter().any(|pattern| pattern.test(&url))
-        };
+        let url = url.parse().expect("a valid url");
+        patterns.iter().any(|pattern| pattern.test(&url))
+    }
+
+    /// Ticket 74. The update pill is the same failure mode as the titlebar's
+    /// buttons — a control that renders correctly and does nothing — so the
+    /// grant that makes it work is asserted here rather than discovered by
+    /// waiting for a release and pressing it.
+    ///
+    /// The commands are named individually because the set is deliberately not
+    /// `updater:default`: that would also grant `download_and_install`, a path
+    /// nothing presses, and the two-press download-then-restart shape is the
+    /// pill's.
+    #[test]
+    fn the_page_may_check_for_download_and_install_an_update() {
+        let updater = capability("updater");
+
+        let default = format!("http://127.0.0.1:{}/", laplus_server::launch::DEFAULT_PORT);
+        assert!(covers(&updater, &default), "the capability does not cover {default}");
+        assert!(covers(&updater, "http://127.0.0.1:4774/"), "an overridden port");
+        // Replacing this application is not something an origin off this machine
+        // may ask for, whatever else it is allowed.
+        assert!(!covers(&updater, "https://example.com/"), "an origin off this machine");
+
+        let granted: Vec<String> = updater
+            .permissions
+            .iter()
+            .map(|permission| permission.identifier().get().to_string())
+            .collect();
+        for needed in [
+            "updater:allow-check",
+            "updater:allow-download",
+            "updater:allow-install",
+        ] {
+            assert!(
+                granted.iter().any(|identifier| identifier == needed),
+                "{needed} is not granted: the pill that presses it does nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capability_covers_the_origin_the_server_serves() {
+        let capability = capability("titlebar");
 
         // The default, spelled the way the server spells it.
         let default = format!("http://127.0.0.1:{}/", laplus_server::launch::DEFAULT_PORT);
-        assert!(covers(&default), "the capability does not cover {default}");
+        assert!(covers(&capability, &default), "the capability does not cover {default}");
         // And a port a developer moved it to.
-        assert!(covers("http://127.0.0.1:4774/"), "an overridden port");
+        assert!(covers(&capability, "http://127.0.0.1:4774/"), "an overridden port");
         // The host is not a wildcard, and should not become one: this grant is
         // the right to move somebody's window.
-        assert!(!covers("https://example.com/"), "an origin off this machine");
+        assert!(!covers(&capability, "https://example.com/"), "an origin off this machine");
 
         // Naming a command the UI presses is what makes the button work, so the
         // list is asserted rather than left to be discovered by pressing them.

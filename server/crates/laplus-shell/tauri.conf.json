@@ -9,9 +9,16 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://github.com/hoangvu12/laplus/releases/latest/download/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENERDEzQzQ0RDk2Q0Y2NTIKUldSUzltelpSRHpSelhoejdZcmZkUWQwb0E2QUE4bGhRZ3VDSDY4V3llNnBYNXlBUEY3bVZyVm4K"
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "icon": ["icons/icon.ico"],
     "copyright": "laplus. UI derived from t3code, Copyright (c) T3 Tools, Inc., MIT licence.",
     "licenseFile": "../../THIRD_PARTY_NOTICES.md",

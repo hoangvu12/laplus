@@ -38,14 +38,22 @@ unless you pass `--manifest-path`.
 
 ```sh
 cd server
-cargo xtask release            # builds the Windows installer and weighs it
+TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/laplus.key)" cargo xtask release
 ```
 
-Pushing a `v*.*.*` tag runs the same thing on CI and attaches the installer to a
-GitHub Release. The tag must match the version in
-`server/crates/laplus-shell/tauri.conf.json`. laplus does not update itself yet,
-and the installer is not code-signed, so Windows will warn about an unknown
-publisher — `server/docs/adr/0020` records both.
+Builds the Windows installer, signs it for the updater, and weighs the result.
+**The key is not optional**: an installed laplus only accepts an update signed by
+the key whose public half is in `tauri.conf.json`, so a build without it fails
+rather than producing an installer nobody can update from.
+
+Pushing a `v*.*.*` tag runs the same thing on CI, signs it with the repository's
+`TAURI_SIGNING_PRIVATE_KEY` secret, and attaches the installer and `latest.json`
+to a GitHub Release — which is the feed an installed copy checks. The tag must
+match the version in `server/crates/laplus-shell/tauri.conf.json`.
+
+The installer is not code-signed for Windows, which is a different signature
+entirely, so SmartScreen will warn about an unknown publisher.
+`server/docs/adr/0020` records both, and ticket 74 the update path.
 
 ## Layout
 
