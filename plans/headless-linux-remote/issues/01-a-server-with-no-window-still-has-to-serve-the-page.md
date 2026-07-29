@@ -4,7 +4,8 @@
 directory given at runtime, so a browser pointed at a headless laplus gets the
 application instead of a 404.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human — built and driven against the real bundle on
+Windows; nobody has yet loaded it from a phone. See **What landed**.
 
 **Depends on:** nothing. This is the first ticket of the effort.
 
@@ -114,3 +115,53 @@ paths, not about where the bytes came from.
   `immutable` versus `no-cache` and that is enough.
 - Watching the directory for changes. A dev loop points Vite at the server, it
   does not point the server at Vite.
+
+## What landed
+
+`--ui <dir>` on `laplus-server`, with `LAPLUS_UI` behind it in the same
+argument-beats-environment order `--port` uses. Without it the binary behaves
+exactly as before: 404 at `/`, every route unchanged, `tests/http_boot.rs`
+untouched.
+
+`Assets::from_directory` walks the directory and keys each file by its path from
+the root **with forward slashes** — the spelling `resolve` matches a URL
+against, so a walk that kept the platform's separator would have built a table
+answering nothing on Windows. `resolve` itself is unchanged, as this ticket
+predicted: its rules are about paths, not about where the bytes came from. Only
+`version` widened, to `Option<String>`.
+
+`launch` now has two entry points rather than one. `requested_port` is the
+shell's and accepts only `--port`; `requested` is the server's and accepts
+`--ui` too. A shared parser that ignored an unknown flag would be a shell
+silently disregarding a directory it was told to serve, so `flags_from` takes
+the set each binary accepts and refuses anything else.
+
+### The bug that only the real bundle showed
+
+The version is looked for **inside the bundle and then in the directory above
+it**, and the second is the case that actually ships. Vite copies no
+`package.json` into `dist/`, so the real number lives in `apps/web/package.json`
+— the same file `laplus-shell/build.rs` reads through `web_directory()`.
+
+The first implementation looked only inside, and every test passed: the unit
+tests wrote a manifest beside the files, and the integration test did too. Run
+against the real `apps/web/dist` it served every file correctly and reported
+`0.1.1`, the crate's own version, instead of `0.0.28`. That is precisely the
+skew ticket 26 exists to prevent, and no test in this repository would have
+caught it, because they all built the fixture the convenient way. `AGENTS.md`'s
+"a green suite is not evidence the application works" earned its place again.
+
+### Driven, not only tested
+
+`laplus-server --ui ../apps/web/dist` answers `/` with the real 3192-byte page,
+`/settings` with the entry point, `/assets/nope.js` with 404, and reports
+`serverVersion` 0.0.28. A `--ui` naming a directory that does not exist, or one
+with no `index.html`, refuses to start and says which path it tried. 879 tests
+pass on Windows.
+
+### What is left
+
+**Nobody has loaded this from a phone.** That is the point of the ticket and it
+needs a person with a handset on the same network as a box running this — which
+also needs tickets 04 and 03, because the server still binds loopback by default
+and still prints `127.0.0.1` as the address to open.

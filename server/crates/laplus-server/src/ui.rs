@@ -36,6 +36,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Where the web bundle's content-hashed output lives, as Vite emits it.
 ///
@@ -77,7 +78,13 @@ pub struct Assets {
     /// be remembered separately is one that would eventually be shipped with
     /// somebody else's number. [`crate::config::ServerConfig::serving_ui_version`]
     /// is where that matters and why.
-    version: Option<&'static str>,
+    ///
+    /// `String` rather than `&'static str` since ticket 01 of the headless-Linux
+    /// effort: the shell's build script hands over a literal, but a bundle read
+    /// from a directory at startup reads its version out of a file and has
+    /// nowhere to leak it to. The `files` map needed no such widening — it was
+    /// already `Cow`.
+    version: Option<String>,
 }
 
 /// One file, ready to be written as a response.
@@ -134,8 +141,45 @@ impl Assets {
                 .iter()
                 .map(|(path, bytes)| ((*path).to_string(), Cow::Borrowed(*bytes)))
                 .collect(),
-            version: Some(version),
+            version: Some(version.to_string()),
         }
+    }
+
+    /// A bundle read off a disk at startup: what `laplus-server --ui <dir>`
+    /// serves.
+    ///
+    /// **Read at runtime rather than embedded**, and that is a decision rather
+    /// than a convenience. The shell embeds `apps/web/dist` through its build
+    /// script, and the workspace manifest keeps the shell out of
+    /// `default-members` precisely because that makes a `pnpm` build a
+    /// prerequisite of building it. Doing the same in `laplus-server` would
+    /// inflict exactly that on the crate that comment exists to protect —
+    /// `cargo test` on a fresh clone would start requiring a web build. It also
+    /// keeps the two binaries honest about what they are: the shell ships an
+    /// application, the server points at one.
+    ///
+    /// **Every failure here is an error rather than an empty bundle.** A server
+    /// that came up serving nothing because a path was misspelled is a 404 the
+    /// user will blame on the feature; [`crate::launch`] makes the same argument
+    /// about the port and it applies unchanged.
+    pub fn from_directory(root: &Path) -> std::io::Result<Assets> {
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files)?;
+
+        if !files.contains_key(ENTRY_POINT) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{} has no {ENTRY_POINT}, so it is not a UI bundle",
+                    root.display()
+                ),
+            ));
+        }
+
+        Ok(Assets {
+            files,
+            version: version_beside(root),
+        })
     }
 
     /// Whether this server has a UI at all. The distinction the plain binary
@@ -146,8 +190,8 @@ impl Assets {
 
     /// The version of the UI in here, or `None` for a server that brought no
     /// UI and therefore speaks only for itself.
-    pub fn version(&self) -> Option<&'static str> {
-        self.version
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
 
     /// Answer one `GET`, or decline it.
@@ -191,6 +235,72 @@ impl Assets {
             caching: caching(path),
         })
     }
+}
+
+/// Read every file under `directory` into `files`, keyed by its path relative
+/// to `root`.
+///
+/// **Forward slashes, always.** The key is what [`Assets::resolve`] matches a
+/// URL against, so a walk that kept the platform's separator would build a
+/// table that answers nothing on Windows. This is the same spelling
+/// [`Assets::from_static`] receives from the shell's build script.
+///
+/// Symlinks are followed, because `std::fs::metadata` does and a bundle is a
+/// build output rather than a place to be defensive about the shapes on disk.
+fn collect(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<String, Cow<'static, [u8]>>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if std::fs::metadata(&path)?.is_dir() {
+            collect(root, &path, files)?;
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let key = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        files.insert(key, Cow::Owned(std::fs::read(&path)?));
+    }
+    Ok(())
+}
+
+/// What the bundle calls itself, out of the nearest `package.json`.
+///
+/// **Inside the bundle first, then the directory above it**, and the second is
+/// the one that matters in practice: Vite does not copy a manifest into its
+/// output, so the real `apps/web/dist` has none and `apps/web/package.json` is
+/// where the number lives. That is the same file `laplus-shell/build.rs` reads
+/// through `web_directory()`, which is what makes a directory-loaded bundle and
+/// an embedded one report the same `serverVersion` — the parity ticket 26 is
+/// about. A bundle laid out the other way, with its manifest beside its files,
+/// is what upstream's `resolveStaticDir` finds, so both are worth looking for.
+///
+/// Absent is not an error and not a guess: a bundle built by something other
+/// than this repository's `pnpm` may well ship no manifest at all, and
+/// `serving_ui_version` is simply not called then. A `package.json` that will
+/// not parse is treated the same as one that is not there — this number is a
+/// label on a banner, not something to refuse to start over.
+fn version_beside(root: &Path) -> Option<String> {
+    let inside = root.join("package.json");
+    let above = root.parent().map(|parent| parent.join("package.json"));
+
+    std::iter::once(inside)
+        .chain(above)
+        .find_map(|manifest| version_in(&manifest))
+}
+
+fn version_in(manifest: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(manifest).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let version = parsed.get("version")?.as_str()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 /// Could this path be one of the UI's own routes, rather than a file it failed
@@ -262,6 +372,29 @@ mod tests {
         )
     }
 
+    /// The same four files as [`bundle`], on a disk.
+    fn bundle_on_disk(version: Option<&str>) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let root = directory.path();
+        std::fs::create_dir(root.join("assets")).expect("creates assets");
+        for (path, bytes) in [
+            ("index.html", &b"<!doctype html><div id=root></div>"[..]),
+            ("assets/index-a1b2c3.js", b"export default 1"),
+            ("assets/index-d4e5f6.css", b":root{}"),
+            ("favicon.ico", b"\x00\x00\x01\x00"),
+        ] {
+            std::fs::write(root.join(path), bytes).expect("writes a file");
+        }
+        if let Some(version) = version {
+            std::fs::write(
+                root.join("package.json"),
+                format!(r#"{{ "name": "@t3tools/web", "version": "{version}" }}"#),
+            )
+            .expect("writes package.json");
+        }
+        directory
+    }
+
     #[test]
     fn a_server_with_no_ui_answers_nothing() {
         let none = Assets::none();
@@ -269,6 +402,108 @@ mod tests {
         assert_eq!(none.resolve("/"), None);
         assert_eq!(none.resolve("/index.html"), None);
         assert_eq!(none.resolve("/settings"), None);
+    }
+
+    /// Ticket 01 of the headless-Linux effort. A bundle read off a disk answers
+    /// exactly as one compiled into the executable does — which is the whole
+    /// claim, because [`Assets::resolve`] is about paths and not about where
+    /// the bytes came from, and it is not changed by this at all.
+    #[test]
+    fn a_bundle_read_from_a_directory_answers_as_one_built_into_the_binary() {
+        let directory = bundle_on_disk(Some("0.0.28"));
+        let loaded = Assets::from_directory(directory.path()).expect("the bundle loads");
+
+        assert_eq!(loaded.resolve("/"), bundle().resolve("/"));
+        assert_eq!(
+            loaded.resolve("/assets/index-a1b2c3.js"),
+            bundle().resolve("/assets/index-a1b2c3.js")
+        );
+        assert_eq!(loaded.resolve("/settings"), bundle().resolve("/settings"));
+        assert_eq!(loaded.resolve("/assets/nope.js"), None);
+    }
+
+    /// Nested directories are keyed by their path from the root, with forward
+    /// slashes — the spelling `resolve` matches against, and the one a URL
+    /// arrives in. A walk that used the platform's separator would serve
+    /// nothing on Windows.
+    #[test]
+    fn a_file_in_a_subdirectory_is_keyed_by_its_path_from_the_root() {
+        let directory = bundle_on_disk(None);
+        std::fs::create_dir_all(directory.path().join("assets/fonts")).expect("creates fonts");
+        std::fs::write(directory.path().join("assets/fonts/x.woff2"), b"font")
+            .expect("writes the font");
+
+        let loaded = Assets::from_directory(directory.path()).expect("the bundle loads");
+        let served = loaded
+            .resolve("/assets/fonts/x.woff2")
+            .expect("the font is served");
+
+        assert_eq!(served.path, "assets/fonts/x.woff2");
+        assert_eq!(served.bytes, b"font");
+    }
+
+    /// The version travels with the bytes for the reason the field's own note
+    /// gives — and a bundle without a `package.json` beside it is not an error,
+    /// it is a bundle that does not know its own name.
+    #[test]
+    fn the_version_is_read_from_the_package_beside_the_bundle_or_is_absent() {
+        let named = bundle_on_disk(Some("0.0.28"));
+        assert_eq!(
+            Assets::from_directory(named.path())
+                .expect("loads")
+                .version(),
+            Some("0.0.28")
+        );
+
+        let anonymous = bundle_on_disk(None);
+        assert_eq!(
+            Assets::from_directory(anonymous.path())
+                .expect("loads")
+                .version(),
+            None
+        );
+    }
+
+    /// **The layout that actually ships.** Vite writes no `package.json` into
+    /// `dist/`, so the real bundle's version is in `apps/web/package.json` — one
+    /// directory up, and the same file `laplus-shell/build.rs` reads. Without
+    /// this the plain binary served the right files and reported the wrong
+    /// number, which is precisely the skew ticket 26 exists to prevent.
+    #[test]
+    fn the_version_is_found_in_the_package_above_a_dist_directory() {
+        let web = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(
+            web.path().join("package.json"),
+            r#"{ "name": "@t3tools/web", "version": "0.0.29" }"#,
+        )
+        .expect("writes the package");
+
+        let dist = web.path().join("dist");
+        std::fs::create_dir(&dist).expect("creates dist");
+        std::fs::write(dist.join("index.html"), b"<!doctype html>").expect("writes the page");
+
+        assert_eq!(
+            Assets::from_directory(&dist).expect("loads").version(),
+            Some("0.0.29")
+        );
+    }
+
+    /// A directory that is not there, or that holds no entry point, is a
+    /// refusal rather than an empty bundle. `crate::launch` turns this into a
+    /// server that does not start: one that came up with no UI because a path
+    /// was misspelled is a 404 the user would blame on the feature.
+    #[test]
+    fn a_directory_that_is_not_a_bundle_is_refused() {
+        let missing = bundle_on_disk(None);
+        let absent = missing.path().join("nowhere");
+        assert!(Assets::from_directory(&absent).is_err());
+
+        let empty = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(empty.path().join("read-me.txt"), b"not a bundle").expect("writes a file");
+        assert!(
+            Assets::from_directory(empty.path()).is_err(),
+            "a directory with no index.html is not a bundle"
+        );
     }
 
     /// Ticket 26: the number the server reports as its own comes from here, so

@@ -280,3 +280,47 @@ async fn a_server_with_no_ui_reports_its_own_version() {
 
     server.stop().await;
 }
+
+/// Ticket 01 of the headless-Linux effort: the same bundle, read off a disk
+/// rather than compiled in, answers the same over the wire.
+///
+/// **This is the test the ticket is really about.** A phone has no application
+/// to start — it is a browser, so the page has to come from the server it will
+/// then talk to, and `laplus-server` passed `Assets::none()` and answered 404 at
+/// `/`. Everything above this line is the shell's path through the same policy;
+/// this is the plain binary's, and the assertions are deliberately the ones
+/// already made above rather than new ones, because the claim is parity.
+#[tokio::test]
+async fn a_bundle_read_from_a_directory_is_served_exactly_as_an_embedded_one() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir(directory.path().join("assets")).expect("creates assets");
+    std::fs::write(directory.path().join("index.html"), PAGE).expect("writes the page");
+    std::fs::write(directory.path().join("assets/index-a1b2c3.js"), SCRIPT)
+        .expect("writes the script");
+    std::fs::write(directory.path().join("favicon.ico"), ICON).expect("writes the icon");
+    std::fs::write(
+        directory.path().join("package.json"),
+        format!(r#"{{ "name": "@t3tools/web", "version": "{BUNDLE_VERSION}" }}"#),
+    )
+    .expect("writes the package");
+
+    let loaded = Assets::from_directory(directory.path()).expect("the bundle loads");
+    let server = TestServer::start_serving(loaded).await;
+
+    // The page, at the root.
+    let root = server.get("/").await;
+    assert_eq!(root.status, 200);
+    assert_eq!(root.text, String::from_utf8_lossy(PAGE));
+
+    // A client-side route, answered with the entry point so the browser can
+    // route it; and a missing file, answered as missing rather than as HTML.
+    assert_eq!(server.get("/settings").await.text, String::from_utf8_lossy(PAGE));
+    assert_eq!(server.get("/assets/nope.js").await.status, 404);
+
+    // The server reports the bundle's version as its own, from a `package.json`
+    // beside the files rather than from a build script.
+    let descriptor = server.get("/.well-known/t3/environment").await;
+    assert_eq!(descriptor.body["serverVersion"], json!(BUNDLE_VERSION));
+
+    server.stop().await;
+}
