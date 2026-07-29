@@ -139,46 +139,70 @@ impl Watcher {
     /// touches — so a caller must not already be holding the index's scans when
     /// it arrives here. [`crate::filesystem::Index::rescan`] is written to that
     /// rule.
+    /// **The registry lock is never held across a call into the backend.** See
+    /// [`Watcher::release`] for what that costs on Linux: `inotify` waits for
+    /// its event thread to acknowledge a registration, and that thread may be
+    /// inside `deliver` holding — or waiting for — this lock. The three
+    /// sections below are therefore three separate acquisitions rather than one.
     pub fn watch(&self, key: &str, root: &Path) {
-        let mut watched = lock(&self.watched);
-        if let Some(position) = watched.iter().position(|entry| entry.key == key) {
-            // Already watched, and just listed again — so it goes to the back of
-            // the eviction order. This is the whole of how "recently used" is
-            // recorded: `listEntries` is the only caller, and it is the UI
-            // opening a project or refreshing it.
-            let touched = watched.remove(position);
-            watched.push(touched);
-            return;
-        }
-
-        let mut notify = lock(&self.notify);
-        if notify.is_none() {
-            match self.start() {
-                Ok(started) => *notify = Some(started),
-                Err(error) => {
-                    eprintln!("laplus: cannot watch the filesystem: {error}");
-                    return;
-                }
+        {
+            let mut watched = lock(&self.watched);
+            if let Some(position) = watched.iter().position(|entry| entry.key == key) {
+                // Already watched, and just listed again — so it goes to the
+                // back of the eviction order. This is the whole of how "recently
+                // used" is recorded: `listEntries` is the only caller, and it is
+                // the UI opening a project or refreshing it.
+                let touched = watched.remove(position);
+                watched.push(touched);
+                return;
             }
         }
-        let started = notify.as_mut().expect("a watcher was just created");
-        if let Err(error) = started.watch(root, RecursiveMode::Recursive) {
-            eprintln!("laplus: cannot watch {}: {error}", root.display());
-            return;
+
+        {
+            let mut notify = lock(&self.notify);
+            if notify.is_none() {
+                match self.start() {
+                    Ok(started) => *notify = Some(started),
+                    Err(error) => {
+                        eprintln!("laplus: cannot watch the filesystem: {error}");
+                        return;
+                    }
+                }
+            }
+            let started = notify.as_mut().expect("a watcher was just created");
+            if let Err(error) = started.watch(root, RecursiveMode::Recursive) {
+                eprintln!("laplus: cannot watch {}: {error}", root.display());
+                return;
+            }
         }
 
         // Evicted *after* the new root is registered, so a watch that fails does
         // not also cost the workspace it would have replaced.
-        if watched.len() >= MAX_WATCHED {
-            let evicted = watched.remove(0);
-            let _ = started.unwatch(&evicted.root);
+        let evicted = {
+            let mut watched = lock(&self.watched);
+            // Re-checked, because the lock was let go above: a second call for
+            // the same key could have registered it while the backend was being
+            // told about this one. Registering a path twice is idempotent in
+            // `notify`, so the loser of that race has nothing to undo — but two
+            // entries under one key would leak a watch on the next release.
+            if watched.iter().any(|entry| entry.key == key) {
+                return;
+            }
+            let evicted = (watched.len() >= MAX_WATCHED).then(|| watched.remove(0));
+            watched.push(Watched::new(key, root));
+            evicted
+        };
+
+        if let Some(evicted) = evicted {
+            if let Some(notify) = lock(&self.notify).as_mut() {
+                let _ = notify.unwatch(&evicted.root);
+            }
             eprintln!(
                 "laplus: {MAX_WATCHED} workspaces are already watched, so changes \
                  under {} will only be noticed when it is listed again",
                 evicted.root.display()
             );
         }
-        watched.push(Watched::new(key, root));
     }
 
     /// Stop watching whatever is held under `key`, releasing its handle.
@@ -187,11 +211,21 @@ impl Watcher {
     /// wire is `project.delete` — see [`crate::orchestration`] — and that is the
     /// caller.
     pub fn release(&self, key: &str) -> bool {
-        let mut watched = lock(&self.watched);
-        let Some(position) = watched.iter().position(|entry| entry.key == key) else {
-            return false;
+        // **The registry lock is dropped before the backend is touched**, and on
+        // Linux that is the difference between working and wedging. `inotify`'s
+        // `unwatch` waits for its own event thread to acknowledge the removal,
+        // and that thread may be inside `deliver` waiting for this very lock —
+        // so holding it across the call is a deadlock with the operating
+        // system's timing as the trigger. It never fired on Windows, where
+        // `ReadDirectoryChangesW` needs no such handshake, which is exactly why
+        // it survived until the suite was first run on Linux.
+        let gone = {
+            let mut watched = lock(&self.watched);
+            let Some(position) = watched.iter().position(|entry| entry.key == key) else {
+                return false;
+            };
+            watched.remove(position)
         };
-        let gone = watched.remove(position);
 
         if let Some(notify) = lock(&self.notify).as_mut() {
             // An unwatch that fails has already lost the registration it was

@@ -218,12 +218,73 @@ does one interrupt test; `server/CLAUDE.md` already warns that this suite's
 timeouts catch hangs rather than enforce budgets, and `--test-threads` is the
 lever. On CI it is a real failure and still open.
 
-## What the Linux job has not yet said
+## What a real Linux box said
 
-**It has never run.** The job fires on push to `main` and on pull requests
-touching `server/`, and this work has done neither yet — so everything above
-about Linux is an argument from the source rather than a result. What the first
-run should be checked against rather than assumed:
+**Run by hand on an Oracle Ampere box before any CI run** — Ubuntu 20.04,
+**aarch64**, 3 cores, `build-essential` already present. Not the same shape as
+the runner this ticket added (`ubuntu-latest` is x86_64 and much newer), so it
+answers a harder version of the question and a different one.
+
+**It compiles.** `cargo build -p laplus-server` finished in 52 seconds, clean,
+first attempt. Every `#[cfg(not(windows))]` twin in the crate had been written
+and never built; none of them was wrong. That was this ticket's actual question.
+
+**`machine_label` was validated on the box rather than argued.** `HOSTNAME` is
+set by bash there and **not exported to child processes** — confirmed with
+`env`, with a Python child, and under `env -i` — so a server started over
+`ssh host cmd` sees neither variable. Before the change it would have called
+itself `laplus`; it now answers `instance-20241102-2034` from `/etc/hostname`.
+
+**783 passed, 60 failed.** The 60 are four separate causes and only some are
+laplus's:
+
+1. **40 of them are the box, not the code.** The workspace harness runs
+   `git init -b main`, and `-b` arrived in git 2.28. Ubuntu 20.04 ships 2.25.1.
+   These will not reproduce on `ubuntu-latest`. Worth knowing anyway: laplus
+   _drives_ git for branches and diffs, so a box running the server wants a
+   modern one for the application's sake, not the suite's.
+2. **A deadlock in the watcher.** Fixed — its own commit, and the reason this
+   ticket was worth running by hand. See below.
+3. **Windows-only assumptions in four tests.** `files` sends `src\lib\util.rs`
+   and `..\secret.txt`, which are paths on Windows and ordinary _filenames_ on
+   Linux, where a backslash is a legal character; `provider` expects a
+   `claude.cmd` to resolve, and there is no `PATHEXT` off Windows. The tests
+   encode the platform, not the behaviour. **Note what this is not:** no
+   traversal escape was demonstrated — `..\secret.txt` is harmless on Linux.
+   Whether real `../` traversal is still refused there is unverified and worth
+   checking before the guard is trusted cross-platform.
+4. **The pty.** `resizing_a_terminal_resizes_the_pty_the_shell_is_running_in`
+   fails with "the shell did not see the size it was opened at" and a bare `$ `
+   captured. Undiagnosed. This is the risk named at the top of this ticket —
+   "the feature most likely to behave differently, and the one the suite can
+   only partly speak for" — and it is the one finding with real product risk.
+
+**The watcher deadlock, because it is the one that would have shipped.**
+`a_released_workspace_is_no_longer_watched` did not fail on Linux, it **hung**,
+at `--test-threads=1`, so not interference. `release` held the registry lock
+across `notify.unwatch`; inotify waits for its event thread to acknowledge, and
+that thread sits in `deliver` waiting for the same lock. `project.delete` is the
+real caller, so closing a project while anything had changed underneath would
+have wedged the watcher and everything queued behind its lock. Windows never saw
+it because `ReadDirectoryChangesW` needs no such handshake. Fixed in both
+`release` and `watch`, verified on Linux (0.51s instead of forever) and on
+Windows (870 passing).
+
+**Still open, deliberately:** a file written into a _just-created_
+subdirectory is never reported on Linux — inotify registers per directory, so
+the write lands before the watch on `src/` exists, and the event is lost rather
+than late. The consequence is a stale `@`-mention listing when the agent or
+`cargo` creates a directory and writes into it. Fixing it is a watcher redesign
+(rescan on directory-create, or subtree exclusions this module's own header
+already wanted), so it wants its own ticket rather than this one.
+
+## What CI has not yet said
+
+**The job has never run.** It fires on push to `main` and on pull requests
+touching `server/`, and this work has done neither yet — so everything about
+`ubuntu-latest` specifically, as opposed to the aarch64 box above, is still an
+argument rather than a result. What the first run should be checked against
+rather than assumed:
 
 - The ConPTY failure, which is Windows-specific and should **pass** on Linux.
 - Anything the `cfg(not(windows))` paths get wrong. This is the ticket's
