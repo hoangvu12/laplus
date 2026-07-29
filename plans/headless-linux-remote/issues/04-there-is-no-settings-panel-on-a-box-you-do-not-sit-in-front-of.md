@@ -3,7 +3,7 @@
 **What to build:** a way to turn network access on from the command line, and
 the documentation for running laplus as a server.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 **Depends on:** nothing. Can land alongside 01.
 
@@ -102,3 +102,93 @@ Three things specific to a headless box:
   business.
 - Any change to the Settings switch or the Tauri command. Both keep working
   unchanged for the desktop application.
+
+## What landed
+
+`--network` on `laplus-server`, with `LAPLUS_NETWORK` behind it in the same
+argument-beats-environment order `--port` and `--ui` use. It sets `Exposure` for
+this run and writes nothing.
+
+**It does not persist, and `docs/adr/0023` is the record.** The short version is
+that `laplus-server` and `laplus-shell` read the same `remote-access.json` out
+of the same preferences directory, so a flag that wrote it would mean one server
+run over ssh silently moving the switch a user later sees in Settings. A
+process-scoped override is the smaller claim and the one a unit file wants.
+
+The flag can also turn exposure **off** — `--network=false` over a file that
+says otherwise. That is beyond what this ticket asked for and is argued in the
+ADR: once the flag exists, an operator who wants one run on loopback otherwise
+has to edit and restore the file, which is the manual step the flag removes.
+`true`/`1`/`on`/`yes` and their opposites are all accepted, because the three
+authors of this value — a person, a `systemd` unit, a `docker run -e` — each
+have their own habit. Anything else is a refusal with a sentence.
+
+`--network` is the first flag in `crate::launch` that means something bare, so
+`flags_from` grew a second list. It accepts `--network=false` but **not**
+`--network false`, which would make `--network --port 4773` eat its neighbour
+and start a server on the default port.
+
+`Server::bind` takes an `Option<Exposure>` the command line insisted on and
+applies it through `ServerConfig::with_remote_access`, so `auth.policy` moves
+with the bind address rather than being left describing a reachability the
+config no longer has. The shell passes `None` and its flag set still refuses
+`--network`: it restarts itself when the switch moves, so a one-run override
+behind a panel that rewrites the file would be undone by the first use of the
+panel.
+
+`StartupFailure::Listen` now carries the address rather than the port. It used
+to render `cannot listen on 127.0.0.1:<port>`, which was true until the exposure
+switch existed and would have sent somebody who passed `--network` looking for a
+conflict on an address the process never asked for.
+
+`RemoteAccess` gained one field, `stored` — whether a `remote-access.json`
+actually decided the mode. Only a `mode` this server understood counts; a
+missing file, an unparseable one, and a mode nobody knows are all the default.
+It exists for one line of output, and it earns that: "from remote-access.json"
+printed on a fresh box sends the operator looking for a file that is not there.
+
+### Startup says which of the four decided it
+
+```
+laplus: network access is on, from --network — this server is on your network
+laplus: network access is off by default — this server answers this machine only
+```
+
+`--network`, `LAPLUS_NETWORK`, `remote-access.json`, or the default. Read back
+out of the _running server's_ configuration rather than from the parsed
+arguments, so the line cannot describe a posture the listener does not have.
+`crate::startup` decides it; ticket 03 is the rest of that module.
+
+### The documentation
+
+`server/docs/running-headless.md` grew from the build prerequisites ticket 05
+left there into the full page: which binary, all three flags and their
+environment variables, what startup prints and how to read each state, the
+pairing walkthrough, where the files live, and the posture.
+
+All three posture points are in it, unsoftened. The third — "nobody is
+watching" — turned out to have a sharper answer than expected: **`laplus-server`
+writes no log file at all.** The `logs/` directory that
+`observability.logsDirectoryPath` advertises to the UI is written only by the
+desktop shell, and only when the shell fails to start. So the page says the log
+is wherever the operator redirects it, and that it has to be **both** streams.
+
+It also carries the finding from the previous session that cost the most time:
+`claude` lives in `~/.local/bin`, which `~/.profile` adds to `PATH` for **login
+shells only**. `ssh box` finds it; `ssh box 'which claude'`, `systemd` and cron
+do not. `crate::provider` walks `PATH`, so a service unit reports no provider on
+a machine where `claude` is installed, authenticated and working by hand, with
+nothing about the failure pointing at `PATH`.
+
+### Driven, not only tested
+
+Against the real `apps/web/dist`, all four sources announce themselves
+correctly, `--network=false` pulls a `network-accessible` file back onto
+loopback for one run, `--network=flase` is refused with a sentence and exit 1,
+and a `remote-access.json` that will not parse complains and falls back. 865
+tests pass on Windows.
+
+### What is left
+
+Nothing in this ticket. The `vite.config.ts` pre-commit question is still
+undecided and still not ours to change.

@@ -1,4 +1,5 @@
-//! Which port a laplus process serves on.
+//! What a laplus process was asked for on the way in: a port, a bundle, and
+//! whether to leave loopback.
 //!
 //! Shared by the two binaries — the plain server and the desktop shell — because
 //! they have to agree: a developer who starts the shell and then points a browser
@@ -14,9 +15,27 @@
 //! it, every time, with nothing in any log to say why. A port already in use is
 //! a loud failure at startup; the alternative is a silent one the developer
 //! would blame on the app forgetting things.
+//!
+//! ## `--network` decides this run and nothing after it
+//!
+//! The switch in Settings owns `remote-access.json`. `--network` does **not**
+//! write to it: it overrides the exposure for the process it was given to, and
+//! the next start reads the file again as though the flag had never been passed.
+//!
+//! One `laplus-server --network` run that rewrote that file would silently
+//! change what the *desktop application* does on its next launch, from a
+//! terminal on a box the user may not even be sitting at. Overriding one process
+//! is the smaller claim, and it is the one a service unit wants — the unit file
+//! is the record of what that service does, and it should not have to be
+//! reconciled against a file it wrote the first time it started.
+//!
+//! `docs/adr/0023` is the long version, including why the flag can turn exposure
+//! *off* as well as on.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use crate::remote_access::Exposure;
 
 /// The port laplus listens on unless told otherwise.
 ///
@@ -37,7 +56,7 @@ pub const DEFAULT_PORT: u16 = 4773;
 /// disregarded `--ui` would be a shell the developer thinks is serving a
 /// directory.
 pub fn requested_port() -> Result<u16, String> {
-    let flags = flags_from(std::env::args().skip(1), &["port"])?;
+    let flags = flags_from(std::env::args().skip(1), &["port"], &[])?;
     port_in(&flags, std::env::var("LAPLUS_PORT").ok())
 }
 
@@ -49,15 +68,49 @@ pub struct Requested {
     /// server that answers calls and no pages — what the plain binary was
     /// before ticket 01 of the headless-Linux effort, and still is by default.
     pub ui: Option<PathBuf>,
+    /// The exposure this run was told to use, and which of the two places said
+    /// so. `None` is neither of them saying anything, which leaves
+    /// `remote-access.json` in charge — see this module's header.
+    pub network: Option<Network>,
+}
+
+/// An exposure the command line or the environment insisted on, and which.
+///
+/// The two travel together because the startup line has to name the source:
+/// a flag and a file disagreeing is otherwise invisible on a box with no
+/// window, and "the switch is on but the server is not listening for you" is
+/// the single most confusing state this feature has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Network {
+    pub exposure: Exposure,
+    pub source: NetworkSource,
+}
+
+/// Which of the two overrides was used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkSource {
+    Flag,
+    Environment,
+}
+
+impl NetworkSource {
+    /// What to call it in a sentence, spelled the way the operator typed it.
+    pub fn named(self) -> &'static str {
+        match self {
+            NetworkSource::Flag => "--network",
+            NetworkSource::Environment => "LAPLUS_NETWORK",
+        }
+    }
 }
 
 /// What the plain server was asked for, from the command line and then the
 /// environment.
 pub fn requested() -> Result<Requested, String> {
-    let flags = flags_from(std::env::args().skip(1), &["port", "ui"])?;
+    let flags = flags_from(std::env::args().skip(1), &["port", "ui"], &["network"])?;
     Ok(Requested {
         port: port_in(&flags, std::env::var("LAPLUS_PORT").ok())?,
         ui: ui_in(&flags, std::env::var("LAPLUS_UI").ok()),
+        network: network_in(&flags, std::env::var("LAPLUS_NETWORK").ok())?,
     })
 }
 
@@ -67,26 +120,37 @@ pub fn requested() -> Result<Requested, String> {
 /// other tool does. An unknown flag is a refusal rather than something to skip:
 /// a typo that started a server with the default it was told not to use is the
 /// silent failure [`DEFAULT_PORT`]'s note is about.
+///
+/// `switches` are the flags that mean something on their own — `--network` is
+/// the only one, and it records `true` when it appears bare. They still accept
+/// `--network=false`, because a run that has to override an environment
+/// variable *downwards* has no other spelling; what they do not accept is
+/// `--network false`, which would make `--network --port 4773` eat its
+/// neighbour and start a server on the default port.
 fn flags_from(
     mut arguments: impl Iterator<Item = String>,
-    allowed: &[&str],
+    valued: &[&str],
+    switches: &[&str],
 ) -> Result<BTreeMap<String, String>, String> {
     let mut given = BTreeMap::new();
     while let Some(argument) = arguments.next() {
-        let (name, value) = match argument.split_once('=') {
-            Some((name, value)) => (name.to_string(), value.to_string()),
-            None => {
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| format!("{argument} needs a value"))?;
-                (argument, value)
-            }
+        let (name, attached) = match argument.split_once('=') {
+            Some((name, value)) => (name.to_string(), Some(value.to_string())),
+            None => (argument, None),
         };
         let flag = name
             .strip_prefix("--")
-            .filter(|flag| allowed.contains(flag))
-            .ok_or_else(|| format!("unrecognised argument {name}"))?;
-        if given.insert(flag.to_string(), value).is_some() {
+            .filter(|flag| valued.contains(flag) || switches.contains(flag))
+            .ok_or_else(|| format!("unrecognised argument {name}"))?
+            .to_string();
+        let value = match attached {
+            Some(value) => value,
+            None if switches.contains(&flag.as_str()) => "true".to_string(),
+            None => arguments
+                .next()
+                .ok_or_else(|| format!("{name} needs a value"))?,
+        };
+        if given.insert(flag.clone(), value).is_some() {
             return Err(format!("--{flag} was given more than once"));
         }
     }
@@ -126,6 +190,49 @@ fn ui_in(flags: &BTreeMap<String, String>, environment: Option<String>) -> Optio
         .map(PathBuf::from)
 }
 
+/// Whether this run was told to leave loopback, argument before environment.
+///
+/// **Validated, unlike the bundle path**, for the reason [`port_in`] is: a
+/// misread value here does not fail later somewhere legible, it silently picks
+/// one of the two answers. `LAPLUS_NETWORK=flase` falling back to loopback is a
+/// phone that cannot connect and a log that says nothing about why; the same
+/// typo meaning "on" would be worse.
+fn network_in(
+    flags: &BTreeMap<String, String>,
+    environment: Option<String>,
+) -> Result<Option<Network>, String> {
+    let (raw, source) = match flags.get("network") {
+        Some(value) => (value.clone(), NetworkSource::Flag),
+        // A blank one is nothing asked for rather than a value to refuse, which
+        // is [`ui_in`]'s rule and the same reason: an exported `LAPLUS_NETWORK=`
+        // is a common way to mean "not set".
+        None => match environment.filter(|value| !value.trim().is_empty()) {
+            Some(value) => (value, NetworkSource::Environment),
+            None => return Ok(None),
+        },
+    };
+
+    let exposure = exposure_from(&raw).ok_or_else(|| match source {
+        NetworkSource::Flag => format!("{raw} is not on or off"),
+        NetworkSource::Environment => format!("LAPLUS_NETWORK={raw} is not on or off"),
+    })?;
+    Ok(Some(Network { exposure, source }))
+}
+
+/// The spellings of yes and no this accepts.
+///
+/// Wider than one word each because this value arrives from three kinds of
+/// author — a person typing a flag, a `systemd` unit's `Environment=`, and a
+/// `docker run -e` — and each of those has its own habit. It is not open-ended:
+/// anything else is a refusal, so a value nobody meant cannot land on a default.
+fn exposure_from(value: &str) -> Option<Exposure> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Some(Exposure::NetworkAccessible),
+        "false" | "0" | "off" | "no" => Some(Exposure::LocalOnly),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,21 +246,45 @@ mod tests {
     }
 
     /// The server's flag set, which is the wider of the two.
+    fn server_flags(given: &[&str]) -> Result<BTreeMap<String, String>, String> {
+        flags_from(arguments(given), &["port", "ui"], &["network"])
+    }
+
     fn port_from(given: &[&str], environment: Option<String>) -> Result<u16, String> {
-        port_in(&flags_from(arguments(given), &["port", "ui"])?, environment)
+        port_in(&server_flags(given)?, environment)
     }
 
     fn ui_from(given: &[&str], environment: Option<String>) -> Result<Option<PathBuf>, String> {
-        Ok(ui_in(
-            &flags_from(arguments(given), &["port", "ui"])?,
-            environment,
-        ))
+        Ok(ui_in(&server_flags(given)?, environment))
+    }
+
+    fn network_from(
+        given: &[&str],
+        environment: Option<String>,
+    ) -> Result<Option<Network>, String> {
+        network_in(&server_flags(given)?, environment)
+    }
+
+    fn on(source: NetworkSource) -> Result<Option<Network>, String> {
+        Ok(Some(Network {
+            exposure: Exposure::NetworkAccessible,
+            source,
+        }))
+    }
+
+    fn off(source: NetworkSource) -> Result<Option<Network>, String> {
+        Ok(Some(Network {
+            exposure: Exposure::LocalOnly,
+            source,
+        }))
     }
 
     #[test]
     fn nothing_asked_for_is_the_default() {
         assert_eq!(port_from(&[], None), Ok(DEFAULT_PORT));
         assert_eq!(ui_from(&[], None), Ok(None));
+        // Not `Some(LocalOnly)`: nothing was said, so the file decides.
+        assert_eq!(network_from(&[], None), Ok(None));
     }
 
     #[test]
@@ -162,6 +293,10 @@ mod tests {
         assert_eq!(
             ui_from(&[], Some("dist".to_string())),
             Ok(Some(PathBuf::from("dist")))
+        );
+        assert_eq!(
+            network_from(&[], Some("1".to_string())),
+            on(NetworkSource::Environment)
         );
     }
 
@@ -185,13 +320,87 @@ mod tests {
             ui_from(&["--ui=chosen"], Some("ignored".to_string())),
             Ok(Some(PathBuf::from("chosen")))
         );
+        assert_eq!(
+            network_from(&["--network"], Some("off".to_string())),
+            on(NetworkSource::Flag)
+        );
+        // The direction that has no other spelling: one run pulled back onto
+        // loopback despite an environment that says otherwise.
+        assert_eq!(
+            network_from(&["--network=false"], Some("on".to_string())),
+            off(NetworkSource::Flag)
+        );
+    }
+
+    /// Ticket 04. `--network` on its own is the whole of what an operator
+    /// should have to type, and it must not swallow the flag after it.
+    #[test]
+    fn the_network_switch_stands_alone() {
+        assert_eq!(network_from(&["--network"], None), on(NetworkSource::Flag));
+
+        let flags = server_flags(&["--network", "--port", "5004"]).expect("both are recognised");
+        assert_eq!(port_in(&flags, None), Ok(5004));
+        assert_eq!(
+            network_in(&flags, None),
+            on(NetworkSource::Flag),
+            "--network took the next argument as its value"
+        );
+    }
+
+    /// Three kinds of author write this value — a person, a systemd unit, a
+    /// `docker run -e` — and each has its own habit.
+    #[test]
+    fn on_and_off_have_more_than_one_spelling_each() {
+        for said in ["true", "1", "on", "yes", "ON", " yes "] {
+            assert_eq!(
+                network_from(&[], Some(said.to_string())),
+                on(NetworkSource::Environment),
+                "{said} should mean on"
+            );
+        }
+        for said in ["false", "0", "off", "no", "Off"] {
+            assert_eq!(
+                network_from(&[], Some(said.to_string())),
+                off(NetworkSource::Environment),
+                "{said} should mean off"
+            );
+        }
+    }
+
+    /// A value nobody meant must not land on either answer. Falling back to
+    /// loopback is a phone that cannot connect with nothing in the log to say
+    /// why; falling forward is a typo opening the machine up.
+    #[test]
+    fn a_network_value_this_does_not_understand_is_refused() {
+        for (given, environment) in [
+            (vec!["--network=flase"], None),
+            (vec!["--network="], None),
+            (vec!["--network=local-only"], None),
+            (vec!["--network", "--network"], None),
+            (vec![], Some("enabled".to_string())),
+        ] {
+            let refused = network_from(&given, environment.clone());
+            assert!(refused.is_err(), "{given:?} {environment:?} should be refused");
+            assert!(
+                !refused.unwrap_err().is_empty(),
+                "{given:?} should say what was wrong"
+            );
+        }
+    }
+
+    /// An exported `LAPLUS_NETWORK=` is a common way to mean "not set", and
+    /// leaving the file in charge is what that should do — not refuse, and not
+    /// force loopback over a file that says otherwise.
+    #[test]
+    fn a_blank_environment_value_leaves_the_file_in_charge() {
+        assert_eq!(network_from(&[], Some(String::new())), Ok(None));
+        assert_eq!(network_from(&[], Some("  ".to_string())), Ok(None));
     }
 
     /// Ticket 01. The two flags are independent, and either order works.
     #[test]
     fn the_port_and_the_bundle_are_asked_for_together() {
-        let flags = flags_from(arguments(&["--ui", "dist", "--port", "5003"]), &["port", "ui"])
-            .expect("both are recognised");
+        let flags = server_flags(&["--ui", "dist", "--port", "5003"]).expect("both are recognised");
         assert_eq!(port_in(&flags, None), Ok(5003));
         assert_eq!(ui_in(&flags, None), Some(PathBuf::from("dist")));
     }
@@ -218,13 +427,19 @@ mod tests {
         }
     }
 
-    /// The shell embeds its bundle, so being handed a directory to serve means
-    /// the developer expected something that will not happen. Refused rather
-    /// than ignored, which is the whole reason there are two entry points.
+    /// The shell embeds its bundle and has a Settings panel for the switch, so
+    /// being handed either means the developer expected something that will not
+    /// happen. Refused rather than ignored, which is the whole reason there are
+    /// two entry points.
+    ///
+    /// `--network` in particular: the shell restarts itself when the switch
+    /// moves (`docs/adr/0022`), so a flag that overrode the file for one run
+    /// would be undone by the first use of the panel it sits behind.
     #[test]
-    fn the_shells_flag_set_does_not_include_the_bundle() {
-        assert!(flags_from(arguments(&["--ui", "dist"]), &["port"]).is_err());
-        assert!(flags_from(arguments(&["--port", "5000"]), &["port"]).is_ok());
+    fn the_shells_flag_set_is_the_port_and_nothing_else() {
+        assert!(flags_from(arguments(&["--ui", "dist"]), &["port"], &[]).is_err());
+        assert!(flags_from(arguments(&["--network"]), &["port"], &[]).is_err());
+        assert!(flags_from(arguments(&["--port", "5000"]), &["port"], &[]).is_ok());
     }
 
     /// An empty value is nothing asked for rather than a path named "". The

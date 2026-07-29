@@ -218,15 +218,24 @@ pub struct Server {
 #[derive(Debug)]
 pub enum StartupFailure {
     Database(StorageError),
-    Listen { port: u16, error: std::io::Error },
+    /// `address` is what was actually asked of the operating system, wildcard
+    /// and all. It used to be the port with `127.0.0.1:` written in front of it,
+    /// which was true until the exposure switch existed and is now the wrong
+    /// half of the sentence: "cannot listen on 127.0.0.1:4773" sends somebody
+    /// who passed `--network` looking for a conflict on an address this process
+    /// never asked for.
+    Listen {
+        address: SocketAddr,
+        error: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for StartupFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StartupFailure::Database(error) => write!(formatter, "{error}"),
-            StartupFailure::Listen { port, error } => {
-                write!(formatter, "cannot listen on 127.0.0.1:{port}: {error}")
+            StartupFailure::Listen { address, error } => {
+                write!(formatter, "cannot listen on {address}: {error}")
             }
         }
     }
@@ -235,22 +244,44 @@ impl std::fmt::Display for StartupFailure {
 impl std::error::Error for StartupFailure {}
 
 impl Server {
-    /// Bind to loopback on `port`, open the registry, and start serving. Port 0
-    /// asks the OS for a free one, which is what the tests use.
+    /// Open the registry, bind, and start serving. Port 0 asks the OS for a
+    /// free one, which is what the tests use.
     ///
-    /// Loopback is not a default here, it is the security model: v1 has no
-    /// identity store, so reachability *is* the boundary.
+    /// Loopback unless `remote-access.json` says otherwise, and `docs/adr/0022`
+    /// is why that file is allowed to say otherwise at all.
     ///
     /// `ui` is the web bundle to serve, or [`Assets::none`] for a server that
-    /// only answers calls. The shell passes one; the plain binary does not,
-    /// which is what keeps `cargo run` a socket endpoint the real UI can be
-    /// pointed at from a development server.
-    pub async fn bind(port: u16, ui: Assets) -> Result<Server, StartupFailure> {
+    /// only answers calls. The shell passes one; the plain binary does so only
+    /// when handed `--ui`, which is what keeps `cargo run` a socket endpoint the
+    /// real UI can be pointed at from a development server.
+    ///
+    /// `exposure` is what the command line insisted on, overriding the file for
+    /// this process and not writing to it — `laplus-server --network`, and
+    /// `docs/adr/0023` for why it does not persist. `None` is nothing insisted
+    /// on, which is every caller but that flag: the shell passes it because the
+    /// switch in Settings owns the file and takes no flag.
+    pub async fn bind(
+        port: u16,
+        ui: Assets,
+        exposure: Option<crate::remote_access::Exposure>,
+    ) -> Result<Server, StartupFailure> {
         let database =
             Database::open(&crate::store::default_path()).map_err(StartupFailure::Database)?;
-        let server = Server::bind_with(port, ServerConfig::detect(), database, ui)
+        let config = ServerConfig::detect();
+        // Through `with_remote_access` rather than onto the field, because
+        // `auth.policy` is derived from the bind address and has to move with
+        // it. That method's own note is about the time it did not.
+        let config = match exposure {
+            None => config,
+            Some(exposure) => {
+                let overridden = config.remote_access.with_exposure(exposure);
+                config.with_remote_access(overridden)
+            }
+        };
+        let address = SocketAddr::from((config.remote_access.bind_address(), port));
+        let server = Server::bind_with(port, config, database, ui)
             .await
-            .map_err(|error| StartupFailure::Listen { port, error })?;
+            .map_err(|error| StartupFailure::Listen { address, error })?;
         server.probe_provider();
         Ok(server)
     }
@@ -480,6 +511,54 @@ impl Server {
         self.boot_credential
             .as_ref()
             .map(|credential| format!("{}#token={credential}", self.http_url()))
+    }
+
+    /// [`Server::http_url`] for a client that is **not** on this machine.
+    ///
+    /// `host` is [`crate::endpoints::advertised_host`]'s answer — the address
+    /// the routing table says other machines send to. Only the *port* comes
+    /// from the listener, as everywhere else here.
+    ///
+    /// Ticket 03 of the headless-Linux effort is why this and its pair exist. A
+    /// server with no window prints its URL for somebody to type into a phone,
+    /// and [`Server::reachable_addr`] is deliberately the wrong answer to that
+    /// question: it names loopback, which is right for the shell's window and
+    /// useless on the device it was printed for.
+    pub fn url_for(&self, host: &str) -> String {
+        format!("http://{host}:{}/", self.local_addr.port())
+    }
+
+    /// [`Server::window_url`] for a client that is not on this machine: the
+    /// same port, credential and fragment as the window's, against `host`.
+    ///
+    /// `None` for the same reason [`Server::window_url`] is — no boot grant was
+    /// minted — and the caller falls back to [`Server::url_for`], which lands
+    /// on the pairing screen.
+    pub fn pairing_url_for(&self, host: &str) -> Option<String> {
+        self.boot_credential
+            .as_ref()
+            .map(|credential| format!("{}#token={credential}", self.url_for(host)))
+    }
+
+    /// The boot credential itself, for a caller that has to show it rather than
+    /// put it in a URL — a pairing screen takes it typed.
+    ///
+    /// This is the one thing in this server that is deliberately printed. See
+    /// [`Server::window_url`] for why the fragment keeps it off the wire, and
+    /// `docs/running-headless.md` for what an operator owes it once it is on
+    /// their terminal.
+    pub fn boot_credential(&self) -> Option<&str> {
+        self.boot_credential.as_deref()
+    }
+
+    /// Where this server was told to listen, and whether a file said so.
+    ///
+    /// The configuration the listener was actually opened with, so a caller
+    /// reporting the exposure cannot describe a posture the socket does not
+    /// have — which is the whole reason `laplus-server` reads it back from here
+    /// rather than from the arguments it parsed.
+    pub fn remote_access(&self) -> crate::remote_access::RemoteAccess {
+        self.state.config().current().remote_access.clone()
     }
 
     pub fn state(&self) -> &Arc<ServerState> {

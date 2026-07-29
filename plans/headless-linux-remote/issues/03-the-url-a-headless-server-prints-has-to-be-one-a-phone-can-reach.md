@@ -3,7 +3,7 @@
 **What to build:** teach `laplus-server`'s startup output to name the address
 other machines reach it at, instead of loopback.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 **Depends on:** 01 (a URL is only worth printing once there is a page at it)
 
@@ -117,3 +117,61 @@ annoying in practice.
   question about the whole endpoints surface.
 - Printing anything the shell prints. The shell has a Settings panel for this
   and it already works.
+
+## What landed
+
+Wiring, as the ticket predicted — but the wiring turned out to be a decision
+table worth its own module. `crate::startup` takes what was bound, where the
+mode came from, and the addresses, and answers with the lines to print;
+`laplus-server/src/main.rs` holds nothing but the reading and the `println!`.
+That split is the only reason any of this is tested: a binary's `main` is the
+one part of this crate no test runs.
+
+```
+laplus: network access is on, from --network — this server is on your network
+laplus: open http://192.168.1.42:4773/#token=ABCD2345WXYZ
+laplus: or open http://192.168.1.42:4773/ and pair with ABCD2345WXYZ
+laplus: on this machine, http://127.0.0.1:4773/#token=ABCD2345WXYZ
+```
+
+The LAN URL is primary and the loopback one stays beneath it. `reachable_from`,
+`reachable_addr` and `window_url` are untouched, along with their tests;
+`Server` grew `url_for(host)` and `pairing_url_for(host)` beside them, which are
+the same arithmetic against a host that is not this machine.
+
+**The third line is the ticket's "print the first three".** Upstream's
+`t3 serve` prints a connection string, a pairing token and a pairing URL, and
+the reason holds harder here than there: the URL above it is being typed by hand
+into a phone, and a bare address followed by twelve characters into the pairing
+screen is a great deal less to get right than the same thing with `/#token=` in
+the middle of it. A QR code would beat both and is still the follow-up this
+ticket said it was.
+
+**Not finding a LAN address is told apart from not looking for one.** Bound to
+loopback there is nothing to look for and the exposure line has already said so
+— so the output is what it was, rather than a complaint greeting every
+`cargo run`. Bound wide with no route off the machine gets a sentence naming
+that cause, on stderr, because the operator asked for something they did not
+get. `startup::Line` has two variants for exactly this: the announcement is not
+all ordinary output, and an operator who redirects stdout should still see the
+half that went wrong.
+
+`endpoints::advertised_host` is called for the first time outside the shell and
+is unchanged. Its exposure guard is what makes the two states above
+distinguishable at all — it answers `None` for both, and `Exposure` says which.
+
+### Driven, not only tested
+
+Against the machine's own LAN address, with the real bundle: `GET /` served the
+3192-byte page, the printed credential exchanged at `POST /oauth/token` for a
+thirty-day bearer, that bearer was accepted at `/api/auth/session`, and the
+descriptor reported `policy: remote-reachable` — which is the `--network`
+override carrying the auth policy with it, end to end. The boot grant was
+confirmed reusable by spending it twice.
+
+### What is left
+
+**The last acceptance criterion is unmet and cannot be met here.** "A phone on
+the same network opens the printed URL, lands on the pairing screen, and pairs.
+A drive, not a test." Everything above was driven from `curl` on the machine
+running the server. Nobody has held a handset.

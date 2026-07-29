@@ -34,6 +34,20 @@
 //! terminal beside `cloudflared`, and two sources for one policy is two places
 //! to look when a phone is refused.
 //!
+//! **`--network` and `LAPLUS_NETWORK` are that someone**, and they do not
+//! contradict the paragraph above so much as arrive at the case it excluded.
+//! Ticket 04 of the headless-Linux effort is a `laplus-server` on a box with no
+//! window, where a terminal is the only thing there *is* and the file is the
+//! awkward one — you have to know that it lives in `$XDG_DATA_HOME/laplus` or
+//! `$HOME/.laplus` before you can hand-write it.
+//!
+//! The "two places to look" cost is real and is paid rather than dodged: the
+//! override does not write this file, so the two genuinely can disagree. What
+//! makes that survivable is that the server says which one it used on every
+//! start — [`crate::startup`] — and that the file remains the only thing the
+//! *desktop application* reads, so no `laplus-server` run can move the switch a
+//! user sees in Settings. `docs/adr/0023`.
+//!
 //! ## Why a bad file is logged rather than reported to the UI
 //!
 //! [`crate::config::ConfigIssue`] would be the obvious home for "your
@@ -106,6 +120,20 @@ impl Exposure {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteAccess {
     exposure: Exposure,
+    /// Whether a file actually decided [`RemoteAccess::exposure`].
+    ///
+    /// False on a machine with no `remote-access.json`, and false when there is
+    /// one this server could not use — both of those are the default rather
+    /// than a stored answer.
+    ///
+    /// Read by exactly one thing, and it is worth saying why it earns a field.
+    /// [`crate::startup`] has to tell an operator *where* the mode came from,
+    /// because on a headless box that line is the only place a flag and a file
+    /// disagreeing shows. "from remote-access.json" printed on a machine that
+    /// has no such file sends them looking for one, and nothing else in the
+    /// process is in a position to know: [`RemoteAccess::load`] is the only
+    /// code that sees whether the read succeeded.
+    stored: bool,
 }
 
 /// Is a bound address one that something other than this machine can reach?
@@ -134,6 +162,12 @@ impl RemoteAccess {
         self.exposure
     }
 
+    /// Whether a `remote-access.json` decided that, rather than the default.
+    /// See the field.
+    pub fn is_stored(&self) -> bool {
+        self.stored
+    }
+
     /// The address to bind, which is the whole of what [`Exposure`] decides.
     ///
     /// `0.0.0.0` is a real change of posture and not a wider default: until the
@@ -146,9 +180,17 @@ impl RemoteAccess {
         }
     }
 
-    /// The same, with the mode changed. What the switch writes.
+    /// The same, with the mode changed. What the switch writes, and what
+    /// `--network` overrides with.
+    ///
+    /// [`RemoteAccess::is_stored`] goes false: whatever this mode is, a file did
+    /// not decide it. The switch makes that true again by [`RemoteAccess::save`]
+    /// and the next start reading it back.
     pub fn with_exposure(&self, exposure: Exposure) -> RemoteAccess {
-        RemoteAccess { exposure }
+        RemoteAccess {
+            exposure,
+            stored: false,
+        }
     }
 
     /// Write it back, for the switch in Settings that changes it.
@@ -208,24 +250,28 @@ impl RemoteAccess {
         // it is what every file written before this change has in it, and a
         // machine that upgrades should keep working rather than be told off
         // for the contents of a file it did not write by hand.
-        let exposure = match stored.get("mode") {
+        // The second half of each arm is [`RemoteAccess::is_stored`], and it
+        // says whether *this file* decided the mode. Only a `mode` this server
+        // understood counts: the other three answers are the default, arrived
+        // at with a file open rather than because of what was in it.
+        let (exposure, stored) = match stored.get("mode") {
             // Absent is the ordinary case, not a problem: every file written
             // before the switch existed has only `allowedOrigins`, and
             // loopback is what those machines were already doing.
-            None => Exposure::default(),
+            None => (Exposure::default(), false),
             Some(mode) => match mode.as_str().and_then(Exposure::from_mode) {
-                Some(exposure) => exposure,
+                Some(exposure) => (exposure, true),
                 None => {
                     complain(&format!(
                         "`mode` is {mode}, which is neither `local-only` nor \
                          `network-accessible`; staying on this machine."
                     ));
-                    Exposure::default()
+                    (Exposure::default(), false)
                 }
             },
         };
 
-        RemoteAccess { exposure }
+        RemoteAccess { exposure, stored }
     }
 
 }
@@ -329,6 +375,52 @@ mod tests {
             RemoteAccess::load(directory.path()).exposure(),
             Exposure::LocalOnly
         );
+    }
+
+    /// Ticket 04 of the headless-Linux effort. A headless server names the
+    /// source of its exposure at startup, and "from remote-access.json" on a
+    /// machine that has no such file sends the operator looking for one. Only a
+    /// mode this server understood is a mode a file decided.
+    #[test]
+    fn only_a_mode_read_from_a_file_counts_as_stored() {
+        let directory = temporary();
+        assert!(!RemoteAccess::load(directory.path()).is_stored(), "no file");
+
+        for (contents, why) in [
+            ("{ not json", "unparseable"),
+            (r#"{ "allowedOrigins": [] }"#, "no mode at all"),
+            (r#"{ "mode": "everyone-welcome" }"#, "a mode nobody knows"),
+        ] {
+            written(directory.path(), contents);
+            assert!(
+                !RemoteAccess::load(directory.path()).is_stored(),
+                "{why} is the default, not a stored answer"
+            );
+        }
+
+        for mode in ["local-only", "network-accessible"] {
+            written(directory.path(), &format!(r#"{{ "mode": "{mode}" }}"#));
+            assert!(RemoteAccess::load(directory.path()).is_stored(), "{mode}");
+        }
+    }
+
+    /// An override is not a stored answer, whichever direction it goes — and
+    /// the switch in Settings makes it one again by writing the file.
+    #[test]
+    fn changing_the_mode_stops_it_being_the_files_answer() {
+        let directory = temporary();
+        written(directory.path(), r#"{ "mode": "network-accessible" }"#);
+        let stored = RemoteAccess::load(directory.path());
+        assert!(stored.is_stored());
+
+        assert!(!stored.with_exposure(Exposure::LocalOnly).is_stored());
+        assert!(!RemoteAccess::none().is_stored());
+
+        stored
+            .with_exposure(Exposure::LocalOnly)
+            .save(directory.path())
+            .expect("writes");
+        assert!(RemoteAccess::load(directory.path()).is_stored());
     }
 
     /// The predicate the auth policy is settled from, against the two addresses

@@ -671,6 +671,7 @@ fn display_path(path: PathBuf, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_access::Exposure;
 
     /// Ticket 23's "application state is stored in the appropriate per-user
     /// location", checked where the answer is decided.
@@ -776,6 +777,41 @@ mod tests {
             serde_json::json!("0.0.28"),
             "the wire carries the number the client compares, not the one behind it"
         );
+    }
+
+    /// Ticket 04 of the headless-Linux effort. `--network` overrides the file
+    /// for one run, and this is the arithmetic that stands behind it: the mode
+    /// moves, the bind address moves with it, and so does the policy the
+    /// descriptor reports. The third is the one worth pinning — a server bound
+    /// to `0.0.0.0` still advertising `loopback-browser` hides the section of
+    /// Settings holding the only button that mints a pairing code, which is the
+    /// bug [`ServerConfig::with_remote_access`] exists to prevent.
+    #[test]
+    fn an_exposure_override_moves_the_address_and_the_policy_together() {
+        let detected = ServerConfig::detect_in(PathBuf::from("does-not-exist"));
+        assert_eq!(detected.remote_access.exposure(), Exposure::LocalOnly);
+        assert_eq!(detected.auth.policy, "loopback-browser");
+
+        let opened = {
+            let exposed = detected.remote_access.with_exposure(Exposure::NetworkAccessible);
+            detected.with_remote_access(exposed)
+        };
+        assert_eq!(
+            opened.remote_access.bind_address(),
+            std::net::Ipv4Addr::UNSPECIFIED
+        );
+        assert_eq!(opened.auth.policy, "remote-reachable");
+
+        // And back, which is `--network=false` over a file that says otherwise.
+        let closed = {
+            let hidden = opened.remote_access.with_exposure(Exposure::LocalOnly);
+            opened.with_remote_access(hidden)
+        };
+        assert_eq!(
+            closed.remote_access.bind_address(),
+            std::net::Ipv4Addr::LOCALHOST
+        );
+        assert_eq!(closed.auth.policy, "loopback-browser");
     }
 
     /// The descriptor names the cookie the UI should send and [`crate::auth`]

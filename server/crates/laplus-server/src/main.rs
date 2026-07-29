@@ -11,12 +11,21 @@
 //! needs: a browser has no application to start, so the page and the API have
 //! to come from the same place. Without the flag this binary behaves exactly as
 //! it did — 404 at `/`, every route unchanged.
+//!
+//! **Tickets 04 and 03 finished the job of making it usable from one.** `--network`
+//! leaves loopback without a Settings panel to turn the switch in, and what is
+//! printed at startup names the address other machines reach this one at rather
+//! than the loopback address that is useless on the phone it was printed for.
+//! Neither decision is made here: [`laplus_server::launch`] parses, and
+//! [`laplus_server::startup`] settles what to say. This is the wiring between
+//! them, and `server/docs/running-headless.md` is the page for an operator.
 
 use std::process::ExitCode;
 
 use laplus_server::launch;
+use laplus_server::startup::{self, Announcement, Line, Reachable};
 use laplus_server::ui::Assets;
-use laplus_server::Server;
+use laplus_server::{endpoints, Server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -57,7 +66,13 @@ async fn main() -> ExitCode {
         },
     };
 
-    let server = match Server::bind(requested.port, assets).await {
+    let server = match Server::bind(
+        requested.port,
+        assets,
+        requested.network.map(|network| network.exposure),
+    )
+    .await
+    {
         Ok(server) => server,
         Err(failure) => {
             eprintln!("laplus: {failure}");
@@ -67,24 +82,43 @@ async fn main() -> ExitCode {
 
     println!("laplus: listening on {}", server.ws_url());
 
+    // Read back out of the running server rather than from `requested`, so what
+    // is announced is the posture the listener actually has: the flag is an
+    // override and `remote-access.json` is the answer when there is none, and
+    // only the configuration the server was built with knows which happened.
+    let access = server.remote_access();
+
+    // Ticket 03. `advertised_host` is a routing-table lookup guarded on
+    // exposure, so this is `None` on a loopback-bound server *and* on a box with
+    // no route off itself — two states the announcement then tells apart.
+    let lan = endpoints::advertised_host(&access).map(|host| Reachable {
+        paired: server.pairing_url_for(&host),
+        plain: server.url_for(&host),
+    });
+
     // Printed because this binary has no window to open it in, and since
     // ticket 73 a browser pointed here needs a credential like anything else.
-    // Without this line the quickest way to see a change would have become the
-    // one that lands on a pairing screen with nothing to type into it.
+    // Without these lines the quickest way to see a change would have become
+    // the one that lands on a pairing screen with nothing to type into it.
     //
-    // The reference server prints the same URL for the same reason —
-    // `issueStartupPairingUrl`, `EnvironmentAuth.ts:911-921`.
-    //
-    // A development server serving the UI on another port is a *different
-    // origin*, so it needs the tunnel allowlist rather than this; see
-    // `laplus_server::remote_access`.
-    match server.window_url() {
-        Some(url) => println!("laplus: open {url}"),
-        None => eprintln!(
-            "laplus: no boot credential was minted, so a browser opened at {} will \
-             ask to be paired",
-            server.http_url()
-        ),
+    // The reference server prints the same URLs for the same reason —
+    // `issueStartupPairingUrl` (`EnvironmentAuth.ts:911-921`) and
+    // `resolveHeadlessConnectionString` (`startupAccess.ts`).
+    for line in startup::announce(&Announcement {
+        exposure: access.exposure(),
+        network: requested.network,
+        stored: access.is_stored(),
+        local: Reachable {
+            paired: server.window_url(),
+            plain: server.http_url(),
+        },
+        lan,
+        credential: server.boot_credential().map(str::to_string),
+    }) {
+        match line {
+            Line::Said(text) => println!("laplus: {text}"),
+            Line::Warned(text) => eprintln!("laplus: {text}"),
+        }
     }
 
     server.serve_until_interrupted().await;

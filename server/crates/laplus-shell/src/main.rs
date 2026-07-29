@@ -104,7 +104,11 @@ fn main() -> ExitCode {
     };
 
     let ui = Assets::from_static(assets::FILES, assets::VERSION);
-    let server = match runtime.block_on(Server::bind(port, ui)) {
+    // No exposure override: `remote-access.json` is what the switch in Settings
+    // owns, `set_network_exposure` below is what moves it, and the shell takes
+    // no flag that could disagree with the panel it draws. `--network` is the
+    // plain server's, for a box with no panel — `docs/adr/0023`.
+    let server = match runtime.block_on(Server::bind(port, ui, None)) {
         Ok(server) => server,
         Err(failure) => return fail(&format!("{failure}")),
     };

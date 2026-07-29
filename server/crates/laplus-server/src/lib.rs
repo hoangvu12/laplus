@@ -83,6 +83,7 @@ pub mod rpc;
 pub mod server;
 pub mod settings;
 pub mod settling;
+pub mod startup;
 pub mod store;
 pub mod subscriptions;
 pub mod terminal;
