@@ -1,10 +1,21 @@
-//! Which origins other than this machine may reach this server.
+//! Where this server listens.
 //!
-//! Empty by default, and that default is the product's posture rather than a
-//! placeholder: laplus binds to loopback and answers the window running beside
-//! it. This file exists for the one case that is not that — a developer who has
-//! put a tunnel in front of laplus so their phone can reach it, which is what
-//! ticket 73 is for.
+//! Loopback by default, and that default is the product's posture rather than a
+//! placeholder: laplus answers the window running beside it. This file exists
+//! for the one case that is not that — somebody who wants a phone to reach it,
+//! which is what ticket 73 is for.
+//!
+//! ## What used to be here
+//!
+//! An `allowedOrigins` list, and an origin check in [`crate::auth`] that refused
+//! anything not on it. Upstream has no such list: its only origin handling is
+//! CORS behind `devOrigin`, for development
+//! (`reference/t3code-server/src/http.ts:57-67`). The list is gone and this
+//! follows upstream, so what a request is allowed to do is settled by its
+//! credential and nothing else.
+//!
+//! A file left over from before that change still has the field in it. It is
+//! read by nothing and is not an error to find — see [`RemoteAccess::load`].
 //!
 //! ## Why a file, and why not an environment variable
 //!
@@ -34,9 +45,9 @@
 //! is the same wall [`crate::settings`] hit, and this follows the same answer it
 //! did: complain to the log, keep the safe default.
 //!
-//! **The safe default is the empty list.** A file that will not parse admits
-//! nothing, so the failure mode of a typo is a phone that cannot connect rather
-//! than a machine that admits everybody.
+//! **The safe default is loopback.** A file that will not parse leaves this
+//! server on this machine, so the failure mode of a typo is a phone that cannot
+//! connect rather than a port open to the network.
 
 use std::path::Path;
 
@@ -92,14 +103,23 @@ impl Exposure {
 /// and closed, and a field of laplus's invention in it fails the client's
 /// decode of the whole payload.
 ///
-/// **They do not replace each other.** Binding to every interface answers the
-/// LAN and says nothing about a `trycloudflare.com` hostname, which resolves to
-/// Cloudflare and arrives here as an `Origin` this machine has never heard of.
-/// Upstream keeps both for the same reason.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteAccess {
-    hosts: Vec<String>,
     exposure: Exposure,
+}
+
+/// Is a bound address one that something other than this machine can reach?
+///
+/// A port of upstream's `isRemoteReachableHost` (`auth/utils.ts:53-67`), and
+/// the whole of what settles [`crate::config::ServerAuthDescriptor::policy`]
+/// there and here. Upstream takes a host string because it has one to take;
+/// this takes the address actually bound, which is the same question with no
+/// parsing in between.
+pub fn is_remote_reachable_host(host: std::net::Ipv4Addr) -> bool {
+    if host.is_unspecified() {
+        return true;
+    }
+    !host.is_loopback()
 }
 
 impl RemoteAccess {
@@ -126,38 +146,21 @@ impl RemoteAccess {
         }
     }
 
-    /// The same list, with the mode changed. What the switch writes.
+    /// The same, with the mode changed. What the switch writes.
     pub fn with_exposure(&self, exposure: Exposure) -> RemoteAccess {
-        RemoteAccess {
-            hosts: self.hosts.clone(),
-            exposure,
-        }
+        RemoteAccess { exposure }
     }
 
-    /// The same mode, with the tunnel hostnames changed. What the list writes.
-    pub fn with_hosts<I, S>(&self, entries: I) -> RemoteAccess
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        RemoteAccess {
-            exposure: self.exposure,
-            ..RemoteAccess::from_hosts(entries)
-        }
-    }
-
-    /// Write it back, for the two controls in Settings that change it.
+    /// Write it back, for the switch in Settings that changes it.
     ///
-    /// Whole-file rather than a patch: there are two fields and the caller has
-    /// just read both. Written to a temporary and renamed, so a crash between
-    /// `write` and `close` cannot leave a half-written file that
-    /// [`RemoteAccess::load`] would then refuse — and refusing this file means
-    /// admitting nobody, which for a user who is mid-way through turning
-    /// pairing *on* would look exactly like the feature not working.
+    /// Written to a temporary and renamed, so a crash between `write` and
+    /// `close` cannot leave a half-written file that [`RemoteAccess::load`]
+    /// would then refuse — and refusing this file means falling back to
+    /// loopback, which for a user who is mid-way through turning the switch
+    /// *on* would look exactly like the feature not working.
     pub fn save(&self, directory: &Path) -> std::io::Result<()> {
         let body = serde_json::to_string_pretty(&serde_json::json!({
             "mode": self.exposure.mode(),
-            "allowedOrigins": self.hosts,
         }))
         .expect("the remote access file serializes");
 
@@ -174,7 +177,7 @@ impl RemoteAccess {
         let complain = |detail: &str| {
             eprintln!(
                 "laplus: the remote access file at {} was not used: {detail} \
-                 No origin beyond this machine will be admitted.",
+                 This server will listen on this machine only.",
                 path.display()
             );
         };
@@ -201,11 +204,10 @@ impl RemoteAccess {
             }
         };
 
-        // Read before the hosts, and kept whatever happens to them. The switch
-        // and the tunnel list are independent controls over one file, so a
-        // machine bound to every interface must not fall back to loopback
-        // because somebody mistyped a hostname underneath it — that would be
-        // one control silently undoing the other.
+        // `allowedOrigins` is read by nothing now and is not an error to find:
+        // it is what every file written before this change has in it, and a
+        // machine that upgrades should keep working rather than be told off
+        // for the contents of a file it did not write by hand.
         let exposure = match stored.get("mode") {
             // Absent is the ordinary case, not a problem: every file written
             // before the switch existed has only `allowedOrigins`, and
@@ -223,147 +225,9 @@ impl RemoteAccess {
             },
         };
 
-        // From here a bad `allowedOrigins` costs the hosts and not the mode.
-        let loopback_only = |()| RemoteAccess {
-            hosts: Vec::new(),
-            exposure,
-        };
-
-        let Some(entries) = stored.get("allowedOrigins") else {
-            // Not a complaint any more: a file that only turns the switch on is
-            // a complete file now, and the common one.
-            return loopback_only(());
-        };
-        let Some(entries) = entries.as_array() else {
-            complain("`allowedOrigins` is not an array.");
-            return loopback_only(());
-        };
-
-        let mut hosts: Vec<String> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let Some(entry) = entry.as_str() else {
-                complain("`allowedOrigins` holds something that is not a string.");
-                return loopback_only(());
-            };
-            match host_of(entry) {
-                // One bad entry does not discard the rest. Unlike the cases
-                // above, the file's *shape* is understood here — this is one
-                // line the user got wrong, and refusing the others would turn a
-                // typo into "nothing works" with no way to tell which line did
-                // it.
-                None => complain(&format!("`{entry}` is not a host or an origin; skipping it.")),
-                Some(host) if hosts.contains(&host) => {}
-                Some(host) => hosts.push(host),
-            }
-        }
-
-        // Only worth saying when the file exists to name hosts and names none.
-        // A file that is here to turn the switch on has nothing missing.
-        if hosts.is_empty() && !exposure.is_network_accessible() {
-            complain("it admits no hosts.");
-        }
-        RemoteAccess { hosts, exposure }
+        RemoteAccess { exposure }
     }
 
-    /// May a page served from this host reach this server?
-    ///
-    /// **Host, not origin**, so `https://phone.example` and
-    /// `http://phone.example` are the same answer — matching how
-    /// [`crate::auth`] has always treated loopback, where the scheme is ignored
-    /// because `tauri://localhost` is as local as `http://localhost`. Being
-    /// stricter here would mean a user who wrote a bare hostname was silently
-    /// admitting nothing, and a user who wrote `https://…` was refused the day
-    /// their tunnel served plain HTTP.
-    ///
-    /// What that costs is worth saying out loud: somebody who can make the
-    /// browser resolve this hostname to a server they control — DNS control, or
-    /// a machine on the same network answering for it — is admitted. That is a
-    /// far larger foothold than this check, and the credential behind it still
-    /// has to verify.
-    pub fn allows(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        if self.hosts.contains(&host) {
-            return true;
-        }
-
-        // A phone on the same network loads the page from this machine's own
-        // LAN address and then opens a socket carrying it as the `Origin`. That
-        // origin is not loopback and nobody typed it into the tunnel list, so
-        // without this the switch would bind the port, serve the page, and
-        // refuse the socket — which is precisely the failure ticket 73 was
-        // reported for, moved one address along.
-        //
-        // Narrow on purpose: it admits *this machine's own address*, not the
-        // subnet. A page served from another machine on the network is still a
-        // page this server has never heard of, and the credential check behind
-        // this still has to pass either way.
-        self.exposure.is_network_accessible()
-            && crate::endpoints::lan_address()
-                .is_some_and(|address| address.to_string() == host)
-    }
-
-    /// The hosts, for a log line at startup. Not on the wire: the contract has
-    /// no field for it, and `tests/socket_conformance.rs` would report an
-    /// addition.
-    pub fn hosts(&self) -> &[String] {
-        &self.hosts
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.hosts.is_empty()
-    }
-
-    /// Build one directly. For the suite, and for a caller assembling a config
-    /// without a directory to read from.
-    pub fn from_hosts<I, S>(entries: I) -> RemoteAccess
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        RemoteAccess {
-            hosts: entries
-                .into_iter()
-                .filter_map(|entry| host_of(entry.as_ref()))
-                .collect(),
-            exposure: Exposure::default(),
-        }
-    }
-}
-
-/// The host part of whatever the user wrote.
-///
-/// Deliberately forgiving about the shape, because the field is called
-/// `allowedOrigins` and a person writing one will reasonably produce any of
-/// `phone.example`, `https://phone.example`, or `https://phone.example:8443`.
-/// All three name one host and all three are meant the same way.
-///
-/// `None` for something with no host in it at all, which is the only case worth
-/// telling the user about.
-fn host_of(entry: &str) -> Option<String> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return None;
-    }
-
-    let after_scheme = match entry.split_once("://") {
-        Some((scheme, rest)) if !scheme.is_empty() => rest,
-        Some(_) => return None,
-        None => entry,
-    };
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or_default();
-    // Anything with credentials in it — `user@host` — keeps the host.
-    let authority = authority.rsplit('@').next().unwrap_or_default();
-
-    let host = match authority.strip_prefix('[') {
-        // IPv6 literal: the port, if any, follows the closing bracket.
-        Some(rest) => rest.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-
-    if host.is_empty() || host.contains(' ') {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -378,28 +242,39 @@ mod tests {
         tempfile::tempdir().expect("a temporary directory")
     }
 
-    /// The ordinary machine: no file, and nothing beyond loopback admitted.
+    /// The ordinary machine: no file, and this server answers itself only.
     #[test]
-    fn a_machine_with_no_file_admits_nothing_beyond_loopback() {
+    fn a_machine_with_no_file_stays_on_this_machine() {
         let directory = temporary();
         let access = RemoteAccess::load(directory.path());
-        assert!(access.is_empty());
-        assert!(!access.allows("phone.example"));
         assert_eq!(access.exposure(), Exposure::LocalOnly);
         assert_eq!(access.bind_address(), std::net::Ipv4Addr::LOCALHOST);
     }
 
     /// Every file written before the switch existed has only `allowedOrigins`,
     /// and those machines were bound to loopback. Reading one must not now move
-    /// them.
+    /// them — nor complain, because the user did not write that file by hand.
     #[test]
     fn a_file_from_before_the_switch_stays_on_this_machine() {
         let directory = temporary();
         written(directory.path(), r#"{ "allowedOrigins": ["phone.example"] }"#);
 
         let access = RemoteAccess::load(directory.path());
-        assert!(access.allows("phone.example"));
         assert_eq!(access.exposure(), Exposure::LocalOnly);
+    }
+
+    /// The field this file used to carry is now read by nothing, and a machine
+    /// that upgrades with one still in place keeps the mode it had.
+    #[test]
+    fn a_leftover_host_list_no_longer_decides_anything() {
+        let directory = temporary();
+        written(
+            directory.path(),
+            r#"{ "mode": "network-accessible", "allowedOrigins": "not-an-array" }"#,
+        );
+
+        let access = RemoteAccess::load(directory.path());
+        assert_eq!(access.exposure(), Exposure::NetworkAccessible);
     }
 
     #[test]
@@ -410,24 +285,6 @@ mod tests {
         let access = RemoteAccess::load(directory.path());
         assert_eq!(access.exposure(), Exposure::NetworkAccessible);
         assert_eq!(access.bind_address(), std::net::Ipv4Addr::UNSPECIFIED);
-        // No `allowedOrigins` at all, and that is a complete file now.
-        assert!(access.is_empty());
-    }
-
-    /// The two controls are independent, and this is the failure that would
-    /// make them not be: a mistyped hostname must not quietly pull the machine
-    /// back to loopback while the switch still reads as on.
-    #[test]
-    fn a_bad_host_list_does_not_take_the_bind_address_with_it() {
-        let directory = temporary();
-        written(
-            directory.path(),
-            r#"{ "mode": "network-accessible", "allowedOrigins": "not-an-array" }"#,
-        );
-
-        let access = RemoteAccess::load(directory.path());
-        assert_eq!(access.exposure(), Exposure::NetworkAccessible);
-        assert!(access.is_empty());
     }
 
     /// A mode this server does not know is the one case that must fall *back*
@@ -436,190 +293,69 @@ mod tests {
     #[test]
     fn a_mode_this_server_does_not_know_stays_on_this_machine() {
         let directory = temporary();
-        written(
-            directory.path(),
-            r#"{ "mode": "everyone-welcome", "allowedOrigins": ["phone.example"] }"#,
-        );
+        written(directory.path(), r#"{ "mode": "everyone-welcome" }"#);
 
         let access = RemoteAccess::load(directory.path());
         assert_eq!(access.exposure(), Exposure::LocalOnly);
-        assert!(access.allows("phone.example"), "the hosts still stand");
     }
 
-    /// What the two controls in Settings write, read back through the same
-    /// loader. Both halves at once, because they share a file and the whole
-    /// risk of writing it whole is that one control clears the other.
+    #[test]
+    fn a_file_that_will_not_parse_stays_on_this_machine() {
+        let directory = temporary();
+        written(directory.path(), "{ not json");
+
+        let access = RemoteAccess::load(directory.path());
+        assert_eq!(access.exposure(), Exposure::LocalOnly);
+    }
+
+    /// What the switch in Settings writes, read back through the same loader.
     #[test]
     fn what_settings_writes_is_what_the_next_start_reads() {
         let directory = temporary();
 
-        RemoteAccess::from_hosts(["phone.example"])
+        RemoteAccess::none()
             .with_exposure(Exposure::NetworkAccessible)
             .save(directory.path())
             .expect("writes");
 
         let reloaded = RemoteAccess::load(directory.path());
         assert_eq!(reloaded.exposure(), Exposure::NetworkAccessible);
-        assert!(reloaded.allows("phone.example"));
 
-        // Turning the switch back off keeps the tunnel hostname, which is the
-        // point of `with_exposure` taking the list along with it.
         reloaded
             .with_exposure(Exposure::LocalOnly)
             .save(directory.path())
             .expect("writes");
-        let again = RemoteAccess::load(directory.path());
-        assert_eq!(again.exposure(), Exposure::LocalOnly);
-        assert!(again.allows("phone.example"));
-    }
-
-    /// The switch admits this machine's own LAN address and nothing else on the
-    /// network.
-    ///
-    /// Skipped on a machine with no route off itself, because there is then no
-    /// address to be admitted and nothing to assert — the suite has to pass on
-    /// a laptop with the Wi-Fi off.
-    #[test]
-    fn the_switch_admits_this_machines_own_address_and_not_its_neighbours() {
-        let Some(own) = crate::endpoints::lan_address() else {
-            return;
-        };
-        let networked = RemoteAccess::none().with_exposure(Exposure::NetworkAccessible);
-
-        assert!(networked.allows(&own.to_string()));
-
-        // A different address on the same network is still a stranger.
-        let octets = own.octets();
-        let neighbour = std::net::Ipv4Addr::new(
-            octets[0],
-            octets[1],
-            octets[2],
-            octets[3].wrapping_add(1).max(1),
+        assert_eq!(
+            RemoteAccess::load(directory.path()).exposure(),
+            Exposure::LocalOnly
         );
-        if neighbour != own {
-            assert!(!networked.allows(&neighbour.to_string()));
-        }
-
-        // And it is the switch that admits it, not the address being local.
-        assert!(!RemoteAccess::none().allows(&own.to_string()));
     }
 
-    /// And the other way: editing the list must not move the switch.
+    /// The predicate the auth policy is settled from, against the two addresses
+    /// [`RemoteAccess::bind_address`] can actually answer.
     #[test]
-    fn changing_the_tunnel_list_leaves_the_switch_where_it_was() {
-        let directory = temporary();
-        RemoteAccess::none()
-            .with_exposure(Exposure::NetworkAccessible)
-            .with_hosts(["tunnel.example", "https://phone.example:8443"])
-            .save(directory.path())
-            .expect("writes");
-
-        let reloaded = RemoteAccess::load(directory.path());
-        assert_eq!(reloaded.exposure(), Exposure::NetworkAccessible);
-        assert!(reloaded.allows("tunnel.example"));
-        assert!(reloaded.allows("phone.example"));
+    fn only_the_unspecified_address_is_reachable_from_elsewhere() {
+        assert!(is_remote_reachable_host(std::net::Ipv4Addr::UNSPECIFIED));
+        assert!(!is_remote_reachable_host(std::net::Ipv4Addr::LOCALHOST));
+        // The whole 127.0.0.0/8 block, matching upstream's `host.startsWith("127.")`.
+        assert!(!is_remote_reachable_host(std::net::Ipv4Addr::new(
+            127, 0, 0, 2
+        )));
+        assert!(is_remote_reachable_host(std::net::Ipv4Addr::new(
+            192, 168, 1, 4
+        )));
     }
 
+    /// The bug this replaced: the policy used to be settled from the tunnel
+    /// hostname list, which the user edits while the server runs, so it went
+    /// stale the moment they added one. It is settled from the bound address
+    /// now, and a bound address cannot move under a running server.
     #[test]
-    fn a_named_host_is_admitted() {
-        let directory = temporary();
-        written(directory.path(), r#"{ "allowedOrigins": ["phone.example"] }"#);
+    fn the_switch_decides_what_the_policy_reports() {
+        let local = RemoteAccess::none();
+        assert!(!is_remote_reachable_host(local.bind_address()));
 
-        let access = RemoteAccess::load(directory.path());
-        assert!(access.allows("phone.example"));
-        assert!(!access.allows("other.example"));
-    }
-
-    /// Whatever shape the user wrote, it names one host.
-    #[test]
-    fn a_host_is_read_out_of_whatever_the_user_wrote() {
-        for written_as in [
-            "phone.example",
-            "https://phone.example",
-            "http://phone.example",
-            "https://phone.example:8443",
-            "https://phone.example/",
-            "  https://PHONE.example  ",
-        ] {
-            assert_eq!(
-                host_of(written_as),
-                Some("phone.example".to_string()),
-                "{written_as}"
-            );
-        }
-        assert_eq!(host_of("http://[2001:db8::1]:8443"), Some("2001:db8::1".to_string()));
-    }
-
-    #[test]
-    fn the_match_is_case_insensitive_because_hostnames_are() {
-        let access = RemoteAccess::from_hosts(["Phone.Example"]);
-        assert!(access.allows("phone.example"));
-        assert!(access.allows("PHONE.EXAMPLE"));
-    }
-
-    /// A subdomain is a different host and is not admitted. Naming
-    /// `phone.example` must not hand over `evil.phone.example`.
-    #[test]
-    fn a_named_host_does_not_admit_anything_underneath_it() {
-        let access = RemoteAccess::from_hosts(["phone.example"]);
-        assert!(!access.allows("evil.phone.example"));
-        assert!(!access.allows("phone.example.evil"));
-        assert!(!access.allows("phone-example"));
-    }
-
-    /// The failure mode of a typo has to be a phone that cannot connect, never
-    /// a machine that admits everybody.
-    #[test]
-    fn a_file_that_will_not_parse_admits_nothing() {
-        for contents in [
-            "not json",
-            "[]",
-            r#"{ "allowedOrigins": "phone.example" }"#,
-            r#"{ "allowed": ["phone.example"] }"#,
-            r#"{ "allowedOrigins": [7] }"#,
-        ] {
-            let directory = temporary();
-            written(directory.path(), contents);
-            let access = RemoteAccess::load(directory.path());
-            assert!(access.is_empty(), "{contents}");
-            assert!(!access.allows("phone.example"), "{contents}");
-        }
-    }
-
-    /// One unusable line does not discard the others. The user gets told which
-    /// line, and the rest of the file still works.
-    #[test]
-    fn one_bad_entry_does_not_discard_the_rest() {
-        let directory = temporary();
-        written(
-            directory.path(),
-            r#"{ "allowedOrigins": ["phone.example", "", "https://", "tablet.example"] }"#,
-        );
-
-        let access = RemoteAccess::load(directory.path());
-        assert!(access.allows("phone.example"));
-        assert!(access.allows("tablet.example"));
-        assert_eq!(access.hosts().len(), 2);
-    }
-
-    #[test]
-    fn a_host_named_twice_is_held_once() {
-        let directory = temporary();
-        written(
-            directory.path(),
-            r#"{ "allowedOrigins": ["phone.example", "https://phone.example:8443"] }"#,
-        );
-        assert_eq!(RemoteAccess::load(directory.path()).hosts().len(), 1);
-    }
-
-    /// Loopback is [`crate::auth`]'s business and never this file's. Naming it
-    /// here is harmless and changes nothing, which is worth pinning so that
-    /// nobody moves the loopback rule in here later and quietly makes an empty
-    /// file lock the window out.
-    #[test]
-    fn admitting_loopback_is_not_this_files_job() {
-        let access = RemoteAccess::none();
-        assert!(!access.allows("127.0.0.1"));
-        assert!(!access.allows("localhost"));
+        let networked = local.with_exposure(Exposure::NetworkAccessible);
+        assert!(is_remote_reachable_host(networked.bind_address()));
     }
 }

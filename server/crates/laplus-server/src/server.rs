@@ -705,14 +705,8 @@ async fn thread_snapshot(
 /// session.
 async fn browser_session(
     State(state): State<Arc<ServerState>>,
-    RawQuery(query): RawQuery,
-    headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Err(refused) = origin_admitted(&state, query.as_deref(), &headers) {
-        return refused;
-    }
-
     let credential = match http::read_browser_session_request(&body) {
         Ok(credential) => credential,
         Err(problem) => {
@@ -778,14 +772,8 @@ async fn browser_session(
 /// [`browser_session`] above instead.
 async fn token_exchange(
     State(state): State<Arc<ServerState>>,
-    RawQuery(query): RawQuery,
-    headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Err(refused) = origin_admitted(&state, query.as_deref(), &headers) {
-        return refused;
-    }
-
     // Form-urlencoded, because `AuthTokenExchangeRequest` ends
     // `.pipe(HttpApiSchema.asFormUrlEncoded())` and RFC 6749 says so. See
     // `crate::http::form_fields` for why not `axum`'s `Form`.
@@ -1115,15 +1103,7 @@ fn authorized<'a>(
     query: Option<&'a str>,
     headers: &'a HeaderMap,
 ) -> Result<(auth::Presented<'a>, pairing::Grant), Response> {
-    let allowed = &state.config().current().remote_access;
-    let presented = auth::authorize(presented(query, headers), allowed).map_err(|rejection| {
-        // No `Access-Control-Allow-Origin` here, unlike the upgrade's own
-        // 401. There it lets a browser read the body rather than reporting
-        // a CORS error for a handshake it cannot see into; here the refused
-        // request *is* the cross-origin one, and helping it read the answer
-        // would be the only thing this refusal gives away.
-        (StatusCode::UNAUTHORIZED, refused(rejection)).into_response()
-    })?;
+    let presented = auth::authorize(presented(query, headers));
 
     let database = state.services.shell.database();
     let verified = match presented.shape {
@@ -1163,30 +1143,6 @@ fn authorized<'a>(
             Err(refuse(http::credential_verification_failed()))
         }
     }
-}
-
-/// The origin half of [`authorized`], and none of the credential half.
-///
-/// **Exactly two routes may use this**, and both for the same reason: they are
-/// how a client holding nothing comes to hold something. `/oauth/token` and
-/// `/api/auth/browser-session` take their credential in the request *body* — a
-/// pairing code — so requiring one in a header would be requiring the thing
-/// they exist to issue.
-///
-/// That is not a hole. What they accept is a pairing code, which is a
-/// credential this server minted, is single use, lives five minutes, and can be
-/// revoked. The origin check still applies, so a page on an unnamed origin
-/// cannot even reach them. What is skipped is only the *session* check, and a
-/// caller that had a session would not be here.
-fn origin_admitted(
-    state: &ServerState,
-    query: Option<&str>,
-    headers: &HeaderMap,
-) -> Result<(), Response> {
-    let allowed = &state.config().current().remote_access;
-    auth::authorize(presented(query, headers), allowed)
-        .map(|_presented| ())
-        .map_err(|rejection| (StatusCode::UNAUTHORIZED, refused(rejection)).into_response())
 }
 
 fn refuse(refusal: http::Refusal) -> Response {

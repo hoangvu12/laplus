@@ -55,13 +55,14 @@ pub struct ServerConfig {
     /// could differ would send the developer to edit a file nothing reads.
     #[serde(skip)]
     pub preferences: PathBuf,
-    /// Which origins beyond this machine may reach this server.
+    /// Where this server listens, and therefore whether anything but this
+    /// machine can reach it.
     ///
     /// **Not on the wire**, and skipped for the same reason `preferences` is:
     /// the contract has no such field and `tests/socket_conformance.rs` reports
     /// an undeclared addition as a break. It rides on the config because this is
-    /// the object assembled from the machine at startup, and the allowlist is
-    /// one more thing read out of the preferences directory.
+    /// the object assembled from the machine at startup, and the switch is one
+    /// more thing read out of the preferences directory.
     ///
     /// See [`crate::remote_access`], which is where the reasoning lives.
     #[serde(skip)]
@@ -378,24 +379,28 @@ impl ServerConfig {
     /// would be a suite nobody could run twice.
     pub fn detect_in(data_dir: PathBuf) -> Self {
         let remote_access = crate::remote_access::RemoteAccess::load(&data_dir);
-        // Upstream settles this from whether the *bind host* is remote-reachable
-        // (`EnvironmentAuthPolicy.ts:18`). laplus always binds loopback — a
-        // tunnel dials `127.0.0.1` from this machine — so reading the bind host
-        // would answer `loopback-browser` on a machine a phone is already
-        // talking to. What makes this server reachable from elsewhere is
-        // somebody having named a host in `remote-access.json`, so that is what
-        // is read instead: the same question, asked where laplus keeps the
-        // answer.
+        // Settled from the *bind host*, which is what upstream does
+        // (`EnvironmentAuthPolicy.ts:16-24`, via `auth/utils.ts:53`). An
+        // earlier version read the tunnel hostname list instead, on the
+        // reasoning that laplus always binds loopback so the host could never
+        // say `remote-reachable`. That stopped being true when the exposure
+        // switch landed: `network-accessible` binds `0.0.0.0`, and the host
+        // answers the question directly again.
         //
-        // It is not cosmetic. Settings hides the whole "Authorized clients"
-        // section — and with it the only button that mints a pairing code —
-        // unless this says `remote-reachable` (`ConnectionsSettings.tsx:2417`).
-        // Reporting `loopback-browser` unconditionally meant a user who had set
-        // up a tunnel still had no way to mint the code to use it.
-        let policy = if remote_access.is_empty() {
-            "loopback-browser"
-        } else {
+        // Reading the address rather than the file is also what keeps this
+        // honest. A `&'static str` settled at startup cannot track a file the
+        // user edits while the server runs, and it did not — a hostname added
+        // from Settings left this reporting `loopback-browser` until the next
+        // restart, which hides the whole "Authorized clients" section and with
+        // it the only button that mints a pairing code
+        // (`ConnectionsSettings.tsx:3022`). The bound address has no such
+        // problem: a socket cannot move under a running server, so what is
+        // read here at startup is still true for as long as the value lives.
+        let policy = if crate::remote_access::is_remote_reachable_host(remote_access.bind_address())
+        {
             "remote-reachable"
+        } else {
+            "loopback-browser"
         };
         ServerConfig {
             remote_access,

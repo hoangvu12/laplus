@@ -192,48 +192,29 @@ pub struct Presented<'a> {
     pub token: &'a str,
 }
 
-/// Decide whether a request may proceed as far as having its credential checked.
+/// Report which credential a request carries.
 ///
 /// **Every caller must then check it.** A `Presented` is not permission; see
-/// its own note. The one thing settled here is the origin, because that is the
-/// question a database cannot answer.
+/// its own note. Nothing is settled here — this reads a header and says what it
+/// found.
 ///
-/// ## The rule
+/// ## Why there is no origin rule
 ///
-/// A page may reach this server if it was served from this machine, or from a
-/// host the user named in [`crate::remote_access`]. Everything else is refused
-/// before any credential is looked at.
+/// There used to be one: a page could reach this server if it came from this
+/// machine or from a host named in `remote-access.json`. Upstream has no such
+/// rule — `apps/server`'s only origin handling is CORS, behind `devOrigin`, for
+/// development (`reference/t3code-server/src/http.ts:57-67`) — and this now
+/// follows it.
 ///
-/// **A request with no `Origin` at all passes this check**, and that is not an
-/// oversight — it is why the credential check that follows is not optional. A
-/// browser always sends `Origin` on a WebSocket upgrade and on any request that
-/// is not a `GET`, so an absent one means a client that is not a browser, which
-/// no origin rule can say anything useful about. `curl` sends whatever it likes.
-/// The origin check exists to stop *a page somewhere else* from making the
-/// user's own browser talk to this server; it has never been able to stop a
-/// program, and before ticket 73 it did not have to, because loopback was the
-/// boundary and a program on this machine is already the user.
-///
-/// A tunnel dissolves that. `cloudflared` runs on this machine and dials
-/// `127.0.0.1`, so a request that came from the far side of the world arrives
-/// looking exactly like one from the window — same peer address, and any header
-/// it likes. **Nothing at this layer can tell them apart**, which is why
-/// `docs/adr/0019` supersedes `0015` and why an absent credential is now
-/// refused rather than accepted.
-pub fn authorize<'a>(
-    request: UpgradeRequest<'a>,
-    allowed: &crate::remote_access::RemoteAccess,
-) -> Result<Presented<'a>, Rejection> {
-    if let Some(origin) = request.origin {
-        if !is_admissible_origin(origin, allowed) {
-            return Err(Rejection::new(format!(
-                "refused a request from origin {origin}, which is neither this machine \
-                 nor named in remote-access.json"
-            )));
-        }
-    }
-
-    Ok(presented(request))
+/// What that gives up is worth stating plainly rather than leaving implied. The
+/// check could never stop a program: `curl` sends whatever headers it likes, and
+/// a browser omits `Origin` on a plain `GET`. What it did stop was *a page
+/// somewhere else* driving the user's own browser into this server with the
+/// session cookie attached. Without it, that is the credential's problem alone —
+/// which is the posture upstream ships and `docs/adr/0019` already relies on for
+/// everything that is not a browser.
+pub fn authorize(request: UpgradeRequest<'_>) -> Presented<'_> {
+    presented(request)
 }
 
 fn presented(request: UpgradeRequest<'_>) -> Presented<'_> {
@@ -277,56 +258,6 @@ fn presented(request: UpgradeRequest<'_>) -> Presented<'_> {
     Presented {
         shape: Credential::Absent,
         token: "",
-    }
-}
-
-/// Is this `Origin` one this server will hear from at all?
-///
-/// This machine, or a host the user wrote down. Both halves matter: without the
-/// first the window cannot connect, and without the second a tunnel cannot.
-fn is_admissible_origin(origin: &str, allowed: &crate::remote_access::RemoteAccess) -> bool {
-    let Some(host) = origin_host(origin) else {
-        // A browser sends the literal `null` for opaque origins (`file://`,
-        // sandboxed iframes), which parses to no host and is refused.
-        return false;
-    };
-    is_loopback_host(host) || allowed.allows(host)
-}
-
-/// The host an `Origin` header names, or `None` if it names none.
-///
-/// Matches on **host** and ignores the scheme, which cuts the opposite way from
-/// what you would guess: `tauri://localhost` is local because its host is
-/// `localhost`, while `http://tauri.localhost` is not, because
-/// `tauri.localhost` is a different host. [`crate::remote_access`] matches the
-/// same way and says why for the allowlist half.
-fn origin_host(origin: &str) -> Option<&str> {
-    let after_scheme = match origin.split_once("://") {
-        Some((scheme, rest)) if !scheme.is_empty() => rest,
-        _ => return None,
-    };
-    // Origins carry no path, but be liberal about what we accept.
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        // IPv6 literal: the port, if any, is after the closing bracket.
-        Some(rest) => rest.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-
-    (!host.is_empty()).then_some(host)
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") || host == "::1" || host == "0:0:0:0:0:0:0:1" {
-        return true;
-    }
-    // The whole 127.0.0.0/8 block, not just 127.0.0.1.
-    match host.parse::<std::net::Ipv4Addr>() {
-        Ok(address) => address.is_loopback(),
-        Err(_) => false,
     }
 }
 
@@ -378,38 +309,23 @@ pub(crate) fn trace_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote_access::RemoteAccess;
 
     fn request<'a>() -> UpgradeRequest<'a> {
         UpgradeRequest::default()
     }
 
-    /// The ordinary machine: loopback, and nothing else named.
-    fn loopback_only() -> RemoteAccess {
-        RemoteAccess::none()
-    }
-
-    /// A machine whose owner has put a tunnel in front of laplus.
-    fn tunnelled() -> RemoteAccess {
-        RemoteAccess::from_hosts(["phone.example"])
-    }
-
-    fn shape(request: UpgradeRequest<'_>, allowed: &RemoteAccess) -> Credential {
-        authorize(request, allowed).expect("admitted").shape
+    fn shape(request: UpgradeRequest<'_>) -> Credential {
+        authorize(request).shape
     }
 
     /// The browser UI's shape, from `01-browser-session.ndjson`.
     #[test]
     fn the_browsers_cookie_and_origin_are_admitted() {
-        let admitted = authorize(
-            UpgradeRequest {
+        let admitted = authorize(UpgradeRequest {
                 origin: Some("http://127.0.0.1:3999"),
                 cookie: Some("t3_session=eyJ2Ijox.c2ln"),
                 ..request()
-            },
-            &loopback_only(),
-        )
-        .expect("admitted");
+            });
 
         assert_eq!(admitted.shape, Credential::SessionCookie);
         // The token travels with the shape, because the caller has to verify it
@@ -422,14 +338,10 @@ mod tests {
     /// no `Origin` at all.
     #[test]
     fn a_websocket_ticket_with_no_origin_is_admitted() {
-        let admitted = authorize(
-            UpgradeRequest {
+        let admitted = authorize(UpgradeRequest {
                 query: Some("wsTicket=eyJ2Ijox.c2ln"),
                 ..request()
-            },
-            &loopback_only(),
-        )
-        .expect("admitted");
+            });
 
         assert_eq!(admitted.shape, Credential::WebSocketTicket);
         assert_eq!(admitted.token, "eyJ2Ijox.c2ln");
@@ -443,7 +355,6 @@ mod tests {
                     authorization: Some("Bearer eyJ2Ijox.c2ln"),
                     ..request()
                 },
-                &loopback_only()
             ),
             Credential::BearerToken
         );
@@ -453,7 +364,6 @@ mod tests {
                     authorization: Some("DPoP eyJ2Ijox.c2ln"),
                     ..request()
                 },
-                &loopback_only()
             ),
             Credential::DpopToken
         );
@@ -463,16 +373,12 @@ mod tests {
     /// server's precedence.
     #[test]
     fn the_ticket_parameter_takes_precedence() {
-        let admitted = authorize(
-            UpgradeRequest {
+        let admitted = authorize(UpgradeRequest {
                 query: Some("wsTicket=ticket"),
                 authorization: Some("Bearer token"),
                 cookie: Some("t3_session=cookie"),
                 ..request()
-            },
-            &loopback_only(),
-        )
-        .expect("admitted");
+            });
 
         assert_eq!(admitted.shape, Credential::WebSocketTicket);
         assert_eq!(admitted.token, "ticket");
@@ -489,7 +395,7 @@ mod tests {
     #[test]
     fn an_absent_credential_is_reported_rather_than_judged() {
         let admitted =
-            authorize(request(), &loopback_only()).expect("the origin is not the problem");
+            authorize(request());
         assert_eq!(admitted.shape, Credential::Absent);
         assert_eq!(admitted.token, "");
     }
@@ -506,7 +412,6 @@ mod tests {
                     authorization: Some("Bearer  "),
                     ..request()
                 },
-                &loopback_only()
             ),
             Credential::Absent
         );
@@ -514,169 +419,19 @@ mod tests {
 
     #[test]
     fn the_session_cookie_is_found_among_others() {
-        let admitted = authorize(
-            UpgradeRequest {
+        let admitted = authorize(UpgradeRequest {
                 cookie: Some("theme=dark; t3_session=eyJ2Ijox.c2ln; other=1"),
                 ..request()
-            },
-            &loopback_only(),
-        )
-        .expect("admitted");
+            });
         assert_eq!(admitted.shape, Credential::SessionCookie);
         assert_eq!(admitted.token, "eyJ2Ijox.c2ln");
-    }
-
-    /// The check matches on **host** and ignores the scheme, which cuts the
-    /// opposite way from what you would guess: `tauri://localhost` is admitted
-    /// because its host is `localhost`, while `http://tauri.localhost` — the
-    /// origin Tauri v2 actually uses on Windows — is refused, because
-    /// `tauri.localhost` is neither `localhost` nor a `127.0.0.0/8` address.
-    ///
-    /// This was pinned so that ticket 23 would find out by reading a failure
-    /// rather than by guessing, and it did its job: ticket 23 serves the UI
-    /// from this server instead (see [`crate::ui`]), so the window's origin is
-    /// the loopback address it was already pointed at and this stays as it is.
-    #[test]
-    fn the_origin_check_matches_on_host_and_ignores_the_scheme() {
-        assert!(
-            authorize(
-                UpgradeRequest {
-                    origin: Some("tauri://localhost"),
-                    ..request()
-                },
-                &loopback_only()
-            )
-            .is_ok(),
-            "a custom scheme on a loopback host is admitted"
-        );
-        assert!(
-            authorize(
-                UpgradeRequest {
-                    origin: Some("http://tauri.localhost"),
-                    ..request()
-                },
-                &loopback_only()
-            )
-            .is_err(),
-            "tauri.localhost is a different host, and is refused"
-        );
-    }
-
-    #[test]
-    fn loopback_origins_are_admitted() {
-        for origin in [
-            "http://127.0.0.1:3999",
-            "http://127.0.0.1",
-            "http://127.4.5.6:1",
-            "http://localhost:5173",
-            "http://LocalHost",
-            "https://localhost:8443",
-            "http://[::1]:1420",
-        ] {
-            assert!(
-                authorize(
-                    UpgradeRequest {
-                        origin: Some(origin),
-                        ..request()
-                    },
-                    &loopback_only()
-                )
-                .is_ok(),
-                "{origin} should be admitted"
-            );
-        }
-    }
-
-    /// Binding to loopback does not stop a page elsewhere from asking the
-    /// user's browser to connect on its behalf, which is what this refuses.
-    #[test]
-    fn unnamed_origins_are_refused_even_with_a_valid_looking_credential() {
-        for origin in [
-            "https://evil.example",
-            "http://127.0.0.1.evil.example",
-            "http://localhost.evil.example",
-            "http://192.168.1.10:3999",
-            "null",
-            "",
-        ] {
-            let refused = authorize(
-                UpgradeRequest {
-                    origin: Some(origin),
-                    cookie: Some("t3_session=eyJ2Ijox.c2ln"),
-                    ..request()
-                },
-                &loopback_only(),
-            );
-            assert!(refused.is_err(), "{origin} should be refused");
-        }
-    }
-
-    /// The tunnel case: the host the user wrote down is admitted, and nothing
-    /// else becomes admitted alongside it.
-    #[test]
-    fn a_named_host_is_admitted_and_its_neighbours_are_not() {
-        assert!(
-            authorize(
-                UpgradeRequest {
-                    origin: Some("https://phone.example"),
-                    cookie: Some("t3_session=eyJ2Ijox.c2ln"),
-                    ..request()
-                },
-                &tunnelled()
-            )
-            .is_ok(),
-            "the host named in remote-access.json is admitted"
-        );
-
-        for origin in [
-            "https://evil.example",
-            "https://evil.phone.example",
-            "https://phone.example.evil",
-        ] {
-            assert!(
-                authorize(
-                    UpgradeRequest {
-                        origin: Some(origin),
-                        cookie: Some("t3_session=eyJ2Ijox.c2ln"),
-                        ..request()
-                    },
-                    &tunnelled()
-                )
-                .is_err(),
-                "{origin} should be refused"
-            );
-        }
-    }
-
-    /// **An acceptance criterion**: an origin absent from the allowlist is
-    /// refused even holding a credential that would otherwise verify. The
-    /// origin is settled before anything looks at what was presented, so there
-    /// is no credential good enough to get past it.
-    #[test]
-    fn an_unnamed_origin_is_refused_before_its_credential_is_even_reported() {
-        let refused = authorize(
-            UpgradeRequest {
-                origin: Some("https://evil.example"),
-                query: Some("wsTicket=a-ticket-that-would-verify"),
-                ..request()
-            },
-            &tunnelled(),
-        );
-        assert!(refused.is_err());
     }
 
     /// The body the client already knows how to read — the shape captured in
     /// `06-upgrade-rejected.ndjson`.
     #[test]
     fn a_refusal_renders_the_captured_error_body() {
-        let refused = authorize(
-            UpgradeRequest {
-                origin: Some("https://evil.example"),
-                ..request()
-            },
-            &loopback_only(),
-        )
-        .expect_err("refused");
+        let refused = Rejection::new("refused a request from origin https://evil.example");
 
         let body = refused.body_value();
         assert_eq!(body["_tag"], "EnvironmentAuthInvalidError");

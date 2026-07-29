@@ -22,14 +22,12 @@ import { createDesktopNetworkAccessStateAtom } from "./desktopNetworkAccess";
 /**
  * One command answers the whole panel, and the atom asks for it in two halves.
  *
- * `laplus-shell`'s `network_access_state` returns the exposure state, the
- * advertised endpoints and the tunnel hostnames together, because it reads them
- * from one snapshot of one file and splitting it would let the halves disagree.
+ * `laplus-shell`'s `network_access_state` returns the exposure state and the
+ * advertised endpoints together, because it reads them from one snapshot of one
+ * file and splitting it would let the halves disagree.
  */
 export interface ShellNetworkAccessState extends DesktopServerExposureState {
   readonly advertisedEndpoints: ReadonlyArray<AdvertisedEndpoint>;
-  /** The tunnel hostnames, which upstream's bridge has no equivalent of. */
-  readonly allowedOrigins: ReadonlyArray<string>;
 }
 
 function readShellNetworkAccessState(): Promise<ShellNetworkAccessState> {
@@ -84,17 +82,4 @@ export function setShellNetworkExposure(
   mode: DesktopServerExposureState["mode"],
 ): Promise<ShellNetworkAccessState> {
   return invokeShellCommand<ShellNetworkAccessState>("set_network_exposure", { mode });
-}
-
-/**
- * Name the hostnames a tunnel may reach this server from.
- *
- * No restart, unlike the switch: the server checks this list per request, so an
- * added hostname is live on the next one. Whole list rather than add/remove,
- * matching the file it is written to.
- */
-export function setShellTunnelHosts(
-  hosts: ReadonlyArray<string>,
-): Promise<ShellNetworkAccessState> {
-  return invokeShellCommand<ShellNetworkAccessState>("set_tunnel_hosts", { hosts: [...hosts] });
 }

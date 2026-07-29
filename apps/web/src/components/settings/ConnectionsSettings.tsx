@@ -119,7 +119,6 @@ import {
 import {
   refreshShellNetworkAccessState,
   setShellNetworkExposure,
-  setShellTunnelHosts,
   shellNetworkAccessStateAtom,
 } from "~/state/shellNetworkAccess";
 import { isDesktopShell } from "~/desktopShell";
@@ -1587,20 +1586,6 @@ export function ConnectionsSettings() {
         : shellNetworkAccessStateAtom
       : null,
   );
-  // Carried on the exposure state the shell answers with, because it is read
-  // from the same file in the same breath — `DesktopServerExposureState` is
-  // upstream's shape and has no field for it, upstream having no such control.
-  const tunnelHosts = useMemo(() => {
-    const hosts = (desktopNetworkAccess.data?.serverExposureState as { allowedOrigins?: unknown })
-      ?.allowedOrigins;
-    return Array.isArray(hosts)
-      ? hosts.filter((host): host is string => typeof host === "string")
-      : [];
-  }, [desktopNetworkAccess.data]);
-  const [tunnelHostInput, setTunnelHostInput] = useState("");
-  const [isUpdatingTunnelHosts, setIsUpdatingTunnelHosts] = useState(false);
-  const [tunnelHostsError, setTunnelHostsError] = useState<string | null>(null);
-
   const refreshNetworkAccess = useCallback(() => {
     if (desktopBridge) {
       refreshDesktopNetworkAccessState();
@@ -1718,32 +1703,6 @@ export function ConnectionsSettings() {
       }
     },
     [canManageNetworkAccess, desktopBridge, refreshNetworkAccess],
-  );
-
-  const handleTunnelHosts = useCallback(
-    async (hosts: ReadonlyArray<string>) => {
-      setIsUpdatingTunnelHosts(true);
-      setTunnelHostsError(null);
-      try {
-        await setShellTunnelHosts(hosts);
-        setTunnelHostInput("");
-        refreshNetworkAccess();
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Failed to save the tunnel hostnames.";
-        setTunnelHostsError(message);
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not save the tunnel hostnames",
-            description: message,
-          }),
-        );
-      } finally {
-        setIsUpdatingTunnelHosts(false);
-      }
-    },
-    [refreshNetworkAccess],
   );
 
   const handleConfirmDesktopServerExposureChange = useCallback(() => {
@@ -2422,67 +2381,6 @@ export function ConnectionsSettings() {
       control={renderNetworkAccessToggle()}
     />
   );
-  // The other half of remote access, and the half binding wide does not cover.
-  // A `trycloudflare.com` or tailnet hostname resolves somewhere else entirely,
-  // so a page served from one arrives with an `Origin` this machine has never
-  // heard of and is refused however the switch is set. Upstream keeps both
-  // controls for the same reason.
-  const renderTunnelHostsRow = () => (
-    <SettingsRow
-      title="Tunnel hostnames"
-      description={
-        tunnelHosts.length > 0
-          ? "Pages served from these hosts may reach this environment. Everything else is refused."
-          : "Add the hostname of a cloudflared or Tailscale tunnel to let a device reach this environment through it."
-      }
-      status={
-        tunnelHostsError ? <span className="block text-destructive">{tunnelHostsError}</span> : null
-      }
-    >
-      <div className="space-y-2">
-        {tunnelHosts.map((host) => (
-          <div key={host} className={ITEM_ROW_INNER_CLASSNAME}>
-            <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
-              {host}
-            </code>
-            <Button
-              size="xs"
-              variant="destructive-outline"
-              disabled={isUpdatingTunnelHosts}
-              onClick={() => void handleTunnelHosts(tunnelHosts.filter((entry) => entry !== host))}
-            >
-              Remove
-            </Button>
-          </div>
-        ))}
-        <form
-          className="flex items-center gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const host = tunnelHostInput.trim();
-            if (!host) return;
-            void handleTunnelHosts([...tunnelHosts, host]);
-          }}
-        >
-          <Input
-            value={tunnelHostInput}
-            onChange={(event) => setTunnelHostInput(event.target.value)}
-            placeholder="laplus.trycloudflare.com"
-            disabled={isUpdatingTunnelHosts}
-            spellCheck={false}
-          />
-          <Button
-            type="submit"
-            size="xs"
-            variant="outline"
-            disabled={isUpdatingTunnelHosts || tunnelHostInput.trim().length === 0}
-          >
-            {isUpdatingTunnelHosts ? "Saving…" : "Add"}
-          </Button>
-        </form>
-      </div>
-    </SettingsRow>
-  );
   const renderDisabledNetworkAccessRow = () => (
     <SettingsRow
       title="Network access"
@@ -2550,7 +2448,6 @@ export function ConnectionsSettings() {
                     only where something can act on it — a tailnet name still
                     works here, through the tunnel list below. */}
                 {desktopBridge ? renderTailscaleRow() : null}
-                {renderTunnelHostsRow()}
               </>
             ) : (
               <>{renderDisabledNetworkAccessRow()}</>

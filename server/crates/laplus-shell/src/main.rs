@@ -149,7 +149,6 @@ fn main() -> ExitCode {
         .invoke_handler(tauri::generate_handler![
             network_access_state,
             set_network_exposure,
-            set_tunnel_hosts,
         ])
         .setup(move |app| {
             window(app, &url)?;
@@ -246,7 +245,6 @@ fn network_access_state(state: tauri::State<'_, NetworkAccess>) -> serde_json::V
         "tailscaleServeEnabled": false,
         "tailscaleServePort": 443,
         "advertisedEndpoints": laplus_server::endpoints::advertised(access, state.port),
-        "allowedOrigins": access.hosts(),
     })
 }
 
@@ -284,21 +282,6 @@ fn set_network_exposure(
         app.restart();
     }
 
-    Ok(network_access_state(state))
-}
-
-/// Name the hostnames a tunnel may reach this server from.
-///
-/// No restart, unlike the switch above, and the asymmetry is real rather than
-/// an inconsistency: [`laplus_server::auth`] reads this list per request, so an
-/// added hostname is live immediately. Only the *bind address* is fixed at
-/// startup.
-#[tauri::command]
-fn set_tunnel_hosts(
-    hosts: Vec<String>,
-    state: tauri::State<'_, NetworkAccess>,
-) -> Result<serde_json::Value, String> {
-    state.config.readdress(|access| access.with_hosts(&hosts))?;
     Ok(network_access_state(state))
 }
 

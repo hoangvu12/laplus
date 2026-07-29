@@ -23,9 +23,9 @@
 //! **Tailscale.** Upstream advertises a MagicDNS name and drives `tailscale
 //! serve` through the same bridge, and `ConnectionsSettings` has a whole row and
 //! two dialogs for it. laplus advertises no such endpoint, so that row does not
-//! appear; a tailnet name still works, as a tunnel hostname in
-//! [`crate::remote_access`], which is the same door a `trycloudflare.com` name
-//! comes through.
+//! appear. A tailnet name still reaches this server, and needs nothing written
+//! down to do it — the same as a `trycloudflare.com` name, since this server no
+//! longer keeps a list of the origins it will hear from.
 
 use serde_json::{json, Value};
 
