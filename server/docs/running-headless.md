@@ -46,12 +46,33 @@ Nothing else in the dependency set needs a system library. `portable-pty` uses
 - **A shell**, for the terminal feature. `crate::terminal` tries `$SHELL`, then
   `/bin/zsh`, `/bin/bash`, `/bin/sh`.
 
-### `claude` is not on a non-interactive `PATH`
+### Nothing user-local is on a non-interactive `PATH`
 
 This costs an hour if you meet it the other way round, so it is worth stating
-before you meet it. The installer puts `claude` in `~/.local/bin`. On Ubuntu
-that directory is added to `PATH` by `~/.profile`, which is read by **login
-shells only** — so:
+before you meet it. It was written here as a `claude` problem and it is not one
+— it is a property of every user-local toolchain on a box like this. Setting one
+up for the 2026-07-30 drive hit it **three separate times**: `claude` in
+`~/.local/bin`, `node`/`corepack` under `~/.nvm`, and `cargo` under `~/.cargo`.
+Each is wired in through `~/.profile` or `~/.bashrc`, and neither of those is
+read by `ssh host cmd`, by `nohup bash`, or by systemd.
+
+`~/.bashrc` is the sharper edge of the two, because it looks like it would work.
+Ubuntu's `~/.profile` does source it for a bash login shell — but `~/.bashrc`
+opens with
+
+```sh
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+```
+
+so it returns immediately unless the shell is **interactive**. `ssh box` then
+typing works; `ssh box 'node -v'` and `bash -lc 'node -v'` both find nothing.
+
+Taking `claude` as the example, since it is the one that breaks laplus rather
+than the build: the installer puts it in `~/.local/bin`, which `~/.profile` adds
+for **login shells only** — so:
 
 ```
 ssh box                       # login shell: `which claude` answers
@@ -64,15 +85,29 @@ and every turn fails — on a machine where `claude` is installed, authenticated
 and working when you check it by hand. Nothing about the failure points at
 `PATH`.
 
-Give the process the path explicitly rather than hoping:
+Two ways out. Give the process the path explicitly:
 
 ```
 Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 ```
 
-or start it with an absolute `PATH` in whatever wrapper you use. `ssh box 'echo
-$PATH'` — with the quotes, so the remote shell expands it — is the check worth
-running before blaming laplus.
+or put the binaries somewhere already on every `PATH`, which is what the test
+box does — one symlink each into `/usr/local/bin`:
+
+```
+sudo ln -sfn ~/.local/bin/claude /usr/local/bin/claude
+```
+
+The second makes the machine behave the same however it is invoked, which is
+worth a lot when the failure it prevents is silent. Its cost is that a symlink
+pins a particular install: `nvm install 26` or a `rustup` toolchain change will
+not be picked up until the link is refreshed, and `node -v` can then disagree
+with itself depending on how you ask.
+
+`ssh box 'echo $PATH'` — with the quotes, so the remote shell expands it — is
+the check worth running before blaming laplus. `laplus: agent binary <path>` in
+the startup output is the confirmation that it worked; its absence is the
+symptom.
 
 ## Running it
 
@@ -287,8 +322,29 @@ accepted at `/api/auth/session`, and the descriptor reported
 `policy: remote-reachable`. The boot grant was confirmed reusable by spending it
 twice.
 
-**Not yet checked:** any of that from an actual phone over an actual network,
-and no hand-driven session on Linux at all — no terminal opened, no turn run
-there. Both of those are what `AGENTS.md` means when it says a green suite is
-not evidence the application works, and the pty and the provider are exactly the
-two things a suite speaks for least. Write what they find here.
+**By hand, on Linux, from a phone** — 2026-07-30, and this is the one that
+matters. An Oracle Ampere instance: aarch64, Ubuntu 20.04, 3 cores. The server
+bound to loopback with `--ui`, a `cloudflared` quick tunnel in front of it, and
+a phone's browser on the far end of the public internet.
+
+The page loaded and paired from the URL's fragment with nothing typed, the
+descriptor answered `"os":"linux","arch":"arm64"`, an uncredentialed
+`/api/orchestration/shell` was still refused `401`, and **a turn ran to
+completion**. That last one is the whole chain on hardware that had never
+executed any of it: the socket upgraded through the tunnel, `crate::provider`
+resolved `claude` on arm64, the CLI streamed back, and the settling pipeline
+rendered it.
+
+**Still not checked, and worth being exact about:**
+
+- **The terminal on Linux.** A turn is the agent path; the pty is separate code
+  (`portable-pty` on `openpty(3)`) and no hand-driven session has opened one on
+  Linux. This is the single largest thing a green suite is not speaking for.
+- **A phone against `--network` on the same LAN.** The drive above went through
+  a tunnel, so the loopback path and HTTPS were exercised and the wildcard bind
+  was not.
+- **The URL the server printed.** It was not the URL used. On a cloud instance
+  the printed host is the private VCN address (`10.0.0.136` on that box), which
+  no phone can reach, so the working URL was assembled by hand against the
+  tunnel hostname. Nothing the server can inspect will find a NATed public
+  address — see the note on advertising a host below.
