@@ -77,10 +77,20 @@ root, so cargo commands are run from this directory.
   `docs/artifact-size.md`. `--measure-install` additionally installs, weighs and
   uninstalls, which is opt-in because it touches the machine — and refuses if
   laplus is already installed, rather than uninstalling someone's copy.
-  **Needs `cargo install tauri-cli --version "^2" --locked` first**: the Tauri
-  CLI is not a workspace dependency and cannot be one, and the first release
-  build downloads NSIS, so a fresh clone needs that command and a network before
-  it can produce an installer. Nothing else in the repo needs either.
+  **Needs the Tauri CLI installed first**: it is not a workspace dependency and
+  cannot be one, and the first release build downloads NSIS, so a fresh clone
+  needs both a CLI and a network before it can produce an installer. Nothing
+  else in the repo needs either.
+
+  ```
+  cargo binstall --locked tauri-cli --version "^2"   # downloads a prebuilt binary
+  cargo install  --locked tauri-cli --version "^2"   # compiles it, ~minutes
+  ```
+
+  Both leave the same `cargo-tauri` in `~/.cargo/bin`, so `cargo tauri build`
+  works either way — `cargo install` has no notion of a prebuilt binary and
+  always builds from source, which is why `release.yml` uses the first form and
+  Tauri's own documentation advises against the second in CI.
   `.github/workflows/release.yml` runs the same command on a Windows runner when
   a `v*.*.*` tag is pushed, and publishes the installer to a GitHub Release —
   the tag has to match `tauri.conf.json`'s version or the job refuses. What this
@@ -91,6 +101,7 @@ root, so cargo commands are run from this directory.
   whose public half is in `tauri.conf.json`. The key lives in `~/.tauri/` and in
   the repository secret of the same name — never in the tree, which `.gitignore`
   enforces. Losing it strands every existing install.
+
 - `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
   what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.

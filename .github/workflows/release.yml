@@ -35,6 +35,15 @@ concurrency:
 permissions:
   contents: write
 
+# Incremental compilation is a bet that the next build shares state with this
+# one, which on a runner that is destroyed afterwards is a bet that never pays.
+# What it does instead is fill `target/` with per-crate fragments that then have
+# to be packed, uploaded and unpacked as part of the cache — so it costs twice,
+# once to write and once to carry. Locally this tree had accumulated 15 GB of
+# them against 1.6 GB of actual release output.
+env:
+  CARGO_INCREMENTAL: 0
+
 jobs:
   release:
     name: Build, measure, publish
@@ -44,6 +53,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Defender scans every `.rlib`, `.pdb` and object file rustc emits, and a
+      # Tauri build emits tens of thousands of them — so on Windows the antivirus
+      # is a compiler tax rather than a background service. Excluding the two
+      # directories cargo writes to is the single largest Windows-specific win
+      # available here, and it costs nothing: the runner is disposable and sees
+      # only this repository's own code.
+      #
+      # `continue-on-error` because a cache is an optimisation and so is this. If
+      # a future image locks Defender policy down, the release should get slower,
+      # not fail.
+      - name: Exclude the build directories from Defender
+        continue-on-error: true
+        shell: powershell
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}\server\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -90,10 +116,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # `cache-on-failure` is what lets this job ever become fast. The cache key
+      # includes the job id, so the release job cannot borrow `rust.yml`'s —
+      # and it would not want to, because `rust.yml` builds `default-members`,
+      # which excludes the shell and therefore never downloads the three hundred
+      # crates Tauri brings. The release job's first run is cold by construction.
+      #
+      # By default the action saves nothing when the job fails, so a first run
+      # that runs out of `timeout-minutes` leaves no cache behind and the retry
+      # is cold as well — a job that can never finish learning. Saving on failure
+      # breaks that: whatever compiled before the timeout is kept, and the next
+      # attempt starts from it.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+          cache-on-failure: true
 
       # A tag can point at any commit, and neither `ci.yml` nor `rust.yml` fires
       # on one — their triggers are pull requests and pushes to `main`. So the
@@ -108,11 +146,35 @@ jobs:
         working-directory: server
         run: cargo test --no-fail-fast
 
-      # Not a workspace dependency and cannot be one. `Swatinem/rust-cache`
-      # caches `~/.cargo/bin`, so this compiles once per cache generation rather
-      # than once per release.
+      # Not a workspace dependency and cannot be one, so it has to be installed —
+      # but not *compiled*. `cargo install` has no notion of a prebuilt binary
+      # and always builds from source, which for this CLI is minutes of a Windows
+      # runner; Tauri's own documentation says plainly that in CI "you're better
+      # off choosing another installation method".
+      #
+      # The earlier note here claimed `Swatinem/rust-cache` reduced this to once
+      # per cache generation. True, and weaker than it sounds: that cache is
+      # keyed on the hashes of `Cargo.lock`, `Cargo.toml`, the toolchain file and
+      # `.cargo/config.toml`, so any dependency bump at all pays the full compile
+      # again — and this job had never completed once, so the cache did not exist.
+      #
+      # `cargo-binstall` downloads the release binary the Tauri project already
+      # publishes and drops it in `~/.cargo/bin` as `cargo-tauri`, which is the
+      # same name from the same place `cargo install` would have used. So
+      # `cargo tauri build` in `xtask` keeps working untouched, and a developer
+      # following `CLAUDE.md` with `cargo install` gets an identical CLI.
+      # Falls back to compiling if the download is unavailable, so this is a
+      # speed-up that cannot become an outage: the worst case is the several
+      # minutes the job spent before this change, not a failed release.
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install the Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+        shell: bash
+        run: |
+          cargo binstall --no-confirm 'tauri-cli@^2' \
+            || cargo install tauri-cli --version "^2" --locked
+          cargo tauri --version
 
       # A missing key is otherwise found halfway through a release build, as a
       # signing error from a tool nobody was thinking about. Ticket 74.

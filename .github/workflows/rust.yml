@@ -29,6 +29,12 @@ concurrency:
 permissions:
   contents: read
 
+# See `release.yml` for the argument. It applies harder here, because this
+# workflow runs on every push and pull request touching `server/` rather than
+# once per tag.
+env:
+  CARGO_INCREMENTAL: 0
+
 jobs:
   test:
     name: Test
@@ -45,6 +51,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # See `release.yml`. The reasoning is the same and the runner is the same;
+      # this is the workflow that pays it most often.
+      #
+      # `working-directory: server` is set for the job, so `${{ github.workspace }}`
+      # rather than a relative path: this step is PowerShell talking to Defender,
+      # not cargo, and it wants the absolute location.
+      - name: Exclude the build directories from Defender
+        continue-on-error: true
+        shell: powershell
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}\server\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
