@@ -247,7 +247,8 @@ Two things to know before trying it:
 far as minting a bearer and then the environment does not appear under "Remote
 environments", because every laplus reports `environmentId: "local"` and the
 client keys its registry on that — the slot is already the desktop's own
-backend's. Ticket 02's "What landed" has the detail. Until that is fixed,
+backend's. Ticket 06 is the fix and ticket 02's "What landed" is how it was
+found. Until it lands,
 `ssh -L 5773:localhost:4773 <box>` and pointing the window at
 `http://127.0.0.1:5773` gets you the same thing.
 

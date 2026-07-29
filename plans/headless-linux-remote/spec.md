@@ -131,6 +131,21 @@ Ticket 02 is the only one the phone does not need, and the only one that is
 about a second origin. If the desktop-app-as-remote-client is not wanted, 02 can
 be dropped without touching the others.
 
+### 06 was added after this was written
+
+> Everything above came from the source read of `9959d6c` and is left as it was.
+> **Ticket 06 did not**: it came out of driving 02, which got the desktop
+> application all the way through pairing and then found it had nowhere to put
+> the result — every laplus answers `environmentId: "local"`, and the client's
+> registry is one slot per id. That is not a fifth thing missing from the read
+> above; it is a consequence of 02 succeeding, and it could not have been seen
+> before then.
+>
+> ```
+> 02 (CORS) ──►  desktop app reaches a remote server
+>                  └─► 06 (a distinct id) ──►  and can hold more than one
+> ```
+
 ## Decisions taken here, so the tickets do not each re-argue them
 
 **The UI is loaded at runtime, not embedded.** The workspace `Cargo.toml` keeps

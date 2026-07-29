@@ -244,3 +244,9 @@ constant swap: the id is what a stored connection profile is keyed by, so
 changing it has to answer what happens to profiles already saved under `local`.
 `ssh -L 5773:localhost:4773` plus this ticket remains the way to reach a remote
 laplus from a desktop window today, which is what to tell anyone who asks.
+
+It is now **ticket 06**, written from its own source read, with both open
+questions answered: the id is generated and persisted per data directory with no
+grandfathering, and it reads `<machine>-<suffix>` rather than opaquely, because
+the requirement it exists for is _several_ environments and an unidentifiable one
+is no use at that point.
