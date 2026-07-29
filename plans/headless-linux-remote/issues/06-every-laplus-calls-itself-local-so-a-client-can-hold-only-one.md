@@ -286,10 +286,32 @@ DESKTOP-19EUMEB
 Disconnect
 ```
 
-This is not a regression and it does not block anything — the environments are
+This is not a regression and it did not block anything — the environments are
 distinct, connected and usable, which is what the ticket was for, and the id does
 its work in the registry where the collision was. But the argument for a
 _legible_ id over an opaque one was that it "lands in URLs and a settings list",
-and half of that is not true yet. **Not ticketed**; the fix is UI work
-(`SavedBackendListRow` showing the id, or the host it was paired with, beside the
-label) and it belongs with whoever owns that component.
+and half of that was not true.
+
+**Fixed afterwards, in a commit of its own**, once the user had seen the finding
+and asked what upstream does about it. It does nothing: `pingdotgg/t3code`'s row
+builds the same metadata line from an SSH target and a `relayManaged` flag, so
+its remotes read `SSH user@host` or `T3 Connect` and only a bare bearer remote is
+left blank — a gap laplus cannot inherit its way out of, because removing the
+relay surface (`94da6be`) left the unlabelled shape as the only remote shape it
+has.
+
+The row now carries the **host it was paired with** under the label —
+`formatRemoteBackendHost` in `ConnectionsSettings.logic.ts`, following the
+`*.logic.ts` split this directory already uses. The host rather than the id
+because the port is what differs between two servers on one machine, and because
+it is the value the user typed rather than one the server invented. Driven the
+same way, and the section now reads:
+
+```
+DESKTOP-19EUMEB
+127.0.0.1:5774
+Disconnect
+DESKTOP-19EUMEB
+127.0.0.1:5775
+Disconnect
+```

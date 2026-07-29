@@ -39,6 +39,7 @@ import * as Option from "effect/Option";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
+import { formatRemoteBackendHost } from "./ConnectionsSettings.logic";
 import { resolveDesktopPairingUrl } from "./pairingUrls";
 import {
   SettingsPageContainer,
@@ -1309,9 +1310,19 @@ function SavedBackendListRow({
     environment.entry.profile.value._tag === "SshConnectionProfile"
       ? environment.entry.profile.value.target
       : null;
-  const metadataBits = [sshTarget ? `SSH ${formatDesktopSshTarget(sshTarget)}` : null].filter(
-    (value): value is string => value !== null,
-  );
+  // The host a remote link was paired with, which is the only thing in this row
+  // that differs between two laplus servers on one machine: they share a
+  // hostname, so they share `environment.label`. See
+  // `formatRemoteBackendHost`, which carries the whole reasoning.
+  const remoteHost =
+    Option.isSome(environment.entry.profile) &&
+    environment.entry.profile.value._tag === "BearerConnectionProfile"
+      ? formatRemoteBackendHost(environment.entry.profile.value.httpBaseUrl)
+      : null;
+  const metadataBits = [
+    sshTarget ? `SSH ${formatDesktopSshTarget(sshTarget)}` : null,
+    remoteHost,
+  ].filter((value): value is string => value !== null);
 
   return (
     <div className={ITEM_ROW_CLASSNAME}>
