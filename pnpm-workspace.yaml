@@ -10,6 +10,18 @@ allowBuilds:
   bufferutil: false
   esbuild: true
   msgpackr-extract: true
+  # Not a dependency of anything here — it arrives under `vitest`, which arrives
+  # under `vite-plus`. Undeclared, pnpm 11 does not silently skip its build the
+  # way pnpm 10 did: it installs everything, prints ERR_PNPM_IGNORED_BUILDS and
+  # exits 1, which reads like a broken lockfile and is actually a policy asking
+  # to be answered. That is what reddened `ci.yml` and what stopped the first
+  # tagged release before it reached a compiler.
+  #
+  # `false` rather than `true` because the script it wants to run writes the
+  # service-worker shim a browser needs to intercept `fetch`, and nothing in this
+  # repository mocks a browser: the suite is node, and the shell talks to its own
+  # server over a socket.
+  msw: false
   utf-8-validate: false
   workerd: false
 
