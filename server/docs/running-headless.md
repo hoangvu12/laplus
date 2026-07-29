@@ -120,11 +120,12 @@ cargo build --release -p laplus-server
 
 ### The flags
 
-| Flag         | Environment      | Default              | What it does                                           |
-| ------------ | ---------------- | -------------------- | ------------------------------------------------------ |
-| `--port <n>` | `LAPLUS_PORT`    | `4773`               | The port to listen on. `0` asks the OS for a free one. |
-| `--ui <dir>` | `LAPLUS_UI`      | none                 | Serve the web bundle from this directory.              |
-| `--network`  | `LAPLUS_NETWORK` | `remote-access.json` | Bind `0.0.0.0` instead of `127.0.0.1`.                 |
+| Flag                      | Environment             | Default              | What it does                                                 |
+| ------------------------- | ----------------------- | -------------------- | ------------------------------------------------------------ |
+| `--port <n>`              | `LAPLUS_PORT`           | `4773`               | The port to listen on. `0` asks the OS for a free one.       |
+| `--ui <dir>`              | `LAPLUS_UI`             | none                 | Serve the web bundle from this directory.                    |
+| `--network`               | `LAPLUS_NETWORK`        | `remote-access.json` | Bind `0.0.0.0` instead of `127.0.0.1`.                       |
+| `--advertise-host <host>` | `LAPLUS_ADVERTISE_HOST` | the routing table    | The host to print in the startup URLs. Changes nothing else. |
 
 An argument beats the environment, which beats the default. An unrecognised flag
 or an unparseable value is a refusal with a sentence rather than a silent
@@ -147,6 +148,31 @@ next launch on that machine. `docs/adr/0023` is the full record, including why
 the flag can also turn exposure _off_ (`--network=false`, over a file that says
 otherwise). `true`, `1`, `on`, `yes` and their opposites are all accepted, for
 the sake of unit files and `docker run -e`.
+
+**`--advertise-host` is for the box whose own address is not the one you reach it
+at.** The startup URLs are built from a routing-table lookup, which is the right
+question on a LAN and one a cloud instance cannot answer: inside a VCN the only
+address on the machine _is_ the private one, and the public address is NAT'd
+somewhere the server cannot see. So the printed URL named `10.0.0.x` and the
+working one had to be assembled by hand by somebody who already knew that.
+
+```
+./target/release/laplus-server --ui ../apps/web/dist --network --advertise-host 129.150.37.24
+```
+
+It takes a **host** — no scheme, no port, no path, and any of those is a refusal
+rather than something it repairs. The scheme is `http` because that is all this
+server speaks, and the port comes from the listener. It changes only what is
+printed: the bind address, the exposure and the security posture are all exactly
+what they were without it, so this is you telling the server a fact about the
+network rather than asking it for anything.
+
+It is honoured whether or not `--network` was passed, because a tunnel is the
+other reason to use it: `cloudflared` forwards a public hostname to `127.0.0.1`,
+so the server is loopback-bound and that hostname works anyway. When it is used
+on a loopback-bound server the startup adds one line saying what the address
+depends on — the server cannot tell a tunnel from a forgotten `--network`, so it
+names the condition instead of guessing at the mistake.
 
 ### What it says at startup
 
@@ -179,6 +205,8 @@ the middle of a URL on a phone keyboard. Both are built from a routing-table
 lookup — `crate::endpoints::lan_address` `connect`s a UDP socket at TEST-NET-3
 and reads back the local address, which sends no packets — so the host is the
 one this machine would send from, and the same one your other traffic takes.
+Unless `--advertise-host` said otherwise, in which case both name that host and
+the lookup is not made.
 
 Two states that are not that:
 
@@ -410,8 +438,13 @@ why that is not CORS.
 - **A phone against `--network` on the same LAN.** The drive above went through
   a tunnel, so the loopback path and HTTPS were exercised and the wildcard bind
   was not.
-- **The URL the server printed.** It was not the URL used. On a cloud instance
-  the printed host is the private VCN address (`10.0.0.136` on that box), which
-  no phone can reach, so the working URL was assembled by hand against the
-  tunnel hostname. Nothing the server can inspect will find a NATed public
-  address — see the note on advertising a host below.
+- **`--advertise-host` on a cloud box.** The flag exists because of that drive:
+  the printed host was the private VCN address (`10.0.0.136` on that box), which
+  no phone can reach, so the working URL was assembled by hand against the tunnel
+  hostname. Nothing the server can inspect will find a NATed public address, so
+  the operator now says it — see the flag above. What has been checked is the flag
+  itself, on Windows, by hand and in tests: the host it is given is what gets
+  printed, with `--network` and without, and a value carrying a scheme, a port or
+  a path is refused. **What has not been checked is a phone reaching a cloud box
+  through a URL the server printed**, which is the whole point of it and needs
+  that box again.
