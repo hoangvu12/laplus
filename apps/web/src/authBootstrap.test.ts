@@ -228,6 +228,50 @@ describe("resolveInitialServerAuthGateState", () => {
     );
   });
 
+  // laplus has no `window.desktopBridge` — its shell and its server are one
+  // process, so there is no preload to hand a token across and the window is
+  // opened at `/#token=…` instead. Nothing read that fragment outside the
+  // `/pair` route, so the gate found no credential, never opened a session, and
+  // every socket upgrade was refused for presenting nothing.
+  it("bootstraps from the url fragment when there is no desktop bridge", async () => {
+    const testApi = await installAuthApi({
+      session: sequence(unauthenticatedSession(LOOPBACK_AUTH), authenticatedSession(LOOPBACK_AUTH)),
+      browserSession: () => Effect.succeed(browserSession(["orchestration:read", "access:write"])),
+    });
+
+    const testWindow = installTestBrowser("http://127.0.0.1:4773/#token=BOOT2345WXYZ");
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+    expect(testApi.calls.browserSession).toEqual([{ credential: "BOOT2345WXYZ" }]);
+    // Peeked, not taken: the boot grant is re-usable precisely so that a reload
+    // can read it again, and spending the address bar's only copy would make F5
+    // the thing that locks the window out.
+    expect(testWindow.location.hash).toBe("#token=BOOT2345WXYZ");
+  });
+
+  // `PairingRouteSurface` reads the same fragment and auto-submits it, and a
+  // phone's pairing code is single-use — so a gate that spent it first would
+  // leave that screen submitting a code the server had already consumed.
+  it("leaves the fragment to the pairing route when that is the route being opened", async () => {
+    const testApi = await installAuthApi({
+      session: () => unauthenticatedSession(LOOPBACK_AUTH),
+    });
+
+    installTestBrowser("http://127.0.0.1:4773/pair#token=PHONE2345WXY");
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).resolves.toEqual({
+      status: "requires-auth",
+      auth: LOOPBACK_AUTH,
+    });
+    expect(testApi.calls.browserSession).toEqual([]);
+  });
+
   it("returns a requires-auth state instead of throwing when no bootstrap credential exists", async () => {
     await installAuthApi({ session: () => unauthenticatedSession(LOOPBACK_AUTH) });
     const { resolveInitialServerAuthGateState } = await import("./environments/primary");

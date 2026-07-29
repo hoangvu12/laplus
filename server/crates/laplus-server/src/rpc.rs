@@ -52,6 +52,15 @@ pub const SERVER_GET_CONFIG: &str = "server.getConfig";
 /// and the one ticket 04 proves the streaming mechanism on.
 pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
 
+/// The access subscription — what Settings reads its pairing links from.
+///
+/// Ticket 73 built `GET /api/auth/pairing-links` because the contract declares
+/// it, and the Settings panel does not call it: `ConnectionsSettings.tsx:1559`
+/// opens this subscription instead and folds the snapshot. So until this
+/// existed, a code could be minted over HTTP and never appeared on the screen
+/// that minted it.
+pub const SUBSCRIBE_AUTH_ACCESS: &str = "subscribeAuthAccess";
+
 /// Everything a method is allowed to read or change.
 ///
 /// One value rather than a widening argument list, and deliberately *not* the
@@ -255,6 +264,8 @@ pub fn dispatch(
         // The payload is an empty struct in the contract, so there is nothing
         // to read out of it and nothing that can be wrong with it.
         SUBSCRIBE_SERVER_CONFIG => Ok(Answer::Stream(services.config.subscribe())),
+        // Also an empty struct in the contract, and also nothing to read.
+        SUBSCRIBE_AUTH_ACCESS => Ok(Answer::Stream(services.shell.subscribe_auth_access())),
         orchestration::DISPATCH_COMMAND => services
             .shell
             .dispatch(payload, &services.index, &services.config.current())

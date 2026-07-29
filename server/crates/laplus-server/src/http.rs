@@ -66,26 +66,76 @@ pub fn environment_descriptor(config: &ServerConfig) -> &EnvironmentDescriptor {
 }
 
 /// `GET /api/auth/session`.
+///
+/// ## This used to answer `authenticated: true` to everyone
+///
+/// It did, and said so: v1 had no identity store, so there was no state in
+/// which a client was *un*authenticated and answering `false` would have sent
+/// the UI to a pairing screen backed by nothing. Ticket 73 built the identity
+/// store, and left this route behind — its scope item 7 is exactly "stop
+/// hardcoding `authenticated: true`", and only the `bootstrapMethods` half of
+/// it landed.
+///
+/// Leaving it cost more than a wrong field. **`scopes` is what the Settings
+/// panel gates its entire local-environment section on** — `canManageLocalBackend`
+/// in `ConnectionsSettings.tsx` is `scopes?.includes("access:write")`, and a
+/// response that omits `scopes` reads as a client that may manage nothing. So
+/// the window, holding a boot grant minted with every administrative scope,
+/// was shown a panel saying it lacked them, and the button that mints a pairing
+/// code was in the half that panel does not render. The server could pair a
+/// phone; there was no way to ask it to.
+///
+/// A `false` here is not a refusal — this route is the probe a client makes
+/// *before* it holds anything, and 200 is the honest answer to "am I signed
+/// in?" when the answer is no. The client already loops on it:
+/// `waitForAuthenticatedSessionAfterBootstrap` in
+/// `apps/web/src/environments/primary/auth.ts` polls until it flips.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthSessionState<'a> {
-    /// Always true. v1 has no identity store, so there is no state in which a
-    /// local client is *un*authenticated — and answering `false` would send
-    /// the UI to a pairing screen backed by a pairing flow that does not
-    /// exist. This is the same permissive posture [`crate::auth`] takes at the
-    /// socket upgrade, and it is bounded the same way: by binding to loopback
-    /// and refusing non-local origins.
     pub authenticated: bool,
     pub auth: &'a AuthDescriptor,
-    // `scopes`, `sessionMethod` and `expiresAt` are optional in the contract
-    // and omitted here. Nothing is scoped because nothing is denied; no method
-    // established the session; and it does not expire. The UI reads `scopes`
-    // only to display them, with a null fallback.
+    /// What the verified session may do — the grant's, verbatim.
+    ///
+    /// Absent rather than empty when nothing verified: the contract types it
+    /// `optionalKey`, and an empty array is a client that authenticated and may
+    /// do nothing, which is a different sentence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    /// Which of `ServerAuthSessionMethod`'s three established this session.
+    ///
+    /// Absent for a `wsTicket`, which is not one of the three: a ticket is how
+    /// a socket is opened, not how a session is held. Nothing asks this route
+    /// with one, but [`crate::server::authorized`] accepts one everywhere, so
+    /// the shape has to have an answer that is not a guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_method: Option<&'static str>,
+    // `expiresAt` is the third optional field and stays omitted. Reporting it
+    // means carrying the session's expiry out of the store alongside the grant,
+    // which nothing reads: the client re-probes rather than counting down.
 }
 
-pub fn auth_session_state(config: &ServerConfig) -> AuthSessionState<'_> {
+/// Nothing verified. The shape a client sees before it has paired.
+pub fn unauthenticated_session(config: &ServerConfig) -> AuthSessionState<'_> {
+    AuthSessionState {
+        authenticated: false,
+        auth: &config.auth,
+        scopes: None,
+        session_method: None,
+    }
+}
+
+/// A credential verified, and this is what it is good for.
+pub fn authenticated_session<'a>(
+    config: &'a ServerConfig,
+    scopes: Vec<String>,
+    session_method: Option<&'static str>,
+) -> AuthSessionState<'a> {
     AuthSessionState {
         authenticated: true,
         auth: &config.auth,
+        scopes: Some(scopes),
+        session_method,
     }
 }
 
@@ -585,12 +635,50 @@ mod tests {
         assert_eq!(over_http, config.to_value()["environment"]);
     }
 
+    /// Both shapes carry the descriptor, and it is the config's either way: a
+    /// client that has not paired reads `bootstrapMethods` off this response to
+    /// know *how* to pair, so the unauthenticated answer is the one that can
+    /// least afford to describe a different server.
     #[test]
     fn the_session_state_reports_the_same_auth_descriptor_as_the_config() {
         let config = ServerConfig::detect();
-        let state = auth_session_state(&config).to_value();
-        assert_eq!(state["authenticated"], serde_json::json!(true));
-        assert_eq!(state["auth"], config.to_value()["auth"]);
+
+        let signed_out = unauthenticated_session(&config).to_value();
+        assert_eq!(signed_out["authenticated"], serde_json::json!(false));
+        assert_eq!(signed_out["auth"], config.to_value()["auth"]);
+
+        let signed_in = authenticated_session(
+            &config,
+            vec!["access:write".to_string()],
+            Some(crate::pairing::BROWSER_SESSION_METHOD),
+        )
+        .to_value();
+        assert_eq!(signed_in["authenticated"], serde_json::json!(true));
+        assert_eq!(signed_in["auth"], config.to_value()["auth"]);
+    }
+
+    /// The one field the Settings panel gates on, spelled the way the contract
+    /// spells it.
+    ///
+    /// `canManageLocalBackend` reads `scopes` and nothing else, so a rename to
+    /// snake_case here would not fail a decode — `scopes` is `optionalKey` — it
+    /// would silently put the panel back in the state this pair of functions
+    /// exists to get it out of.
+    #[test]
+    fn a_verified_session_reports_its_scopes_and_how_it_was_established() {
+        let config = ServerConfig::detect();
+        let state = authenticated_session(
+            &config,
+            vec!["orchestration:read".to_string(), "access:write".to_string()],
+            Some(crate::pairing::BEARER_SESSION_METHOD),
+        )
+        .to_value();
+
+        assert_eq!(
+            state["scopes"],
+            serde_json::json!(["orchestration:read", "access:write"])
+        );
+        assert_eq!(state["sessionMethod"], serde_json::json!("bearer-access-token"));
     }
 
     /// The client decodes a refusal by its `_tag` and branches on it, so the
@@ -827,14 +915,28 @@ mod tests {
     /// as `optionalKey`, where absent decodes cleanly and null does not.
     #[test]
     fn unset_optional_fields_are_absent_rather_than_null() {
-        let state = auth_session_state(&ServerConfig::detect()).to_value();
+        let config = ServerConfig::detect();
         // `serde_json::Value` orders keys itself, so compare the set.
-        let fields: Vec<&str> = state
-            .as_object()
-            .expect("an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(fields, ["auth", "authenticated"]);
+        let fields = |state: serde_json::Value| -> Vec<String> {
+            state
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+
+        assert_eq!(
+            fields(unauthenticated_session(&config).to_value()),
+            ["auth", "authenticated"]
+        );
+
+        // A `wsTicket` names no `ServerAuthSessionMethod`, so that field drops
+        // out while `scopes` stays — the two are independently optional and a
+        // single `Option` over both would have made this shape unreachable.
+        assert_eq!(
+            fields(authenticated_session(&config, vec!["access:read".to_string()], None).to_value()),
+            ["auth", "authenticated", "scopes"]
+        );
     }
 }

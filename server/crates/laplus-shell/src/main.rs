@@ -111,6 +111,11 @@ fn main() -> ExitCode {
 
     println!("laplus: serving {}", server.http_url());
 
+    // Cloned before the server is moved into the mutex below. The store is the
+    // one the running server reads, so a hostname added in Settings is a
+    // hostname the next request is checked against.
+    let server_config = server.state().config().clone();
+
     // The window opens on a URL carrying the credential it will authenticate
     // with, in the fragment — which the browser keeps and never sends, so the
     // credential reaches this window and nothing that merely reaches this
@@ -131,6 +136,21 @@ fn main() -> ExitCode {
         // would have anywhere to report the answer — the pill that shows it is
         // the UI's.
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Network access. The page has no other way to ask: this is the shell's
+        // own question — where the listener is bound — and the socket contract
+        // has no word for it, because upstream asks it over Electron's IPC and
+        // `packages/contracts` describes the *server* rather than the desktop.
+        // Same shape as the titlebar and the updater: a command, a capability
+        // naming the loopback origin, and the page pressing it.
+        .manage(NetworkAccess {
+            config: server_config.clone(),
+            port,
+        })
+        .invoke_handler(tauri::generate_handler![
+            network_access_state,
+            set_network_exposure,
+            set_tunnel_hosts,
+        ])
         .setup(move |app| {
             window(app, &url)?;
             Ok(())
@@ -193,6 +213,93 @@ fn window(app: &tauri::App, url: &str) -> tauri::Result<()> {
         .build()?;
 
     Ok(())
+}
+
+/// What the three network-access commands need: the store the file rides on,
+/// and the port the endpoints are advertised at.
+struct NetworkAccess {
+    config: laplus_server::config_store::ConfigStore,
+    port: u16,
+}
+
+/// The switch's position, the reachable URLs, and the tunnel hostnames.
+///
+/// Shaped as `DesktopServerExposureState` plus the endpoint list, because
+/// `ConnectionsSettings` reads exactly those two things and reads them together
+/// — upstream asks `getServerExposureState` and `getAdvertisedEndpoints`
+/// separately over an IPC that is already open, where this is a round trip and
+/// there is no reason to make two.
+///
+/// `tailscaleServeEnabled` and `tailscaleServePort` are reported because the
+/// state shape declares them, and are always off: laplus drives no `tailscale
+/// serve`. A tailnet name reaches it as a tunnel hostname instead.
+#[tauri::command]
+fn network_access_state(state: tauri::State<'_, NetworkAccess>) -> serde_json::Value {
+    let config = state.config.current();
+    let access = &config.remote_access;
+
+    serde_json::json!({
+        "mode": access.exposure().mode(),
+        "endpointUrl": laplus_server::endpoints::advertised_host(access)
+            .map(|host| format!("http://{host}:{}", state.port)),
+        "advertisedHost": laplus_server::endpoints::advertised_host(access),
+        "tailscaleServeEnabled": false,
+        "tailscaleServePort": 443,
+        "advertisedEndpoints": laplus_server::endpoints::advertised(access, state.port),
+        "allowedOrigins": access.hosts(),
+    })
+}
+
+/// Turn the switch, then restart so the listener is bound to the new address.
+///
+/// **The restart is the point, not a shortcut.** The address was bound before
+/// the window opened and a listener cannot be moved from under the sockets on
+/// it, so writing the file without restarting would leave a switch that reads
+/// as on and a port that is still loopback — the failure this whole change
+/// exists to remove, in a new place. Upstream restarts its backend here and its
+/// dialog already says so: "laplus will restart to expose this environment over
+/// the network".
+///
+/// `app.restart()` does not return.
+#[tauri::command]
+fn set_network_exposure(
+    mode: String,
+    state: tauri::State<'_, NetworkAccess>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let exposure = match mode.as_str() {
+        "local-only" => laplus_server::remote_access::Exposure::LocalOnly,
+        "network-accessible" => laplus_server::remote_access::Exposure::NetworkAccessible,
+        other => return Err(format!("{other} is not a network exposure mode")),
+    };
+
+    let current = state.config.current().remote_access.exposure();
+    state
+        .config
+        .readdress(|access| access.with_exposure(exposure))?;
+
+    // Nothing to restart for when the switch was already where it was put, and
+    // restarting anyway would make an idempotent call throw the window away.
+    if current != exposure {
+        app.restart();
+    }
+
+    Ok(network_access_state(state))
+}
+
+/// Name the hostnames a tunnel may reach this server from.
+///
+/// No restart, unlike the switch above, and the asymmetry is real rather than
+/// an inconsistency: [`laplus_server::auth`] reads this list per request, so an
+/// added hostname is live immediately. Only the *bind address* is fixed at
+/// startup.
+#[tauri::command]
+fn set_tunnel_hosts(
+    hosts: Vec<String>,
+    state: tauri::State<'_, NetworkAccess>,
+) -> Result<serde_json::Value, String> {
+    state.config.readdress(|access| access.with_hosts(&hosts))?;
+    Ok(network_access_state(state))
 }
 
 /// Report a failure that happened before there was a window to report it in,

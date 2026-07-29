@@ -175,15 +175,43 @@ export function takePairingTokenFromUrl(): string | null {
   return token;
 }
 
-function getDesktopBootstrapCredential(): string | null {
+// Routes that own the pairing fragment themselves. `PairingRouteSurface` reads
+// the token out of the URL and auto-submits it, and a phone's pairing code is
+// single-use — so the gate reading it first would spend it and leave that
+// screen submitting a code the server has already consumed.
+const PAIRING_FRAGMENT_OWNING_ROUTES = ["/pair", "/connect"];
+
+function ownsPairingFragmentItself(pathname: string): boolean {
+  return PAIRING_FRAGMENT_OWNING_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  );
+}
+
+function getBootstrapCredential(): string | null {
   // Both backends share the same bootstrap token (DesktopBackendConfiguration
   // mints one tokenRef and feeds it to both resolvers), so picking the
   // primary entry is fine even when the WSL backend is also registered.
   const bootstraps = window.desktopBridge?.getLocalEnvironmentBootstraps() ?? [];
   const primary = bootstraps.find((entry) => entry.id === PRIMARY_LOCAL_ENVIRONMENT_ID);
-  return typeof primary?.bootstrapToken === "string" && primary.bootstrapToken.length > 0
-    ? primary.bootstrapToken
-    : null;
+  if (typeof primary?.bootstrapToken === "string" && primary.bootstrapToken.length > 0) {
+    return primary.bootstrapToken;
+  }
+
+  // laplus has no `window.desktopBridge`. Its shell and its server are one
+  // process, so there is no Electron preload to hand a token across — the
+  // window is opened at `http://127.0.0.1:4773/#token=…` instead, and a URL
+  // fragment is never sent to the server, which is what makes it a private
+  // channel rather than a credential in a request log. `Server::window_url` in
+  // `server/crates/laplus-server/src/server.rs` is the other end.
+  //
+  // Peeked rather than taken: the boot grant is deliberately re-usable so that
+  // reloading the window re-reads it, and stripping it here would spend the
+  // address bar's only copy on a session cookie that a cleared cookie jar can
+  // outlive.
+  if (ownsPairingFragmentItself(window.location.pathname)) {
+    return null;
+  }
+  return peekPairingTokenFromUrl();
 }
 
 export async function fetchSessionState(): Promise<AuthSessionState> {
@@ -318,7 +346,7 @@ function isTransientBootstrapError(error: unknown): boolean {
 }
 
 async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
-  const bootstrapCredential = getDesktopBootstrapCredential();
+  const bootstrapCredential = getBootstrapCredential();
   const currentSession = await fetchSessionState();
   if (currentSession.authenticated) {
     return { status: "authenticated" };

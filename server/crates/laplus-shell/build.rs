@@ -76,7 +76,25 @@ fn main() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     std::fs::write(out.join("assets.rs"), generated).expect("the generated table is written");
 
-    tauri_build::build();
+    // The three network-access commands, named so that `tauri-build` generates
+    // an `allow-…` permission for each. Without this the capability that grants
+    // them cannot refer to them and the build fails listing every permission
+    // that *does* exist — which is the whole plugin surface and none of ours.
+    //
+    // Only commands the page is allowed to reach need naming. The permission
+    // system is what stands between a page served over HTTP and this process,
+    // and the window is served over HTTP (ADR-0010), so this is not a
+    // formality: see `capabilities/network-access.toml`.
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(
+            tauri_build::AppManifest::new().commands(&[
+                "network_access_state",
+                "set_network_exposure",
+                "set_tunnel_hosts",
+            ]),
+        ),
+    )
+    .expect("the tauri manifest builds");
 }
 
 /// Where the UI's `dist/` is, relative to this crate.

@@ -61,6 +61,7 @@ pub mod clock;
 pub mod config;
 pub mod config_store;
 pub mod editor;
+pub mod endpoints;
 pub mod files;
 pub mod filesystem;
 pub mod git;

@@ -1,0 +1,28 @@
+# What the page may ask about where this server listens.
+#
+# The Settings switch and the tunnel hostname list, and nothing else. Upstream
+# asks the same questions over Electron's IPC — `desktopBridge.getServerExposureState`,
+# `setServerExposureMode`, `getAdvertisedEndpoints` — which laplus has no
+# equivalent of, because its shell and its server are one process and there is
+# no preload. Commands through Tauri's IPC are the shell's established answer to
+# that: see `capabilities/titlebar.toml`, whose reasoning about a *remote*
+# origin applies here word for word and is not repeated.
+#
+# **This grant is narrower than it looks.** These three commands are declared by
+# `laplus-shell` itself, so the permission names below are the crate's own
+# rather than a plugin's, and no capability elsewhere grants them. A page that is
+# not served from this machine's loopback interface cannot reach them at all.
+#
+# Worth stating plainly, because of what the switch does: turning it on binds
+# the server to every interface, which is a change of security posture and not a
+# preference. `docs/adr/0022` is the decision. What makes it defensible is that
+# every request already has to present a credential that verifies (`0019`) — so
+# reaching the port is no longer the same as being let in.
+identifier = "network-access"
+description = "Lets laplus's own UI read and change where this server listens."
+windows = ["main"]
+
+permissions = ["allow-network-access-state", "allow-set-network-exposure", "allow-set-tunnel-hosts"]
+
+[remote]
+urls = ["http://127.0.0.1:*"]

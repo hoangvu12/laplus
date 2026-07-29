@@ -377,8 +377,28 @@ impl ServerConfig {
     /// beside it, and a suite that wrote to the developer's real configuration
     /// would be a suite nobody could run twice.
     pub fn detect_in(data_dir: PathBuf) -> Self {
+        let remote_access = crate::remote_access::RemoteAccess::load(&data_dir);
+        // Upstream settles this from whether the *bind host* is remote-reachable
+        // (`EnvironmentAuthPolicy.ts:18`). laplus always binds loopback — a
+        // tunnel dials `127.0.0.1` from this machine — so reading the bind host
+        // would answer `loopback-browser` on a machine a phone is already
+        // talking to. What makes this server reachable from elsewhere is
+        // somebody having named a host in `remote-access.json`, so that is what
+        // is read instead: the same question, asked where laplus keeps the
+        // answer.
+        //
+        // It is not cosmetic. Settings hides the whole "Authorized clients"
+        // section — and with it the only button that mints a pairing code —
+        // unless this says `remote-reachable` (`ConnectionsSettings.tsx:2417`).
+        // Reporting `loopback-browser` unconditionally meant a user who had set
+        // up a tunnel still had no way to mint the code to use it.
+        let policy = if remote_access.is_empty() {
+            "loopback-browser"
+        } else {
+            "remote-reachable"
+        };
         ServerConfig {
-            remote_access: crate::remote_access::RemoteAccess::load(&data_dir),
+            remote_access,
             preferences: data_dir.clone(),
             environment: EnvironmentDescriptor {
                 environment_id: "local".to_string(),
@@ -396,7 +416,7 @@ impl ServerConfig {
                 },
             },
             auth: AuthDescriptor {
-                policy: "loopback-browser",
+                policy,
                 bootstrap_methods: vec![crate::pairing::ONE_TIME_TOKEN_METHOD],
                 session_methods: vec![
                     "browser-session-cookie",

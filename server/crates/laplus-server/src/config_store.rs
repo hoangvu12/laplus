@@ -246,6 +246,47 @@ impl ConfigStore {
         Ok(answer)
     }
 
+    /// Change who may reach this server, write it down, and publish it.
+    ///
+    /// The third of the same shape as [`ConfigStore::reconfigure`] and
+    /// [`ConfigStore::rebind`], and here for the same reason both of those are:
+    /// the file is read, changed and written back, and two of those
+    /// interleaving would lose one edit under the other. Turning the switch on
+    /// while adding a tunnel hostname is exactly that pair.
+    ///
+    /// **A change here does not move the listener.** The address was bound at
+    /// startup and cannot be re-bound from under an open socket, so
+    /// [`crate::remote_access::Exposure`] takes effect on the next start and the
+    /// shell restarts the application to make that immediate — which is what
+    /// upstream's switch does too. The *hostname list* has no such problem:
+    /// [`crate::auth`] reads it per request, so an added tunnel works at once.
+    /// The caller is what knows which of the two it changed.
+    pub fn readdress(
+        &self,
+        change: impl FnOnce(&crate::remote_access::RemoteAccess) -> crate::remote_access::RemoteAccess,
+    ) -> Result<crate::remote_access::RemoteAccess, String> {
+        let mut current = self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let next_access = change(&current.remote_access);
+        next_access
+            .save(&current.preferences)
+            .map_err(|error| format!("cannot write the remote access file: {error}"))?;
+
+        let mut next = (**current).clone();
+        next.remote_access = next_access.clone();
+        *current = Arc::new(next);
+
+        // No event. `remote_access` is `#[serde(skip)]` and carried on the
+        // config only so one reading of the file is shared — publishing a
+        // config change would send every subscriber the whole payload to
+        // announce a field none of them can see.
+        Ok(next_access)
+    }
+
     /// Open a subscription: the configuration now, then every change to it.
     pub fn subscribe(&self) -> EventSource {
         // Subscribed to *before* the snapshot function is handed over, so a

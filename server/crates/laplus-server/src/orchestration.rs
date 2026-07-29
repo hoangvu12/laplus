@@ -133,6 +133,16 @@ struct Inner {
     /// written down on a thread of its own rather than on whoever changed it.
     database: Arc<Database>,
     updates: broadcast::Sender<Value>,
+    /// Fires when the codes this machine has handed out change.
+    ///
+    /// Separate from `updates` rather than folded into it, because the two
+    /// carry different vocabularies to different subscriptions: `updates` is
+    /// the shell's projects and conversations, ordered by [`Sequences`], and a
+    /// client folds it against one cursor. An access snapshot is a wholesale
+    /// replacement with a `revision` of its own and no ordering relationship to
+    /// a project being renamed. Sharing the channel would put each aggregate's
+    /// events in the other's stream for both to filter back out.
+    access_updates: broadcast::Sender<Value>,
     /// The number every change on this wire is ordered by, shared with
     /// [`Threads`] because both aggregates travel on the same subscription and
     /// a client folds them against one cursor.
@@ -245,9 +255,51 @@ impl Shell {
                 threads,
                 sequences,
                 updates,
+                access_updates: broadcast::channel(BACKLOG).0,
                 transcripts,
             }),
         }
+    }
+
+    /// `subscribeAuthAccess` — the codes this machine has handed out, and who
+    /// is holding one.
+    ///
+    /// **Snapshots only.** The contract's `AuthAccessStreamEvent` is a union of
+    /// five, four of them deltas, and the Settings panel that is the only
+    /// reader keeps just one: `if (event?.type !== "snapshot") return []`
+    /// (`ConnectionsSettings.tsx:1602`). Emitting deltas would be writing four
+    /// event shapes nothing decodes, so a change republishes the whole list —
+    /// which is what the client folds anyway, and what every other subscription
+    /// on this wire does.
+    ///
+    /// `clientSessions` is always empty, and that is ticket 73's decision
+    /// rather than an omission here: it puts `auth.clients` out of scope and
+    /// says to leave the UI refusing. A pairing link is what has to be visible,
+    /// because a code the user cannot read off the screen is a code they cannot
+    /// carry to their phone.
+    pub fn subscribe_auth_access(&self) -> EventSource {
+        // Subscribed before the description is handed over, for the reason
+        // `ConfigStore::subscribe` gives: a change landing in between arrives
+        // as an update rather than falling into the gap, and being seen twice
+        // costs nothing when both are whole replacements.
+        let updates = self.inner.access_updates.subscribe();
+        let database = Arc::clone(&self.inner.database);
+        EventSource::new(move || vec![access_snapshot_event(&database)], updates)
+    }
+
+    /// Say that the codes changed, so every open Settings panel re-reads them.
+    ///
+    /// Called by the two routes that change them. A failure to read the list
+    /// back is not this function's to report — [`access_snapshot_event`] answers
+    /// with an empty list and complains to the log, which is the same posture
+    /// the route itself takes.
+    pub fn auth_access_changed(&self) {
+        // `send` errors only when nothing is subscribed, which is the ordinary
+        // case: nobody has Settings open.
+        let _ = self
+            .inner
+            .access_updates
+            .send(access_snapshot_event(&self.inner.database));
     }
 
     /// The conversations this shell carries. One registry per server, shared the
@@ -840,6 +892,35 @@ fn unavailable(attempting: &'static str) -> impl Fn(StorageError) -> CommandErro
 ///
 /// `updatedAt` is the later of the registry's own timestamp and the newest
 /// thread's, because the field describes the shell rather than either half of it.
+/// `subscribeAuthAccess`'s only event: the whole access list, wrapped.
+///
+/// `version` is a literal `1` in the contract and the client refuses anything
+/// else. `revision` is required and typed `Schema.Number` with no ordering
+/// contract attached to it — the reader keeps the latest snapshot and nothing
+/// compares two — so it is the wall clock rather than a counter this server
+/// would have to persist to keep monotonic across a restart.
+///
+/// A list that cannot be read becomes an empty one and a line in the log. The
+/// alternative is `AuthAccessStreamError`, which would tear down the
+/// subscription and leave Settings with no list *and* no way to mint into it;
+/// the panel already renders "No pairing links or client sessions" for the
+/// empty case, and a code minted afterwards republishes.
+fn access_snapshot_event(database: &Database) -> Value {
+    let links = database.active_pairing_links().unwrap_or_else(|error| {
+        eprintln!("laplus: cannot read the pairing links to publish them: {error}");
+        Vec::new()
+    });
+    json!({
+        "version": 1,
+        "revision": crate::clock::now_epoch_millis(),
+        "type": "snapshot",
+        "payload": {
+            "pairingLinks": crate::http::pairing_links(&links),
+            "clientSessions": [],
+        },
+    })
+}
+
 fn shell_snapshot(registry: &Registry, threads: &Threads, sequence: i64) -> Value {
     let updated_at = threads
         .latest_change()

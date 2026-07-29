@@ -30,7 +30,7 @@
 //! frame. Ticket 06's file tree is the first method that needed this, and the
 //! reason is spelled out on [`crate::rpc::Deferred`].
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -360,8 +360,18 @@ impl Server {
             .fallback(any(asset))
             .with_state(Arc::clone(&state));
 
-        let listener =
-            tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
+        // Loopback unless the developer turned the switch on, and read from the
+        // configuration this server was built with rather than from the disk
+        // again — `remote-access.json` is read once, at `ServerConfig::detect`,
+        // so the address bound and the origins admitted cannot come from two
+        // different readings of one file.
+        //
+        // `docs/adr/0022` is why binding wider is allowed at all. The short
+        // version: `0019` made every request carry a credential that verifies,
+        // which is the thing that was missing when `0015` reasoned that
+        // loopback *was* the boundary.
+        let bind = state.config().current().remote_access.bind_address();
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port))).await?;
         let local_addr = listener.local_addr()?;
 
         let serving = tokio::spawn(async move {
@@ -391,15 +401,44 @@ impl Server {
         self.local_addr
     }
 
+    /// What [`Server::reachable_addr`] does to a wildcard, without a listener.
+    ///
+    /// Split out so the rule can be tested at all: binding `0.0.0.0` in the
+    /// suite means a test that opens a port to the network on whoever's machine
+    /// is running it, and the thing worth pinning is the arithmetic rather than
+    /// the socket.
+    fn reachable_from(bound: SocketAddr) -> SocketAddr {
+        if bound.ip().is_unspecified() {
+            return SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound.port()));
+        }
+        bound
+    }
+
     /// The URL the UI connects to.
     pub fn ws_url(&self) -> String {
-        format!("ws://{}/ws", self.local_addr)
+        format!("ws://{}/ws", self.reachable_addr())
+    }
+
+    /// Where a client on *this machine* reaches this server.
+    ///
+    /// [`Server::local_addr`] is the socket's own address, and once the network
+    /// access switch exists that is `0.0.0.0` — a wildcard meaning "every
+    /// interface", which is a thing to bind and not a thing to connect to. A
+    /// browser sent there answers `ERR_ADDRESS_INVALID`, which is exactly what
+    /// the window did the first time the switch was turned on.
+    ///
+    /// So every URL this server hands out for local use names loopback
+    /// explicitly, and only the *port* comes from the listener. The addresses
+    /// other machines use are [`crate::endpoints`]'s, which is a different
+    /// question with a different answer.
+    fn reachable_addr(&self) -> SocketAddr {
+        Server::reachable_from(self.local_addr)
     }
 
     /// The URL the UI is *at*. What the shell points its window at, and the
     /// origin every request the window makes will carry.
     pub fn http_url(&self) -> String {
-        format!("http://{}/", self.local_addr)
+        format!("http://{}/", self.reachable_addr())
     }
 
     /// The URL to open the UI *with a credential already in hand*.
@@ -530,9 +569,47 @@ async fn environment_descriptor(State(state): State<Arc<ServerState>>) -> Respon
     Json(http::environment_descriptor(&config).clone()).into_response()
 }
 
-async fn auth_session(State(state): State<Arc<ServerState>>) -> Response {
+/// `GET /api/auth/session` — "am I signed in, and as what?"
+///
+/// **A refusal here is answered `200 {authenticated: false}` and not `401`**,
+/// which is the one place in this server that reads a [`authorized`] `Err` and
+/// throws the response away. This route is the probe a client makes *before* it
+/// holds anything: `bootstrapServerAuth` calls it first and exchanges its boot
+/// credential only if the answer is `false`. A 401 would be the same
+/// information in a shape the client treats as a transport failure and retries.
+///
+/// Until this route looked at the request at all it answered `true` to
+/// everyone, and that is what stopped the window connecting — see
+/// [`crate::http::AuthSessionState`], which carries the whole reasoning.
+async fn auth_session(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
     let config = state.config().current();
-    Json(http::auth_session_state(&config).to_value()).into_response()
+    let state = match authorized(&state, query.as_deref(), &headers) {
+        Ok((presented, grant)) => {
+            http::authenticated_session(&config, grant.scopes, session_method(presented.shape))
+        }
+        Err(_) => http::unauthenticated_session(&config),
+    };
+    Json(state.to_value()).into_response()
+}
+
+/// Which of `ServerAuthSessionMethod`'s three a verified credential was.
+///
+/// `None` for the two shapes that are not one of the three: a `wsTicket` opens
+/// a socket rather than holding a session, and a DPoP token never reaches here
+/// because [`authorized`] refuses it. Guessing on either would put a string on
+/// the wire that the contract's closed union does not have, which costs the
+/// client the decode of the whole response rather than the one field.
+fn session_method(shape: auth::Credential) -> Option<&'static str> {
+    match shape {
+        auth::Credential::BearerToken => Some(pairing::BEARER_SESSION_METHOD),
+        auth::Credential::SessionCookie => Some(pairing::BROWSER_SESSION_METHOD),
+        auth::Credential::WebSocketTicket | auth::Credential::DpopToken => None,
+        auth::Credential::Absent => None,
+    }
 }
 
 /// `GET /api/orchestration/shell` — the project list, over HTTP.
@@ -813,7 +890,7 @@ async fn websocket_ticket(
     // `issue_websocket_ticket` finds nothing and this answers 401. Tickets do
     // not beget tickets.
     let token = match authorized(&state, query.as_deref(), &headers) {
-        Ok(presented) => presented.token,
+        Ok((presented, _grant)) => presented.token,
         Err(refused) => return refused,
     };
 
@@ -896,7 +973,13 @@ async fn pairing_credential(
             // The second use of one is somebody who should not have it.
             reusable: false,
         }) {
-        Ok(link) => Json(http::pairing_credential(&link)).into_response(),
+        Ok(link) => {
+            // Settings reads its list from `subscribeAuthAccess`, not from the
+            // response to this call, so a code that is minted and not announced
+            // is a code the user cannot see well enough to carry anywhere.
+            state.services.shell.auth_access_changed();
+            Json(http::pairing_credential(&link)).into_response()
+        }
         Err(error) => {
             eprintln!("laplus: cannot mint a pairing code: {error}");
             refuse(http::pairing_credential_unavailable())
@@ -961,7 +1044,14 @@ async fn revoke_pairing_link(
         // `false` for an id that names nothing, rather than a 404. The contract
         // gives this route no `EnvironmentResourceNotFoundError`, and the state
         // the caller wanted — that code cannot be spent — holds either way.
-        Ok(revoked) => Json(http::pairing_link_revoked(revoked)).into_response(),
+        Ok(revoked) => {
+            // Only when something actually went: republishing an unchanged list
+            // is work every open panel does for nothing.
+            if revoked {
+                state.services.shell.auth_access_changed();
+            }
+            Json(http::pairing_link_revoked(revoked)).into_response()
+        }
         Err(error) => {
             eprintln!("laplus: cannot revoke the pairing code: {error}");
             refuse(http::pairing_link_revoke_failed())
@@ -1002,11 +1092,20 @@ fn unauthorized(rejection: Rejection) -> Response {
 ///
 /// That makes this function's effect depend on what arrived, which is worth
 /// knowing before calling it twice on one request. Nothing does.
+///
+/// ## What it hands back
+///
+/// The credential that arrived **and the grant it named** — what that session
+/// is entitled to, straight out of the store. Most callers want only the gate
+/// and ignore the second half; `/api/auth/session` is the one that reports it,
+/// and it is reported rather than re-read because the read has already
+/// happened here. A second lookup would be a second answer that could differ
+/// from the one this function refused or admitted on.
 fn authorized<'a>(
     state: &ServerState,
     query: Option<&'a str>,
     headers: &'a HeaderMap,
-) -> Result<auth::Presented<'a>, Response> {
+) -> Result<(auth::Presented<'a>, pairing::Grant), Response> {
     let allowed = &state.config().current().remote_access;
     let presented = auth::authorize(presented(query, headers), allowed).map_err(|rejection| {
         // No `Access-Control-Allow-Origin` here, unlike the upgrade's own
@@ -1043,7 +1142,7 @@ fn authorized<'a>(
     };
 
     match verified {
-        Ok(Some(_grant)) => Ok(presented),
+        Ok(Some(grant)) => Ok((presented, grant)),
         Ok(None) => Err(unauthorized(auth::Rejection::invalid_credential(format!(
             "refusing a {:?} that names no live session",
             presented.shape
@@ -1131,7 +1230,7 @@ async fn upgrade(
     // spent anything, which is what lets a client retry with a fresh ticket
     // rather than having to re-pair.
     match authorized(&state, query.as_deref(), &headers) {
-        Ok(presented) => {
+        Ok((presented, _grant)) => {
             let credential = presented.shape;
             ws.on_upgrade(move |socket| connection(socket, state, credential))
         }
@@ -1404,6 +1503,42 @@ impl Drop for LiveConnection<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `0.0.0.0` is an address to bind and not an address to reach.
+    ///
+    /// The first time the network access switch was turned on, the window
+    /// opened at `http://0.0.0.0:4773/#token=…` and the webview answered
+    /// `ERR_ADDRESS_INVALID` — a wildcard means "every interface" to a listener
+    /// and nothing at all to a client. So the switch made the application
+    /// unopenable, on the machine that turned it on, with the credential it
+    /// needed sitting in a URL that could not be fetched.
+    ///
+    /// Only the address is replaced. The port is the listener's, because
+    /// `--port` and `LAPLUS_PORT` both move it and a loopback URL naming the
+    /// wrong one is the same failure wearing a different error.
+    #[test]
+    fn a_wildcard_bind_is_reported_to_this_machine_as_loopback() {
+        let wildcard = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 4773));
+        assert_eq!(
+            Server::reachable_from(wildcard),
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4773))
+        );
+
+        let overridden = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 4774));
+        assert_eq!(Server::reachable_from(overridden).port(), 4774);
+    }
+
+    /// And a real address is left alone, or a server told to bind one interface
+    /// would advertise a different one.
+    #[test]
+    fn an_address_that_is_not_a_wildcard_is_reported_as_it_is() {
+        for bound in [
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4773)),
+            SocketAddr::from((std::net::Ipv4Addr::new(192, 168, 10, 45), 4773)),
+        ] {
+            assert_eq!(Server::reachable_from(bound), bound);
+        }
+    }
 
     /// The real [`Connection`] with the socket taken off the end: frames go in
     /// as text and come back out of the queue.

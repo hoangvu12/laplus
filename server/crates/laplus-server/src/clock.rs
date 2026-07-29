@@ -28,6 +28,20 @@ pub fn now_iso() -> String {
     iso_from_epoch(since_epoch.as_secs(), since_epoch.subsec_millis())
 }
 
+/// Now, in milliseconds since the epoch.
+///
+/// For the contract's handful of bare-number `revision` fields, which are read
+/// as "newer than the last one" and never rendered. A wall clock rather than a
+/// counter because nothing here persists a counter across a restart, and a
+/// revision that restarted at zero would read as older than what a client
+/// already held.
+pub fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// The civil date and time `seconds` after the Unix epoch, as an ISO string.
 ///
 /// Split out from [`now_iso`] because a clock that cannot be given a time is a

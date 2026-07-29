@@ -231,6 +231,165 @@ channel; `docs/adr/0019` argues both.
 "Verify during implementation". A green suite is not evidence and this is the
 change most able to lock the developer out of their own window.
 
+> **It did lock the developer out, and the 810 tests did not notice.** Reported
+> 2026-07-29 as "the remote control feature isn't really usable", with a
+> screenshot of the window reconnecting for ever and a Settings page showing one
+> row where the panel should be. Findings 9, 10 and 11 are what it was. The
+> `window.desktopBridge` audit this paragraph defers is not an optional
+> follow-up — **the bridge is where the client sourced its boot credential**,
+> which is why nothing this ticket built ever reached the window.
+
+## The session route, the fragment, and the policy — 2026-07-29
+
+Three changes, one user-visible failure. Findings 9, 10 and 11 carry the
+reasoning; this is what moved.
+
+- `src/http.rs` — `AuthSessionState` gains `scopes` and `sessionMethod`, and
+  splits into `unauthenticated_session` / `authenticated_session`. The doc
+  comment on the struct is the short version of Finding 9.
+- `src/server.rs` — `auth_session` takes the query and headers and runs
+  `authorized`, answering `200 {authenticated:false}` rather than a 401 on a
+  refusal, because this route is the probe a client makes before it holds
+  anything. `authorized` returns `(Presented, Grant)`; `session_method` maps the
+  credential shape to the contract's closed union, `None` for the two shapes
+  that are not in it.
+- `src/config.rs` — `policy` reads `remote_access.is_empty()`.
+- `apps/web/src/environments/primary/auth.ts` — `getDesktopBootstrapCredential`
+  becomes `getBootstrapCredential` and falls back to the URL fragment when there
+  is no `window.desktopBridge`, skipping the routes that own the fragment
+  themselves.
+
+Tests: `the_session_route_reports_what_verified_and_not_a_hardcoded_yes` in
+`tests/http_pairing.rs` walks all three callers (nobody, the window, a phone
+paired for one scope); `a_verified_session_reports_its_scopes_and_how_it_was_established`
+and the extended `unset_optional_fields_are_absent_rather_than_null` pin the
+shape; two tests in `apps/web/src/authBootstrap.test.ts` pin the fragment
+fallback and the `/pair` exemption. 812 pass, `cargo test --no-fail-fast`
+exit 0, `tsgo --noEmit` clean.
+
+**Driven, at last, and it found a fourth defect the suite could not.** The
+reporter closed the released app; the debug shell was built and run in its
+place, and the window walked with `tools/ui-driver/window-click.ps1` and
+`window-shot.ps1`. In order:
+
+1. The window opened, the sidebar filled, and **the reconnect banner was gone** —
+   the socket had never opened before this. `.scratch/after-fix.png`.
+2. Settings → Connections drew the real "Network access" row instead of the
+   "Administrative access" placeholder, so the scopes were arriving.
+   `.scratch/after-fix-connections.png`.
+3. With a `remote-access.json` naming a host, "Authorized clients" and **Create
+   link** appeared — over `Method not implemented by this server:
+subscribeAuthAccess`. That is Finding 12, and nothing short of opening this
+   page would have shown it. `.scratch/connections-remote.png`.
+4. With the subscription implemented, the red line is gone
+   (`.scratch/connections-final.png`) and pressing Create link mints a code that
+   **appears in the list, live, with Copy code and a running expiry**.
+   `.scratch/minted.png`.
+
+The test `remote-access.json` was removed afterwards, so the machine is back to
+loopback-only and Create link is hidden again until a real tunnel host is named.
+
+### And then a second client actually redeemed one
+
+The chain end to end, driven, on 2026-07-29:
+
+1. **Create link** in Settings, then **Copy code** — read back out of the
+   Windows clipboard, which is the same path a person uses:
+   `KJDL3QR9P8TV`. Twelve characters, all of them in the reference alphabet.
+2. `node tools/ui-driver/probe-boot.mjs "http://127.0.0.1:4773/pair#token=KJDL3QR9P8TV"`
+   — **a different browser**, headless Chrome on a fresh profile with no cookie
+   and no boot fragment. It redeemed the code, opened
+   `ws://127.0.0.1:4773/ws`, and rendered the application: projects, threads,
+   `subscribeVcsStatus`, `server.getConfig` all answered. Not the pairing
+   screen.
+3. The same code a second time lands on **"Invalid pairing token. Check the
+   token and try again."** and no socket carries a frame. Single-use holds
+   against a real client, not only against `store.rs`'s race test.
+
+So a client that arrives holding nothing but a code becomes a client with a
+session, and the code dies on use. **The only untested link left is the tunnel
+itself** — every origin in the above is loopback, so what `remote_access` admits
+has still only been exercised by the suite. Acceptance criterion 1 stays
+unchecked for that reason and no other.
+
+Incidental, and pre-existing: the probe log shows `subscribeThread` retried
+about twenty-five times for a thread that does not exist, which is **ticket 35**
+seen from the outside, and refusals for `subscribeServerLifecycle`,
+`assets.createUrl` and `subscribeDiscoveredLocalServers`, which are the parity
+ledger's. None of them are new here.
+
+**Test residue removed afterwards:** the `remote-access.json`, and the 30-day
+session the headless browser opened — revoked directly in `state.sqlite`, since
+`auth.clients`/`auth.revokeClient` are out of this ticket's scope and the
+"Revoke others" button therefore cannot. That is worth noticing as a gap: this
+server can now hand out sessions it has no way to withdraw from its own UI.
+
+## Then the file was replaced by the switch T3 Code has — 2026-07-29
+
+The reporter's next words about `remote-access.json` were "a bit too manual", and
+the ask was to do what upstream does. **This ticket's "making the server bind
+off-loopback" exclusion is therefore superseded**, by `docs/adr/0022`, which is
+also where the security argument and its costs are written down rather than
+here. The short version: ADR-0019 made the credential check real, so the bind is
+no longer the only lock, and the exclusion's own reasoning — "keeping the bind is
+a second lock" — was what changed.
+
+**Both controls, because upstream has both.** Binding wide answers the LAN;
+a `trycloudflare.com` hostname still arrives as an origin this machine has never
+heard of, so the named list stays and got a UI instead of being hand-edited.
+
+- `remote_access.rs` — `Exposure`, `bind_address`, `save`, and a loader that
+  reads `mode` **before** the hosts and keeps it whatever happens to them. The
+  two controls share one file, and a mistyped hostname silently pulling the
+  machine back to loopback would be one control undoing the other.
+- `endpoints.rs` (new) — the LAN address, found by asking the routing table
+  which source address it would use (a UDP `connect` to TEST-NET-3 sends
+  nothing), and the `AdvertisedEndpoint` list. The `desktop-loopback:` and
+  `desktop-lan:` id prefixes are load-bearing: `endpointDefaultPreferenceKey`
+  reads them, and an invented one renders fine and then remembers a "Set as
+  default" key nothing ever matches again.
+- `config_store.rs` — `readdress`, the third of the same shape as `reconfigure`
+  and `rebind`, so two edits to one file cannot interleave.
+- `laplus-shell` — three commands, `capabilities/network-access.toml`, and the
+  command names declared in `build.rs` so `tauri-build` generates their
+  permissions. Setting the mode restarts the app; setting the hosts does not,
+  because `auth` reads the list per request.
+- `apps/web` — `state/shellNetworkAccess.ts` and a `canManageNetworkAccess`
+  path in `ConnectionsSettings`. **No `window.desktopBridge` was faked**, for
+  the reason `desktopShell.ts` already gives and one more: the boot-credential
+  lookup asks the bridge first, so a partial one would stop the fragment
+  fallback and put the window straight back to reconnecting for ever.
+
+### Two defects found by driving, neither visible to a suite
+
+1. **The window opened at `http://0.0.0.0:4773/`** the first time the switch was
+   turned on — `ERR_ADDRESS_INVALID`. `http_url` was built from `local_addr`,
+   and a wildcard is an address to bind rather than one to reach. So the switch
+   made the application unopenable on the machine that turned it on, with the
+   credential it needed sitting in a URL that could not be fetched.
+   `Server::reachable_from` and two tests.
+2. **Windows Firewall prompts on the first wide bind**, and declining leaves a
+   switch that reads as on and a machine nothing can reach. The UI cannot
+   currently see or explain that state. Not fixed; recorded in ADR-0022's costs
+   and worth its own ticket.
+
+### Driven
+
+`.scratch/net-on3.png` and `net-endpoints.png`: the toggle on, **This machine**
+`http://127.0.0.1:4773` marked Default and **Local network**
+`http://192.168.10.45:4773` beside it — the same address the reporter's own T3
+Code screenshot showed, discovered rather than configured. Tunnel hostnames,
+Authorized clients and Create link all in the layout upstream draws. Turned on
+and off again through the UI, with `netstat` confirming `0.0.0.0:4773` and then
+`127.0.0.1:4773`, and the file confirming each mode.
+
+**Left off.** The switch was returned to `local-only` afterwards; enabling it is
+the user's decision to make deliberately, and the firewall prompt is part of it.
+
+**Still unproven: no second device has connected over the LAN.** The origin rule
+that admits this machine's own address has unit tests and no phone. That and the
+tunnel are now the same single gap — acceptance criterion 1.
+
 The open decision, now made: **the origin allowlist is a `remote-access.json`
 in the preferences directory.** `config.rs:350-358` argues explicitly against an
 environment variable for anything the suite touches and establishes
@@ -328,6 +487,120 @@ this server's invention would fail the client's decode of the **whole**
 hit the same wall and answered it the same way: complain to the log, keep the
 safe default. The safe default is an empty allowlist, so a typo means a phone
 that cannot connect rather than a machine that admits everybody.
+
+### 9. Scope item 7 half-landed, and the half left behind kept the window off its own socket
+
+**This is the one that mattered, and it was reported as a user seeing an app
+that reconnects for ever.** Found 2026-07-29.
+
+Scope item 7 is two sentences: `/api/auth/session` stops hardcoding
+`authenticated: true`, and `auth.bootstrapMethods` stops being empty. Only the
+second landed. `auth_session` did not read the request at all — no query, no
+headers, no `authorized` — and answered `{authenticated: true}` to anyone.
+
+That is not a cosmetic wrong field, because of what reads it:
+
+```ts
+// apps/web/src/environments/primary/auth.ts
+const bootstrapCredential = getBootstrapCredential();
+const currentSession = await fetchSessionState();
+if (currentSession.authenticated) {
+  return { status: "authenticated" }; // ← always taken
+}
+// …exchangeBootstrapCredential — never reached
+```
+
+So the window was told it was signed in, never opened a session, presented
+`Credential::Absent` at the upgrade, and was refused — by the very rule this
+ticket added. **The window has not connected since the third piece landed.** The
+acceptance criterion "the window now carries a credential instead of being
+exempt" was true of the server and false of the application: the credential was
+minted, put in the fragment, and never picked up.
+
+The second reader is Settings. `canManageLocalBackend` is
+`scopes?.includes("access:write")` (`ConnectionsSettings.tsx:1558`), and a
+response with no `scopes` collapses the whole "This environment" section to a
+single row saying the caller lacks administrative access — with the window
+holding administrative scopes the whole time. So this ticket's own first
+acceptance criterion was unreachable: **the button that mints a pairing code
+lives in a section that could not render.**
+
+Both symptoms, one missing credential check. Fixed by having the route answer
+what actually verified — `http::authenticated_session` /
+`http::unauthenticated_session`, and `authorized` handing back the `Grant` it
+already read rather than discarding it.
+
+### 10. The client half was _not_ already written, and this is the licence being spent
+
+This ticket says "the client half of all four is already written and waiting"
+and "Nothing in `apps/web` or `packages/` should need to change for the happy
+path. If it does, that is a finding worth writing down." Writing it down:
+
+`bootstrapServerAuth` sources its credential from
+`getDesktopBootstrapCredential()`, which reads
+`window.desktopBridge.getLocalEnvironmentBootstraps()` — **Electron's preload
+channel, which laplus does not have.** It returns `null` here and always will.
+Nothing outside the `/pair` route ever read the `#token=` fragment that
+`Server::window_url` puts the boot grant in.
+
+Finding 6 argued the fragment is laplus's answer to the preload channel, and
+that argument is right; what was missing is that the client end of it was never
+built. `getBootstrapCredential` now falls back to `peekPairingTokenFromUrl()`
+when there is no bridge.
+
+Two details that are decisions rather than mechanics:
+
+- **Peeked, not taken.** This ticket's own decision list says the boot grant is
+  re-usable so a reload can re-read it. Stripping the fragment on first use
+  would spend the address bar's only copy on a session cookie, and make F5 the
+  thing that locks the developer out.
+- **`/pair` and `/connect` are skipped.** The root route's `beforeLoad` gate runs
+  on every route, `PairingRouteSurface` reads the same fragment and auto-submits
+  it, and a phone's code is single-use. Whoever owns the screen owns the
+  fragment.
+
+### 11. `policy` was pinned to `loopback-browser`, which hides Create link
+
+Upstream settles the policy from whether the _bind host_ is remote-reachable
+(`EnvironmentAuthPolicy.ts:18`). laplus always binds loopback — a tunnel dials
+`127.0.0.1` from this machine — so that question read off the bind host answers
+`loopback-browser` on a machine a phone is already talking to.
+
+`ConnectionsSettings.tsx:2417` hides "Authorized clients", and with it the only
+"Create link" button, unless the policy is `remote-reachable`. So a user who had
+set up the tunnel this ticket is _for_ still had no way to mint the code to use
+it. It now reads `remote_access.is_empty()` — the same question, asked where
+laplus keeps the answer.
+
+### 12. Settings reads the pairing links off a subscription, not off the routes this ticket built
+
+**Found by driving the window, and only by driving it.** With Findings 9–11
+fixed, "Create link" appeared — over a red line reading `Method not implemented
+by this server: subscribeAuthAccess`, and an empty list.
+
+Scope item 5 names five routes and calls the contract "the wire, not a
+suggestion". It is the wrong wire for this panel. `ConnectionsSettings.tsx:1559`
+opens `authEnvironment.accessChanges` — the `subscribeAuthAccess` socket
+subscription — and folds its snapshot into `desktopPairingLinks`. It never calls
+`GET /api/auth/pairing-links`, and it does not read the response to
+`POST /api/auth/pairing-token` either. So both routes were correct, tested, and
+invisible: a code could be minted and never appear on the screen that minted it,
+which is the same as not being able to mint one.
+
+Implemented as **snapshots only**. `AuthAccessStreamEvent` is a union of five,
+four of them deltas, and the panel keeps exactly one —
+`if (event?.type !== "snapshot") return []` (`:1602`). Writing the four delta
+shapes would be writing events nothing decodes.
+
+`clientSessions` is always `[]`, which is this ticket's own decision rather than
+a shortcut: it puts `auth.clients` out of scope and says to leave the UI
+refusing. The consequence is that "Authorized clients" lists codes and not
+devices, and the "This device" row upstream draws is absent.
+
+`Shell::subscribe_auth_access` and `Shell::auth_access_changed` in
+`orchestration.rs`; `SUBSCRIBE_AUTH_ACCESS` in `rpc.rs`; the two mutating routes
+publish. `refusals.rs` needed no edit — its table lists all 61 methods on
+purpose, and an implemented one stops reaching it.
 
 ### 8. `/api/auth/browser-session` is missing from the Scope list
 

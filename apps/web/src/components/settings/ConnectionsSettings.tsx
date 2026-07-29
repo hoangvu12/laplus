@@ -116,6 +116,13 @@ import {
   desktopNetworkAccessStateAtom,
   refreshDesktopNetworkAccessState,
 } from "~/state/desktopNetworkAccess";
+import {
+  refreshShellNetworkAccessState,
+  setShellNetworkExposure,
+  setShellTunnelHosts,
+  shellNetworkAccessStateAtom,
+} from "~/state/shellNetworkAccess";
+import { isDesktopShell } from "~/desktopShell";
 import { desktopSshHostsStateAtom } from "~/state/desktopSshHosts";
 import {
   type EnvironmentPresentation,
@@ -1564,9 +1571,43 @@ export function ConnectionsSettings() {
         })
       : null,
   );
+  // Two ways to answer one question. Upstream's bridge when there is one;
+  // otherwise the Tauri shell, which answers the same two questions over its
+  // own commands — `~/state/shellNetworkAccess` is why that is a separate seam
+  // rather than a `window.desktopBridge` laplus pretends to have.
+  //
+  // `canManageNetworkAccess` and not `desktopBridge` from here down: every
+  // control in this section is about where *this* server listens, and in laplus
+  // that is the shell's to answer.
+  const canManageNetworkAccess = Boolean(desktopBridge) || isDesktopShell;
   const desktopNetworkAccess = useEnvironmentQuery(
-    canManageLocalBackend && desktopBridge ? desktopNetworkAccessStateAtom : null,
+    canManageLocalBackend && canManageNetworkAccess
+      ? desktopBridge
+        ? desktopNetworkAccessStateAtom
+        : shellNetworkAccessStateAtom
+      : null,
   );
+  // Carried on the exposure state the shell answers with, because it is read
+  // from the same file in the same breath — `DesktopServerExposureState` is
+  // upstream's shape and has no field for it, upstream having no such control.
+  const tunnelHosts = useMemo(() => {
+    const hosts = (desktopNetworkAccess.data?.serverExposureState as { allowedOrigins?: unknown })
+      ?.allowedOrigins;
+    return Array.isArray(hosts)
+      ? hosts.filter((host): host is string => typeof host === "string")
+      : [];
+  }, [desktopNetworkAccess.data]);
+  const [tunnelHostInput, setTunnelHostInput] = useState("");
+  const [isUpdatingTunnelHosts, setIsUpdatingTunnelHosts] = useState(false);
+  const [tunnelHostsError, setTunnelHostsError] = useState<string | null>(null);
+
+  const refreshNetworkAccess = useCallback(() => {
+    if (desktopBridge) {
+      refreshDesktopNetworkAccessState();
+      return;
+    }
+    refreshShellNetworkAccessState();
+  }, [desktopBridge]);
   const desktopSshHosts = useEnvironmentQuery(
     desktopBridge && addBackendDialogOpen && savedBackendMode === "ssh"
       ? desktopSshHostsStateAtom
@@ -1615,7 +1656,7 @@ export function ConnectionsSettings() {
       ),
     );
   }, [authAccessChanges.data]);
-  const isLocalBackendNetworkAccessible = desktopBridge
+  const isLocalBackendNetworkAccessible = canManageNetworkAccess
     ? desktopServerExposureState?.mode === "network-accessible"
     : currentAuthPolicy === "remote-reachable";
   const trimmedTailscaleServePortInput = tailscaleServePortInput.trim();
@@ -1643,12 +1684,22 @@ export function ConnectionsSettings() {
 
   const handleDesktopServerExposureChange = useCallback(
     async (checked: boolean) => {
-      if (!desktopBridge) return;
+      if (!canManageNetworkAccess) return;
       setIsUpdatingDesktopServerExposure(true);
       setDesktopServerExposureMutationError(null);
+      const mode = checked ? "network-accessible" : "local-only";
       try {
-        await desktopBridge.setServerExposureMode(checked ? "network-accessible" : "local-only");
-        refreshDesktopNetworkAccessState();
+        // In the Tauri shell this does not come back when the mode actually
+        // changes — the listener cannot be re-bound under its open sockets, so
+        // the shell writes the file and relaunches, which is what the dialog
+        // above already says will happen. The lines after it run only when the
+        // mode asked for was the one already in force.
+        if (desktopBridge) {
+          await desktopBridge.setServerExposureMode(mode);
+        } else {
+          await setShellNetworkExposure(mode);
+        }
+        refreshNetworkAccess();
         setIsDesktopServerExposureDialogOpen(false);
         setIsUpdatingDesktopServerExposure(false);
       } catch (error) {
@@ -1666,7 +1717,33 @@ export function ConnectionsSettings() {
         setIsUpdatingDesktopServerExposure(false);
       }
     },
-    [desktopBridge],
+    [canManageNetworkAccess, desktopBridge, refreshNetworkAccess],
+  );
+
+  const handleTunnelHosts = useCallback(
+    async (hosts: ReadonlyArray<string>) => {
+      setIsUpdatingTunnelHosts(true);
+      setTunnelHostsError(null);
+      try {
+        await setShellTunnelHosts(hosts);
+        setTunnelHostInput("");
+        refreshNetworkAccess();
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Failed to save the tunnel hostnames.";
+        setTunnelHostsError(message);
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not save the tunnel hostnames",
+            description: message,
+          }),
+        );
+      } finally {
+        setIsUpdatingTunnelHosts(false);
+      }
+    },
+    [refreshNetworkAccess],
   );
 
   const handleConfirmDesktopServerExposureChange = useCallback(() => {
@@ -2345,6 +2422,67 @@ export function ConnectionsSettings() {
       control={renderNetworkAccessToggle()}
     />
   );
+  // The other half of remote access, and the half binding wide does not cover.
+  // A `trycloudflare.com` or tailnet hostname resolves somewhere else entirely,
+  // so a page served from one arrives with an `Origin` this machine has never
+  // heard of and is refused however the switch is set. Upstream keeps both
+  // controls for the same reason.
+  const renderTunnelHostsRow = () => (
+    <SettingsRow
+      title="Tunnel hostnames"
+      description={
+        tunnelHosts.length > 0
+          ? "Pages served from these hosts may reach this environment. Everything else is refused."
+          : "Add the hostname of a cloudflared or Tailscale tunnel to let a device reach this environment through it."
+      }
+      status={
+        tunnelHostsError ? <span className="block text-destructive">{tunnelHostsError}</span> : null
+      }
+    >
+      <div className="space-y-2">
+        {tunnelHosts.map((host) => (
+          <div key={host} className={ITEM_ROW_INNER_CLASSNAME}>
+            <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
+              {host}
+            </code>
+            <Button
+              size="xs"
+              variant="destructive-outline"
+              disabled={isUpdatingTunnelHosts}
+              onClick={() => void handleTunnelHosts(tunnelHosts.filter((entry) => entry !== host))}
+            >
+              Remove
+            </Button>
+          </div>
+        ))}
+        <form
+          className="flex items-center gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const host = tunnelHostInput.trim();
+            if (!host) return;
+            void handleTunnelHosts([...tunnelHosts, host]);
+          }}
+        >
+          <Input
+            value={tunnelHostInput}
+            onChange={(event) => setTunnelHostInput(event.target.value)}
+            placeholder="laplus.trycloudflare.com"
+            disabled={isUpdatingTunnelHosts}
+            spellCheck={false}
+          />
+          <Button
+            type="submit"
+            size="xs"
+            variant="outline"
+            disabled={isUpdatingTunnelHosts || tunnelHostInput.trim().length === 0}
+          >
+            {isUpdatingTunnelHosts ? "Saving…" : "Add"}
+          </Button>
+        </form>
+      </div>
+    </SettingsRow>
+  );
   const renderDisabledNetworkAccessRow = () => (
     <SettingsRow
       title="Network access"
@@ -2403,11 +2541,16 @@ export function ConnectionsSettings() {
                 }
               />
             ) : null}
-            {desktopBridge ? (
+            {canManageNetworkAccess ? (
               <>
                 {renderNetworkAccessRow()}
                 {renderEndpointRows("endpoint-rail")}
-                {renderTailscaleRow()}
+                {/* Tailscale Serve is upstream's, driven through the bridge.
+                    laplus starts no `tailscale serve`, so the row is offered
+                    only where something can act on it — a tailnet name still
+                    works here, through the tunnel list below. */}
+                {desktopBridge ? renderTailscaleRow() : null}
+                {renderTunnelHostsRow()}
               </>
             ) : (
               <>{renderDisabledNetworkAccessRow()}</>

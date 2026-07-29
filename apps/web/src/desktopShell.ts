@@ -67,6 +67,27 @@ export const isDesktopShell =
   typeof tauri()?.invoke === "function";
 
 /**
+ * Ask the shell something only it can answer.
+ *
+ * The sibling of {@link invokeWindowCommand}, for commands `laplus-shell`
+ * declares itself rather than ones a Tauri plugin provides — so no
+ * `plugin:<name>|` prefix, and the grant is
+ * `capabilities/network-access.toml` rather than the titlebar's.
+ *
+ * Unlike the window commands, these have answers the caller has to act on, so a
+ * refusal is rethrown rather than logged and swallowed: a network toggle that
+ * silently failed would leave the switch showing a state the server is not in,
+ * which is worse than an error the panel can render.
+ */
+export async function invokeShellCommand<T>(command: string, payload?: unknown): Promise<T> {
+  const internals = tauri();
+  if (!internals) {
+    throw new Error(`laplus: ${command} needs the desktop shell, and this page has no IPC.`);
+  }
+  return (await internals.invoke(command, payload)) as T;
+}
+
+/**
  * Ask the shell to do something to its window.
  *
  * Rejections are reported rather than swallowed. The way this fails in practice

@@ -569,6 +569,141 @@ async fn the_window_reaches_these_routes_with_the_credential_it_booted_with() {
     server.stop().await;
 }
 
+/// `/api/auth/session` answers what actually verified, which is what tells the
+/// window it still has to pair.
+///
+/// This route used to answer `authenticated: true` to everyone, and that single
+/// field is what kept the window off its own socket for the whole of ticket 73:
+/// `bootstrapServerAuth` reads it *first* and exchanges its boot credential
+/// only if the answer is `false`, so a client that was told it was signed in
+/// never opened a session, presented nothing at the upgrade, and reconnected
+/// for ever. The same field is what Settings gates the local-environment panel
+/// on — `scopes` is absent unless something verified — so the button that mints
+/// a pairing code was in a section that could not render either.
+///
+/// Both halves are asserted here because they are one bug: a probe that lies
+/// about being authenticated and a probe that cannot report a scope are the
+/// same missing credential check.
+#[tokio::test]
+async fn the_session_route_reports_what_verified_and_not_a_hardcoded_yes() {
+    let server = TestServer::start().await;
+
+    // Nobody. The shape a client sees before it has paired — and `auth` is
+    // still there, because `bootstrapMethods` is how it learns what to do next.
+    let anonymous = server
+        .get_as("/api/auth/session", &ClientIdentity::anonymous())
+        .await;
+    assert_eq!(anonymous.status, 200, "a probe is not a refusal: {}", anonymous.text);
+    assert_eq!(anonymous.body["authenticated"], json!(false));
+    assert!(
+        anonymous.body.get("scopes").is_none(),
+        "nothing verified, so there are no scopes to report: {}",
+        anonymous.text
+    );
+    assert_eq!(
+        anonymous.body["auth"]["bootstrapMethods"],
+        json!(["one-time-token"]),
+        "an unpaired client reads its way in off this response: {}",
+        anonymous.text
+    );
+
+    // The window, holding the session it booted with. `access:write` is the
+    // one scope `canManageLocalBackend` looks for.
+    let window = server.browser();
+    let session = server.get_as("/api/auth/session", &window).await;
+    assert_eq!(session.status, 200, "{}", session.text);
+    assert_eq!(session.body["authenticated"], json!(true));
+    assert_eq!(session.body["sessionMethod"], json!("browser-session-cookie"));
+    let scopes = session.body["scopes"].as_array().expect("scopes");
+    assert!(
+        scopes.contains(&json!("access:write")),
+        "the window boots with administrative scopes and has to be told so: {}",
+        session.text
+    );
+
+    // A phone that paired for one scope is told that, and not the window's.
+    let minted = server
+        .post_json_as(
+            "/api/auth/pairing-token",
+            &window,
+            &json!({ "scopes": ["orchestration:read"] }),
+        )
+        .await;
+    let bearer = server
+        .post_form(
+            "/oauth/token",
+            &exchange(text(&minted.body["credential"])),
+        )
+        .await;
+    let phone = ClientIdentity::anonymous().with_bearer(text(&bearer.body["access_token"]));
+    let phone_session = server.get_as("/api/auth/session", &phone).await;
+    assert_eq!(phone_session.body["authenticated"], json!(true));
+    assert_eq!(phone_session.body["sessionMethod"], json!("bearer-access-token"));
+    assert_eq!(phone_session.body["scopes"], json!(["orchestration:read"]));
+
+    server.stop().await;
+}
+
+/// A minted code reaches the screen that minted it.
+///
+/// Settings does not read the response to `POST /api/auth/pairing-token`, and
+/// it does not call `GET /api/auth/pairing-links` either — both of which this
+/// ticket built. It opens `subscribeAuthAccess` and folds the snapshot
+/// (`ConnectionsSettings.tsx:1559`). Until that method existed the panel drew
+/// "Method not implemented by this server: subscribeAuthAccess" over an empty
+/// list, so a code could be minted and never seen, which is the same as not
+/// being able to mint one.
+///
+/// Driven over the socket rather than asserted on the store, because the gap
+/// this closes was entirely in which transport the client chose.
+#[tokio::test]
+async fn a_minted_code_appears_on_the_access_subscription_and_leaves_when_revoked() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let subscription = client.subscribe("subscribeAuthAccess", json!({})).await;
+    let opening = client.next_event(&subscription).await;
+    assert_eq!(opening["version"], json!(1));
+    assert_eq!(opening["type"], json!("snapshot"));
+    assert_eq!(
+        opening["payload"]["pairingLinks"],
+        json!([]),
+        "the boot grant is filtered out of this list the way it is out of the \
+         HTTP one, so a fresh server opens empty: {opening}"
+    );
+
+    let minted = server
+        .post_json("/api/auth/pairing-token", &json!({ "label": "Phone" }))
+        .await;
+    assert_eq!(minted.status, 200, "{}", minted.text);
+
+    let announced = client.next_event(&subscription).await;
+    let links = announced["payload"]["pairingLinks"]
+        .as_array()
+        .expect("an array");
+    assert_eq!(links.len(), 1, "{announced}");
+    assert_eq!(links[0]["label"], json!("Phone"));
+    assert_eq!(
+        links[0]["credential"],
+        minted.body["credential"],
+        "the code on the screen has to be the code that was minted: {announced}"
+    );
+
+    let revoked = server
+        .post_json(
+            "/api/auth/pairing-links/revoke",
+            &json!({ "id": text(&minted.body["id"]) }),
+        )
+        .await;
+    assert_eq!(revoked.body["revoked"], json!(true), "{}", revoked.text);
+
+    let after = client.next_event(&subscription).await;
+    assert_eq!(after["payload"]["pairingLinks"], json!([]), "{after}");
+
+    client.close().await;
+    server.stop().await;
+}
+
 /// The window survives a reload, which is the whole reason its boot grant is
 /// re-usable where a phone's code is not.
 ///
