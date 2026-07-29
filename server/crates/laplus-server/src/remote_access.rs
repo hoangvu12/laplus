@@ -10,7 +10,7 @@
 //! An `allowedOrigins` list, and an origin check in [`crate::auth`] that refused
 //! anything not on it. Upstream has no such list: its only origin handling is
 //! CORS behind `devOrigin`, for development
-//! (`reference/t3code-server/src/http.ts:57-67`). The list is gone and this
+//! (`pingdotgg/t3code:apps/server/src/http.ts:57-67`). The list is gone and this
 //! follows upstream, so what a request is allowed to do is settled by its
 //! credential and nothing else.
 //!

@@ -19,22 +19,21 @@ the live code does.
 laplus/
 ├── apps/web        the UI this shell embeds
 ├── packages/       @t3tools/{contracts,client-runtime,shared} — the contract
-├── reference/      upstream's TypeScript server, as a specification
 ├── server/         ← you are here: the Rust server, the shell, the release
-└── .scratch/       the tickets, for both halves
+└── .scratch/       specs and audits, for both halves
 ```
 
-**The reference server is `reference/t3code-server/`,** and it is an ordinary
-directory you can open — not a sparse-checkout, not something to recover from
-the object store. This repository has no history before its first commit and no
-upstream remote, so the older instructions to run
-`git show HEAD:apps/server/src/ws.ts` or `git sparse-checkout disable` no longer
-describe anything; tickets written before the move still say so, and they are
-wrong about the mechanism and right about why it matters. The reference
-implementation is often the only specification a divergence can be argued
-against, which is why it was carried across rather than left behind.
-`reference/README.md` has the rules — read it, do not edit it, do not import
-from it.
+**There is no reference server in the tree.** `reference/t3code-server/` held
+upstream's TypeScript implementation as a specification; it was deleted, along
+with the ticket set that was written against it. This repository has no history
+before its first commit and no upstream remote, so neither
+`git show HEAD:apps/server/src/ws.ts` nor a sparse-checkout will bring it back.
+
+When a divergence needs arguing against the original, read it at
+`github.com/pingdotgg/t3code` under `apps/server/` — the doc comments in
+`crates/laplus-server/src/` cite it in that form. It is MIT, it has moved on
+since the fork, and it is evidence of an implementation rather than a
+dependency.
 
 The shell's build script reads `../../../apps/web/dist` and says what to run if
 it is not there: `pnpm install && pnpm --filter @t3tools/web build`, from the

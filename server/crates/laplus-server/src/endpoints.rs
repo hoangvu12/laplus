@@ -2,7 +2,7 @@
 //!
 //! Upstream computes this in its Electron main process and hands it to the
 //! renderer over `desktopBridge.getAdvertisedEndpoints()`. That process is not
-//! in `reference/` — only the server is — so what is copied here is the
+//! something this repository ever carried a copy of — so what is copied here is the
 //! **contract**, `AdvertisedEndpoint` in `packages/contracts/src/remoteAccess.ts`,
 //! which is exact about every field. The rendering is
 //! `ConnectionsSettings.tsx`, and it is the reason two details below are not

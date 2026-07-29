@@ -16,7 +16,7 @@
 //! hour after it was issued it stops working ([`TTL_MS`]).
 //!
 //! This is the reference server's design, kept deliberately —
-//! `reference/t3code-server/src/assets/AssetAccess.ts` signs the same claims
+//! `pingdotgg/t3code:apps/server/src/assets/AssetAccess.ts` signs the same claims
 //! with the same construction. What differs is the encoding: upstream writes
 //! base64url and this writes hex, because the token is opaque to every reader
 //! except this file and hex needs no dependency. Nothing in the client parses

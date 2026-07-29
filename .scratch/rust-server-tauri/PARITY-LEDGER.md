@@ -26,11 +26,17 @@ implements **26**.
 
 ---
 
-## This ledger is now tracked. Read the tickets, not this file, to pick work
+## The tickets this ledger indexed have been deleted
 
-Triaged 2026-07-28 into **tickets 39–70** under `issues/`. The findings below are
-the evidence and the reasoning; the tickets are the work, and they carry the
-acceptance criteria. Where the two disagree, the ticket is newer.
+Triaged 2026-07-28 into **tickets 39–70** under `issues/`, and that whole ticket
+set — all 76 files — was deleted on 2026-07-29 along with `reference/`. Every
+`issues/NN-…` reference below is dangling; recover them from git history
+(`git log --diff-filter=D -- .scratch/rust-server-tauri/issues/`) if the work is
+picked up again.
+
+What survives here is the evidence and the reasoning, which is the part that was
+expensive to produce. The acceptance criteria lived in the tickets and are gone
+with them.
 
 | Finding       | Ticket                                                                    | State            |
 | ------------- | ------------------------------------------------------------------------- | ---------------- |

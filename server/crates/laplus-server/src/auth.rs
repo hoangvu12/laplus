@@ -203,7 +203,7 @@ pub struct Presented<'a> {
 /// There used to be one: a page could reach this server if it came from this
 /// machine or from a host named in `remote-access.json`. Upstream has no such
 /// rule — `apps/server`'s only origin handling is CORS, behind `devOrigin`, for
-/// development (`reference/t3code-server/src/http.ts:57-67`) — and this now
+/// development (`pingdotgg/t3code:apps/server/src/http.ts:57-67`) — and this now
 /// follows it.
 ///
 /// What that gives up is worth stating plainly rather than leaving implied. The

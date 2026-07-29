@@ -7,7 +7,7 @@
 //!
 //! ## The order is upstream's, and the order is the feature
 //!
-//! `reference/t3code-server/src/project/ProjectFaviconResolver.ts` looks in
+//! `pingdotgg/t3code:apps/server/src/project/ProjectFaviconResolver.ts` looks in
 //! three places, in this order, and stops at the first hit:
 //!
 //! 1. **`t3.json`'s `iconPath`.** A project that says what its icon is has

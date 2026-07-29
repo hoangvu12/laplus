@@ -18,10 +18,9 @@ scripted RPC client     ─┘        (tools/wire-capture/proxy.mjs)
 
 1. `pnpm install` and `pnpm build:web` at the repository root.
 2. Start the reference server against a throwaway data directory so nothing
-   touches a real installation. It lives at `reference/t3code-server/` — read
-   `reference/README.md` first; running it needs dependencies this workspace
-   deliberately does not install, so this step means restoring the upstream
-   checkout it came from rather than running it in place:
+   touches a real installation. This repository no longer carries a copy, so the
+   step means checking out `github.com/pingdotgg/t3code` beside this one and
+   installing its dependencies — its server is `apps/server/`:
    `T3CODE_HOME=$TEMP/laplus-wire-home node apps/server/src/bin.ts --port 3773 --host 127.0.0.1 --no-browser`
    It logs `Listening on http://127.0.0.1:3773` and a one-time pairing URL.
 3. Start the recording proxy:

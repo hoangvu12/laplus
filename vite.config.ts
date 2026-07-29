@@ -14,9 +14,6 @@ export default defineConfig({
       "**/node_modules/**",
       "**/dist/**",
       "**/target/**",
-      // Upstream's server, kept as a specification rather than as code. See
-      // reference/README.md.
-      "reference/**",
       "**/.{idea,git,cache,output,temp}/**",
     ],
     hookTimeout: 60_000,
@@ -36,7 +33,6 @@ export default defineConfig({
       "dist",
       "node_modules",
       "pnpm-lock.yaml",
-      "reference/**",
       "server/target/**",
       "*.tsbuildinfo",
       "**/routeTree.gen.ts",
@@ -51,7 +47,6 @@ export default defineConfig({
       "dist",
       "node_modules",
       "pnpm-lock.yaml",
-      "reference/**",
       "server/target/**",
       // Standalone Node scripts beside the Rust half — the recording proxy and
       // the headless browser driver. The rules below describe the Effect

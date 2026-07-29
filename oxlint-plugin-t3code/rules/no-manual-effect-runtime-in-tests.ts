@@ -22,8 +22,8 @@ const EFFECT_RUNTIME_METHODS = new Set([
 // Existing manual runners are tracked as debt. The rule permits no net-new
 // occurrences in these files, while unlisted test files must have zero.
 // The twenty-two `apps/server` and `apps/mobile` entries this list used to
-// carry are gone with those packages: the TypeScript server is `reference/`
-// now, which the linter does not read, and there is no mobile app.
+// carry are gone with those packages: the TypeScript server is not in this
+// repository at all, and there is no mobile app.
 const LEGACY_BASELINE = new Map<string, number>([
   ["apps/web/src/environments/runtime/service.addSavedEnvironment.test.ts", 1],
   ["oxlint-plugin-t3code/rules/no-manual-effect-runtime-in-tests.test.ts", 7],

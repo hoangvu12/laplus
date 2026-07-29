@@ -229,7 +229,7 @@ impl ContextUsage {
     /// different question. The reference server drops them here too.
     ///
     /// Mirrors `normalizeClaudeContextUsageApiSnapshot` in
-    /// `reference/t3code-server/src/provider/Layers/ClaudeAdapter.ts`.
+    /// `pingdotgg/t3code:apps/server/src/provider/Layers/ClaudeAdapter.ts`.
     pub fn reading(&self) -> Option<TokenUsage> {
         let active_tokens = self.total_tokens.filter(|total| *total > 0)?;
         Some(TokenUsage {
@@ -897,7 +897,7 @@ impl ResultEvent {
     /// the previous turn had filled in.
     ///
     /// Mirrors `normalizeClaudeActiveTokenUsage` in the reference server
-    /// (`reference/t3code-server/src/provider/Layers/ClaudeAdapter.ts`).
+    /// (`pingdotgg/t3code:apps/server/src/provider/Layers/ClaudeAdapter.ts`).
     ///
     /// `known_window` is what the session has been told before now, used when
     /// this line did not say — see [`SessionState::context_window`].

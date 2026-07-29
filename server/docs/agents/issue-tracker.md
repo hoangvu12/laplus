@@ -4,7 +4,7 @@ Issues and specs (you may know a spec as a PRD) for this repo live as markdown f
 
 `.scratch/` is deliberately **not** gitignored: tracker files are committed and version alongside the code. That is the point of them, and it is why they are markdown rather than GitHub issues — a ticket and the commit that closes it move together.
 
-This repository does have remotes (`origin`, and `upstream` with push disabled), so `gh` is available. It is still not how tickets are tracked here. Do not open GitHub issues for this work.
+This repository has one remote, `origin`, so `gh` is available. It is still not how tickets are tracked here. Do not open GitHub issues for this work.
 
 ## Conventions
 
