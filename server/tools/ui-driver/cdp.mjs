@@ -127,6 +127,67 @@ export function frameLog(session) {
   return frames;
 }
 
+/**
+ * Every HTTP request Chrome actually put on the wire, **including the preflights
+ * the page never sees**, keyed by CDP request id.
+ *
+ * Read from the protocol rather than from the page, and for CORS work that is
+ * not a convenience — it is the only place the answer exists. Ticket 02 of the
+ * headless-Linux effort needed both halves:
+ *
+ * - `Access-Control-Allow-Origin` is **not** a header JavaScript may read. It is
+ *   not CORS-safelisted, so `response.headers.get` of it is `null` on a response
+ *   that carried it perfectly well. A driver that reports what the page can see
+ *   reports `—` either way and proves nothing.
+ * - A **preflight is not a request the page made**, so it has no `fetch` to
+ *   fail. It is invisible from inside the page even in principle.
+ *
+ * `asked` is the preflight's own `Access-Control-Request-Headers`, which is how
+ * ticket 02 found that the client asks for `b3, traceparent` — and therefore that
+ * a header list written from what the server implements would fail the first
+ * call with `Allow-Origin: *` present.
+ */
+export function wireLog(session) {
+  const wire = new Map();
+  const headerOf = (headers, name) =>
+    Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name)?.[1];
+  session.on((message) => {
+    const { requestId, request, response, type } = message.params ?? {};
+    if (message.method === "Network.requestWillBeSent") {
+      wire.set(requestId, {
+        method: request.method,
+        url: request.url,
+        kind: type,
+        asked: headerOf(request.headers, "access-control-request-headers"),
+      });
+    }
+    const seen = wire.get(requestId);
+    if (seen && message.method === "Network.responseReceived") {
+      seen.status = response.status;
+      seen.allowOrigin = headerOf(response.headers, "access-control-allow-origin");
+      seen.allowHeaders = headerOf(response.headers, "access-control-allow-headers");
+    }
+    if (seen && message.method === "Network.loadingFailed") {
+      seen.failed = message.params.corsErrorStatus?.corsError ?? message.params.errorText;
+    }
+  });
+  return wire;
+}
+
+/** The wire log's calls to one origin, in order, as printable lines. */
+export function crossOriginLines(wire, origin) {
+  return [...wire.values()]
+    .filter((seen) => seen.url.startsWith(origin))
+    .map((seen) => {
+      const verdict = seen.failed ? `FAILED ${seen.failed}` : String(seen.status ?? "—");
+      return (
+        `${verdict.padEnd(8)} ${seen.method.padEnd(7)} ${seen.url.replace(origin, "")}` +
+        `  allow-origin=${seen.allowOrigin ?? "—"}` +
+        (seen.method === "OPTIONS" ? `  asked=${seen.asked ?? "—"}` : "")
+      );
+    });
+}
+
 export function consoleLog(session) {
   const lines = [];
   session.on((message) => {

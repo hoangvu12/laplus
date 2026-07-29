@@ -24,7 +24,7 @@
 // is a different origin, which is all a browser means by cross-origin — so this
 // exercises the same code path a desktop window on one machine and a laplus on
 // another do, without needing the second machine.
-import { launch, consoleLog, poll } from "./cdp.mjs";
+import { launch, consoleLog, crossOriginLines, poll, wireLog } from "./cdp.mjs";
 
 const page = process.argv[2] ?? "http://127.0.0.1:5773/";
 const remote = process.argv[3] ?? "http://127.0.0.1:5774";
@@ -37,33 +37,8 @@ if (!code) {
 const session = await launch({ url: page });
 const logs = consoleLog(session);
 
-// Every request Chrome actually put on the wire, **including the preflights the
-// page never sees**, read from the DevTools protocol rather than from the page.
-//
-// This is not the same information as the `fetch` results below and the
-// difference is the point twice over. `Access-Control-Allow-Origin` is not a
-// header JavaScript may read — it is not CORS-safelisted, so
-// `response.headers.get` of it is `null` on a response that carried it
-// perfectly well — and a preflight is not a request the page made, so it has no
-// `fetch` to fail. Both are only visible here.
-const wire = new Map();
-const headerOf = (headers, name) =>
-  Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name)?.[1];
-session.on((message) => {
-  const { requestId, request, response, type } = message.params ?? {};
-  if (message.method === "Network.requestWillBeSent") {
-    wire.set(requestId, { method: request.method, url: request.url, kind: type });
-  }
-  const seen = wire.get(requestId);
-  if (seen && message.method === "Network.responseReceived") {
-    seen.status = response.status;
-    seen.allowOrigin = headerOf(response.headers, "access-control-allow-origin");
-    seen.allowHeaders = headerOf(response.headers, "access-control-allow-headers");
-  }
-  if (seen && message.method === "Network.loadingFailed") {
-    seen.failed = message.params.corsErrorStatus?.corsError ?? message.params.errorText;
-  }
-});
+// Why this is read from the protocol and not from the page: see `wireLog`.
+const wire = wireLog(session);
 
 const ready = await poll(
   () => session.evaluate(`return document.readyState === "complete" ? "yes" : null;`),
@@ -187,14 +162,7 @@ for (const step of walked.steps) {
 // loaded from are same-origin and have nothing to say here.
 const crossOrigin = [...wire.values()].filter((seen) => seen.url.startsWith(remote));
 console.log("=== what chrome put on the wire ===");
-for (const seen of crossOrigin) {
-  const verdict = seen.failed ? `FAILED ${seen.failed}` : String(seen.status);
-  console.log(
-    `${verdict.padEnd(8)} ${seen.method.padEnd(7)} ${seen.url.replace(remote, "")}` +
-      `  allow-origin=${seen.allowOrigin ?? "—"}` +
-      (seen.method === "OPTIONS" ? `  allow-headers=${seen.allowHeaders ?? "—"}` : ""),
-  );
-}
+for (const line of crossOriginLines(wire, remote)) console.log(line);
 const preflights = crossOrigin.filter((seen) => seen.method === "OPTIONS");
 console.log(
   `${preflights.length} preflight(s), ${preflights.filter((f) => f.failed).length} refused`,

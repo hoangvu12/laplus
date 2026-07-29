@@ -26,18 +26,19 @@ cargo build -p laplus-shell --release
 node tools/ui-driver/repro.mjs 40
 ```
 
-| File                      | What it does                                                                                                                                                                        |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cdp.mjs`                 | Launches headless Chrome, attaches, and exposes the DOM, the console, and **every WebSocket frame in both directions**                                                              |
-| `probe-boot.mjs`          | Boots the UI and dumps what it says on the socket. Start here. Takes the URL as an argument, for the second-instance recipe below                                                   |
-| `probe-open-thread.mjs`   | Clicks a conversation in the sidebar and prints the pane. Ticket 28's free discriminator                                                                                            |
-| `repro.mjs`               | Types a prompt into the composer of a new thread and watches the pane. Exit code 1 if the reply never renders                                                                       |
-| `first-turn.mjs`          | The same, sampling four times a second. Ticket 35's "the first message doesn't show anything"                                                                                       |
-| `probe-context-meter.mjs` | Runs a turn and reads the composer's context meter. Exit code 1 if no meter is drawn — which is what a server that never emits `context-window.updated` looks like from the outside |
-| `titlebar-boxes.mjs`      | Where everything in the topbar's right-hand corner is, in pixels in from the window edge. `--plain` measures the browser layout for comparison                                      |
-| `remote-pairing.mjs`      | Pairs a page served by one laplus with a **second laplus on another origin**, and reports every preflight Chrome sent. Ticket 02 of the headless-Linux effort; wants two servers    |
-| `surface-walk.mjs`        | Navigates every route, enumerates the visible controls, and reports refusals, empty renders and console errors per route                                                            |
-| `surface-actions.mjs`     | Presses controls and reports what the server answered, plus every failed HTTP request the page made                                                                                 |
+| File                         | What it does                                                                                                                                                                        |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cdp.mjs`                    | Launches headless Chrome, attaches, and exposes the DOM, the console, and **every WebSocket frame in both directions**                                                              |
+| `probe-boot.mjs`             | Boots the UI and dumps what it says on the socket. Start here. Takes the URL as an argument, for the second-instance recipe below                                                   |
+| `probe-open-thread.mjs`      | Clicks a conversation in the sidebar and prints the pane. Ticket 28's free discriminator                                                                                            |
+| `repro.mjs`                  | Types a prompt into the composer of a new thread and watches the pane. Exit code 1 if the reply never renders                                                                       |
+| `first-turn.mjs`             | The same, sampling four times a second. Ticket 35's "the first message doesn't show anything"                                                                                       |
+| `probe-context-meter.mjs`    | Runs a turn and reads the composer's context meter. Exit code 1 if no meter is drawn — which is what a server that never emits `context-window.updated` looks like from the outside |
+| `titlebar-boxes.mjs`         | Where everything in the topbar's right-hand corner is, in pixels in from the window edge. `--plain` measures the browser layout for comparison                                      |
+| `remote-pairing.mjs`         | Pairs a page served by one laplus with a **second laplus on another origin**, and reports every preflight Chrome sent. Ticket 02 of the headless-Linux effort; wants two servers    |
+| `add-remote-environment.mjs` | The same, through the real Settings form rather than `fetch`. **Exits 1 until ticket 06 lands** — its header says why that is a pending acceptance check and not a broken driver    |
+| `surface-walk.mjs`           | Navigates every route, enumerates the visible controls, and reports refusals, empty renders and console errors per route                                                            |
+| `surface-actions.mjs`        | Presses controls and reports what the server answered, plus every failed HTTP request the page made                                                                                 |
 
 `repro.mjs`, `first-turn.mjs` and `probe-context-meter.mjs` each spend a **real
 agent turn** against the configured `claude` binary and the project the sidebar
