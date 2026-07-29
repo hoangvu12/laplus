@@ -347,6 +347,15 @@ impl Server {
             .route("/api/auth/pairing-token", post(pairing_credential))
             .route("/api/auth/pairing-links", get(pairing_links))
             .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
+            // A file out of a project, for an `<img>` the browser fetches
+            // itself. A real route and not the fallback for the same reason as
+            // the two above it: a token has no extension, so the asset fallback
+            // would answer this with the UI's own `index.html`.
+            //
+            // Two segments rather than a wildcard, because the filename is a
+            // basename and [`crate::assets`] percent-encodes the separator out
+            // of it. See that module for why nothing here checks a credential.
+            .route("/api/assets/{token}/{name}", get(project_asset))
             // Last, and only for paths nothing above matched: the UI itself.
             // A route wins over a fallback, so attaching a bundle cannot move
             // an answer the client already decodes — which is the property
@@ -1216,6 +1225,55 @@ async fn asset(
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// A project's own icon, for the `<img>` the sidebar draws it in.
+///
+/// The token is the whole of the authorization — see [`crate::assets`], which
+/// is also why every failure here is the same 404. Off the async runtime
+/// because it reads a row and then a file.
+async fn project_asset(
+    State(state): State<Arc<ServerState>>,
+    Path((token, _name)): Path<(String, String)>,
+) -> Response {
+    // The whole state moves in rather than the database: `Database` is not
+    // `Clone` — it owns the connection — and the `Arc` is what everything else
+    // here shares it by.
+    let served = tokio::task::spawn_blocking(move || {
+        let secret = state
+            .services
+            .shell
+            .database()
+            .secret_or_create(
+                crate::assets::SIGNING_SECRET_NAME,
+                crate::assets::SIGNING_SECRET_BYTES,
+            )
+            .ok()?;
+        crate::assets::serve(&token, &secret, crate::clock::now_epoch_millis() as i64)
+    })
+    .await;
+
+    match served {
+        Ok(Some(asset)) => (
+            [
+                (header::CONTENT_TYPE, asset.content_type),
+                // Private because this is one developer's project and not a
+                // public file, and an hour because that is the token's own life
+                // — a cache entry that outlived it would answer from disk for a
+                // URL the server has stopped honouring.
+                (header::CACHE_CONTROL, "private, max-age=3600"),
+                // The content type is inferred from an extension on a file
+                // inside somebody's project, so it is a guess about a file the
+                // server did not write. Sniffing on top of a wrong guess is how
+                // an "icon" becomes a script.
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            asset.bytes,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

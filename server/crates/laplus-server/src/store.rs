@@ -268,6 +268,27 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX auth_websocket_tickets_by_session
         ON auth_websocket_tickets (session_id);
     "#,
+    // v6 — ticket 75, the key an asset URL is signed with.
+    //
+    // A table rather than a column on something, because what it holds is not
+    // about any row this database already has: it is a server-lifetime secret
+    // that happens to need somewhere durable, and the next one — there will be
+    // one — belongs beside it rather than in a second table of one.
+    //
+    // Note what is *not* here. `crate::assets` does not store a row per issued
+    // URL; the URL carries its own signed claims, and this is only the key they
+    // are signed with. That is the opposite of ticket 73's decision one
+    // migration above, and the module says why.
+    r#"
+    CREATE TABLE server_secrets (
+        name       TEXT PRIMARY KEY,
+        -- Raw bytes, not hex or base64: this column is never read by anything
+        -- but the code that wrote it, and an encoding would be a second thing
+        -- to agree about.
+        secret     BLOB NOT NULL,
+        created_at TEXT NOT NULL
+    ) STRICT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -1252,6 +1273,47 @@ impl Database {
                 },
             )
             .map_err(StorageError::while_("read back the session"))
+    }
+
+    /// A named server secret, minted on first use and the same one after that.
+    ///
+    /// Get-or-create in one statement rather than a read, a branch and a write:
+    /// two connections asking at once — two windows opening together, which is
+    /// the ordinary case — would otherwise both find nothing, both insert, and
+    /// one would lose. `ON CONFLICT DO NOTHING` followed by the read means the
+    /// loser reads the winner's key instead of failing, and every caller gets
+    /// the same bytes.
+    ///
+    /// The consequence of getting this wrong is quiet: every URL signed with
+    /// the key that lost stops verifying, and a sidebar full of icons turns
+    /// into a sidebar full of 404s an hour later.
+    pub fn secret_or_create(&self, name: &str, bytes: usize) -> Result<Vec<u8>, StorageError> {
+        let mut fresh = vec![0u8; bytes];
+        getrandom::fill(&mut fresh).map_err(|error| {
+            StorageError::refusing(
+                "mint a server secret",
+                format!("randomness is unavailable: {error}"),
+            )
+        })?;
+
+        let connection = self.lock();
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO server_secrets (name, secret, created_at) \
+                     VALUES (?1, ?2, {NOW}) ON CONFLICT (name) DO NOTHING"
+                ),
+                (name, &fresh),
+            )
+            .map_err(StorageError::while_("store a server secret"))?;
+
+        connection
+            .query_row(
+                "SELECT secret FROM server_secrets WHERE name = ?1",
+                (name,),
+                |row| row.get(0),
+            )
+            .map_err(StorageError::while_("read a server secret"))
     }
 
     /// Is this bearer a live session? The subject and scopes if so.

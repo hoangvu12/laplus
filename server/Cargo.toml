@@ -37,6 +37,14 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # this has no use for; `getrandom` is the syscall, and calling it here is what
 # keeps `unsafe_code = "forbid"` intact above.
 getrandom = "0.3"
+# Ticket 75: an asset URL is a capability, and the only thing standing between
+# `/api/assets/…` and any file in a project is that its claims were signed by a
+# key this server holds. HMAC-SHA256 is what the reference server signs the same
+# claims with, so this is parity rather than a choice. Both crates are
+# RustCrypto's, pure safe Rust with no build script and no C — which is what
+# keeps `unsafe_code = "forbid"` above intact, and is why the alternative of
+# linking a system crypto library was not weighed.
+hmac = "0.12"
 # The only way to hear about a change the app did not make. Default features are
 # kept: everything they add is target-gated to macOS, so on the platform v1 ships
 # they cost nothing, and dropping them would leave a developer running the suite
@@ -56,6 +64,10 @@ portable-pty = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The hash `hmac` above is keyed over. Separate crates because RustCrypto keeps
+# the construction and the digest apart; neither is useful here without the
+# other.
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = [
   "io-util",

@@ -30,6 +30,7 @@ use std::fmt;
 
 use serde_json::Value;
 
+use crate::assets::{self, CreateUrl};
 use crate::checkpoints::{self, Diff};
 use crate::config_store::ConfigStore;
 use crate::editor::{self, OpenInEditor};
@@ -313,6 +314,23 @@ pub fn dispatch(
         editor::OPEN_IN_EDITOR => OpenInEditor::read(payload)
             .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
             .map_err(DispatchError::Declared),
+        // Reads the project looking for an icon and then signs what it found,
+        // so it is deferred for the reason every other disk-touching method is.
+        // The key is loaded on the read loop and not inside the deferred work:
+        // it is one indexed row, and threading the database into the closure
+        // would be a clone of it per favicon per sidebar render.
+        assets::CREATE_URL => {
+            let call = CreateUrl::read(payload).map_err(DispatchError::Declared)?;
+            let secret = services
+                .shell
+                .database()
+                .secret_or_create(assets::SIGNING_SECRET_NAME, assets::SIGNING_SECRET_BYTES)
+                .map_err(|failure| DispatchError::Declared(call.signing_key_error(failure)))?;
+            let now = crate::clock::now_epoch_millis() as i64;
+            Ok(Answer::Deferred(Deferred::new(move || {
+                call.run(&secret, now)
+            })))
+        }
         // Opening a terminal stats a directory and starts a process, so it goes
         // off the read loop. Attaching to one cannot — a stream is answered by
         // its own pump and there is no deferred form of that — but it only

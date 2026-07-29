@@ -355,6 +355,18 @@ fn existing_ancestor(path: &Path) -> PathBuf {
 /// path that lands *on* the root — the project directory is not a file in the
 /// project — and, on Windows, a bare drive letter.
 fn descend(root: &Path, requested: &Path) -> Result<PathBuf, Refusal> {
+    within(root, requested).ok_or(Refusal::OutsideRoot)
+}
+
+/// [`descend`] without this module's refusal shape, for callers that answer with
+/// a different contract's errors.
+///
+/// The rule is stated once here and read twice: `projects.readFile` maps the
+/// `None` onto a `ProjectFileFailure` literal, and [`crate::assets`] onto an
+/// `AssetAccessError`. A second implementation of the fold would be a second
+/// place for the `..` case above to be got wrong, and only one of them would
+/// have this module's tests over it.
+pub(crate) fn within(root: &Path, requested: &Path) -> Option<PathBuf> {
     use std::path::Component;
 
     let mut inside = root.to_path_buf();
@@ -363,18 +375,18 @@ fn descend(root: &Path, requested: &Path) -> Result<PathBuf, Refusal> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if !inside.pop() || !inside.starts_with(root) {
-                    return Err(Refusal::OutsideRoot);
+                    return None;
                 }
             }
             Component::Normal(part) => inside.push(part),
-            Component::RootDir | Component::Prefix(_) => return Err(Refusal::OutsideRoot),
+            Component::RootDir | Component::Prefix(_) => return None,
         }
     }
 
     if inside == root {
-        return Err(Refusal::OutsideRoot);
+        return None;
     }
-    Ok(inside)
+    Some(inside)
 }
 
 /// Read at most `wanted` bytes, without asking for a buffer the size of the

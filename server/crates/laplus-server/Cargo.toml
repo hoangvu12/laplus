@@ -11,11 +11,13 @@ workspace = true
 axum.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
 notify.workspace = true
 portable-pty.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

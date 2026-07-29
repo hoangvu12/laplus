@@ -54,6 +54,7 @@
 //! "the agent's format moved" and "the UI's contract moved" separate failures.
 
 pub mod agent;
+pub mod assets;
 pub mod auth;
 pub mod catalogue;
 pub mod checkpoints;
@@ -71,6 +72,7 @@ pub mod launch;
 pub mod orchestration;
 pub mod pairing;
 pub mod process;
+pub mod project_favicon;
 pub mod projects;
 pub mod protocol;
 pub mod provider;

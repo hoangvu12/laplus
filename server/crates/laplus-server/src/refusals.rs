@@ -234,6 +234,24 @@ pub fn refusal(method: &str) -> Value {
     }
 }
 
+/// A refusal of *part* of a method this server does implement.
+///
+/// `assets.createUrl` answers for one of the contract's three asset resources
+/// and not for the other two, so it is neither in the position of a method that
+/// is absent — dispatch reaches it, and [`refusal`] would say it does not exist
+/// — nor able to answer. The tag is the one that method's union declares, and
+/// the sentence is [`REFUSAL_SENTENCE`] verbatim so that
+/// `tools/ui-driver/surface-walk.mjs` still counts a control that reaches this
+/// among the things that do nothing. That it says *which* part is the only
+/// difference from a whole-method refusal, and is the point.
+pub fn partial_refusal(method: &str, subject: &str) -> Value {
+    json!({
+        "_tag": Tag::EnvironmentAuthorization.as_str(),
+        "message": format!("{REFUSAL_SENTENCE}: {method} for {subject}"),
+        "requiredScope": REFUSAL_SCOPE,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

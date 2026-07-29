@@ -217,7 +217,7 @@ fn caching(path: &str) -> Caching {
 /// The default is deliberate: `application/octet-stream` makes an unknown type
 /// a download the page ignores, where a guess of `text/html` would make it
 /// something the webview tries to run.
-fn content_type(path: &str) -> &'static str {
+pub(crate) fn content_type(path: &str) -> &'static str {
     let extension = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
     match extension.as_str() {
         "html" => "text/html; charset=utf-8",
