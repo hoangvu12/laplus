@@ -21,7 +21,16 @@ export default defineConfig({
   },
   staged: {
     // Formatter only for now — no lint or typecheck on commit.
-    "*": "vp fmt",
+    //
+    // **Extensions rather than `"*"`, so a Rust-only commit is possible.** `vp
+    // fmt` has no Rust formatter, so a commit staging nothing but `.rs` files
+    // handed it a list it could not format and failed the hook with "Expected at
+    // least one target file" — which made every server-side change carry a
+    // markdown file to get itself committed. The glob now describes what the
+    // formatter actually handles, so a commit it has nothing to say about runs no
+    // task instead of failing. The same failure from the other direction is why
+    // `.scratch` is deliberately absent from `fmt.ignorePatterns` below.
+    "*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc,md,css,html,yaml,yml}": "vp fmt",
   },
   fmt: {
     ignorePatterns: [
