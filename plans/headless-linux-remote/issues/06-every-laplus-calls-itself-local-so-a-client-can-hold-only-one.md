@@ -4,7 +4,9 @@
 and persisted, so a client can hold this server and another one at the same
 time.
 
-**Status:** ready-for-agent
+**Status:** done — every acceptance criterion met, the last by a drive that held
+three environments at once. "What landed" is at the bottom, and it carries one
+finding the drive turned up that this ticket had assumed away.
 
 **Depends on:** 02, which landed. Nothing else. This is the blocker 02's drive
 found, and it is the one standing between the desktop application and the thing
@@ -206,3 +208,88 @@ read off a screen and retype.
   (`tools/ui-driver/README.md`).
 - **The label.** Two machines with the same hostname show the same label and
   that is fine; they are now told apart by the id, which is what the id is for.
+  **The drive found this reasoning to be wrong** — see "What landed".
+
+## What landed
+
+Four small pieces, no new dependency, and 11 tests. The shape is the one the
+ticket specified; what it did not anticipate is in the last section, and it came
+from the drive rather than from the code.
+
+`pairing::identifier_suffix` — four characters, lowercased, sharing
+`PAIRING_CODE_ALPHABET` and **not** truncating `pairing_code`, as decided. It
+uses a bare `%` where its neighbour keeps `PAIRING_CODE_REJECTION_LIMIT`, and
+says why in a comment: 32 divides 256 so it is uniform today, the existing
+`nothing_is_rejected_while_the_alphabet_divides_the_byte_range` fails loudly the
+moment that stops being true, and a biased suffix costs a collision chance rather
+than a weakened credential.
+
+`config::machine_slug` and `config::slug_of` — the prefix, split the way
+`machine_label`/`hostname_in` already split, so the parsing is testable without
+setting a process-global environment variable. Capped at 28 characters, trimmed
+**after** the cap so a name cut mid-run does not keep the dash it was cut
+through. `DESKTOP-19EUMEB` → `desktop-19eumeb`.
+
+`store`: migration **v7**, a one-row `environment` table shaped like
+`orchestration`, and `Database::environment_id_or_create` — `ON CONFLICT DO
+NOTHING` then a read, following `secret_or_create` exactly. Not `server_secrets`,
+whose column comment says it is never read by anything but its writer, and this
+value is published unauthenticated in the descriptor.
+
+`config::fresh_environment_id` mints `<machine>-<suffix>` for both callers, so an
+id read from the database and an id minted by an unbound config are not
+distinguishable — a reader of a log line cannot tell which they have.
+`ServerConfig::with_environment_id` is settled in `Server::bind_with` beside the
+UI version, and a database failure there is logged and survived like
+`mint_boot_grant` above it: the process keeps the id `detect` minted, which is
+legal and unique to this run but does not outlive it.
+
+**The field's own doc comment was rewritten**, since the ticket quoted it as the
+Why and leaving it would have left the file arguing for the constant it no longer
+holds. `docs/running-headless.md` had the same problem in prose — it told the
+reader the desktop case does not finish and to use an `ssh -L` tunnel — and now
+documents the id, the data-directory-per-server requirement, and the one-time
+re-key cost.
+
+### The drive
+
+`add-remote-environment.mjs` exited 1 before this landed and exits 0 after, with
+nothing else changed, which is what the ticket asked for. It also does more than
+it used to: 9 cross-origin calls per remote rather than 4, because a registration
+that is actually adopted goes on to trade the bearer for a socket ticket and
+fetch the orchestration shell. Four calls and an empty list was the symptom; nine
+and a listed row is the environment being _used_.
+
+The driver now takes **one or more** `<remote-url> <code>` pairs and insists the
+list grows by one for each, because three separate runs would prove three servers
+each pair once rather than that one client holds three at a time. Driven against
+three servers on 5773/5774/5775 with a data directory each: two remotes added in
+one session, both connected, 0 refused calls, and the ids
+`desktop-19eumeb-xj6d`, `-xy4x`, `-v6wy` — which survived a restart of all three
+unchanged.
+
+### What the drive found, which this ticket got wrong
+
+**"They are now told apart by the id" is false as written**, and Out of scope
+above says it. `SavedBackendListRow` renders `environment.label` and nothing else
+identifying — `ConnectionsSettings.tsx:1330` — so the id this ticket generates is
+never shown to the user anywhere in that list. Three data directories on one
+machine share a hostname by design, so the drive's own output is two rows both
+reading `DESKTOP-19EUMEB` with nothing to choose between them:
+
+```
+Remote environments
+Add environment
+DESKTOP-19EUMEB
+Disconnect
+DESKTOP-19EUMEB
+Disconnect
+```
+
+This is not a regression and it does not block anything — the environments are
+distinct, connected and usable, which is what the ticket was for, and the id does
+its work in the registry where the collision was. But the argument for a
+_legible_ id over an opaque one was that it "lands in URLs and a settings list",
+and half of that is not true yet. **Not ticketed**; the fix is UI work
+(`SavedBackendListRow` showing the id, or the host it was paired with, beside the
+label) and it belongs with whoever owns that component.

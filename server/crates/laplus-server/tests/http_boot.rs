@@ -96,6 +96,61 @@ async fn the_descriptor_agrees_with_the_one_the_socket_reports() {
     server.stop().await;
 }
 
+/// Ticket 06 of the headless-Linux effort, and the fault it was written for.
+///
+/// Every laplus used to answer `environmentId: "local"` — a constant. The
+/// client's connection registry is one slot per id, and the desktop's own
+/// backend already held that slot, so a remote server that walked the entire
+/// pairing chain successfully was then dropped on arrival and the user was shown
+/// "No saved remote environments". Two servers is the whole of the reproduction,
+/// which is why this test is two servers.
+#[tokio::test]
+async fn two_servers_with_their_own_data_directories_are_two_environments() {
+    let one = tempfile::tempdir().expect("a temporary directory");
+    let other = tempfile::tempdir().expect("a second temporary directory");
+
+    let first = TestServer::start_at(&one.path().join("state.sqlite")).await;
+    let second = TestServer::start_at(&other.path().join("state.sqlite")).await;
+
+    let here = first.get("/.well-known/t3/environment").await.body;
+    let there = second.get("/.well-known/t3/environment").await.body;
+
+    assert_ne!(
+        here["environmentId"], there["environmentId"],
+        "two laplus servers must not answer with one name, or a client can hold \
+         only one of them"
+    );
+    assert_ne!(here["environmentId"], json!("local"));
+
+    first.stop().await;
+    second.stop().await;
+}
+
+/// The same data directory across a restart is the same environment.
+///
+/// This is the half that makes the id worth persisting rather than minting at
+/// startup: a client stores its bearer profile under the id it paired with, so a
+/// server that renamed itself on every boot would un-pair every client it had
+/// every time it restarted — a slower version of the same silent failure.
+#[tokio::test]
+async fn a_server_restarted_on_its_own_data_directory_keeps_its_name() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("state.sqlite");
+
+    let first = TestServer::start_at(&path).await;
+    let before = first.get("/.well-known/t3/environment").await.body;
+    first.stop().await;
+
+    let second = TestServer::start_at(&path).await;
+    let after = second.get("/.well-known/t3/environment").await.body;
+    second.stop().await;
+
+    assert_eq!(
+        before["environmentId"], after["environmentId"],
+        "a restart must not rename the environment its clients paired with"
+    );
+}
+
 /// The UI's root route awaits this before rendering anything, so a server
 /// without it leaves a blank window rather than an error.
 #[tokio::test]

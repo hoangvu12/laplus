@@ -243,14 +243,25 @@ Two things to know before trying it:
   the browser blocks it, which is what `compatibility.hostedHttpsApp` in
   `crate::endpoints` reports.
 
-**It does not finish yet, and the remaining gap is not CORS.** Pairing gets as
-far as minting a bearer and then the environment does not appear under "Remote
-environments", because every laplus reports `environmentId: "local"` and the
-client keys its registry on that — the slot is already the desktop's own
-backend's. Ticket 06 is the fix and ticket 02's "What landed" is how it was
-found. Until it lands,
-`ssh -L 5773:localhost:4773 <box>` and pointing the window at
-`http://127.0.0.1:5773` gets you the same thing.
+**This server tells you which machine it is.** Every laplus reported
+`environmentId: "local"` until ticket 06, and the client keys its connection
+registry on that id — so pairing got as far as minting a bearer and the
+environment then never appeared under "Remote environments", because the slot was
+already the desktop's own backend's. A pairing that succeeded at every step
+showed as an empty list.
+
+Each data directory now generates its own id on first start and keeps it in
+`state.sqlite`, shaped `<machine>-<suffix>` — `orpheus-8f2a`. Two things follow
+that are worth knowing:
+
+- **Two servers need two data directories**, which is what makes them two
+  environments. `LOCALAPPDATA` (or `XDG_DATA_HOME`) per instance is how that is
+  done; two servers sharing one directory share one id and collide exactly as
+  before, and they are already sharing one database, which nothing supports.
+- **A directory that was paired with before ticket 06 gets a new id**, once.
+  Anything the client had keyed to `local` — composer drafts, a bookmarked thread
+  URL — is orphaned that one time. Nothing durable is lost: threads, projects and
+  sessions live in `state.sqlite` and are not keyed by environment.
 
 ## What this costs
 

@@ -289,6 +289,35 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL
     ) STRICT;
     "#,
+    // v7 — ticket 06 of the headless-Linux effort, the name this server answers
+    // to.
+    //
+    // **Not a row in `server_secrets` one migration above**, though the shape of
+    // the get-or-create is the same. That column's own comment says it is never
+    // read by anything but the code that wrote it, and this value is the
+    // opposite: it is published unauthenticated in the environment descriptor,
+    // printed in a boot line and read off a settings list. A secret and a
+    // published name sharing a table would make that comment false for half its
+    // rows.
+    //
+    // Here rather than in a file beside the database, because the id should
+    // share the database's lifetime. A lost `state.sqlite` is every session,
+    // every pairing and every thread gone, and every client re-pairing anyway —
+    // so a new id costs nothing that was not already lost. A separate file could
+    // outlive the database or be restored without it, and the id would then name
+    // a server whose sessions it no longer matches.
+    r#"
+    CREATE TABLE environment (
+        -- Exactly one row, the way `orchestration` above is one row: this is
+        -- what is true of the whole database rather than of anything in it.
+        id             INTEGER PRIMARY KEY CHECK (id = 0),
+        -- `<machine>-<suffix>`, minted by `crate::config::fresh_environment_id`.
+        -- Written once and never updated: a client stores a profile under this
+        -- name, so changing it silently un-pairs everything that had paired.
+        environment_id TEXT NOT NULL,
+        created_at     TEXT NOT NULL
+    ) STRICT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -1316,6 +1345,53 @@ impl Database {
             .map_err(StorageError::while_("read a server secret"))
     }
 
+    /// What this laplus calls itself, minted on first use and the same one after
+    /// that.
+    ///
+    /// **This is the identity a client files this server under.** The client's
+    /// connection registry is one slot per environment id
+    /// (`packages/client-runtime/src/connection/registry.ts`), so an id shared
+    /// with another laplus is not a cosmetic collision: the second server to
+    /// register is dropped, silently, and the user is shown "No saved remote
+    /// environments" after a pairing that succeeded at every step. That is
+    /// ticket 06 of the headless-Linux effort, and it is what this function
+    /// exists to prevent.
+    ///
+    /// Get-or-create in one statement rather than a read, a branch and a write,
+    /// exactly as [`Database::secret_or_create`] does and for its reason: two
+    /// handles on one file — two windows opening together — would otherwise both
+    /// find nothing, both insert, and one would lose. `ON CONFLICT DO NOTHING`
+    /// and then a read means the loser reads the winner's name instead of
+    /// failing.
+    ///
+    /// The row is never updated. [`crate::Server::bind_with`] is the caller, and
+    /// what it does with the answer is settle it into the config the descriptor
+    /// is serialized from.
+    pub fn environment_id_or_create(&self) -> Result<String, StorageError> {
+        let fresh = crate::config::fresh_environment_id().map_err(|error| {
+            StorageError::refusing("name this environment", error.to_string())
+        })?;
+
+        let connection = self.lock();
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO environment (id, environment_id, created_at) \
+                     VALUES (0, ?1, {NOW}) ON CONFLICT (id) DO NOTHING"
+                ),
+                (&fresh,),
+            )
+            .map_err(StorageError::while_("store this environment's name"))?;
+
+        connection
+            .query_row(
+                "SELECT environment_id FROM environment WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::while_("read this environment's name"))
+    }
+
     /// Is this bearer a live session? The subject and scopes if so.
     pub fn verify_session(&self, token: &str) -> Result<Option<Grant>, StorageError> {
         let connection = self.lock();
@@ -2236,6 +2312,106 @@ mod tests {
             failure.to_string().contains("newer version"),
             "the refusal must say why: {failure}"
         );
+    }
+
+    // -- this server's own name -----------------------------------------------
+
+    /// Ticket 06 of the headless-Linux effort, and its first acceptance
+    /// criterion: a data directory reports the **same** id after a restart.
+    ///
+    /// This is the whole reason the id lives in the database rather than being
+    /// computed at startup. A client pairs with `desktop-19eumeb-8f2a`, stores a
+    /// profile under it, and comes back tomorrow: an id that was minted fresh
+    /// each boot would leave every paired client holding the name of an
+    /// environment that no longer exists.
+    #[test]
+    fn one_data_directory_keeps_its_environment_id_across_a_restart() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+
+        let first = {
+            let database = Database::open(&path).expect("creates the database");
+            database.environment_id_or_create().expect("mints an id")
+        };
+        let second = {
+            let database = Database::open(&path).expect("reopens the database");
+            database.environment_id_or_create().expect("reads the id back")
+        };
+
+        assert_eq!(
+            first, second,
+            "a restart against the same file must not rename the environment"
+        );
+    }
+
+    /// The second criterion: two data directories are two environments, which is
+    /// the entire point of the ticket — the desktop's own backend and a remote
+    /// one have to be able to sit in a client's registry at the same time, and
+    /// that registry is one slot per id.
+    #[test]
+    fn two_data_directories_report_different_environment_ids() {
+        let one = tempfile::tempdir().expect("a temporary directory");
+        let other = tempfile::tempdir().expect("a second temporary directory");
+
+        let first = Database::open(&one.path().join("state.sqlite"))
+            .expect("creates one database")
+            .environment_id_or_create()
+            .expect("mints an id");
+        let second = Database::open(&other.path().join("state.sqlite"))
+            .expect("creates another database")
+            .environment_id_or_create()
+            .expect("mints an id");
+
+        assert_ne!(
+            first, second,
+            "two laplus installations must not answer with one name"
+        );
+    }
+
+    /// The third: two handles on one file agree, which is what the get-or-create
+    /// statement is for. [`Database::secret_or_create`]'s own comment carries the
+    /// reasoning — two windows opening together would otherwise both find
+    /// nothing, both insert, and one would lose.
+    ///
+    /// **The two handles are held open at once**, rather than opened one after
+    /// the other as the restart test does, because that is the arrangement the
+    /// race needs: the loser has to read the winner's row instead of failing.
+    #[test]
+    fn two_database_handles_on_one_file_agree_on_the_environment_id() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+
+        let one = Database::open(&path).expect("creates the database");
+        let other = Database::open(&path).expect("opens the same file again");
+
+        let first = one.environment_id_or_create().expect("mints or reads");
+        let second = other.environment_id_or_create().expect("mints or reads");
+
+        assert_eq!(first, second);
+    }
+
+    /// The fourth: the shape. `^[a-z0-9][a-z0-9-]*$` and beginning with this
+    /// machine's slug, because an id that lands in a URL and in a settings list
+    /// is read by someone — the ticket's argument for `desktop-19eumeb-8f2a`
+    /// over `8f2a41c9d3e7` is that there will be *several*.
+    #[test]
+    fn an_environment_id_is_this_machine_and_a_suffix() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database =
+            Database::open(&directory.path().join("state.sqlite")).expect("creates the database");
+
+        let id = database.environment_id_or_create().expect("mints an id");
+
+        assert!(
+            id.starts_with(&crate::config::machine_slug()),
+            "{id} should name this machine"
+        );
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "{id} should be safe in a URL path segment"
+        );
+        assert!(!id.starts_with('-') && !id.ends_with('-'), "{id} has a bare edge");
     }
 
     // -- conversations --------------------------------------------------------

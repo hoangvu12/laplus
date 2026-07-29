@@ -79,10 +79,27 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvironmentDescriptor {
-    /// v1 has exactly one environment and no remote ones — cloud and remote
-    /// environments are out of scope — so this is a constant rather than a
-    /// generated id that would have to be persisted to stay stable across
-    /// restarts. The contract types it as a non-empty string, not a UUID.
+    /// What a client files this server under, shaped `<machine>-<suffix>` —
+    /// `desktop-19eumeb-8f2a`. The contract types it as a non-empty string, not
+    /// a UUID.
+    ///
+    /// **Generated once per data directory and persisted**, which it has to be
+    /// twice over: the client's connection registry is one slot per environment
+    /// id, so two laplus servers answering the same one means the second is
+    /// dropped on arrival; and a client stores its bearer profile under this
+    /// name, so an id minted fresh each boot would un-pair every client on every
+    /// restart. [`crate::store::Database::environment_id_or_create`] mints and
+    /// keeps it, [`ServerConfig::with_environment_id`] is how it arrives here,
+    /// and [`fresh_environment_id`] is the shape.
+    ///
+    /// This was the constant `"local"` until ticket 06 of the headless-Linux
+    /// effort. The comment here argued that "v1 has exactly one environment and
+    /// no remote ones", which was true when it was written and stopped being
+    /// true when ticket 02 answered a cross-origin request: the desktop
+    /// application then walked the whole pairing chain against a second laplus
+    /// and had nowhere to put the result. The symptom was not an error but an
+    /// empty "Remote environments" list after a pairing that succeeded at every
+    /// step.
     pub environment_id: String,
     pub label: String,
     pub platform: Platform,
@@ -401,7 +418,24 @@ impl ServerConfig {
             remote_access,
             preferences: data_dir.clone(),
             environment: EnvironmentDescriptor {
-                environment_id: "local".to_string(),
+                // Minted rather than read, and replaced at bind: the durable one
+                // lives in `state.sqlite` and this constructor has no database.
+                // [`ServerConfig::with_environment_id`] is the other half, and
+                // `server_version` two fields down has exactly this shape
+                // already — the crate's answer here, the bundle's at bind.
+                //
+                // A fresh id rather than an empty string because a config that
+                // is never bound still has to serialize: the contract types this
+                // as a non-empty string, and `no_required_string_is_empty` walks
+                // `/environment/environmentId` for that reason. An empty one
+                // decodes as a schema failure the UI reports as a broken server.
+                //
+                // Randomness failing leaves the machine's slug alone, which is
+                // legal, non-empty, and stable enough for the only thing that
+                // reaches this path without a database — a config assembled and
+                // serialized inside one process. See
+                // [`crate::pairing::RandomError`] for why this is not a panic.
+                environment_id: fresh_environment_id().unwrap_or_else(|_| machine_slug()),
                 label: machine_label(),
                 platform: Platform {
                     os: platform_os(),
@@ -504,6 +538,25 @@ impl ServerConfig {
         self
     }
 
+    /// Report the durable name this data directory was given, in place of the
+    /// one [`ServerConfig::detect_in`] minted.
+    ///
+    /// **The same shape as [`ServerConfig::serving_ui_version`] above, for the
+    /// same reason.** `detect` assembles the config from the machine and has no
+    /// database to ask; [`crate::Server::bind_with`] has both in one hand. So the
+    /// constructor mints a value that is legal on its own and the binder replaces
+    /// it with the one that survives a restart — which is where the id has to
+    /// come from, because a client files this server under it and comes back
+    /// tomorrow expecting to find it.
+    ///
+    /// Ticket 06 of the headless-Linux effort;
+    /// [`crate::store::Database::environment_id_or_create`] is what produces the
+    /// argument.
+    pub fn with_environment_id(mut self, environment_id: String) -> ServerConfig {
+        self.environment.environment_id = environment_id;
+        self
+    }
+
     /// Change where this server is willing to be reached from.
     ///
     /// **The policy travels with it**, which is the whole reason this is a
@@ -590,6 +643,85 @@ fn machine_label() -> String {
         .or_else(|| non_empty_env("HOSTNAME"))
         .or_else(configured_hostname)
         .unwrap_or_else(|| "laplus".to_string())
+}
+
+/// How much of a machine's name an environment id carries.
+///
+/// Twenty-eight characters. A fully-qualified cloud hostname —
+/// `ip-10-0-1-42.eu-west-1.compute.internal` — is over twice that and nobody
+/// reads the end of it; what the prefix is for is recognising *which* box, which
+/// the front of a name does. The id is a route segment
+/// (`_chat.$environmentId.$threadId`) and appears in a settings list, so the cap
+/// is about both being usable and being read.
+const MACHINE_SLUG_LIMIT: usize = 28;
+
+/// A name for a laplus that does not have one yet: this machine's slug, a dash,
+/// and a short random suffix — `desktop-19eumeb-8f2a`.
+///
+/// **Minted here and made durable elsewhere.** The one place an id is *kept* is
+/// [`crate::store::Database::environment_id_or_create`], which is the only
+/// caller that persists what this returns; [`ServerConfig::detect_in`] calls it
+/// too, for a value that lives as long as one unbound config. Both go through
+/// this function so that the shape has one definition — an id read from the
+/// database and an id minted by a config that was never bound should not be
+/// distinguishable, because a reader of a log line cannot tell which one they
+/// are looking at.
+///
+/// Ticket 06 of the headless-Linux effort is where `<machine>-<suffix>` and the
+/// argument for a legible id over an opaque one are written down.
+pub(crate) fn fresh_environment_id() -> Result<String, crate::pairing::RandomError> {
+    Ok(format!("{}-{}", machine_slug(), crate::pairing::identifier_suffix()?))
+}
+
+/// The prefix half of this laplus's environment id: what
+/// [`machine_label`] answers, in a form a URL can carry.
+///
+/// **The label is what the UI shows and this is not it.** Two machines with the
+/// same hostname show the same label, and that stays true — they are told apart
+/// by the suffix [`crate::pairing::identifier_suffix`] adds, not by this. See
+/// ticket 06 of the headless-Linux effort, which is where the shape
+/// `<machine>-<suffix>` and the reasons for it are written down.
+///
+/// A machine whose name slugs to nothing falls back to the same `"laplus"` the
+/// label does, so the id is still legal and still says what product it belongs
+/// to.
+pub(crate) fn machine_slug() -> String {
+    slug_of(&machine_label()).unwrap_or_else(|| "laplus".to_string())
+}
+
+/// [`machine_slug`]'s parsing, separated from the machine so it can be checked
+/// without setting a process-global environment variable — the split
+/// [`hostname_in`] already makes, for the reason its own comment gives.
+///
+/// [`None`] rather than an empty string for a name with nothing keepable in it:
+/// `""` would be a broken id the client reports as a broken server, while
+/// [`None`] is a machine that did not usefully say and leaves the caller its
+/// fallback.
+fn slug_of(name: &str) -> Option<String> {
+    let mut slug = String::with_capacity(name.len().min(MACHINE_SLUG_LIMIT));
+    for character in name.chars() {
+        if slug.len() == MACHINE_SLUG_LIMIT {
+            break;
+        }
+        match character.to_ascii_lowercase() {
+            kept @ ('a'..='z' | '0'..='9') => slug.push(kept),
+            // One dash per run of anything else, which is what turns
+            // `Ada's  Laptop` into `ada-s-laptop` rather than `ada-s--laptop`.
+            // A leading run pushes nothing, so the trim below only ever has the
+            // tail to deal with.
+            _ if slug.ends_with('-') || slug.is_empty() => {}
+            _ => slug.push('-'),
+        }
+    }
+
+    // After the cap and not before it: a name cut mid-run would otherwise keep
+    // the dash it was cut through, and the acceptance criterion is that an id
+    // matches `^[a-z0-9][a-z0-9-]*$`.
+    let trimmed = slug.trim_end_matches('-');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// What `hostname(1)` reads, when there is such a file to read.
@@ -892,6 +1024,78 @@ mod tests {
             "a file naming nothing is not an answer of \"\" — the caller falls \
              through to the fallback, which is the whole point of the Option"
         );
+    }
+
+    /// Ticket 06 of the headless-Linux effort. The prefix half of an
+    /// environment id, and the parsing is separated from the machine for the
+    /// same reason [`super::hostname_in`] is: a test that set `COMPUTERNAME`
+    /// would set it for every test beside it.
+    ///
+    /// The cases below are the ones a real machine produces. `DESKTOP-19EUMEB`
+    /// is this developer's Windows box, which is where the ticket's own example
+    /// came from; a hostname with a dot in it is every cloud instance; and the
+    /// last two are why this answers [`Option`] rather than a string — a name
+    /// that slugs to nothing is not an id of `""`, it is a machine that did not
+    /// usefully say, and the caller has a fallback for that.
+    #[test]
+    fn a_machine_name_slugs_into_a_url_safe_prefix() {
+        assert_eq!(slug_of("DESKTOP-19EUMEB").as_deref(), Some("desktop-19eumeb"));
+        assert_eq!(slug_of("orpheus").as_deref(), Some("orpheus"));
+        assert_eq!(
+            slug_of("ip-10-0-1-42.eu-west-1.compute.internal").as_deref(),
+            Some("ip-10-0-1-42-eu-west-1-compu"),
+            "capped, because this is a route segment and not a label"
+        );
+        assert_eq!(
+            slug_of("Ada's  Laptop!!").as_deref(),
+            Some("ada-s-laptop"),
+            "every run of anything else collapses to one dash, and none is left \
+             hanging off either end"
+        );
+        assert_eq!(
+            slug_of("--host--").as_deref(),
+            Some("host"),
+            "a name that already had dashes keeps one word rather than growing \
+             empty segments"
+        );
+
+        assert_eq!(slug_of(""), None);
+        assert_eq!(
+            slug_of("!!!"),
+            None,
+            "a name with nothing keepable in it is not an id of \"\""
+        );
+    }
+
+    /// A cap that cut mid-run would leave the dash it cut through on the end,
+    /// which is the one case the trimming has to happen *after* the truncation
+    /// rather than before it. Twenty-eight characters of hostname is already
+    /// past the point of being read.
+    #[test]
+    fn a_capped_slug_does_not_end_in_the_dash_it_was_cut_through() {
+        let slug = slug_of("averyveryverylongmachinename-with-more-after-it")
+            .expect("a name this long still slugs");
+        assert_eq!(slug.len(), MACHINE_SLUG_LIMIT);
+        assert!(!slug.ends_with('-'), "{slug} should not end in a dash");
+    }
+
+    /// Whatever machine this is running on, the prefix is a legal id — the same
+    /// read-only shape as the label test above, and the property the ticket's
+    /// acceptance criterion states: `^[a-z0-9][a-z0-9-]*$`.
+    #[test]
+    fn this_machine_has_a_slug_whatever_it_is_running_on() {
+        let slug = machine_slug();
+        assert!(!slug.is_empty());
+        assert!(
+            slug.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            "{slug} should begin with a character and not a dash"
+        );
+        assert!(
+            slug.bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "{slug} should be lowercase, digits and dashes only"
+        );
+        assert!(!slug.ends_with('-'));
     }
 
     /// Ticket 05 of the headless-Linux effort, and the finding that made it a

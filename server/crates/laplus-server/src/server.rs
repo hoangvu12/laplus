@@ -312,6 +312,29 @@ impl Server {
             Some(version) => config.serving_ui_version(version),
             None => config,
         };
+        // And the name this data directory answers to, settled here for the
+        // reason above and one more: this is the one place the config and the
+        // database are together, and the id has to come from the database to
+        // survive a restart. `ServerConfig::with_environment_id` is why it is
+        // done at all, and ticket 06 of the headless-Linux effort is what
+        // happened when every laplus answered `local`.
+        //
+        // A failure is logged and survived, as the boot grant below is: the
+        // config keeps the id `detect` minted, which is legal and unique to this
+        // process but does not survive a restart. A server that answers is worth
+        // more than one that refuses to start over its own name, and a client
+        // that has to re-pair is a better outcome than a window that will not
+        // open.
+        let config = match database.environment_id_or_create() {
+            Ok(environment_id) => config.with_environment_id(environment_id),
+            Err(error) => {
+                eprintln!(
+                    "laplus: cannot read this environment's durable name, using a \
+                     temporary one for this run: {error}"
+                );
+                config
+            }
+        };
         // The index is built first because the working trees listen to its
         // watcher: there is one watcher in the process and both the file tree
         // and the status are kept fresh by it.

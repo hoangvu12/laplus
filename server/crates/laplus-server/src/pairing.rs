@@ -164,6 +164,48 @@ pub fn pairing_code() -> Result<String, RandomError> {
     Ok(code)
 }
 
+/// How many characters an environment id ends in. Four, so
+/// `desktop-19eumeb-8f2a` stays readable — about 20 bits, which is sized to tell
+/// a handful of data directories on one machine apart and nothing else.
+const IDENTIFIER_SUFFIX_LENGTH: usize = 4;
+
+/// The tail of an environment id: what tells two laplus data directories on the
+/// *same* machine apart, since the hostname they both answer cannot.
+///
+/// **This is not a credential and is deliberately not built like one.** Ticket
+/// 06 of the headless-Linux effort asked for a neighbour of
+/// [`pairing_code`] rather than a truncation of it, and the reason is
+/// legibility of the code rather than of the id: `pairing_code()[..4]` is
+/// indistinguishable, at a glance and in a diff, from someone quietly cutting a
+/// twelve-character credential down to four. Nothing here guards a boundary —
+/// an environment id is published in the descriptor, printed in logs and read
+/// off a settings list — so there is no strength to weaken.
+///
+/// It shares [`PAIRING_CODE_ALPHABET`] because that alphabet already omits
+/// `0O1I`, and this value is read off a screen for the same reason a pair code
+/// is. Lowercased on the way out: an id lands in a URL path segment
+/// (`_chat.$environmentId.$threadId`), and the one this crate mints should look
+/// like the rest of it.
+pub fn identifier_suffix() -> Result<String, RandomError> {
+    let mut bytes = [0u8; IDENTIFIER_SUFFIX_LENGTH];
+    getrandom::fill(&mut bytes).map_err(RandomError)?;
+
+    let mut suffix = String::with_capacity(IDENTIFIER_SUFFIX_LENGTH);
+    for byte in bytes {
+        // A bare `%` where `pairing_code` above keeps a rejection limit, and
+        // deliberately: 32 divides 256 so this is uniform today, and
+        // `nothing_is_rejected_while_the_alphabet_divides_the_byte_range` fails
+        // the moment that stops being true — so a shortened alphabet is caught
+        // loudly rather than silently biasing this. What it would cost here is
+        // also different in kind: a biased *credential* is weaker, while a
+        // biased suffix only makes two data directories slightly likelier to
+        // collide.
+        let index = usize::from(byte) % PAIRING_CODE_ALPHABET.len();
+        suffix.push(char::from(PAIRING_CODE_ALPHABET[index]).to_ascii_lowercase());
+    }
+    Ok(suffix)
+}
+
 /// A fresh opaque token — a session bearer, or a socket ticket.
 ///
 /// Thirty-two bytes rendered as hex. Not the pair-code alphabet: nobody types
@@ -493,6 +535,42 @@ mod tests {
     fn codes_do_not_repeat() {
         let codes: HashSet<String> = (0..32).map(|_| pairing_code().expect("randomness")).collect();
         assert_eq!(codes.len(), 32);
+    }
+
+    /// Ticket 06 of the headless-Linux effort. The tail of an environment id —
+    /// what keeps two data directories on one machine apart, since the hostname
+    /// they share cannot.
+    ///
+    /// **It is checked as an identifier and not as a credential**, which is the
+    /// distinction the ticket asked for: the assertions below are about being
+    /// legible and safe in a URL, and there is deliberately no assertion here
+    /// about entropy, because this value is not keeping anyone out of anything.
+    #[test]
+    fn an_identifier_suffix_is_short_lowercase_and_safe_in_a_url() {
+        let suffix = identifier_suffix().expect("randomness");
+        assert_eq!(suffix.len(), IDENTIFIER_SUFFIX_LENGTH);
+        assert_eq!(suffix, suffix.to_lowercase(), "an id reads lowercase");
+        assert!(
+            suffix.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            "{suffix} should be a URL path segment with nothing to escape"
+        );
+        assert!(
+            suffix
+                .bytes()
+                .all(|byte| PAIRING_CODE_ALPHABET.contains(&byte.to_ascii_uppercase())),
+            "{suffix} should share the alphabet that omits 0O1I, which is what \
+             makes it safe to read off a screen"
+        );
+    }
+
+    /// The same weak-but-sufficient check [`codes_do_not_repeat`] makes, for the
+    /// same reason: two data directories minting the same suffix is the one
+    /// failure that would put this ticket's own bug back.
+    #[test]
+    fn identifier_suffixes_do_not_repeat() {
+        let suffixes: HashSet<String> =
+            (0..32).map(|_| identifier_suffix().expect("randomness")).collect();
+        assert_eq!(suffixes.len(), 32);
     }
 
     /// Every alphabet position is reachable. A generator that could only ever
