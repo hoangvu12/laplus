@@ -220,9 +220,10 @@ lever. On CI it is a real failure and still open.
 
 ## What the Linux job has not yet said
 
-**It has never run.** The job only fires on push, so everything above about
-Linux is an argument from the source rather than a result. What the first run
-should be checked against rather than assumed:
+**It has never run.** The job fires on push to `main` and on pull requests
+touching `server/`, and this work has done neither yet — so everything above
+about Linux is an argument from the source rather than a result. What the first
+run should be checked against rather than assumed:
 
 - The ConPTY failure, which is Windows-specific and should **pass** on Linux.
 - Anything the `cfg(not(windows))` paths get wrong. This is the ticket's

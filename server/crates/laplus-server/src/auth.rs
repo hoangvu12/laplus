@@ -1,11 +1,10 @@
-//! Who may talk to this server: the origin half.
+//! Who may talk to this server: the reading half.
 //!
-//! This module answers one question — is this request *from* somewhere this
-//! server will listen to, and what did it present? — and answers it without
-//! touching a database or a web framework. The other half of the answer, does
-//! the presented credential verify, is a database read and lives in
-//! [`crate::server`] against [`crate::store`]. Neither half is sufficient
-//! alone.
+//! This module answers one question — what did this request present? — and
+//! answers it without touching a database or a web framework. The other half of
+//! the answer, does the presented credential verify, is a database read and
+//! lives in [`crate::server`] against [`crate::store`]. Neither half is
+//! sufficient alone.
 //!
 //! The policy:
 //!
@@ -120,9 +119,8 @@ impl Rejection {
     ///
     /// Ticket 73's routes, which are the first thing in this server that
     /// verifies a credential against anything at all. [`authorize`] does not
-    /// build one of these: what it refuses is an origin, and it reports that
-    /// through the same `invalid_credential` for the reason
-    /// [`Rejection::body`] gives.
+    /// build one of these — it refuses nothing at all now that the origin rule
+    /// is gone, and returns a [`Presented`] for its caller to check.
     pub fn invalid_credential(detail: impl Into<String>) -> Rejection {
         Rejection::new(detail)
     }
@@ -144,14 +142,17 @@ impl Rejection {
 
     /// The JSON body to return with `401 Unauthorized`.
     ///
-    /// For a refusal from [`authorize`], `reason` is `invalid_credential` even
-    /// though what was actually wrong was the origin. The contract's
-    /// `EnvironmentAuthInvalidReason` is a closed union of
-    /// `missing_credential | invalid_credential`, and upstream has no origin
-    /// check to have added a third member for. Reusing the closed union keeps
-    /// the body decodable by the unmodified client; inventing a reason would
-    /// not. The real cause is in [`Rejection::detail`], which stays
-    /// server-side.
+    /// `reason` carries only what the contract's `EnvironmentAuthInvalidReason`
+    /// allows — a closed union of `missing_credential | invalid_credential` —
+    /// so a refusal whose real cause is neither is reported as
+    /// `invalid_credential` rather than given an invented third member, which
+    /// would cost the client its ability to decode the body at all. The real
+    /// cause is in [`Rejection::detail`], which stays server-side.
+    ///
+    /// This paragraph used to be about the origin check, which was the one
+    /// refusal that had no honest member here. That check is gone and the
+    /// argument outlived it: every refusal this server now makes is genuinely
+    /// about a credential.
     pub fn body(&self) -> AuthInvalidBody {
         AuthInvalidBody {
             tag: "EnvironmentAuthInvalidError",
@@ -174,12 +175,16 @@ impl Rejection {
 pub struct UpgradeRequest<'a> {
     /// The raw query string, without the leading `?`.
     pub query: Option<&'a str>,
+    /// **Read and consulted by nothing**, since the origin rule was removed —
+    /// see [`authorize`]. Kept because it is what a refusal is logged with, and
+    /// because ticket 02 of the headless-Linux effort needs the header when it
+    /// answers a second origin with CORS.
     pub origin: Option<&'a str>,
     pub authorization: Option<&'a str>,
     pub cookie: Option<&'a str>,
 }
 
-/// A credential that got past the origin check, and the token to verify it by.
+/// What arrived, and the token to verify it by.
 ///
 /// **This module does not verify it.** Verification is a database read and
 /// [`crate::store`] is the only file that speaks SQL, so what `authorize`

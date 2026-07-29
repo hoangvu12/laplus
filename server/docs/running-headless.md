@@ -53,9 +53,12 @@ Nothing else in the dependency set needs a system library. `portable-pty` uses
 The `environment.label` a paired client shows comes from `COMPUTERNAME`, then
 `HOSTNAME`, then `/etc/hostname`. The third was added by ticket 05: `HOSTNAME`
 is a _shell_ variable on most distributions and is not exported, so a server
-started by systemd, by Docker, or over `ssh host cmd` sees neither of the first
-two — and every headless laplus answered `"laplus"`, which distinguishes no
-machine from any other at exactly the moment there is more than one.
+started by systemd or over `ssh host cmd` sees neither of the first two — and a
+headless laplus answered `"laplus"`, which distinguishes no machine from any
+other at exactly the moment there is more than one.
+
+A container is the exception worth knowing: Docker exports `HOSTNAME`, so the
+second source answers there and the file is never read.
 
 A box with no `/etc/hostname` still answers `"laplus"`. That is the honest
 fallback rather than a bug.

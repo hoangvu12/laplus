@@ -577,12 +577,14 @@ fn policy_for(remote_access: &crate::remote_access::RemoteAccess) -> &'static st
 ///
 /// Three sources, in the order of how much each knows about *this* box.
 /// `COMPUTERNAME` is set by Windows for every process. `HOSTNAME` is asked
-/// second and is nearly always absent off Windows — bash sets it as a *shell*
-/// variable and does not export it, so a server started by systemd, by Docker,
-/// or over `ssh host cmd` never sees it. That left `/etc/hostname`, added by
-/// ticket 05 of the headless-Linux effort: without it every headless laplus
-/// answered `"laplus"`, and a user pairing a phone against three of them would
-/// have been shown one name three times.
+/// second and is usually absent off Windows — bash sets it as a *shell*
+/// variable and does not export it, so a server started by systemd or over
+/// `ssh host cmd` never sees it. (A container is the exception: Docker exports
+/// `HOSTNAME` to the process, so the second source answers there and the third
+/// is not reached.) That left `/etc/hostname`, added by ticket 05 of the
+/// headless-Linux effort: without it a headless laplus answered `"laplus"`, and
+/// a user pairing a phone against three of them would have been shown one name
+/// three times.
 fn machine_label() -> String {
     non_empty_env("COMPUTERNAME")
         .or_else(|| non_empty_env("HOSTNAME"))
