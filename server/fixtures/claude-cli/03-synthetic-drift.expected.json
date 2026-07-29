@@ -35,8 +35,11 @@
     "num_turns": 1,
     "duration_ms": 1234,
     "total_cost_usd": 0.01,
-    "error": null
+    "error": null,
+    "token_usage": null
   },
+  "token_usage": null,
+  "context_window": null,
   "unknown_events": 3,
   "parse_errors": 1
 }

@@ -84,8 +84,23 @@
     "num_turns": 2,
     "duration_ms": 5615,
     "total_cost_usd": 0.0214254,
-    "error": null
+    "error": null,
+    "token_usage": {
+      "used_tokens": 26940,
+      "total_processed_tokens": 54145,
+      "max_tokens": 200000,
+      "input_tokens": 26925,
+      "output_tokens": 15
+    }
   },
+  "token_usage": {
+    "used_tokens": 26940,
+    "total_processed_tokens": 54145,
+    "max_tokens": 200000,
+    "input_tokens": 26925,
+    "output_tokens": 15
+  },
+  "context_window": 200000,
   "unknown_events": 0,
   "parse_errors": 0
 }

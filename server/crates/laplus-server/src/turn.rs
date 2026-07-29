@@ -193,7 +193,7 @@ use crate::clock::{iso_from_epoch, now_iso};
 use crate::config::ClaudeSettings;
 use crate::process::Search;
 use crate::protocol::{
-    Compaction, ContentBlock, Drift, Folded, Permission, RateLimit, SessionState,
+    Compaction, ContentBlock, Drift, Folded, Permission, RateLimit, SessionState, TokenUsage,
 };
 use crate::settling::SessionStatus;
 use crate::threads::{
@@ -286,6 +286,7 @@ async fn drive(
         interrupts: 0,
         drift_reported: Drift::default(),
         finished: None,
+        reported_usage: None,
     };
     // A turn that arrived while another was still running. Held rather than
     // sent: sending it would orphan the turn in flight — that turn would never
@@ -777,6 +778,16 @@ struct Driving {
     /// Written by exactly one arm of [`publish`] and taken by the loop on the
     /// next statement, so it is never carried across an iteration.
     finished: Option<Finished>,
+    /// The last context-window reading the client was told about.
+    ///
+    /// Kept so an unchanged reading is not published again. The CLI repeats its
+    /// counts — the `result` at the end of a turn usually agrees with the last
+    /// assistant message of that turn — and a row per repetition would be a row
+    /// per message on the thread, each one saying what the one before it said.
+    /// Per session rather than per turn, because the repetition crosses the
+    /// boundary: a turn that asked the agent nothing new ends where the last one
+    /// did.
+    reported_usage: Option<TokenUsage>,
 }
 
 /// A turn that ended in a way a checkpoint can describe.
@@ -803,6 +814,21 @@ impl Driving {
         unreported
     }
 
+    /// The context-window row the client has not been told yet, if the reading
+    /// has moved, and a note that it has now been told.
+    ///
+    /// `None` when nothing has changed, which is most lines: the counts arrive
+    /// on every assistant message and on the `result`, and the last two of those
+    /// usually agree.
+    fn usage_to_report(&mut self, folding: &SessionState) -> Option<TokenUsage> {
+        let reading = folding.token_usage.clone()?;
+        if self.reported_usage.as_ref() == Some(&reading) {
+            return None;
+        }
+        self.reported_usage = Some(reading.clone());
+        Some(reading)
+    }
+
     /// Take every request still waiting, so the caller can close it.
     fn take_outstanding(&mut self) -> Vec<Permission> {
         let mut open: Vec<Permission> = std::mem::take(&mut self.outstanding)
@@ -813,6 +839,33 @@ impl Driving {
         open.sort_by(|left, right| left.request_id.cmp(&right.request_id));
         open
     }
+}
+
+/// How full the context window is, as the row the composer's meter reads.
+///
+/// The client never renders this row in the work log — `session-logic.ts` skips
+/// the kind in `deriveWorkLogEntries` — it walks the activity list backwards for
+/// the newest one and draws the meter from it
+/// (`apps/web/src/lib/contextWindow.ts`, `deriveLatestContextWindowSnapshot`).
+/// So the row is a carrier rather than something a developer reads, and its
+/// summary exists only because the contract requires a non-empty one.
+fn context_window_row(usage: &TokenUsage, turn_id: Option<String>) -> Activity {
+    Activity::info(
+        "context-window.updated",
+        "Context window updated",
+        json!({
+            "usedTokens": usage.used_tokens,
+            // The same number as `usedTokens` on this path. The contract carries
+            // both because a provider that compacts mid-turn ends below where it
+            // peaked, and the client shows the peak as the turn's cost.
+            "lastUsedTokens": usage.used_tokens,
+            "totalProcessedTokens": usage.total_processed_tokens,
+            "maxTokens": usage.max_tokens,
+            "inputTokens": usage.input_tokens,
+            "outputTokens": usage.output_tokens,
+        }),
+        turn_id,
+    )
 }
 
 /// Tell the agent what the developer decided, and say so in the conversation.
@@ -1299,8 +1352,29 @@ fn publish(
     driving: &mut Driving,
     line: &str,
 ) {
+    let folded = folding.fold_line(line);
+
+    // How full the context window is, reported here rather than from each arm
+    // that might have moved it. Two kinds of line carry the counts — every
+    // assistant message during a turn, and the `result` that ends one — and both
+    // are already handled below for other reasons; asking once, where the answer
+    // is the same question, keeps the arms about what they are about.
+    //
+    // Ahead of the match rather than inside it, which is what puts this in front
+    // of `turn.completed` on the line that ends a turn: the row a developer
+    // actually reads stays the last thing in it. The client never renders this
+    // one — see [`context_window_row`].
+    let moved = driving.usage_to_report(folding);
+    if let Some(usage) = moved {
+        let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(context_window_row(&usage, turn_id)),
+        );
+    }
+
     let turn = &mut driving.turn;
-    match folding.fold_line(line) {
+    match folded {
         Folded::Nothing => {}
 
         // The agent has stopped and is waiting for the developer. The row is what
@@ -1821,6 +1895,7 @@ mod tests {
             duration_ms,
             total_cost_usd: cost,
             error: None,
+            token_usage: None,
         });
         state
     }

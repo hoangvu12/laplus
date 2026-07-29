@@ -489,6 +489,111 @@ async fn a_turn_reports_its_model_its_permission_mode_and_what_it_cost() {
     server.stop().await;
 }
 
+/// How full the context window is, which the composer draws its meter from
+/// (`apps/web/src/components/chat/ContextWindowMeter.tsx`, fed by
+/// `deriveLatestContextWindowSnapshot`).
+///
+/// Replays the two-tool-call capture rather than a plain turn, because the whole
+/// difficulty is in that capture: its `usage` reports 52,763 tokens across the
+/// turn and the conversation is carrying 26,441. A meter reading the first would
+/// show a 200k window twice as full as it is, and would climb further with every
+/// tool call — so this asserts the smaller number, and asserts the larger one is
+/// carried separately rather than dropped.
+///
+/// The client reads this from the thread snapshot as well as from the live
+/// event, so both are checked: a developer opening a thread they have not
+/// touched this session gets the meter from the snapshot alone.
+#[tokio::test]
+async fn a_turn_reports_how_full_the_context_window_is() {
+    let agent = ScriptedAgent::replaying("06-several-tool-calls");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "read both files"),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let rows: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| {
+            event["type"] == "thread.activity-appended"
+                && event["payload"]["activity"]["kind"] == "context-window.updated"
+        })
+        .map(|event| &event["payload"]["activity"])
+        .collect();
+    let readings: Vec<&Value> = rows.iter().map(|row| &row["payload"]).collect();
+
+    // The climb. This capture carries ten sets of counts and reports five: five
+    // assistant messages of which three repeat the one before, two
+    // `message_delta`s, two `message_start`s this build does not read, and the
+    // `result`. The meter moves when the conversation does and stays still when
+    // it does not.
+    //
+    // 26322 and the first 26441 are the streaming readings — they arrive while
+    // the message they belong to is still being written, which is the whole
+    // difference between a meter that moves during a turn and one that moves
+    // twice in it.
+    assert_eq!(
+        readings
+            .iter()
+            .map(|reading| reading["usedTokens"].clone())
+            .collect::<Vec<Value>>(),
+        vec![
+            json!(26_089),
+            json!(26_322),
+            json!(26_402),
+            json!(26_441),
+            json!(26_441),
+        ],
+    );
+
+    // Mid-turn there is no window to measure against — `modelUsage` arrives only
+    // on the `result` — so the client draws a token count and no percentage
+    // until the turn ends. On the turns after this one the window is remembered
+    // and the percentage is there from the first reading.
+    assert_eq!(readings[0]["maxTokens"], json!(null));
+    assert_eq!(readings[0]["totalProcessedTokens"], json!(null));
+
+    // The last two readings agree on the count and differ on everything else:
+    // the `result` repeats what the final `message_delta` already said and adds
+    // the window it is measured against. That is why an unchanged `usedTokens`
+    // is not on its own a reason to stay silent.
+    assert_eq!(readings[3]["usedTokens"], readings[4]["usedTokens"]);
+    assert_eq!(readings[3]["maxTokens"], json!(null));
+
+    // The turn's last word, and the reading the meter settles on.
+    let settled = readings.last().expect("a settled reading");
+    assert_eq!(settled["maxTokens"], json!(200_000));
+    assert_eq!(settled["totalProcessedTokens"], json!(52_763));
+    assert_eq!(settled["inputTokens"], json!(26_400));
+    assert_eq!(settled["outputTokens"], json!(41));
+
+    let snapshot = server.connect().await.into_thread_snapshot("thread-1").await;
+    let activities = snapshot["thread"]["activities"]
+        .as_array()
+        .expect("activities");
+    // Backwards, which is the direction the client reads them in
+    // (`deriveLatestContextWindowSnapshot`): the newest row is the reading.
+    let stored = activities
+        .iter()
+        .rev()
+        .find(|activity| activity["kind"] == "context-window.updated")
+        .expect("the meter's row survives into the snapshot");
+    assert_eq!(stored["payload"]["usedTokens"], json!(26_441));
+    assert_eq!(stored["turnId"], rows.last().expect("a row")["turnId"]);
+
+    client.close().await;
+    server.stop().await;
+}
+
 /// The agent's working directory is the project's folder. Observed by having the
 /// agent write a file where it stands, because a relative path in a transcript
 /// only means what the developer thinks it means if this is true.

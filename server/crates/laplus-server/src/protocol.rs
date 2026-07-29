@@ -379,6 +379,12 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
     #[serde(default)]
     pub stop_reason: Option<String>,
+    /// This message's token counts, which are the *conversation's* — every
+    /// request re-sends the whole thing, so what went into this message is what
+    /// the context is carrying. Read to move the meter while the turn is still
+    /// running; the `result` line corrects it at the end.
+    #[serde(default)]
+    pub usage: Option<UsageCounts>,
 }
 
 /// The message's blocks, with anything this build cannot read reduced to
@@ -495,7 +501,13 @@ pub enum StreamEvent {
     ContentBlockStart { index: usize },
     ContentBlockDelta { index: usize, delta: Delta },
     ContentBlockStop { index: usize },
-    MessageDelta {},
+    /// The end of a streamed message, and the finest-grained reading of the
+    /// context window this protocol offers: it arrives while the turn is still
+    /// running and carries the whole count set, not just the output side.
+    MessageDelta {
+        #[serde(default)]
+        usage: Option<UsageCounts>,
+    },
     MessageStop,
     #[serde(other)]
     Unknown,
@@ -532,6 +544,181 @@ pub struct ResultEvent {
     /// [`ResultEvent::complaint`].
     #[serde(default)]
     pub result: Option<String>,
+    /// The turn's token counts. Read for the context meter — see
+    /// [`ResultEvent::token_usage`].
+    #[serde(default)]
+    pub usage: Option<ResultUsage>,
+    /// Per-model totals, keyed by the model as the CLI names it
+    /// (`"claude-opus-5[1m]"`). The only place in the wire format that says how
+    /// large the context window *is*, which is what turns a token count into a
+    /// meter.
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: BTreeMap<String, ModelUsage>,
+
+    // The rest of the line. Declared rather than consumed — ticket 40 asked for
+    // them while the struct was open, on the argument that a field serde drops
+    // silently is a field nobody can discover is there. Nothing reads these yet,
+    // and because they do not reach [`ResultSummary`] the golden files cannot
+    // see them either: declaring stops the silent drop, it does not buy drift
+    // detection. That comes when something consumes them.
+    /// Tools the developer refused, which the CLI reports even though the
+    /// refusals were already seen one at a time as control responses.
+    #[serde(default)]
+    pub permission_denials: Vec<PermissionDenial>,
+    /// How the turn ended, said outright — `completed`, `aborted_streaming`,
+    /// `error`.
+    ///
+    /// [`crate::turn`]'s `Ending` infers the same thing from what did or did not
+    /// happen. Preferring this over the inference is deliberately **not** done
+    /// here: ticket 40 put the field in scope and the behaviour change out of it.
+    #[serde(default)]
+    pub terminal_reason: Option<String>,
+    /// The API's own error standing. Every capture has it as `null`, so its type
+    /// when it is *not* null has never been observed — a status number and a
+    /// status string are both plausible. Left as a `Value` rather than guessed
+    /// at, so whichever it turns out to be parses instead of failing the line.
+    #[serde(default)]
+    pub api_error_status: Option<Value>,
+    #[serde(default)]
+    pub fast_mode_state: Option<String>,
+    /// Time to first token, and the API's own share of the turn's duration.
+    /// Beside `duration_ms`, which is the whole turn including this server.
+    #[serde(default)]
+    pub ttft_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_api_ms: Option<u64>,
+}
+
+/// One tool the developer would not allow.
+///
+/// Every field optional: this is declared rather than consumed, and a shape that
+/// drifted should not cost the `result` line it rides on — the module's rule
+/// that a format change has the blast radius of one block, applied to a field.
+#[derive(Debug, Default, Deserialize)]
+pub struct PermissionDenial {
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<Value>,
+}
+
+/// The four token counts the CLI reports, in the one shape it reports them in.
+///
+/// Shared between the `usage` object and each of its `iterations`, because they
+/// carry the same fields and are read the same way — the difference is what they
+/// *mean*, which is [`ResultEvent::token_usage`]'s problem rather than this
+/// struct's.
+///
+/// Every field is optional: the CLI omits a count it has nothing to say about,
+/// and a missing count is zero rather than a parse failure.
+#[derive(Debug, Default, Deserialize)]
+pub struct UsageCounts {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+}
+
+impl UsageCounts {
+    /// Everything that went *in*, cache included.
+    ///
+    /// The cached counts are added rather than passed over because the context
+    /// window does not care how a token got there: a cache read occupies the
+    /// same room as a fresh one, and leaving them out reports a window that is
+    /// nearly empty on a conversation that is nearly full.
+    fn input(&self) -> u64 {
+        self.input_tokens.unwrap_or(0)
+            + self.cache_creation_input_tokens.unwrap_or(0)
+            + self.cache_read_input_tokens.unwrap_or(0)
+    }
+
+    fn output(&self) -> u64 {
+        self.output_tokens.unwrap_or(0)
+    }
+
+    /// The CLI's own total when it gave one, and the sum when it did not.
+    ///
+    /// `None` rather than `0` for a set of counts that is entirely absent or
+    /// entirely zero, so a caller can tell "nothing was reported" from "nothing
+    /// was used".
+    fn total(&self) -> Option<u64> {
+        if let Some(total) = self.total_tokens.filter(|total| *total > 0) {
+            return Some(total);
+        }
+        let summed = self.input() + self.output();
+        (summed > 0).then_some(summed)
+    }
+
+    /// These counts as a reading of a window of `max_tokens`.
+    ///
+    /// `None` for counts that are absent or all zero, so a turn that ended
+    /// before the API was reached reports nothing rather than blanking a meter
+    /// the previous turn had filled in.
+    ///
+    /// `total_processed_tokens` is left unset: it is not a property of one set
+    /// of counts but of how a *turn's* counts compare with the conversation's,
+    /// which only [`ResultEvent::token_usage`] is in a position to say.
+    fn reading(&self, max_tokens: Option<u64>) -> Option<TokenUsage> {
+        let active_tokens = self.total()?;
+        Some(TokenUsage {
+            used_tokens: max_tokens.map_or(active_tokens, |window| active_tokens.min(window)),
+            total_processed_tokens: None,
+            max_tokens,
+            input_tokens: self.input(),
+            output_tokens: self.output(),
+        })
+    }
+}
+
+/// The `usage` object on a `result` line.
+///
+/// `iterations` is the part that matters and the part that is easy to miss: the
+/// top level accumulates *the whole turn*, so on a turn that made ten tool calls
+/// it is roughly ten times the context actually in use. The last iteration is
+/// the state the conversation is actually in. See [`ResultEvent::token_usage`].
+#[derive(Debug, Default, Deserialize)]
+pub struct ResultUsage {
+    #[serde(flatten)]
+    pub counts: UsageCounts,
+    #[serde(default)]
+    pub iterations: Vec<UsageCounts>,
+}
+
+/// One model's entry in `modelUsage`. Only the window is read; the costs and
+/// call counts beside it are the CLI's accounting rather than this server's.
+#[derive(Debug, Deserialize)]
+pub struct ModelUsage {
+    #[serde(default, rename = "contextWindow")]
+    pub context_window: Option<u64>,
+}
+
+/// How full the context window is, as the client's meter reads it.
+///
+/// Field names follow the contract's `ThreadTokenUsageSnapshot`
+/// (`packages/contracts/src/providerRuntime.ts`) rather than the CLI's wire
+/// names, because this is the shape that leaves the server — the translation
+/// happens once, here, at the point where the CLI's vocabulary is still in view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TokenUsage {
+    /// What the conversation is carrying now, clamped to the window.
+    pub used_tokens: u64,
+    /// Everything the turn processed, tool iterations included, and **only when
+    /// it exceeds `used_tokens`** — otherwise it is the same number twice and
+    /// the client would show a second figure that says nothing.
+    pub total_processed_tokens: Option<u64>,
+    /// The window itself. `None` when `modelUsage` did not say, which the client
+    /// renders as a token count without a percentage rather than as a full bar.
+    pub max_tokens: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl ResultEvent {
@@ -557,6 +744,58 @@ impl ResultEvent {
             .filter(|said| !said.is_empty())
             .map(str::to_string)
             .or_else(|| self.subtype.clone())
+    }
+
+    /// How full the context window is, from the counts on this line.
+    ///
+    /// Two numbers come out of `usage` and they are not interchangeable. The
+    /// **last iteration** is the context the conversation is actually carrying,
+    /// because each iteration re-sends the whole conversation and the last one
+    /// therefore *is* the conversation; the **top level** is everything the turn
+    /// processed, which on a turn with tool calls counts the same context over
+    /// and over. The meter wants the first. The second is reported beside it
+    /// only when it is the larger of the two, which is what makes it worth
+    /// saying.
+    ///
+    /// The window comes from the largest `modelUsage[*].contextWindow`: a turn
+    /// that changed model has two entries, and the conversation has to fit the
+    /// one still in use.
+    ///
+    /// `None` when nothing was reported — a turn that failed before the API was
+    /// reached has a `usage` of zeroes, and publishing that would blank a meter
+    /// the previous turn had filled in.
+    ///
+    /// Mirrors `normalizeClaudeActiveTokenUsage` in the reference server
+    /// (`reference/t3code-server/src/provider/Layers/ClaudeAdapter.ts`).
+    ///
+    /// `known_window` is what the session has been told before now, used when
+    /// this line did not say — see [`SessionState::context_window`].
+    pub fn token_usage(&self, known_window: Option<u64>) -> Option<TokenUsage> {
+        let usage = self.usage.as_ref()?;
+        // The last iteration, because each one re-sends the whole conversation
+        // and the last one therefore *is* the conversation. The top level is the
+        // turn's running total, which counts the same context once per tool call.
+        let active = usage.iterations.last().unwrap_or(&usage.counts);
+        let mut reading = active.reading(self.context_window().or(known_window))?;
+        // Everything the turn processed, and only when it exceeds what the
+        // conversation is carrying — otherwise it is the same number twice.
+        reading.total_processed_tokens = usage
+            .counts
+            .total()
+            .filter(|total| *total > reading.used_tokens);
+        Some(reading)
+    }
+
+    /// The largest window any model on this turn was running with.
+    ///
+    /// Largest rather than first: a turn that changed model has two entries, and
+    /// the conversation has to fit the one still in use.
+    pub fn context_window(&self) -> Option<u64> {
+        self.model_usage
+            .values()
+            .filter_map(|model| model.context_window)
+            .filter(|window| *window > 0)
+            .max()
     }
 }
 
@@ -598,6 +837,30 @@ pub struct SessionState {
     pub permissions: Vec<Permission>,
 
     pub last_result: Option<ResultSummary>,
+
+    /// How full the context window is, as of the last line that said anything
+    /// about it — an assistant message during a turn, a `result` at the end of
+    /// one.
+    ///
+    /// Per session rather than per turn, because the meter is about the
+    /// *conversation* rather than about the turn that last moved it: a thread
+    /// sitting idle between turns is still holding its context, and a reading
+    /// that expired with the turn would blank the meter every time the agent
+    /// stopped talking.
+    pub token_usage: Option<TokenUsage>,
+    /// How large the window is, remembered from the last `result` that said.
+    ///
+    /// Held separately from the reading above because the two arrive on
+    /// different lines and only one of them repeats: `modelUsage` appears on the
+    /// terminal `result` and nowhere else, while the counts that move the meter
+    /// arrive on every assistant message. Without this, every mid-turn reading
+    /// would be a token count with no window to measure it against, and the
+    /// meter would show a percentage only at the moment each turn ended.
+    ///
+    /// The reference server keeps the same thing for the same reason —
+    /// `lastKnownContextWindow` in `ClaudeAdapter.ts`.
+    pub context_window: Option<u64>,
+
     /// Protocol-drift telemetry: event types we did not recognize.
     pub unknown_events: usize,
     pub parse_errors: usize,
@@ -696,6 +959,9 @@ pub struct ResultSummary {
     /// and the whole point of reporting an error rather than crashing is that
     /// the developer can decide whether to retry.
     pub error: Option<String>,
+    /// How full the context window is after this turn. `None` when the CLI
+    /// reported no counts — see [`ResultEvent::token_usage`].
+    pub token_usage: Option<TokenUsage>,
 }
 
 /// A session's tally of what this build could not read.
@@ -820,8 +1086,27 @@ impl SessionState {
                     self.bump("stream/content_block_stop");
                     Folded::Nothing
                 }
-                StreamEvent::MessageDelta {} => {
+                StreamEvent::MessageDelta { usage } => {
                     self.bump("stream/message_delta");
+                    // The earliest the meter can move. The buffered `assistant`
+                    // message says the same thing later — this is the same
+                    // conversation counted before the message it belongs to has
+                    // finished arriving.
+                    //
+                    // Only a reading with an input side is taken. The Messages
+                    // API is free to send a `message_delta` carrying nothing but
+                    // `output_tokens`, and this CLI does send the full set; the
+                    // guard is for the version that does not, because a reading
+                    // built from the output side alone is not a picture of the
+                    // conversation and would collapse the meter from tens of
+                    // thousands of tokens to tens.
+                    let window = self.context_window;
+                    let reading = usage
+                        .filter(|counts| counts.input() > 0)
+                        .and_then(|counts| counts.reading(window));
+                    if reading.is_some() {
+                        self.token_usage = reading;
+                    }
                     Folded::Nothing
                 }
                 StreamEvent::Unknown => {
@@ -837,6 +1122,20 @@ impl SessionState {
                 // Reconcile: the buffered message is authoritative.
                 let text = visible(&env.message);
                 let from_deltas = !self.live_text.is_empty() && self.live_text == text;
+                // Before `message` is moved into the transcript. A turn that
+                // uses tools emits several of these, each carrying a larger
+                // conversation than the last, which is what makes the meter
+                // climb during the turn rather than jump at the end of it.
+                let window = self.context_window;
+                let reading = env
+                    .message
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.reading(window));
+                if reading.is_some() {
+                    self.token_usage = reading;
+                }
+
                 self.transcript.push(Turn {
                     role: env.message.role,
                     text,
@@ -873,6 +1172,21 @@ impl SessionState {
                 self.bump("result");
                 self.streaming = false;
                 let error = r.complaint();
+                let token_usage = r.token_usage(self.context_window);
+                // Remembered before the reading is stored, so the next turn's
+                // mid-turn readings have a window to measure against. A `result`
+                // that carried no `modelUsage` leaves the last known one alone
+                // rather than forgetting it — `fixtures/claude-cli/15` is one,
+                // and forgetting would drop the meter to a bare token count.
+                if let Some(window) = r.context_window() {
+                    self.context_window = Some(window);
+                }
+                // Kept only when this line said something. A turn that failed
+                // before the API was reached reports zeroes, and letting those
+                // through would blank a meter the previous turn had filled in.
+                if let Some(reading) = &token_usage {
+                    self.token_usage = Some(reading.clone());
+                }
                 self.last_result = Some(ResultSummary {
                     is_error: r.is_error,
                     stop_reason: r.stop_reason,
@@ -880,6 +1194,7 @@ impl SessionState {
                     duration_ms: r.duration_ms,
                     total_cost_usd: r.total_cost_usd,
                     error,
+                    token_usage,
                 });
                 Folded::Completed
             }
@@ -1739,5 +2054,281 @@ mod tests {
             ]),
             vec![Folded::Nothing; 4]
         );
+    }
+
+    /// The reading that separates a meter from a wrong meter.
+    ///
+    /// The counts below are one conversation of ~26k sent twice, because the
+    /// turn made a tool call. Reading the top level reports 53k of a 200k
+    /// window — twice the truth, and it climbs with every tool call a turn
+    /// makes, so a long turn would show the context nearly full on a
+    /// conversation with plenty of room. The last iteration is the
+    /// conversation.
+    #[test]
+    fn a_turn_with_tool_calls_measures_the_last_iteration_not_the_whole_turn() {
+        let state = fold(&[&json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "usage": {
+                "input_tokens": 6,
+                "cache_creation_input_tokens": 1_183,
+                "cache_read_input_tokens": 51_206,
+                "output_tokens": 43,
+                "iterations": [
+                    { "input_tokens": 4, "cache_read_input_tokens": 25_000, "output_tokens": 20 },
+                    { "input_tokens": 2, "cache_read_input_tokens": 26_210, "output_tokens": 43 },
+                ],
+            },
+            "modelUsage": { "claude-opus-5": { "contextWindow": 200_000 } },
+        })
+        .to_string()]);
+
+        assert_eq!(
+            state.last_result.and_then(|result| result.token_usage),
+            Some(TokenUsage {
+                used_tokens: 26_255,
+                total_processed_tokens: Some(52_438),
+                max_tokens: Some(200_000),
+                input_tokens: 26_212,
+                output_tokens: 43,
+            })
+        );
+    }
+
+    /// A turn that ended before the API was reached reports zeroes. Publishing
+    /// those would blank a meter the previous turn had filled in, so nothing is
+    /// reported and the last good reading stands.
+    /// `fixtures/claude-cli/11-interrupted-turn.ndjson` is a recorded one.
+    #[test]
+    fn a_turn_that_used_nothing_reports_no_usage_at_all() {
+        let state = fold(&[&json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+            },
+            "modelUsage": {},
+        })
+        .to_string()]);
+
+        assert_eq!(state.last_result.and_then(|result| result.token_usage), None);
+    }
+
+    /// No `modelUsage` is a count without a ceiling, which is worth reporting:
+    /// the client renders a token figure and no percentage. The alternative —
+    /// dropping the reading — leaves the meter empty on a turn whose size is
+    /// perfectly well known.
+    #[test]
+    fn a_turn_that_did_not_say_how_large_the_window_is_still_reports_its_size() {
+        let state = fold(&[&json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "usage": { "input_tokens": 900, "output_tokens": 100 },
+        })
+        .to_string()]);
+
+        assert_eq!(
+            state.last_result.and_then(|result| result.token_usage),
+            Some(TokenUsage {
+                used_tokens: 1_000,
+                total_processed_tokens: None,
+                max_tokens: None,
+                input_tokens: 900,
+                output_tokens: 100,
+            })
+        );
+    }
+
+    /// The meter moves while the turn is still running.
+    ///
+    /// Each assistant message carries the conversation as it stood when that
+    /// message was requested, so a turn using tools reports a larger one each
+    /// time. Without this the meter would sit still for the length of a turn and
+    /// jump at the end of it — which on a long turn is the whole time a
+    /// developer is watching.
+    #[test]
+    fn each_assistant_message_moves_the_reading_before_the_turn_ends() {
+        let message = |cache_read: u64, output: u64| {
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "working" }],
+                    "usage": {
+                        "input_tokens": 10,
+                        "cache_read_input_tokens": cache_read,
+                        "output_tokens": output,
+                    },
+                },
+            })
+            .to_string()
+        };
+
+        let mut state = SessionState::new();
+        state.fold_line(&message(21_481, 4));
+        let first = state.token_usage.clone().expect("a reading");
+        state.fold_line(&message(26_075, 2));
+        let second = state.token_usage.clone().expect("a reading");
+
+        assert_eq!(first.used_tokens, 21_495);
+        assert_eq!(second.used_tokens, 26_087);
+        // No `modelUsage` on an assistant message, so the first turn of a session
+        // has a count and no window to measure it against. The client draws a
+        // token figure and no percentage until the `result` says.
+        assert_eq!(first.max_tokens, None);
+
+        // The `result` both corrects the count and supplies the window.
+        state.fold_line(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "usage": { "input_tokens": 10, "cache_read_input_tokens": 26_075, "output_tokens": 41 },
+                "modelUsage": { "claude-opus-5": { "contextWindow": 200_000 } },
+            })
+            .to_string(),
+        );
+        let settled = state.token_usage.clone().expect("a reading");
+        assert_eq!(settled.used_tokens, 26_126);
+        assert_eq!(settled.max_tokens, Some(200_000));
+
+        // And the window is remembered, so the *next* turn's mid-turn readings
+        // have a percentage from their first message.
+        assert_eq!(state.context_window, Some(200_000));
+        state.fold_line(&message(30_000, 5));
+        assert_eq!(
+            state.token_usage.expect("a reading").max_tokens,
+            Some(200_000)
+        );
+    }
+
+    /// `message_delta` is the earliest the meter can move — while the message it
+    /// belongs to is still arriving, rather than once it has.
+    #[test]
+    fn a_streamed_message_moves_the_reading_before_the_message_is_complete() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": {
+                        "input_tokens": 2,
+                        "cache_creation_input_tokens": 6_911,
+                        "cache_read_input_tokens": 20_504,
+                        "output_tokens": 4,
+                    },
+                },
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            state.token_usage.expect("a reading").used_tokens,
+            27_421
+        );
+    }
+
+    /// A `message_delta` carrying only the output side is not a picture of the
+    /// conversation. The Messages API is free to send one, and taking it would
+    /// collapse the meter from tens of thousands of tokens to single digits.
+    #[test]
+    fn a_streamed_reading_with_no_input_side_is_not_taken() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "usage": { "input_tokens": 30_000, "output_tokens": 5 },
+                },
+            })
+            .to_string(),
+        );
+        state.fold_line(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": { "output_tokens": 9 },
+                },
+            })
+            .to_string(),
+        );
+
+        // The full reading stands; the partial one is ignored.
+        assert_eq!(
+            state.token_usage.expect("a reading").used_tokens,
+            30_005
+        );
+    }
+
+    /// A `result` that carried no `modelUsage` does not make the session forget
+    /// the window it already knew. `fixtures/claude-cli/15` is one, and
+    /// forgetting would drop a filled meter back to a bare token count.
+    #[test]
+    fn a_result_without_a_window_leaves_the_known_one_alone() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "usage": { "input_tokens": 1_000, "output_tokens": 10 },
+                "modelUsage": { "claude-opus-5": { "contextWindow": 200_000 } },
+            })
+            .to_string(),
+        );
+        state.fold_line(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "usage": { "input_tokens": 0, "output_tokens": 0 },
+                "modelUsage": {},
+            })
+            .to_string(),
+        );
+
+        assert_eq!(state.context_window, Some(200_000));
+        // And the reading that turn could not take is the one from before it,
+        // rather than nothing.
+        assert_eq!(
+            state.token_usage.expect("a reading").used_tokens,
+            1_010
+        );
+    }
+
+    /// A turn that changed model has two `modelUsage` entries, and the
+    /// conversation has to fit the window still in use.
+    #[test]
+    fn a_turn_that_changed_model_is_measured_against_the_larger_window() {
+        let state = fold(&[&json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "usage": { "input_tokens": 300_000, "output_tokens": 100 },
+            "modelUsage": {
+                "claude-sonnet-5": { "contextWindow": 200_000 },
+                "claude-opus-5[1m]": { "contextWindow": 1_000_000 },
+            },
+        })
+        .to_string()]);
+
+        let usage = state
+            .last_result
+            .and_then(|result| result.token_usage)
+            .expect("a reading");
+        assert_eq!(usage.max_tokens, Some(1_000_000));
+        assert_eq!(usage.used_tokens, 300_100);
     }
 }
