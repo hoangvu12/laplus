@@ -72,6 +72,11 @@ pub struct Requested {
     /// so. `None` is neither of them saying anything, which leaves
     /// `remote-access.json` in charge — see this module's header.
     pub network: Option<Network>,
+    /// The host to print in the startup URLs, when the operator knows one the
+    /// server cannot discover. `None` leaves the question to
+    /// [`crate::endpoints::advertised_host`], which is right on a LAN and
+    /// cannot be right everywhere — see this module's header.
+    pub advertise_host: Option<String>,
 }
 
 /// An exposure the command line or the environment insisted on, and which.
@@ -106,11 +111,16 @@ impl NetworkSource {
 /// What the plain server was asked for, from the command line and then the
 /// environment.
 pub fn requested() -> Result<Requested, String> {
-    let flags = flags_from(std::env::args().skip(1), &["port", "ui"], &["network"])?;
+    let flags = flags_from(
+        std::env::args().skip(1),
+        &["port", "ui", "advertise-host"],
+        &["network"],
+    )?;
     Ok(Requested {
         port: port_in(&flags, std::env::var("LAPLUS_PORT").ok())?,
         ui: ui_in(&flags, std::env::var("LAPLUS_UI").ok()),
         network: network_in(&flags, std::env::var("LAPLUS_NETWORK").ok())?,
+        advertise_host: advertise_host_in(&flags, std::env::var("LAPLUS_ADVERTISE_HOST").ok())?,
     })
 }
 
@@ -219,6 +229,55 @@ fn network_in(
     Ok(Some(Network { exposure, source }))
 }
 
+/// The host the startup URLs should name, argument before environment.
+///
+/// **For the box whose own address is not the one anybody reaches it at.**
+/// [`crate::endpoints::advertised_host`] asks the routing table, which is the
+/// right question on a LAN and unanswerable on a cloud instance: there the only
+/// address on the machine is the private one — `10.0.0.x` inside a VCN — and the
+/// public address is NAT'd somewhere the server cannot see. So the printed URL
+/// named a host nothing outside the subnet could reach, and the working one had
+/// to be assembled by hand by somebody who already knew that.
+///
+/// **It changes what is printed and nothing else.** The listener, the bind
+/// address and the exposure are all untouched: this is the operator telling the
+/// server a fact about the network it is on, which is why it is not validated
+/// against anything but its own shape. A host that does not resolve prints a URL
+/// that does not work, exactly as the routing table's own wrong answer already
+/// did — and unlike that one, this is a value somebody chose and can see.
+///
+/// It is honoured whether or not the server left loopback, because a tunnel is
+/// the other case this is for: `cloudflared` forwards a public hostname to
+/// `127.0.0.1`, so the server is loopback-bound and the hostname works anyway.
+///
+/// **A host, not a URL.** [`crate::Server::url_for`] supplies the scheme and
+/// takes the port from the listener, so anything carrying either would be
+/// interpolated into nonsense. Refused rather than repaired: stripping a scheme
+/// raises the question of what a port that disagrees with the listener should
+/// mean, and there is no answer to that which is not a surprise.
+fn advertise_host_in(
+    flags: &BTreeMap<String, String>,
+    environment: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(host) = flags
+        .get("advertise-host")
+        .cloned()
+        .or(environment)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if host.contains("://") || host.contains('/') || host.contains(':') {
+        return Err(format!(
+            "--advertise-host takes a host and not a URL: {host} — the scheme is \
+             http and the port comes from the listener"
+        ));
+    }
+    Ok(Some(host))
+}
+
 /// The spellings of yes and no this accepts.
 ///
 /// Wider than one word each because this value arrives from three kinds of
@@ -247,7 +306,11 @@ mod tests {
 
     /// The server's flag set, which is the wider of the two.
     fn server_flags(given: &[&str]) -> Result<BTreeMap<String, String>, String> {
-        flags_from(arguments(given), &["port", "ui"], &["network"])
+        flags_from(
+            arguments(given),
+            &["port", "ui", "advertise-host"],
+            &["network"],
+        )
     }
 
     fn port_from(given: &[&str], environment: Option<String>) -> Result<u16, String> {
@@ -279,12 +342,68 @@ mod tests {
         }))
     }
 
+    fn advertise_host_from(
+        given: &[&str],
+        environment: Option<String>,
+    ) -> Result<Option<String>, String> {
+        advertise_host_in(&server_flags(given)?, environment)
+    }
+
     #[test]
     fn nothing_asked_for_is_the_default() {
         assert_eq!(port_from(&[], None), Ok(DEFAULT_PORT));
         assert_eq!(ui_from(&[], None), Ok(None));
         // Not `Some(LocalOnly)`: nothing was said, so the file decides.
         assert_eq!(network_from(&[], None), Ok(None));
+        // Nothing insisted on, so the routing table is left to answer.
+        assert_eq!(advertise_host_from(&[], None), Ok(None));
+    }
+
+    /// A host to print, for the box whose own address is not the one anybody
+    /// reaches it at. A cloud instance is the case: the routing table names the
+    /// private VCN address, because that genuinely is the only address on the
+    /// machine, and the public one is NAT'd somewhere the server cannot see.
+    ///
+    /// Trimmed and emptied-to-`None` like [`ui_in`], for its reason: an exported
+    /// `LAPLUS_ADVERTISE_HOST=` is a common way to mean "not set".
+    #[test]
+    fn a_host_to_advertise_is_taken_from_the_argument_then_the_environment() {
+        assert_eq!(
+            advertise_host_from(&["--advertise-host", "129.150.37.24"], None),
+            Ok(Some("129.150.37.24".to_string()))
+        );
+        assert_eq!(
+            advertise_host_from(&["--advertise-host=laplus.example.com"], None),
+            Ok(Some("laplus.example.com".to_string()))
+        );
+        assert_eq!(
+            advertise_host_from(&[], Some("box.example.com".to_string())),
+            Ok(Some("box.example.com".to_string()))
+        );
+        assert_eq!(
+            advertise_host_from(&["--advertise-host", "chosen"], Some("ignored".to_string())),
+            Ok(Some("chosen".to_string()))
+        );
+        assert_eq!(
+            advertise_host_from(&["--advertise-host", "  spaced  "], None),
+            Ok(Some("spaced".to_string()))
+        );
+        assert_eq!(advertise_host_from(&[], Some("   ".to_string())), Ok(None));
+    }
+
+    /// **A host and not a URL**, which is the one mistake this flag invites: the
+    /// port comes from the listener and the scheme is `http` because that is all
+    /// this server speaks, so a value carrying either would be interpolated into
+    /// nonsense — `http://http://host:4773/`.
+    ///
+    /// Refused rather than repaired. Stripping a scheme would leave the question
+    /// of what to do with a path or a port that disagrees with the listener, and
+    /// an operator who is told the rule once types it correctly forever.
+    #[test]
+    fn a_host_to_advertise_is_not_a_url() {
+        assert!(advertise_host_from(&["--advertise-host", "http://host"], None).is_err());
+        assert!(advertise_host_from(&["--advertise-host", "host:4773"], None).is_err());
+        assert!(advertise_host_from(&["--advertise-host", "host/path"], None).is_err());
     }
 
     #[test]

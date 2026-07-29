@@ -91,10 +91,21 @@ async fn main() -> ExitCode {
     // Ticket 03. `advertised_host` is a routing-table lookup guarded on
     // exposure, so this is `None` on a loopback-bound server *and* on a box with
     // no route off itself — two states the announcement then tells apart.
-    let lan = endpoints::advertised_host(&access).map(|host| Reachable {
-        paired: server.pairing_url_for(&host),
-        plain: server.url_for(&host),
-    });
+    //
+    // `--advertise-host` wins where it was given, and is the answer for the box
+    // where the routing table's is unobtainable rather than merely absent: a
+    // cloud instance holds only its private address, and a tunnel's hostname is
+    // not on the machine at all. `crate::launch::advertise_host_in` is the
+    // reasoning. It is taken whatever the exposure, because the tunnel case is
+    // loopback-bound and works anyway.
+    let lan = requested
+        .advertise_host
+        .clone()
+        .or_else(|| endpoints::advertised_host(&access))
+        .map(|host| Reachable {
+            paired: server.pairing_url_for(&host),
+            plain: server.url_for(&host),
+        });
 
     // Printed because this binary has no window to open it in, and since
     // ticket 73 a browser pointed here needs a credential like anything else.
@@ -113,6 +124,7 @@ async fn main() -> ExitCode {
             plain: server.http_url(),
         },
         lan,
+        advertised_by_operator: requested.advertise_host.is_some(),
         credential: server.boot_credential().map(str::to_string),
     }) {
         match line {

@@ -108,6 +108,16 @@ pub struct Announcement {
     /// [`crate::endpoints::advertised_host`]. `None` when exposure is loopback,
     /// and also when the routing table has no answer.
     pub lan: Option<Reachable>,
+    /// Whether [`Announcement::lan`] came from `--advertise-host` rather than
+    /// from the routing table.
+    ///
+    /// It changes one sentence and only when the server stayed on loopback,
+    /// which is the single combination where the announcement would otherwise
+    /// contradict itself — see
+    /// `an_advertised_host_says_what_it_depends_on_when_the_server_stayed_on_loopback`.
+    /// The server cannot tell a tunnel from a forgotten `--network`, so it says
+    /// what the address depends on instead of guessing.
+    pub advertised_by_operator: bool,
     /// The boot credential itself, printed on its own beside a LAN address so
     /// it can be typed into a pairing screen rather than into a URL. `None`
     /// when none was minted, which is also when every `paired` above is `None`.
@@ -136,6 +146,20 @@ pub fn announce(announcement: &Announcement) -> Vec<Line> {
                     "or open {} and pair with {code}",
                     lan.plain
                 )));
+            }
+            // A host the operator named while the server sits on loopback is
+            // either a tunnel — right, and the reason the flag is honoured
+            // whatever the exposure — or a `--network` that was forgotten, in
+            // which case the URL above cannot work. Nothing here can tell those
+            // apart, so this names the condition rather than the mistake.
+            if announcement.advertised_by_operator && !announcement.exposure.is_network_accessible()
+            {
+                lines.push(Line::Said(
+                    "that address reaches this server only through something that \
+                     forwards to it — a tunnel does; another machine on your \
+                     network needs --network"
+                        .to_string(),
+                ));
             }
             if let Some(local) = &announcement.local.paired {
                 lines.push(Line::Said(format!("on this machine, {local}")));
@@ -222,6 +246,7 @@ mod tests {
                 plain: "http://127.0.0.1:4773/".to_string(),
             },
             lan: None,
+            advertised_by_operator: false,
             credential: Some("ABCD2345WXYZ".to_string()),
         }
     }
@@ -239,6 +264,51 @@ mod tests {
 
     fn said(lines: &[Line]) -> Vec<&str> {
         lines.iter().map(Line::text).collect()
+    }
+
+    /// An operator-supplied host on a server that never left loopback is the one
+    /// combination where the lines above contradict each other: "this server
+    /// answers this machine only", and then a URL on some other host.
+    ///
+    /// **Both are true and the combination is legitimate** — a tunnel forwards a
+    /// public hostname to `127.0.0.1`, so a loopback-bound server is exactly
+    /// what `cloudflared` wants. It is also what somebody who typed
+    /// `--advertise-host` and forgot `--network` has, and for them the URL cannot
+    /// work. One sentence tells those apart without guessing which happened,
+    /// because the server cannot know.
+    #[test]
+    fn an_advertised_host_says_what_it_depends_on_when_the_server_stayed_on_loopback() {
+        let lines = announce(&Announcement {
+            lan: Some(lan()),
+            advertised_by_operator: true,
+            ..loopback()
+        });
+
+        assert!(
+            said(&lines)
+                .iter()
+                .any(|line| line.contains("only through something that forwards")),
+            "{:?}",
+            said(&lines)
+        );
+
+        // And it is not said when the server really is on the network, where the
+        // address stands on its own and the sentence would be noise on every
+        // start.
+        let wide = announce(&Announcement {
+            exposure: Exposure::NetworkAccessible,
+            network: from(NetworkSource::Flag, Exposure::NetworkAccessible),
+            lan: Some(lan()),
+            advertised_by_operator: true,
+            ..loopback()
+        });
+        assert!(
+            !said(&wide)
+                .iter()
+                .any(|line| line.contains("only through something that forwards")),
+            "{:?}",
+            said(&wide)
+        );
     }
 
     /// The acceptance criterion, and the reason the ticket exists: bound wide
