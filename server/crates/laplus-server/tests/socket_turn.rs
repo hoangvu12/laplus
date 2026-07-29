@@ -45,7 +45,7 @@
 
 mod harness;
 
-use harness::agent::{ScriptedAgent, PAUSE, WORKING_DIRECTORY_MARKER};
+use harness::agent::{ScriptedAgent, AWAIT_QUESTION, PAUSE, WORKING_DIRECTORY_MARKER};
 use harness::conversation::{
     activity, assistant_sends, create_project, follow_up, kinds, start_turn,
 };
@@ -589,6 +589,215 @@ async fn a_turn_reports_how_full_the_context_window_is() {
         .expect("the meter's row survives into the snapshot");
     assert_eq!(stored["payload"]["usedTokens"], json!(26_441));
     assert_eq!(stored["turnId"], rows.last().expect("a row")["turnId"]);
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// The meter fills from what the CLI *says* rather than from what this server
+/// works out, which is ticket 76.
+///
+/// Replays `19-context-usage`, the capture of the exchange: the server asks
+/// `get_context_usage` when the session announces itself and again when the turn
+/// ends, and the CLI answers both. What it settles that the counts cannot is
+/// three things, one per moment:
+///
+/// - **The opening turn has a percentage.** The window is in the first answer,
+///   before any `result` has arrived — inference has nothing to measure against
+///   until a turn has finished.
+/// - **The tooltip's sentence has a source.** `isAutoCompactEnabled` appears
+///   nowhere in the event stream, so before this the line the client renders from
+///   it could never appear.
+/// - **The answer beats the inference.** Both are available when the turn ends
+///   and they disagree by 22 tokens; the CLI's own count is the one that stands.
+#[tokio::test]
+async fn the_meter_is_filled_from_what_the_agent_says_about_its_own_window() {
+    let agent = ScriptedAgent::replaying("19-context-usage");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "write a note about bicycles"),
+        )
+        .await
+        .expect_success();
+
+    // Read past the settle rather than up to it. The last answer arrives *after*
+    // the turn has ended — it is a reply to a question asked on the `result` —
+    // so `events_through_the_turn` would stop one row short of the reading the
+    // meter comes to rest on.
+    let events = client
+        .values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "context-window.updated"
+                && item["event"]["payload"]["activity"]["payload"]["usedTokens"] == json!(26_937)
+        })
+        .await;
+
+    let readings: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| {
+            event["type"] == "thread.activity-appended"
+                && event["payload"]["activity"]["kind"] == "context-window.updated"
+        })
+        .map(|event| &event["payload"]["activity"]["payload"])
+        .collect();
+
+    // The first reading of the session is the CLI's answer, and it is a *whole*
+    // one. Under ticket 40 alone the first row of a session carried a token count
+    // and `maxTokens: null`, so the composer drew a figure with no percentage and
+    // no bar until the turn ended.
+    let opening = readings.first().expect("a reading before the turn ended");
+    assert_eq!(opening["usedTokens"], json!(26_789));
+    assert_eq!(opening["maxTokens"], json!(200_000));
+    assert_eq!(opening["compactsAutomatically"], json!(true));
+
+    // The one field no amount of inference reaches, on *every* row rather than
+    // only on the two the answers produced. The client reads the newest row and
+    // does not merge it with the ones before it, so a row that dropped this would
+    // take the sentence out of the tooltip until the next answer arrived —
+    // several times a turn, since every assistant message moves the meter.
+    assert!(
+        readings
+            .iter()
+            .all(|reading| reading["compactsAutomatically"] == json!(true)),
+        "the sentence must not blink out between answers: {readings:#?}"
+    );
+
+    // The turn's last word. The `result` inferred 26,959 from its own counts and
+    // the CLI answered 26,937 about the same conversation; the answer is what the
+    // meter settles on, which is the precedence `completeTurn` uses upstream.
+    let settled = readings.last().expect("a settled reading");
+    assert_eq!(settled["usedTokens"], json!(26_937));
+    assert_eq!(settled["maxTokens"], json!(200_000));
+    assert!(
+        readings
+            .iter()
+            .any(|reading| reading["usedTokens"] == json!(26_959)),
+        "the inferred reading is still taken — it is what a CLI that refuses \
+         leaves the meter on: {readings:#?}"
+    );
+    // Carried onto the answer rather than lost with the line it arrived on: the
+    // total belongs to the turn, and the reading that follows the turn is still
+    // about the same conversation.
+    assert_eq!(settled["totalProcessedTokens"], json!(54_082));
+    // The window has no input or output side to report, and says so rather than
+    // claiming zero.
+    assert_eq!(settled["inputTokens"], json!(null));
+    assert_eq!(settled["outputTokens"], json!(null));
+
+    // What the agent was actually asked, which no capture can contain because it
+    // travelled on stdin. Two questions, at the two moments the driver asks.
+    let asked: Vec<Value> = agent
+        .answers()
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["type"] == "control_request")
+        .collect();
+    assert_eq!(asked.len(), 2, "{:?}", agent.answers());
+    for question in &asked {
+        assert_eq!(question["request"], json!({"subtype": "get_context_usage"}));
+    }
+    assert_ne!(
+        asked[0]["request_id"], asked[1]["request_id"],
+        "each question gets an id of its own"
+    );
+
+    // And the meter survives into the snapshot, which is where a developer
+    // opening the thread tomorrow reads it from.
+    let snapshot = server.connect().await.into_thread_snapshot("thread-1").await;
+    let stored = snapshot["thread"]["activities"]
+        .as_array()
+        .expect("activities")
+        .iter()
+        .rev()
+        .find(|activity| activity["kind"] == "context-window.updated")
+        .expect("the meter's row survives into the snapshot");
+    assert_eq!(stored["payload"]["usedTokens"], json!(26_937));
+    assert_eq!(stored["payload"]["compactsAutomatically"], json!(true));
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// A CLI that will not answer the question keeps the meter ticket 40 built.
+///
+/// The acceptance the whole fallback rests on, and the case this project may
+/// actually meet: `get_context_usage` is an SDK control request, and a `claude`
+/// that predates it answers with an error naming a callback it never registered.
+/// Written rather than recorded, because the installed CLI implements the
+/// request and cannot be asked to stop.
+#[tokio::test]
+async fn an_agent_that_will_not_say_leaves_the_inferred_meter_alone() {
+    let agent = ScriptedAgent::emitting(&[
+        r#"{"type":"system","subtype":"init","session_id":"session-1","model":"claude-opus-5","cwd":".","permissionMode":"default","tools":["Read"]}"#,
+        // The server's question goes here — asked on `init`, refused on the next
+        // line. Everything after it is a turn that never learns it was refused.
+        AWAIT_QUESTION,
+        r#"{"type":"control_response","response":{"subtype":"error","request_id":"context-1","error":"get_context_usage is not supported in this context (onGetContextUsage callback not registered)"}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Refusing to introspect."}],"usage":{"input_tokens":30000,"output_tokens":40}}}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":11,"usage":{"input_tokens":30000,"output_tokens":40,"iterations":[{"input_tokens":30000,"output_tokens":40}]},"modelUsage":{"claude-opus-5":{"contextWindow":200000}}}"#,
+        // The question asked on the `result`, refused the same way. Nothing after
+        // it, which is the point: the turn has already settled on the inferred
+        // reading and nothing arrives to disturb it.
+        AWAIT_QUESTION,
+        r#"{"type":"control_response","response":{"subtype":"error","request_id":"context-2","error":"get_context_usage is not supported in this context (onGetContextUsage callback not registered)"}}"#,
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "introspect"),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let readings: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| {
+            event["type"] == "thread.activity-appended"
+                && event["payload"]["activity"]["kind"] == "context-window.updated"
+        })
+        .map(|event| &event["payload"]["activity"]["payload"])
+        .collect();
+
+    // The meter is exactly what ticket 40 would have made of this turn.
+    let settled = readings.last().expect("the counts still fill the meter");
+    assert_eq!(settled["usedTokens"], json!(30_040));
+    assert_eq!(settled["maxTokens"], json!(200_000));
+    // Never said, so never claimed. The client renders the absence by leaving the
+    // sentence out — which is what it did before this request existed.
+    assert_eq!(settled["compactsAutomatically"], json!(null));
+
+    // **Nothing reaches the conversation.** A refusal here is not the developer's
+    // problem: the number they are looking at is already on screen, and a row
+    // about how it got there would be the first thing they saw.
+    let complaints: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .filter(|activity| activity["tone"] == "error")
+        .collect();
+    assert!(complaints.is_empty(), "{complaints:#?}");
+
+    // The turn still ends the way any other does.
+    let session = events
+        .iter()
+        .map(|item| &item["event"])
+        .rfind(|event| event["type"] == "thread.session-set")
+        .expect("the session settles");
+    assert_eq!(session["payload"]["session"]["status"], "ready");
 
     client.close().await;
     server.stop().await;

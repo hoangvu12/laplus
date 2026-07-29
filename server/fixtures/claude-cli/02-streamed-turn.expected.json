@@ -32,7 +32,8 @@
       "total_processed_tokens": null,
       "max_tokens": 1000000,
       "input_tokens": 27417,
-      "output_tokens": 4
+      "output_tokens": 4,
+      "compacts_automatically": null
     }
   },
   "token_usage": {
@@ -40,10 +41,12 @@
     "total_processed_tokens": null,
     "max_tokens": 1000000,
     "input_tokens": 27417,
-    "output_tokens": 4
+    "output_tokens": 4,
+    "compacts_automatically": null
   },
   "context_window": 1000000,
   "total_processed_tokens": 27421,
+  "compacts_automatically": null,
   "unknown_events": 0,
   "parse_errors": 0
 }

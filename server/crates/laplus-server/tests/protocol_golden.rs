@@ -174,6 +174,22 @@ fn the_captures_cover_the_wire_format() {
         *totals.entry("rate-limit notices").or_default() +=
             state.counts.get("rate_limit_event").copied().unwrap_or(0);
 
+        // Ticket 76's. The exchange is the only one in this directory that the
+        // *server* starts, so it is also the only one a re-capture could quietly
+        // drop — a recorder run without the question in it produces a perfectly
+        // healthy turn with no answer in it, and every other assertion here would
+        // still pass. Counted in two parts because they fail separately: an
+        // answer that stopped arriving, and an answer that arrived carrying
+        // nothing the meter could be made of.
+        *totals.entry("context-window answers").or_default() += state
+            .counts
+            .get("control_response/get_context_usage")
+            .copied()
+            .unwrap_or(0);
+        *totals
+            .entry("sessions told whether the agent compacts by itself")
+            .or_default() += usize::from(state.compacts_automatically.is_some());
+
         // Ticket 12's cases, counted rather than asserted per file: what matters
         // is that the capture set as a whole reaches a tool call, a result that
         // failed, a session that made several calls, and the reasoning between

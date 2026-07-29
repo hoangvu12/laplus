@@ -328,6 +328,23 @@ impl Agent {
             .await
     }
 
+    /// Ask how full the context window is.
+    ///
+    /// The second question this server asks, and the one with no deadline on
+    /// either side: nothing is waiting for the answer and nothing breaks if it
+    /// never comes. A CLI too old to know the request answers with an error, a
+    /// CLI that is busy answers late, and in both cases the meter goes on being
+    /// filled from the token counts — which is why the caller does not report a
+    /// failure here into the conversation the way it reports a failed interrupt.
+    ///
+    /// Nothing is waited for, the same as an interrupt: the answer arrives on
+    /// stdout as a `control_response` naming the same `request_id`, and
+    /// [`crate::protocol::SessionState::reduce`] folds it where it lands.
+    pub async fn measure_context(&mut self, request_id: &str) -> std::io::Result<()> {
+        self.write_line(crate::protocol::context_usage_line(request_id))
+            .await
+    }
+
     /// One JSON object on one line, which is the whole of what this server ever
     /// says to the agent.
     ///

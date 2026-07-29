@@ -48,11 +48,52 @@ sent, and then abort a turn nobody had stopped.
 | `16-error-result.ndjson`                   | Hand-written                                             | A turn the agent reports as failed, with its reason in the `result`'s `errors` array — which is the only thing in a failed turn a developer can act on                                                          |
 | `17-rate-limited.ndjson`                   | Hand-written                                             | Three `rate_limit_event`s — fine, close to the limit, refused — and the failed turn the third produces                                                                                                          |
 | `18-compacted.ndjson`                      | Hand-written                                             | A `system`/`compact_boundary` between two turns: the agent's memory rewritten, and the transcript deliberately unchanged by it                                                                                  |
+| `19-context-usage.ndjson`                  | Recorded, ticket 76                                      | The CLI answering how full its own window is, twice — as the session announces itself and as the turn ends — around a turn that uses a tool                                                                     |
 
 The `.scratch/*.ndjson` originals stay where they are as raw evidence; these are
 the committed, test-facing copies. `04`–`15` were recorded straight into
 `fixtures/` against `claude-haiku-4-5`, with the same flags
-[`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes.
+[`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes, and `19`
+was recorded the same way.
+
+## What `19` settled
+
+The first capture in this directory of an exchange the **server** starts — not a
+question the CLI asked, and not an acknowledgement of a stop, but an answer to
+`{"subtype": "get_context_usage"}` sent on stdin. Ticket 76's, and what it
+records could not have been read off anything in this repository:
+
+- **The request exists in the shipped CLI.** It is an SDK control request, so
+  the version this project drives might have answered with an error naming a
+  callback it never registered — which is the shape
+  `an_agent_that_will_not_say_leaves_the_inferred_meter_alone` is written
+  against. `claude` 2.1.220 implements it.
+- **It is answered while a turn is running.** The first of the two questions
+  here goes out on the session's `init`, before the opening turn has produced a
+  single delta, and comes back straight away rather than queueing behind the
+  turn. That is the whole of why the meter can show a percentage on the first
+  turn of a session: `modelUsage` carries the window only on the `result` that
+  ends one.
+- **The reply is the whole reading in one answer** — `totalTokens`, `maxTokens`
+  and `isAutoCompactEnabled` — among seventeen fields of the CLI's own
+  accounting: a category breakdown, the grid `/context` draws with, per-skill and
+  per-agent counts. Three are read. The rest are left in the capture, because a
+  golden that trimmed them could not see them move.
+- **`isAutoCompactEnabled` is the reason the request is sent at all.**
+  Auto-compact is mentioned nowhere in the eighteen captures before this one, and
+  the client renders a sentence from it.
+- **The CLI's count and this server's inference disagree**, by 22 tokens on this
+  recording: the `result` adds up to 26,959 and the answer that follows it says
+  26,937 about the same conversation. Both are in the golden — one on
+  `last_result`, one on `token_usage` — which is what pins the precedence.
+
+Asking costs no API call. The recorder can be run against a fresh process with
+no turn at all and still get a reading, which is what the probe that settled the
+first point above did.
+
+`tools/context-capture/record.mjs` made it, and asks at the two moments
+[`crate::turn`] asks at — the timing is what decides where the answers land in
+the recording, and therefore what the replay in `tests/socket_turn.rs` sees.
 
 ## What `16`–`18` are, and why they are not recordings
 

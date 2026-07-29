@@ -284,6 +284,8 @@ async fn drive(
         turn: None,
         outstanding: HashMap::new(),
         interrupts: 0,
+        measurements: 0,
+        unmeasured: false,
         drift_reported: Drift::default(),
         finished: None,
         reported_usage: None,
@@ -401,6 +403,13 @@ async fn drive(
         match next {
             Next::Line(Some(line)) => {
                 publish(&threads, &start, &mut folding, &mut driving, &line);
+                // Asked before the checkpoint below, which is a `git add -A`
+                // over the whole project: the meter is what the developer is
+                // looking at and the question costs one line on stdin, so it
+                // does not queue behind seconds of git.
+                if std::mem::take(&mut driving.unmeasured) {
+                    measure(&mut agent, &mut driving).await;
+                }
                 // The turn is over, so what the agent left behind is what this
                 // turn did. Recorded before the loop takes the next prompt,
                 // which is what makes the next turn's baseline this checkpoint
@@ -768,6 +777,17 @@ struct Driving {
     /// compaction boundary — and drift there belongs to somebody. Anchoring it
     /// to the start of a turn would drop it.
     drift_reported: Drift,
+    /// How many times this session has asked the agent how full its window is,
+    /// so the next request gets an id nothing else has used.
+    measurements: u32,
+    /// A moment has arrived that only the agent can settle, and the loop has not
+    /// asked it yet.
+    ///
+    /// The same one-line handoff from the fold to the loop that `finished` is,
+    /// and for the same reason: asking is a *write* to the agent and so has to
+    /// happen where the loop can `await` it, while noticing that the moment
+    /// arrived happens where the lines are read, which is synchronous.
+    unmeasured: bool,
     /// A turn that has just ended and whose working tree has not been recorded
     /// yet.
     ///
@@ -804,6 +824,16 @@ impl Driving {
     fn next_interrupt_id(&mut self) -> String {
         self.interrupts += 1;
         format!("interrupt-{}", self.interrupts)
+    }
+
+    /// The id for the next context-window question.
+    ///
+    /// Distinct from an interrupt's for the developer reading a log rather than
+    /// for the code: the answer is told apart by what it carries, not by the id
+    /// it names — see [`crate::protocol::Acknowledgement::reading`].
+    fn next_measurement_id(&mut self) -> String {
+        self.measurements += 1;
+        format!("context-{}", self.measurements)
     }
 
     /// What has gone unread since the last time anybody was told, and a note
@@ -863,6 +893,12 @@ fn context_window_row(usage: &TokenUsage, turn_id: Option<String>) -> Activity {
             "maxTokens": usage.max_tokens,
             "inputTokens": usage.input_tokens,
             "outputTokens": usage.output_tokens,
+            // On every row rather than only on the one the CLI's answer
+            // produced, because the client reads the newest row and does not
+            // merge it with the ones before it
+            // (`deriveLatestContextWindowSnapshot`). A row without this is a row
+            // that says auto-compact is off.
+            "compactsAutomatically": usage.compacts_automatically,
         }),
         turn_id,
     )
@@ -1086,6 +1122,29 @@ async fn interrupt(
     };
     active.stop(&request_id);
     stopped(threads, start, &turn_id, &request_id);
+}
+
+/// Ask the agent how full its context window is.
+///
+/// **Nothing is published, and a failure is not reported.** That is the whole
+/// difference between this and every other write to the agent, and it is what
+/// makes the request safe to add to a build whose CLI may not implement it: a
+/// stop that did not land is a button that did nothing and has to be said, while
+/// a question that did not land leaves the meter exactly as it was — filled from
+/// the token counts, the way ticket 40 filled it. A row reading "the agent would
+/// not say how full its context window is" would be the first thing a developer
+/// saw on an older CLI, about a number already on screen.
+///
+/// The answer comes back on stdout whenever the agent gets to it, and
+/// [`crate::protocol::SessionState::reduce`] folds it. Nothing here waits, and
+/// no state records that a question is outstanding — a second question asked
+/// before the first was answered is two readings rather than a problem, and the
+/// later of them wins because it arrives later.
+async fn measure(agent: &mut Agent, driving: &mut Driving) {
+    let request_id = driving.next_measurement_id();
+    if let Err(error) = agent.measure_context(&request_id).await {
+        eprintln!("laplus: cannot ask the agent how full its context window is: {error}");
+    }
 }
 
 /// Say in the conversation that the developer stopped this turn.
@@ -1437,6 +1496,14 @@ fn publish(
             if let Some(session_id) = &folding.session_id {
                 threads.remember_agent_session(&start.thread_id, session_id);
             }
+            // The first of the two moments worth asking about, and the one
+            // upstream does not have: it asks as a turn *completes*, which
+            // leaves the opening turn of a session drawing a bare token count
+            // with no window behind it, because `modelUsage` has not arrived
+            // yet. Here the CLI has loaded its system prompt, its tools and its
+            // skills and knows exactly how much room they took — and answers
+            // while the turn it is announcing is still running.
+            driving.unmeasured = true;
         }
 
         // A row and nothing else, which is the whole of the criterion: the
@@ -1594,6 +1661,13 @@ fn publish(
         // the request that is outstanding, because an acknowledgement for some
         // other id — a late one, for a turn that has already ended — says nothing
         // about the turn running now.
+        // The agent said how full its window is. Nothing to do here: the reading
+        // was folded where it landed, and the block at the top of this function
+        // has already published the row — it reads `folding.token_usage` after
+        // the fold, so an answer that moved the meter moves it on the same line
+        // it arrived on.
+        Folded::Measured => {}
+
         Folded::Acknowledged(acknowledged) => {
             let Some(active) = turn.as_mut() else { return };
             if !active.awaiting(&acknowledged.request_id) {
@@ -1625,6 +1699,15 @@ fn publish(
                 .clone()
                 .zip(ending.checkpoint_status())
                 .map(|(turn_id, status)| Finished { turn_id, status });
+            // The second moment worth asking about, and upstream's own timing —
+            // `completeTurn` in `ClaudeAdapter.ts`. What it settles that the
+            // counts cannot: a turn that reached no API has a `usage` of zeroes
+            // and leaves the meter reading whatever it read before, and a turn
+            // that compacted mid-way ends carrying far less than its counts
+            // added up to. Asked here rather than only at the start of a session
+            // because the conversation is what changed, and the conversation is
+            // what the reading is of.
+            driving.unmeasured = true;
             // What has gone unread and unreported. The session's running totals
             // go in the payload beside it; the sentence gets what is new, so a
             // turn that drifted says so and the one after it does not repeat the

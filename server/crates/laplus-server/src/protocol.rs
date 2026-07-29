@@ -141,6 +141,15 @@ pub struct Acknowledgement {
     pub subtype: String,
     #[serde(default)]
     pub error: Option<String>,
+    /// What the CLI answered *with*, for the one request whose answer is worth
+    /// more than the fact that it succeeded.
+    ///
+    /// An interrupt's is `{"still_queued": []}` and is deliberately unread; a
+    /// [`context_usage_line`]'s is the whole reading. Both land here, and which
+    /// one this is comes off the shape rather than off the id — see
+    /// [`Acknowledgement::reading`].
+    #[serde(default)]
+    pub response: Option<ContextUsage>,
 }
 
 impl Acknowledgement {
@@ -156,6 +165,82 @@ impl Acknowledgement {
         Some(match &self.error {
             Some(said) => said.clone(),
             None => format!("the agent answered '{}'", self.subtype),
+        })
+    }
+
+    /// How full the window is, when this is the answer to a
+    /// [`context_usage_line`].
+    ///
+    /// Told apart by what it carries rather than by the id it names, which is
+    /// what makes this safe to ask on an envelope shared with the interrupt: an
+    /// interrupt's answer has no `totalTokens` in it and no reading can be made
+    /// of one, so the two cannot be confused by a server that reads the shape.
+    /// Correlating on the id would say the same thing and would additionally
+    /// have to be kept in step with the ids the driver mints.
+    pub fn reading(&self) -> Option<TokenUsage> {
+        self.response.as_ref()?.reading()
+    }
+}
+
+/// The CLI's own account of how full the context window is.
+///
+/// The answer to `get_context_usage`, recorded in
+/// `fixtures/claude-cli/19-context-usage.ndjson`. The reply carries seventeen
+/// fields — a category breakdown, a grid the CLI's own `/context` draws with,
+/// per-agent and per-skill token counts — and three are read, because three are
+/// what the client's meter is made of.
+///
+/// **`isAutoCompactEnabled` is why this request exists at all.** Nothing in the
+/// event stream mentions auto-compact, so it is the one part of the reading this
+/// server cannot infer, and the client renders a sentence from it.
+///
+/// Every field is optional for the reason the rest of this module's are: the
+/// shape is the CLI's rather than a contract, and a reply missing a field should
+/// narrow what can be said rather than fail to parse.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ContextUsage {
+    /// What the conversation is carrying — system prompt, tools, skills and
+    /// messages. Not the same arithmetic as the token counts on an assistant
+    /// message, and closer to the truth: this is the CLI counting its own
+    /// window rather than this server adding up what an API call reported.
+    #[serde(default, rename = "totalTokens")]
+    pub total_tokens: Option<u64>,
+    /// The window. Available here on the *first* reading of a session, which is
+    /// the whole of why asking beats waiting — `modelUsage` carries it only on
+    /// the `result` that ends a turn.
+    #[serde(default, rename = "maxTokens")]
+    pub max_tokens: Option<u64>,
+    /// Whether the agent will summarise the conversation by itself when the
+    /// window fills, rather than failing.
+    #[serde(default, rename = "isAutoCompactEnabled")]
+    pub compacts_automatically: Option<bool>,
+}
+
+impl ContextUsage {
+    /// This answer as a reading of the meter.
+    ///
+    /// `None` when the CLI said nothing about the size of the conversation,
+    /// which is the same rule the inferred path follows: a reading with no
+    /// number in it would blank a meter that the counts had filled.
+    ///
+    /// `input_tokens` and `output_tokens` are left unset rather than zeroed.
+    /// This answer is a picture of the *window*, and it has no side to it — the
+    /// reply's own `apiUsage` is the session's running API total, which is a
+    /// different question. The reference server drops them here too.
+    ///
+    /// Mirrors `normalizeClaudeContextUsageApiSnapshot` in
+    /// `reference/t3code-server/src/provider/Layers/ClaudeAdapter.ts`.
+    pub fn reading(&self) -> Option<TokenUsage> {
+        let active_tokens = self.total_tokens.filter(|total| *total > 0)?;
+        Some(TokenUsage {
+            used_tokens: self
+                .max_tokens
+                .map_or(active_tokens, |window| active_tokens.min(window)),
+            total_processed_tokens: None,
+            max_tokens: self.max_tokens.filter(|window| *window > 0),
+            input_tokens: None,
+            output_tokens: None,
+            compacts_automatically: self.compacts_automatically,
         })
     }
 }
@@ -179,6 +264,33 @@ pub fn interrupt_line(request_id: &str) -> String {
         "type": "control_request",
         "request_id": request_id,
         "request": { "subtype": "interrupt" },
+    })
+    .to_string()
+}
+
+/// Build the stdin line that asks the agent how full its context window is.
+///
+/// The fourth thing this server says to the agent, and the second that is a
+/// question. It takes no arguments — the CLI describes it as "requests a
+/// breakdown of current context window usage by category", and the conversation
+/// it is about is the one the process is already holding.
+///
+/// **Asking beats inferring on three counts**, and each was a defect before this
+/// existed: the reply carries `isAutoCompactEnabled`, which appears nowhere in
+/// the event stream; it carries the window on the first reading of a session,
+/// where `modelUsage` arrives only on the `result` that ends a turn; and it can
+/// be asked at a moment of this server's choosing rather than only when the CLI
+/// happens to report counts.
+///
+/// Found in the binary rather than in documentation, the same way the permission
+/// and interrupt channels were. It answers *while a turn is running* — the
+/// request is served off the control channel rather than queued behind the turn,
+/// which is what makes the first-turn reading possible at all.
+pub fn context_usage_line(request_id: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "get_context_usage" },
     })
     .to_string()
 }
@@ -672,8 +784,11 @@ impl UsageCounts {
             used_tokens: max_tokens.map_or(active_tokens, |window| active_tokens.min(window)),
             total_processed_tokens: None,
             max_tokens,
-            input_tokens: self.input(),
-            output_tokens: self.output(),
+            input_tokens: Some(self.input()),
+            output_tokens: Some(self.output()),
+            // Nothing in the event stream says. Stamped afterwards from what the
+            // CLI answered when it was asked — see [`SessionState::remembering`].
+            compacts_automatically: None,
         })
     }
 }
@@ -714,11 +829,27 @@ pub struct TokenUsage {
     /// it exceeds `used_tokens`** — otherwise it is the same number twice and
     /// the client would show a second figure that says nothing.
     pub total_processed_tokens: Option<u64>,
-    /// The window itself. `None` when `modelUsage` did not say, which the client
-    /// renders as a token count without a percentage rather than as a full bar.
+    /// The window itself. `None` when nothing has said — neither an answer to
+    /// [`context_usage_line`] nor a `modelUsage` — which the client renders as a
+    /// token count without a percentage rather than as a full bar.
     pub max_tokens: Option<u64>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    /// The two sides of what the conversation is carrying, when the reading came
+    /// from counts that had sides.
+    ///
+    /// `None` on a reading taken from the CLI's own answer, which describes the
+    /// window rather than an API call and has no input or output to it. The
+    /// client carries both through its snapshot and renders neither, so this is
+    /// about not claiming a zero that nobody reported.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Whether the agent summarises the conversation by itself when the window
+    /// fills. The client turns it into a sentence in the meter's tooltip.
+    ///
+    /// **The one field no amount of inference can fill.** It is only ever the
+    /// CLI's own answer to [`context_usage_line`], carried onto later readings by
+    /// [`SessionState::remembering`] so that the sentence does not blink out
+    /// every time a token count moves the meter.
+    pub compacts_automatically: Option<bool>,
 }
 
 impl ResultEvent {
@@ -875,6 +1006,18 @@ pub struct SessionState {
     /// is likewise the *last* turn's figure carried forward rather than a sum
     /// over the session.
     pub total_processed_tokens: Option<u64>,
+    /// Whether the agent compacts by itself, remembered from the last answer to
+    /// [`context_usage_line`].
+    ///
+    /// Remembered for a reason the other two do not have. They are carried
+    /// forward because they arrive rarely; this is carried forward because it
+    /// arrives on a *different kind of line altogether* — the CLI's answer to a
+    /// question, rather than anything it says on its own. Every reading in
+    /// between is inferred from token counts, and the client reads only the
+    /// newest one (`deriveLatestContextWindowSnapshot`, which does not merge), so
+    /// a reading that dropped this would take the tooltip's sentence down with it
+    /// until the next answer arrived.
+    pub compacts_automatically: Option<bool>,
 
     /// Protocol-drift telemetry: event types we did not recognize.
     pub unknown_events: usize,
@@ -955,6 +1098,14 @@ pub enum Folded {
     /// Carried rather than swallowed so a *refused* request can be reported: see
     /// [`Acknowledgement::refusal`].
     Acknowledged(Acknowledgement),
+    /// The agent said how full its context window is, and `token_usage` now
+    /// holds what it said.
+    ///
+    /// Carries nothing, because there is nothing for a caller to do with it: the
+    /// reading is already folded, and the driver publishes the reading rather
+    /// than the event. It is a variant of its own only so that the arm which
+    /// reports a *refused* request does not have to wonder whether this was one.
+    Measured,
     /// The terminal `result` for the turn. `last_result` holds the duration and
     /// the cost.
     Completed,
@@ -1020,19 +1171,24 @@ impl SessionState {
 
     /// A fresh reading, with what the session already knows written onto it.
     ///
-    /// Only the total belongs here: the window is folded in earlier, when the
-    /// reading is built, because it *changes the reading* — `used_tokens` is
-    /// clamped to it. The total changes nothing and is carried alongside, which
-    /// is why it can be stamped afterwards and why every reading gets it rather
-    /// than only the one that happened to arrive with it.
+    /// Two of the three remembered figures belong here: the window is folded in
+    /// earlier, when the reading is built, because it *changes the reading* —
+    /// `used_tokens` is clamped to it. These two change nothing and are carried
+    /// alongside, which is why they can be stamped afterwards and why every
+    /// reading gets them rather than only the one that arrived with them.
     ///
-    /// Dropped when it does not exceed what the conversation is carrying, which
-    /// is the client's own rule for showing the row at all: the same number
-    /// twice tells a reader nothing.
+    /// The total is dropped when it does not exceed what the conversation is
+    /// carrying, which is the client's own rule for showing the row at all: the
+    /// same number twice tells a reader nothing. Auto-compact has no such rule —
+    /// it is a fact about the agent rather than about this reading, and the
+    /// reading it arrived on is not more entitled to it than the next one.
     fn remembering(&self, mut reading: TokenUsage) -> TokenUsage {
         reading.total_processed_tokens = self
             .total_processed_tokens
             .filter(|total| *total > reading.used_tokens);
+        reading.compacts_automatically = reading
+            .compacts_automatically
+            .or(self.compacts_automatically);
         reading
     }
 
@@ -1291,6 +1447,30 @@ impl SessionState {
             // a format change on every turn a developer stopped.
             Event::ControlResponse { response } => {
                 self.bump("control_response");
+                // The CLI answering how full its window is. Taken here rather
+                // than handed to the driver because it is a *reading*, and every
+                // other reading in this module is folded where it lands — the
+                // driver publishes what the fold arrived at, and would have
+                // nowhere else to put this one.
+                //
+                // Preferred over whatever the counts had inferred, which is the
+                // precedence `completeTurn` uses in the reference server: this is
+                // the CLI counting its own window, and the inferred reading is
+                // this server adding up what an API call happened to report.
+                if let Some(reading) = response.reading() {
+                    self.bump("control_response/get_context_usage");
+                    // Both before the reading is stamped, so this answer's own
+                    // figures reach this answer — and so the readings inferred
+                    // between here and the next answer have them too.
+                    if let Some(window) = reading.max_tokens {
+                        self.context_window = Some(window);
+                    }
+                    if let Some(compacts) = reading.compacts_automatically {
+                        self.compacts_automatically = Some(compacts);
+                    }
+                    self.token_usage = Some(self.remembering(reading));
+                    return Folded::Measured;
+                }
                 Folded::Acknowledged(response)
             }
 
@@ -1834,6 +2014,158 @@ mod tests {
         );
     }
 
+    // -- asking how full the window is ------------------------------------------
+    //
+    // Ticket 76. The recorded exchange is `fixtures/claude-cli/19-context-usage`
+    // and the reading taken from it is in that capture's golden; what lives here
+    // is the line that goes out, and the four shapes of answer that come back.
+
+    /// The request the CLI's own schema declares. It carries no arguments —
+    /// the conversation it is about is the one the process is already holding.
+    #[test]
+    fn the_context_question_is_the_control_request_the_cli_expects() {
+        assert_eq!(
+            serde_json::from_str::<Value>(&context_usage_line("context-1")).unwrap(),
+            json!({
+                "type": "control_request",
+                "request_id": "context-1",
+                "request": {"subtype": "get_context_usage"},
+            })
+        );
+    }
+
+    /// The three fields the meter is made of, out of the seventeen the reply
+    /// carries — and the reading is the CLI's own count rather than a sum this
+    /// server made of somebody else's.
+    #[test]
+    fn the_answer_becomes_the_reading_the_meter_shows() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"context-1","response":{"totalTokens":26937,"maxTokens":200000,"isAutoCompactEnabled":true,"percentage":13,"categories":[],"gridRows":[]}}}"#,
+        );
+
+        assert!(matches!(told, Folded::Measured), "{told:?}");
+        assert_eq!(
+            state.token_usage,
+            Some(TokenUsage {
+                used_tokens: 26_937,
+                total_processed_tokens: None,
+                max_tokens: Some(200_000),
+                // The window has no input or output side. See
+                // [`ContextUsage::reading`].
+                input_tokens: None,
+                output_tokens: None,
+                compacts_automatically: Some(true),
+            })
+        );
+        // Remembered, so the readings inferred between here and the next answer
+        // have a window to measure against and a sentence to carry.
+        assert_eq!(state.context_window, Some(200_000));
+        assert_eq!(state.compacts_automatically, Some(true));
+        assert_eq!(state.unknown_events, 0);
+    }
+
+    /// The first turn of a session, which is the case inference cannot reach:
+    /// `modelUsage` arrives only on the `result` that ends a turn, so until this
+    /// request existed the opening turn drew a token count with no percentage
+    /// and no bar.
+    #[test]
+    fn the_window_is_known_before_any_turn_has_finished() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"context-1","response":{"totalTokens":24102,"maxTokens":200000,"isAutoCompactEnabled":false}}}"#,
+        );
+
+        let reading = state.token_usage.clone().expect("a reading");
+        assert_eq!(reading.max_tokens, Some(200_000));
+        assert_eq!(reading.used_tokens, 24_102);
+        // Said, and said to be off — which the client renders by leaving the
+        // sentence out. Not the same as never having asked.
+        assert_eq!(reading.compacts_automatically, Some(false));
+    }
+
+    /// What the CLI said outlives the answer it arrived on.
+    ///
+    /// The client reads the newest `context-window.updated` row and does not
+    /// merge it with the ones before it, so a later reading that dropped this
+    /// would take the tooltip's sentence down with it — every time a token count
+    /// moved the meter, which is several times a turn.
+    #[test]
+    fn auto_compact_is_carried_onto_the_readings_after_it() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"context-1","response":{"totalTokens":24102,"maxTokens":200000,"isAutoCompactEnabled":true}}}"#,
+        );
+        state.fold_line(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "usage": { "input_tokens": 30_000, "output_tokens": 40 },
+                },
+            })
+            .to_string(),
+        );
+
+        let inferred = state.token_usage.clone().expect("a reading");
+        assert_eq!(
+            inferred.used_tokens, 30_040,
+            "the counts still move the meter between answers"
+        );
+        assert_eq!(inferred.compacts_automatically, Some(true));
+    }
+
+    /// A CLI that will not answer leaves the ticket-40 meter exactly as it was.
+    ///
+    /// The acceptance the fallback rests on, and the one shape of answer this
+    /// build may actually meet in the field: `get_context_usage` is an SDK
+    /// control request, and an older `claude` answers it with an error naming a
+    /// callback it has never registered.
+    #[test]
+    fn a_refused_question_leaves_the_inferred_meter_standing() {
+        let mut state = SessionState::new();
+        state.fold_line(
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "message_delta",
+                    "usage": { "input_tokens": 30_000, "output_tokens": 40 },
+                },
+            })
+            .to_string(),
+        );
+        let inferred = state.token_usage.clone().expect("a reading");
+
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"context-1","error":"get_context_usage is not supported in this context (onGetContextUsage callback not registered)"}}"#,
+        );
+
+        // An acknowledgement rather than a reading, which is what keeps it out of
+        // the meter. The driver then ignores it: it names no interrupt this turn
+        // is waiting on, so nothing is published and no error reaches the
+        // conversation.
+        assert!(matches!(told, Folded::Acknowledged(_)), "{told:?}");
+        assert_eq!(state.token_usage, Some(inferred));
+        // And it is not drift. An answer this server asked for is not a format
+        // change, however unwelcome the answer.
+        assert_eq!(state.unknown_events, 0);
+        assert_eq!(state.parse_errors, 0);
+    }
+
+    /// An interrupt's acknowledgement travels the same envelope and must not be
+    /// mistaken for a reading. `{"still_queued": []}` has no window in it, and
+    /// the shape is what tells the two apart — see [`Acknowledgement::reading`].
+    #[test]
+    fn an_interrupts_acknowledgement_is_not_mistaken_for_a_reading() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"interrupt-1","response":{"still_queued":[]}}}"#,
+        );
+
+        assert!(matches!(told, Folded::Acknowledged(_)), "{told:?}");
+        assert_eq!(state.token_usage, None);
+    }
+
     // -- long sessions and bad weather -----------------------------------------
     //
     // The three things that happen to a session rather than to a turn:
@@ -2131,8 +2463,9 @@ mod tests {
                 used_tokens: 26_255,
                 total_processed_tokens: Some(52_438),
                 max_tokens: Some(200_000),
-                input_tokens: 26_212,
-                output_tokens: 43,
+                input_tokens: Some(26_212),
+                output_tokens: Some(43),
+                compacts_automatically: None,
             })
         );
     }
@@ -2180,8 +2513,9 @@ mod tests {
                 used_tokens: 1_000,
                 total_processed_tokens: None,
                 max_tokens: None,
-                input_tokens: 900,
-                output_tokens: 100,
+                input_tokens: Some(900),
+                output_tokens: Some(100),
+                compacts_automatically: None,
             })
         );
     }

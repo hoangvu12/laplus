@@ -6,7 +6,7 @@
 reads what the CLI says about the window rather than what this server works out
 from the token counts flowing past.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 **Depends on:** ticket 40, which is done. This replaces the _source_ of the
 reading; the activity, the payload and the client are already in place.
@@ -88,18 +88,114 @@ error, which is itself the thing the fallback path has to survive.
 
 ## Acceptance
 
-- [ ] The tooltip shows "…automatically compacts its context when needed." when
+- [x] The tooltip shows "…automatically compacts its context when needed." when
       the CLI says auto-compact is on, and does not when it says otherwise.
-- [ ] The meter has a percentage on the **first** turn of a session, before any
+- [x] The meter has a percentage on the **first** turn of a session, before any
       `result` has arrived.
-- [ ] A CLI that refuses or does not implement the request still gets the
+- [x] A CLI that refuses or does not implement the request still gets the
       ticket-40 meter, from the counts. No error reaches the conversation.
-- [ ] A fixture under `server/fixtures/claude-cli/` contains the request and its
+- [x] A fixture under `server/fixtures/claude-cli/` contains the request and its
       reply, and the golden pins the reading taken from it.
-- [ ] The reply is preferred over the inferred reading when both are available.
+- [x] The reply is preferred over the inferred reading when both are available.
+
+All five checked against the real UI as well as the suite — see below.
 
 ## Out of scope
 
 - Removing `context_window` / `total_processed_tokens` from `SessionState`. They
   are the fallback path's memory and the fallback path stays.
 - Cost display, still. `costUSD` is still arriving and still has nowhere to go.
+
+## What was actually found while building it
+
+**The installed CLI implements the request.** `claude` 2.1.220 answers
+`{"subtype": "get_context_usage"}` on the same stdin the interrupt travels on,
+with no flag to turn it on. That was the fork the whole job hung on and it is
+settled: the fallback is a fallback rather than the deliverable.
+
+Two things about it that the ticket could not have known and that the design
+now rests on:
+
+- **It answers while a turn is running.** The question goes out on the session's
+  `init`, before the opening turn has produced a delta, and the answer comes
+  straight back rather than queueing behind the turn. So this server asks at
+  _two_ moments — `init` as well as turn completion — where upstream asks only
+  at the second. That is what the first-turn acceptance needed; copying
+  upstream's timing wholesale would not have met it.
+- **Asking costs no API call.** A fresh process with no turn at all answers with
+  a full reading, because the CLI is counting its own assembled prompt rather
+  than asking anything of the API.
+
+**`compactsAutomatically` has to be remembered, not just reported.** The client
+reads the _newest_ `context-window.updated` row and does not merge it with the
+ones before it (`deriveLatestContextWindowSnapshot`). Readings between two
+answers are inferred from token counts and carry no auto-compact flag of their
+own, so a server that put the field only on the rows the CLI's answer produced
+would have the tooltip's sentence blink out several times a turn. It is
+remembered on `SessionState` beside `context_window` and stamped onto every
+reading — which is a third remembered field where the ticket expected the
+existing two to _narrow_.
+
+**The counts and the CLI disagree, slightly.** On the recorded turn the `result`
+adds up to 26,959 and the answer that follows it says 26,937 about the same
+conversation; on the real UI run it was 32,308 against 32,203. Small, and the
+point is that they are two different arithmetics rather than one number arriving
+twice — so "prefer the reply" is a real precedence and the golden pins both.
+
+**`input_tokens` / `output_tokens` are now optional.** The CLI's answer describes
+the _window_, which has no input or output side to it; the reply's `apiUsage` is
+the session's running API total, a different question. Upstream drops them here
+too. They serialize as `null` on a reading taken from an answer, and the client
+carries them through and renders neither.
+
+### The test double had to learn that the server speaks first
+
+`harness::agent::ScriptedAgent` assumed the server only ever writes in _reply_ —
+a turn, or an answer to a question the CLI asked. It now also asks a question on
+`init`, and the scripted agent read that as a turn: a third of the suite failed
+until the double learned to read past it. Three things there are worth knowing
+before touching that file again, because two of them cost real time:
+
+- `echo %LINE% | findstr …` **is wrong for JSON**. cmd places the pipe while the
+  line still has quotes in it, mis-parses, and prints the line to _stdout_ —
+  which is the agent's output, so the server reads back the question it had just
+  asked and counts it as an unrecognised event. It presented as two unrelated
+  drift tests each gaining one.
+- Writing the line to a scratch file and running `findstr` over it is correct
+  and **not concurrency-safe**: one `ScriptedAgent`'s processes share a
+  directory and `%RANDOM%` is seeded from the clock, so two started in the same
+  tick race on the same "unique" file. A lost line is a turn nobody answers, so
+  it presents as a hang — `socket_concurrency.rs` went from two seconds to three
+  tests timing out.
+- What works is deleting the quotes from a copy of the variable and comparing,
+  which needs no file and no child process. See
+  `skips_the_servers_own_question`.
+
+A capture whose `control_response` is a _reading_ now replays with a stop that
+waits for the question, and one whose acknowledgement is an interrupt's keeps
+the old stop that reads past the question. `AWAIT_QUESTION` is the new marker.
+
+### Still open
+
+- **`an_agent_that_refuses_to_stop_says_so_and_the_turn_ends_as_it_was_going_to`
+  is newly flaky**, and it is this change's doing rather than the machine's: it
+  timed out at sixty seconds in one full-suite run out of three, and the suite at
+  the parent commit was clean across a run of its own. Alone it passes in 1.7
+  seconds, three times out of three.
+
+  The suspect is named rather than proven. Teaching the double to read past the
+  server's question turned `Stop::Answer` from "read one line and carry on" into
+  "keep reading until something else arrives" — which is a wait that can block
+  where the old one could not. The fix is to bound it: skip the question once,
+  then take whatever comes next, so the double cannot deadlock however the lines
+  interleave. Not done here, because proving it costs full-suite runs.
+
+  Nothing about it touches the meter. It is the test double's stdin handling.
+
+- The three pre-existing failures the ticket-40 handoff named are still failing,
+  unchanged and untouched: two `a_non_local_origin_is_refused_*` and
+  `a_refused_upgrade_matches_the_captured_401`. 28 of 31 binaries pass, which is
+  the same count the handoff recorded.
+- `SessionState::context_window` did **not** narrow. The window arrives on an
+  answer now, but the fallback still needs it remembered for the readings between
+  answers, exactly as before.

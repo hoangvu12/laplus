@@ -144,6 +144,67 @@ pub const PAUSE: &str = "<pause>";
 /// recorded behaviour being replayed.
 pub const AWAIT_ANSWER: &str = "<answer>";
 
+/// A place where the agent stops until the server *asks* it something, and
+/// records the question.
+///
+/// The mirror of [`AWAIT_ANSWER`] and the newer of the two: ticket 76 gave the
+/// server a question of its own — how full is the context window — so a
+/// recording can now contain a line the CLI said *because it was asked*, with
+/// the asking absent because it travelled on stdin.
+///
+/// The difference between the two is what each one skips. A stop waiting for an
+/// answer must not be satisfied by the server's question, and a stop waiting for
+/// the question must not skip it. See [`SKIPPED`].
+pub const AWAIT_QUESTION: &str = "<question>";
+
+/// What a stand-in agent reads past rather than acting on.
+///
+/// **This is the whole of how the double demultiplexes its stdin.** The real CLI
+/// reads the control channel and the turn channel out of one pipe and tells them
+/// apart by parsing; a batch file cannot parse, so it matches one substring —
+/// the subtype of the only request this server sends on its own initiative.
+///
+/// Without it, the question the driver asks when a session announces itself is
+/// read by the turn loop as a *turn*, and every scripted agent answers a prompt
+/// nobody sent. That is not a hypothetical: adding the question broke a third of
+/// the suite until this went in.
+///
+/// Narrow on purpose. A double that skipped everything it did not recognise
+/// would go on passing when the server started saying something new, which is
+/// the opposite of what a test double in a drift-detecting suite is for.
+const SKIPPED: &str = "get_context_usage";
+
+/// How a batch script asks whether the line it just read is one of those,
+/// spelled out because the two obvious ways are both wrong.
+///
+/// `echo %LINE% | findstr …` is wrong **for this content**: cmd decides where
+/// the pipe is while the JSON's quotes are still in the line, mis-parses, and
+/// prints the line to *stdout* — which is the agent's output, so the server reads
+/// back the question it had just asked and counts it as an event it does not
+/// recognise. It presented as two unrelated drift tests each gaining one.
+///
+/// Writing the line to a scratch file and running `findstr` over that is
+/// correct but **not concurrency-safe here**: the scripts of one `ScriptedAgent`
+/// share a directory, `%RANDOM%` is seeded from the clock, and two agent
+/// processes started in the same tick draw the same "unique" name and race on
+/// it. A lost line is a turn the agent never answers, so it presents as a hang —
+/// `socket_concurrency.rs` went from two seconds to three tests timing out.
+///
+/// So: no file and no child process. The quotes are deleted from a copy, which
+/// makes the value safe to put either side of an `if`, and the two copies differ
+/// exactly when the needle was in it.
+///
+/// A `&` or a `>` in the line would still break this, and would equally break
+/// the `echo %ANSWER%` that logs it — the script has never been able to carry
+/// one, and nothing the server writes in a test contains one.
+fn skips_the_servers_own_question(variable: &str, target: &str) -> String {
+    format!(
+        "set PROBE=%{variable}:\"=%\r\n\
+         set REST=%PROBE:{SKIPPED}=%\r\n\
+         if not \"%PROBE%\"==\"%REST%\" goto {target}\r\n"
+    )
+}
+
 /// A place where the agent *changes the project*, the way a real one does when
 /// it edits a file.
 ///
@@ -483,10 +544,30 @@ impl ScriptedAgent {
                     // `set /p` leaves the variable undefined at EOF, which is how
                     // "the server closed stdin instead of answering" arrives here.
                     // The script carries on either way — see [`AWAIT_ANSWER`].
-                    Some(Stop::Answer) => bodies.push_str(&format!(
-                        "set \"ANSWER=\"\r\n\
-                         set /p ANSWER=\r\n\
-                         if defined ANSWER >>\"%~dp0{ANSWERS_LOG}\" echo %ANSWER%\r\n"
+                    //
+                    // The loop is what makes this a wait for an *answer*: the
+                    // server's own question may be sitting in the pipe ahead of
+                    // it, and reading that as the decision would leave the agent
+                    // acting on a line nobody meant as one. See [`SKIPPED`].
+                    Some(Stop::Answer) => {
+                        let again = format!("answer-{}-{index}", turn - 1);
+                        bodies.push_str(&format!(
+                            ":{again}\r\n\
+                             set \"ANSWER=\"\r\n\
+                             set /p ANSWER=\r\n\
+                             if not defined ANSWER goto {again}-done\r\n\
+                             {skip}\
+                             >>\"%~dp0{ANSWERS_LOG}\" echo %ANSWER%\r\n\
+                             :{again}-done\r\n",
+                            skip = skips_the_servers_own_question("ANSWER", &again),
+                        ))
+                    }
+                    // The mirror, and the one place the skipped line is the line
+                    // being waited for.
+                    Some(Stop::Question) => bodies.push_str(&format!(
+                        "set \"ASKED=\"\r\n\
+                         set /p ASKED=\r\n\
+                         if defined ASKED >>\"%~dp0{ANSWERS_LOG}\" echo %ASKED%\r\n"
                     )),
                     // `exit` rather than `exit /b`: this is inside a `call`, and
                     // `/b` would return from the subroutine and carry on reading
@@ -556,13 +637,19 @@ impl ScriptedAgent {
              set \"LINE=\"\r\n\
              set /p LINE=\r\n\
              if not defined LINE exit /b 0\r\n\
+             rem Not every line the server writes is a turn. It asks how full\r\n\
+             rem the context window is whenever a session announces itself,\r\n\
+             rem and counting that as a prompt would answer a turn nobody\r\n\
+             rem sent — see [`skips_the_servers_own_question`].\r\n\
+             {skip}\
              rem A relative path, so it lands wherever the agent was started —\r\n\
              rem which is the whole point of writing it.\r\n\
              echo.>\"{WORKING_DIRECTORY_MARKER}\"\r\n\
              set /a TURN+=1\r\n\
              {dispatch}\
              goto turns\r\n\
-             {bodies}"
+             {bodies}",
+            skip = skips_the_servers_own_question("LINE", "turns"),
         )
     }
 
@@ -599,10 +686,21 @@ impl ScriptedAgent {
                     Some(Stop::Pause) => cases.push_str("      sleep 1\n"),
                     // `read` fails at EOF, which is how "the server closed stdin
                     // instead of answering" arrives here. The script carries on
-                    // either way — see [`AWAIT_ANSWER`].
+                    // either way — see [`AWAIT_ANSWER`]. The server's own
+                    // question is read past rather than taken for the decision;
+                    // see [`SKIPPED`].
                     Some(Stop::Answer) => cases.push_str(&format!(
-                        "      if IFS= read -r answer; then\n\
+                        "      while IFS= read -r answer; do\n\
+                         \x20       case \"$answer\" in *{SKIPPED}*) continue ;; esac\n\
                          \x20       printf '%s\\n' \"$answer\" >> \"$here/{ANSWERS_LOG}\"\n\
+                         \x20       break\n\
+                         \x20     done\n"
+                    )),
+                    // The mirror, and the one place the skipped line is the line
+                    // being waited for.
+                    Some(Stop::Question) => cases.push_str(&format!(
+                        "      if IFS= read -r asked; then\n\
+                         \x20       printf '%s\\n' \"$asked\" >> \"$here/{ANSWERS_LOG}\"\n\
                          \x20     fi\n"
                     )),
                     Some(Stop::Die) => {
@@ -651,6 +749,8 @@ impl ScriptedAgent {
              turn=0\n\
              {first_turn}\
              while IFS= read -r line; do\n\
+             \x20 # Not every line the server writes is a turn — see [`SKIPPED`].\n\
+             \x20 case \"$line\" in *{SKIPPED}*) continue ;; esac\n\
              \x20 : > \"{WORKING_DIRECTORY_MARKER}\"\n\
              \x20 turn=$((turn + 1))\n\
              \x20 case \"$turn\" in\n\
@@ -712,6 +812,8 @@ struct Segment<'a> {
 enum Stop {
     Pause,
     Answer,
+    /// Wait for the server to ask something. See [`AWAIT_QUESTION`].
+    Question,
     Die,
     /// Create or overwrite a file. The contents travel to the agent the same way
     /// its lines do — in a file beside the script, which the script copies —
@@ -730,6 +832,7 @@ fn segments<'a>(lines: &'a [&'a str]) -> Vec<Segment<'a>> {
         let stop = match *line {
             PAUSE => Stop::Pause,
             AWAIT_ANSWER => Stop::Answer,
+            AWAIT_QUESTION => Stop::Question,
             DIES => Stop::Die,
             edit => match edit.strip_prefix(WRITES) {
                 Some(rest) => {
@@ -778,6 +881,14 @@ fn segments<'a>(lines: &'a [&'a str]) -> Vec<Segment<'a>> {
 ///
 /// The asymmetry is the direction of the missing line: after a question the
 /// server has to answer, before an answer the server had to ask for.
+///
+/// The second case splits in two, because the server now asks two different
+/// things and the stops differ in what they read past. A stop before a *context
+/// reading* is waiting for the question that produced it; a stop before an
+/// interrupt's acknowledgement is waiting for the interrupt, and must not be
+/// satisfied by a context question that happens to be in the pipe already — the
+/// driver asks one when the session announces itself, long before any turn is
+/// stopped. See [`SKIPPED`].
 fn replayable(recorded: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = Vec::new();
     for line in recorded.lines() {
@@ -786,8 +897,11 @@ fn replayable(recorded: &str) -> Vec<&str> {
                 lines.push(line);
                 lines.push(AWAIT_ANSWER);
             }
-            Some(Exchange::Answers) => {
-                lines.push(AWAIT_ANSWER);
+            Some(Exchange::Answers { asked }) => {
+                lines.push(match asked {
+                    Asked::HowFullTheWindowIs => AWAIT_QUESTION,
+                    Asked::SomethingElse => AWAIT_ANSWER,
+                });
                 lines.push(line);
             }
             None => lines.push(line),
@@ -803,7 +917,17 @@ enum Exchange {
     Asks,
     /// The CLI answering the server. The server's line came first, and is not in
     /// the recording.
-    Answers,
+    Answers { asked: Asked },
+}
+
+/// Which of the server's questions a recorded answer is answering.
+///
+/// Read off what the answer *carries* rather than off the id it names, the same
+/// way `crate::protocol::Acknowledgement::reading` does: a reading has a window
+/// in it and an interrupt's `{"still_queued": []}` does not.
+enum Asked {
+    HowFullTheWindowIs,
+    SomethingElse,
 }
 
 /// Which half of an exchange this line is, if it is one.
@@ -815,7 +939,12 @@ fn exchange(line: &str) -> Option<Exchange> {
     let event: serde_json::Value = serde_json::from_str(line).ok()?;
     match event["type"].as_str()? {
         "control_request" => Some(Exchange::Asks),
-        "control_response" => Some(Exchange::Answers),
+        "control_response" => Some(Exchange::Answers {
+            asked: match event["response"]["response"]["totalTokens"].is_number() {
+                true => Asked::HowFullTheWindowIs,
+                false => Asked::SomethingElse,
+            },
+        }),
         _ => None,
     }
 }

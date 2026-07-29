@@ -41,6 +41,7 @@
   "token_usage": null,
   "context_window": null,
   "total_processed_tokens": null,
+  "compacts_automatically": null,
   "unknown_events": 3,
   "parse_errors": 1
 }
