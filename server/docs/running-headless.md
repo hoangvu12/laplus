@@ -329,17 +329,20 @@ a phone's browser on the far end of the public internet.
 
 The page loaded and paired from the URL's fragment with nothing typed, the
 descriptor answered `"os":"linux","arch":"arm64"`, an uncredentialed
-`/api/orchestration/shell` was still refused `401`, and **a turn ran to
-completion**. That last one is the whole chain on hardware that had never
-executed any of it: the socket upgraded through the tunnel, `crate::provider`
-resolved `claude` on arm64, the CLI streamed back, and the settling pipeline
+`/api/orchestration/shell` was still refused `401`, **a terminal opened and
+worked**, and **a turn ran to completion**.
+
+Those last two are the two things a suite speaks for least, and they are
+separate code. The terminal is `crate::terminal` on `portable-pty` over
+`openpty(3)` — every `#[cfg(not(windows))]` branch in it had been written and
+never exercised by a human until this. The turn is the whole other chain on
+hardware that had never executed any of it: the socket upgraded through the
+tunnel, `crate::provider` resolved `claude` on arm64, the CLI streamed back, and
+the settling pipeline
 rendered it.
 
 **Still not checked, and worth being exact about:**
 
-- **The terminal on Linux.** A turn is the agent path; the pty is separate code
-  (`portable-pty` on `openpty(3)`) and no hand-driven session has opened one on
-  Linux. This is the single largest thing a green suite is not speaking for.
 - **A phone against `--network` on the same LAN.** The drive above went through
   a tunnel, so the loopback path and HTTPS were exercised and the wildcard bind
   was not.

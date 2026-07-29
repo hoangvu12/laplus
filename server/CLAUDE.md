@@ -153,9 +153,12 @@ It gates on the build and the suite only: clippy reports without `-D warnings`,
 and `cargo fmt --check` is absent because this tree has never been
 rustfmt-formatted and fails on all 29 files. Tickets 36 and 05.
 
-**What CI does not cover is the application on Linux.** No hand-driven session
-has run there — see `docs/running-headless.md`, which also carries the build
-prerequisites (a C compiler, for `rusqlite`'s bundled SQLite).
+**What CI covers on Linux is the suite, not the application.** One hand-driven
+session has now run there — a phone against an aarch64 box through a tunnel,
+pairing, a terminal and a turn, on 2026-07-30. What that did and did not touch
+is written down in `docs/running-headless.md`, which is also the page for
+running a server: build prerequisites (a C compiler, for `rusqlite`'s bundled
+SQLite), the flags, the pairing walkthrough, and the security posture.
 
 **There are two workflows in this repository and both are ours** — `rust.yml`
 and `ci.yml`, the latter covering `apps/web` and the three packages on Linux.
