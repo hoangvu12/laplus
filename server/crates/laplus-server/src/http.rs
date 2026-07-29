@@ -57,6 +57,53 @@ use serde_json::{json, Value};
 
 use crate::config::{AuthDescriptor, EnvironmentDescriptor, ServerConfig};
 
+/// What a page on another origin is allowed to do with these routes.
+///
+/// **`pingdotgg/t3code:apps/server/src/httpCors.ts`, verbatim** — including the
+/// name, which is that file's `browserApiCorsHeaders` and not a term from
+/// `CONTEXT.md`. That file is upstream's entire CORS surface and it is fourteen
+/// lines; the client is built from the same contract upstream's server is, so the
+/// spelling is not this server's to choose, and a local name would hide where to
+/// check it against. Constants rather than lists joined per response: two
+/// allocations on every request to say something that cannot change, and a
+/// divergence from the file above would be a bug either way round.
+///
+/// `dpop` and the two tracing headers are named even though this server refuses
+/// DPoP ([`crate::server::authorized`]) and traces nothing. A preflight that
+/// omits a header the client *may* send fails the request outright rather than
+/// degrading it, so the list has to be the client's, not the implementation's.
+///
+/// **`Access-Control-Allow-Credentials` is not here and must not be.** It is
+/// invalid beside `*` — a browser rejects the whole response for it — and the
+/// remote path is bearer-based end to end: `bootstrapRemoteBearerSession` stores
+/// an `access_token`, and the session cookie is for the same-origin case only.
+///
+/// ## What `*` widens, stated plainly
+///
+/// Nothing about who may do what. Origin is not part of the decision anywhere in
+/// this server: [`crate::auth::authorize`] never reads it, and
+/// `UpgradeRequest.origin` is populated at the edge and consulted by nothing. A
+/// credential is the boundary, before this and after it.
+///
+/// What it does mean is that any page anywhere may *make* these requests and
+/// read the answers. Every one of them either needs a credential it will not
+/// have, or is the descriptor — which is public by design, so that a client
+/// holding nothing can discover what it is talking to.
+///
+/// Lowercase because that is what a static header name may be built from
+/// without checking it at runtime, and because it is how the file above spells
+/// them.
+pub fn browser_api_cors_headers() -> [(&'static str, &'static str); 3] {
+    [
+        ("access-control-allow-origin", "*"),
+        ("access-control-allow-methods", "GET, POST, OPTIONS"),
+        (
+            "access-control-allow-headers",
+            "authorization, b3, traceparent, content-type, dpop",
+        ),
+    ]
+}
+
 /// `GET /.well-known/t3/environment`.
 ///
 /// The same descriptor `server.getConfig` carries, so a client cannot see two

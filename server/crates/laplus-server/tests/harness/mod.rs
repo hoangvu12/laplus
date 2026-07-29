@@ -747,6 +747,34 @@ impl TestServer {
             .await
     }
 
+    /// The preflight a browser sends before a cross-origin call it cannot make
+    /// simply — which is any of them with a JSON body or an `Authorization`
+    /// header. Ticket 02 of the headless-Linux effort.
+    ///
+    /// **Presents no credential, because a preflight carries none.** That is not
+    /// this harness being economical: a browser sends the `Origin` and the two
+    /// `Access-Control-Request-*` headers and nothing else, so a route that
+    /// checked a credential here would refuse every cross-origin request before
+    /// the real one was ever sent.
+    ///
+    /// Written out by hand rather than going through [`TestServer::send`],
+    /// because those two request headers are the whole of what makes this a
+    /// preflight rather than a bare `OPTIONS` — and a future CORS
+    /// implementation that reads them would answer a bare one as an ordinary
+    /// request.
+    pub async fn preflight(&self, method: &str, path: &str) -> HttpResponse {
+        let request = format!(
+            "OPTIONS {path} HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Origin: {DESKTOP_WINDOW_ORIGIN}\r\n\
+             Access-Control-Request-Method: {method}\r\n\
+             Access-Control-Request-Headers: authorization, content-type\r\n\
+             Connection: close\r\n\r\n",
+            addr = self.addr(),
+        );
+        parse_response(&self.raw_request(&request).await)
+    }
+
     /// One request, written by hand. Raw HTTP rather than a client library, for
     /// the same reason [`TestServer::raw_upgrade`] is: no dependency, and
     /// nothing between the assertion and the bytes.
@@ -773,25 +801,7 @@ impl TestServer {
             request.push_str(payload);
         }
 
-        let raw = self.raw_request(&request).await;
-
-        let (head, body) = raw
-            .split_once("\r\n\r\n")
-            .unwrap_or_else(|| panic!("no header/body boundary in: {raw}"));
-
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("no status code in: {head}"));
-
-        HttpResponse {
-            status,
-            head: head.to_string(),
-            body: serde_json::from_str(body).unwrap_or(Value::Null),
-            text: body.to_string(),
-        }
+        parse_response(&self.raw_request(&request).await)
     }
 
     /// Perform the upgrade by hand and return the raw response head.
@@ -851,6 +861,38 @@ impl TestServer {
 enum StopAt {
     EndOfHead,
     EndOfStream,
+}
+
+/// The origin the desktop window's page is served from, and so the origin every
+/// call to a *remote* laplus arrives with. `crate::launch::DEFAULT_PORT`, which
+/// is the point: it is a second laplus on another port or another host that this
+/// one is being reached from, never this server's own address.
+pub const DESKTOP_WINDOW_ORIGIN: &str = "http://127.0.0.1:4773";
+
+/// A response head and body, split apart.
+///
+/// Free rather than a method because [`TestServer::preflight`] writes its own
+/// request and still wants the same parse — the alternative is two readings of
+/// one wire format, which is how a test starts asserting against a bug in its
+/// own harness.
+fn parse_response(raw: &str) -> HttpResponse {
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header/body boundary in: {raw}"));
+
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status code in: {head}"));
+
+    HttpResponse {
+        status,
+        head: head.to_string(),
+        body: serde_json::from_str(body).unwrap_or(Value::Null),
+        text: body.to_string(),
+    }
 }
 
 /// A plain HTTP response, with its body parsed as JSON when it is JSON.

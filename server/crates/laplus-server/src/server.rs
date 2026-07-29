@@ -37,10 +37,10 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, RawQuery, State, WebSocketUpgrade};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
-use axum::{Json, Router};
+use axum::routing::{any, get, post, MethodRouter};
+use axum::{middleware, Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 
@@ -349,17 +349,23 @@ impl Server {
             .route("/ws", get(upgrade))
             // The two answers the UI needs before it will open the socket at
             // all. See `crate::http`.
-            .route("/.well-known/t3/environment", get(environment_descriptor))
-            .route("/api/auth/session", get(auth_session))
+            .route(
+                "/.well-known/t3/environment",
+                cross_origin(get(environment_descriptor)),
+            )
+            .route("/api/auth/session", cross_origin(get(auth_session)))
             // The two the UI asks for *instead of* the socket, and falls back
             // to the socket without. Real routes rather than fallback paths for
             // a second reason beyond answering them: `/api/orchestration/…` has
             // no extension, so the asset fallback would otherwise hand a thread
             // id to the UI's own router and answer a `fetch` with an HTML page.
-            .route("/api/orchestration/shell", get(shell_snapshot))
+            .route(
+                "/api/orchestration/shell",
+                cross_origin(get(shell_snapshot)),
+            )
             .route(
                 "/api/orchestration/threads/{threadId}",
-                get(thread_snapshot),
+                cross_origin(get(thread_snapshot)),
             )
             // Ticket 73's five, in the order a phone walks them: mint a code
             // in Settings on the PC, trade it for a bearer, trade that for a
@@ -372,9 +378,22 @@ impl Server {
             // the contract says otherwise in all three places. The contract is
             // what the client is built from, so the contract wins — recorded in
             // the ticket's own Comments.
-            .route("/api/auth/browser-session", post(browser_session))
-            .route("/oauth/token", post(token_exchange))
-            .route("/api/auth/websocket-ticket", post(websocket_ticket))
+            //
+            // Ticket 02 puts [`cross_origin`] on the first three and not on the
+            // last three. The first three are how a client that holds nothing
+            // comes to hold something, which is exactly what the desktop
+            // application is doing when it adds a *remote* environment; the last
+            // three are Settings managing the codes for the backend it is
+            // already attached to, and no cross-origin caller asks for them.
+            .route(
+                "/api/auth/browser-session",
+                cross_origin(post(browser_session)),
+            )
+            .route("/oauth/token", cross_origin(post(token_exchange)))
+            .route(
+                "/api/auth/websocket-ticket",
+                cross_origin(post(websocket_ticket)),
+            )
             .route("/api/auth/pairing-token", post(pairing_credential))
             .route("/api/auth/pairing-links", get(pairing_links))
             .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
@@ -650,6 +669,73 @@ fn mint_boot_grant(state: &ServerState) -> Result<String, Box<dyn std::error::Er
         &pairing::administrative_scopes(),
     )?;
     Ok(credential)
+}
+
+/// A route a **remote** client's browser calls, wearing the headers that let it
+/// read the answer.
+///
+/// Ticket 02 of the headless-Linux effort, and the whole of it. The desktop
+/// window's page is served by its own server, so every call it makes to a second
+/// laplus is cross-origin; without these headers the browser refuses the
+/// response it already has, and the user is shown "could not reach the backend"
+/// for a server that answered fine.
+///
+/// **A layer, on each route, rather than a line in each handler.** This is the
+/// first `.layer()` in this router and it earns the exception: the seven routes
+/// have some twenty return points between them — every refusal, every typed 404,
+/// every `Err` out of [`authorized`] — and a *refused* cross-origin request that
+/// forgot its headers is unreadable, which is the exact bug this ticket is
+/// about. One place per route cannot forget. It is `axum`'s own
+/// [`middleware::map_response`] and not a dependency; `tower-http` is in
+/// `Cargo.lock` only through the shell's updater plugin and does not become
+/// this crate's for fourteen lines of constant headers.
+///
+/// Applied route by route and never to the whole `Router`, because `/ws` must
+/// **not** have them — see [`upgrade`] — and neither the asset fallback nor
+/// `/api/assets/…` has any reason to.
+fn cross_origin(routes: MethodRouter<Arc<ServerState>>) -> MethodRouter<Arc<ServerState>> {
+    routes
+        .options(preflight)
+        .layer(middleware::map_response(allow_a_browser_to_read_it))
+}
+
+/// The `OPTIONS` answer, for the question the browser asks before the request
+/// the page made.
+///
+/// **Nothing above it is reachable without this.** A JSON body and an
+/// `Authorization` header each force a preflight, and this router registered no
+/// `OPTIONS` handler anywhere — so every one of them was answered `405` by the
+/// `MethodRouter`'s own default, with an `Allow: GET,HEAD`, and the real request
+/// was never sent. Not by the asset fallback: `Router::fallback` is for paths
+/// that match nothing, and these paths matched.
+///
+/// No credential is checked, and there is nothing here to check one against: a
+/// preflight is the browser asking on the page's behalf, before the page's
+/// request exists, and it carries neither cookie nor `Authorization`. What it
+/// answers is "may that request be made", which this server's answer to is
+/// unconditionally yes — see [`crate::http::browser_api_cors_headers`] for why
+/// that widens nothing. The request itself still meets [`authorized`].
+///
+/// 204 rather than 200 because there is no body to describe. The headers are
+/// [`cross_origin`]'s layer, the same ones the real answer carries.
+async fn preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+/// [`crate::http::browser_api_cors_headers`], on the way out.
+///
+/// `insert` rather than `append`: nothing here sets these, and a duplicate
+/// `Access-Control-Allow-Origin` is a browser error rather than two chances at
+/// being read.
+async fn allow_a_browser_to_read_it(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    for (name, value) in http::browser_api_cors_headers() {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response
 }
 
 async fn environment_descriptor(State(state): State<Arc<ServerState>>) -> Response {
@@ -1335,6 +1421,14 @@ async fn upgrade(
         // let any page on any origin read the 401 it provoked. The body says
         // nothing secret; the header is simply no longer buying anything the
         // refused client needs.
+        //
+        // **Ticket 02 admits it on seven other routes and not on this one**, and
+        // the difference is what the refused client can do with the answer. There
+        // the request being refused is one the remote client meant to make, and
+        // reading *which* refusal it was is its whole recovery. A browser cannot
+        // put a header on an upgrade — which is why the ticket rides in the query
+        // string — so nothing here is waiting to be told apart. See
+        // [`cross_origin`].
         Err(refusal) => refusal,
     }
 }

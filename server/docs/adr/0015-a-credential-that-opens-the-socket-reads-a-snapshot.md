@@ -9,6 +9,17 @@ Status: Superseded by [ADR-0019](0019-a-tunnel-dissolves-the-loopback-boundary.m
 > credential is now refused. A tunnel makes a request from anywhere look like a
 > request from this machine, so "reachability is the boundary" stopped being
 > true rather than stopped being convenient.
+>
+> **One more bullet below is now false.** "The 401 does _not_ carry
+> `Access-Control-Allow-Origin: *`" was reversed by ticket 02 of the
+> headless-Linux effort: both routes carry the header on every answer, refusals
+> included. The reasoning here assumed the cross-origin caller was an attacker,
+> which was true while the desktop window only ever talked to its own server.
+> It now also fetches a _remote_ laplus, and the refusal it must be able to read
+> is its own. Nothing about the strength of the check changed — a credential is
+> still the whole boundary — only who is allowed to read the answer.
+> `crate::http::browser_api_cors_headers` and `tests/http_cors.rs` are the
+> current statement.
 
 ## Context
 

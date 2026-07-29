@@ -216,6 +216,41 @@ and mints a new one.
 
 Once paired, the phone holds a session that is good for thirty days.
 
+## Reaching this server from the desktop application
+
+A phone loads the page _from_ this box, so page and API share an origin. The
+desktop application does not: its window is served by its own server on
+`http://127.0.0.1:4773`, so every call it makes to this one is **cross-origin**,
+and a browser will not hand a page a response that does not say it may.
+
+Since ticket 02 of this effort it says so. The routes a remote client calls carry
+`Access-Control-Allow-Origin: *` and answer the `OPTIONS` preflight; `/ws` does
+not and does not need to, because a WebSocket handshake is not governed by CORS.
+This widens nothing about who may do what. Origin is not part of any decision
+this server makes — `auth::authorize` reads the header and consults it nowhere,
+the allowlist that once did was removed by ticket 73, and a credential is still
+the whole boundary. What the header settles is only whether the page that asked
+may read the answer.
+
+Two things to know before trying it:
+
+- **Type the scheme.** `resolveRemotePairingTarget` defaults a bare host to
+  `https://`, so `192.168.1.42:4773` becomes an HTTPS URL and fails against this
+  server, which speaks plain HTTP. Type `http://192.168.1.42:4773`.
+- **A tunnel with TLS works and is the better shape**, because an `https://`
+  pairing URL derives `wss://` correctly. What does _not_ work is the reverse: a
+  page served over HTTPS calling a plain-HTTP LAN address is mixed content and
+  the browser blocks it, which is what `compatibility.hostedHttpsApp` in
+  `crate::endpoints` reports.
+
+**It does not finish yet, and the remaining gap is not CORS.** Pairing gets as
+far as minting a bearer and then the environment does not appear under "Remote
+environments", because every laplus reports `environmentId: "local"` and the
+client keys its registry on that — the slot is already the desktop's own
+backend's. Ticket 02's "What landed" has the detail. Until that is fixed,
+`ssh -L 5773:localhost:4773 <box>` and pointing the window at
+`http://127.0.0.1:5773` gets you the same thing.
+
 ## What this costs
 
 Not softened, because it is the whole of the security model. ADR-0022 wrote the
@@ -341,8 +376,25 @@ tunnel, `crate::provider` resolved `claude` on arm64, the CLI streamed back, and
 the settling pipeline
 rendered it.
 
+**By hand, across two origins** — ticket 02, on Windows, with a real Chrome over
+the DevTools protocol (`tools/ui-driver/remote-pairing.mjs`). Two `laplus-server`
+processes on ports 5773 and 5774, each with a profile of its own; a different port
+is a different origin, which is all a browser means by cross-origin.
+
+From a page served by the first, against the second: the descriptor, the token
+exchange, `/api/auth/session`, the socket ticket and the shell snapshot all
+answered 200, three preflights answered 204, and the socket returned a
+`server.getConfig` success. The same drive against a laplus built before that
+ticket dies at the first call with `MissingAllowOriginHeader`, which is the
+control that makes the rest mean anything. Driving the real Add Environment form
+got as far as minting the bearer — see the section above for where it stops, and
+why that is not CORS.
+
 **Still not checked, and worth being exact about:**
 
+- **A desktop application against a Linux box.** The two-origin drive above was
+  two servers on one Windows machine, which is the same code path a browser
+  takes and not the same machine boundary.
 - **A phone against `--network` on the same LAN.** The drive above went through
   a tunnel, so the loopback path and HTTPS were exercised and the wildcard bind
   was not.

@@ -364,6 +364,15 @@ The window is pointed at `http://127.0.0.1:4773/`, so the port is part of what
 the browser scopes `localStorage` by — and `localStorage` is where the UI keeps
 the developer's layout, drafts and open thread. See ADR-0010.
 
+It is also what makes a **remote** laplus a different server to a browser, and
+not only to a person: the window's page is served by its own loopback server, so
+every call it makes to a second laplus is **cross-origin** and is refused by the
+browser unless the answer says otherwise. `http::browser_api_cors_headers` is
+that answer, on the routes a remote client calls. **Origin is still not part of
+any decision this server makes** — `auth::authorize` does not read it, and a
+credential is the whole boundary. What the header settles is whether a page is
+allowed to _read_ a refusal it already provoked.
+
 **Install directory** — `%LOCALAPPDATA%\Programs\laplus`, where the
 installer writes. Named separately from the **data directory** —
 `%LOCALAPPDATA%\laplus`, `config::data_dir`, which holds `state.sqlite`,

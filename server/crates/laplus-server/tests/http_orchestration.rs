@@ -268,15 +268,20 @@ async fn every_credential_that_opens_the_socket_reads_a_snapshot() {
 /// below: presenting nothing is refused whatever the origin, and presenting a
 /// credential this server minted is answered whatever the origin.
 ///
-/// The second half is not as alarming as it first reads, and the last assertion
-/// is why: there is no `Access-Control-Allow-Origin` on the answer, so a browser
-/// hands the page a CORS error rather than the project list. A foreign *page*
-/// still cannot read this. A foreign *program* holding a stolen cookie always
-/// could, which is the posture `authorize` states plainly.
+/// **Ticket 02 of the headless-Linux effort changed the second half**, on
+/// purpose, and this is where it announced itself. It used to end by asserting
+/// there was no `Access-Control-Allow-Origin` on the answer — so a browser handed
+/// the page a CORS error rather than the project list, and a foreign *page* could
+/// not read what a foreign *program* holding a stolen cookie always could.
 ///
-/// **Ticket 02 of the headless-Linux effort changes that last line**, on purpose
-/// — the desktop app fetching a remote server is a second origin that has to be
-/// answered. This assertion is where that change will announce itself.
+/// That absence is gone, because the desktop application fetching a *remote*
+/// laplus is a second origin that has to be answered and there is no way to
+/// admit it without admitting every other page too — narrowing `*` to a
+/// configured list is the allowlist that was removed on purpose. So the honest
+/// statement is the one asserted below: a page anywhere may now read this, and
+/// what stands between it and the project list is the credential, which is where
+/// `crate::auth` always said the boundary was. `tests/http_cors.rs` carries the
+/// whole argument and the header set.
 #[tokio::test]
 async fn these_routes_check_the_credential_and_not_the_origin() {
     let server = a_server_with_a_conversation().await;
@@ -312,10 +317,15 @@ async fn these_routes_check_the_credential_and_not_the_origin() {
             "{path} — the credential is what is checked"
         );
 
-        // The answer is not readable by the page that asked for it. Nothing on
-        // this server writes a CORS header today, and that absence is doing
-        // security work here rather than being an oversight.
-        assert_eq!(response.header("access-control-allow-origin"), None, "{path}");
+        // And since ticket 02 the page that asked may read the answer. The
+        // credential it had to present to get one is the boundary; the header is
+        // what lets the desktop application's own window read a remote laplus at
+        // all.
+        assert_eq!(
+            response.header("access-control-allow-origin").as_deref(),
+            Some("*"),
+            "{path}"
+        );
     }
 
     server.stop().await;
