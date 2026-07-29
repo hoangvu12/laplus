@@ -16,7 +16,6 @@ import { primaryServerKeybindingsAtom } from "../state/server";
 import { useClientSettings } from "../hooks/useSettings";
 import ThreadSidebar from "./Sidebar";
 import ThreadSidebarV2 from "./SidebarV2";
-import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import {
   resolveInitialThreadSidebarWidth,
   resolveThreadSidebarMaximumWidth,
@@ -59,7 +58,6 @@ function SidebarControl() {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const { toggleSidebar } = useSidebar();
   const isSidebarVisible = useSidebarVisibility();
-  const stageBackdropVariant = useSidebarStageBackdropVariant();
   const shortcutLabel = shortcutLabelForCommand(keybindings, "sidebar.toggle");
 
   useEffect(() => {
@@ -94,8 +92,10 @@ function SidebarControl() {
             <SidebarTrigger
               className={cn(
                 "pointer-events-auto",
+                // The sidebar header carries banner art on every channel now,
+                // so the trigger that sits on top of it is always on a dark
+                // backdrop whenever the sidebar is showing.
                 isSidebarVisible &&
-                  stageBackdropVariant &&
                   "[:hover,[data-pressed]]:bg-white/15 focus-visible:ring-white/90 focus-visible:ring-offset-blue-700 [&_svg]:stroke-white/90! [&_svg]:opacity-100! [&_svg]:hover:stroke-white!",
               )}
               aria-label="Toggle main sidebar"
