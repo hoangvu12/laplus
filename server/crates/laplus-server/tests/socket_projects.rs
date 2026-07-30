@@ -389,7 +389,7 @@ async fn the_database_is_created_on_first_run() {
     server.stop().await;
 }
 
-/// Roughly twenty command types exist and laplus implements nine. An
+/// Roughly twenty command types exist and laplus implements eleven. An
 /// unimplemented one has to fail its own call and name itself — not take the
 /// connection down, and not be mistaken for the method being missing.
 #[tokio::test]

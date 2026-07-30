@@ -191,5 +191,10 @@ than discovered by:
 - **The send is guarded.** `startThreadTurn` runs only `if (failure === null)`,
   and the metadata and mode commands are all attempted before it. So one refused
   command there does not merely lose a setting — **it stops the message being
-  sent.** With `thread.meta.update` still unimplemented, that is what a developer
-  who changes the model picker on an existing conversation gets.
+  sent.** That is what a developer who changed the model picker on an existing
+  conversation got while `thread.meta.update` was unimplemented, and it is why
+  ticket 03 was taken first. That ticket answers the command — **at the socket,
+  not here**: no probe has driven this path since, so what is written above is
+  still the last thing a browser actually observed. The guard itself has not
+  moved, so the same failure returns for any command on this path that goes
+  unanswered.

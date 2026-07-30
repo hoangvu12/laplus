@@ -95,10 +95,12 @@ use crate::clock::now_iso;
 use crate::config::ServerConfig;
 use crate::filesystem::Index;
 use crate::projects::{Project, WorkspaceRoot};
-use crate::store::{Conflict, Database, Insert, Registry, Removal, Sequences, StorageError};
+use crate::store::{
+    Conflict, Database, Insert, Registry, Removal, Rename, Sequences, StorageError,
+};
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::settling::SessionStatus;
-use crate::threads::{self, Change, Prompt, Session, Thread, Threads};
+use crate::threads::{self, Change, Given, MetaUpdate, Prompt, Session, Thread, Threads};
 use crate::transcripts::Transcripts;
 
 /// The tag that carries every write to the registry.
@@ -182,8 +184,10 @@ struct Inner {
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
     CreateProject(CreateProject),
+    RenameProject { project_id: String, title: String },
     DeleteProject { project_id: String },
     CreateThread(CreateThread),
+    UpdateThreadMeta(UpdateThreadMetaPayload),
     StartTurn(Box<StartTurn>),
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -411,8 +415,12 @@ impl Shell {
     ) -> Result<Value, CommandError> {
         let sequence = match Command::parse(payload)? {
             Command::CreateProject(create) => self.create_project(&create)?,
+            Command::RenameProject { project_id, title } => {
+                self.rename_project(&project_id, &title)?
+            }
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
             Command::CreateThread(create) => self.create_thread(&create)?,
+            Command::UpdateThreadMeta(update) => self.update_thread_meta(update)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
@@ -475,6 +483,97 @@ impl Shell {
             .threads
             .apply(thread_id, change)
             .ok_or_else(|| self.not_open(thread_id))
+    }
+
+    /// Rename a conversation — and, on the same command, move the three other
+    /// things the client keeps beside its title.
+    ///
+    /// **This is not only the rename control**, and that is the thing about
+    /// `thread.meta.update` worth knowing before touching it. The composer sends
+    /// it on *every* send whose model or branch differs from the thread's, from
+    /// `ChatView.tsx`'s `persistThreadSettingsForNextTurn`, and it sends it
+    /// *first* — the two mode commands and the turn itself are behind an
+    /// `if (failure === null)`. So while this command was refused by name, picking
+    /// a runtime mode and pressing enter dispatched this, was refused, and never
+    /// sent the message. Ticket 03 of the thread-lifecycle tracker records the
+    /// run that found it.
+    ///
+    /// A blank title never reaches here — [`Command::parse`] refuses one, because
+    /// a conversation called "" is a row the developer cannot pick out of a list.
+    /// What does reach here is a rename to the title already held, which is
+    /// answered rather than refused for [`Shell::set_mode`]'s reason: folding the
+    /// event a second time lands on the same state.
+    ///
+    /// Such a repeat does move the thread's `updatedAt`, because [`Threads::apply`]
+    /// stamps the clock for every change — and it is *not* the spec's "idempotence
+    /// by re-emission", which carries the existing timestamp so a duplicate cannot
+    /// churn a list ordered by when things changed. That rule was written for
+    /// settle and snooze, and [`Shell::set_mode`] carries the whole argument: the
+    /// client's own thread list prefers `latestUserMessageAt` (`threadSort.ts`), so
+    /// nothing the developer looks at reorders. Worth knowing before the settle
+    /// commands reuse this path, where it would matter.
+    ///
+    /// An unknown thread is refused by [`Threads::apply`]'s own `None`, again as
+    /// [`Shell::set_mode`] does it and for the same reason — a pre-check would
+    /// clone a whole transcript to ask a question the write answers anyway.
+    fn update_thread_meta(&self, update: UpdateThreadMetaPayload) -> Result<i64, CommandError> {
+        let UpdateThreadMetaPayload {
+            thread_id,
+            title,
+            model_selection,
+            branch,
+            worktree_path,
+        } = update;
+        self.inner
+            .threads
+            .apply(
+                &thread_id,
+                Change::MetaUpdated(MetaUpdate {
+                    title,
+                    model_selection,
+                    branch,
+                    worktree_path,
+                }),
+            )
+            .ok_or_else(|| self.not_open(&thread_id))
+    }
+
+    /// Give a project the developer's own name for it.
+    ///
+    /// The sidebar's rename dialog, and the whole of what this server reads from
+    /// `project.meta.update` — the command's other three fields are refused at the
+    /// parse rather than accepted and dropped, because this registry stores none
+    /// of them. See [`Command::parse`].
+    ///
+    /// The number is taken and held until the change has been announced, which is
+    /// [`Shell::create_project`]'s shape and is not optional: two aggregates
+    /// publish onto the one feed the project list folds, and a client drops
+    /// anything at or below the sequence it holds.
+    ///
+    /// A rename publishes `project-upserted` — the same event a creation does,
+    /// carrying the whole project. The client's shell reducer upserts by id
+    /// (`shellReducer.ts`), so one event shape serves both and there is no
+    /// separate "renamed" the list would have to learn.
+    ///
+    /// A repeat is answered rather than refused, as a thread's is. It moves the
+    /// row's `updated_at` and moves nothing the developer sees: the registry is
+    /// read `ORDER BY created_at ASC, id ASC` ([`Database::registry`]), so the
+    /// project list cannot be reordered by renaming something twice.
+    fn rename_project(&self, project_id: &str, title: &str) -> Result<i64, CommandError> {
+        let commit = self.inner.sequences.commit();
+        let renamed = self
+            .inner
+            .database
+            .rename_project(project_id, title, commit.sequence())
+            .map_err(unavailable("rename the project"))?;
+
+        match renamed {
+            Rename::Committed { sequence, project } => {
+                self.announce(project_upserted(sequence, &project));
+                Ok(sequence)
+            }
+            Rename::Absent => Err(self.not_registered(project_id)),
+        }
     }
 
     /// Hand the developer's permission decision to the agent waiting on it.
@@ -726,11 +825,18 @@ impl Shell {
             .database
             .project(project_id)
             .map_err(unavailable("look up the project"))?
-            .ok_or_else(|| {
-                CommandError::new(format!(
-                    "Project '{project_id}' is not registered with this server."
-                ))
-            })
+            .ok_or_else(|| self.not_registered(project_id))
+    }
+
+    /// A command about a project this server has never registered. Said in one
+    /// place because two commands refuse for it — a thread cannot be created in a
+    /// project that is not there, and a project that is not there cannot be
+    /// renamed — and the developer should not have to work out that two different
+    /// sentences mean the same thing.
+    fn not_registered(&self, project_id: &str) -> CommandError {
+        CommandError::new(format!(
+            "Project '{project_id}' is not registered with this server."
+        ))
     }
 
     fn create_project(&self, create: &CreateProject) -> Result<i64, CommandError> {
@@ -1247,6 +1353,77 @@ struct RespondToUserInput {
     answers: Value,
 }
 
+/// `project.meta.update` — the sidebar's rename dialog.
+///
+/// The command's other three fields — `workspaceRoot`, `defaultModelSelection`
+/// and `scripts` — are absent here on purpose and are refused rather than
+/// dropped; [`Command::parse`] is where that is argued.
+///
+/// The title is optional in the contract and therefore optional here, so that a
+/// command carrying one of those three and no title is refused for the field this
+/// server cannot keep rather than for a missing title it never needed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProjectMetaPayload {
+    project_id: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// The fields of `project.meta.update` this registry has nowhere to put.
+///
+/// A workspace root is a project's *identity* — `canonical_root` is derived from
+/// it and is what "the same project" is answered by — so moving one is a different
+/// act from renaming, with a duplicate check and a filesystem check of its own.
+/// The other two are constants on the wire, each a later ticket's; see
+/// [`crate::projects`].
+const UNSTORED_PROJECT_FIELDS: [&str; 3] = ["workspaceRoot", "defaultModelSelection", "scripts"];
+
+/// `thread.meta.update` — the conversation's own description, as the client keeps
+/// it.
+///
+/// Four fields, every one optional, and only the ones that arrived are applied —
+/// see [`MetaUpdate`], which is the same shape one step further in. All four are
+/// already columns on the thread and already published, so this command needs no
+/// migration and no new read-model shape.
+///
+/// `commandId` and `expectedBranch` are in the contract and deliberately absent.
+/// The first is unread everywhere on this wire — see the module documentation.
+/// The second is a compare-and-swap on the branch that **nothing in this
+/// repository sends**: no call site in `apps/web` or `packages/client-runtime`
+/// builds one. Honouring it would mean inventing the semantics of a guard no
+/// client asks for, and refusing a payload that carried one would refuse a client
+/// merely more careful than ours. So it is ignored, and this comment is the record
+/// that it was a decision.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateThreadMetaPayload {
+    thread_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    model_selection: Option<Value>,
+    #[serde(default, deserialize_with = "given")]
+    branch: Given<String>,
+    #[serde(default, deserialize_with = "given")]
+    worktree_path: Given<String>,
+}
+
+/// Tell an absent field from one sent as `null`.
+///
+/// serde's own `Option` cannot: it reads `null` as `None`, which is the same
+/// answer it gives for a field that was not there — and on this command the two
+/// mean opposite things, "leave it alone" against "clear it". Wrapping the read in
+/// a second `Some` makes the outer layer mean *presence* and the inner one mean
+/// *value*, which is what [`Given`] is.
+fn given<'de, D, T>(deserializer: D) -> Result<Given<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
+}
+
 /// `thread.runtime-mode.set` — the composer's runtime picker, moved
 /// mid-conversation.
 ///
@@ -1334,7 +1511,7 @@ impl Command {
     ///
     /// The `type` is taken by hand before the rest is deserialized so that an
     /// unimplemented command names itself in the refusal. The contract carries
-    /// roughly twenty command types and laplus implements nine, so "which
+    /// roughly twenty command types and laplus implements eleven, so "which
     /// one" is the most useful thing a message can say during the build-out.
     fn parse(payload: &Value) -> Result<Command, CommandError> {
         let kind = payload
@@ -1351,6 +1528,47 @@ impl Command {
                     ..create
                 }))
             }
+            // **Only the title.** The command carries three other fields and
+            // this server stores none of them: a workspace root is a project's
+            // identity and moving one is a different act from renaming it, and
+            // `defaultModelSelection` and `scripts` are constants on the wire
+            // (see [`crate::projects`], where each is a later ticket's).
+            //
+            // Refused rather than accepted and ignored, which is ADR-0009's
+            // declined-setting posture. The UI does send one of them — the script
+            // editor sends `{projectId, scripts}` — and answering it with a
+            // sequence would tell the developer their script was saved, leaving
+            // them to find out at the next restart that it was not. A refusal is
+            // the same outcome they get today, with a sentence saying why.
+            //
+            // On *presence*, not on the value. Two of the three would be a no-op
+            // at the values this server reports — it publishes `scripts: []` and
+            // `defaultModelSelection: null` as constants — so a value-sensitive
+            // rule would let deleting the last script succeed while adding one
+            // failed, which is a worse account of "this server does not keep
+            // these" than refusing both.
+            "project.meta.update" => {
+                let rename: UpdateProjectMetaPayload = read(payload, kind)?;
+                let project_id = non_blank(rename.project_id, "projectId", kind)?;
+                for field in UNSTORED_PROJECT_FIELDS {
+                    if payload.get(field).is_some() {
+                        return Err(CommandError::new(format!(
+                            "This server does not keep a project's {field}, so project \
+                             '{project_id}' was left as it was. Its title is the one thing this \
+                             command can change here."
+                        )));
+                    }
+                }
+                let Some(title) = rename.title else {
+                    return Err(CommandError::new(format!(
+                        "{kind} asked for no change to project '{project_id}'. Send a title."
+                    )));
+                };
+                Ok(Command::RenameProject {
+                    title: a_title(title, "project", &project_id)?,
+                    project_id,
+                })
+            }
             "project.delete" => {
                 let delete: DeleteProjectPayload = read(payload, kind)?;
                 Ok(Command::DeleteProject {
@@ -1365,6 +1583,64 @@ impl Command {
                         project_id: non_blank(create.thread.project_id, "projectId", kind)?,
                         ..create.thread
                     },
+                }))
+            }
+            "thread.meta.update" => {
+                let UpdateThreadMetaPayload {
+                    thread_id,
+                    title,
+                    model_selection,
+                    branch,
+                    worktree_path,
+                } = read_about_a_thread(payload, kind)?;
+                // The thread first, so every refusal below has a conversation to
+                // name — the same order the two mode commands take, and for the
+                // same reason.
+                let thread_id = non_blank(thread_id, "threadId", kind)?;
+                // A command carrying none of the four is refused, because the
+                // event describing it would name nothing: a `thread.meta-updated`
+                // whose payload is a `threadId` and a timestamp says a
+                // conversation was updated while naming no part of it that was.
+                // The client folds that as an update, so it would be an event
+                // asserting a change nobody could point at.
+                if title.is_none()
+                    && model_selection.is_none()
+                    && branch.is_none()
+                    && worktree_path.is_none()
+                {
+                    return Err(CommandError::new(format!(
+                        "{kind} asked for no change to thread '{thread_id}'. Send a title, a model \
+                         selection, a branch or a worktree path."
+                    )));
+                }
+                // An object or nothing, for [`RespondToUserInput::answers`]'s
+                // reason turned up one notch: the selection is published as part
+                // of the thread, so one that is not an object fails the client's
+                // decode of the *whole conversation* rather than of this write.
+                //
+                // The shape and not the contents. `ModelSelection` also names an
+                // instance and a model, and neither is checked here — `{}` is
+                // stored and would fail that decode too. `thread.create` accepts
+                // the same field with no check at all, so tightening one without
+                // the other would leave the looser door open; both together are a
+                // ticket of their own.
+                if model_selection
+                    .as_ref()
+                    .is_some_and(|selection| !selection.is_object())
+                {
+                    return Err(CommandError::new(format!(
+                        "A model selection is an object, so thread '{thread_id}' was left as it \
+                         was."
+                    )));
+                }
+                Ok(Command::UpdateThreadMeta(UpdateThreadMetaPayload {
+                    title: title
+                        .map(|title| a_title(title, "thread", &thread_id))
+                        .transpose()?,
+                    model_selection,
+                    branch: cleared_or_named(branch, "branch", &thread_id)?,
+                    worktree_path: cleared_or_named(worktree_path, "worktree path", &thread_id)?,
+                    thread_id,
                 }))
             }
             "thread.turn.start" => {
@@ -1496,6 +1772,67 @@ fn non_blank(value: String, field: &str, kind: &str) -> Result<String, CommandEr
     Ok(value)
 }
 
+/// A name worth having, trimmed — or a refusal naming what stayed as it was.
+///
+/// The contract types every title as trimmed and non-empty, and the two rename
+/// controls already refuse a blank one before dispatching. This is the same rule
+/// where it is authoritative rather than convenient: a thread or a project called
+/// "" is not a smaller thing than a named one, it is a row the developer cannot
+/// pick out of a list.
+///
+/// Stored trimmed, which is what [`Shell::create_project`] does with the title on
+/// a creation — the surrounding whitespace is the client's, and keeping it would
+/// sort the list by something invisible.
+///
+/// `subject` is the word for the thing, because the sentence is the whole
+/// diagnostic the UI can show and "a title cannot be blank" without saying whose
+/// title is not something a developer with two windows open can act on.
+fn a_title(value: String, subject: &str, id: &str) -> Result<String, CommandError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError::new(format!(
+            "A title cannot be blank, so {subject} '{id}' was left as it was."
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// A field the client either clears or names, never blanks.
+///
+/// `null` and `""` are different answers on `thread.meta.update`: the composer
+/// clears a worktree path by sending `null` (`ChatView.logic.ts`), while a blank
+/// branch is a ref name that names nothing. The contract types both fields as
+/// trimmed and non-empty *or* null, so `""` is a third state neither side has a
+/// meaning for — and the client has one place to show it, the branch toolbar,
+/// where "on branch ''" is worse than either a name or nothing.
+///
+/// Nothing checks it beyond being non-blank, and that is deliberate rather than
+/// missing. `branch` and `worktreePath` are carried and never acted on
+/// ([`crate::threads`]), so this is not the guard [`crate::refs`] would owe a ref
+/// name it was about to hand to git; it is the contract's own rule, enforced
+/// where the value enters.
+///
+/// Absent and `null` are both passed through; only the blank string is refused.
+fn cleared_or_named(
+    value: Given<String>,
+    field: &str,
+    thread_id: &str,
+) -> Result<Given<String>, CommandError> {
+    match value {
+        Some(Some(given)) => {
+            let trimmed = given.trim();
+            if trimmed.is_empty() {
+                return Err(CommandError::new(format!(
+                    "A blank {field} names nothing; send null to clear it. Thread '{thread_id}' \
+                     was left as it was."
+                )));
+            }
+            Ok(Some(Some(trimmed.to_string())))
+        }
+        absent_or_cleared => Ok(absent_or_cleared),
+    }
+}
+
 /// One value out of a closed set the contract spells out, or a refusal naming
 /// what was sent and which conversation it was sent about.
 ///
@@ -1625,6 +1962,46 @@ mod tests {
                 "branch": Value::Null,
                 "worktreePath": Value::Null,
                 "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+        }
+
+        /// The `thread.meta.update` `updateThreadMetadata` builds, carrying
+        /// whichever of the four fields the caller means to move.
+        ///
+        /// Merged into the envelope rather than taken as four arguments, because
+        /// *which fields are present* is the whole question this command turns on
+        /// — an argument list would have to spell absent and null differently and
+        /// would then be testing the helper rather than the parse.
+        fn update_thread_meta(
+            &self,
+            thread_id: &str,
+            fields: Value,
+        ) -> Result<Value, CommandError> {
+            let mut command = json!({
+                "type": "thread.meta.update",
+                "commandId": format!("test:meta:{thread_id}"),
+                "threadId": thread_id,
+            });
+            let envelope = command.as_object_mut().expect("the envelope is an object");
+            for (field, value) in fields.as_object().expect("the fields are an object") {
+                envelope.insert(field.clone(), value.clone());
+            }
+            self.dispatch(&command)
+        }
+
+        /// The sidebar's thread rename, which is a `thread.meta.update` carrying
+        /// nothing but a title.
+        fn rename_thread(&self, thread_id: &str, title: &str) -> Result<Value, CommandError> {
+            self.update_thread_meta(thread_id, json!({"title": title}))
+        }
+
+        /// The sidebar's project rename dialog.
+        fn rename_project(&self, project_id: &str, title: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "project.meta.update",
+                "commandId": format!("test:project-meta:{project_id}"),
+                "projectId": project_id,
+                "title": title,
             }))
         }
 
@@ -2030,7 +2407,7 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and laplus implements nine. Each
+    /// Roughly twenty command types exist and laplus implements eleven. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]
@@ -2437,6 +2814,372 @@ mod tests {
             "{}",
             refusal.message()
         );
+    }
+
+    // -- the two renames -----------------------------------------------------
+    //
+    // Payload validation only, which is the seam the spec assigns this file:
+    // each of these is one sentence about one payload, and asserting them end to
+    // end would be a connection and a dispatch per sentence. The sequence, both
+    // feeds, a second connection, a fresh subscriber and the restart are
+    // `tests/socket_renaming.rs`.
+
+    /// A blank title is refused for both, with a sentence naming the problem and
+    /// the thing it applies to — and the thing is left as it was.
+    ///
+    /// The two rename controls already refuse a blank title before dispatching,
+    /// so this is reached by a client that does not. It matters anyway: a
+    /// conversation or a project called "" is a row the developer cannot pick
+    /// out of a list, and the contract types both titles as trimmed and
+    /// non-empty.
+    #[test]
+    fn a_blank_title_is_refused_and_says_what_it_was_about() {
+        let fixture = Fixture::with_a_conversation();
+
+        for blank in ["", "   ", "\t\n"] {
+            let refusal = fixture
+                .rename_thread("thread-1", blank)
+                .expect_err("a blank title is not a name");
+            assert!(
+                refusal.message().contains("title") && refusal.message().contains("thread-1"),
+                "{blank:?}: {}",
+                refusal.message()
+            );
+
+            let refusal = fixture
+                .rename_project("project-1", blank)
+                .expect_err("a blank title is not a name");
+            assert!(
+                refusal.message().contains("title") && refusal.message().contains("project-1"),
+                "{blank:?}: {}",
+                refusal.message()
+            );
+        }
+
+        assert_eq!(fixture.detail("thread-1")["title"], "A conversation");
+        assert_eq!(fixture.listed()[0]["title"], "modes");
+    }
+
+    /// A title is stored trimmed, which is what a creation already does with
+    /// one. The surrounding whitespace is the client's, and keeping it would
+    /// order the list by something the developer cannot see.
+    #[test]
+    fn a_title_is_stored_trimmed() {
+        let fixture = Fixture::with_a_conversation();
+
+        fixture
+            .rename_thread("thread-1", "  Renaming things  ")
+            .expect("a title with whitespace around it is a title");
+        assert_eq!(fixture.detail("thread-1")["title"], "Renaming things");
+
+        fixture
+            .rename_project("project-1", "\tThe project\t")
+            .expect("the same rule");
+        assert_eq!(fixture.listed()[0]["title"], "The project");
+    }
+
+    /// Renaming to the title already held is answered rather than refused.
+    ///
+    /// Both rename controls compare before dispatching, so this is reached by a
+    /// retry or a second window that has not folded the first one's event yet.
+    /// Folding what it publishes a second time lands on the same state, which is
+    /// what "harmless" has to mean on a server that remembers no command ids.
+    #[test]
+    fn renaming_to_the_title_already_held_is_answered_rather_than_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        fixture.rename_thread("thread-1", "Same").expect("renamed");
+        let again = fixture
+            .rename_thread("thread-1", "Same")
+            .expect("a repeat is harmless");
+        assert!(again["sequence"].as_i64().expect("a sequence") > 0);
+        assert_eq!(fixture.detail("thread-1")["title"], "Same");
+
+        fixture.rename_project("project-1", "Same").expect("renamed");
+        fixture
+            .rename_project("project-1", "Same")
+            .expect("a repeat is harmless");
+        assert_eq!(fixture.listed()[0]["title"], "Same");
+    }
+
+    /// **`thread.meta.update` is not only the rename control.** The composer
+    /// sends it on every send whose model or branch differs from the thread's,
+    /// so a payload with no title in it is the ordinary case rather than an odd
+    /// one — and each field that arrives is applied while the others are left
+    /// exactly as they were.
+    #[test]
+    fn each_field_that_arrives_is_applied_and_the_others_are_left_alone() {
+        let fixture = Fixture::with_a_conversation();
+
+        fixture
+            .update_thread_meta(
+                "thread-1",
+                json!({"modelSelection": {"instanceId": "claudeAgent", "model": "claude-sonnet-5"}}),
+            )
+            .expect("the composer's own payload");
+        let thread = fixture.detail("thread-1");
+        assert_eq!(thread["modelSelection"]["model"], "claude-sonnet-5");
+        assert_eq!(
+            thread["title"], "A conversation",
+            "a payload with no title moved the title: {thread}"
+        );
+
+        // The branch change the composer sends: the branch it wants and a null
+        // worktree path, in one command.
+        fixture
+            .update_thread_meta(
+                "thread-1",
+                json!({"branch": "feature/renaming", "worktreePath": Value::Null}),
+            )
+            .expect("a branch and a cleared worktree");
+        let thread = fixture.detail("thread-1");
+        assert_eq!(thread["branch"], "feature/renaming");
+        assert_eq!(thread["worktreePath"], Value::Null);
+        assert_eq!(thread["modelSelection"]["model"], "claude-sonnet-5");
+
+        fixture
+            .rename_thread("thread-1", "Renamed")
+            .expect("renamed");
+        let thread = fixture.detail("thread-1");
+        assert_eq!(thread["title"], "Renamed");
+        assert_eq!(
+            thread["branch"], "feature/renaming",
+            "the rename cleared the branch: {thread}"
+        );
+    }
+
+    /// `null` clears a field and a blank string does not.
+    ///
+    /// The distinction is the client's: it clears a worktree path by sending
+    /// `null`, and a blank branch is a ref name that names nothing — a third
+    /// state the contract does not type and the branch toolbar has nothing to
+    /// render for.
+    #[test]
+    fn null_clears_a_field_and_a_blank_string_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        fixture
+            .update_thread_meta("thread-1", json!({"branch": "main"}))
+            .expect("a branch");
+        fixture
+            .update_thread_meta("thread-1", json!({"branch": Value::Null}))
+            .expect("null clears it");
+        assert_eq!(fixture.detail("thread-1")["branch"], Value::Null);
+
+        for blank in ["", "  "] {
+            let refusal = fixture
+                .update_thread_meta("thread-1", json!({"branch": blank}))
+                .expect_err("a blank branch names nothing");
+            assert!(
+                refusal.message().contains("branch") && refusal.message().contains("thread-1"),
+                "{blank:?}: {}",
+                refusal.message()
+            );
+            let refusal = fixture
+                .update_thread_meta("thread-1", json!({"worktreePath": blank}))
+                .expect_err("a blank worktree path names nothing");
+            assert!(
+                refusal.message().contains("worktree") && refusal.message().contains("thread-1"),
+                "{blank:?}: {}",
+                refusal.message()
+            );
+        }
+    }
+
+    /// A command that asks for nothing is refused rather than answered with a
+    /// sequence.
+    ///
+    /// It would otherwise publish a `thread.meta-updated` carrying nothing but a
+    /// new `updatedAt`, which the client's reducer folds as an update — so a
+    /// payload that asked for no change would move the conversation in a list
+    /// ordered by when things changed.
+    #[test]
+    fn a_meta_update_that_asks_for_nothing_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .update_thread_meta("thread-1", json!({}))
+            .expect_err("nothing was asked for");
+        assert!(
+            refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "project.meta.update",
+                "commandId": "c",
+                "projectId": "project-1",
+            }))
+            .expect_err("nothing was asked for");
+        assert!(
+            refusal.message().contains("project-1") && refusal.message().contains("title"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// The three fields of `project.meta.update` this registry cannot keep are
+    /// refused by name rather than accepted and dropped.
+    ///
+    /// The UI sends one of them: the script editor sends `{projectId, scripts}`.
+    /// Answering it with a sequence would tell the developer their script was
+    /// saved and leave them to discover at the next restart that it was not.
+    #[test]
+    fn a_project_field_this_server_cannot_keep_is_refused_by_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        for (field, value) in [
+            ("scripts", json!([])),
+            ("workspaceRoot", json!("C:\\elsewhere")),
+            ("defaultModelSelection", Value::Null),
+        ] {
+            let mut command = json!({
+                "type": "project.meta.update",
+                "commandId": "c",
+                "projectId": "project-1",
+                "title": "A new name",
+            });
+            command
+                .as_object_mut()
+                .expect("an object")
+                .insert(field.to_string(), value);
+
+            let refusal = fixture
+                .dispatch(&command)
+                .expect_err("this server keeps none of these");
+            assert!(
+                refusal.message().contains(field) && refusal.message().contains("project-1"),
+                "{field}: {}",
+                refusal.message()
+            );
+        }
+
+        // Refused whole: the title that came with the unkeepable field did not
+        // land either, because a command that half happened is worse than one
+        // that did not.
+        assert_eq!(fixture.listed()[0]["title"], "modes");
+    }
+
+    /// A model selection that is not an object is refused.
+    ///
+    /// One notch worse than a malformed field usually is: the selection is
+    /// published as part of the thread, so storing a number there would fail the
+    /// client's decode of the whole conversation rather than of this write.
+    #[test]
+    fn a_model_selection_that_is_not_an_object_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        // A slug rather than a selection, and deliberately *not* the one the
+        // conversation already holds — otherwise the assertion below would pass
+        // whether the write was refused or applied.
+        let refusal = fixture
+            .update_thread_meta("thread-1", json!({"modelSelection": "claude-sonnet-5"}))
+            .expect_err("a model selection is an object");
+        assert!(
+            refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+        assert_eq!(
+            fixture.detail("thread-1")["modelSelection"],
+            json!({"instanceId": "claudeAgent", "model": "claude-opus-5"}),
+            "a refused selection was stored anyway"
+        );
+    }
+
+    /// Both commands are parsed before the world is consulted: a blank
+    /// identifier is refused at the door, and a payload that will not
+    /// deserialize still names the conversation it was about.
+    #[test]
+    fn a_malformed_rename_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .rename_thread("  ", "A name")
+            .expect_err("a blank thread id names no conversation");
+        assert!(
+            refusal.message().contains("threadId"),
+            "{}",
+            refusal.message()
+        );
+        let refusal = fixture
+            .rename_project("  ", "A name")
+            .expect_err("a blank project id names no project");
+        assert!(
+            refusal.message().contains("projectId"),
+            "{}",
+            refusal.message()
+        );
+
+        // Wrong in two ways at once, and refused for the payload rather than for
+        // the world — which is what "parsed before the world is consulted"
+        // means where it is observable.
+        let refusal = fixture
+            .rename_thread("never-created", "  ")
+            .expect_err("both are wrong");
+        assert!(
+            refusal.message().contains("title"),
+            "the world was consulted before the payload was read: {}",
+            refusal.message()
+        );
+        let refusal = fixture
+            .rename_project("never-registered", "  ")
+            .expect_err("both are wrong");
+        assert!(
+            refusal.message().contains("title"),
+            "the world was consulted before the payload was read: {}",
+            refusal.message()
+        );
+
+        // A payload serde cannot read still says which conversation it was
+        // about, the way the mode commands do.
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.meta.update",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "title": 7,
+            }))
+            .expect_err("a title is a string");
+        assert!(
+            refusal.message().contains("malformed") && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// An unknown thread and an unknown project are both refused by name.
+    ///
+    /// A title written against something this server has never heard of would be
+    /// state no client could ever read back.
+    #[test]
+    fn renaming_something_this_server_does_not_have_is_refused_by_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .rename_thread("never-created", "A name")
+            .expect_err("there is no such thread");
+        assert!(
+            refusal.message().contains("never-created"),
+            "{}",
+            refusal.message()
+        );
+
+        let refusal = fixture
+            .rename_project("never-registered", "A name")
+            .expect_err("there is no such project");
+        assert!(
+            refusal.message().contains("never-registered"),
+            "{}",
+            refusal.message()
+        );
+
+        // And the registry is untouched: a rename of nothing must not leave a
+        // project behind.
+        assert_eq!(fixture.listed().len(), 1);
+        assert_eq!(fixture.listed()[0]["id"], "project-1");
     }
 
     /// Projects and threads share one counter, because they share one

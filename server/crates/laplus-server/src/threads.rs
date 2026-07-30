@@ -725,6 +725,36 @@ impl LatestTurn {
 // What can happen to one
 // ---------------------------------------------------------------------------
 
+/// A field that may be absent, may be `null`, and may carry a value.
+///
+/// Three states, which is one more than an `Option` holds — and the distinction
+/// is load-bearing on `thread.meta.update`: the client sends only the fields it
+/// means to move, so **absent has to mean "leave this alone"** while an explicit
+/// `null` means "clear it". The composer relies on both at once, sending
+/// `{branch, worktreePath: null}` to move a conversation onto a branch and out of
+/// whatever worktree it was in (`ChatView.logic.ts`,
+/// `resolveThreadMetadataUpdateForNextTurn`).
+pub type Given<T> = Option<Option<T>>;
+
+/// What a `thread.meta.update` asked to change about a conversation.
+///
+/// Every field is optional and only the present ones are applied, which mirrors
+/// the client's own reducer (`threadReducer.ts`, `case "thread.meta-updated"`,
+/// which spreads in each field only when it is not `undefined`). The mirroring is
+/// the rule the whole fold follows: a client that watched every event and one that
+/// arrives late and takes a snapshot have to see the same conversation.
+///
+/// The two nullable fields are [`Given`] rather than `Option`, because the client
+/// clears them by sending `null` and a server that could not tell that from an
+/// absent field would either never clear one or clear it on every write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaUpdate {
+    pub title: Option<String>,
+    pub model_selection: Option<Value>,
+    pub branch: Given<String>,
+    pub worktree_path: Given<String>,
+}
+
 /// Everything that changes a thread after it exists.
 ///
 /// A closed vocabulary rather than a setter per field, for the reason
@@ -754,6 +784,11 @@ pub enum Change {
         runtime_mode: Option<String>,
         interaction_mode: Option<String>,
     },
+    /// The conversation's own description changed. `thread.meta-updated`.
+    ///
+    /// Four fields, each of which may be absent — see [`MetaUpdate`], where what
+    /// "absent" has to mean is argued.
+    MetaUpdated(MetaUpdate),
     /// The developer moved the conversation's runtime mode.
     /// `thread.runtime-mode-set`.
     ///
@@ -1166,6 +1201,36 @@ impl Threads {
             } => {
                 thread.latest_user_message_at = Some(at.to_string());
                 self.message_sent(thread, message_id, "user", text, Some(turn_id), false, at)
+            }
+            // The client's reducer, mirrored twice over: each field is applied
+            // only if it was sent, and the payload carries only the fields that
+            // were — so a subscriber folding this event moves exactly what the
+            // stored thread just moved, and nothing else. An event that named all
+            // four every time would have a title-only rename claim to have set
+            // the model and the branch as well, which is a different account of
+            // what happened; the reducer distinguishes the two, so this does.
+            Change::MetaUpdated(update) => {
+                let mut payload = json!({"threadId": thread.id, "updatedAt": at});
+                let described = payload
+                    .as_object_mut()
+                    .expect("the payload above is an object");
+                if let Some(title) = &update.title {
+                    thread.title = title.clone();
+                    described.insert("title".to_string(), json!(title));
+                }
+                if let Some(selection) = &update.model_selection {
+                    thread.model_selection = selection.clone();
+                    described.insert("modelSelection".to_string(), selection.clone());
+                }
+                if let Some(branch) = &update.branch {
+                    thread.branch = branch.clone();
+                    described.insert("branch".to_string(), json!(branch));
+                }
+                if let Some(worktree_path) = &update.worktree_path {
+                    thread.worktree_path = worktree_path.clone();
+                    described.insert("worktreePath".to_string(), json!(worktree_path));
+                }
+                payload
             }
             // The client's reducer, mirrored: one field and `updatedAt`, and
             // nothing else moves. `updatedAt` is the payload's own key here
@@ -1930,6 +1995,7 @@ impl Change {
             Change::UserMessage { .. }
             | Change::AssistantDelta { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
+            Change::MetaUpdated(_) => "thread.meta-updated",
             Change::RuntimeModeSet { .. } => "thread.runtime-mode-set",
             Change::InteractionModeSet { .. } => "thread.interaction-mode-set",
             Change::TurnRequested { .. } => "thread.turn-start-requested",

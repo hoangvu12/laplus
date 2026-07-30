@@ -577,6 +577,27 @@ pub enum Conflict {
     WorkspaceRoot,
 }
 
+/// What happened to an attempt to rename a project.
+///
+/// Not a third variant on [`Insert`]: an insert is refused because something is
+/// already there, and a rename can only be refused because nothing is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rename {
+    /// Written, and the log advanced to this sequence. Carries the row as it now
+    /// stands, for [`Insert::Committed`]'s reason — `updated_at` is the
+    /// database's, and the caller has to publish the row rather than a guess at
+    /// it.
+    Committed { sequence: i64, project: Project },
+    /// Nothing is registered under that id, so nothing was renamed.
+    ///
+    /// Carries no sequence, unlike [`Removal::Absent`]. A repeated *delete*
+    /// describes a world the server already agrees with, so answering it with
+    /// the sequence the registry is at is honest; a rename of a project that is
+    /// not there asks for a change that will never happen, and the caller
+    /// refuses it by name.
+    Absent,
+}
+
 /// What happened to an attempt to remove a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Removal {
@@ -814,6 +835,58 @@ impl Database {
             .commit()
             .map_err(StorageError::while_("register the project"))?;
         Ok(Insert::Committed {
+            sequence: at,
+            project,
+        })
+    }
+
+    /// Give a project a new name.
+    ///
+    /// The title and `updated_at` and nothing else. A project's folder is its
+    /// identity — `canonical_root` is what "the same project" is answered by, and
+    /// what everything the server holds *about* a project is keyed by — so a
+    /// rename cannot collide with anything and needs no uniqueness check.
+    ///
+    /// `updated_at` is the database's clock rather than the client's, the same
+    /// way [`Database::insert_project`] sets it: the field describes when the row
+    /// changed, and a client with a skewed clock would otherwise reorder the
+    /// project list. `created_at` is left alone, because a rename is not a
+    /// creation.
+    ///
+    /// Read back inside the transaction for the reason the insert does it: the
+    /// timestamp is the database's, so this is the only account of the project
+    /// that is not a guess — and it is what the caller publishes.
+    pub fn rename_project(&self, id: &str, title: &str, at: i64) -> Result<Rename, StorageError> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(StorageError::while_("rename the project"))?;
+
+        let renamed = transaction
+            .execute(
+                &format!("UPDATE projects SET title = ?2, updated_at = {NOW} WHERE id = ?1"),
+                (id, title),
+            )
+            .map_err(StorageError::while_("rename the project"))?;
+        // Dropped rather than committed, so the registry is left exactly as it
+        // was — there is nothing to stamp, and stamping would advance the log for
+        // a change that did not happen.
+        if renamed == 0 {
+            return Ok(Rename::Absent);
+        }
+
+        let project = find_project(&transaction, "id", id)?.ok_or_else(|| {
+            StorageError::refusing(
+                "rename the project",
+                format!("the row for '{id}' was not there immediately after renaming it"),
+            )
+        })?;
+
+        stamp(&transaction, at)?;
+        transaction
+            .commit()
+            .map_err(StorageError::while_("rename the project"))?;
+        Ok(Rename::Committed {
             sequence: at,
             project,
         })
@@ -1982,6 +2055,12 @@ mod tests {
                 .remove_project(id, self.sequences.commit().sequence())
                 .expect("the delete reaches the database")
         }
+
+        fn rename(&self, id: &str, title: &str) -> Rename {
+            self.database
+                .rename_project(id, title, self.sequences.commit().sequence())
+                .expect("the rename reaches the database")
+        }
     }
 
     fn sequence(insert: Insert) -> i64 {
@@ -2094,6 +2173,56 @@ mod tests {
         fixture.add("project-2");
 
         assert_eq!(fixture.database.registry().expect("reads").sequence, before);
+    }
+
+    /// A rename writes the title and the row's own timestamp, keeps the folder
+    /// and the creation date, and advances the log.
+    ///
+    /// The row comes back from the write rather than from a second read, because
+    /// `updated_at` is the database's — so this is the only account of the project
+    /// that is not a guess, and it is what the caller publishes.
+    #[test]
+    fn renaming_a_project_writes_the_title_and_advances_the_log() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        let before = fixture.database.project("project-1").expect("reads").expect("registered");
+
+        let renamed = fixture.rename("project-1", "The developer's own name");
+        let (sequence, project) = match renamed {
+            Rename::Committed { sequence, project } => (sequence, project),
+            other => panic!("expected a committed rename, got {other:?}"),
+        };
+
+        assert_eq!(sequence, 2);
+        assert_eq!(project.title, "The developer's own name");
+        // A rename is not a move and it is not a creation.
+        assert_eq!(project.workspace_root, before.workspace_root);
+        assert_eq!(project.canonical_root, before.canonical_root);
+        assert_eq!(project.created_at, before.created_at);
+        assert!(project.updated_at.ends_with('Z'));
+
+        let registry = fixture.database.registry().expect("reads");
+        assert_eq!(registry.sequence, 2);
+        assert_eq!(registry.projects[0].title, "The developer's own name");
+    }
+
+    /// Renaming something that is not registered changes nothing and says so.
+    ///
+    /// Unlike a delete, which agrees with a client describing a world it already
+    /// wanted: a rename of nothing asks for a change that will never happen, so
+    /// the caller refuses it — and the log must not move, or a client would be
+    /// told something changed when nothing had.
+    #[test]
+    fn renaming_an_unregistered_project_changes_nothing() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+
+        assert_eq!(fixture.rename("never-registered", "A name"), Rename::Absent);
+
+        let registry = fixture.database.registry().expect("reads");
+        assert_eq!(registry.sequence, 1);
+        assert_eq!(registry.projects.len(), 1);
+        assert_eq!(registry.projects[0].title, "project");
     }
 
     #[test]

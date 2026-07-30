@@ -11,6 +11,22 @@ the reused UI speaks. Where a term exists on both sides, the entry says so.
 **Thread** — one conversation, scoped to a project. What the UI reads. Survives
 a restart; the agent process behind it does not. `crate::threads`.
 
+**Title** — what the developer calls a thread or a project, and the only field
+either one carries purely so that it can be found again. Both are the contract's
+trimmed non-empty string, so a blank one is refused rather than stored — a
+conversation called "" is not a smaller thing than a named one, it is a row
+nobody can pick out of a list. A project registered with no title takes its
+folder's name (`projects::WorkspaceRoot::inferred_title`); a thread with none
+takes its project's.
+
+Moved by `thread.meta.update` and `project.meta.update` — and **the first of those
+is not only the rename control.** The composer sends it before every message whose
+model or branch differs from the thread's, and writes those two fields with it, so
+a refusal there stopped the message queued behind it.
+`orchestration::UpdateThreadMetaPayload` is the whole of what it may carry; a
+project's title is the whole of what the other one changes here. See the
+thread-lifecycle tracker, ticket 03.
+
 **Turn** — one exchange within a thread: the developer's prompt and everything
 the agent does before it goes quiet. Has an id the client mints.
 
