@@ -413,6 +413,16 @@ authoritative and replaces the accumulation. Whether the two agreed is recorded.
 **Join** — a place where the agent protocol and the contract meet. `crate::turn`
 is the declared one; `crate::worklog` is a second.
 
+The declared one is crossed in two halves and each is checked on its own.
+`crate::protocol` takes a line and answers with a **`Folded`** — what that line
+was, in this server's words — and `tests/protocol_golden.rs` pins that against 19
+captured sessions. `crate::turn::decide` takes the `Folded` and answers with a
+**`Decided`**: the changes the conversation is owed, the agent session id if one
+was announced, and how the turn ended if it did. `crate::turn::spend` applies it.
+Deciding and applying are two functions for the reason the fold and `commit` are
+(ADR-0025): a function that applies its own results can only be tested against a
+live world, and this one's world is a running `claude`. See ADR-0027.
+
 **Refusal** — how a method this server has not implemented is declined: a typed
 error carrying a tag the _called method's own_ contract union declares, and a
 sentence naming what was refused. `crate::refusals`. A contract term borrowed

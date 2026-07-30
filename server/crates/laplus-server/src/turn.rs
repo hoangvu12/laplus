@@ -45,6 +45,17 @@
 //! was, and the rule that makes the buffered message authoritative lives in the
 //! reducer the golden files check.
 //!
+//! ## The table is one function, and it does not apply itself
+//!
+//! [`decide`] is that table in code — one match over [`crate::protocol::Folded`]
+//! — and it answers with a [`Decided`] rather than publishing as it goes.
+//! [`spend`] is what publishes. The split is `docs/adr/0027` and it is
+//! ADR-0025's, taken again one level down: a function that applies its own
+//! results can be tested only by watching what it did to a live world, and this
+//! one's world is a [`Threads`] with a running `claude` behind it. Nothing about
+//! the wire changed — the same events, in the same order, under the same numbers
+//! — and the tests at the bottom of this file are what the change was for.
+//!
 //! Nothing in that table makes the session `running`, and that is deliberate:
 //! `init` is printed once for the whole conversation, so the transition belongs
 //! to the prompt being sent rather than to anything the agent says.
@@ -434,7 +445,11 @@ async fn drive(
 
         match next {
             Next::Line(Some(line)) => {
-                publish(&threads, &start, &mut folding, &mut driving, &line);
+                // Decided and then applied, rather than applied as it is decided.
+                // What the split is for is [`Decided`]; what it costs here is one
+                // more local.
+                let decided = decide(&mut folding, &mut driving, &line);
+                spend(&threads, &start, decided);
                 // Asked before the checkpoint below, which is a `git add -A`
                 // over the whole project: the meter is what the developer is
                 // looking at and the question costs one line on stdin, so it
@@ -883,8 +898,17 @@ struct Driving {
     /// two halves cannot swap places. Recording a checkpoint is a `git` and
     /// therefore has to happen where the loop can `await` it; knowing that a
     /// turn ended happens where the lines are read, which is synchronous.
-    /// Written by exactly one arm of [`publish`] and taken by the loop on the
+    /// Written by exactly one arm of [`decide`] and taken by the loop on the
     /// next statement, so it is never carried across an iteration.
+    ///
+    /// **Left here rather than moved onto [`Decided`]**, along with `unmeasured`
+    /// above. Both are already what that type is — a thing decided on one line and
+    /// spent on the next — but both are read by the loop itself rather than by
+    /// [`spend`], and neither is a change to a conversation. Moving them would
+    /// have widened `Decided` from "what happened to the thread" to "what the
+    /// driver does next" for no assertion this file could not already make: they
+    /// are `&mut Driving` fields, and a test of `decide` reads them off the
+    /// `Driving` it handed in.
     finished: Option<Finished>,
     /// The last context-window reading the client was told about.
     ///
@@ -1491,15 +1515,74 @@ async fn open(start: &Start) -> Result<Agent, String> {
     })
 }
 
-/// Fold one line and publish whatever it turned out to be.
-fn publish(
-    threads: &Threads,
-    start: &Start,
-    folding: &mut SessionState,
-    driving: &mut Driving,
-    line: &str,
-) {
+/// What one line of the agent's NDJSON turned out to mean for the conversation.
+///
+/// [`decide`] answers with one of these and [`spend`] applies it, which is the
+/// same seam `docs/adr/0025` cut one level down: the fold there reports the
+/// reconciliation verdict rather than spending it, because a function that
+/// applies its own results can only be tested by watching what it did to a live
+/// world. Here the world is a [`Threads`] with a running `claude` behind it, so
+/// there was nothing to watch it with at all.
+///
+/// **Three fields rather than a `Vec<Change>`**, because two of the twelve things
+/// [`decide`] used to do are not changes:
+///
+/// - the agent's own session id is written down and published to nobody
+///   ([`crate::threads::Threads::remember_agent_session`]), so no `Change`
+///   describes it and none could;
+/// - the event that ends a turn is published *only if the session is still
+///   describing that turn*, which is a question about the world asked between two
+///   applies. Returned as a precondition rather than answered here, so the lock it
+///   costs is taken on the lines that end a turn rather than on every line.
+///
+/// See `docs/adr/0027`.
+#[derive(Debug, Default)]
+struct Decided {
+    /// The changes to apply, in the order they were decided — which is the order
+    /// the developer saw the work happen, because the CLI closes one content
+    /// block before announcing the next.
+    changes: Vec<Change>,
+    /// The `claude` session the agent has just announced, if it announced one.
+    agent_session: Option<String>,
+    /// The turn ended, and how. `None` on every line that is not a `result`.
+    settles: Option<Settles>,
+}
+
+/// The end of a turn, as the line that ended it reports it.
+///
+/// Two of the five fields of a [`Session`] and not the other three, and the split
+/// is the seam rather than an arbitrary cut: **how the turn went** is what this
+/// line decided, while **which session and when** are facts the driver has held
+/// since it started the child. Leaving the second pair to [`spend`] is what takes
+/// the last clock read out of [`decide`].
+#[derive(Debug)]
+struct Settles {
+    /// The turn that ended — and the turn the session must *still* be describing
+    /// for the ending to be published at all.
+    ///
+    /// `None` is a `result` that arrived with no turn in flight, and it is a
+    /// value rather than a missing one: the session's `activeTurnId` is then also
+    /// `None`, and the two matching is what makes this publishable.
+    turn_id: Option<String>,
+    status: SessionStatus,
+    last_error: Option<String>,
+}
+
+/// Fold one line and say what it turned out to be.
+///
+/// No [`Threads`], no lock, no clock and no child process: a [`SessionState`], a
+/// [`Driving`] and a line in, a [`Decided`] out. That is the whole of what this
+/// commit bought and the whole of why the tests at the bottom of this file can
+/// exist — see [`Decided`] and `docs/adr/0027`.
+///
+/// It is **not** pure, and the difference is worth being exact about rather than
+/// claiming otherwise in a doc comment. It advances the reducer, it mutates the
+/// turn in flight, and the five [`Activity`] constructors it calls read a clock
+/// and mint identifiers exactly as ADR-0025 left them. What changed is that it
+/// returns its results instead of applying them.
+fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Decided {
     let folded = folding.fold_line(line);
+    let mut decided = Decided::default();
 
     // How full the context window is, reported here rather than from each arm
     // that might have moved it. Two kinds of line carry the counts — every
@@ -1514,10 +1597,9 @@ fn publish(
     let moved = driving.usage_to_report(folding);
     if let Some(usage) = moved {
         let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(context_window_row(&usage, turn_id)),
-        );
+        decided
+            .changes
+            .push(Change::Activity(context_window_row(&usage, turn_id)));
     }
 
     let turn = &mut driving.turn;
@@ -1551,7 +1633,7 @@ fn publish(
                 }
                 None => crate::worklog::requested(&asked, turn_id),
             };
-            threads.apply(&start.thread_id, Change::Activity(activity));
+            decided.changes.push(Change::Activity(activity));
             // Held either way: the request is outstanding because the *agent* is
             // waiting, which is a fact about the protocol rather than about which
             // row the developer was shown.
@@ -1581,9 +1663,7 @@ fn publish(
         // differ, and now nothing says so. Ticket 12 asked for that visibility;
         // this is a later decision against it, not an oversight.
         Folded::Initialized => {
-            if let Some(session_id) = &folding.session_id {
-                threads.remember_agent_session(&start.thread_id, session_id);
-            }
+            decided.agent_session = folding.session_id.clone();
             // The first of the two moments worth asking about, and the one
             // upstream does not have: it asks as a turn *completes*, which
             // leaves the opening turn of a session drawing a bare token count
@@ -1602,22 +1682,19 @@ fn publish(
         // a follow-up that refers to what is plainly on screen may be answered
         // by an agent that no longer has it.
         Folded::Compacted(compaction) => {
-            threads.apply(
-                &start.thread_id,
-                Change::Activity(Activity::info(
-                    "session.compacted",
-                    &compaction_summary(&compaction),
-                    json!({
-                        "trigger": compaction.trigger,
-                        "preTokens": compaction.pre_tokens,
-                        "postTokens": compaction.post_tokens,
-                        "detail": "The agent summarised the conversation to make room. \
-                                   Everything above is still here — what changed is how much \
-                                   of it the agent can still see.",
-                    }),
-                    turn.as_ref().map(|turn| turn.turn_id.clone()),
-                )),
-            );
+            decided.changes.push(Change::Activity(Activity::info(
+                "session.compacted",
+                &compaction_summary(&compaction),
+                json!({
+                    "trigger": compaction.trigger,
+                    "preTokens": compaction.pre_tokens,
+                    "postTokens": compaction.post_tokens,
+                    "detail": "The agent summarised the conversation to make room. \
+                               Everything above is still here — what changed is how much \
+                               of it the agent can still see.",
+                }),
+                turn.as_ref().map(|turn| turn.turn_id.clone()),
+            )));
         }
 
         // The account's standing with the API, when it is worth saying. Surfaced
@@ -1641,27 +1718,28 @@ fn publish(
             if limit.rejected() {
                 told.tone = "error";
             }
-            threads.apply(&start.thread_id, Change::Activity(told));
+            decided.changes.push(Change::Activity(told));
         }
 
         Folded::Streamed(text) => {
-            let Some(active) = turn.as_mut() else { return };
+            let Some(active) = turn.as_mut() else {
+                return decided;
+            };
             let message_id = active
                 .assistant_message_id
                 .get_or_insert_with(crate::threads::fresh_message_id)
                 .clone();
-            threads.apply(
-                &start.thread_id,
-                Change::AssistantDelta {
-                    message_id,
-                    turn_id: active.turn_id.clone(),
-                    text,
-                },
-            );
+            decided.changes.push(Change::AssistantDelta {
+                message_id,
+                turn_id: active.turn_id.clone(),
+                text,
+            });
         }
 
         Folded::Turn { index } => {
-            let Some(active) = turn.as_mut() else { return };
+            let Some(active) = turn.as_mut() else {
+                return decided;
+            };
             let completed = &folding.transcript[index];
 
             // Only the assistant's text is the conversation, and only when there
@@ -1686,14 +1764,11 @@ fn publish(
                     .assistant_message_id
                     .take()
                     .unwrap_or_else(crate::threads::fresh_message_id);
-                threads.apply(
-                    &start.thread_id,
-                    Change::AssistantMessage {
-                        message_id,
-                        turn_id: active.turn_id.clone(),
-                        text: completed.text.clone(),
-                    },
-                );
+                decided.changes.push(Change::AssistantMessage {
+                    message_id,
+                    turn_id: active.turn_id.clone(),
+                    text: completed.text.clone(),
+                });
             }
 
             // Everything the message carried besides its text, in the order it
@@ -1740,7 +1815,7 @@ fn publish(
                 };
 
                 if let Some(activity) = change {
-                    threads.apply(&start.thread_id, Change::Activity(activity));
+                    decided.changes.push(Change::Activity(activity));
                 }
             }
         }
@@ -1757,20 +1832,21 @@ fn publish(
         Folded::Measured => {}
 
         Folded::Acknowledged(acknowledged) => {
-            let Some(active) = turn.as_mut() else { return };
+            let Some(active) = turn.as_mut() else {
+                return decided;
+            };
             if !active.awaiting(&acknowledged.request_id) {
-                return;
+                return decided;
             }
-            let Some(why) = acknowledged.refusal() else { return };
+            let Some(why) = acknowledged.refusal() else {
+                return decided;
+            };
 
             active.carries_on();
-            threads.apply(
-                &start.thread_id,
-                Change::Activity(Activity::failed(
-                    "turn.interrupt-failed",
-                    &format!("The agent would not stop the turn: {why}"),
-                )),
-            );
+            decided.changes.push(Change::Activity(Activity::failed(
+                "turn.interrupt-failed",
+                &format!("The agent would not stop the turn: {why}"),
+            )));
         }
 
         Folded::Completed => {
@@ -1826,17 +1902,7 @@ fn publish(
                     active.clone(),
                 )
             };
-            threads.apply(&start.thread_id, Change::Activity(completed));
-
-            // **Only when the session is still describing this turn.** A
-            // developer who stopped the agent can send the next turn while this
-            // one is still winding down — that is the whole point of stopping it
-            // — and the dispatch has already moved the session on to that turn.
-            // Publishing here would settle a turn that has just started, and the
-            // client would show it finished until the agent got round to it.
-            if threads.active_turn(&start.thread_id) != active {
-                return;
-            }
+            decided.changes.push(Change::Activity(completed));
 
             // Leaving `running` is what ends the turn for the client, so this
             // is the event that settles it — and the reason a turn's reported
@@ -1845,20 +1911,67 @@ fn publish(
             // own session statuses and settles the turn as interrupted with it,
             // which is what keeps the partial reply on screen marked as what it
             // is rather than as an answer.
-            threads.apply(
-                &start.thread_id,
-                Change::Session(Session {
-                    status: ending.session_status(),
-                    runtime_mode: start.runtime_mode.clone(),
-                    active_turn_id: None,
-                    last_error: ending
-                        .failed()
-                        .then(|| turn_summary(folding, ending, drift)),
-                    updated_at: now_iso(),
-                }),
-            );
+            //
+            // Carried out of here rather than published, and the turn id beside
+            // it is the whole reason: it may go up **only while the session is
+            // still describing this turn**. A developer who stopped the agent can
+            // send the next turn while this one is still winding down — that is
+            // the whole point of stopping it — and the dispatch has already moved
+            // the session on to that turn. Published unconditionally it would
+            // settle a turn that had just started, and the client would show it
+            // finished until the agent got round to it. [`spend`] asks.
+            decided.settles = Some(Settles {
+                turn_id: active,
+                status: ending.session_status(),
+                last_error: ending
+                    .failed()
+                    .then(|| turn_summary(folding, ending, drift)),
+            });
         }
     }
+
+    decided
+}
+
+/// Apply what [`decide`] decided.
+///
+/// The impure half of the pair, and it is deliberately this short: every line of
+/// it is a call on [`Threads`], so there is nothing here to get wrong that a test
+/// of `decide` would not already have caught.
+///
+/// The order is the order the arms decided in, and the two things that are not
+/// changes go where they went before the split — the id after the row that may
+/// have preceded it on the same line, the ending last of all.
+fn spend(threads: &Threads, start: &Start, decided: Decided) {
+    for change in decided.changes {
+        threads.apply(&start.thread_id, change);
+    }
+
+    if let Some(session_id) = &decided.agent_session {
+        threads.remember_agent_session(&start.thread_id, session_id);
+    }
+
+    let Some(settles) = decided.settles else { return };
+    // The question [`Settles::turn_id`] exists to ask, and the lock it costs is
+    // taken here — on the lines that end a turn — rather than on every line the
+    // agent writes.
+    if threads.active_turn(&start.thread_id) != settles.turn_id {
+        return;
+    }
+
+    threads.apply(
+        &start.thread_id,
+        Change::Session(Session {
+            status: settles.status,
+            // The session's own, not the line's: a turn ends with the latitude
+            // the child was started with, whatever the thread has been moved to
+            // since. See `CONTEXT.md`, *Runtime mode*.
+            runtime_mode: start.runtime_mode.clone(),
+            active_turn_id: None,
+            last_error: settles.last_error,
+            updated_at: now_iso(),
+        }),
+    );
 }
 
 
@@ -2079,6 +2192,533 @@ mod tests {
             tools: HashMap::new(),
             stopped: stopped.map(str::to_string),
         }
+    }
+
+    // -- what one line turns out to mean --------------------------------------
+    //
+    // [`decide`] is 26% of this file's implementation and until ADR-0027 none of
+    // it was assertable: it applied its own results, so reaching any of these
+    // nine arms meant a live `Threads` and a real `claude` child. What follows is
+    // the other half of the join `tests/protocol_golden.rs` checks the first half
+    // of — that file pins `protocol` → [`Folded`] against captured NDJSON, and
+    // these pin [`Folded`] → [`Change`].
+    //
+    // The lines are minimal rather than captured, and deliberately so: a whole
+    // recording is what the golden files are for, and what is under test here is
+    // which changes one line produces, in what order. The shapes are the ones
+    // `crate::protocol`'s own tests use, which is where they were checked against
+    // the real captures.
+
+    /// A driver at the start of a session, with or without a turn under way.
+    fn driver(turn: Option<InFlight>) -> Driving {
+        Driving {
+            turn,
+            outstanding: HashMap::new(),
+            interrupts: 0,
+            measurements: 0,
+            unmeasured: false,
+            drift_reported: Drift::default(),
+            finished: None,
+            reported_usage: None,
+        }
+    }
+
+    /// The kinds of the activities a line produced, which is what a work log is
+    /// a list of. Anything that is not an activity reads as the variant it is,
+    /// because a test that silently skipped a `thread.message-sent` would be
+    /// asserting about a shorter conversation than the one that happened.
+    fn kinds(decided: &Decided) -> Vec<&str> {
+        decided
+            .changes
+            .iter()
+            .map(|change| match change {
+                Change::Activity(activity) => activity.kind.as_str(),
+                Change::AssistantDelta { .. } => "<delta>",
+                Change::AssistantMessage { .. } => "<message>",
+                Change::Session(_) => "<session>",
+                _ => "<other>",
+            })
+            .collect()
+    }
+
+    /// The one activity a line produced, or a failure naming what it produced
+    /// instead.
+    fn only_activity(decided: &Decided) -> &Activity {
+        match decided.changes.as_slice() {
+            [Change::Activity(activity)] => activity,
+            other => panic!("expected one activity, got {other:?}"),
+        }
+    }
+
+    /// The id the agent announces is written down and **published to nobody**.
+    /// It is not a `Change` and there is no event in the contract that describes
+    /// one, which is the whole reason [`Decided`] has a field for it rather than
+    /// being a `Vec<Change>` — see `docs/adr/0027`.
+    #[test]
+    fn the_agents_announcement_is_written_down_and_told_to_nobody() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"system","subtype":"init","session_id":"s-1","model":"m","cwd":"/tmp","permissionMode":"default"}"#,
+        );
+
+        assert_eq!(decided.agent_session.as_deref(), Some("s-1"));
+        assert!(decided.changes.is_empty(), "{:?}", kinds(&decided));
+        assert!(decided.settles.is_none());
+        // And the loop is told to go and ask how full the window is, which is the
+        // one thing this arm does besides remembering the id.
+        assert!(driving.unmeasured);
+    }
+
+    /// The meter's row is asked for once per reading rather than once per line.
+    /// The CLI repeats its counts — the `result` at the end of a turn usually
+    /// agrees with the last assistant message in it — and a row per repetition
+    /// would be a row per message on the thread, each saying what the one before
+    /// it said.
+    #[test]
+    fn the_context_window_row_goes_up_once_per_reading() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+        let answer = r#"{"type":"control_response","response":{"subtype":"success","request_id":"context-1","response":{"totalTokens":26937,"maxTokens":200000,"isAutoCompactEnabled":true,"percentage":13,"categories":[],"gridRows":[]}}}"#;
+
+        let first = decide(&mut folding, &mut driving, answer);
+        assert_eq!(kinds(&first), vec!["context-window.updated"]);
+        let row = only_activity(&first);
+        assert_eq!(row.payload["usedTokens"], 26_937);
+        assert_eq!(row.payload["maxTokens"], 200_000);
+        assert_eq!(row.turn_id.as_deref(), Some("turn-1"));
+
+        let again = decide(&mut folding, &mut driving, answer);
+        assert!(again.changes.is_empty(), "{:?}", kinds(&again));
+    }
+
+    /// A permission request is a row *and* a copy held here, and the copy is the
+    /// half that makes an answer possible: the client answers by naming an id,
+    /// and what has to go back to the CLI is the whole request.
+    #[test]
+    fn a_permission_request_is_a_row_and_a_copy_kept_to_answer_with() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"note.txt"},"tool_use_id":"toolu_1"}}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["approval.requested"]);
+        assert_eq!(only_activity(&decided).turn_id.as_deref(), Some("turn-1"));
+        assert!(
+            driving.outstanding.contains_key("req-1"),
+            "the request the answer names has to survive the line that raised it"
+        );
+    }
+
+    /// The same wire shape, told apart by what this build can *render*. An
+    /// `AskUserQuestion` the composer can draw as a question becomes one; see
+    /// [`crate::worklog::questions`] for why anything else falls through to the
+    /// approval row rather than to nothing.
+    #[test]
+    fn a_question_the_composer_can_draw_is_a_question_and_not_an_approval() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let readable = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which?","header":"Pick","options":[{"label":"This","description":"the first"}]}]}}}"#,
+        );
+        assert_eq!(kinds(&readable), vec!["user-input.requested"]);
+
+        // A question with no options is one the client would silently discard,
+        // so it goes up as the approval it arrived as — the developer is left
+        // with something to answer either way.
+        let unreadable = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which?","options":[]}]}}}"#,
+        );
+        assert_eq!(kinds(&unreadable), vec!["approval.requested"]);
+        assert!(driving.outstanding.contains_key("req-2"));
+    }
+
+    /// Compaction is a row and nothing else, which is the whole of the criterion:
+    /// the transcript is this server's own copy and a compaction is a fact about
+    /// what the *agent* can still see.
+    #[test]
+    fn a_compaction_is_a_row_and_touches_nothing_else() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"auto","pre_tokens":154000,"post_tokens":21000}}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["session.compacted"]);
+        let row = only_activity(&decided);
+        assert_eq!(row.payload["trigger"], "auto");
+        assert_eq!(row.payload["preTokens"], 154_000);
+        assert_eq!(row.tone, "info", "a compaction is not a failure");
+        assert!(decided.settles.is_none());
+    }
+
+    /// A refusal is a failure; being close to a limit is not yet one. The tone is
+    /// the difference between a turn that is slow and a turn that is not going to
+    /// happen, and it is the only thing the developer reads it by.
+    #[test]
+    fn a_refused_request_is_an_error_and_a_warning_is_not() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let warned = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1764547200},"session_id":"s"}"#,
+        );
+        assert_eq!(kinds(&warned), vec!["session.rate-limited"]);
+        assert_eq!(only_activity(&warned).tone, "info");
+
+        let refused = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1764547200},"session_id":"s"}"#,
+        );
+        assert_eq!(only_activity(&refused).tone, "error");
+    }
+
+    /// Deltas open a message and keep appending to the *same* one, because the
+    /// client folds a delta into a message it already holds. A second id would be
+    /// a second bubble halfway through a sentence.
+    #[test]
+    fn deltas_open_one_message_and_go_on_filling_it() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+        let delta = |text: &str| {
+            format!(
+                r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}}}"#
+            )
+        };
+
+        let first = decide(&mut folding, &mut driving, &delta("hel"));
+        let second = decide(&mut folding, &mut driving, &delta("lo"));
+
+        let (Some(Change::AssistantDelta { message_id: opened, text: hel, .. }), Some(Change::AssistantDelta { message_id: still, text: lo, .. })) =
+            (first.changes.first(), second.changes.first())
+        else {
+            panic!("{:?} then {:?}", kinds(&first), kinds(&second));
+        };
+        assert_eq!((hel.as_str(), lo.as_str()), ("hel", "lo"));
+        assert_eq!(opened, still, "a reply is one message, not one per token");
+    }
+
+    /// The buffered message is authoritative and closes the id the deltas opened,
+    /// which is what settles a reply the client is drawing as still arriving.
+    #[test]
+    fn a_buffered_message_closes_the_id_the_deltas_opened() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let streamed = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+        );
+        let Some(Change::AssistantDelta { message_id: opened, .. }) = streamed.changes.first()
+        else {
+            panic!("{:?}", kinds(&streamed));
+        };
+        let opened = opened.clone();
+
+        let buffered = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        );
+
+        let [Change::AssistantMessage { message_id, text, .. }] = buffered.changes.as_slice()
+        else {
+            panic!("{:?}", kinds(&buffered));
+        };
+        assert_eq!(*message_id, opened, "the same message, now settled");
+        assert_eq!(text, "hello");
+        assert!(
+            driving
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.assistant_message_id.is_none()),
+            "the id has to be given up, or the next message appends to this one"
+        );
+    }
+
+    /// A message that is nothing but a tool call is not an empty chat bubble. The
+    /// CLI emits one buffered message per content block, so a turn that uses a
+    /// tool produces several and most carry no text at all.
+    #[test]
+    fn a_message_that_is_only_a_tool_call_is_not_an_empty_bubble() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["tool.updated"]);
+    }
+
+    /// Everything a message carried besides its text, in the order it carried it
+    /// — which is the order the developer saw it happen. The pairing is held on
+    /// this side because a `tool_result` carries an id and nothing else: what the
+    /// tool *was* only exists here.
+    #[test]
+    fn a_calls_two_halves_are_two_rows_in_the_order_they_happened() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let called = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"weighing it up"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
+        );
+        assert_eq!(kinds(&called), vec!["task.progress", "tool.updated"]);
+
+        let returned = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"fn main() {}"}]}}"#,
+        );
+        assert_eq!(kinds(&returned), vec!["tool.completed"]);
+        // The result names an id and nothing else, so the tool's own name in this
+        // row can only have come from the call held on this side. `Call::untracked`
+        // is what an unpaired result renders as, and it says `Tool`.
+        assert_eq!(
+            only_activity(&returned).payload["data"]["toolName"], "Read",
+            "the pair is joined here or it is not joined at all"
+        );
+        assert!(
+            driving
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.tools.is_empty()),
+            "a call answered is a call no longer held"
+        );
+    }
+
+    /// An agent that will not stop says so, and the turn goes back to ending the
+    /// way it was going to end. The flag has to come off rather than merely being
+    /// ignored: a normal ending reported as one the developer asked for would be a
+    /// work log claiming they did something they did not.
+    #[test]
+    fn an_agent_that_refuses_to_stop_says_so_and_the_turn_carries_on() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(Some("interrupt-1"))));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["turn.interrupt-failed"]);
+        let row = only_activity(&decided);
+        assert!(row.summary.ends_with("No active turn"), "{}", row.summary);
+        assert!(
+            driving.turn.as_ref().is_some_and(|turn| !turn.was_stopped()),
+            "a stop that was refused is not a stop"
+        );
+    }
+
+    /// An acknowledgement for some other request says nothing about the turn
+    /// running now — a late one, for a turn that has already ended, would
+    /// otherwise put a failure on the turn after it.
+    #[test]
+    fn an_acknowledgement_for_another_request_is_not_this_turns() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(Some("interrupt-2"))));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
+        );
+
+        assert!(decided.changes.is_empty(), "{:?}", kinds(&decided));
+        assert!(
+            driving.turn.as_ref().is_some_and(InFlight::was_stopped),
+            "the stop this turn is actually waiting on still stands"
+        );
+    }
+
+    /// The row and the ending, and the ending names the turn it is about. That
+    /// name is the whole of ADR-0027's second field: [`spend`] publishes the
+    /// session change only while the conversation is still describing this turn,
+    /// because a developer who stopped the agent can send the next turn while
+    /// this one is still winding down.
+    #[test]
+    fn a_completed_turn_is_a_row_and_an_ending_that_names_its_turn() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":2008,"total_cost_usd":0.5}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["turn.completed"]);
+        assert_eq!(only_activity(&decided).turn_id.as_deref(), Some("turn-1"));
+
+        let settles = decided.settles.expect("a result ends a turn");
+        assert_eq!(settles.turn_id.as_deref(), Some("turn-1"));
+        assert!(matches!(settles.status, SessionStatus::Ready));
+        assert_eq!(settles.last_error, None);
+
+        // And the loop is left the two things it has to `await`: the checkpoint
+        // this turn's tree owes, and the question about the window.
+        assert!(driving.unmeasured);
+        assert_eq!(
+            driving.finished.map(|finished| finished.status),
+            Some("ready")
+        );
+        assert!(driving.turn.is_none(), "the turn is over");
+    }
+
+    /// A turn the developer stopped ends as `interrupted` rather than as the
+    /// failure the CLI reports it as, and it is checkpointed as nothing at all —
+    /// there is no checkpoint status that means interrupted, and one that said
+    /// otherwise would relabel the turn. ADR-0004 and `CONTEXT.md`, *Settling*.
+    #[test]
+    fn a_stopped_turn_ends_as_interrupted_and_leaves_no_checkpoint() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(Some("interrupt-1"))));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":13660}"#,
+        );
+
+        let settles = decided.settles.expect("a result ends a turn");
+        assert!(matches!(settles.status, SessionStatus::Interrupted));
+        assert_eq!(
+            settles.last_error, None,
+            "a turn the developer stopped did not fail"
+        );
+        assert!(
+            driving.finished.is_none(),
+            "there is no checkpoint status that means interrupted"
+        );
+    }
+
+    /// A `result` that arrives with no turn in flight still ends the session's
+    /// idea of one, and the `None` it names is a value rather than a missing
+    /// answer: the session's `activeTurnId` is `None` too, and the two matching is
+    /// what makes the ending publishable.
+    #[test]
+    fn a_result_with_no_turn_behind_it_names_the_turn_it_is_about_anyway() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(None);
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":12}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["turn.completed"]);
+        assert_eq!(only_activity(&decided).turn_id, None);
+        let settles = decided.settles.expect("a result ends a turn");
+        assert_eq!(settles.turn_id, None);
+        assert!(driving.finished.is_none(), "no turn, no tree to record");
+    }
+
+    /// Every line that reaches a turn asks for one first, and a line that arrives
+    /// with none says nothing rather than inventing a turn to attribute it to.
+    /// Three arms return early for this and each of them has to carry the
+    /// context-window row out with it — see below.
+    #[test]
+    fn a_line_that_needs_a_turn_and_has_none_publishes_nothing() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(None);
+
+        for line in [
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
+        ] {
+            let decided = decide(&mut folding, &mut driving, line);
+            assert!(decided.changes.is_empty(), "{line}: {:?}", kinds(&decided));
+            assert!(decided.settles.is_none(), "{line}");
+        }
+    }
+
+    /// The meter's row is decided *ahead of* the match and must survive the arms
+    /// that give up early. It was applied before the early `return` when this
+    /// function published its own results; returning a value made losing it
+    /// possible for the first time, so it is pinned here.
+    #[test]
+    fn the_early_returns_still_carry_the_context_window_row_out() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(None);
+
+        // A reading arrives, and the same line is one of the three that needs a
+        // turn and has none.
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"context-1","response":{"totalTokens":26937,"maxTokens":200000,"isAutoCompactEnabled":true}}}"#,
+        );
+        assert_eq!(kinds(&decided), vec!["context-window.updated"]);
+
+        // And on a line that does give up early: a delta with no turn behind it,
+        // arriving after a reading that has moved.
+        let mut driving = driver(None);
+        let mut folding = SessionState::new();
+        folding.token_usage = Some(TokenUsage {
+            used_tokens: 10,
+            total_processed_tokens: None,
+            max_tokens: Some(200_000),
+            input_tokens: None,
+            output_tokens: None,
+            compacts_automatically: None,
+        });
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+        );
+        assert_eq!(
+            kinds(&decided),
+            vec!["context-window.updated"],
+            "the row is decided before the match and the arm gave up after it"
+        );
+    }
+
+    /// The meter's row goes *in front of* the row that ends the turn, so the last
+    /// thing in a turn is the one a developer actually reads. Both are decided on
+    /// the same line — the `result` carries counts — and the order they are
+    /// decided in is the order they are applied in.
+    #[test]
+    fn the_row_that_ends_a_turn_stays_the_last_thing_in_it() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":12,"usage":{"input_tokens":11,"output_tokens":22},"modelUsage":{"claude-opus-5":{"contextWindow":200000}}}"#,
+        );
+
+        assert_eq!(
+            kinds(&decided),
+            vec!["context-window.updated", "turn.completed"]
+        );
     }
 
     /// The ticket asks a completed turn to report its duration and its cost, and
