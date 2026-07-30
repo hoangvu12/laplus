@@ -114,10 +114,6 @@ async fn the_server_config_payload_conforms_to_the_capture() {
 /// unsupported — or a driver v1 does not ship.
 const MISSING: &[Declared] = &[
     Declared {
-        path: "/environment/capabilities/connectionProbe",
-        because: "no server.probe method; the client falls back to probing with server.getConfig",
-    },
-    Declared {
         path: "/providers/0/continuation",
         because: "`groupKey` is how threads are grouped for resumption; ticket 11 \
                   owns multi-turn continuity",

@@ -49,8 +49,12 @@ async fn the_clients_first_call_is_answered_with_a_server_config() {
 }
 
 /// The client fetches config, keeps the socket alive with `Ping`, and — since
-/// this server does not advertise `connectionProbe` — probes by calling
-/// `server.getConfig` again. All of that has to work on one connection.
+/// this server advertises `connectionProbe` — probes by calling `server.probe`.
+/// All of that has to work on one connection.
+///
+/// The config is fetched again at the end anyway, because the probe answering is
+/// only half of what this is for: the connection has to still be the same one
+/// afterwards, and an empty success proves nothing about that on its own.
 #[tokio::test]
 async fn the_connection_survives_the_keepalive_and_the_probe() {
     let server = TestServer::start().await;
@@ -60,16 +64,29 @@ async fn the_connection_survives_the_keepalive_and_the_probe() {
         .call("server.getConfig", json!({}))
         .await
         .expect_success();
+    assert_eq!(
+        first["environment"]["capabilities"]["connectionProbe"],
+        json!(true),
+        "the client picks its probe method from this flag: {first}"
+    );
 
     for _ in 0..3 {
         assert_eq!(client.ping().await, json!({"_tag": "Pong"}));
     }
 
-    let probed = client
+    for _ in 0..3 {
+        assert_eq!(
+            client.call("server.probe", json!({})).await.expect_success(),
+            json!({}),
+            "the probe answers empty and says nothing about the server's state"
+        );
+    }
+
+    let after = client
         .call("server.getConfig", json!({}))
         .await
         .expect_success();
-    assert_eq!(first, probed, "the probe must see the same config");
+    assert_eq!(first, after, "the connection outlived its probes");
 
     client.close().await;
     server.stop().await;

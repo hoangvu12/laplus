@@ -50,6 +50,23 @@ use crate::threads::{self, Watch};
 /// when the server does not advertise `connectionProbe`.
 pub const SERVER_GET_CONFIG: &str = "server.getConfig";
 
+/// The liveness probe itself: an empty payload in, an empty payload out.
+///
+/// The contract is `payload: Schema.Struct({})`, `success: Schema.Struct({})` —
+/// there is nothing to read and nothing to say. What it buys is what it does
+/// *not* carry: `session.ts` probes a live connection on a timer, and against a
+/// server that stays quiet about `capabilities.connectionProbe` it probes by
+/// re-sending [`SERVER_GET_CONFIG`], which drags the whole config payload back
+/// over the wire to prove the socket is still there.
+///
+/// **The capability and this arm ship together.** `session.ts` turns an
+/// `EnvironmentAuthorizationError` from this method into `ConnectionBlockedError`
+/// — a connection refused on permission, and not retried — so advertising
+/// `connectionProbe` while this was still refused would have turned every probe
+/// into a blocked connection. [`crate::refusals`] records that trap where the
+/// refusal used to live.
+pub const SERVER_PROBE: &str = "server.probe";
+
 /// The configuration subscription — the simplest of the eight the UI opens,
 /// and the one ticket 04 proves the streaming mechanism on.
 pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
@@ -263,6 +280,10 @@ pub fn dispatch(
 ) -> Result<Answer, DispatchError> {
     match tag {
         SERVER_GET_CONFIG => Ok(Answer::Value(services.config.current().to_value())),
+        // The whole method. It reads nothing and touches nothing, which is the
+        // point: a probe that consulted any state could fail for a reason that
+        // has nothing to do with whether the connection is alive.
+        SERVER_PROBE => Ok(Answer::Value(serde_json::json!({}))),
         // The payload is an empty struct in the contract, so there is nothing
         // to read out of it and nothing that can be wrong with it.
         SUBSCRIBE_SERVER_CONFIG => Ok(Answer::Stream(services.config.subscribe())),
@@ -600,6 +621,19 @@ mod tests {
         let first = dispatch(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
         let second = dispatch(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
         assert_eq!(value(first), value(second));
+    }
+
+    /// The empty answer is the contract's — `success: Schema.Struct({})` — and
+    /// a probe that answered anything else would be a probe with a reason to
+    /// fail. Repeatable for the reason `server.getConfig` is: this is what the
+    /// client sends on a timer for the life of the connection.
+    #[test]
+    fn probe_answers_empty_every_time() {
+        let services = services();
+        for _ in 0..3 {
+            let answer = dispatch(&services, SERVER_PROBE, &json!({})).expect("dispatches");
+            assert_eq!(value(answer), json!({}));
+        }
     }
 
     /// Every subscription is dispatched by the same path as a unary call and

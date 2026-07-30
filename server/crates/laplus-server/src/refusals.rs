@@ -129,17 +129,19 @@ const NOT_IMPLEMENTED: &str = "ServerMethodNotImplementedError";
 const REFUSALS: &[(&str, Tag)] = &[
     ("server.upsertKeybinding", Tag::EnvironmentAuthorization),
     ("server.removeKeybinding", Tag::EnvironmentAuthorization),
-    // Refused, and the one refusal the client acts on rather than draws:
-    // `session.ts` turns this tag into `ConnectionBlockedError`, a connection
-    // refused on permission and not retried. Dormant only because this server
-    // does not advertise `capabilities.connectionProbe`, so the client probes
-    // with `server.getConfig` instead. **Advertising that capability before
-    // implementing this method turns every probe into a blocked connection.**
+    // Implemented today, so it does not reach this table — and the one refusal
+    // the client would act on rather than draw: `session.ts` turns this tag into
+    // `ConnectionBlockedError`, a connection refused on permission and not
+    // retried. That was dormant while the server stayed quiet about
+    // `capabilities.connectionProbe` and the client probed with
+    // `server.getConfig` instead. It is not dormant now: the capability is
+    // advertised, so this is the method every live connection probes with, and a
+    // regression that made it refuse would refuse the connection rather than
+    // draw an empty state.
     ("server.probe", Tag::EnvironmentAuthorization),
-    // Implemented today, so it does not reach this table — but it is on the
-    // same `session.ts` path as `server.probe` above, and a regression that
-    // made it refuse would not draw an empty state: it would refuse the
-    // connection.
+    // Implemented, and on the same `session.ts` path as `server.probe` above,
+    // with the same consequence — it is the first call of every connection and
+    // the fallback probe for a server without the capability.
     ("server.getConfig", Tag::EnvironmentAuthorization),
     ("server.refreshProviders", Tag::EnvironmentAuthorization),
     ("server.updateProvider", Tag::EnvironmentAuthorization),

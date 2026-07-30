@@ -122,9 +122,18 @@ pub struct Capabilities {
     /// Reporting a repository's canonical identity so threads can be grouped
     /// across checkouts. Not built; the git tickets (19–21) may.
     pub repository_identity: bool,
-    /// `server.probe`, a cheap liveness call. Absent here, so the client falls
-    /// back to probing with `server.getConfig` — which this ticket implements,
-    /// and which is small enough for laplus to serve on repeat.
+    /// `server.probe`, a cheap liveness call — [`crate::rpc::SERVER_PROBE`].
+    ///
+    /// **This flag and the method ship together, in that order**, and the order
+    /// is not a preference: `session.ts` reads an `EnvironmentAuthorizationError`
+    /// from `server.probe` as `ConnectionBlockedError`, a connection refused on
+    /// permission and not retried. Advertising this while the method was still
+    /// refused would have blocked every connection rather than degraded one
+    /// probe. `crate::refusals` carries the same warning from the other side.
+    ///
+    /// What it changes: the client stops re-sending `server.getConfig` to prove
+    /// the socket is alive, so a liveness check costs an empty round trip
+    /// instead of the whole config payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_probe: Option<bool>,
     /// `thread.settle` and `thread.unsettle`, which ticket 07 of the
@@ -482,7 +491,7 @@ impl ServerConfig {
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
                 capabilities: Capabilities {
                     repository_identity: false,
-                    connection_probe: None,
+                    connection_probe: Some(true),
                     thread_settlement: Some(true),
                     thread_snooze: Some(true),
                 },
@@ -1004,7 +1013,10 @@ mod tests {
     fn a_capability_is_advertised_exactly_when_it_has_been_built() {
         let capabilities = ServerConfig::detect().environment.capabilities;
         assert!(!capabilities.repository_identity);
-        assert_eq!(capabilities.connection_probe, None);
+        // `server.probe`, which `crate::rpc` answers. Advertised only because it
+        // is answered — see [`Capabilities::connection_probe`] for what a flag
+        // ahead of its method would cost here, which is the connection.
+        assert_eq!(capabilities.connection_probe, Some(true));
         // `thread.settle` and `thread.unsettle`, ticket 07.
         assert_eq!(capabilities.thread_settlement, Some(true));
         // `thread.snooze` and `thread.unsnooze`, ticket 09.
@@ -1013,7 +1025,14 @@ mod tests {
 
     #[test]
     fn absent_capabilities_are_omitted_rather_than_serialized_as_null() {
-        let value = ServerConfig::detect().to_value();
+        let mut config = ServerConfig::detect();
+        // Every optional flag this server holds is on today, so the omission
+        // half of this test has to be posed rather than observed: turning one
+        // off is what proves `skip_serializing_if` is still doing the work. The
+        // contract reads absent as unsupported and `null` as a decode failure,
+        // so the difference is the whole of the test.
+        config.environment.capabilities.connection_probe = None;
+        let value = config.to_value();
         let capabilities = &value["environment"]["capabilities"];
         assert_eq!(capabilities["repositoryIdentity"], serde_json::json!(false));
         assert!(capabilities.get("connectionProbe").is_none());
@@ -1021,6 +1040,19 @@ mod tests {
         // against, rather than any other truthy shape.
         assert_eq!(capabilities["threadSettlement"], serde_json::json!(true));
         assert_eq!(capabilities["threadSnooze"], serde_json::json!(true));
+    }
+
+    /// The flag the client reads before it decides how to probe, as it reaches
+    /// the wire: `session.ts` compares against the literal `true`, so anything
+    /// else — absent, `null`, a truthy string — sends it back to
+    /// `server.getConfig`.
+    #[test]
+    fn the_connection_probe_capability_reaches_the_wire_as_true() {
+        let value = ServerConfig::detect().to_value();
+        assert_eq!(
+            value["environment"]["capabilities"]["connectionProbe"],
+            serde_json::json!(true)
+        );
     }
 
     /// Whatever this platform answers, the label is a name rather than an empty
