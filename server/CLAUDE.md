@@ -42,11 +42,19 @@ bug in this project rather than a vendoring detail, which is what ticket 32
 changed. `docs/adr/0014` is why the two trees are one repository.
 
 **There is no `upstream` remote and there are no more syncs.** This project
-stopped merging from `pingdotgg/t3code`: laplus answers 26 of the 71 methods the
+stopped merging from `pingdotgg/t3code`: laplus answers 33 of the 61 methods the
 contract declares, so every feature upstream ships is more UI calling a method
 this server does not have — a sync widens the gap rather than closing it, which
 is what the one sync that was taken demonstrated (ticket 33). The UI is now
 maintained here.
+
+**Where those two numbers come from.** `.scratch/contract-parity/ledger.md`,
+which counts both sides and says what each gap costs — 33 of 61 RPC methods and
+7 of 20 dispatchable commands, as of 2026-07-30. It carries the commands to
+reproduce the counts, and it is those rather than the figures that should be
+trusted once the code has moved. The three lines this replaces read "26 of the
+71" and had been wrong in both halves for long enough to be quoted in two other
+files.
 
 The `@t3tools/*` package scope is kept anyway. It appears in over a thousand
 files, and renaming it now buys a nicer name in exchange for touching every
