@@ -19,7 +19,7 @@ back to resume the conversation it was holding.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The command is parsed before the world is consulted; a blank identifier is
       refused.
