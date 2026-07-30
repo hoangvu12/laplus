@@ -44,6 +44,15 @@ export const HELP = `laplus — the laplus server, and the UI it serves.
   npx laplus                  listen on 127.0.0.1:4773 and print a URL to open
   npx laplus --network        also listen off loopback, for a phone on this network
 
+Keeping it running (Linux with systemd):
+
+  npx laplus service install [flags]   start at boot, and survive logging out
+  npx laplus service status            whether one is installed, and up to date
+  npx laplus service uninstall         stop it and take it off startup
+
+The flags given to \`service install\` are the ones the service runs with. The
+pairing URL then goes to ~/.laplus/logs/service.log rather than to a terminal.
+
 Flags, all of them the server's own:
 
   --port <n>                  the port to listen on (default 4773, LAPLUS_PORT)

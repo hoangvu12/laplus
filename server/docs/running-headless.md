@@ -353,10 +353,11 @@ and `laplus-server` **writes no log file**. It prints to stdout and stderr and
 nothing else; the `logs/` directory that `observability.logsDirectoryPath`
 advertises to the UI is written only by the desktop shell, and only when the
 shell fails to start. So the log is wherever you put it, and putting it
-somewhere is your job:
+somewhere is your job — unless you let `service install` do it, which writes
+`~/.laplus/logs/service.log` and captures both streams into it:
 
 ```
-ExecStart=…                          # systemd: journalctl -u laplus -f
+npx laplus service install           # both streams, one file, done for you
 laplus-server … >> ~/laplus.log 2>&1 # or redirect both streams yourself
 ```
 
@@ -365,6 +366,75 @@ load, a `remote-access.json` that would not parse, and a socket that stopped are
 split across `stdout` and `stderr` on purpose — the ordinary output and the
 things that went wrong — and capturing only the first loses exactly the half you
 will want.
+
+## Keeping it running after you log out
+
+```sh
+npx laplus@latest service install --network
+```
+
+That writes a systemd **user** unit, starts it, and turns on lingering so it
+survives your SSH session closing. `service status` says whether one is
+installed and whether it is the one the binary you are holding would write;
+`service uninstall` stops it and takes it off startup.
+
+The flags you give the install are the flags the unit carries, so
+`service install --network --port 5000` is a service that starts that way every
+boot. `--network` is worth saying out loud: without it the service binds
+loopback and nothing on your network can reach it, which on a VPS is a service
+that runs perfectly and answers nobody.
+
+**The pairing URL goes to the log**, because there is no terminal for it any
+more:
+
+```sh
+tail -f ~/.laplus/logs/service.log
+```
+
+Restarting mints a new credential and retires the old one, so that file is where
+you look after every restart — and it is a secret, for the reason _Pairing a
+phone_ gives. Already-paired devices are unaffected: a session is good for
+thirty days and a restart does not end it.
+
+### What the unit gets right, and why it is not a snippet
+
+Two things, both of which this page had already learned the hard way, which is
+why this is a command rather than a file to paste.
+
+**`PATH` is the installing shell's own.** Not a list of directories written into
+laplus that would have to keep up with where toolchains live — the section above
+is three demonstrations that such a list does not converge. You ran
+`service install` from a terminal where `claude` works; the unit gets that
+`PATH`, plus `/usr/local/bin`, `/usr/bin` and `/bin` if they were somehow
+missing.
+
+**Both streams are captured, to one file, in order.** The credential is on
+stdout and the reason there is no page to use it on is on stderr, and an
+operator who cannot pair needs them interleaved rather than in two places.
+
+The unit also gives up after five failures in five minutes rather than
+restarting every five seconds forever, because that log has no rotation behind
+it. It orders on nothing: `network-online.target` does not exist in the systemd
+_user_ manager, so requiring it is accepted and silently ignored, and
+`Restart=always` is what actually covers a server that started before the box
+had an address.
+
+### The binary it points at is a copy
+
+`npx laplus` runs out of `~/.npm/_npx/<hash>`, which npm may empty whenever it
+likes, so a unit naming that path is a service that works until one day it does
+not. `service install` copies the binary and the UI bundle into
+`~/.laplus/service/` first and points the unit there. A binary already somewhere
+stable — a release build in a checkout, something in `/usr/local/bin` — is used
+where it is, so a developer's `cargo build --release` is picked up by the next
+restart.
+
+Upgrading is `npx laplus@latest service install` again: it re-copies, rewrites
+the unit and restarts. Nothing needs uninstalling first.
+
+**Linux with systemd only.** Everywhere else the three verbs say so and change
+nothing. macOS would want launchd and a different file, and the machine most
+people run the desktop application on already has a window to start it from.
 
 ## Where laplus keeps its files
 
@@ -401,8 +471,9 @@ fallback rather than a bug.
 
 ## Known gaps
 
-**No systemd unit ships with this.** The two things such a unit has to get right
-are the explicit `PATH` above and capturing both streams.
+**Nothing keeps this running on a Mac or a BSD.** `service install` is systemd
+only; launchd would be a second file to render and a second thing to be wrong
+about, and no one has asked for it.
 
 ## What has and has not been checked
 

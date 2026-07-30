@@ -35,6 +35,21 @@ npx laplus@latest --network            # reachable from your phone on this netwo
 npx laplus@latest --port 5000
 ```
 
+## Keeping it running
+
+On Linux with systemd, laplus can install itself as a background service for
+your user — it starts at boot and survives you logging out of SSH.
+
+```sh
+npx laplus@latest service install --network
+npx laplus@latest service status
+npx laplus@latest service uninstall
+```
+
+The flags you pass to `service install` are the ones the service runs with. The
+pairing URL then goes to `~/.laplus/logs/service.log` instead of your terminal,
+so `tail -f` that after a restart.
+
 `--network` turns the listener off loopback **for one run** and does not change
 what the desktop app does next time it starts. Anything it can reach can drive
 an agent on that machine, so the credential printed at startup is the whole of

@@ -22,15 +22,24 @@
 
 use std::process::ExitCode;
 
-use laplus_server::launch;
+use laplus_server::launch::{self, Invoked};
+use laplus_server::service;
 use laplus_server::startup::{self, Announcement, Line, Reachable};
 use laplus_server::ui::Assets;
 use laplus_server::{endpoints, Server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let requested = match launch::requested() {
-        Ok(requested) => requested,
+    let requested = match launch::invoked() {
+        Ok(Invoked::Serve(requested)) => requested,
+        // `service` does its work and exits; it never gets as far as binding a
+        // port. The server it installs is a different process entirely — see
+        // `laplus_server::service`.
+        Ok(Invoked::Service {
+            verb,
+            requested,
+            arguments,
+        }) => return manage_service(verb, requested, arguments),
         Err(message) => {
             eprintln!("laplus: {message}");
             return ExitCode::FAILURE;
@@ -135,4 +144,112 @@ async fn main() -> ExitCode {
 
     server.serve_until_interrupted().await;
     ExitCode::SUCCESS
+}
+
+/// `laplus-server service <verb>`: write, inspect or remove the systemd user
+/// unit that starts this server at boot.
+///
+/// **The bundle is staged before the plan is made, and that order matters.** The
+/// unit has to name a `--ui` directory that will still be there after npm empties
+/// its cache, so the path written into `ExecStart` is the copy's rather than the
+/// one this process was started with. `service::stage` decides whether there is
+/// anything to copy.
+fn manage_service(
+    verb: service::Verb,
+    requested: launch::Requested,
+    arguments: Vec<String>,
+) -> ExitCode {
+    // The bundle the *launcher* passed, kept out of the recorded flags: `npx
+    // laplus` appends `--ui <its own cache>` on every run, and a unit carrying
+    // that path is the exact failure staging exists to prevent.
+    let arguments: Vec<String> = without_ui(&arguments);
+
+    let outcome = (|| -> Result<(), String> {
+        match verb {
+            // Predicted, not staged: asking where the binary *would* go rather
+            // than putting it there, so that `service status` reads the machine
+            // and changes nothing on it.
+            service::Verb::Status => {
+                let plan = service::plan(arguments, None).ok().map(|plan| {
+                    let (binary, ui) = service::destination(
+                        &plan.binary,
+                        requested.ui.as_deref(),
+                        &service::data_directory(),
+                    );
+                    service::Plan { binary, ui, ..plan }
+                });
+                println!("{}", service::status(plan.as_ref())?);
+                Ok(())
+            }
+            service::Verb::Uninstall => {
+                match service::uninstall()? {
+                    service::Outcome::Removed => println!("laplus: removed the service."),
+                    _ => println!("laplus: no service was installed."),
+                }
+                Ok(())
+            }
+            service::Verb::Install => {
+                let binary = std::env::current_exe()
+                    .map_err(|failure| format!("cannot find this binary on disk: {failure}"))?;
+                let data = service::data_directory();
+                let (binary, ui) = service::stage(&binary, requested.ui.as_deref(), &data)?;
+                let plan = service::Plan {
+                    binary,
+                    ui,
+                    ..service::plan(arguments, None)?
+                };
+                let (outcome, warnings) = service::install(&plan)?;
+                match outcome {
+                    service::Outcome::Unchanged(_) => {
+                        println!("laplus: the service is already what this binary would install.");
+                    }
+                    service::Outcome::Updated(plan) => {
+                        println!("laplus: updated the service.\nlaplus: log {}", plan.log_path.display());
+                    }
+                    _ => {
+                        println!("laplus: installed the service.\nlaplus: log {}", plan.log_path.display());
+                        // The credential is printed at startup and there is no
+                        // terminal to print it to any more, so say where it went.
+                        println!(
+                            "laplus: the pairing URL is in that log — `tail -f {}`",
+                            plan.log_path.display()
+                        );
+                    }
+                }
+                for warning in warnings {
+                    eprintln!("laplus: {warning}");
+                }
+                Ok(())
+            }
+        }
+    })();
+
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("laplus: {failure}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The recorded flags without `--ui` and its value, in either spelling.
+fn without_ui(arguments: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for argument in arguments {
+        if skipping {
+            skipping = false;
+            continue;
+        }
+        if argument == "--ui" {
+            skipping = true;
+            continue;
+        }
+        if argument.starts_with("--ui=") {
+            continue;
+        }
+        kept.push(argument.clone());
+    }
+    kept
 }

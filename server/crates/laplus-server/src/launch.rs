@@ -111,16 +111,64 @@ impl NetworkSource {
 /// What the plain server was asked for, from the command line and then the
 /// environment.
 pub fn requested() -> Result<Requested, String> {
-    let flags = flags_from(
-        std::env::args().skip(1),
-        &["port", "ui", "advertise-host"],
-        &["network"],
-    )?;
+    requested_from(std::env::args().skip(1))
+}
+
+/// [`requested`], from arguments somebody else has already peeled a verb off.
+fn requested_from(arguments: impl Iterator<Item = String>) -> Result<Requested, String> {
+    let flags = flags_from(arguments, &["port", "ui", "advertise-host"], &["network"])?;
     Ok(Requested {
         port: port_in(&flags, std::env::var("LAPLUS_PORT").ok())?,
         ui: ui_in(&flags, std::env::var("LAPLUS_UI").ok()),
         network: network_in(&flags, std::env::var("LAPLUS_NETWORK").ok())?,
         advertise_host: advertise_host_in(&flags, std::env::var("LAPLUS_ADVERTISE_HOST").ok())?,
+    })
+}
+
+/// What this process was asked to *do*, which is nearly always "be a server".
+///
+/// **One verb, and it is not a general command line.** `service` is here because
+/// installing a background service needs the same flags a run does — the unit it
+/// writes has to start the server the way the operator would have — and putting
+/// it anywhere else means a second parser that has to agree with this one about
+/// what `--network` means. Everything without a leading verb is a run, so the
+/// spelling that has always worked still does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invoked {
+    Serve(Requested),
+    /// `service <verb> [flags…]`. The flags are what the unit will carry.
+    Service {
+        verb: crate::service::Verb,
+        requested: Requested,
+        /// The flags exactly as typed, to write into `ExecStart`. Rebuilding
+        /// them from [`Requested`] would bake this run's *defaults* into the
+        /// unit — a port nobody chose and an exposure that came from
+        /// `remote-access.json` rather than from the command line.
+        arguments: Vec<String>,
+    },
+}
+
+/// Read the command line as a verb and its flags.
+pub fn invoked() -> Result<Invoked, String> {
+    invoked_from(std::env::args().skip(1).collect())
+}
+
+fn invoked_from(arguments: Vec<String>) -> Result<Invoked, String> {
+    let Some(first) = arguments.first() else {
+        return Ok(Invoked::Serve(requested_from(arguments.into_iter())?));
+    };
+    if first != "service" {
+        return Ok(Invoked::Serve(requested_from(arguments.into_iter())?));
+    }
+    let verb = arguments
+        .get(1)
+        .ok_or_else(|| "service needs a command — install, status or uninstall".to_string())?;
+    let verb = crate::service::Verb::parse(verb)?;
+    let rest: Vec<String> = arguments.into_iter().skip(2).collect();
+    Ok(Invoked::Service {
+        verb,
+        requested: requested_from(rest.clone().into_iter())?,
+        arguments: rest,
     })
 }
 
@@ -573,5 +621,53 @@ mod tests {
     #[test]
     fn zero_is_a_port_like_any_other_here() {
         assert_eq!(port_from(&["--port", "0"], None), Ok(0));
+    }
+
+    fn invoked_with(arguments: &[&str]) -> Result<Invoked, String> {
+        invoked_from(arguments.iter().map(|argument| argument.to_string()).collect())
+    }
+
+    /// The spelling that has always worked, still working. Every run of this
+    /// binary before `service` existed had no verb at all.
+    #[test]
+    fn no_verb_is_a_server_as_it_always_was() {
+        assert!(matches!(invoked_with(&[]), Ok(Invoked::Serve(_))));
+        assert!(matches!(
+            invoked_with(&["--port", "5000"]),
+            Ok(Invoked::Serve(_))
+        ));
+    }
+
+    /// The flags travel twice over: parsed, so this run can refuse a bad one
+    /// before touching systemd, and verbatim, so the unit starts the server the
+    /// operator described rather than the one this parser defaulted to.
+    #[test]
+    fn the_service_verb_keeps_the_flags_both_ways() {
+        let invoked = invoked_with(&["service", "install", "--network", "--port", "5000"]);
+        let Ok(Invoked::Service {
+            verb,
+            requested,
+            arguments,
+        }) = invoked
+        else {
+            panic!("expected a service invocation, got {invoked:?}");
+        };
+        assert_eq!(verb, crate::service::Verb::Install);
+        assert_eq!(requested.port, 5000);
+        assert_eq!(arguments, vec!["--network", "--port", "5000"]);
+    }
+
+    #[test]
+    fn a_service_verb_with_no_command_says_which_ones_there_are() {
+        let failure = invoked_with(&["service"]).unwrap_err();
+        assert!(failure.contains("install"));
+        assert!(failure.contains("uninstall"));
+    }
+
+    /// A bad flag is refused before anything is written, which is the whole
+    /// reason the flags are parsed here as well as copied.
+    #[test]
+    fn an_unknown_flag_after_the_verb_is_still_refused() {
+        assert!(invoked_with(&["service", "install", "--porrt", "5000"]).is_err());
     }
 }

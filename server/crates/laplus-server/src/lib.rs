@@ -81,6 +81,7 @@ pub mod refusals;
 pub mod remote_access;
 pub mod rpc;
 pub mod server;
+pub mod service;
 pub mod settings;
 pub mod settling;
 pub mod startup;
