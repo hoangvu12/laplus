@@ -1,10 +1,11 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Twenty-four are implemented — the
+//! The vocabulary is roughly sixty methods. Twenty-five are implemented — the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
 //! registry and starts a conversation, the subscription that *is* the project
-//! list, the subscription that *is* one conversation, the three that enumerate
+//! list, the call that answers with the other half of it, the subscription that
+//! *is* one conversation, the three that enumerate
 //! names on disk for the picker, the tree and the `@` mention, the two that open
 //! and save one of those files, the one that hands a file to the developer's
 //! own editor, the five that open a terminal, read it, type into it, resize
@@ -288,6 +289,25 @@ pub fn dispatch(
             })
             .map_err(|refusal| DispatchError::Declared(refusal.to_error())),
         orchestration::SUBSCRIBE_SHELL => Ok(Answer::Stream(services.shell.subscribe(payload))),
+        // Answered from the read loop, because it is the same work the shell
+        // subscription already does to describe itself: one indexed read of the
+        // project registry, and the conversations are in memory. The payload is
+        // an empty struct in the contract, so there is nothing to read out of it.
+        //
+        // A registry that cannot be read is the method's *declared* error rather
+        // than a defect. The panel that asks for this renders "Failed to load
+        // archived threads" from a refusal (`archivedThreads.ts`) and would tear
+        // down the whole socket on a defect.
+        orchestration::GET_ARCHIVED_SHELL_SNAPSHOT => services
+            .shell
+            .archived_shell_snapshot()
+            .map(Answer::Value)
+            .map_err(|error| {
+                DispatchError::Declared(declared(
+                    "OrchestrationGetSnapshotError",
+                    format_args!("Could not read the archived conversations: {error}"),
+                ))
+            }),
         threads::SUBSCRIBE_THREAD => Watch::read(payload)
             .and_then(|call| services.shell.threads().subscribe(&call))
             .map(Answer::Stream)

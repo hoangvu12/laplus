@@ -100,7 +100,7 @@ use crate::store::{
 };
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::settling::SessionStatus;
-use crate::threads::{self, Change, Given, MetaUpdate, Prompt, Session, Thread, Threads};
+use crate::threads::{self, Change, Given, MetaUpdate, Prompt, Session, Shelf, Thread, Threads};
 use crate::transcripts::Transcripts;
 
 /// The tag that carries every write to the registry.
@@ -108,6 +108,13 @@ pub const DISPATCH_COMMAND: &str = "orchestration.dispatchCommand";
 
 /// The subscription that *is* the project list.
 pub const SUBSCRIBE_SHELL: &str = "orchestration.subscribeShell";
+
+/// The other half of the project list: what the developer archived.
+///
+/// A call rather than a subscription, because it is read by a settings panel a
+/// developer opens rather than by the sidebar they live in — see
+/// [`Shell::archived_shell_snapshot`].
+pub const GET_ARCHIVED_SHELL_SNAPSHOT: &str = "orchestration.getArchivedShellSnapshot";
 
 /// The contract's default when a client sends no runtime mode
 /// (`DEFAULT_RUNTIME_MODE` in `orchestration.ts`). Repeated here rather than
@@ -188,6 +195,8 @@ enum Command {
     DeleteProject { project_id: String },
     CreateThread(CreateThread),
     UpdateThreadMeta(UpdateThreadMetaPayload),
+    Archive { thread_id: String },
+    Unarchive { thread_id: String },
     StartTurn(Box<StartTurn>),
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -423,6 +432,8 @@ impl Shell {
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
             Command::CreateThread(create) => self.create_thread(&create)?,
             Command::UpdateThreadMeta(update) => self.update_thread_meta(update)?,
+            Command::Archive { thread_id } => self.set_archived(&thread_id, Shelf::Archived)?,
+            Command::Unarchive { thread_id } => self.set_archived(&thread_id, Shelf::Working)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
@@ -646,6 +657,62 @@ impl Shell {
                 }),
             )
             .ok_or_else(|| self.not_open(&thread_id))
+    }
+
+    /// Put a finished conversation away, or take it back out.
+    ///
+    /// The first thing in this server that lets the inbox be *cleared*: the
+    /// project list has carried every conversation ever started, so the one that
+    /// needs attention has been buried among the ones that do not.
+    ///
+    /// **Archiving is not deleting.** The thread, its transcript, its work log
+    /// and its checkpoints all stay exactly as they were, and the agent — if one
+    /// is running — is not told anything. The only thing that changes is which
+    /// snapshot names the conversation: the project list stops
+    /// ([`crate::threads::Shelf`]), and [`Shell::archived_shell_snapshot`]
+    /// starts. That is what makes unarchiving give the whole conversation back
+    /// rather than a husk of it.
+    ///
+    /// **A repeat is refused rather than answered**, which is where these two
+    /// part company with [`Shell::set_mode`] and [`Shell::update_thread_meta`].
+    /// Those write a field to a value the developer chose, so writing it twice
+    /// lands on what they asked for either way. This is a move between two lists,
+    /// and a second archive is a click on a control that is no longer there — a
+    /// stale window, or a second one that has not caught up. A sentence saying
+    /// which list the conversation is already on is more use to the developer
+    /// than a sequence for a move that did not happen, and it is what upstream
+    /// answers. It is also not the spec's "idempotence by re-emission", which is
+    /// explicitly about settle and snooze.
+    ///
+    /// The refusal is decided under the same lock the change is folded under —
+    /// see [`Threads::apply_unless`] — so two windows archiving at once cannot
+    /// both be told they did it.
+    fn set_archived(&self, thread_id: &str, to: Shelf) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                // The shelf answers whether it already holds this conversation,
+                // which is the same question [`Threads::shell_summaries`] asks it
+                // — so a move that would move nothing is refused by the predicate
+                // that decides which list the conversation is on, rather than by
+                // a second reading of the field.
+                |thread| {
+                    to.holds(thread).then(|| match to {
+                        Shelf::Archived => format!(
+                            "Conversation '{thread_id}' is already archived, so it was left where \
+                             it is."
+                        ),
+                        Shelf::Working => format!(
+                            "Conversation '{thread_id}' is not archived, so there is nothing to \
+                             bring back."
+                        ),
+                    })
+                },
+                to.arrival(),
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
     }
 
     /// Give a project the developer's own name for it.
@@ -1175,10 +1242,33 @@ impl Shell {
     /// get and two builders would let the shell a developer sees depend on
     /// which transport won.
     pub fn shell_snapshot(&self) -> Result<Value, StorageError> {
+        self.snapshot_of(Shelf::Working)
+    }
+
+    /// `orchestration.getArchivedShellSnapshot` — the same object, filtered to
+    /// the conversations the developer put away.
+    ///
+    /// The project list excludes archived threads, so this is the only way back
+    /// to one: it is what the archived section of the settings panel is drawn
+    /// from, and the unarchive control there is the only one that exists. It
+    /// carries **every** project rather than only those with something archived
+    /// in them, because the panel groups the threads by project and looks each
+    /// one up in this list (`SettingsPanels.tsx`) — a filtered project list would
+    /// silently drop the threads whose project had nothing else archived.
+    ///
+    /// Built by [`Shell::shell_snapshot`]'s own builder, which the ticket asks
+    /// for by name: two builders would let the world the client draws depend on
+    /// which transport answered first.
+    pub fn archived_shell_snapshot(&self) -> Result<Value, StorageError> {
+        self.snapshot_of(Shelf::Archived)
+    }
+
+    fn snapshot_of(&self, shelf: Shelf) -> Result<Value, StorageError> {
         Ok(shell_snapshot(
             &self.inner.database.registry()?,
             &self.inner.threads,
             self.inner.sequences.current(),
+            shelf,
         ))
     }
 
@@ -1264,9 +1354,14 @@ fn access_snapshot_event(database: &Database) -> Value {
     })
 }
 
-fn shell_snapshot(registry: &Registry, threads: &Threads, sequence: i64) -> Value {
+fn shell_snapshot(
+    registry: &Registry,
+    threads: &Threads,
+    sequence: i64,
+    shelf: Shelf,
+) -> Value {
     let updated_at = threads
-        .latest_change()
+        .latest_change(shelf)
         .filter(|latest| latest > &registry.updated_at)
         .unwrap_or_else(|| registry.updated_at.clone());
 
@@ -1277,7 +1372,7 @@ fn shell_snapshot(registry: &Registry, threads: &Threads, sequence: i64) -> Valu
             .iter()
             .map(Project::to_value)
             .collect::<Vec<Value>>(),
-        "threads": threads.shell_summaries(),
+        "threads": threads.shell_summaries(shelf),
         "updatedAt": updated_at,
     })
 }
@@ -1658,22 +1753,29 @@ struct RevertCheckpointPayload {
     turn_count: u64,
 }
 
-/// `thread.session.stop` — the agent process behind a conversation, ended.
+/// A command whose whole payload is the conversation it is about.
 ///
-/// One field, which is the shape of the command: the contract's own is a
-/// `threadId` and the two fields every command carries. Deliberately **not** a
-/// `turnId` — that is what distinguishes this from `thread.turn.interrupt`, where
-/// naming the wrong turn would stop work the developer never saw start. Here
-/// there is nothing for a turn to change: the process goes.
+/// `thread.session.stop`, `thread.archive` and `thread.unarchive`. All three
+/// carry a `threadId` and the fields every command carries, and this server reads
+/// none of those — see the module documentation for `commandId` and
+/// [`SetRuntimeModePayload`] for `createdAt`, which is the moment the *client*
+/// built the command while every event on this feed is stamped by
+/// [`crate::clock::now_iso`]. So the conversation is the payload, and naming none
+/// is the only thing that can be wrong with one.
 ///
-/// `createdAt` is in the contract and absent here for [`SetRuntimeModePayload`]'s
-/// reason. The event this command publishes carries a `createdAt` of its own, and
-/// it is the moment this server committed rather than the moment the client built
-/// the command — the client's reducer puts it on the session, so a skewed clock
-/// would otherwise decide when a session stopped.
+/// One struct for the three rather than three of one field, because three would
+/// be three places to get the field name wrong. What each command can still be
+/// refused for is a question about the *thread* — whether it exists, whether an
+/// agent is running behind it, which list it is already on — and each is asked
+/// where the answer lives.
+///
+/// Deliberately **not** a `turnId` on any of them. That is what distinguishes a
+/// session stop from `thread.turn.interrupt`, where naming the wrong turn would
+/// stop work the developer never saw start; here there is nothing for a turn to
+/// change.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StopSessionPayload {
+struct AboutAThread {
     thread_id: String,
 }
 
@@ -1870,6 +1972,21 @@ impl Command {
                     thread_id,
                 }))
             }
+            // A conversation and nothing else, as `thread.session.stop` is:
+            // which conversation is the only thing either command carries that
+            // could be wrong. Whether it is *already* on the shelf being asked
+            // for is the world's question and is [`Shell::set_archived`]'s.
+            //
+            // One arm for both, because the payloads are one payload and two arms
+            // would be two places to forget the blank check.
+            "thread.archive" | "thread.unarchive" => {
+                let about: AboutAThread = read_about_a_thread(payload, kind)?;
+                let thread_id = non_blank(about.thread_id, "threadId", kind)?;
+                Ok(match kind {
+                    "thread.archive" => Command::Archive { thread_id },
+                    _ => Command::Unarchive { thread_id },
+                })
+            }
             // A turn carries a mode through *two* doors: the per-turn override
             // the composer sends beside every message, and the thread it asks to
             // have created. Both are checked, because both are written onto the
@@ -1996,7 +2113,7 @@ impl Command {
             // exists, and whether anything is running behind it, are the world's
             // questions and are [`Shell::stop_session`]'s.
             "thread.session.stop" => {
-                let stop: StopSessionPayload = read_about_a_thread(payload, kind)?;
+                let stop: AboutAThread = read_about_a_thread(payload, kind)?;
                 Ok(Command::StopSession {
                     thread_id: non_blank(stop.thread_id, "threadId", kind)?,
                 })
@@ -2372,6 +2489,23 @@ mod tests {
             }))
         }
 
+        /// The `thread.archive` the sidebar's context menu sends, and its twin.
+        fn archive(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.archive",
+                "commandId": format!("test:archive:{thread_id}"),
+                "threadId": thread_id,
+            }))
+        }
+
+        fn unarchive(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.unarchive",
+                "commandId": format!("test:unarchive:{thread_id}"),
+                "threadId": thread_id,
+            }))
+        }
+
         /// The `thread.checkpoint.revert` the diff panel's undo sends.
         fn revert(&self, thread_id: &str, turn_count: u64) -> Result<Value, CommandError> {
             self.dispatch(&json!({
@@ -2418,6 +2552,17 @@ mod tests {
 
         fn listed_threads(&self) -> Vec<Value> {
             self.snapshot()["snapshot"]["threads"]
+                .as_array()
+                .expect("an array of threads")
+                .clone()
+        }
+
+        /// The conversations on the *other* shelf — what
+        /// `orchestration.getArchivedShellSnapshot` answers with.
+        fn archived_threads(&self) -> Vec<Value> {
+            self.shell
+                .archived_shell_snapshot()
+                .expect("the registry is readable")["threads"]
                 .as_array()
                 .expect("an array of threads")
                 .clone()
@@ -2762,7 +2907,7 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and laplus implements eleven. Each
+    /// Roughly twenty command types exist and laplus implements fifteen. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]
@@ -2770,10 +2915,10 @@ mod tests {
         let fixture = Fixture::new();
 
         let refusal = fixture
-            .dispatch(&json!({"type": "thread.archive", "commandId": "c", "threadId": "t"}))
-            .expect_err("archiving is not implemented");
+            .dispatch(&json!({"type": "thread.settle", "commandId": "c", "threadId": "t"}))
+            .expect_err("settling is not implemented");
         assert!(
-            refusal.message().contains("thread.archive"),
+            refusal.message().contains("thread.settle"),
             "{}",
             refusal.message()
         );
@@ -3393,6 +3538,144 @@ mod tests {
             assert!(
                 refusal.message().contains(&format!("turn {turn}")),
                 "the refusal has to name the turn: {}",
+                refusal.message()
+            );
+        }
+    }
+
+    /// Both archive commands are parsed before the world is consulted, so a
+    /// payload naming no conversation is refused at the door.
+    ///
+    /// The whole of what can be wrong with either payload, because the
+    /// conversation is the whole of what either carries — which is the reason the
+    /// two share one arm and one struct.
+    #[test]
+    fn a_malformed_archive_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        for kind in ["thread.archive", "thread.unarchive"] {
+            for blank in ["", "   "] {
+                let refusal = fixture
+                    .dispatch(&json!({"type": kind, "commandId": "c", "threadId": blank}))
+                    .expect_err("a blank thread id names no conversation");
+                assert!(
+                    refusal.message().contains("threadId"),
+                    "{kind}: {}",
+                    refusal.message()
+                );
+            }
+
+            let refusal = fixture
+                .dispatch(&json!({"type": kind, "commandId": "c"}))
+                .expect_err("a command about no conversation");
+            assert!(
+                refusal.message().contains("malformed"),
+                "{kind}: {}",
+                refusal.message()
+            );
+        }
+    }
+
+    /// Archiving moves the conversation between the two snapshots and moves
+    /// nothing else about it.
+    ///
+    /// The list the developer works from is the point of the ticket — a project
+    /// list that carries every conversation ever started buries the one that needs
+    /// attention — and the archived snapshot is the only way back, because the
+    /// unarchive control lives on it.
+    #[test]
+    fn an_archived_conversation_leaves_the_project_list_and_joins_the_other_one() {
+        let fixture = Fixture::with_a_conversation();
+
+        assert_eq!(fixture.listed_threads().len(), 1);
+        assert!(fixture.archived_threads().is_empty());
+
+        fixture.archive("thread-1").expect("archived");
+
+        assert!(
+            fixture.listed_threads().is_empty(),
+            "an archived conversation is still on the list the developer works from: {:#?}",
+            fixture.listed_threads()
+        );
+        let put_away = fixture.archived_threads();
+        assert_eq!(put_away.len(), 1, "{put_away:#?}");
+        assert_eq!(put_away[0]["id"], "thread-1");
+        assert!(
+            put_away[0]["archivedAt"].is_string(),
+            "the summary has to say when: {put_away:#?}"
+        );
+        // The other half of the snapshot is untouched: the panel groups the
+        // threads by project and looks each one up in this list, so a project
+        // list filtered alongside the threads would hide them.
+        assert_eq!(
+            fixture.shell.archived_shell_snapshot().expect("a snapshot")["projects"]
+                .as_array()
+                .expect("the registry")
+                .len(),
+            1
+        );
+
+        fixture.unarchive("thread-1").expect("unarchived");
+
+        assert!(fixture.archived_threads().is_empty());
+        let back = fixture.listed_threads();
+        assert_eq!(back.len(), 1, "{back:#?}");
+        assert_eq!(back[0]["id"], "thread-1");
+        assert_eq!(back[0]["archivedAt"], Value::Null);
+        // Archiving is not deleting: the conversation the client opens is the
+        // one that was put away, not a new one wearing its id.
+        assert_eq!(fixture.detail("thread-1")["title"], back[0]["title"]);
+    }
+
+    /// A repeat of either command is refused with a sentence naming the
+    /// conversation and which list it is already on.
+    ///
+    /// Not [`Shell::set_mode`]'s reading, where a repeat is answered: this is a
+    /// move between two lists rather than a write of a value, and a second
+    /// archive is a click on a control that is no longer there. The sentence is
+    /// the whole diagnostic `OrchestrationDispatchCommandError` carries.
+    #[test]
+    fn archiving_twice_or_unarchiving_what_is_not_archived_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .unarchive("thread-1")
+            .expect_err("it was never archived");
+        assert!(
+            refusal.message().contains("thread-1") && refusal.message().contains("not archived"),
+            "{}",
+            refusal.message()
+        );
+
+        fixture.archive("thread-1").expect("archived");
+        let refusal = fixture.archive("thread-1").expect_err("already archived");
+        assert!(
+            refusal.message().contains("thread-1")
+                && refusal.message().contains("already archived"),
+            "{}",
+            refusal.message()
+        );
+
+        // And the refusal changed nothing: one refused command does not put the
+        // conversation back on a list it left.
+        assert!(fixture.listed_threads().is_empty());
+        assert_eq!(fixture.archived_threads().len(), 1);
+    }
+
+    /// Neither command reaches a conversation this server does not hold, and the
+    /// refusal names the one that was asked for.
+    #[test]
+    fn archiving_an_unknown_conversation_is_refused_by_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        for asked in [
+            fixture.archive("never-created"),
+            fixture.unarchive("never-created"),
+        ] {
+            let refusal = asked.expect_err("there is no such conversation");
+            assert!(
+                refusal.message().contains("never-created"),
+                "{}",
                 refusal.message()
             );
         }

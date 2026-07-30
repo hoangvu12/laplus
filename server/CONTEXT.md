@@ -217,6 +217,27 @@ Two consequences worth naming: a snooze expires by being **read** rather than by
 a timer, so there is nothing to schedule; and a thread raising its hand while
 snoozed does not clear the fields, it only stops them classifying.
 
+**Shelf** — which of the developer's two lists a conversation is on.
+`crate::threads::Shelf`, and the first of the six fields to become something a
+developer can move: `thread.archive` stamps `archivedAt`, `thread.unarchive`
+clears it, and the stamp is the whole of the difference between the two lists.
+
+**Archiving is not deleting.** The thread, its transcript, its work log and its
+checkpoints all stay exactly as they were, and a running agent is not told
+anything. What changes is which snapshot names the conversation: the project list
+(`orchestration.subscribeShell` and `GET /api/orchestration/shell`) carries the
+working shelf, and `orchestration.getArchivedShellSnapshot` carries the other —
+**one builder, filtered two ways**, because two would let the world a client
+draws depend on which of them answered. The archived answer carries the whole
+project registry rather than a filtered one, because the settings panel that
+reads it groups the threads by project and looks each one up there.
+
+Both commands **refuse a repeat**, unlike the renames and the mode pickers: this
+is a move between two lists rather than a write of a value the developer chose,
+so a second archive is a click on a control that is no longer there. The refusal
+is decided under the fold's own lock — `crate::threads::Threads::apply_unless`,
+which exists for this.
+
 **Deleting is soft** — `deletedAt` is a stamp, not a `DELETE`. The row, its
 transcript, its work log and its checkpoints are all meant to stay: a hard delete
 would orphan the git refs the turns wrote and take the transcript with it

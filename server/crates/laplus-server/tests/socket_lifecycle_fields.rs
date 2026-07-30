@@ -110,7 +110,30 @@ async fn as_a_fresh_subscriber_sees_it(server: &TestServer, thread_id: &str) -> 
 
 /// The conversation's summary on the project list.
 async fn on_the_project_list(server: &TestServer, thread_id: &str) -> Value {
-    let snapshot = server.connect().await.into_shell_snapshot().await;
+    summary_in(
+        &server.connect().await.into_shell_snapshot().await,
+        thread_id,
+    )
+}
+
+/// The conversation's summary on the *other* list.
+///
+/// Ticket 06 took archived conversations off the project list, so the curated
+/// lifecycle below — which sets all six fields, `archivedAt` among them — is
+/// found here instead. The shape is the same shape: both snapshots are one
+/// builder filtered two ways, which is what `socket_archiving.rs` asserts
+/// directly.
+async fn on_the_archived_list(server: &TestServer, thread_id: &str) -> Value {
+    let mut client = server.connect().await;
+    let snapshot = client
+        .call("orchestration.getArchivedShellSnapshot", json!({}))
+        .await
+        .expect_success();
+    client.close().await;
+    summary_in(&snapshot, thread_id)
+}
+
+fn summary_in(snapshot: &Value, thread_id: &str) -> Value {
     snapshot["threads"]
         .as_array()
         .expect("the list carries its conversations")
@@ -205,11 +228,11 @@ async fn a_curated_lifecycle_survives_a_restart_and_reaches_both_feeds() {
         "the thread's own feed lost the lifecycle across the restart"
     );
 
-    let summary = on_the_project_list(&server, "thread-1").await;
+    let summary = on_the_archived_list(&server, "thread-1").await;
     assert_eq!(
         lifecycle_of(&summary),
         on_the_wire(),
-        "the project list lost the lifecycle across the restart"
+        "the shell summary lost the lifecycle across the restart"
     );
 
     server.stop().await;

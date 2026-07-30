@@ -312,6 +312,50 @@ impl Lifecycle {
     }
 }
 
+/// Which of the developer's two lists a snapshot is describing.
+///
+/// The project list is the work in hand and stops carrying a conversation the
+/// moment it is archived; `orchestration.getArchivedShellSnapshot` is the other
+/// half, and is the only way back to one. Both are built by
+/// [`Threads::shell_summaries`] from this — a second builder would let the world
+/// a client draws depend on which of the two answered first, which is what the
+/// shared builder exists to prevent.
+///
+/// An archived conversation is still *here*: it stays in the registry, keeps its
+/// transcript and its checkpoints, and is one unarchive away from the list it
+/// left. This decides only which snapshot names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shelf {
+    /// Everything not archived — the list the developer is working from.
+    Working,
+    /// What they put away.
+    Archived,
+}
+
+impl Shelf {
+    /// Is this conversation on this shelf already?
+    ///
+    /// The one place the question is answered, and it is asked from two very
+    /// different directions: [`Threads::shell_summaries`] filters a snapshot with
+    /// it, and `Shell::set_archived` refuses a move that would not move anything.
+    /// A second reading of `archived_at` would be a second answer to one
+    /// question.
+    pub fn holds(&self, thread: &Thread) -> bool {
+        match self {
+            Shelf::Working => thread.lifecycle.archived_at.is_none(),
+            Shelf::Archived => thread.lifecycle.archived_at.is_some(),
+        }
+    }
+
+    /// The change that puts a conversation here.
+    pub fn arrival(&self) -> Change {
+        match self {
+            Shelf::Working => Change::Unarchived,
+            Shelf::Archived => Change::Archived,
+        }
+    }
+}
+
 /// A stored settle override, back as one of the contract's two.
 ///
 /// Same reasoning as [`tone`], with a sharper edge: `settledOverride` is a
@@ -887,6 +931,28 @@ pub enum Change {
     /// Four fields, each of which may be absent — see [`MetaUpdate`], where what
     /// "absent" has to mean is argued.
     MetaUpdated(MetaUpdate),
+    /// The developer put a conversation away. `thread.archived`.
+    ///
+    /// **Archiving is not deleting**, and nothing here says otherwise: the only
+    /// field it moves is [`Lifecycle::archived_at`], so the transcript, the work
+    /// log and the checkpoints are exactly where they were. What changes is
+    /// which snapshot names the conversation — see [`Shelf`].
+    ///
+    /// The stamp is the moment this server committed, which is also the
+    /// `updatedAt` [`Threads::apply`] is about to put on the thread. The client's
+    /// reducer reads both out of the payload (`threadReducer.ts`,
+    /// `case "thread.archived"`), so sending one and not the other would leave a
+    /// window that watched the archive disagreeing with one that reloaded after
+    /// it about when the conversation last changed.
+    Archived,
+    /// The developer took one back out. `thread.unarchived`.
+    ///
+    /// [`Change::Archived`]'s twin, and it clears the stamp rather than writing a
+    /// second one: the contract's `ThreadUnarchivedPayload` is the conversation
+    /// and an `updatedAt`, with no stamp of its own, because there is no such
+    /// thing as when a conversation stopped being archived — it either is or it
+    /// is not.
+    Unarchived,
     /// The developer moved the conversation's runtime mode.
     /// `thread.runtime-mode-set`.
     ///
@@ -1326,9 +1392,35 @@ impl Threads {
     /// `None` when the thread does not exist — a change published for a thread
     /// nothing has created would describe a conversation no client could open.
     pub fn apply(&self, thread_id: &str, change: Change) -> Option<i64> {
+        self.apply_unless(thread_id, |_| None, change)?.ok()
+    }
+
+    /// [`Threads::apply`], with the world's own refusal decided under the lock
+    /// the fold runs under.
+    ///
+    /// The two archive commands are why this exists. Whether a conversation is
+    /// already archived is a question about the very field the change is about to
+    /// move, so asking it under one lock and answering under another would let
+    /// two windows both be told they archived one conversation — and the second
+    /// of them would have published a `thread.archived` over a thread that was
+    /// already put away. `refused` is asked *before* a sequence is taken, so a
+    /// refusal costs the log nothing.
+    ///
+    /// `None` for a conversation this server does not hold, which is
+    /// [`Threads::apply`]'s own answer to one; `Some(Err)` for one it holds and
+    /// will not move, carrying the sentence a client is shown.
+    pub fn apply_unless(
+        &self,
+        thread_id: &str,
+        refused: impl FnOnce(&Thread) -> Option<String>,
+        change: Change,
+    ) -> Option<Result<i64, String>> {
         let entry = self.find(thread_id)?;
         let mut state = lock(&entry.state);
         let thread = state.as_mut()?;
+        if let Some(why) = refused(thread) {
+            return Some(Err(why));
+        }
 
         // Under the entry's lock, so two changes to one thread are numbered in
         // the order they are applied; and holding the log until both
@@ -1361,7 +1453,7 @@ impl Threads {
                 "thread": summary,
             }));
         }
-        Some(sequence)
+        Some(Ok(sequence))
     }
 
     /// Apply one change to the stored thread and return the event payload that
@@ -1414,6 +1506,27 @@ impl Threads {
                     described.insert("worktreePath".to_string(), json!(worktree_path));
                 }
                 payload
+            }
+            // The client's reducer, mirrored: one field moves, and the payload
+            // carries the same two values the reducer writes onto the thread
+            // (`threadReducer.ts`, `case "thread.archived"`). Nothing else is
+            // touched — archiving a conversation is not a way of ending it, so
+            // the session, the latest turn and the transcript are all left as
+            // they are.
+            Change::Archived => {
+                thread.lifecycle.archived_at = Some(at.to_string());
+                json!({
+                    "threadId": thread.id,
+                    "archivedAt": at,
+                    "updatedAt": at,
+                })
+            }
+            Change::Unarchived => {
+                thread.lifecycle.archived_at = None;
+                json!({
+                    "threadId": thread.id,
+                    "updatedAt": at,
+                })
             }
             // The client's reducer, mirrored: one field and `updatedAt`, and
             // nothing else moves. `updatedAt` is the payload's own key here
@@ -1808,14 +1921,20 @@ impl Threads {
         Some(detail_snapshot(state.as_ref()?, &self.inner.sequences))
     }
 
-    /// Every thread, as the project list carries them.
-    pub fn shell_summaries(&self) -> Vec<Value> {
+    /// The threads on one of the developer's two shelves, as a snapshot carries
+    /// them.
+    ///
+    /// One builder for both, which is ticket 06's own instruction: the project
+    /// list and the archived snapshot are the same object filtered two ways, and
+    /// a second builder would let the conversation a client draws depend on which
+    /// of them answered.
+    pub fn shell_summaries(&self, shelf: Shelf) -> Vec<Value> {
         let entries: Vec<Arc<Entry>> = self.lock().values().map(Arc::clone).collect();
         let mut summaries: Vec<((String, String), Value)> = entries
             .iter()
             .filter_map(|entry| {
                 let state = lock(&entry.state);
-                let thread = state.as_ref()?;
+                let thread = state.as_ref().filter(|thread| shelf.holds(thread))?;
                 Some((
                     (thread.created_at.clone(), thread.id.clone()),
                     thread.to_shell_value(),
@@ -1830,13 +1949,24 @@ impl Threads {
         summaries.into_iter().map(|(_, thread)| thread).collect()
     }
 
-    /// The most recent moment any thread changed, for the shell snapshot's own
-    /// timestamp.
-    pub fn latest_change(&self) -> Option<String> {
+    /// The most recent moment a thread on this shelf changed, for the shell
+    /// snapshot's own timestamp.
+    ///
+    /// Filtered by the same shelf the snapshot's conversations are, because the
+    /// field describes *that* snapshot: an archived answer whose `updatedAt` came
+    /// from a conversation still on the project list would be reporting a change
+    /// to something it does not carry — and would be non-null with nothing
+    /// archived at all.
+    pub fn latest_change(&self, shelf: Shelf) -> Option<String> {
         let entries: Vec<Arc<Entry>> = self.lock().values().map(Arc::clone).collect();
         entries
             .iter()
-            .filter_map(|entry| lock(&entry.state).as_ref().map(|thread| thread.updated_at.clone()))
+            .filter_map(|entry| {
+                lock(&entry.state)
+                    .as_ref()
+                    .filter(|thread| shelf.holds(thread))
+                    .map(|thread| thread.updated_at.clone())
+            })
             .max()
     }
 
@@ -2305,6 +2435,8 @@ impl Change {
             | Change::AssistantDelta { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
             Change::MetaUpdated(_) => "thread.meta-updated",
+            Change::Archived => "thread.archived",
+            Change::Unarchived => "thread.unarchived",
             Change::RuntimeModeSet { .. } => "thread.runtime-mode-set",
             Change::InteractionModeSet { .. } => "thread.interaction-mode-set",
             Change::TurnRequested { .. } => "thread.turn-start-requested",
@@ -3303,7 +3435,7 @@ pub(crate) mod tests {
             None
         );
         assert!(shell.try_recv().is_err());
-        assert!(threads.shell_summaries().is_empty());
+        assert!(threads.shell_summaries(Shelf::Working).is_empty());
     }
 
     /// The two renderings of one thread carry the keys the contract declares.

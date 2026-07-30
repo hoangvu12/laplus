@@ -23,6 +23,16 @@ also be withheld from the archived shell snapshot is a client-visible detail tha
 was not settled during the audit. Check it against the client's own reducer before
 choosing, rather than picking whichever seems tidier.
 
+> **Confirmed while building ticket 06, and the answer is "withhold it".** The
+> archived section of the settings panel filters on neither `deletedAt` nor
+> `archivedAt` — `SettingsPanels.tsx`'s `archivedGroups` takes
+> `snapshot.threads` whole and groups it by project. So a thread that was
+> archived and then deleted renders in the panel, with an unarchive control on
+> it, unless this server leaves it out of the answer. Ticket 06 built the filter
+> as `crate::threads::Shelf`, which is where the extra condition goes:
+> `Shelf::Archived` means archived **and not deleted**, and `Shelf::Working`
+> already has to exclude deleted threads for the criterion below.
+
 Note this ticket does **not** depend on archive. Delete has no archived condition
 in its invariants — what it needs is the deletion field from ticket 01, and
 nothing more.
