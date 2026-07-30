@@ -341,6 +341,7 @@ jobs:
       matrix:
         include:
           - key: win32 x64
+            slug: win32-x64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             binary: laplus-server.exe
@@ -349,14 +350,17 @@ jobs:
           # out, and `cargo build -p laplus-server` on the box is the answer for
           # them. `server/docs/running-headless.md` says what that needs.
           - key: linux x64
+            slug: linux-x64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: laplus-server
           - key: linux arm64
+            slug: linux-arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             binary: laplus-server
           - key: darwin arm64
+            slug: darwin-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
             binary: laplus-server
@@ -365,6 +369,7 @@ jobs:
           # the bundled SQLite needs, and it costs a `rustup target add` instead
           # of a runner label that Apple's hardware transition keeps taking away.
           - key: darwin x64
+            slug: darwin-x64
             runner: macos-latest
             target: x86_64-apple-darwin
             binary: laplus-server
@@ -405,10 +410,17 @@ jobs:
       # Named for the platform key rather than the Rust triple, because what
       # reads it back is `artifactName` in `apps/cli/src/release.ts`, which
       # thinks in Node's platform names. The triple stops mattering here.
+      #
+      # **`slug`, not `key`.** The key has a space in it — it is
+      # `${process.platform} ${process.arch}`, which is the pair npm's `os` and
+      # `cpu` want — and an artifact called `server-darwin arm64` is not the
+      # directory `artifactName` then goes looking for. GitHub expressions have
+      # no `replace`, so the dashed form is carried in the matrix rather than
+      # computed, and the first dispatch run found this the hard way.
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: server-${{ matrix.key }}
+          name: server-${{ matrix.slug }}
           path: server/target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
 

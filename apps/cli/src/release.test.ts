@@ -55,6 +55,23 @@ function fakeBinaries(only?: readonly string[]): string {
   return root;
 }
 
+// The `slug` field of the release workflow's build matrix, written down. These
+// five strings are a contract with a YAML file no test can read: the workflow
+// uploads `server-<slug>` and this is what goes looking for it. Naming the
+// artifact after the platform *key* instead — which has a space in it — is
+// exactly how the first dispatch run failed.
+describe("artifactName", () => {
+  it("is the dashed platform key, for all five", () => {
+    expect(Object.keys(TARGETS).map(artifactName)).toEqual([
+      "server-darwin-arm64",
+      "server-darwin-x64",
+      "server-linux-arm64",
+      "server-linux-x64",
+      "server-win32-x64",
+    ]);
+  });
+});
+
 describe("platformManifest", () => {
   it("takes npm's os and cpu straight from the platform key", () => {
     expect(platformManifest({ key: "darwin arm64", version: "1.2.3" })).toMatchObject({
