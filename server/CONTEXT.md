@@ -200,6 +200,25 @@ stopped. Distinct from turn state because the CLI reports a stopped turn as a
 failed one, so only this server's own knowledge that it asked can tell them
 apart. `crate::turn::Ending`.
 
+**Session stop** — ending the agent process behind a conversation, keeping the
+conversation. `thread.session.stop`, and **not an interrupt**: an interrupt asks
+a running turn to stop and leaves the child alive, this ends the session, and the
+case it exists for — an agent that is idle or wedged, holding a process — has no
+turn to interrupt. `crate::threads::Threads::stop_session`.
+
+Answered in two stages, like an interrupt. The slot is freed and the driver told
+at once, so the next turn starts a _new_ session and the developer's click is
+what stops the conversation being drawn as alive; the driver leaves its loop,
+closes the agent's stdin, waits, and kills if waiting was not enough, and only
+then publishes the session as `stopped`. Nothing else moves: the transcript, the
+work log and above all the **agent session id** survive, which is the whole of
+how the next turn continues the same conversation.
+
+**Session epoch** — which of a conversation's sessions a driver is. Counted per
+thread, and the reason it exists is that a stop frees the slot while the child is
+still being reaped: a driver can outlive its own session, and must not publish an
+ending over the session that replaced it. `crate::threads::Live::epoch`.
+
 ## Protocol
 
 **Drift counter** — a tally of agent-protocol events this build did not

@@ -833,6 +833,27 @@ pub enum Change {
     },
     /// The agent process changed state. `thread.session-set`.
     Session(Session),
+    /// The developer ended the session. `thread.session-stop-requested`.
+    ///
+    /// Published when the driver has been *told* rather than when the child has
+    /// gone, which is [`Change::InterruptRequested`]'s shape and is why the
+    /// contract declares an event for a command that could have been answered
+    /// with a session change alone: the process takes a moment to go, and the
+    /// developer's click is what should stop the session being drawn as alive.
+    /// The `thread.session-set` carrying `stopped` follows once it really has —
+    /// see [`crate::turn`], where reaping precedes it.
+    ///
+    /// It folds what the client folds and no more (`threadReducer.ts`,
+    /// `case "thread.session-stop-requested"`): the session goes to `stopped`
+    /// with no active turn, and the **latest turn is left alone**. Settling the
+    /// turn here would be a third copy of the settling rule
+    /// ([`crate::settling`]) in a place the client has none, so a window that
+    /// watched the stop and one that reloaded after it would disagree about how
+    /// the last turn ended.
+    ///
+    /// A conversation with no session folds to nothing at all, which is why the
+    /// command does not publish this when there was no agent to end.
+    SessionStopRequested,
     /// Something happened worth showing. `thread.activity-appended`.
     Activity(Activity),
     /// A turn finished and what the working tree looked like was recorded.
@@ -959,11 +980,24 @@ struct Entry {
     events: broadcast::Sender<Value>,
     /// The running agent's end of the conversation, while there is one.
     live: Mutex<Option<Live>>,
+    /// How many sessions this conversation has had. What [`Live::epoch`] is
+    /// counted by.
+    sessions: AtomicU64,
 }
 
 /// A handle on the task driving one session.
 #[derive(Debug)]
 struct Live {
+    /// Which session of this conversation's this is.
+    ///
+    /// Carried so that a driver ending can tell "my slot" from "the slot the
+    /// session after mine is in". [`Threads::stop_session`] frees the slot at
+    /// once — that is what lets the next turn start a new session rather than
+    /// queueing prompts into a channel nobody is reading — so a driver winding
+    /// down afterwards would otherwise [`Threads::detach`] the session that
+    /// replaced it, taking a live agent out of the registry and off the gauge
+    /// while its child went on running.
+    epoch: u64,
     prompts: mpsc::Sender<Prompt>,
     signals: mpsc::Sender<Signal>,
     task: JoinHandle<()>,
@@ -1026,6 +1060,22 @@ pub enum Signal {
     /// `None` is the client saying "whatever is running", which is what it sends
     /// when it does not believe anything is.
     Interrupt { turn_id: Option<String> },
+    /// The developer ended the session.
+    ///
+    /// **Not an interrupt, and travelling this channel for the same reason one
+    /// does**: it is owed to the turn in flight rather than queued behind it. An
+    /// interrupt asks a turn to stop and leaves the child running; this ends the
+    /// session, and the driver answers it by leaving its loop — which closes the
+    /// agent's stdin, waits for the child, and kills it if waiting was not
+    /// enough ([`crate::agent::Agent::stop`]). That bound is the point: the case
+    /// this exists for is an agent that is wedged, and closing a pipe at
+    /// something wedged is a hope rather than a guarantee.
+    ///
+    /// It carries no turn. The developer is ending the process, so *which* turn
+    /// it was in the middle of does not change what happens to it — unlike an
+    /// interrupt, where naming the wrong turn would stop work the developer
+    /// never saw start.
+    Stop,
 }
 
 /// One permission decision on its way to the agent waiting for it.
@@ -1130,6 +1180,7 @@ impl Threads {
                 state: Mutex::new(None),
                 events: broadcast::channel(BACKLOG).0,
                 live: Mutex::new(None),
+                sessions: AtomicU64::new(0),
             })
         }))
     }
@@ -1374,6 +1425,26 @@ impl Threads {
                 json!({
                     "threadId": thread.id,
                     "session": session.to_value(&thread.id),
+                })
+            }
+            // The client's reducer, mirrored down to what it leaves alone: the
+            // session stops and gives up its turn, and the *latest turn* is not
+            // settled here. See [`Change::SessionStopRequested`], where both
+            // halves of that are argued.
+            //
+            // `createdAt` is the moment this server committed, like every other
+            // stamp on this feed, and it is also what the reducer puts on the
+            // session — so the two copies of the session agree on when it
+            // stopped.
+            Change::SessionStopRequested => {
+                if let Some(session) = thread.session.as_mut() {
+                    session.status = SessionStatus::Stopped;
+                    session.active_turn_id = None;
+                    session.updated_at = at.to_string();
+                }
+                json!({
+                    "threadId": thread.id,
+                    "createdAt": at,
                 })
             }
             Change::Activity(activity) => {
@@ -1812,8 +1883,10 @@ impl Threads {
     ///
     /// Returns the channel to feed prompts into either way, so a caller does not
     /// have to know whether it was the one that started the session. `start`
-    /// receives the prompt channel's other end and is expected to spawn the task
-    /// that owns the agent.
+    /// receives the prompt channel's other end, the signal channel's, and the
+    /// number of the session it is about to drive, and is expected to spawn the
+    /// task that owns the agent. That number comes back on the way out — see
+    /// [`Live::epoch`].
     ///
     /// Synchronous on purpose: the call that dispatches a turn has to answer the
     /// client immediately, so nothing on this path may wait for a process to
@@ -1822,7 +1895,7 @@ impl Threads {
     pub fn attach(
         &self,
         thread_id: &str,
-        start: impl FnOnce(mpsc::Receiver<Prompt>, mpsc::Receiver<Signal>) -> JoinHandle<()>,
+        start: impl FnOnce(mpsc::Receiver<Prompt>, mpsc::Receiver<Signal>, u64) -> JoinHandle<()>,
     ) -> mpsc::Sender<Prompt> {
         let entry = self.entry(thread_id);
         let mut live = lock(&entry.live);
@@ -1832,11 +1905,13 @@ impl Threads {
 
         let (prompts, incoming) = mpsc::channel(PROMPT_QUEUE);
         let (signals, signalled) = mpsc::channel(SIGNAL_QUEUE);
+        let epoch = entry.sessions.fetch_add(1, Ordering::Relaxed);
         self.inner.live_agents.fetch_add(1, Ordering::Relaxed);
         *live = Some(Live {
+            epoch,
             prompts: prompts.clone(),
             signals,
-            task: start(incoming, signalled),
+            task: start(incoming, signalled, epoch),
         });
         prompts
     }
@@ -1944,15 +2019,70 @@ impl Threads {
         }
     }
 
+    /// End this conversation's session, keeping the conversation.
+    ///
+    /// Answers whether there was one to end. `false` is not a failure: the
+    /// developer asked for no agent to be running and there is none, which is
+    /// the state they asked for — the same reading [`Threads::interrupt`] takes
+    /// of a turn that is not there. `Err` is reserved for a conversation this
+    /// server has never heard of, which is a client naming something that does
+    /// not exist.
+    ///
+    /// **Nothing here is about the turn.** Interrupting asks a running turn to
+    /// stop and leaves the child alive; this ends the process, which is a
+    /// different act with a different subject — see [`Signal::Stop`], and
+    /// `.scratch/thread-lifecycle/issues/04-…`, where the distinction is the
+    /// ticket.
+    ///
+    /// Three things happen, in this order, and each is load-bearing:
+    ///
+    /// 1. **The slot is freed**, so a turn dispatched a moment later starts a
+    ///    *new* session. Leaving it would mean the next turn queued a prompt into
+    ///    a channel whose driver had stopped reading, which is a conversation
+    ///    waiting forever on a turn nothing was ever handed. The real client does
+    ///    exactly this: the branch toolbar stops the session and moves the
+    ///    conversation's worktree in the same breath.
+    /// 2. **The driver is told**, on the channel it is already listening to. Said
+    ///    before the channels are dropped, and it arrives anyway: a closed
+    ///    [`mpsc`] still yields what was queued on it before the sender went.
+    /// 3. **The handle is parked**, because dropping a [`JoinHandle`] detaches
+    ///    the task and a detached driver is one [`Threads::shutdown`] would not
+    ///    wait for. The same reasoning, and the same list, as
+    ///    [`Threads::forget`]; nothing *waits* here either, because the developer
+    ///    is owed an answer rather than a reaping.
+    ///
+    /// If the signal cannot be queued the dropped prompt channel is still the
+    /// older way of saying the same thing — the driver reads it as "no more
+    /// turns", closes the agent's stdin and drains what is left. That is a
+    /// gentler ending than the signal asks for and it is the right fallback: a
+    /// driver with a full signal queue is one that is not reading them.
+    pub fn stop_session(&self, thread_id: &str) -> Result<bool, String> {
+        let entry = self.find(thread_id).ok_or_else(unknown(thread_id))?;
+        // The guard is released with the statement, before the parking list is
+        // taken — the lock order [`Threads::forget`] uses, and there is no reason
+        // for this to be the one path that inverts it.
+        let Some(live) = lock(&entry.live).take() else {
+            return Ok(false);
+        };
+        self.inner.live_agents.fetch_sub(1, Ordering::Relaxed);
+
+        let _ = live.signals.try_send(Signal::Stop);
+        drop(live.prompts);
+        drop(live.signals);
+
+        let mut winding_down = lock(&self.inner.winding_down);
+        winding_down.retain(|driver| !driver.is_finished());
+        winding_down.push(live.task);
+        Ok(true)
+    }
+
     /// The running session's signal channel, or `None` when nothing is running.
     ///
     /// `Err` is reserved for a conversation this server has never heard of,
     /// which is a client naming something that does not exist rather than
     /// anything about a session.
     fn live(&self, thread_id: &str) -> Result<Option<mpsc::Sender<Signal>>, String> {
-        let entry = self
-            .find(thread_id)
-            .ok_or_else(|| format!("There is no conversation '{thread_id}' on this server."))?;
+        let entry = self.find(thread_id).ok_or_else(unknown(thread_id))?;
         let live = lock(&entry.live);
         Ok(live.as_ref().map(|running| running.signals.clone()))
     }
@@ -1985,12 +2115,36 @@ impl Threads {
     /// it was driving — [`Threads::forget`] removes a deleted project's
     /// conversations while their agents are still winding down — and allocating
     /// here would put an empty slot back for every one of them.
-    pub fn detach(&self, thread_id: &str) {
+    ///
+    /// `epoch` is the session the caller was driving, and the slot is given up
+    /// only if it is still holding *that* one. A driver can also outlive its own
+    /// slot: [`Threads::stop_session`] frees it while the child is still being
+    /// reaped, and the next turn fills it with a session of its own. See
+    /// [`Live::epoch`].
+    ///
+    /// Answers whether the conversation is **still this session's to describe**,
+    /// which is the question a driver has to ask before publishing its ending and
+    /// the only place it can ask it — see [`crate::turn`].
+    ///
+    /// That is not quite "was the slot mine". An *empty* slot is still this
+    /// session's to describe: a stop or a shutdown frees it and neither of them
+    /// puts another session in the conversation, so the ending is the last true
+    /// thing anybody can say about it. `false` is reserved for the two cases where
+    /// something else is now the truth — a *newer* session in the slot, and a
+    /// conversation that has been forgotten with its project.
+    pub fn detach(&self, thread_id: &str, epoch: u64) -> bool {
         let Some(entry) = self.find(thread_id) else {
-            return;
+            return false;
         };
-        if lock(&entry.live).take().is_some() {
-            self.inner.live_agents.fetch_sub(1, Ordering::Relaxed);
+        let mut live = lock(&entry.live);
+        match live.as_ref().map(|running| running.epoch) {
+            Some(held) if held == epoch => {
+                *live = None;
+                self.inner.live_agents.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            Some(_) => false,
+            None => true,
         }
     }
 
@@ -2030,6 +2184,15 @@ impl Threads {
     }
 }
 
+/// A command naming a conversation this server has never heard of.
+///
+/// Said in one place because two of the session commands refuse for it, and the
+/// sentence names the thread: a client that asked about something that does not
+/// exist has a bug, and which id it sent is the whole of what would find it.
+fn unknown(thread_id: &str) -> impl FnOnce() -> String + '_ {
+    move || format!("There is no conversation '{thread_id}' on this server.")
+}
+
 /// A poisoned lock means a previous holder panicked mid-change. What is behind
 /// it is a plain value with no invariant a panic could have broken halfway, so
 /// refusing to use it would turn one panic into a dead conversation.
@@ -2049,6 +2212,7 @@ impl Change {
             Change::TurnRequested { .. } => "thread.turn-start-requested",
             Change::InterruptRequested { .. } => "thread.turn-interrupt-requested",
             Change::Session(_) => "thread.session-set",
+            Change::SessionStopRequested => "thread.session-stop-requested",
             Change::Activity(_) => "thread.activity-appended",
             Change::Checkpointed(_) => "thread.turn-diff-completed",
             Change::RevertRequested { .. } => "thread.checkpoint-revert-requested",

@@ -195,6 +195,7 @@ enum Command {
     SetRuntimeMode(SetRuntimeModePayload),
     SetInteractionMode(SetInteractionModePayload),
     RevertCheckpoint(RevertCheckpointPayload),
+    StopSession { thread_id: String },
 }
 
 /// Everything a diff of a conversation needs that is not about git.
@@ -439,6 +440,7 @@ impl Shell {
                 },
             )?,
             Command::RevertCheckpoint(revert) => self.revert_checkpoint(revert)?,
+            Command::StopSession { thread_id } => self.stop_session(&thread_id)?,
         };
 
         Ok(json!({ "sequence": sequence }))
@@ -787,6 +789,53 @@ impl Shell {
             .interrupt(&interrupt.thread_id, interrupt.turn_id.clone())
             .map_err(CommandError::new)?;
         Ok(self.inner.sequences.current())
+    }
+
+    /// End the agent process behind a conversation, and keep the conversation.
+    ///
+    /// **Not [`Shell::interrupt_turn`] under another name.** An interrupt asks a
+    /// running turn to stop and leaves the child alive, which is what makes the
+    /// correction typed a moment later a correction. This ends the session, and
+    /// the case it exists for — an agent that is idle or wedged, holding a
+    /// process — has no turn to interrupt at all. The client reaches for it in
+    /// two places, neither of them a stop button: before deleting a thread, and
+    /// when moving a conversation to a different worktree
+    /// (`useThreadActions.ts`, `BranchToolbarBranchSelector.tsx`).
+    ///
+    /// **The conversation survives, and so does the agent's own handle on it.**
+    /// Nothing here touches the transcript, the work log, or
+    /// [`Thread::agent_session_id`] — which is the whole of how continuity
+    /// outlives a process, because the next turn is started with `--resume` and
+    /// the context is in the agent's store rather than in this server's
+    /// transcript. So the next turn is a new session continuing the same
+    /// conversation.
+    ///
+    /// **Stopping a conversation with no session is answered rather than
+    /// refused**, which is [`Threads::interrupt`]'s reading of an absent turn
+    /// applied to an absent process: the developer asked for no agent to be
+    /// running and there is none. It answers with the log position, because
+    /// nothing was committed — the same shape [`Shell::respond_to_approval`]
+    /// argues, and for the same reason: numbering a change that did not happen
+    /// would let the client drop one that did.
+    ///
+    /// When there *was* one, the receipt is published after the driver has been
+    /// told and answered with. [`Change::SessionStopRequested`] carries the rest
+    /// of that argument, including why the session's own `stopped` follows
+    /// separately rather than being the only event.
+    fn stop_session(&self, thread_id: &str) -> Result<i64, CommandError> {
+        let stopped = self
+            .inner
+            .threads
+            .stop_session(thread_id)
+            .map_err(CommandError::new)?;
+        if !stopped {
+            return Ok(self.inner.sequences.current());
+        }
+
+        self.inner
+            .threads
+            .apply(thread_id, Change::SessionStopRequested)
+            .ok_or_else(|| self.not_open(thread_id))
     }
 
     /// Register a conversation.
@@ -1605,6 +1654,25 @@ struct RevertCheckpointPayload {
     turn_count: u64,
 }
 
+/// `thread.session.stop` — the agent process behind a conversation, ended.
+///
+/// One field, which is the shape of the command: the contract's own is a
+/// `threadId` and the two fields every command carries. Deliberately **not** a
+/// `turnId` — that is what distinguishes this from `thread.turn.interrupt`, where
+/// naming the wrong turn would stop work the developer never saw start. Here
+/// there is nothing for a turn to change: the process goes.
+///
+/// `createdAt` is in the contract and absent here for [`SetRuntimeModePayload`]'s
+/// reason. The event this command publishes carries a `createdAt` of its own, and
+/// it is the moment this server committed rather than the moment the client built
+/// the command — the client's reducer puts it on the session, so a skewed clock
+/// would otherwise decide when a session stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopSessionPayload {
+    thread_id: String,
+}
+
 impl StartTurn {
     fn prepares_a_worktree(&self) -> bool {
         self.bootstrap
@@ -1662,7 +1730,7 @@ impl Command {
     ///
     /// The `type` is taken by hand before the rest is deserialized so that an
     /// unimplemented command names itself in the refusal. The contract carries
-    /// roughly twenty command types and laplus implements twelve, so "which
+    /// roughly twenty command types and laplus implements thirteen, so "which
     /// one" is the most useful thing a message can say during the build-out.
     fn parse(payload: &Value) -> Result<Command, CommandError> {
         let kind = payload
@@ -1917,6 +1985,17 @@ impl Command {
                     thread_id: non_blank(revert.thread_id, "threadId", kind)?,
                     ..revert
                 }))
+            }
+            // A conversation and nothing else. Which conversation is the only
+            // thing this command can carry that could be wrong, so a blank one is
+            // the whole of the payload check — whether the named conversation
+            // exists, and whether anything is running behind it, are the world's
+            // questions and are [`Shell::stop_session`]'s.
+            "thread.session.stop" => {
+                let stop: StopSessionPayload = read_about_a_thread(payload, kind)?;
+                Ok(Command::StopSession {
+                    thread_id: non_blank(stop.thread_id, "threadId", kind)?,
+                })
             }
             unimplemented => Err(CommandError::new(format!(
                 "Command not implemented by this server: {unimplemented}"
@@ -2275,6 +2354,16 @@ mod tests {
                 "commandId": format!("test:interaction-mode:{thread_id}"),
                 "threadId": thread_id,
                 "interactionMode": mode,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+        }
+
+        /// The `thread.session.stop` `stopThreadSession` builds.
+        fn stop_session(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.session.stop",
+                "commandId": format!("test:stop:{thread_id}"),
+                "threadId": thread_id,
                 "createdAt": "2026-07-26T00:23:04.909Z",
             }))
         }
@@ -3329,6 +3418,92 @@ mod tests {
             "{}",
             refusal.message()
         );
+    }
+
+    // -- stopping a session --------------------------------------------------
+    //
+    // Payload validation and the two answers the world can give, which is as far
+    // as this seam reaches: a session needs an agent, and an agent needs a real
+    // binary and a turn. `tests/socket_session_stop.rs` is the rest.
+
+    /// The payload is read before the world is consulted, so a blank
+    /// conversation is refused at the door.
+    ///
+    /// Driven against a fixture that *has* a conversation, which is what makes
+    /// this a statement about the payload: nothing here could have been refused
+    /// for a later reason.
+    #[test]
+    fn a_stop_with_no_conversation_on_it_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        for blank in ["", "  "] {
+            let refusal = fixture
+                .stop_session(blank)
+                .expect_err("a blank thread id names no conversation");
+            assert!(
+                refusal.message().contains("threadId"),
+                "{}",
+                refusal.message()
+            );
+        }
+
+        // A payload with no `threadId` at all is the same refusal reached one step
+        // earlier, and it is the one case with no conversation to name.
+        let refusal = fixture
+            .dispatch(&json!({"type": "thread.session.stop", "commandId": "c"}))
+            .expect_err("a stop has to say what to stop");
+        assert!(
+            refusal.message().contains("malformed"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// A conversation this server has never heard of is refused with a sentence
+    /// naming it.
+    ///
+    /// The one thing about this command that is not a race. Stopping a session
+    /// that is not running is the developer getting what they asked for, but a
+    /// command naming a conversation that does not exist is a client bug, and
+    /// which id it sent is the whole of what would find it.
+    #[test]
+    fn stopping_an_unknown_conversation_is_refused_by_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .stop_session("never-created")
+            .expect_err("there is no such conversation");
+        assert!(
+            refusal.message().contains("never-created"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// A conversation with no agent behind it is answered rather than refused,
+    /// and answering does not invent a session to have stopped.
+    ///
+    /// There is nothing to stop and nothing went wrong — the same reading an
+    /// interrupt takes of a turn that is not running. What it must not do is
+    /// publish a stop: the client folds one onto the session it holds, and a
+    /// conversation whose session is `null` has none to fold it onto, so an event
+    /// here would be describing a process that never existed.
+    #[test]
+    fn stopping_a_conversation_with_no_session_is_answered_and_publishes_nothing() {
+        let fixture = Fixture::with_a_conversation();
+        let before = fixture.snapshot()["snapshot"]["snapshotSequence"].clone();
+
+        let answer = fixture
+            .stop_session("thread-1")
+            .expect("there is nothing to stop, which is not a failure");
+
+        assert_eq!(
+            answer["sequence"], before,
+            "nothing was committed, so the answer is the log position: {answer}"
+        );
+        let thread = fixture.detail("thread-1");
+        assert_eq!(thread["session"], Value::Null, "{thread}");
+        assert_eq!(thread["latestTurn"], Value::Null);
     }
 
     // -- the two renames -----------------------------------------------------

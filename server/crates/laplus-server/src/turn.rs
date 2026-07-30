@@ -139,6 +139,20 @@
 //! registry takes it with no session to route it to, and the driver drops it
 //! with no turn to stop. See [`interrupt`], where the three races are named.
 //!
+//! The other act — ending the session — arrives on the same channel as
+//! [`Signal::Stop`] and is answered by *leaving this loop*. Everything below the
+//! loop is the ending a session is owed, and [`Agent::stop`] at the end of it
+//! closes stdin, waits, and kills if waiting was not enough. That bound is why
+//! it is a signal rather than only the prompt channel closing, which is the
+//! gentler "no more turns" a shutdown and a deleted project use: the case the
+//! stop command exists for is an agent that is not answering, and closing a pipe
+//! at one of those is a hope. Two things follow from the developer having asked,
+//! and both are marked in the ending: the turn it cut short is not reported as
+//! the agent having died, and it gets no checkpoint — for
+//! [`Ending::checkpoint_status`]'s reason, since no checkpoint status means "the
+//! developer ended the session" and both the ones there are would relabel the
+//! turn.
+//!
 //! ## A turn is also a point in time, and this is the only place that knows when
 //!
 //! Ticket 20 asks for a turn to be reviewable as a diff, and a diff needs a
@@ -230,8 +244,8 @@ pub struct Start {
 pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
-    let prompts = threads.attach(&start.thread_id, move |incoming, signals| {
-        tokio::spawn(drive(driving, starting, incoming, signals))
+    let prompts = threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+        tokio::spawn(drive(driving, starting, incoming, signals, epoch))
     });
 
     prompts.try_send(prompt).map_err(|error| match error {
@@ -247,11 +261,16 @@ pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), Stri
 
 /// The session: start an agent, feed it turns and decisions, publish what it
 /// says, reap it.
+///
+/// `epoch` is which of the conversation's sessions this one is, and is given
+/// back on the way out — a driver may outlive its own slot, so it gives up only
+/// the slot it was in. See [`crate::threads::Threads::detach`].
 async fn drive(
     threads: Threads,
     start: Start,
     mut prompts: tokio::sync::mpsc::Receiver<Prompt>,
     mut signals: tokio::sync::mpsc::Receiver<Signal>,
+    epoch: u64,
 ) {
     let mut agent = match open(&start).await {
         Ok(agent) => agent,
@@ -274,7 +293,7 @@ async fn drive(
                     updated_at: now_iso(),
                 }),
             );
-            threads.detach(&start.thread_id);
+            threads.detach(&start.thread_id, epoch);
             return;
         }
     };
@@ -303,8 +322,12 @@ async fn drive(
     // closed channel yields `None` forever and a `select!` arm that kept polling
     // one would spin.
     let mut listening = true;
+    // True once the developer has ended the session. Read at the bottom of this
+    // function, where the difference it makes is that a turn cut short by *this*
+    // is not reported as the agent having died: they asked.
+    let mut asked_to_stop = false;
 
-    loop {
+    'session: loop {
         // Anything already owed to the turn that just ended is dealt with before
         // the next one is started.
         //
@@ -331,6 +354,15 @@ async fn drive(
                 }
                 Signal::Interrupt { turn_id } => {
                     interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await
+                }
+                // Taken here as well as in the `select!` below, and it belongs
+                // here most: the drain exists so that what was owed to the turn
+                // that just ended is dealt with before the next one starts, and
+                // a stop the developer pressed a moment ago must not be spent on
+                // a turn they never saw begin.
+                Signal::Stop => {
+                    asked_to_stop = true;
+                    break 'session;
                 }
             }
         }
@@ -430,6 +462,17 @@ async fn drive(
             Next::Signal(Some(Signal::Interrupt { turn_id })) => {
                 interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await;
             }
+            // The session is over. Left by leaving the loop rather than by
+            // closing the agent's input and draining, which is what the *channel
+            // closing* means below: everything this function does after the loop
+            // is the ending a session is owed, and `Agent::stop` at the end of it
+            // closes stdin, waits, and kills if waiting was not enough. A drain
+            // would be a gentler ending with no bound on it, and the case this
+            // command exists for is an agent that is not answering.
+            Next::Signal(Some(Signal::Stop)) => {
+                asked_to_stop = true;
+                break;
+            }
             Next::Signal(None) => listening = false,
             Next::Prompt(Some(prompt)) => waiting = Some(prompt),
             Next::Prompt(None) => {
@@ -524,10 +567,23 @@ async fn drive(
     // been talking in a dialect this build could not read would otherwise report
     // the death and nothing about the dialect — which is the more likely
     // explanation of the two.
+    //
+    // **Unless the developer ended the session**, which is the one way a turn is
+    // cut short that nobody needs telling about: they asked for the process to go
+    // and it went. Reporting it as a death would put an error on a conversation
+    // whose only fault was being stopped, and would settle the turn as `error`
+    // rather than as the `interrupted` a `stopped` session settles it to — which
+    // is the same reading `interrupted` and `stopped` already share (`CONTEXT.md`,
+    // *Settling*): from the turn's point of view it did not finish, and nothing
+    // went wrong.
+    //
+    // A stop mid-turn therefore takes that turn's unreported drift with it, and
+    // that is the accepted cost rather than an oversight: the tally is reported on
+    // every turn that ends on its own, and inventing a row to carry it out of a
+    // session the developer ended would put a diagnostic about this build in front
+    // of somebody who had just pressed stop.
     let unread = driving.drift_to_report(&folding);
-    let death = driving
-        .turn
-        .is_some()
+    let death = (driving.turn.is_some() && !asked_to_stop)
         .then(|| died_mid_turn(complaint.as_deref(), unread));
 
     // Said in the conversation and not only on the session, because the session
@@ -540,26 +596,43 @@ async fn drive(
         );
     }
 
+    // The slot given up before the ending is published, and **whether the
+    // conversation is still this session's to describe decides whether the ending
+    // is published at all.** A driver can outlive its own session: a developer who
+    // stops one and sends a turn straight afterwards — which is exactly what the
+    // branch toolbar does — has a new session describing this conversation while
+    // this one is still being reaped. Its ending would then settle a turn that had
+    // just started and report a session that had just opened as gone.
+    //
+    // The rows above are said either way, because they are about *this* session's
+    // turn rather than about the conversation's current state: a partial reply
+    // left streaming and a permission request left open are defects whoever is
+    // running now.
+    let ours = threads.detach(&start.thread_id, epoch);
+
     let failure = refused.or(death);
-    threads.apply(
-        &start.thread_id,
-        Change::Session(Session {
-            // **`error` rather than `stopped` for a turn cut short**, and ticket
-            // 15 settled it deliberately — see ADR-0004. `stopped` is available
-            // and would settle the turn as `interrupted`; it is not used, because
-            // nobody asked for this and because `lastError` below — the only
-            // place the developer is told the agent went away mid-turn — is the
-            // sentence a session that is not in `error` has nowhere to put.
-            status: match failure.is_some() {
-                true => SessionStatus::Error,
-                false => SessionStatus::Stopped,
-            },
-            runtime_mode: start.runtime_mode.clone(),
-            active_turn_id: None,
-            last_error: failure,
-            updated_at: now_iso(),
-        }),
-    );
+    if ours {
+        threads.apply(
+            &start.thread_id,
+            Change::Session(Session {
+                // **`error` rather than `stopped` for a turn cut short**, and
+                // ticket 15 settled it deliberately — see ADR-0004. `stopped` is
+                // available and would settle the turn as `interrupted`; it is not
+                // used, because nobody asked for this and because `lastError`
+                // below — the only place the developer is told the agent went away
+                // mid-turn — is the sentence a session that is not in `error` has
+                // nowhere to put.
+                status: match failure.is_some() {
+                    true => SessionStatus::Error,
+                    false => SessionStatus::Stopped,
+                },
+                runtime_mode: start.runtime_mode.clone(),
+                active_turn_id: None,
+                last_error: failure,
+                updated_at: now_iso(),
+            }),
+        );
+    }
 
     // A turn the agent died in the middle of still changed the working tree, and
     // the developer's first question about a session that fell over is what it
@@ -571,7 +644,24 @@ async fn drive(
     // ADR-0004 settles a turn cut short by a dead agent as an error rather than
     // an interruption, and a checkpoint saying anything else would move the turn
     // back — see [`Ending::checkpoint_status`].
-    if let Some(active) = driving.turn.take() {
+    //
+    // **A session the developer ended gets no row**, and that is the same rule
+    // rather than an exception to it: there is no checkpoint status that means "the
+    // developer ended the session", so every one this could send would relabel the
+    // turn the moment the client folded it — `error` says the turn failed, and it
+    // did not. What the turn had already done to the tree falls into the diff of
+    // the turn that follows, which is what a model built on photographs does with
+    // an unattributed change (ADR-0008).
+    //
+    // Nor does a session the conversation has already replaced, for the reason the
+    // ending above is conditional: the client reads a checkpoint's status back
+    // into the *latest* turn, so a row for a turn two sessions ago would relabel
+    // the turn running now.
+    if let Some(active) = driving
+        .turn
+        .take()
+        .filter(|_| ours && !asked_to_stop)
+    {
         checkpoint(
             &threads,
             &start,
@@ -582,8 +672,6 @@ async fn drive(
         )
         .await;
     }
-
-    threads.detach(&start.thread_id);
 }
 
 /// Record what the working tree looks like before this conversation's next turn
