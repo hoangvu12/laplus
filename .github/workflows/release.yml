@@ -439,7 +439,10 @@ jobs:
       - name: Check the Linux binaries are static
         if: contains(matrix.target, 'musl')
         run: |
-          binary=server/target/${{ matrix.target }}/release/laplus-server
+          # Relative to `server/`, which this job's `defaults` already put us
+          # in — unlike the upload step below, where the path is the action's
+          # and therefore the workspace's.
+          binary=target/${{ matrix.target }}/release/laplus-server
           file "$binary"
           if ldd "$binary" 2>&1 | grep -qv "not a dynamic executable"; then
             echo "$binary is dynamically linked; musl was supposed to make it static." >&2
