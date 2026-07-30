@@ -15,10 +15,19 @@
 //!
 //! [`Agent::send`] is a turn. [`Agent::answer`] is a permission decision, and it
 //! is different in kind rather than in content: the agent has *stopped* until it
-//! arrives. [`Agent::interrupt`] is the third and the only one that is a
-//! *request* — it carries an id and the CLI answers it. All three are one line
-//! and all three are flushed, and the reason for flushing is the same in every
-//! case and merely more urgent in the last two.
+//! arrives. The third kind is a **request**: it carries an id and the CLI answers
+//! it on stdout, and there are four — [`Agent::interrupt`],
+//! [`Agent::measure_context`], [`Agent::set_permission_mode`] and
+//! [`Agent::set_model`]. Every one is one line and every one is flushed, and the
+//! reason for flushing is the same in each case and merely more urgent in the
+//! ones something is waiting on.
+//!
+//! The last two are the only lines here that change what the child *is* rather
+//! than what it is doing. They exist because `--permission-mode` and `--model`
+//! are read once, at launch, so a developer who changed either mid-conversation
+//! was answered by a process still running under the old one — ticket 11 of
+//! `thread-lifecycle`. The alternative was replacing the session, which costs a
+//! fresh `init` and the CLI's warm context window; a push costs a line.
 //!
 //! What makes an answer possible at all is [`PERMISSION_PROMPT_TOOL`], which is
 //! passed on every session and tells the CLI to ask this stdio pair rather than
@@ -164,6 +173,29 @@ pub fn permission_mode_for(runtime_mode: &str) -> Option<&'static str> {
         "full-access" => Some("bypassPermissions"),
         _ => None,
     }
+}
+
+/// The CLI's permission mode for a thread's runtime mode, as a *push* to a
+/// running child.
+///
+/// The same question as [`permission_mode_for`] asked at a different moment, and
+/// the answers differ in exactly one place — which is why these are two functions
+/// rather than one. A launch expresses `approval-required` by omitting the flag;
+/// a push has no such option, because there is no request that means "go back to
+/// whatever you would have done". So this translation is **total**, and
+/// `approval-required` becomes the CLI's `default`, whose behaviour is to ask.
+/// That is also upstream's convention for the no-flag case (`?? "default"` in
+/// `ClaudeAdapter.ts`) rather than an invention here.
+///
+/// The launch table is deliberately left lossy. Passing `--permission-mode
+/// default` for `approval-required` would be a different change and a wrong one:
+/// it would override a developer's own configured default with the CLI's.
+///
+/// A mode this build does not know falls to `default` for the same reason,
+/// though nothing can reach it — the contract's closed set is checked in
+/// [`crate::orchestration`] before a mode is written to a thread.
+pub fn pushed_permission_mode_for(runtime_mode: &str) -> &'static str {
+    permission_mode_for(runtime_mode).unwrap_or("default")
 }
 
 /// A running `claude`, and the two ends of its conversation.
@@ -350,6 +382,37 @@ impl Agent {
     ///
     /// Flushed rather than left to the buffer, because the agent is waiting for
     /// it and a line that sat in a write buffer would look exactly like a hang.
+    /// Move this agent to another permission mode without replacing it.
+    ///
+    /// The third question this server asks, and the first that changes what the
+    /// child *does* rather than reporting on it: `--permission-mode` is read once
+    /// at launch, so before this a mode the developer changed mid-conversation
+    /// reached the picker, the database and the next turn's request and never
+    /// reached the process serving them.
+    ///
+    /// Nothing is waited for, as with the other two. The CLI answers on stdout
+    /// with a `control_response` naming this id, and the caller keys the outcome
+    /// off that — a refusal has to be reported, because a mode that did not land
+    /// is a session running under rules the developer thinks they changed.
+    pub async fn set_permission_mode(
+        &mut self,
+        request_id: &str,
+        mode: &str,
+    ) -> std::io::Result<()> {
+        self.write_line(crate::protocol::set_permission_mode_line(request_id, mode))
+            .await
+    }
+
+    /// Move this agent to another model without replacing it.
+    ///
+    /// [`Agent::set_permission_mode`]'s twin, down to the reason it exists: the
+    /// model is a launch flag too, and a developer who switched model
+    /// mid-conversation was answered by the one they started with.
+    pub async fn set_model(&mut self, request_id: &str, model: &str) -> std::io::Result<()> {
+        self.write_line(crate::protocol::set_model_line(request_id, model))
+            .await
+    }
+
     async fn write_line(&mut self, mut line: String) -> std::io::Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(
@@ -469,6 +532,41 @@ mod tests {
              CLI's own default is to ask, and asking is what the mode means"
         );
         assert_eq!(permission_mode_for("something-later"), None);
+    }
+
+    /// The same table asked as a *push*, where the omission cannot stand: there
+    /// is no request that means "pass no flag", so `approval-required` has to
+    /// name a mode, and the mode whose behaviour is to ask is `default`.
+    ///
+    /// Pinned beside the launch table rather than instead of it, because the one
+    /// thing that would quietly break ticket 11 is the two being made to agree —
+    /// a launch that started passing `--permission-mode default` would override
+    /// a developer's own configured default with the CLI's.
+    #[test]
+    fn a_pushed_mode_is_total_where_the_launch_table_is_lossy() {
+        assert_eq!(pushed_permission_mode_for("auto-accept-edits"), "acceptEdits");
+        assert_eq!(pushed_permission_mode_for("auto"), "auto");
+        assert_eq!(pushed_permission_mode_for("full-access"), "bypassPermissions");
+        assert_eq!(
+            pushed_permission_mode_for("approval-required"),
+            "default",
+            "the one runtime mode with no launch flag still has to be sayable"
+        );
+        assert_eq!(
+            pushed_permission_mode_for("something-later"),
+            "default",
+            "unreachable — the contract's closed set is checked first — and the \
+             safe answer if it ever is reached, because default asks"
+        );
+        // The four the CLI named when it refused one, from
+        // `fixtures/claude-cli/21-modes-refused.ndjson`: every mode this table
+        // can produce is one the CLI will take.
+        for mode in ["acceptEdits", "auto", "bypassPermissions", "default"] {
+            assert!(
+                "acceptEdits, auto, bypassPermissions, default, dontAsk, plan".contains(mode),
+                "{mode} is not one the CLI accepts"
+            );
+        }
     }
 
     /// A binary that is not there fails at the spawn rather than hanging or

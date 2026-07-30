@@ -602,3 +602,252 @@ async fn a_mode_set_with_nothing_running_does_not_conjure_a_session() {
 
     server.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Ticket 11: the change reaching the process
+// ---------------------------------------------------------------------------
+//
+// Everything above this line is about the *conversation* holding a mode. What
+// follows is about the `claude` already serving it, which the tests above could
+// not have caught: a mode moved the picker, survived a restart and reached the
+// next turn's request, and the agent went on working under the mode the
+// conversation opened with because `--permission-mode` is read once, at launch.
+//
+// The push these drive is recorded in
+// `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson`, against a real
+// `claude` 2.1.220: a mode tightened between two turns, and the second turn
+// asking permission where the first had not.
+
+/// A plain reply, for a turn whose content is beside the point.
+const REPLY: &str =
+    r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
+const ENDED: &str = r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","duration_ms":10,"total_cost_usd":0.01}"#;
+
+/// The `user` line `claude` writes itself when a `set_model` push lands.
+///
+/// The one trap this mechanism ships with, recorded verbatim in
+/// `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson`: it is marked
+/// `isReplay`, and its `content` is a bare string where every other user line
+/// carries a list of blocks.
+const NARRATED: &str = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to claude-haiku-4-5 (claude-haiku-4-5-20251001)</local-command-stdout>"},"session_id":"s","parent_tool_use_id":null,"uuid":"u","timestamp":"2026-07-30T19:45:11.527Z","isReplay":true}"#;
+
+/// A follow-up carrying the composer's model picker, which is the *other* door a
+/// mode or model comes through — the per-turn override, which has had this same
+/// hole for longer than the picker's own command has.
+fn follow_up_choosing(thread_id: &str, message_id: &str, model: &str) -> Value {
+    json!({
+        "type": "thread.turn.start",
+        "commandId": format!("test:turn:{message_id}"),
+        "threadId": thread_id,
+        "message": {
+            "messageId": message_id,
+            "role": "user",
+            "text": "again",
+            "attachments": [],
+        },
+        "modelSelection": {"instanceId": "claudeAgent", "model": model},
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
+/// Every `set_permission_mode` and `set_model` the agent was written, in order.
+///
+/// Read off the stand-in rather than out of an event, because the point is what
+/// reached the *process*: a server that published the change and told the child
+/// nothing would pass every other assertion in this file.
+fn pushes(agent: &ScriptedAgent) -> Vec<Value> {
+    agent
+        .requests()
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["request"]["subtype"] != "get_context_usage")
+        .collect()
+}
+
+/// The ticket's first four acceptance criteria in one conversation: a mode
+/// tightened between turns is *pushed* to the child that is already serving the
+/// conversation, as the CLI's `default` rather than as no push at all, and only
+/// when it has actually changed.
+///
+/// Three turns rather than two, and the third is the guard: it runs under the
+/// same mode as the second, so a server pushing on every dispatch would send two
+/// and this would say so.
+#[tokio::test]
+async fn a_tightened_mode_is_pushed_to_the_agent_already_serving_the_conversation() {
+    let agent = ScriptedAgent::per_turn(&[[REPLY, ENDED], [REPLY, ENDED], [REPLY, ENDED]]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "first"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    assert!(
+        pushes(&agent).is_empty(),
+        "the opening turn's mode is a launch flag, so there was nothing to push: {:?}",
+        pushes(&agent)
+    );
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            set_runtime_mode("thread-1", "approval-required"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up_taking_the_threads_word("thread-1", "message-2"),
+        )
+        .await
+        .expect_success();
+    let second = client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        pushes(&agent),
+        vec![json!({
+            "type": "control_request",
+            "request_id": "retune-1",
+            "request": {"subtype": "set_permission_mode", "mode": "default"},
+        })],
+        "`approval-required` has to be pushed as the CLI's `default`, which is \
+         the mode whose behaviour is to ask — not as the nothing the launch \
+         table maps it to"
+    );
+
+    // Every session event for this turn agrees. Before ticket 11 the `starting`
+    // one came from the thread and the `running` one from the driver's capture,
+    // so one turn announced two modes and the badge flipped and flipped back.
+    let announced: Vec<(&str, &Value)> = second
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.session-set")
+        .map(|event| {
+            (
+                event["payload"]["session"]["status"].as_str().unwrap_or("?"),
+                &event["payload"]["session"]["runtimeMode"],
+            )
+        })
+        .collect();
+    assert!(
+        announced.iter().any(|(status, _)| *status == "starting")
+            && announced.iter().any(|(status, _)| *status == "running"),
+        "the turn did not announce itself: {announced:?}"
+    );
+    for (status, mode) in &announced {
+        assert_eq!(
+            *mode, "approval-required",
+            "the {status} session reports a mode the agent is not running under: {announced:?}"
+        );
+    }
+
+    // A third turn under the same mode, which is what says the guard is real.
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up_taking_the_threads_word("thread-1", "message-3"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        pushes(&agent).len(),
+        1,
+        "a turn whose mode had not moved sent a request anyway: {:?}",
+        pushes(&agent)
+    );
+    // And the session was never replaced to achieve any of it — one process took
+    // all three turns, which is the whole reason a push beats a restart.
+    assert_eq!(agent.starts(), 1);
+    assert_eq!(server.live_agents(), 1);
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// The model's half of the same defect, through the per-turn override rather
+/// than a picker command: a developer who switches model mid-conversation is
+/// answered by the model they picked, and the session is not replaced to manage
+/// it.
+///
+/// The CLI's own narration of the change is replayed here, because it is the one
+/// trap this mechanism ships with: `set_model` makes `claude` write itself a
+/// `user` line, and this server folded every user line into the transcript. The
+/// assertion is that the developer's conversation does not grow a turn they
+/// never typed.
+#[tokio::test]
+async fn a_model_changed_mid_conversation_reaches_the_agent_without_adding_a_turn() {
+    let agent = ScriptedAgent::per_turn(&[
+        vec![REPLY, ENDED],
+        vec![NARRATED, REPLY, ENDED],
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "first"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up_choosing("thread-1", "message-2", "claude-haiku-4-5"),
+        )
+        .await
+        .expect_success();
+    let turn = client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        pushes(&agent),
+        vec![json!({
+            "type": "control_request",
+            "request_id": "retune-1",
+            "request": {"subtype": "set_model", "model": "claude-haiku-4-5"},
+        })],
+        "the slug the thread holds is what the push carries — the CLI resolves \
+         it itself — and the mode has not moved, so nothing else is sent"
+    );
+    assert_eq!(agent.starts(), 1, "the session was replaced to change a model");
+
+    let said: Vec<&str> = turn
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.message-sent")
+        .filter_map(|event| event["payload"]["message"]["text"].as_str())
+        .collect();
+    assert!(
+        !said.iter().any(|text| text.contains("local-command-stdout")),
+        "the CLI's narration of the model change became a message: {said:?}"
+    );
+
+    // Nor did it register as a format this build cannot read, which is what a
+    // line that failed to parse would have been counted as.
+    let completed = turn
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .rfind(|activity| activity["kind"] == "turn.completed")
+        .expect("the turn ended");
+    assert_eq!(completed["payload"]["parseErrors"], 0, "{completed}");
+    assert_eq!(completed["payload"]["unknownEvents"], 0, "{completed}");
+
+    client.close().await;
+    server.stop().await;
+}

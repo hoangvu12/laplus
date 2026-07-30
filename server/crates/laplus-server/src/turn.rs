@@ -208,6 +208,34 @@
 //! deliberately *kept* — starting a fresh session under a thread whose history
 //! the agent has forgotten would leave the developer talking to something that
 //! cannot see the transcript in front of them.
+//!
+//! ## The child is moved rather than replaced when the conversation changes
+//!
+//! `--permission-mode` and `--model` are launch flags, and one child serves a
+//! whole conversation — so for as long as those were the only places the values
+//! reached the agent, a developer who changed either mid-conversation was
+//! answered by a process still running under the old one. The picker moved, the
+//! change survived a restart, the next turn was *requested* under it, and nothing
+//! the agent did was any different.
+//!
+//! [`retune`] closes that, and the shape is worth stating because three
+//! properties fall out of it rather than being enforced anywhere:
+//!
+//! - **The moment is the next turn's dispatch**, not the moment the picker's
+//!   command commits. So a change made while a turn is running does not move the
+//!   rules under it, which is what ticket 02 and the spec's story 29 asked for.
+//! - **The comparison is against [`Start`]**, which is this driver's account of
+//!   what the child in front of it is running under rather than of what the
+//!   thread last said. That is what makes "no push when nothing changed" true,
+//!   and it is why a successful push has to move `Start` — every session event
+//!   this file publishes reads it.
+//! - **A refusal is a `control_response`**, arriving later like everything else
+//!   the agent says, so putting `Start` back is a thing [`decide`] asks for and
+//!   the loop spends.
+//!
+//! Ticket 11 of `.scratch/thread-lifecycle/`, and
+//! `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson` is a real
+//! `claude` being moved between two turns.
 
 use std::collections::HashMap;
 
@@ -234,7 +262,16 @@ pub struct Start {
     /// The project's folder. The agent's working directory, which is what makes
     /// a relative path in the transcript mean what the developer thinks.
     pub workspace_root: String,
+    /// The model the child is running under — the launch flag at first, and then
+    /// whatever a successful push has moved it to. See [`retune`].
     pub model: Option<String>,
+    /// The runtime mode the child is running under, on the same terms as
+    /// [`Start::model`].
+    ///
+    /// **Every session event the driver publishes reads this**, which is why a
+    /// push that succeeds has to move it and a push that is refused has to leave
+    /// it alone: the badge beside the session state is a claim about what the
+    /// agent is doing, not about what was asked of it.
     pub runtime_mode: String,
     /// The `claude` session to continue, when the thread already has one. See
     /// this module's documentation: it is the whole of how a conversation
@@ -259,6 +296,24 @@ pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), Stri
         tokio::spawn(drive(driving, starting, incoming, signals, epoch))
     });
 
+    // What this turn wants the agent to be, sent *before* the turn itself and on
+    // the channel that overtakes it. A session started a line above is already
+    // launched with these, and the driver's guard makes that the no-op it should
+    // be; what this is for is every turn after the first, where the launch flags
+    // are the only place these values had ever reached the child.
+    //
+    // Ahead of the prompt in the queue rather than merely on a faster channel:
+    // the driver takes a prompt into a holding slot and dispatches it on the next
+    // pass round its loop, and the signal drain at the top of that loop is what
+    // guarantees the mode moves before the turn is written rather than after.
+    threads.retune(
+        &start.thread_id,
+        crate::threads::Retune {
+            runtime_mode: start.runtime_mode.clone(),
+            model: start.model.clone(),
+        },
+    )?;
+
     prompts.try_send(prompt).map_err(|error| match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
             "The agent has not read the turns already sent to it, so this one was not queued."
@@ -278,7 +333,7 @@ pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), Stri
 /// the slot it was in. See [`crate::threads::Threads::detach`].
 async fn drive(
     threads: Threads,
-    start: Start,
+    mut start: Start,
     mut prompts: tokio::sync::mpsc::Receiver<Prompt>,
     mut signals: tokio::sync::mpsc::Receiver<Signal>,
     epoch: u64,
@@ -315,6 +370,9 @@ async fn drive(
         outstanding: HashMap::new(),
         interrupts: 0,
         measurements: 0,
+        retunes: 0,
+        wanted: None,
+        pushed: HashMap::new(),
         unmeasured: false,
         drift_reported: Drift::default(),
         finished: None,
@@ -366,6 +424,12 @@ async fn drive(
                 Signal::Interrupt { turn_id } => {
                     interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await
                 }
+                // Recorded rather than acted on, and that is the whole of how
+                // ticket 02's rule survives this one: the mode a turn asks for
+                // reaches the agent when *that turn* is dispatched, so a change
+                // the developer made while another turn was running does not move
+                // the rules under it. Held here; spent below.
+                Signal::Retune(wanted) => driving.wanted = Some(wanted),
                 // Taken here as well as in the `select!` below, and it belongs
                 // here most: the drain exists so that what was owed to the turn
                 // that just ended is dealt with before the next one starts, and
@@ -381,6 +445,14 @@ async fn drive(
         // Whatever is waiting goes next, as soon as the turn before it is done.
         if accepting && driving.turn.is_none() {
             if let Some(prompt) = waiting.take() {
+                // Before anything this turn publishes and before the turn itself
+                // reaches the agent, which is what makes the mode this turn is
+                // *requested* under the mode it is *answered* under. It moves
+                // `start`, so the three session events below — `starting` from
+                // the thread, `running` from here, and whatever ends the turn —
+                // all report the same thing.
+                retune(&threads, &mut start, &mut agent, &mut driving).await;
+
                 // The turn is under way, and *this* is where the session enters
                 // `running` — not the agent's `init` line, which a long-lived
                 // child prints once for the whole conversation. Driving it off
@@ -448,8 +520,24 @@ async fn drive(
                 // Decided and then applied, rather than applied as it is decided.
                 // What the split is for is [`Decided`]; what it costs here is one
                 // more local.
-                let decided = decide(&mut folding, &mut driving, &line);
+                let mut decided = decide(&mut folding, &mut driving, &line);
+                // Taken before the changes are spent and applied after them, so
+                // the developer reads the refusal and *then* the badge corrects
+                // itself, rather than the badge flipping back with nothing
+                // beside it saying why.
+                let reverts = decided.reverts.take();
                 spend(&threads, &start, decided);
+                if let Some(refused) = reverts {
+                    refused.revert(&mut start);
+                    // Republished because the mode this turn was announced under
+                    // is now known to be wrong, and the session is where the
+                    // client reads it. Only while a turn is running: between
+                    // turns there is no session event to correct, and the next
+                    // one will carry the reverted value anyway.
+                    if let Some(active) = driving.turn.as_ref().map(|turn| turn.turn_id.clone()) {
+                        running(&threads, &start, &active);
+                    }
+                }
                 // Asked before the checkpoint below, which is a `git add -A`
                 // over the whole project: the meter is what the developer is
                 // looking at and the question costs one line on stdin, so it
@@ -477,6 +565,8 @@ async fn drive(
             Next::Signal(Some(Signal::Interrupt { turn_id })) => {
                 interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await;
             }
+            // Held, not spent. See the drain at the top of the loop.
+            Next::Signal(Some(Signal::Retune(wanted))) => driving.wanted = Some(wanted),
             // The session is over. Left by leaving the loop rather than by
             // closing the agent's input and draining, which is what the *channel
             // closing* means below: everything this function does after the loop
@@ -883,6 +973,23 @@ struct Driving {
     /// How many times this session has asked the agent how full its window is,
     /// so the next request gets an id nothing else has used.
     measurements: u32,
+    /// How many mode and model pushes this session has sent, on the same terms.
+    retunes: u32,
+    /// What the next turn dispatched wants the agent to be running under, as the
+    /// thread said when that turn was sent.
+    ///
+    /// Held rather than acted on the moment it arrives, which is what keeps a
+    /// mode change off the turn already in flight — ticket 02's rule, and the
+    /// spec's story 29. The latest one wins: a developer who moved the picker
+    /// twice while a turn ran meant the second.
+    wanted: Option<crate::threads::Retune>,
+    /// Pushes written to the agent and not yet answered, by the id this server
+    /// minted.
+    ///
+    /// The answer is the only thing that says a push landed, and a refusal has to
+    /// put [`Start`] back — so what it was before travels here rather than being
+    /// re-derived from a thread that has since moved on. See [`Pushed`].
+    pushed: HashMap<String, Pushed>,
     /// A moment has arrived that only the agent can settle, and the loop has not
     /// asked it yet.
     ///
@@ -946,6 +1053,16 @@ impl Driving {
     fn next_measurement_id(&mut self) -> String {
         self.measurements += 1;
         format!("context-{}", self.measurements)
+    }
+
+    /// The id for the next mode or model push.
+    ///
+    /// One counter for both, because they are one kind of request as far as the
+    /// answer is concerned: the id is what says *which* push a refusal is about,
+    /// and [`Pushed`] carries which kind it was.
+    fn next_retune_id(&mut self) -> String {
+        self.retunes += 1;
+        format!("retune-{}", self.retunes)
     }
 
     /// What has gone unread since the last time anybody was told, and a note
@@ -1259,6 +1376,143 @@ async fn measure(agent: &mut Agent, driving: &mut Driving) {
     }
 }
 
+/// Move the child onto the mode and model this turn asks for, before it is given
+/// the turn.
+///
+/// The whole of ticket 11. `--permission-mode` and `--model` are read once, when
+/// the process is opened, and one process serves a whole conversation — so
+/// before this a developer who tightened `full-access` to `approval-required`
+/// saw the picker move, saw it survive a restart, saw the next turn *requested*
+/// under the new mode, and was answered by an agent still bypassing permissions.
+///
+/// Four rules, and each of them is an acceptance criterion:
+///
+/// - **Nothing is sent for a value that has not moved.** The comparison is
+///   against [`Start`], which is what the child is running under rather than what
+///   the thread last said — so a conversation whose mode never changes never
+///   sends one of these, and upstream's guard-on-change is followed rather than
+///   re-derived.
+/// - **The capture moves only when the write did.** `start` is what every session
+///   event reads, so setting it before the line was written would publish a claim
+///   about a child nobody had managed to tell.
+/// - **The refusal is left to the acknowledgement.** The CLI answers on stdout,
+///   and a mode it will not take comes back as a `control_response` naming this
+///   id — see [`decide`]'s `Acknowledged` arm, which puts `start` back and says
+///   so in the conversation. What is reported *here* is the narrower failure of
+///   the child no longer reading at all.
+/// - **A model is pushed only when there is one to push.** A selection that names
+///   none cannot be expressed as a request — there is nothing that means "go back
+///   to your default" — so the child keeps what it has, and `start` keeps saying
+///   so.
+async fn retune(threads: &Threads, start: &mut Start, agent: &mut Agent, driving: &mut Driving) {
+    let Some(wanted) = driving.wanted.take() else {
+        return;
+    };
+
+    if wanted.runtime_mode != start.runtime_mode {
+        let request_id = driving.next_retune_id();
+        let mode = crate::agent::pushed_permission_mode_for(&wanted.runtime_mode);
+        match agent.set_permission_mode(&request_id, mode).await {
+            Ok(()) => {
+                driving.pushed.insert(
+                    request_id,
+                    Pushed::Mode {
+                        previous: std::mem::replace(
+                            &mut start.runtime_mode,
+                            wanted.runtime_mode.clone(),
+                        ),
+                        asked: wanted.runtime_mode.clone(),
+                    },
+                );
+            }
+            Err(error) => unreachable_agent(threads, start, "runtime mode", &error),
+        }
+    }
+
+    if let Some(model) = wanted.model.filter(|model| Some(model) != start.model.as_ref()) {
+        let request_id = driving.next_retune_id();
+        match agent.set_model(&request_id, &model).await {
+            Ok(()) => {
+                driving.pushed.insert(
+                    request_id,
+                    Pushed::Model {
+                        previous: start.model.replace(model.clone()),
+                        asked: model,
+                    },
+                );
+            }
+            Err(error) => unreachable_agent(threads, start, "model", &error),
+        }
+    }
+}
+
+/// The agent stopped reading before it could be told what this turn wants.
+///
+/// Reported rather than swallowed, unlike [`measure`]'s failure and for the
+/// reason a failed interrupt is: the developer changed something and was shown
+/// the change, so a change that reached nothing has to be said. The turn goes on
+/// regardless — refusing to send it would leave a conversation with a message in
+/// it and nothing running, which is worse than a turn answered under the old
+/// rules with a row saying so.
+fn unreachable_agent(threads: &Threads, start: &Start, what: &str, error: &std::io::Error) {
+    eprintln!("laplus: cannot tell the agent its {what}: {error}");
+    threads.apply(
+        &start.thread_id,
+        Change::Activity(Activity::failed(
+            "session.retune-failed",
+            &format!(
+                "The agent could not be told which {what} this turn wants, because it is no \
+                 longer reading: {error}"
+            ),
+        )),
+    );
+}
+
+/// One thing this server asked a running child to become, and what it was before.
+///
+/// Held from the moment the line is written until the CLI answers it, because
+/// the answer is the only thing that says whether it landed — and a refusal has
+/// to put [`Start`] back to the value the child is really running under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pushed {
+    Mode { previous: String, asked: String },
+    Model { previous: Option<String>, asked: String },
+}
+
+impl Pushed {
+    /// What the developer is told, when the CLI would not take it.
+    ///
+    /// Names what was refused, in this server's own vocabulary rather than the
+    /// CLI's: the developer picked `approval-required` in a menu and has never
+    /// seen the word `default`.
+    fn sentence(&self, why: &str) -> String {
+        match self {
+            Pushed::Mode { asked, previous } => format!(
+                "The agent would not change to the '{asked}' runtime mode and is still running \
+                 under '{previous}': {why}"
+            ),
+            Pushed::Model { asked, previous } => match previous {
+                Some(previous) => format!(
+                    "The agent would not change to the '{asked}' model and is still running \
+                     '{previous}': {why}"
+                ),
+                None => format!(
+                    "The agent would not change to the '{asked}' model and is still running the \
+                     one it started with: {why}"
+                ),
+            },
+        }
+    }
+
+    /// Put the driver's capture back to what the child is really running under.
+    fn revert(self, start: &mut Start) {
+        match self {
+            Pushed::Mode { previous, .. } => start.runtime_mode = previous,
+            Pushed::Model { previous, .. } => start.model = previous,
+        }
+    }
+}
+
 /// Say in the conversation that the developer stopped this turn.
 ///
 /// Two changes rather than one, because they are read by different parts of the
@@ -1546,6 +1800,15 @@ struct Decided {
     agent_session: Option<String>,
     /// The turn ended, and how. `None` on every line that is not a `result`.
     settles: Option<Settles>,
+    /// A push the CLI refused, and what the driver's capture of the session has
+    /// to go back to.
+    ///
+    /// A fourth field for the same reason the two above are not changes: putting
+    /// [`Start`] back is not something a conversation can be told, and the
+    /// re-publish that follows it needs a value this function does not hold. So
+    /// the refusal's *row* travels in `changes` and the correction travels here,
+    /// and the loop spends both — see `docs/adr/0027`.
+    reverts: Option<Pushed>,
 }
 
 /// The end of a turn, as the line that ended it reports it.
@@ -1600,6 +1863,28 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
         decided
             .changes
             .push(Change::Activity(context_window_row(&usage, turn_id)));
+    }
+
+    // The answer to a mode or model push, taken before anything below can borrow
+    // the turn — and taken whether or not one is running, which is the difference
+    // between this and the interrupt acknowledgement it shares an envelope with.
+    // A push is about the *session*, so its answer means the same thing between
+    // turns as during one.
+    //
+    // Silence is success: the CLI answers `{"subtype": "success"}` and there is
+    // nothing to do about a change that landed, because `retune` moved the
+    // capture when it wrote the line. Only a refusal has work in it.
+    if let Folded::Acknowledged(answer) = &folded {
+        if let Some(asked) = driving.pushed.remove(&answer.request_id) {
+            if let Some(why) = answer.refusal() {
+                decided.changes.push(Change::Activity(Activity::failed(
+                    "session.retune-refused",
+                    &asked.sentence(&why),
+                )));
+                decided.reverts = Some(asked);
+            }
+            return decided;
+        }
     }
 
     let turn = &mut driving.turn;
@@ -2184,6 +2469,26 @@ mod tests {
         state
     }
 
+    /// A driver's capture of what its child is running under. Only the two
+    /// fields a push can move are interesting here; the rest are what the tests
+    /// that need a real session build.
+    fn a_start() -> Start {
+        Start {
+            thread_id: "thread-1".to_string(),
+            workspace_root: ".".to_string(),
+            model: None,
+            runtime_mode: "full-access".to_string(),
+            resume: None,
+            settings: ClaudeSettings {
+                enabled: true,
+                binary_path: "claude".to_string(),
+                home_path: String::new(),
+                launch_args: String::new(),
+                custom_models: Vec::new(),
+            },
+        }
+    }
+
     /// A turn in flight, however it is going.
     fn in_flight(stopped: Option<&str>) -> InFlight {
         InFlight {
@@ -2216,6 +2521,9 @@ mod tests {
             outstanding: HashMap::new(),
             interrupts: 0,
             measurements: 0,
+            retunes: 0,
+            wanted: None,
+            pushed: HashMap::new(),
             unmeasured: false,
             drift_reported: Drift::default(),
             finished: None,
@@ -2553,6 +2861,143 @@ mod tests {
             driving.turn.as_ref().is_some_and(InFlight::was_stopped),
             "the stop this turn is actually waiting on still stands"
         );
+    }
+
+    // -- a push the agent would not take ---------------------------------------
+    //
+    // Ticket 11. The push itself needs a live child and lives in
+    // `tests/socket_thread_modes.rs`; what is decidable here is what the *answer*
+    // means, which is the half that has to put the driver's capture back.
+
+    /// A mode the CLI refused. Two things are owed and neither is optional: a
+    /// sentence naming what was refused, and the correction that stops the
+    /// session claiming a mode it is not running under.
+    #[test]
+    fn a_refused_mode_push_is_reported_and_the_capture_goes_back() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+        driving.pushed.insert(
+            "retune-1".to_string(),
+            Pushed::Mode {
+                previous: "full-access".to_string(),
+                asked: "approval-required".to_string(),
+            },
+        );
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"retune-1","error":"Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"}}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["session.retune-refused"]);
+        let row = only_activity(&decided);
+        assert!(
+            row.summary.contains("approval-required") && row.summary.contains("full-access"),
+            "the sentence has to name what was refused and what is still running: {}",
+            row.summary
+        );
+
+        // The correction is the driver's to spend, and it takes the capture back
+        // to what the child is really running under.
+        let mut start = a_start();
+        start.runtime_mode = "approval-required".to_string();
+        decided.reverts.clone().expect("a correction").revert(&mut start);
+        assert_eq!(start.runtime_mode, "full-access");
+    }
+
+    /// A model the CLI refused, which is the reachable half of the two: a runtime
+    /// mode is checked against the contract's closed set before it gets here, and
+    /// a model slug is whatever the picker offered.
+    #[test]
+    fn a_refused_model_push_names_the_model_the_agent_kept() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(None);
+        driving.pushed.insert(
+            "retune-1".to_string(),
+            Pushed::Model {
+                previous: Some("haiku".to_string()),
+                asked: "not-a-model".to_string(),
+            },
+        );
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"retune-1","error":"Model \"not-a-model\" is not a recognized model id. Run /model to see available models."}}"#,
+        );
+
+        // Decided with **no turn in flight**, which is the difference between
+        // this answer and an interrupt's: a push is about the session, so its
+        // refusal means the same thing between turns as during one.
+        let row = only_activity(&decided);
+        assert!(
+            row.summary.contains("not-a-model") && row.summary.contains("haiku"),
+            "{}",
+            row.summary
+        );
+
+        let mut start = a_start();
+        start.model = Some("not-a-model".to_string());
+        decided.reverts.clone().expect("a correction").revert(&mut start);
+        assert_eq!(start.model.as_deref(), Some("haiku"));
+    }
+
+    /// A push that landed says nothing, and that is the point: the capture moved
+    /// when the line was written, so a success has no work in it. A row per
+    /// accepted mode change would be a row on every turn a developer picked a
+    /// mode for.
+    #[test]
+    fn an_accepted_push_publishes_nothing_and_leaves_the_capture_alone() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+        driving.pushed.insert(
+            "retune-1".to_string(),
+            Pushed::Mode {
+                previous: "full-access".to_string(),
+                asked: "approval-required".to_string(),
+            },
+        );
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"retune-1","response":{"mode":"default"}}}"#,
+        );
+
+        assert!(decided.changes.is_empty(), "{:?}", kinds(&decided));
+        assert_eq!(decided.reverts, None);
+        assert!(
+            driving.pushed.is_empty(),
+            "an answered push is no longer outstanding"
+        );
+    }
+
+    /// An interrupt's acknowledgement travels the same envelope, so the two must
+    /// not be confused: a stop the agent refused is about the *turn* and has to
+    /// reach the arm that un-marks it, rather than being read as a push nobody
+    /// sent.
+    #[test]
+    fn an_interrupts_acknowledgement_is_not_taken_for_a_push() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(Some("interrupt-1"))));
+        driving.pushed.insert(
+            "retune-1".to_string(),
+            Pushed::Mode {
+                previous: "full-access".to_string(),
+                asked: "approval-required".to_string(),
+            },
+        );
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
+        );
+
+        assert_eq!(kinds(&decided), vec!["turn.interrupt-failed"]);
+        assert_eq!(decided.reverts, None);
+        assert_eq!(driving.pushed.len(), 1, "the push is still outstanding");
     }
 
     /// The row and the ending, and the ending names the turn it is about. That

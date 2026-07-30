@@ -172,18 +172,20 @@ pub const AWAIT_QUESTION: &str = "<question>";
 ///
 /// **This is the whole of how the double demultiplexes its stdin.** The real CLI
 /// reads the control channel and the turn channel out of one pipe and tells them
-/// apart by parsing; a batch file cannot parse, so it matches one substring —
-/// the subtype of the only request this server sends on its own initiative.
+/// apart by parsing; a batch file cannot parse, so it matches substrings — the
+/// subtypes of the requests this server sends on its own initiative.
 ///
 /// Without it, the question the driver asks when a session announces itself is
 /// read by the turn loop as a *turn*, and every scripted agent answers a prompt
 /// nobody sent. That is not a hypothetical: adding the question broke a third of
 /// the suite until this went in.
 ///
-/// Narrow on purpose. A double that skipped everything it did not recognise
-/// would go on passing when the server started saying something new, which is
-/// the opposite of what a test double in a drift-detecting suite is for.
-const SKIPPED: &str = "get_context_usage";
+/// Narrow on purpose, and a list rather than a pattern for the same reason. A
+/// double that skipped every `control_request` would go on passing when the
+/// server started sending a *new* one, which is the opposite of what a test
+/// double in a drift-detecting suite is for — so each subtype earns its entry
+/// here, and the day a fourth appears the suite says so.
+const SKIPPED: &[&str] = &["get_context_usage", "set_permission_mode", "set_model"];
 
 /// How a batch script asks whether the line it just read is one of those,
 /// spelled out because the two obvious ways are both wrong.
@@ -208,12 +210,36 @@ const SKIPPED: &str = "get_context_usage";
 /// A `&` or a `>` in the line would still break this, and would equally break
 /// the `echo %ANSWER%` that logs it — the script has never been able to carry
 /// one, and nothing the server writes in a test contains one.
-fn skips_the_servers_own_question(variable: &str, target: &str) -> String {
-    format!(
-        "set PROBE=%{variable}:\"=%\r\n\
-         set REST=%PROBE:{SKIPPED}=%\r\n\
-         if not \"%PROBE%\"==\"%REST%\" goto {target}\r\n"
-    )
+///
+/// `log` is where the skipped line goes before the jump, for the one caller that
+/// wants it: the requests the server makes on its own initiative are otherwise
+/// invisible from outside the server, and a mode push is exactly the thing
+/// ticket 11 needs a test to be able to see. The main loop logs; the wait for a
+/// permission decision does not, because there the skip is incidental.
+fn skips_the_servers_own_question(variable: &str, target: &str, log: Option<&str>) -> String {
+    let mut skipping = format!("set PROBE=%{variable}:\"=%\r\n");
+    for needle in SKIPPED {
+        skipping.push_str(&format!("set REST=%PROBE:{needle}=%\r\n"));
+        skipping.push_str(&match log {
+            Some(log) => format!(
+                "if not \"%PROBE%\"==\"%REST%\" (\r\n\
+                 \x20 >>\"%~dp0{log}\" echo %{variable}%\r\n\
+                 \x20 goto {target}\r\n\
+                 )\r\n"
+            ),
+            None => format!("if not \"%PROBE%\"==\"%REST%\" goto {target}\r\n"),
+        });
+    }
+    skipping
+}
+
+/// The same test, in `sh`, as one `case` pattern.
+fn shell_skip_patterns() -> String {
+    SKIPPED
+        .iter()
+        .map(|needle| format!("*{needle}*"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// A place where the agent *changes the project*, the way a real one does when
@@ -455,6 +481,18 @@ impl ScriptedAgent {
         self.logged(ANSWERS_LOG)
     }
 
+    /// Every request the server made of this agent *on its own initiative*, in
+    /// order — the lines the turn loop reads past rather than taking for a turn.
+    ///
+    /// The mirror of [`ScriptedAgent::answers`], and the only sight a test gets
+    /// of the control channel this server uses to move a live child: a runtime
+    /// mode or a model changed mid-conversation reaches the agent here and
+    /// nowhere else, so without this a server that published the change and sent
+    /// nothing would pass every other assertion in the suite. Ticket 11's.
+    pub fn requests(&self) -> Vec<String> {
+        self.logged(REQUESTS_LOG)
+    }
+
     /// The sessions this agent was asked to resume, in the order it was asked.
     ///
     /// Empty when every start was a fresh conversation, which is what a single
@@ -570,7 +608,7 @@ impl ScriptedAgent {
                              {skip}\
                              >>\"%~dp0{ANSWERS_LOG}\" echo %ANSWER%\r\n\
                              :{again}-done\r\n",
-                            skip = skips_the_servers_own_question("ANSWER", &again),
+                            skip = skips_the_servers_own_question("ANSWER", &again, None),
                         ))
                     }
                     // The mirror, and the one place the skipped line is the line
@@ -660,7 +698,7 @@ impl ScriptedAgent {
              {dispatch}\
              goto turns\r\n\
              {bodies}",
-            skip = skips_the_servers_own_question("LINE", "turns"),
+            skip = skips_the_servers_own_question("LINE", "turns", Some(REQUESTS_LOG)),
         )
     }
 
@@ -702,10 +740,11 @@ impl ScriptedAgent {
                     // see [`SKIPPED`].
                     Some(Stop::Answer) => cases.push_str(&format!(
                         "      while IFS= read -r answer; do\n\
-                         \x20       case \"$answer\" in *{SKIPPED}*) continue ;; esac\n\
+                         \x20       case \"$answer\" in {skipped}) continue ;; esac\n\
                          \x20       printf '%s\\n' \"$answer\" >> \"$here/{ANSWERS_LOG}\"\n\
                          \x20       break\n\
-                         \x20     done\n"
+                         \x20     done\n",
+                        skipped = shell_skip_patterns(),
                     )),
                     // The mirror, and the one place the skipped line is the line
                     // being waited for.
@@ -761,13 +800,21 @@ impl ScriptedAgent {
              {first_turn}\
              while IFS= read -r line; do\n\
              \x20 # Not every line the server writes is a turn — see [`SKIPPED`].\n\
-             \x20 case \"$line\" in *{SKIPPED}*) continue ;; esac\n\
+             \x20 # The ones that are not are logged, because they are the only\n\
+             \x20 # sight a test gets of what the server asked of a live agent.\n\
+             \x20 case \"$line\" in\n\
+             \x20   {skipped})\n\
+             \x20     printf '%s\\n' \"$line\" >> \"$here/{REQUESTS_LOG}\"\n\
+             \x20     continue\n\
+             \x20     ;;\n\
+             \x20 esac\n\
              \x20 : > \"{WORKING_DIRECTORY_MARKER}\"\n\
              \x20 turn=$((turn + 1))\n\
              \x20 case \"$turn\" in\n\
              {cases}\
              \x20 esac\n\
-             done\n"
+             done\n",
+            skipped = shell_skip_patterns(),
         )
     }
 }
@@ -971,6 +1018,10 @@ const ARGUMENTS_LOG: &str = "args.log";
 /// One line per answer the server wrote at an [`AWAIT_ANSWER`]. Read by
 /// [`ScriptedAgent::answers`].
 const ANSWERS_LOG: &str = "answers.log";
+
+/// One line per request the server made on its own initiative and the turn loop
+/// therefore read past. Read by [`ScriptedAgent::requests`].
+const REQUESTS_LOG: &str = "requests.log";
 
 /// The canned answer to the `initialize` control request, beside the script.
 const HANDSHAKE_ANSWER: &str = "handshake.ndjson";

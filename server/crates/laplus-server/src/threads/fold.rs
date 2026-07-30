@@ -1286,9 +1286,10 @@ pub enum Change {
     /// per-turn override, reached by its own command instead — which is the whole
     /// of what makes the picker mean something between turns rather than only at
     /// the start of one. It does not touch [`Session::runtime_mode`], and that is
-    /// the point: a session is a process that was launched with a mode, so the
-    /// turn in flight stays under the rules it started with and the next one is
-    /// started under this.
+    /// the point: the turn in flight stays under the rules it started with, and
+    /// the mode reaches the child when the *next* turn is dispatched — see
+    /// `crate::turn::retune`, which pushes it on the agent's control channel and
+    /// moves the session's own copy with it.
     RuntimeModeSet { runtime_mode: String },
     /// The developer moved the conversation's interaction mode.
     /// `thread.interaction-mode-set`. [`Change::RuntimeModeSet`]'s twin.

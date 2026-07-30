@@ -75,15 +75,22 @@ of what one may be.
 
 Not to be confused with the CLI's **permission mode**, which is what a runtime
 mode is _translated into_ — `--permission-mode`, one of the agent protocol's own
-words, and the translation is `crate::agent::permission_mode_for`. The two are
-not one vocabulary renamed: the table is lossy in both directions.
+words. There are **two translations**, because the question is asked at two
+moments: `crate::agent::permission_mode_for` is the launch flag and is lossy —
 `approval-required` maps to _no flag at all_, because upstream expresses it by
-answering the CLI's permission callback instead, and so the reverse reading of a
-missing flag is ambiguous.
+answering the CLI's permission callback instead — while
+`crate::agent::pushed_permission_mode_for` is the same table as a _push_ and is
+total, mapping `approval-required` to the CLI's `default`. A push has no way to
+say "pass no flag", and `default`'s behaviour is to ask, which is what the mode
+means.
 
-A mode is read **when a session opens** and given to the child then, so a mode
-set mid-conversation reaches the thread and not the process already serving it.
-That gap is a known one; see the thread-lifecycle tracker.
+A mode is given to the child at launch and **pushed to it afterwards**, on the
+agent's control channel at the next turn's dispatch — `set_permission_mode`, with
+`set_model` beside it for the model, which had the identical hole. So a mode set
+mid-conversation reaches the process already serving it, without replacing the
+session: no `--resume`, no fresh `init`, no lost context window. The push happens
+when the *next turn* is dispatched rather than when the picker commits, so a turn
+already in flight keeps the rules it started under.
 
 **Interaction mode** — whether the developer is planning or acting:
 `default` or `plan`. Also a property of the thread, also editable by a command of
@@ -190,12 +197,18 @@ override, and the two that create a thread — because a literal the contract do
 not name fails the client's decode of the whole conversation rather than drawing
 a wrong badge. `crate::agent::permission_mode_for` is the separate question of
 which `--permission-mode` each one becomes, and answers nothing for
-`approval-required` because upstream expresses that by passing no flag.
+`approval-required` because upstream expresses that by passing no flag;
+`crate::agent::pushed_permission_mode_for` answers the same question for a
+running child, where the omission cannot stand and `approval-required` becomes
+`default`.
 
-Read **once per session**, when the agent is launched. A thread carries the mode
-and a change to it reaches the next session, not the child already running — see
-`crate::orchestration::Shell::set_mode`, and `.scratch/thread-lifecycle/issues/11`
-for the consequence.
+Given to the agent **at launch and again at every turn whose mode has moved** —
+`crate::turn::retune` pushes it on the control channel before the turn is
+written, and the driver's own copy moves with it, so every session event for one
+turn reports the same mode. Ticket 11 of `.scratch/thread-lifecycle/` is the
+whole of it, and `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson`
+is a real child being moved. The **model** is the same mechanism through
+`set_model`, and had the identical hole.
 
 **Interaction mode** — whether the developer is planning or acting: the
 contract's `default` and `plan`. Carried on the thread, published, and **never

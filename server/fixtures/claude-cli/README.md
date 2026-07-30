@@ -49,6 +49,8 @@ sent, and then abort a turn nobody had stopped.
 | `17-rate-limited.ndjson`                   | Hand-written           | Three `rate_limit_event`s — fine, close to the limit, refused — and the failed turn the third produces                                                                                                          |
 | `18-compacted.ndjson`                      | Hand-written           | A `system`/`compact_boundary` between two turns: the agent's memory rewritten, and the transcript deliberately unchanged by it                                                                                  |
 | `19-context-usage.ndjson`                  | Recorded, ticket 76    | The CLI answering how full its own window is, twice — as the session announces itself and as the turn ends — around a turn that uses a tool                                                                     |
+| `20-modes-changed-mid-conversation.ndjson` | Recorded, ticket 11    | A runtime mode and a model pushed to a *running* child between two turns: the first turn writes a file unasked, the second is stopped for permission, and the model on it is the one that was pushed            |
+| `21-modes-refused.ndjson`                  | Recorded, ticket 11    | The same two requests refused — an unnameable mode and an unrecognised model — which is the first `control_response` with `"subtype": "error"` in this directory                                                 |
 
 The raw STEP 1 originals these two were curated from lived in `.scratch/` and
 were deleted on 2026-07-29; the committed, test-facing copies here are now the
@@ -56,6 +58,54 @@ only ones. `04`–`15` were recorded straight into
 `fixtures/` against `claude-haiku-4-5`, with the same flags
 [`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes, and `19`
 was recorded the same way.
+
+## What `20` and `21` settled
+
+Ticket 11 was written on the premise that **the agent protocol has no control
+request that moves a running child's permission mode**, and asked for a human
+decision between replacing the session and giving up on the claim. The premise
+was false, and `20` is the disproof: two requests this server now sends, probed
+against `claude` 2.1.220 with this server's own launch flags.
+
+- **`set_permission_mode` moves a live child, both ways.** `20` opens under
+  `bypassPermissions`, writes a file with nothing asked of the developer, is
+  pushed to `default` between turns, and is then *stopped for permission* on the
+  second turn's identical `Write`. That prompt is the whole evidence: it exists
+  only because the push landed.
+- **`set_model` moves a live child too**, and takes the bare slug — `opus`, which
+  the CLI resolves to `claude-opus-5` itself. The second turn's `message_start`
+  carries `claude-opus-5` where the first carried `claude-haiku-4-5-20251001`.
+- **The session is not replaced.** One `session_id` throughout, and the
+  conversation continues rather than restarting — which is what makes a push
+  worth having over a kill-and-`--resume`: no fresh `init`, no lost context
+  window.
+- **The CLI confirms twice.** A `control_response` naming the request and the
+  mode it moved to, and a `system`/`status` line carrying `permissionMode`. The
+  first is what the server keys the outcome off; the second is unrecognised and
+  folds to nothing, which the golden records by its absence.
+- **A `set_model` push makes the CLI narrate itself a `user` line** reading
+  `<local-command-stdout>Set model to opus (claude-opus-5)</local-command-stdout>`
+  and marked `isReplay`, with `content` as a bare string rather than a list of
+  blocks. This server folded *every* user line into the transcript on the stated
+  grounds that it does not pass `--replay-user-messages`; that reasoning no longer
+  holds, and the line is now read and dropped. Both halves of the trap are in the
+  golden: no eighth transcript entry, and `parse_errors: 0`.
+- **`approval-required` maps cleanly to `default` as a pushed mode**, so
+  tightening and loosening are the same operation in opposite directions — the
+  asymmetry the ticket worried about was a property of the *launch* table, which
+  is deliberately left lossy.
+
+`21` is the refusal half, and it is why the two are separate captures: a healthy
+conversation does not contain one. It records the two sentences the CLI answers
+with — `Cannot set permission mode: must be one of acceptEdits, auto,
+bypassPermissions, default, dontAsk, plan`, and `Model "not-a-model" is not a
+recognized model id` — which are what the developer is shown, verbatim, when a
+push does not land. It also pins the list of modes the CLI will take, which is
+what `agent::pushed_permission_mode_for` is checked against.
+
+Both were recorded by a script driving `claude` directly with this server's flags,
+the same way `19` was. `21` needs no turn at all: the control channel answers a
+process that has never been sent one.
 
 ## What `19` settled
 

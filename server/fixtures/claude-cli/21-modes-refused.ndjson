@@ -1,0 +1,8 @@
+{"type":"control_response","response":{"subtype":"success","request_id":"probe-tighten","response":{"mode":"default"}}}
+{"type":"system","subtype":"status","status":null,"permissionMode":"default","uuid":"e7c41c06-c934-4282-8cc7-eb233585c475","session_id":"10289b60-d49a-4bcc-a415-2860ca65da4e"}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe-loosen","response":{"mode":"bypassPermissions"}}}
+{"type":"system","subtype":"status","status":null,"permissionMode":"bypassPermissions","uuid":"91eb4972-3931-403d-8777-1961cc14384b","session_id":"10289b60-d49a-4bcc-a415-2860ca65da4e"}
+{"type":"control_response","response":{"subtype":"error","request_id":"probe-bad-mode","error":"Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"}}
+{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to opus (claude-opus-5)</local-command-stdout>"},"session_id":"10289b60-d49a-4bcc-a415-2860ca65da4e","parent_tool_use_id":null,"uuid":"aadc6bdf-a5de-4b8c-9d4a-ca45cce4e43a","timestamp":"2026-07-30T19:45:11.527Z","isReplay":true}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe-model"}}
+{"type":"control_response","response":{"subtype":"error","request_id":"probe-bad-model","error":"Model \"not-a-model\" is not a recognized model id. Run /model to see available models."}}

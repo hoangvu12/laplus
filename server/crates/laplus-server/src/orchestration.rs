@@ -511,16 +511,18 @@ impl Shell {
     /// falls out of where each value is read rather than being enforced here:
     /// this writes the *thread*, which is what the composer's pickers read
     /// (`ChatView.tsx`'s `activeThread?.runtimeMode`), and touches neither the
-    /// session nor the agent — [`crate::turn::Start`] was built when the session
-    /// opened and the child was given its `--permission-mode` then. So the turn
-    /// in flight stays under the rules it started with, which is the point: the
-    /// rules an agent is working under must not move under its feet.
+    /// session nor the agent. So the turn in flight stays under the rules it
+    /// started with, which is the point: the rules an agent is working under must
+    /// not move under its feet.
     ///
-    /// The other side of that is a gap this ticket did not close, recorded in
-    /// `.scratch/thread-lifecycle/issues/11-…`: one child serves a whole
-    /// conversation, so a *reused* process goes on applying the mode it was
-    /// launched with even for turns requested under the new one. The per-turn
-    /// override has always had the same hole.
+    /// **What carries it to the child is the next turn's dispatch.**
+    /// [`crate::turn::send`] reads the thread and pushes what has moved on the
+    /// agent's control channel before the prompt is written, so a mode changed
+    /// here reaches the process already serving the conversation without
+    /// replacing it — ticket 11 of `.scratch/thread-lifecycle/`, which also
+    /// closed the same hole in the per-turn override and in the model. Nothing
+    /// about that belongs in this function, and that is the division: this says
+    /// what the conversation wants, and the dispatch says it to the agent.
     ///
     /// **A repeat is answered rather than refused.** Both commands are a write
     /// of one field, and folding the event a second time lands on the same

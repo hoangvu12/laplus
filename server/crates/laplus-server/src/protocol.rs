@@ -34,7 +34,8 @@ pub enum Event {
     System(SystemEvent),
     /// A complete assistant turn. `message` is a standard Messages API object.
     Assistant(MessageEnvelope),
-    /// Echoed user turn (with `--replay-user-messages`).
+    /// A tool result, or a line the CLI is replaying to itself — see
+    /// [`MessageEnvelope::is_replay`], which is what tells the two apart.
     User(MessageEnvelope),
     /// A verbatim Messages API SSE event, for token-level rendering.
     StreamEvent { event: StreamEvent },
@@ -295,6 +296,61 @@ pub fn context_usage_line(request_id: &str) -> String {
     .to_string()
 }
 
+/// Build the stdin line that moves a running agent to another permission mode.
+///
+/// The fifth thing this server says to the agent, and the one that settled
+/// ticket 11: a mode is passed at launch as `--permission-mode`, and until this
+/// existed a developer who changed it mid-conversation was answered by a child
+/// still running under the mode the conversation opened with. The child is told
+/// instead of being replaced, so no `--resume`, no fresh `init` and no lost
+/// context window.
+///
+/// **The mode is the CLI's vocabulary, not the contract's**, and it is total
+/// where the launch table is lossy: `crate::agent::permission_mode_for` answers
+/// `None` for `approval-required` because upstream expresses that by passing no
+/// flag, and a pushed mode has no such option. See
+/// `crate::agent::pushed_permission_mode_for`, which is the translation this
+/// takes.
+///
+/// Found by probing the binary, the same way the permission, interrupt and
+/// context-usage channels were —
+/// `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson` is the
+/// recording. The CLI answers on two lines: an [`Acknowledgement`] naming this
+/// id and carrying `{"mode": …}`, and a `system`/`status` line carrying
+/// `permissionMode`. The first is the one an outcome is keyed off; the second is
+/// unrecognized and folds to nothing.
+pub fn set_permission_mode_line(request_id: &str, mode: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "set_permission_mode", "mode": mode },
+    })
+    .to_string()
+}
+
+/// Build the stdin line that moves a running agent to another model.
+///
+/// The mirror of [`set_permission_mode_line`] and the other half of ticket 11:
+/// a model is passed at launch as `--model` and had the identical hole, so a
+/// developer who switched model mid-conversation was answered by the model they
+/// started with, having been shown the one they picked.
+///
+/// **The slug is the one the thread already holds.** `opus` is accepted and
+/// resolved by the CLI to `claude-opus-5`, so none of upstream's api-id
+/// resolution is needed — what the launch flag carries is what this carries.
+///
+/// One consequence is not on this line and is worth knowing here: the CLI
+/// narrates the change to itself as a replayed `user` message, which this module
+/// drops rather than folding. See [`MessageEnvelope::is_replay`].
+pub fn set_model_line(request_id: &str, model: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "set_model", "model": model },
+    })
+    .to_string()
+}
+
 /// What the developer decided, in the CLI's own vocabulary.
 ///
 /// Deliberately *not* the client's — the UI offers four decisions
@@ -479,6 +535,17 @@ pub struct InitEvent {
 #[derive(Debug, Deserialize)]
 pub struct MessageEnvelope {
     pub message: Message,
+    /// The CLI replaying a message rather than reporting a new one.
+    ///
+    /// Absent on everything this server's flags produce but one, and that one is
+    /// why the field exists: a `set_model` push makes the CLI narrate itself a
+    /// `user` line reading
+    /// `<local-command-stdout>Set model to opus (claude-opus-5)</local-command-stdout>`
+    /// and mark it with this. Folding it would grow the developer's transcript a
+    /// turn they never typed, so it is read and the line is dropped —
+    /// `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson` has it.
+    #[serde(default, rename = "isReplay", alias = "is_replay")]
+    pub is_replay: bool,
 }
 
 /// The inner payload is the standard Anthropic Messages API `Message`.
@@ -508,6 +575,11 @@ pub struct Message {
 /// drifted would cost the reply beside it. The module's own rule is that a format
 /// change has the blast radius of one file; this makes it the blast radius of one
 /// block.
+///
+/// **A bare string is a message too.** The Messages API's own shorthand for a
+/// single text block, and the shape the CLI narrates a `set_model` push in — see
+/// [`MessageEnvelope::is_replay`]. Without this the line does not parse at all,
+/// which counted an ordinary model change as protocol drift.
 fn readable_blocks<'de, D>(deserializer: D) -> Result<Vec<ContentBlock>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -522,13 +594,23 @@ where
         Unreadable(serde::de::IgnoredAny),
     }
 
-    Ok(Vec::<Readable>::deserialize(deserializer)?
-        .into_iter()
-        .map(|block| match block {
-            Readable::Block(block) => block,
-            Readable::Unreadable(_) => ContentBlock::Unknown,
-        })
-        .collect())
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Shorthand(String),
+        Blocks(Vec<Readable>),
+    }
+
+    Ok(match Content::deserialize(deserializer)? {
+        Content::Shorthand(text) => vec![ContentBlock::Text { text }],
+        Content::Blocks(blocks) => blocks
+            .into_iter()
+            .map(|block| match block {
+                Readable::Block(block) => block,
+                Readable::Unreadable(_) => ContentBlock::Unknown,
+            })
+            .collect(),
+    })
 }
 
 /// One block of a message's content.
@@ -1340,10 +1422,23 @@ impl SessionState {
             }
 
             // Folded rather than dropped, and not because this server asked for
-            // the developer's own turns back — it does not pass
-            // `--replay-user-messages`. A **tool result** arrives as a user
+            // the developer's own turns back. A **tool result** arrives as a user
             // message, which is the Messages API's shape, so this is the only
             // place a tool call can be seen to have returned.
+            //
+            // **A replayed one is dropped**, and the flag has to be read because
+            // the old reasoning here — "this server does not pass
+            // `--replay-user-messages`, so a user line can only be a tool
+            // result" — turned out to be false. A `set_model` push makes the CLI
+            // narrate the change to itself as a `user` line marked `isReplay`,
+            // with no flag involved; folding it would put a turn the developer
+            // never typed in front of them. Counted rather than passed over in
+            // silence, so the day the CLI replays something else there is a
+            // number saying how often.
+            Event::User(env) if env.is_replay => {
+                self.bump("user/replayed");
+                Folded::Nothing
+            }
             Event::User(env) => {
                 self.bump("user");
                 self.note_unreadable_blocks(&env.message.content);
@@ -1687,9 +1782,8 @@ mod tests {
     /// well — so the successful case is the one that has to default correctly.
     ///
     /// A result arrives with the role `user`, which is why it has to be reported as
-    /// something rather than skipped: this server does not pass
-    /// `--replay-user-messages`, so a user message is never the developer's own
-    /// turn coming back.
+    /// something rather than skipped: an unreplayed user message is never the
+    /// developer's own turn coming back, so folding one costs no duplicate.
     #[test]
     fn a_tool_result_names_its_call_and_whether_it_failed() {
         let state = fold(&[
@@ -2164,6 +2258,151 @@ mod tests {
 
         assert!(matches!(told, Folded::Acknowledged(_)), "{told:?}");
         assert_eq!(state.token_usage, None);
+    }
+
+    // -- moving a running agent -------------------------------------------------
+    //
+    // Ticket 11 of `thread-lifecycle`. The whole exchange is recorded in
+    // `fixtures/claude-cli/20-modes-changed-mid-conversation` — where a mode
+    // pushed mid-conversation produces a permission prompt the turn before it
+    // never saw — and its refusals in `21-modes-refused`. What lives here is the
+    // two lines that go out, and the three things that come back.
+
+    /// The request the CLI answers, probed against 2.1.220 with this server's
+    /// own launch flags.
+    #[test]
+    fn the_mode_push_is_the_control_request_the_cli_expects() {
+        assert_eq!(
+            serde_json::from_str::<Value>(&set_permission_mode_line("retune-1", "default"))
+                .unwrap(),
+            json!({
+                "type": "control_request",
+                "request_id": "retune-1",
+                "request": {"subtype": "set_permission_mode", "mode": "default"},
+            })
+        );
+    }
+
+    /// The model's twin, which takes the bare slug the thread already holds —
+    /// `opus`, which the CLI resolves to `claude-opus-5` itself.
+    #[test]
+    fn the_model_push_is_the_control_request_the_cli_expects() {
+        assert_eq!(
+            serde_json::from_str::<Value>(&set_model_line("retune-2", "opus")).unwrap(),
+            json!({
+                "type": "control_request",
+                "request_id": "retune-2",
+                "request": {"subtype": "set_model", "model": "opus"},
+            })
+        );
+    }
+
+    /// A push that landed. The CLI names the mode it moved to, and the shape is
+    /// deliberately not a reading — an answer carrying `{"mode": …}` and no
+    /// `totalTokens` must not be mistaken for the context question's, which
+    /// travels the same envelope.
+    #[test]
+    fn an_accepted_push_is_an_acknowledgement_rather_than_a_reading() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"retune-1","response":{"mode":"default"}}}"#,
+        );
+
+        let Folded::Acknowledged(answer) = told else {
+            panic!("expected an acknowledgement, got {told:?}");
+        };
+        assert_eq!(answer.request_id, "retune-1");
+        assert_eq!(answer.refusal(), None);
+        assert_eq!(state.token_usage, None, "a mode is not a meter reading");
+        assert_eq!(state.unknown_events, 0);
+        assert_eq!(state.parse_errors, 0);
+    }
+
+    /// A push the CLI would not take, in both its recorded spellings. The
+    /// sentence is the CLI's own and is what the developer is shown, so it has to
+    /// survive the fold rather than being reduced to "refused".
+    #[test]
+    fn a_refused_push_carries_the_reason_the_cli_gave() {
+        let mut state = SessionState::new();
+
+        let mode = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"retune-1","error":"Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"}}"#,
+        );
+        let Folded::Acknowledged(answer) = mode else {
+            panic!("expected an acknowledgement, got {mode:?}");
+        };
+        assert_eq!(
+            answer.refusal().as_deref(),
+            Some(
+                "Cannot set permission mode: must be one of acceptEdits, auto, \
+                 bypassPermissions, default, dontAsk, plan"
+            )
+        );
+
+        let model = state.fold_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"retune-2","error":"Model \"not-a-model\" is not a recognized model id. Run /model to see available models."}}"#,
+        );
+        let Folded::Acknowledged(answer) = model else {
+            panic!("expected an acknowledgement, got {model:?}");
+        };
+        assert!(
+            answer.refusal().is_some_and(|why| why.contains("not-a-model")),
+            "the refusal has to name what was refused: {answer:?}"
+        );
+
+        // Neither is drift. An answer this server asked for is not a format
+        // change, however unwelcome.
+        assert_eq!(state.unknown_events, 0);
+        assert_eq!(state.parse_errors, 0);
+    }
+
+    /// **The trap ticket 11 named.** A `set_model` push makes the CLI narrate the
+    /// change to itself as a `user` line, and this module used to fold every user
+    /// line into the transcript on the stated grounds that it does not pass
+    /// `--replay-user-messages`. This line arrives without that flag, so the
+    /// premise was false and the developer's transcript would have grown a turn
+    /// they never typed.
+    ///
+    /// Two failures are pinned at once, because the line breaks the module twice:
+    /// its `content` is a bare string where a list of blocks was required, so
+    /// before this it did not parse at all and an ordinary model change was
+    /// counted as protocol drift.
+    #[test]
+    fn the_line_a_model_push_narrates_is_neither_a_turn_nor_drift() {
+        let mut state = SessionState::new();
+        let told = state.fold_line(
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to opus (claude-opus-5)</local-command-stdout>"},"session_id":"s","parent_tool_use_id":null,"uuid":"u","timestamp":"2026-07-30T19:45:11.527Z","isReplay":true}"#,
+        );
+
+        assert_eq!(told, Folded::Nothing);
+        assert!(
+            state.transcript.is_empty(),
+            "the developer's transcript grew a turn they never typed: {:?}",
+            state.transcript
+        );
+        assert_eq!(state.parse_errors, 0);
+        assert_eq!(state.unknown_events, 0);
+        // Counted, so the day the CLI replays something else there is a number
+        // saying how often rather than silence.
+        assert_eq!(state.counts.get("user/replayed"), Some(&1));
+    }
+
+    /// The Messages API's shorthand for one text block, which is the shape the
+    /// replayed line above arrives in — and which any user line is allowed to
+    /// take. Read as a block rather than refused, so an unreplayed one would
+    /// still reach the transcript with its text intact.
+    #[test]
+    fn a_message_whose_content_is_a_bare_string_is_one_text_block() {
+        let mut state = SessionState::new();
+        state.fold_line(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#);
+
+        assert_eq!(
+            state.transcript[0].content,
+            vec![ContentBlock::Text {
+                text: "hello".to_string()
+            }]
+        );
+        assert_eq!(state.parse_errors, 0);
     }
 
     // -- long sessions and bad weather -----------------------------------------
