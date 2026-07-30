@@ -1,6 +1,6 @@
 # 13 — A stored mode the contract does not name is still published
 
-**What to build:** a decision about the *read* side of the mode vocabulary, and
+**What to build:** a decision about the _read_ side of the mode vocabulary, and
 then whatever it implies.
 
 Ticket 12 closed the doors. `named_by_the_contract` now guards every command that
@@ -32,7 +32,7 @@ framing of the cost, and it is unchanged by the doors being shut.
 
 **The rows are possible rather than hypothetical**, which is the whole reason
 this is a ticket. The doors were open from ticket 10 until ticket 12, and the
-composer sends the per-turn override on *every* send — so the unguarded door was
+composer sends the per-turn override on _every_ send — so the unguarded door was
 the one almost every mode change went through, for the whole of that window.
 
 ## The three answers, and what each costs
@@ -44,7 +44,7 @@ the one almost every mode change went through, for the whole of that window.
   is not one. **There is a precedent three lines above the reader**, and it went
   this way for exactly this class of problem — a `model_selection` that will not
   parse is read as `null`, with the comment "a worse answer than the stored one
-  and a much better one than no conversation". The question this leaves is *which*
+  and a much better one than no conversation". The question this leaves is _which_
   mode, and it is not free: rounding an unnameable mode to `approval-required` is
   safe and may not be what the row meant, while rounding to `full-access` matches
   what a hand-edited `bypassPermissions` was reaching for and hands out latitude
@@ -64,7 +64,36 @@ like.
 - **Not about `model_selection`**, which already degrades and whose reasoning is
   the precedent cited above rather than the subject.
 
-**Blocked by:** None. Wants the call on which of the three, and — if rounding —
-which mode an unnameable one becomes.
+## The call — rounding, no migration, low priority
 
-**Status:** needs-triage
+Decided 2026-07-30, in the `/grill-with-docs` session that produced
+`.scratch/contract-parity/ledger.md`. Recorded here so a later triage pass does
+not re-open a question that has an answer.
+
+**Build the read-side rounder, and only that.** When a stored value is not one
+the contract names, round it to `DEFAULT_RUNTIME_MODE` (`full-access`) or
+`DEFAULT_PROVIDER_INTERACTION_MODE` (`default`), reusing `RUNTIME_MODES` and
+`INTERACTION_MODES` — three lines beside the identical `model_selection`
+degradation that already sits in the same function, which is the precedent this
+follows rather than merely resembles.
+
+`full-access` rather than `approval-required`, and the section above names the
+trade honestly: it hands out latitude nobody asked this server for. It is chosen
+anyway because it is what a hand-edited `bypassPermissions` was reaching for, and
+because a conversation silently downgraded to asking permission for everything is
+a bug report about the agent rather than about the mode column.
+
+**No migration.** This is the half of the ticket that measurement removed rather
+than argument: the live database at `~/.laplus/state.sqlite` holds two threads,
+both `full-access` / `default`. There are no bad rows to migrate. The risk this
+ticket describes is real in principle and zero in fact, and there is one user of
+this application today — one `UPDATE` typed into a terminal beats a
+schema-version entry that exists forever to fix rows that do not.
+
+**Low priority**, behind everything in the contract-parity ledger's Gap 2. The
+doors are shut, the store is clean, and the rounder is insurance rather than a
+repair.
+
+**Blocked by:** None.
+
+**Status:** ready-for-agent
