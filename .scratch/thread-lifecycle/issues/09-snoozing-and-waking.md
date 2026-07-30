@@ -34,9 +34,16 @@ normalised — it would create a thread that is snoozed and awake at once, carry
 snooze state it can never leave. The same comparison catches an unparseable time,
 which must never be persisted.
 
-**Note:** the turn-requested site is also touched by ticket 08, which resets a
-settle override there. Neither gates the other, but they edit the same place, so
-whichever lands second should expect to merge.
+**Note:** ticket 08 landed first and there is nothing to merge. It did not touch
+`Shell::start_turn` at all: the reset lives in `Threads::apply_unless`, which every
+change already goes through, so the trigger is an arm in
+`Change::wakes_the_inbox` and a guarded emission in `Threads::wake_the_inbox`. The
+snooze clear wanted here is a second arm and a second emission in the same two
+places — and the guard is the same shape, asked through the refusal
+`Threads::commit` takes so that "is there a snooze to clear?" is decided under the
+lock the fold runs under. `Thread::wants_waking` is the settle half of that guard
+and reads `Shelf::holds`; the snooze half wants the same archived reading, because
+`thread.snooze` is refused on an archived conversation too.
 
 **Blocked by:** 01 — Lifecycle fields reach the client as stored state.
 06 — Archiving and unarchiving (snooze refuses an archived thread, and at the

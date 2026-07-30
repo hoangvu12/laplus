@@ -143,10 +143,9 @@ pub struct Capabilities {
     /// conversation nobody has touched for `autoSettleAfterDays` now leaves the
     /// inbox by itself. That derivation is the client's and ships unmodified
     /// (ADR-0012), and its premise — that the server un-settles on real
-    /// activity — is only half true until ticket 08 emits the three resets. The
-    /// blockers hold regardless, so live work is never hidden; what can happen
-    /// meanwhile is an auto-settled conversation re-settling once a new turn
-    /// finishes.
+    /// activity — is now true: [`crate::threads::Change::wakes_the_inbox`] is the
+    /// three resets, so an auto-settled conversation comes back the moment there
+    /// is work in it again rather than staying gone until the developer opens it.
     ///
     /// This is the whole of what advertising it costs, and the alternative was
     /// shipping the commands with no control that sends them.

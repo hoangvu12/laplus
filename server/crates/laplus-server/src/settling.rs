@@ -85,6 +85,25 @@ impl SessionStatus {
         }
     }
 
+    /// Is there an agent working behind this conversation right now?
+    ///
+    /// `starting` and `running`, which are exactly the two
+    /// [`SessionStatus::settles_turn_as`] has no answer for — a status that says
+    /// nothing about how a turn went says so because the turn is not over.
+    ///
+    /// Named rather than matched in place because it is read from two directions
+    /// that must not be allowed to disagree:
+    /// [`crate::threads::Thread::busy`] refuses a settle with it, and
+    /// [`crate::threads::Change::wakes_the_inbox`] resets an override with it.
+    /// A conversation the developer *cannot settle* because an agent is working
+    /// is the same conversation whose settle a starting agent *undoes*, and a
+    /// second reading of the enum would let those two part company — which would
+    /// show as a status arriving after the fact quietly undoing a decision it was
+    /// never meant to touch.
+    pub fn is_working(self) -> bool {
+        matches!(self, SessionStatus::Starting | SessionStatus::Running)
+    }
+
     /// The literal the contract puts on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -210,6 +229,30 @@ mod tests {
             SessionStatus::Error,
         ] {
             assert_ne!(status.settles_turn_as(), Some(TurnState::Running));
+        }
+    }
+
+    /// An agent is working exactly while the status has nothing to say about how
+    /// a turn went, which is the agreement [`SessionStatus::is_working`] claims
+    /// and the two readings of it depend on: the settle it refuses and the
+    /// override a starting agent resets are the same set of conversations.
+    #[test]
+    fn an_agent_is_working_exactly_while_no_turn_has_settled() {
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Starting,
+            SessionStatus::Running,
+            SessionStatus::Ready,
+            SessionStatus::Interrupted,
+            SessionStatus::Stopped,
+            SessionStatus::Error,
+        ] {
+            assert_eq!(
+                status.is_working(),
+                status.settles_turn_as().is_none(),
+                "{} is read as working by one rule and not the other",
+                status.as_str()
+            );
         }
     }
 

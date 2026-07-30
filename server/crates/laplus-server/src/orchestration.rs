@@ -758,6 +758,12 @@ impl Shell {
     /// **A repeat re-emits rather than being refused**, which is where this parts
     /// company with [`Shell::set_archived`] — see [`Change::re_emitted_at`] for
     /// the whole of that argument.
+    ///
+    /// **And a settle is not permanent.** The invariants above refuse to hide
+    /// live work at the moment the developer asks, and
+    /// `crate::threads::Threads::wake_the_inbox` is what stops that being reachable a
+    /// minute later: real activity in the conversation returns it to the inbox by
+    /// itself, without this command being sent again.
     fn settle(&self, thread_id: &str) -> Result<i64, CommandError> {
         // Drawn before the lock is taken rather than inside the guard, so the
         // window a queued turn is measured against is one instant for the whole
@@ -805,8 +811,14 @@ impl Shell {
     /// reason is `user`, which pins the conversation *active* rather than clearing
     /// the override to neutral, so the client's own auto-settle stays suppressed
     /// until real work moves it on — see [`crate::threads::pinned_by`]. The
-    /// neutral reset is the server's own and is ticket 08's; the contract lets a
-    /// client send only this reason, so it cannot be forged.
+    /// neutral reset is the server's own — `crate::threads::Threads::wake_the_inbox`,
+    /// which real work triggers — and the contract lets a client send only this
+    /// reason, so it cannot be forged.
+    ///
+    /// "Until real work moves it on" is the pin's whole lifetime and it is not
+    /// enforced here: the same three triggers that wake a *settled* conversation
+    /// return a pinned one to neutral, so nothing has to remember that the
+    /// developer pinned it.
     ///
     /// **The invariants are not this command's.** Pinning something back can never
     /// hide work — it is the direction that makes work visible — so the four

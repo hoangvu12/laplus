@@ -610,6 +610,29 @@ pub fn unanswered_user_input(activities: &[Activity]) -> Vec<&str> {
     open
 }
 
+/// Is this row the agent stopping to wait on the developer?
+///
+/// The two request kinds and neither of their answers — the openers of the two
+/// folds above, which is what makes this and them one reading: a row that opens
+/// a pending request is exactly a row that puts a conversation in front of the
+/// developer. `a_row_blocks_on_the_developer_exactly_when_it_opens_a_request`
+/// holds the two together, so a third request kind cannot reach a fold and miss
+/// this.
+///
+/// Asked of **one row as it is appended** rather than of a whole work log, which
+/// is why it is not `unanswered(&[activity])`: the caller
+/// ([`crate::threads::Change::wakes_the_inbox`]) has the row and wants to know
+/// whether *this* is the one that raises a hand. A conversation with a request
+/// already open has already been woken by the row that opened it.
+///
+/// **Nothing else counts, deliberately.** A tool call, a result, a thinking row
+/// — a turn produces dozens — say the agent is busy rather than that it needs
+/// anybody, and a settled conversation that woke on each of them would be a
+/// conversation the developer cannot let go of.
+pub fn blocks_on_the_developer(activity: &Activity) -> bool {
+    matches!(activity.kind.as_str(), REQUESTED | USER_INPUT_REQUESTED)
+}
+
 /// The questions inside an `AskUserQuestion`, in the shape the composer folds —
 /// or `None`, meaning "this is an ordinary permission request, show it as one".
 ///
@@ -1491,5 +1514,48 @@ mod tests {
             closed,
         ])
         .is_empty());
+    }
+
+    // -- what raises a hand ---------------------------------------------------
+
+    /// A row blocks on the developer exactly when it is a row that, on its own,
+    /// leaves a request open.
+    ///
+    /// **Agreement rather than a list**, which is what keeps this and the two
+    /// folds above one reading: [`blocks_on_the_developer`] is asked of one row and
+    /// the folds are asked of a whole log, so a third request kind added to either
+    /// fold and missed here would silently stop waking a settled conversation —
+    /// see `crate::threads::Change::wakes_the_inbox`, which is the only caller.
+    /// The rows that must *not* block are as much the point: a turn produces dozens
+    /// of them, and a conversation woken by each would be one the developer cannot
+    /// let go of. Both resolutions are in the set because they are a request
+    /// *closing*, which is the opposite of needing anybody.
+    #[test]
+    fn a_row_blocks_on_the_developer_exactly_when_it_opens_a_request() {
+        let permission = asking("Bash", json!({"command": "ls"}));
+        let question = asking(ASK_USER_QUESTION, a_question());
+        let asked = questions(&question).expect("a question");
+
+        for row in [
+            requested(&permission, None),
+            user_input_requested(&question, asked.clone(), None),
+            resolved(&permission, Decision::Accept, None),
+            unanswerable(&permission.request_id),
+            user_input_resolved(&question.request_id, &json!({}), None),
+            unanswerable_user_input(&question.request_id),
+            Call::untracked("toolu_1").invoked(None),
+            thinking("wondering", None).expect("a thinking row"),
+            Activity::failed("session.failed", "the agent stopped"),
+        ] {
+            let alone = [row.clone()];
+            let opens_a_request =
+                !unanswered(&alone).is_empty() || !unanswered_user_input(&alone).is_empty();
+            assert_eq!(
+                blocks_on_the_developer(&row),
+                opens_a_request,
+                "{} is read as blocking on the developer by one rule and not the other",
+                row.kind
+            );
+        }
     }
 }

@@ -367,9 +367,31 @@ pub const ACTIVE: &str = "active";
 /// One of the contract's two, and the only one a *command* can carry: the
 /// neutral reset is the server's own and must not be forgeable, which is why
 /// `ThreadUnsettleCommand.reason` is the single literal `user` while
-/// `ThreadUnsettledPayload.reason` is a union of two. Ticket 08 of the
-/// thread-lifecycle effort is what emits the other.
+/// `ThreadUnsettledPayload.reason` is a union of two.
 pub const BY_THE_USER: &str = "user";
+
+/// The other of the contract's two: the reason on a reset this server decided
+/// for itself, because real work turned up in the conversation.
+///
+/// **No command can carry it**, and that is the property the asymmetry rests on
+/// — see [`pinned_by`]. A user unsettle *pins* a conversation active; this one
+/// returns it to no override at all, so it can settle itself again once the
+/// burst of work goes stale. A client able to send it could pin a conversation
+/// the developer had let go of, or clear a pin they had asked for.
+///
+/// The three places it is emitted from are [`Change::wakes_the_inbox`].
+pub const BY_ACTIVITY: &str = "activity";
+
+/// Why a lifecycle reset was not emitted — a sentence that reaches nobody.
+///
+/// [`Threads::wake_the_inbox`] asks [`Thread::wants_waking`] through the same
+/// refusal the archive commands use, because that is the only guard in this
+/// module decided under the fold's own lock. A refusal there is a sentence, and
+/// this is the honest one; it is a constant rather than a `format!` naming the
+/// conversation because this is the *ordinary* answer — most work happens in a
+/// conversation nobody has settled — and a sentence nobody renders is not worth
+/// building per work-log row.
+const NOTHING_TO_WAKE: &str = "There is no inbox state to return this conversation to.";
 
 /// A stored settle override, back as one of the contract's two.
 ///
@@ -395,6 +417,11 @@ pub fn settled_override(stored: &str) -> Option<&'static str> {
 /// all, so it can settle itself again once the burst of work goes stale.
 /// `threadReducer.ts`, `case "thread.unsettled"`, mirrored — a server that
 /// disagreed here would pin a conversation a client had let go of.
+///
+/// [`BY_ACTIVITY`] takes the second branch, and so would any third reason
+/// somebody added without reading this: the reducer tests `=== "user"` and
+/// treats everything else as neutral, so falling through to `None` is agreement
+/// rather than laziness.
 fn pinned_by(reason: &str) -> Option<&'static str> {
     match reason {
         BY_THE_USER => Some(ACTIVE),
@@ -790,16 +817,40 @@ impl Thread {
         if self.has_pending_user_input() {
             return Some(Busy::Question);
         }
-        if self.session.as_ref().is_some_and(|session| {
-            matches!(
-                session.status,
-                SessionStatus::Starting | SessionStatus::Running
-            )
-        }) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.status.is_working())
+        {
             return Some(Busy::Session);
         }
         self.has_queued_turn_start(adoption)
             .then_some(Busy::QueuedTurn)
+    }
+
+    /// Is there an inbox state here for real work to reset?
+    ///
+    /// The guard on all three of [`Change::wakes_the_inbox`]'s triggers, and both
+    /// halves of it are about not moving something nobody asked to have moved:
+    ///
+    /// - **An override to clear.** A reset over a conversation with none lands in
+    ///   [`Change::re_emitted_at`] as a repeat, which would publish a no-op event
+    ///   at a stale `updatedAt` — a conversation reordered by work that changed
+    ///   nothing about it, or not reordered by work that did.
+    /// - **A conversation that is in the inbox at all.** [`Shelf::holds`] is
+    ///   asked here as well as by both settle commands, so the filter and the
+    ///   rule stay one rule: an archived conversation has no inbox to be returned
+    ///   to, and clearing an override that `thread.unsettle` itself refuses to
+    ///   touch would lose the developer's decision the moment they unarchived it.
+    ///
+    /// Live work is never hidden either way, and that is what makes the archived
+    /// half safe rather than a hole: the client's `effectiveSettled` checks its
+    /// activity blockers — a pending approval or question, a session that is
+    /// working, an unadopted turn — *before* it reads any override, so a
+    /// conversation unarchived while its agent is busy does not classify as
+    /// settled whatever these two fields say.
+    fn wants_waking(&self) -> bool {
+        self.lifecycle.settled_override.is_some() && Shelf::Working.holds(self)
     }
 
     /// A message the developer sent that no session has picked up yet.
@@ -1174,9 +1225,9 @@ pub enum Change {
     /// The developer pinned a conversation back. `thread.unsettled`.
     ///
     /// The reason is one of the contract's two and decides what the conversation
-    /// is left in — see [`pinned_by`], where the asymmetry is argued. Ticket 07
-    /// of the thread-lifecycle effort sends only [`BY_THE_USER`]; the neutral
-    /// reset that real activity triggers is ticket 08's.
+    /// is left in — see [`pinned_by`], where the asymmetry is argued. A command
+    /// sends only [`BY_THE_USER`]; the neutral [`BY_ACTIVITY`] reset is this
+    /// server's own and is emitted from [`Change::wakes_the_inbox`].
     ///
     /// It clears `settledAt` rather than stamping a second time, for
     /// [`Change::Unarchived`]'s reason: there is no such thing as when a
@@ -1343,9 +1394,10 @@ impl Change {
     /// **A caller must still ask whether the change is worth making.** An
     /// `Unsettled { reason: "activity" }` over a conversation with no override
     /// lands here as a repeat and would publish a no-op event at a stale
-    /// `updatedAt`. The spec's answer is the guard at the call site — "unsettled
-    /// (activity) *if any override is set*" — and this is a note for ticket 08,
-    /// which is what builds that caller.
+    /// `updatedAt` — a conversation reordered, or not, by work that changed
+    /// nothing about it. The answer is the guard at the call site, and the one
+    /// caller that sends that reason has it: see [`Threads::wake_the_inbox`], which
+    /// refuses the reset when there is no override to reset.
     fn re_emitted_at(&self, thread: &Thread) -> Option<String> {
         let already = match self {
             Change::Settled => thread.lifecycle.settled_override == Some(SETTLED),
@@ -1353,6 +1405,50 @@ impl Change {
             _ => return None,
         };
         already.then(|| thread.updated_at.clone())
+    }
+
+    /// Is this the real activity that owes the conversation a place in the inbox
+    /// again?
+    ///
+    /// **Leaving the inbox must never hide something that needs the developer.**
+    /// The invariants ([`Busy`]) refuse to create that state when the developer
+    /// asks, and it must not be reachable a minute later either: a conversation
+    /// settled while quiet whose agent then asks for permission would sit outside
+    /// the inbox while blocked on a decision only the developer can make. These
+    /// three triggers are what close that, [`Thread::wants_waking`] is the guard
+    /// on all of them, and [`Threads::wake_the_inbox`] is where the reset is
+    /// emitted.
+    ///
+    /// **It resets an override in either direction**, which is why the answer is
+    /// not "does this un-settle it": a conversation the developer pinned *active*
+    /// returns to neutral too, so it can settle itself again once the burst of
+    /// work goes stale. Both go through [`BY_ACTIVITY`], which [`pinned_by`]
+    /// reads as no override at all.
+    ///
+    /// Two of the three are narrow on purpose:
+    ///
+    /// - **A session only counts while it is working.** `ready`, `stopped` and
+    ///   `error` are a status arriving *after* the fact, and one of those must
+    ///   not fight the developer's explicit settle — a conversation whose agent
+    ///   has just finished is the ordinary thing to settle, and a `ready` a moment
+    ///   later would undo it. [`SessionStatus::is_working`] is the same reading [`Busy`]
+    ///   refuses a settle with, deliberately: the settle an agent blocks is the
+    ///   settle a starting agent undoes.
+    /// - **Only a request that blocks on the developer counts.**
+    ///   [`crate::worklog::blocks_on_the_developer`], not any work-log row — a
+    ///   settled conversation would otherwise wake on every tool call of every
+    ///   turn.
+    ///
+    /// A turn request is not narrowed, because there is nothing narrower about
+    /// it: the developer typed something and pressed enter, which is the
+    /// clearest possible statement that they are back in the conversation.
+    fn wakes_the_inbox(&self) -> bool {
+        match self {
+            Change::TurnRequested { .. } => true,
+            Change::Session(session) => session.status.is_working(),
+            Change::Activity(appended) => crate::worklog::blocks_on_the_developer(appended),
+            _ => false,
+        }
     }
 }
 
@@ -1663,6 +1759,12 @@ impl Threads {
     ///
     /// `None` when the thread does not exist — a change published for a thread
     /// nothing has created would describe a conversation no client could open.
+    ///
+    /// **One change can be two events.** Real work in a conversation the
+    /// developer had settled returns it to the inbox, and the answer is then the
+    /// reset's number rather than the change's — see [`Threads::wake_the_inbox`]. Every
+    /// caller here is already right for that, because the answer is the log
+    /// position reached either way.
     pub fn apply(&self, thread_id: &str, change: Change) -> Option<i64> {
         self.apply_unless(thread_id, |_| None, change)?.ok()
     }
@@ -1688,6 +1790,59 @@ impl Threads {
         change: Change,
     ) -> Option<Result<i64, String>> {
         let entry = self.find(thread_id)?;
+        let sequence = match self.commit(&entry, refused, &change)? {
+            Ok(sequence) => sequence,
+            Err(why) => return Some(Err(why)),
+        };
+        // *After* the change that caused it, and after the refusal: a reset
+        // published beside a change that was turned away would be a conversation
+        // woken by work that did not happen. The answer is the later of the two
+        // numbers, which is the shape a turn already answers with when it commits
+        // several events — the log position reached, with everything before it
+        // already published.
+        Some(Ok(self.wake_the_inbox(&entry, &change).unwrap_or(sequence)))
+    }
+
+    /// Return an overridden conversation to the inbox, because real work turned
+    /// up in it.
+    ///
+    /// The three trigger points are [`Change::wakes_the_inbox`], and two of them
+    /// are paths this server already owned — a session change and a work-log
+    /// append — so this is a guarded emission *beside* an event that already
+    /// fires rather than a new mechanism.
+    ///
+    /// [`Thread::wants_waking`] is the guard, and it travels through the refusal
+    /// [`Threads::commit`] already takes for the archive commands rather than
+    /// being asked before the call: that is what puts it under the lock the fold
+    /// runs under and before a sequence is taken, so two triggers arriving at once
+    /// cannot both find an override and both emit. The cost is [`NOTHING_TO_WAKE`]
+    /// — a refusal sentence no client reads, because nothing dispatches this.
+    fn wake_the_inbox(&self, entry: &Arc<Entry>, change: &Change) -> Option<i64> {
+        if !change.wakes_the_inbox() {
+            return None;
+        }
+        self.commit(
+            entry,
+            |thread| (!thread.wants_waking()).then(|| NOTHING_TO_WAKE.to_string()),
+            &Change::Unsettled {
+                reason: BY_ACTIVITY,
+            },
+        )?
+        .ok()
+    }
+
+    /// Fold one change into the conversation this entry holds and publish it.
+    ///
+    /// [`Threads::apply_unless`] without the wake, so that the wake can be one of
+    /// its callers: the reset is a second change against the same conversation,
+    /// and going back through `apply_unless` would ask whether *it* wakes
+    /// anything.
+    fn commit(
+        &self,
+        entry: &Arc<Entry>,
+        refused: impl FnOnce(&Thread) -> Option<String>,
+        change: &Change,
+    ) -> Option<Result<i64, String>> {
         let mut state = lock(&entry.state);
         let thread = state.as_mut()?;
         if let Some(why) = refused(thread) {
@@ -1706,14 +1861,14 @@ impl Threads {
         // argued, and why such a repeat must report the moment the conversation
         // already carried rather than this one.
         let occurred_at = change.re_emitted_at(thread).unwrap_or_else(now_iso);
-        let payload = self.fold(thread, &change, sequence, &occurred_at);
+        let payload = self.fold(thread, change, sequence, &occurred_at);
         thread.updated_at = occurred_at.clone();
 
-        let event = thread_event(sequence, thread_id, change.event_type(), payload, &occurred_at);
+        let event = thread_event(sequence, &thread.id, change.event_type(), payload, &occurred_at);
         let summary = change.reaches_the_shell().then(|| thread.to_shell_value());
         // Under the same lock as the fold, so what is written down is what was
         // just folded in and not whatever a later change left behind.
-        for write in durable(thread, &change) {
+        for write in durable(thread, change) {
             self.inner.transcripts.queue(write);
         }
         drop(state);
@@ -4169,6 +4324,329 @@ pub(crate) mod tests {
         assert_eq!(
             again.updated_at, renamed_at,
             "the repeat moved the conversation in a list it had not changed in"
+        );
+    }
+
+    // -- lifecycle resets on real activity -----------------------------------
+    //
+    // Leaving the inbox must never hide something that needs the developer.
+    // [`Busy`] refuses to create that state when the developer asks; these are
+    // what stop it being reachable a minute later. They live here rather than at
+    // the socket because two of the three cannot be reached from there: a turn
+    // request resets the override before the session or the work log gets a chance
+    // to, so through this server's own dispatch the later two triggers always find
+    // nothing to reset. `tests/socket_activity_resets.rs` drives the first.
+
+    /// A permission request as the module that writes them writes it — so the
+    /// wiring under test is the same constant [`crate::worklog`] reads.
+    fn a_permission() -> crate::protocol::Permission {
+        crate::protocol::Permission {
+            request_id: "req-1".to_string(),
+            tool_name: "Bash".to_string(),
+            input: json!({"command": "ls"}),
+            tool_use_id: Some("toolu_1".to_string()),
+            description: None,
+            suggestions: Vec::new(),
+        }
+    }
+
+    /// Everything published on a conversation's own feed since this was last read.
+    fn events(watching: &mut broadcast::Receiver<Value>) -> Vec<Value> {
+        let mut seen = Vec::new();
+        while let Ok(item) = watching.try_recv() {
+            seen.push(item);
+        }
+        seen
+    }
+
+    /// The same, as the event types alone.
+    fn published(watching: &mut broadcast::Receiver<Value>) -> Vec<String> {
+        events(watching)
+            .iter()
+            .map(|item| {
+                item["event"]["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The last summary the project list was sent.
+    fn last_upsert(shell: &mut broadcast::Receiver<Value>) -> Option<Value> {
+        let mut last = None;
+        while let Ok(item) = shell.try_recv() {
+            last = Some(item);
+        }
+        last
+    }
+
+    fn a_turn_request() -> Change {
+        Change::TurnRequested {
+            turn_id: "turn-1".to_string(),
+            message_id: "message-1".to_string(),
+            model_selection: None,
+            runtime_mode: None,
+            interaction_mode: None,
+        }
+    }
+
+    fn override_on(threads: &Threads, id: &str) -> Option<&'static str> {
+        threads
+            .get(id)
+            .expect("the thread")
+            .lifecycle
+            .settled_override
+    }
+
+    /// A turn the developer asked for resets either override, and the reset is
+    /// published *after* the change that caused it, at its own number.
+    ///
+    /// Both directions through one event: a settled conversation comes back, and
+    /// one the developer pinned *active* returns to neutral so it can settle
+    /// itself again once the burst of work goes stale.
+    #[test]
+    fn a_turn_request_resets_either_override_to_neutral() {
+        let (threads, mut shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        for standing in [Change::Settled, Change::Unsettled { reason: BY_THE_USER }] {
+            threads.apply("thread-1", standing).expect("an override");
+            assert!(override_on(&threads, "thread-1").is_some());
+
+            let _ = published(&mut watching);
+            while shell.try_recv().is_ok() {}
+
+            let answered = threads
+                .apply("thread-1", a_turn_request())
+                .expect("the turn was requested");
+            assert_eq!(override_on(&threads, "thread-1"), None);
+
+            // The reset follows the turn rather than preceding it, and the answer
+            // is the later of the two numbers — the log position reached, which is
+            // the shape a turn already answers with when it commits several
+            // events.
+            let seen = published(&mut watching);
+            assert_eq!(
+                seen,
+                vec!["thread.turn-start-requested", "thread.unsettled"],
+                "the reset did not accompany the turn it was caused by"
+            );
+            let reset = last_upsert(&mut shell).expect("the project list heard the reset");
+            assert_eq!(reset["kind"], "thread-upserted");
+            assert_eq!(reset["sequence"], json!(answered));
+            assert_eq!(reset["thread"]["settledOverride"], Value::Null);
+            assert_eq!(reset["thread"]["settledAt"], Value::Null);
+        }
+    }
+
+    /// A conversation with no override is left alone, which is the guard
+    /// [`Change::re_emitted_at`] asks for: a reset over a conversation with
+    /// nothing to reset would land there as a repeat and publish a no-op event at
+    /// a stale `updatedAt`.
+    #[test]
+    fn work_in_a_conversation_with_no_override_publishes_no_reset() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+        let _ = published(&mut watching);
+
+        for work in [
+            a_turn_request(),
+            Change::Session(running("turn-1")),
+            Change::Activity(crate::worklog::requested(&a_permission(), None)),
+        ] {
+            threads.apply("thread-1", work).expect("applied");
+        }
+
+        let seen = published(&mut watching);
+        assert!(
+            !seen.iter().any(|kind| kind == "thread.unsettled"),
+            "a conversation nobody had settled was woken anyway: {seen:?}"
+        );
+    }
+
+    /// A session wakes a settled conversation only while the agent is *working*.
+    ///
+    /// `ready`, `stopped` and `error` are a status arriving after the fact, and
+    /// one of those must not fight the developer's explicit settle — settling a
+    /// conversation whose agent has just finished is the ordinary case, and a
+    /// `ready` a moment later would undo it.
+    #[test]
+    fn only_a_session_that_is_working_wakes_a_settled_conversation() {
+        for after_the_fact in [
+            SessionStatus::Ready,
+            SessionStatus::Stopped,
+            SessionStatus::Error,
+            SessionStatus::Idle,
+            SessionStatus::Interrupted,
+        ] {
+            let (threads, _shell) = threads();
+            threads.create(a_thread("thread-1")).expect("created");
+            threads.apply("thread-1", Change::Settled).expect("settled");
+
+            threads
+                .apply(
+                    "thread-1",
+                    Change::Session(Session {
+                        status: after_the_fact,
+                        active_turn_id: None,
+                        ..running("turn-1")
+                    }),
+                )
+                .expect("the session changed");
+            assert_eq!(
+                override_on(&threads, "thread-1"),
+                Some(SETTLED),
+                "{} undid the developer's settle",
+                after_the_fact.as_str()
+            );
+        }
+
+        for coming_alive in [SessionStatus::Starting, SessionStatus::Running] {
+            let (threads, _shell) = threads();
+            threads.create(a_thread("thread-1")).expect("created");
+            threads.apply("thread-1", Change::Settled).expect("settled");
+
+            threads
+                .apply(
+                    "thread-1",
+                    Change::Session(Session {
+                        status: coming_alive,
+                        ..running("turn-1")
+                    }),
+                )
+                .expect("the session changed");
+            assert_eq!(
+                override_on(&threads, "thread-1"),
+                None,
+                "{} left the conversation out of the inbox with an agent working in it",
+                coming_alive.as_str()
+            );
+        }
+    }
+
+    /// A request that blocks on the developer wakes a settled conversation; an
+    /// ordinary work-log row does not.
+    ///
+    /// This is the hole ticket 07 shipped knowingly: a conversation settled while
+    /// quiet whose agent then asks for permission would sit outside the inbox
+    /// while blocked on a decision only the developer can make. The negative half
+    /// matters as much — a turn produces dozens of tool rows, and a conversation
+    /// woken by each is one the developer cannot let go of.
+    #[test]
+    fn a_request_that_blocks_on_the_developer_wakes_it_and_a_tool_call_does_not() {
+        let asked = crate::worklog::user_input_requested(
+            &a_permission(),
+            vec![json!({"id": "Which database?", "question": "Which database?"})],
+            None,
+        );
+
+        for blocking in [crate::worklog::requested(&a_permission(), None), asked] {
+            let (threads, mut shell) = threads();
+            threads.create(a_thread("thread-1")).expect("created");
+            threads.apply("thread-1", Change::Settled).expect("settled");
+
+            threads
+                .apply(
+                    "thread-1",
+                    Change::Activity(Activity::tool("tool.invoked", "Read", json!({}), None)),
+                )
+                .expect("a tool row");
+            assert_eq!(
+                override_on(&threads, "thread-1"),
+                Some(SETTLED),
+                "ordinary work woke a conversation the developer had finished with"
+            );
+
+            let kind = blocking.kind.clone();
+            let _ = last_upsert(&mut shell);
+            let answered = threads
+                .apply("thread-1", Change::Activity(blocking))
+                .expect("the request");
+            assert_eq!(
+                override_on(&threads, "thread-1"),
+                None,
+                "{kind} was left waiting outside the inbox"
+            );
+
+            // The list hears the reset even though it does not hear the row that
+            // caused it — an activity does not reach the shell
+            // ([`Change::reaches_the_shell`]) and this is how the conversation
+            // reappears, carrying the raised hand the same summary now reports.
+            let listed = last_upsert(&mut shell).expect("the project list heard the reset");
+            assert_eq!(listed["sequence"], json!(answered));
+            assert_eq!(listed["thread"]["settledOverride"], Value::Null);
+        }
+    }
+
+    /// An archived conversation is not woken, however much work turns up in it.
+    ///
+    /// [`Shelf::holds`] is asked here as well as by both settle commands, so the
+    /// filter and the rule stay one rule: there is no inbox to return an archived
+    /// conversation to, and clearing an override `thread.unsettle` itself refuses
+    /// to touch would lose the developer's decision the moment they unarchived it.
+    /// The safety this ticket is about is not weakened — the client's
+    /// `effectiveSettled` checks its activity blockers before it reads either
+    /// field, so a conversation unarchived while its agent is busy does not
+    /// classify as settled regardless.
+    #[test]
+    fn an_archived_conversation_keeps_its_inbox_state_through_real_work() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.apply("thread-1", Change::Settled).expect("settled");
+        threads
+            .apply("thread-1", Change::Archived)
+            .expect("archived");
+
+        for work in [
+            a_turn_request(),
+            Change::Session(running("turn-1")),
+            Change::Activity(crate::worklog::requested(&a_permission(), None)),
+        ] {
+            threads.apply("thread-1", work).expect("applied");
+            assert_eq!(
+                override_on(&threads, "thread-1"),
+                Some(SETTLED),
+                "work in an archived conversation cleared a decision no command could"
+            );
+        }
+
+        // And it comes back as the developer left it.
+        threads
+            .apply("thread-1", Change::Unarchived)
+            .expect("unarchived");
+        assert_eq!(override_on(&threads, "thread-1"), Some(SETTLED));
+    }
+
+    /// The reset carries the server's own reason and never the user's, which is
+    /// the whole of why it cannot be forged: `user` *pins* a conversation active,
+    /// and a reset that carried it would hold in the inbox a conversation nobody
+    /// had asked to hold there.
+    #[test]
+    fn a_reset_carries_the_neutral_reason() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.apply("thread-1", Change::Settled).expect("settled");
+        while watching.try_recv().is_ok() {}
+
+        threads.apply("thread-1", a_turn_request()).expect("a turn");
+
+        let reasons: Vec<Value> = events(&mut watching)
+            .iter()
+            .filter(|item| item["event"]["type"] == "thread.unsettled")
+            .map(|item| item["event"]["payload"]["reason"].clone())
+            .collect();
+        assert_eq!(reasons, vec![json!(BY_ACTIVITY)]);
+        assert_eq!(
+            pinned_by(BY_ACTIVITY),
+            None,
+            "the neutral reason pinned the conversation instead of releasing it"
         );
     }
 

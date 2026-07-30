@@ -251,7 +251,7 @@ the inbox. A **user** unsettle _pins_ it active, so the client's own auto-settle
 stays suppressed until real work moves it on — it does not return the
 conversation to no override at all. That neutral reset is the server's own,
 carried on the same event with `reason: "activity"`, and the contract lets a
-command send only `user` so it cannot be forged. Emitting it is ticket 08's.
+command send only `user` so it cannot be forged — see **Lifecycle reset** below.
 
 **What may be settled is enforced here; what counts as settled is not.**
 `effectiveSettled` reads these two fields alongside four other things and lives
@@ -262,6 +262,50 @@ an unanswered approval or question, one whose session is `starting` or `running`
 and one whose turn was asked for and not yet adopted. An archived conversation is
 refused by both commands, in the same reading — it is not in the inbox to leave
 and there is no inbox to pin it back into.
+
+**Lifecycle reset** — a conversation returning to the inbox on its own, because
+there is real work in it again. The spec's own phrase.
+`crate::threads::Change::wakes_the_inbox` decides what counts,
+`crate::threads::Thread::wants_waking` is the guard, and
+`crate::threads::Threads::wake_the_inbox` emits the `thread.unsettled` carrying
+`reason: "activity"`.
+
+**Leaving the inbox must never hide something that needs the developer.** The
+invariants above refuse to create that state when the developer asks, and this is
+what stops it being reachable a minute later: a conversation settled while quiet
+whose agent then asks for permission would otherwise sit outside the inbox while
+blocked on a decision only the developer can make. It resets an override in
+_either_ direction — a conversation pinned active returns to neutral too, so it
+can settle itself again once the burst of work goes stale.
+
+**An archived conversation is not woken.** `Shelf::holds` is asked here as well as
+by both commands, so the filter and the rule stay one rule: there is no inbox to
+return an archived conversation to, and clearing an override the commands
+themselves refuse to touch would lose the developer's decision the moment they
+unarchived it. Live work is still never hidden, because the client's
+`effectiveSettled` checks its activity blockers _before_ any override.
+
+Three triggers, two of them narrow on purpose:
+
+| When                                                  | Why it is that narrow                                                                                                                                                                                   |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| a turn is requested                                   | not narrow at all: the developer typed something and pressed enter                                                                                                                                      |
+| the session becomes `starting` or `running`           | `ready`, `stopped` and `error` are a status arriving _after_ the fact and must not fight an explicit settle. `SessionStatus::is_working` is the same reading `Busy` refuses a settle with, deliberately |
+| an approval or a question is appended to the work log | `crate::worklog::blocks_on_the_developer` — any work-log row would wake a settled conversation on every tool call of every turn                                                                         |
+
+Two of the three are paths this server already owned, so the reset is a guarded
+emission _beside_ an event that already fires rather than a new mechanism. The
+guard is `Thread::wants_waking`, and it travels through the refusal
+`Threads::commit` already takes for the archive commands — so it is asked under
+the lock the fold runs under and before a sequence is taken. Without it a reset
+with no override behind it would land in `Change::re_emitted_at` as a repeat and
+put a no-op event on the feed at a stale `updatedAt`, reordering a list the
+developer had not changed anything in.
+
+**One command, two events.** The reset is published after the change that caused
+it, and the dispatch answers with the last of the sequences it committed — the
+shape a turn request already had when it committed three. Snooze is cleared only
+by a new turn, which is ticket 09's.
 
 **Adoption grace** — how long a user message with no turn behind it is still a
 turn about to start rather than stale data. Two minutes either side of now,
@@ -288,10 +332,9 @@ The same flag also lets the client's **inactivity auto-settle** classify at all
 (`SidebarV2.tsx`), so advertising it does more than reveal two menu items: a
 conversation nobody has touched for `autoSettleAfterDays` now leaves the inbox by
 itself. That derivation is the client's and ships unmodified, and its premise —
-that the server un-settles on real activity — is only half true until ticket 08
-emits the three resets. The blockers above hold either way, so live work is never
-hidden; what can happen meanwhile is an auto-settled conversation re-settling
-once a new turn finishes.
+that the server un-settles on real activity — is what **Lifecycle reset** above
+is: an auto-settled conversation comes back the moment there is work in it again,
+rather than staying gone until the developer goes looking.
 
 **Deleting is soft** — `deletedAt` is a stamp, not a `DELETE`. The row, its
 transcript, its work log and its checkpoints are all meant to stay: a hard delete
