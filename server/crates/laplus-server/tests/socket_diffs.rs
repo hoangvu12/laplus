@@ -61,29 +61,6 @@ fn a_repository(files: &[(&str, &str)]) -> Workspace {
     workspace
 }
 
-/// The turn diff for one step, as the panel asks for it: `max(0, n - 1)` to `n`.
-async fn turn_diff(client: &mut harness::SocketClient, thread: &str, turn: u64) -> String {
-    let answered = client
-        .call(
-            "orchestration.getTurnDiff",
-            json!({
-                "threadId": thread,
-                "fromTurnCount": turn.saturating_sub(1),
-                "toTurnCount": turn,
-                "ignoreWhitespace": false,
-            }),
-        )
-        .await
-        .expect_success();
-    assert_eq!(answered["threadId"], thread);
-    assert_eq!(answered["fromTurnCount"], json!(turn.saturating_sub(1)));
-    assert_eq!(answered["toTurnCount"], json!(turn));
-    answered["diff"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a diff is a string: {answered}"))
-        .to_string()
-}
-
 /// The whole conversation as one change.
 async fn thread_diff(client: &mut harness::SocketClient, thread: &str, through: u64) -> String {
     let answered = client
@@ -154,7 +131,7 @@ async fn a_turn_is_reviewable_as_the_diff_of_what_it_changed() {
         .events_through_the_checkpoint(&subscription, 1)
         .await;
 
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(diff.contains("+three"), "the modified file is not in {diff}");
     assert!(
         diff.contains("src/new.txt") && diff.contains("+brand new"),
@@ -228,11 +205,11 @@ async fn a_conversation_is_reviewable_both_step_by_step_and_as_one_change() {
         .events_through_the_checkpoint(&subscription, 2)
         .await;
 
-    let one = turn_diff(&mut client, "thread-1", 1).await;
+    let one = client.turn_diff("thread-1", 1).await;
     assert!(one.contains("first.txt"), "{one}");
     assert!(!one.contains("second.txt"), "turn one predates it: {one}");
 
-    let two = turn_diff(&mut client, "thread-1", 2).await;
+    let two = client.turn_diff("thread-1", 2).await;
     assert!(two.contains("second.txt"), "{two}");
     assert!(
         !two.contains("first.txt"),
@@ -302,7 +279,7 @@ async fn a_diff_covers_files_that_were_added_modified_deleted_and_renamed() {
         .events_through_the_checkpoint(&subscription, 1)
         .await;
 
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(diff.contains("new file mode"), "nothing was added: {diff}");
     assert!(diff.contains("deleted file mode"), "nothing was deleted: {diff}");
     assert!(diff.contains("+three"), "nothing was modified: {diff}");
@@ -359,7 +336,7 @@ async fn a_turn_that_changed_nothing_is_an_empty_diff_rather_than_an_error() {
         .events_through_the_checkpoint(&subscription, 1)
         .await;
 
-    assert_eq!(turn_diff(&mut client, "thread-1", 1).await, "");
+    assert_eq!(client.turn_diff("thread-1", 1).await, "");
     assert_eq!(thread_diff(&mut client, "thread-1", 1).await, "");
 
     // The turn is still *offered*, with an empty file list. A turn missing from
@@ -397,7 +374,7 @@ async fn a_binary_file_is_reported_without_its_contents() {
         .events_through_the_checkpoint(&subscription, 1)
         .await;
 
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(
         diff.contains("logo.bin") && diff.contains("Binary files"),
         "a binary file has to be named rather than rendered: {diff}"
@@ -461,13 +438,13 @@ async fn a_hand_edit_between_turns_belongs_to_the_turn_it_happened_in() {
         .events_through_the_checkpoint(&subscription, 2)
         .await;
 
-    let one = turn_diff(&mut client, "thread-1", 1).await;
+    let one = client.turn_diff("thread-1", 1).await;
     assert!(
         !one.contains("by-hand.txt"),
         "the turn that finished before the edit must not claim it: {one}"
     );
 
-    let two = turn_diff(&mut client, "thread-1", 2).await;
+    let two = client.turn_diff("thread-1", 2).await;
     assert!(
         two.contains("by-hand.txt") && two.contains("the developer wrote this"),
         "an edit made between two turns falls in the second of them: {two}"
@@ -634,7 +611,7 @@ async fn a_restored_conversation_still_offers_its_turns() {
     assert_eq!(recorded[0]["checkpointTurnCount"], json!(1));
     assert_eq!(recorded[0]["files"][0]["path"], "before.txt");
 
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(diff.contains("written before the restart"), "{diff}");
 
     restarted.stop().await;
@@ -676,7 +653,7 @@ async fn a_turn_that_failed_is_recorded_as_a_failure_rather_than_a_clean_one() {
 
     // The work is still reviewable. A turn that went wrong is the one a
     // developer most wants to look at.
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(diff.contains("got this far"), "{diff}");
 
     server.stop().await;
@@ -768,7 +745,7 @@ async fn a_turn_the_developer_stopped_is_not_offered_for_review_on_its_own() {
         "two turns ran and only the one that finished is reviewable: {recorded:#?}"
     );
 
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(
         diff.contains("half-written.txt") && diff.contains("finished.txt"),
         "the stopped turn's work is reviewed as part of the turn that followed it: {diff}"
@@ -806,7 +783,7 @@ async fn a_diff_too_large_to_send_is_cut_and_says_so() {
         .events_through_the_checkpoint(&subscription, 1)
         .await;
 
-    let diff = turn_diff(&mut client, "thread-1", 1).await;
+    let diff = client.turn_diff("thread-1", 1).await;
     assert!(
         diff.len() <= 10_000_000 + 200,
         "the patch was not bounded: {} bytes",

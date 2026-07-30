@@ -17,13 +17,20 @@ use serde_json::Value;
 /// `contents` is what goes in every one of them. Tests that care what is *in* a
 /// file write it themselves — most only care that it is there.
 pub struct Workspace {
+    /// The temporary directory, held so that it is cleaned up.
     directory: tempfile::TempDir,
+    /// Where this workspace actually is, which is usually the directory itself.
+    /// [`Workspace::worktree`] is the exception: it roots one level inside its
+    /// own, because `git worktree add` wants a path that is not there yet.
+    root: PathBuf,
 }
 
 impl Workspace {
     pub fn with(paths: &[&str]) -> Workspace {
+        let directory = tempfile::tempdir().expect("a temporary directory");
         let workspace = Workspace {
-            directory: tempfile::tempdir().expect("a temporary directory"),
+            root: directory.path().to_path_buf(),
+            directory,
         };
         for path in paths {
             workspace.put(path, "contents");
@@ -48,7 +55,31 @@ impl Workspace {
     }
 
     pub fn path(&self) -> &Path {
-        self.directory.path()
+        &self.root
+    }
+
+    /// Check `ref_name` out into a worktree of this repository, on a new ref of
+    /// that name, and hand back a handle to the folder it went in.
+    ///
+    /// Somewhere else entirely, in a temporary directory of its own: a developer
+    /// who runs `git worktree add` puts the second checkout beside the first
+    /// rather than inside it, and a worktree nested in its own repository would
+    /// turn up as an untracked directory in every status the project answers.
+    ///
+    /// This is a developer at a terminal, not a laplus method — the point of the
+    /// case is that a conversation can be pointed at a worktree this server
+    /// neither made nor knows about.
+    pub fn worktree(&self, ref_name: &str) -> Workspace {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let root = directory.path().join("checkout");
+        self.git(&[
+            "worktree",
+            "add",
+            "-b",
+            ref_name,
+            &root.to_string_lossy(),
+        ]);
+        Workspace { directory, root }
     }
 
     /// The root as the client spells it in a `cwd` or `partialPath`.

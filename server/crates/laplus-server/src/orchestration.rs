@@ -252,6 +252,47 @@ pub struct Reviewing {
     pub checkpoints: u64,
 }
 
+/// Where a conversation's work happens: its worktree when it has one, the
+/// project's folder otherwise.
+///
+/// **One rule, stated once, read by both sides.** A conversation is pointed at a
+/// worktree by picking a ref that is current in one — no method here makes a
+/// worktree, and none has to: one made by hand at a terminal is enough to reach
+/// this. Two paths then have to agree about which folder that is, because they
+/// are two views of one turn: the turn path, which is both the folder the agent
+/// is started in and the folder [`crate::checkpoints`] photographs at each turn
+/// boundary ([`Shell::start_turn`], through [`crate::turn::Start`]); and the
+/// review path, which is the folder the diff and the revert are run in
+/// ([`Shell::reviewing`], read by [`Shell::revert_checkpoint`] and by
+/// [`crate::checkpoints::Diff`]).
+///
+/// They did not agree. The review path resolved the worktree; the turn path used
+/// the project's folder unconditionally. **What that cost, precisely**, because
+/// it is easy to get wrong in both directions:
+///
+/// - **The diff panel was right by accident.** A checkpoint is a ref, and a
+///   patch is `git diff` between two of them — it never reads a tree. Refs are
+///   shared with a linked worktree, so a patch run in the worktree resolved
+///   checkpoints captured from the project's folder and showed the agent's own
+///   changes after all.
+/// - **A revert was not.** [`crate::checkpoints::restore`] does write a tree, and
+///   it wrote the tree recorded from the project's folder into the *worktree* —
+///   over a checkout the agent had never touched, and quite possibly over work
+///   the developer had. That is the damage, and nothing in the UI said so.
+///
+/// Writing the rule in one path and describing it in a comment on the other is
+/// what let them drift, so it is a function rather than a comment now.
+///
+/// The client already resolves it this way for the terminal it opens
+/// (`packages/shared/src/projectScripts.ts`, `projectScriptCwd`), which is why a
+/// terminal lands beside the agent rather than needing a rule of its own here.
+fn where_the_work_happens(thread: &Thread, project: &Project) -> String {
+    thread
+        .worktree_path
+        .clone()
+        .unwrap_or_else(|| project.workspace_root.clone())
+}
+
 /// A command that was not carried out, as the client will read it.
 ///
 /// The contract's `OrchestrationDispatchCommandError` carries a message and
@@ -405,14 +446,10 @@ impl Shell {
         let thread = self.open_thread(thread_id)?;
         let project = self.project(&thread.project_id)?;
         Ok(Reviewing {
-            // The worktree when the conversation has one, the project's folder
-            // otherwise — the same rule [`crate::turn::starting`] follows for
-            // where the agent runs, and it has to be, because the tree a
-            // checkpoint recorded is the tree the agent was working in.
-            workspace_root: thread
-                .worktree_path
-                .clone()
-                .unwrap_or(project.workspace_root),
+            // [`where_the_work_happens`], the same call [`Shell::start_turn`]
+            // makes — and it has to be, because the tree a checkpoint recorded
+            // is the tree the agent was working in.
+            workspace_root: where_the_work_happens(&thread, &project),
             // Asked of the registry rather than folded out of the copy above,
             // so that "how far has this conversation been recorded" has one
             // answer — the same one the driver uses to decide what the next
@@ -1302,9 +1339,13 @@ impl Shell {
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;
 
+        // [`where_the_work_happens`], the same call [`Shell::reviewing`] makes
+        // — so the folder the agent edits is the folder the checkpoint records
+        // and the revert puts back. Read off the thread as it stands after the
+        // turn request, for the same reason the model and the runtime mode are.
         let starting = crate::turn::starting(
             &thread,
-            &project.workspace_root,
+            &where_the_work_happens(&thread, &project),
             &config.settings.providers.claude_agent,
         );
         if let Err(why) = crate::turn::send(
@@ -1763,8 +1804,10 @@ impl ThreadFields {
     /// shape of the hole ticket 12 was written about.
     ///
     /// The modes are the only two fields with a closed vocabulary. `title` is
-    /// free text, `modelSelection` is the client's own, and `branch` and
-    /// `worktreePath` are carried and never acted on.
+    /// free text, `modelSelection` is the client's own, `branch` is carried and
+    /// never acted on, and `worktreePath` is a path this server does not
+    /// second-guess — see [`where_the_work_happens`], which is the whole of
+    /// what it does with one.
     fn modes_the_contract_names(&self, thread_id: &str) -> Result<(), CommandError> {
         named_by_the_contract(&self.runtime_mode, &RUNTIME_MODES, "runtime mode", thread_id)?;
         named_by_the_contract(
@@ -2676,10 +2719,25 @@ fn a_title(value: String, subject: &str, id: &str) -> Result<String, CommandErro
 /// where "on branch ''" is worse than either a name or nothing.
 ///
 /// Nothing checks it beyond being non-blank, and that is deliberate rather than
-/// missing. `branch` and `worktreePath` are carried and never acted on
-/// ([`crate::threads`]), so this is not the guard [`crate::refs`] would owe a ref
-/// name it was about to hand to git; it is the contract's own rule, enforced
-/// where the value enters.
+/// missing. `branch` is carried and never acted on, and a `worktreePath` is a
+/// folder rather than an argument — [`where_the_work_happens`] hands it to the
+/// agent and to git as a working directory, where a path that is not there fails
+/// by name and a path that is there needs no permission from this function. So
+/// this is not the guard [`crate::refs`] would owe a ref name it was about to
+/// interpolate; it is the contract's own rule about a spelling, enforced on the
+/// one command that carries it.
+///
+/// **That command is `thread.meta.update` and only that one.** A `thread.create`
+/// — or the bootstrap inside a first turn — does not come through here, so a
+/// client that sent `worktreePath: ""` on one would have a conversation whose
+/// work happens nowhere. No client sends it and the contract forbids it, and
+/// what such a conversation gets is a turn that refuses — a blank working
+/// directory is `NotFound` to the operating system, so the agent never starts
+/// and the refusal names the folder — rather than one that quietly runs in the
+/// project's folder as if the field had been absent. That is the failure worth
+/// having, so this stays a spelling rule rather than growing a second door. It
+/// is named here because the paragraph above would otherwise read as a guarantee
+/// about both.
 ///
 /// Absent and `null` are both passed through; only the blank string is refused.
 fn cleared_or_named(

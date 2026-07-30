@@ -41,6 +41,18 @@ pub fn create_project(id: &str, folder: &Path) -> Value {
 /// [`SocketClient::open_conversation_in`] for why the tests create it up front
 /// rather than watching a draft.
 pub fn create_thread(project_id: &str, thread_id: &str) -> Value {
+    create_thread_at(project_id, thread_id, None)
+}
+
+/// The same, for a conversation the developer pointed at a worktree.
+///
+/// `worktreePath` is one of the fields the composer sends on the thread it asks
+/// for. It is set by picking a ref that is current in a worktree — something a
+/// developer reaches with `git worktree add` and no help from this server — and
+/// what the server then does with it is the whole of
+/// `orchestration::where_the_work_happens`. `branch` stays null either way: the
+/// server carries it and acts on nothing, so no test here has a use for it.
+pub fn create_thread_at(project_id: &str, thread_id: &str, worktree: Option<&Path>) -> Value {
     json!({
         "type": "thread.create",
         "commandId": format!("test:thread:{thread_id}"),
@@ -51,7 +63,10 @@ pub fn create_thread(project_id: &str, thread_id: &str) -> Value {
         "runtimeMode": "full-access",
         "interactionMode": "default",
         "branch": Value::Null,
-        "worktreePath": Value::Null,
+        "worktreePath": match worktree {
+            Some(path) => json!(path.to_string_lossy()),
+            None => Value::Null,
+        },
         "createdAt": "2026-07-26T00:23:04.909Z",
     })
 }
@@ -121,6 +136,21 @@ fn turn_start(
                 "createdAt": "2026-07-26T00:23:04.909Z",
             },
         },
+        "createdAt": "2026-07-26T00:23:04.909Z",
+    })
+}
+
+/// The `thread.checkpoint.revert` `revertThreadCheckpoint` builds.
+///
+/// `createdAt` is sent because the contract requires it of the client. This
+/// server ignores it — see `orchestration::RevertCheckpointPayload` — and no
+/// test reads it back.
+pub fn revert_checkpoint(thread_id: &str, turn_count: u64) -> Value {
+    json!({
+        "type": "thread.checkpoint.revert",
+        "commandId": format!("test:revert:{thread_id}:{turn_count}"),
+        "threadId": thread_id,
+        "turnCount": turn_count,
         "createdAt": "2026-07-26T00:23:04.909Z",
     })
 }
@@ -313,6 +343,23 @@ impl SocketClient {
         project_id: &str,
         thread_id: &str,
     ) -> String {
+        self.open_conversation_at(workspace, project_id, thread_id, None)
+            .await
+    }
+
+    /// The same, for a conversation whose work happens in a worktree of the
+    /// project rather than in the project's own folder.
+    ///
+    /// The project is still registered at its own root — that is the whole point
+    /// of the case: the developer registered a repository and then pointed one
+    /// conversation at a checkout of it somewhere else.
+    pub async fn open_conversation_at(
+        &mut self,
+        workspace: &Workspace,
+        project_id: &str,
+        thread_id: &str,
+        worktree: Option<&Path>,
+    ) -> String {
         self.call(
             "orchestration.dispatchCommand",
             create_project(project_id, workspace.path()),
@@ -321,7 +368,7 @@ impl SocketClient {
         .expect_success();
         self.call(
             "orchestration.dispatchCommand",
-            create_thread(project_id, thread_id),
+            create_thread_at(project_id, thread_id, worktree),
         )
         .await
         .expect_success();
@@ -470,6 +517,57 @@ impl SocketClient {
             _ => false,
         })
         .await
+    }
+
+    /// Read the turn out up to and including the moment the working tree has
+    /// been put back.
+    ///
+    /// One event later than the *answer* to the revert, and the gap between them
+    /// is the whole shape of that command: the dispatch records that a revert was
+    /// asked for, and the restore happens off the read loop because it touches a
+    /// disk. A test that looked at files on the answer would be racing a `git`.
+    ///
+    /// A *snapshot* does not end this read, unlike the checkpoint's own reader:
+    /// the server leaves the conversation alone across a revert, so there is
+    /// nothing in a snapshot that would say one had happened.
+    pub async fn events_through_the_revert(
+        &mut self,
+        subscription: &str,
+        turn_count: u64,
+    ) -> Vec<Value> {
+        self.values_until(subscription, |item| {
+            item["kind"] == json!("event")
+                && item["event"]["type"] == json!("thread.reverted")
+                && item["event"]["payload"]["turnCount"] == json!(turn_count)
+        })
+        .await
+    }
+
+    /// The diff of one turn, as the panel asks for it: `max(0, n - 1)` to `n`.
+    ///
+    /// The echoed fields are asserted here rather than by each caller, because
+    /// they are the same three every time and a panel that got them back wrong
+    /// would render one turn's patch under another turn's heading.
+    pub async fn turn_diff(&mut self, thread_id: &str, turn: u64) -> String {
+        let answered = self
+            .call(
+                "orchestration.getTurnDiff",
+                json!({
+                    "threadId": thread_id,
+                    "fromTurnCount": turn.saturating_sub(1),
+                    "toTurnCount": turn,
+                    "ignoreWhitespace": false,
+                }),
+            )
+            .await
+            .expect_success();
+        assert_eq!(answered["threadId"], thread_id);
+        assert_eq!(answered["fromTurnCount"], json!(turn.saturating_sub(1)));
+        assert_eq!(answered["toTurnCount"], json!(turn));
+        answered["diff"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a diff is a string: {answered}"))
+            .to_string()
     }
 
     /// Read the turn out up to and including the agent asking for permission,

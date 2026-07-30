@@ -76,8 +76,12 @@
 //!   which owns what those rows look like, and `checkpoints` holds the turns
 //!   that can be reviewed as a diff — see [`crate::checkpoints`], which owns
 //!   what is behind one.
-//! - **Worktrees.** `branch` and `worktreePath` are carried and never acted on.
-//!   A `thread.turn.start` that asks for a worktree to be prepared is refused by
+//! - **Worktrees.** `branch` is carried and never acted on. `worktreePath` is
+//!   acted on in exactly one way: it says which folder the conversation's work
+//!   happens in — the agent's, the checkpoints' and a revert's, all through
+//!   [`crate::orchestration`]'s `where_the_work_happens`. That is *obeying* a
+//!   worktree the developer made, not *giving* a thread one: a
+//!   `thread.turn.start` that asks for one to be prepared is still refused by
 //!   name rather than silently run in the project root — see
 //!   [`crate::orchestration`].
 

@@ -28,9 +28,11 @@
 mod harness;
 
 use harness::agent::{deletes, writes, ScriptedAgent, WORKING_DIRECTORY_MARKER};
-use harness::conversation::{activity, create_project, create_thread, follow_up, start_turn};
+use harness::conversation::{
+    activity, create_project, create_thread, follow_up, revert_checkpoint, start_turn,
+};
 use harness::workspace::Workspace;
-use harness::{SocketClient, TestServer};
+use harness::TestServer;
 use serde_json::{json, Value};
 
 /// The lines a scripted turn is made of, either side of whatever it does to the
@@ -40,21 +42,6 @@ const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s","model"
 const SAID: &str =
     r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
 const DONE: &str = r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","num_turns":1,"duration_ms":10,"total_cost_usd":0.001}"#;
-
-/// The `thread.checkpoint.revert` `revertThreadCheckpoint` builds.
-///
-/// `createdAt` is sent because the contract requires it of the client. This
-/// server ignores it — see `orchestration::RevertCheckpointPayload` — and
-/// nothing below reads it back.
-fn revert(thread_id: &str, turn_count: u64) -> Value {
-    json!({
-        "type": "thread.checkpoint.revert",
-        "commandId": format!("test:revert:{thread_id}:{turn_count}"),
-        "threadId": thread_id,
-        "turnCount": turn_count,
-        "createdAt": "2026-07-26T00:23:04.909Z",
-    })
-}
 
 /// A repository with one committed file and one the developer left untracked.
 ///
@@ -79,31 +66,6 @@ fn a_repository() -> Workspace {
     // it. A file git has never been told about is what an agent mostly produces.
     workspace.put("untracked.txt", "before the turn\n");
     workspace
-}
-
-/// Read a thread subscription up to and including the moment the working tree
-/// has been put back.
-///
-/// One event later than the answer, and the gap between them is the whole shape
-/// of this command: the dispatch records that a revert was asked for, and the
-/// restore happens off the read loop because it touches a disk. A test that
-/// looked at files on the answer would be racing it.
-///
-/// A *snapshot* does not end this read, unlike the checkpoint's own reader: the
-/// server leaves the conversation alone across a revert, so there is nothing in
-/// a snapshot that would say one had happened.
-async fn events_through_the_revert(
-    client: &mut SocketClient,
-    subscription: &str,
-    turn_count: u64,
-) -> Vec<Value> {
-    client
-        .values_until(subscription, |item| {
-            item["kind"] == json!("event")
-                && item["event"]["type"] == json!("thread.reverted")
-                && item["event"]["payload"]["turnCount"] == json!(turn_count)
-        })
-        .await
 }
 
 /// The event types a subscriber saw, in order.
@@ -161,10 +123,10 @@ async fn a_turn_is_undone_and_the_project_is_put_back_to_how_it_looked() {
     // names when the developer reverts the conversation's first message:
     // `max(0, n - 1)` in `ChatView.tsx`.
     client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_success();
-    events_through_the_revert(&mut client, &subscription, 0).await;
+    client.events_through_the_revert(&subscription, 0).await;
 
     assert_eq!(
         workspace.read("kept.txt"),
@@ -241,14 +203,14 @@ async fn a_revert_answers_first_and_publishes_its_completion_after_the_tree_is_w
     let watching = watcher.watch_conversation("thread-1").await;
 
     let answered = client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_success();
     let sequence = answered["sequence"]
         .as_i64()
         .unwrap_or_else(|| panic!("a revert answers with a sequence: {answered}"));
 
-    let seen = events_through_the_revert(&mut client, &subscription, 0).await;
+    let seen = client.events_through_the_revert(&subscription, 0).await;
     assert_eq!(
         event_types(&seen),
         vec!["thread.checkpoint-revert-requested", "thread.reverted"],
@@ -273,7 +235,7 @@ async fn a_revert_answers_first_and_publishes_its_completion_after_the_tree_is_w
     );
 
     // And the other window heard the same two things.
-    let elsewhere = events_through_the_revert(&mut watcher, &watching, 0).await;
+    let elsewhere = watcher.events_through_the_revert(&watching, 0).await;
     assert_eq!(
         event_types(&elsewhere),
         vec!["thread.checkpoint-revert-requested", "thread.reverted"],
@@ -319,10 +281,10 @@ async fn a_revert_names_a_turn_and_keeps_everything_before_it() {
     client.events_through_the_checkpoint(&subscription, 2).await;
 
     client
-        .call("orchestration.dispatchCommand", revert("thread-1", 1))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 1))
         .await
         .expect_success();
-    events_through_the_revert(&mut client, &subscription, 1).await;
+    client.events_through_the_revert(&subscription, 1).await;
 
     assert_eq!(
         workspace.read("first.txt"),
@@ -398,10 +360,10 @@ async fn a_project_inside_a_repository_reverts_itself_and_nothing_above_it() {
     workspace.git(&["commit", "-m", "work outside the project"]);
 
     client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_success();
-    events_through_the_revert(&mut client, &subscription, 0).await;
+    client.events_through_the_revert(&subscription, 0).await;
 
     assert!(
         !package.join("new.txt").exists(),
@@ -452,10 +414,10 @@ async fn a_revert_does_not_reach_the_project_list() {
     lists.ack(&shell).await;
 
     client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_success();
-    events_through_the_revert(&mut client, &subscription, 0).await;
+    client.events_through_the_revert(&subscription, 0).await;
 
     // A rename is the nearest change that does reach the list, so it is what
     // proves the two revert events were not simply still in flight.
@@ -511,10 +473,10 @@ async fn reverting_to_the_turn_the_tree_already_matches_is_harmless() {
 
     for _ in 0..2 {
         client
-            .call("orchestration.dispatchCommand", revert("thread-1", 1))
+            .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 1))
             .await
             .expect_success();
-        events_through_the_revert(&mut client, &subscription, 1).await;
+        client.events_through_the_revert(&subscription, 1).await;
 
         assert_eq!(
             workspace.read("only.txt"),
@@ -554,10 +516,10 @@ async fn a_revert_leaves_the_conversation_where_it_was() {
     let before = server.connect().await.into_thread_snapshot("thread-1").await;
 
     client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_success();
-    events_through_the_revert(&mut client, &subscription, 0).await;
+    client.events_through_the_revert(&subscription, 0).await;
 
     let after = server.connect().await.into_thread_snapshot("thread-1").await;
     for kept in ["messages", "activities", "checkpoints"] {
@@ -617,7 +579,7 @@ async fn a_restore_that_fails_is_reported_as_a_failure_rather_than_a_completion(
     }
 
     client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_success();
 
@@ -665,7 +627,7 @@ async fn a_revert_of_a_turn_with_no_checkpoint_is_refused_by_name() {
 
     // Before any turn has finished, every turn is one with nothing behind it.
     let refusal = client
-        .call("orchestration.dispatchCommand", revert("thread-1", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 0))
         .await
         .expect_declared("OrchestrationDispatchCommandError");
     let message = refusal["message"].as_str().unwrap_or_default();
@@ -682,7 +644,7 @@ async fn a_revert_of_a_turn_with_no_checkpoint_is_refused_by_name() {
 
     // One turn recorded, so turn two is still past the end of the conversation.
     let refusal = client
-        .call("orchestration.dispatchCommand", revert("thread-1", 2))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-1", 2))
         .await
         .expect_declared("OrchestrationDispatchCommandError");
     let message = refusal["message"].as_str().unwrap_or_default();
@@ -694,7 +656,7 @@ async fn a_revert_of_a_turn_with_no_checkpoint_is_refused_by_name() {
     // A conversation this server has never heard of is refused by name, not by
     // turn: there is no conversation to have a turn.
     let refusal = client
-        .call("orchestration.dispatchCommand", revert("thread-9", 0))
+        .call("orchestration.dispatchCommand", revert_checkpoint("thread-9", 0))
         .await
         .expect_declared("OrchestrationDispatchCommandError");
     let message = refusal["message"].as_str().unwrap_or_default();
