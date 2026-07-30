@@ -231,6 +231,101 @@ pub struct Thread {
     /// not in this server's transcript, and this id is the handle on it. `None`
     /// until an agent has announced itself for this thread.
     pub agent_session_id: Option<String>,
+    /// Where this conversation sits in the developer's inbox — see
+    /// [`Lifecycle`].
+    pub lifecycle: Lifecycle,
+}
+
+/// **Inbox state**: whether a conversation belongs in the developer's working
+/// list, and until when.
+///
+/// The six fields the contract declares on both renderings of a thread, in one
+/// shape because they are emitted twice. Before ticket 01 of the
+/// thread-lifecycle effort they were two independent lists of `null` literals on
+/// the two `json!` blocks below, which is a shape that agrees until somebody adds
+/// a seventh field to one of them.
+///
+/// **Not [`crate::settling`]**, despite `settled_override` and `settled_at`.
+/// Settling is reading a session status as how a *turn* went; this is whether a
+/// *thread* is in the inbox. The field names are the contract's and are not
+/// negotiable — see the **Inbox state** entry in `CONTEXT.md`.
+///
+/// **This server does not classify.** `effectiveSettled`, `effectiveSnoozed`,
+/// `threadRaisedHandWhileSnoozed` and the rest already exist in
+/// `@t3tools/client-runtime`, with their own suite, and are what the developer
+/// actually sees. A Rust copy would be a fourth copy of a rule this repository
+/// already keeps three of — which is a thing this repository *could* do, since
+/// ADR-0012 makes the client ordinary work, and does not. In particular a snooze
+/// expires by being *read*: once `snoozed_until` is in the past the client stops
+/// counting the thread as snoozed, so there is no timer here and nothing to
+/// schedule.
+///
+/// Every field is `None` on a thread nothing has been done to, which is the same
+/// answer a row written before the columns existed gives back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lifecycle {
+    pub archived_at: Option<String>,
+    /// The developer's standing answer to "is this finished?", overriding what
+    /// the client would otherwise derive. One of the contract's two literals —
+    /// see [`settled_override`] for why it is not a free string.
+    pub settled_override: Option<&'static str>,
+    pub settled_at: Option<String>,
+    /// When the conversation comes back to the inbox on its own.
+    pub snoozed_until: Option<String>,
+    pub snoozed_at: Option<String>,
+    /// Deleting is soft: the row, its transcript and its checkpoints stay, and
+    /// this is the whole of what makes the thread deleted.
+    pub deleted_at: Option<String>,
+}
+
+impl Lifecycle {
+    /// Add the six keys to a rendering of a thread.
+    ///
+    /// Called from both [`Thread::to_detail_value`] and [`Thread::to_shell_value`]
+    /// rather than written out in each, which is the point of the struct: a
+    /// seventh field cannot reach one rendering and miss the other.
+    ///
+    /// The shell summary carries `deletedAt` too, though the contract's
+    /// `OrchestrationThreadShell` does not declare it. A `Schema.Struct` ignores
+    /// a key it does not name, so this costs the client nothing and saves this
+    /// file a second, shorter shape whose only difference would be one omission.
+    ///
+    /// Panics on anything that is not an object, rather than returning and
+    /// leaving the six keys off. Both callers pass a `json!({…})` literal, so
+    /// there is no runtime path to it — and the failure it would otherwise
+    /// produce is the expensive one this module keeps warning about: a snapshot
+    /// missing a key the contract requires, which a client rejects whole.
+    fn write_onto(&self, rendering: &mut Value) {
+        let fields = rendering
+            .as_object_mut()
+            .expect("a rendering of a thread is an object");
+        for (key, value) in [
+            ("archivedAt", json!(self.archived_at)),
+            ("settledOverride", json!(self.settled_override)),
+            ("settledAt", json!(self.settled_at)),
+            ("snoozedUntil", json!(self.snoozed_until)),
+            ("snoozedAt", json!(self.snoozed_at)),
+            ("deletedAt", json!(self.deleted_at)),
+        ] {
+            fields.insert(key.to_string(), value);
+        }
+    }
+}
+
+/// A stored settle override, back as one of the contract's two.
+///
+/// Same reasoning as [`tone`], with a sharper edge: `settledOverride` is a
+/// closed set of two on the wire, so a literal the contract does not name fails
+/// the client's decode of the *whole* conversation rather than drawing a wrong
+/// badge — the argument `CONTEXT.md` makes for the runtime modes. `None` is the
+/// answer for anything else, and it is the honest one: no override is what a
+/// thread has before anybody settles it.
+pub fn settled_override(stored: &str) -> Option<&'static str> {
+    match stored {
+        "settled" => Some("settled"),
+        "active" => Some("active"),
+        _ => None,
+    }
 }
 
 /// A conversation's own row: everything about a thread except what is in it.
@@ -252,6 +347,7 @@ pub struct ThreadRow {
     pub latest_user_message_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub lifecycle: Lifecycle,
 }
 
 /// A thread as the database gives it back: its row, and everything in it.
@@ -434,7 +530,7 @@ impl Thread {
     /// [`crate::projects::Project::to_value`] is: a third of it is constants the
     /// contract requires and a `Serialize` impl would hide which.
     pub fn to_detail_value(&self) -> Value {
-        json!({
+        let mut detail = json!({
             "id": self.id,
             "projectId": self.project_id,
             "title": self.title,
@@ -446,10 +542,6 @@ impl Thread {
             "latestTurn": self.latest_turn.as_ref().map(LatestTurn::to_value),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "archivedAt": Value::Null,
-            "settledOverride": Value::Null,
-            "settledAt": Value::Null,
-            "deletedAt": Value::Null,
             "messages": self.messages.iter().map(Message::to_value).collect::<Vec<Value>>(),
             "proposedPlans": [],
             "activities": self.activities.iter().map(Activity::to_value).collect::<Vec<Value>>(),
@@ -459,7 +551,9 @@ impl Thread {
                 .map(Checkpoint::to_value)
                 .collect::<Vec<Value>>(),
             "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
-        })
+        });
+        self.lifecycle.write_onto(&mut detail);
+        detail
     }
 
     /// The `OrchestrationThreadShell` the project list carries — the same thread
@@ -474,7 +568,7 @@ impl Thread {
     /// `true` nothing could act on would put a badge on a thread with nothing
     /// behind it.
     pub fn to_shell_value(&self) -> Value {
-        json!({
+        let mut summary = json!({
             "id": self.id,
             "projectId": self.project_id,
             "title": self.title,
@@ -486,9 +580,6 @@ impl Thread {
             "latestTurn": self.latest_turn.as_ref().map(LatestTurn::to_value),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "archivedAt": Value::Null,
-            "settledOverride": Value::Null,
-            "settledAt": Value::Null,
             "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
             "latestUserMessageAt": self.latest_user_message_at,
             // Derived from the work log rather than counted beside it, because
@@ -501,7 +592,9 @@ impl Thread {
             "hasPendingUserInput": !crate::worklog::unanswered_user_input(&self.activities)
                 .is_empty(),
             "hasActionableProposedPlan": false,
-        })
+        });
+        self.lifecycle.write_onto(&mut summary);
+        summary
     }
 
     /// The model slug to start the agent with, if the selection names one.
@@ -528,6 +621,7 @@ impl Thread {
             latest_user_message_at: self.latest_user_message_at.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 
@@ -577,6 +671,10 @@ impl Thread {
             latest_turn,
             latest_user_message_at: row.latest_user_message_at,
             agent_session_id: row.agent_session_id,
+            // Kept for the same reason the checkpoints are: an archived or
+            // snoozed conversation that came back from a restart in the inbox
+            // would undo the developer's curation every time the window opened.
+            lifecycle: row.lifecycle,
         }
     }
 }
@@ -2547,6 +2645,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// The six keys [`Lifecycle`] writes, as the contract spells them.
+    const LIFECYCLE_KEYS: [&str; 6] = [
+        "archivedAt",
+        "settledOverride",
+        "settledAt",
+        "snoozedUntil",
+        "snoozedAt",
+        "deletedAt",
+    ];
+
     /// The least conversation there can be. Shared with `crate::rpc`'s tests,
     /// which need one to subscribe to and have no other way to make one.
     pub(crate) fn a_thread(id: &str) -> Thread {
@@ -2568,6 +2676,7 @@ pub(crate) mod tests {
             latest_turn: None,
             latest_user_message_at: None,
             agent_session_id: None,
+            lifecycle: Lifecycle::default(),
         }
     }
 
@@ -3223,6 +3332,8 @@ pub(crate) mod tests {
             "archivedAt",
             "settledOverride",
             "settledAt",
+            "snoozedUntil",
+            "snoozedAt",
             "deletedAt",
             "messages",
             "proposedPlans",
@@ -3249,6 +3360,13 @@ pub(crate) mod tests {
             "archivedAt",
             "settledOverride",
             "settledAt",
+            "snoozedUntil",
+            "snoozedAt",
+            // `deletedAt` is deliberately not here: the contract's
+            // `OrchestrationThreadShell` does not declare it, and this test is
+            // about the keys it does. That the summary carries it anyway is
+            // argued on `Lifecycle::write_onto` and pinned by
+            // [`both_renderings_read_the_lifecycle_from_one_shape`].
             "session",
             "latestUserMessageAt",
             "hasPendingApprovals",
@@ -3266,6 +3384,63 @@ pub(crate) mod tests {
         assert_eq!(session["threadId"], "thread-1");
         assert_eq!(session["status"], "running");
         assert_eq!(session["providerName"], crate::provider::INSTANCE_ID);
+    }
+
+    /// Ticket 01 of the thread-lifecycle effort: the six fields are one shape
+    /// emitted twice rather than two lists of literals that happen to agree.
+    ///
+    /// Asserted as "the two renderings say the same thing" rather than by
+    /// reading each value twice, because the failure this guards is a field
+    /// reaching one of them and not the other.
+    #[test]
+    fn both_renderings_read_the_lifecycle_from_one_shape() {
+        let (threads, _shell) = threads();
+        let mut thread = a_thread("thread-1");
+        thread.lifecycle = Lifecycle {
+            archived_at: Some("2026-07-30T09:00:00.000Z".to_string()),
+            settled_override: Some("settled"),
+            settled_at: Some("2026-07-30T09:01:00.000Z".to_string()),
+            snoozed_until: Some("2026-07-31T09:00:00.000Z".to_string()),
+            snoozed_at: Some("2026-07-30T09:02:00.000Z".to_string()),
+            deleted_at: Some("2026-07-30T09:03:00.000Z".to_string()),
+        };
+        threads.create(thread).expect("created");
+        let thread = threads.get("thread-1").expect("the thread");
+
+        let detail = thread.to_detail_value();
+        let summary = thread.to_shell_value();
+        for key in LIFECYCLE_KEYS {
+            assert!(!detail[key].is_null(), "the detail dropped {key}: {detail}");
+            assert_eq!(detail[key], summary[key], "{key} disagrees");
+        }
+        assert_eq!(detail["settledOverride"], "settled");
+        assert_eq!(detail["snoozedUntil"], "2026-07-31T09:00:00.000Z");
+    }
+
+    /// A thread nothing has been done to reports all six as `null` — the same
+    /// answer a row written before the columns existed gives back, which is what
+    /// makes the two indistinguishable.
+    #[test]
+    fn a_thread_nothing_has_been_done_to_is_null_on_all_six() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        let thread = threads.get("thread-1").expect("the thread");
+
+        for key in LIFECYCLE_KEYS {
+            assert_eq!(thread.to_detail_value()[key], Value::Null, "{key}");
+            assert_eq!(thread.to_shell_value()[key], Value::Null, "{key}");
+        }
+    }
+
+    /// A stored override that is not one of the contract's two is no override.
+    /// Passing it through would fail the client's decode of the whole
+    /// conversation — see [`settled_override`].
+    #[test]
+    fn a_settle_override_the_contract_does_not_name_is_no_override() {
+        assert_eq!(settled_override("settled"), Some("settled"));
+        assert_eq!(settled_override("active"), Some("active"));
+        assert_eq!(settled_override("archived"), None);
+        assert_eq!(settled_override(""), None);
     }
 
     // -- coming back from a restart -----------------------------------------

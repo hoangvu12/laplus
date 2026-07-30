@@ -318,6 +318,39 @@ const MIGRATIONS: &[&str] = &[
         created_at     TEXT NOT NULL
     ) STRICT;
     "#,
+    // v8 — ticket 01 of the thread-lifecycle effort, where a conversation sits
+    // in the developer's inbox.
+    //
+    // Six columns rather than a second table, per ADR-0002: these are properties
+    // of the thread, and a thread is one row. See `crate::threads::Lifecycle`,
+    // which is the shape they are read and published as.
+    //
+    // **Nullable with no default**, which is the whole point of the migration
+    // rather than an omission from it. NULL already means "never happened"
+    // everywhere else in this table, so a row written before today reads back
+    // indistinguishable from a thread nobody has archived, settled, snoozed or
+    // deleted — and `ALTER TABLE ADD COLUMN` fills the existing rows with
+    // exactly that.
+    //
+    // No index. The project list is a few dozen conversations read whole on
+    // every snapshot, and this database sorts and joins on ids and timestamps
+    // and nothing else — an index here would be for a query nobody writes.
+    r#"
+    ALTER TABLE threads ADD COLUMN archived_at      TEXT;
+    -- One of the contract's two literals, `settled` or `active`, and read back
+    -- through `crate::threads::settled_override` so that anything else is no
+    -- override rather than a value the client cannot decode.
+    ALTER TABLE threads ADD COLUMN settled_override TEXT;
+    ALTER TABLE threads ADD COLUMN settled_at       TEXT;
+    -- When the conversation comes back on its own. There is no timer behind
+    -- this: a snooze expires by being read, in the client. See `Lifecycle`.
+    ALTER TABLE threads ADD COLUMN snoozed_until    TEXT;
+    ALTER TABLE threads ADD COLUMN snoozed_at       TEXT;
+    -- Deleting is soft, so this is the whole of what makes a thread deleted —
+    -- the row, its transcript and its checkpoints all stay, and the git refs a
+    -- turn wrote are not orphaned.
+    ALTER TABLE threads ADD COLUMN deleted_at       TEXT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -408,7 +441,8 @@ fn pairing_link_from_row(row: &Row<'_>) -> rusqlite::Result<PairingLink> {
 /// The thread table's columns, in the order [`thread_from_row`] reads them.
 const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mode, \
      interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
-     latest_user_message_at, created_at, updated_at";
+     latest_user_message_at, created_at, updated_at, archived_at, settled_override, \
+     settled_at, snoozed_until, snoozed_at, deleted_at";
 
 /// The registry's durable half.
 #[derive(Debug)]
@@ -1720,8 +1754,10 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
         .execute(
             "INSERT INTO threads (id, project_id, title, model_selection, runtime_mode, \
                 interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
-                latest_user_message_at, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                latest_user_message_at, created_at, updated_at, archived_at, \
+                settled_override, settled_at, snoozed_until, snoozed_at, deleted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                ?16, ?17, ?18, ?19) \
              ON CONFLICT (id) DO UPDATE SET \
                 project_id = excluded.project_id, \
                 title = excluded.title, \
@@ -1733,7 +1769,13 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 agent_session_id = excluded.agent_session_id, \
                 latest_turn = excluded.latest_turn, \
                 latest_user_message_at = excluded.latest_user_message_at, \
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at, \
+                archived_at = excluded.archived_at, \
+                settled_override = excluded.settled_override, \
+                settled_at = excluded.settled_at, \
+                snoozed_until = excluded.snoozed_until, \
+                snoozed_at = excluded.snoozed_at, \
+                deleted_at = excluded.deleted_at",
             rusqlite::params![
                 thread.id,
                 thread.project_id,
@@ -1748,6 +1790,17 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 thread.latest_user_message_at,
                 thread.created_at,
                 thread.updated_at,
+                // The six travel with the rest of the row rather than in a
+                // statement of their own, unlike `remember_agent_session` below:
+                // they arrive from `crate::threads` on the same in-memory
+                // conversation every other column here comes from, so an update
+                // that left them behind would be the row disagreeing with itself.
+                thread.lifecycle.archived_at,
+                thread.lifecycle.settled_override,
+                thread.lifecycle.settled_at,
+                thread.lifecycle.snoozed_until,
+                thread.lifecycle.snoozed_at,
+                thread.lifecycle.deleted_at,
             ],
         )
         .map_err(StorageError::while_("store the conversation"))?;
@@ -1905,6 +1958,7 @@ fn remember_agent_session(
 fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
     let model_selection: String = row.get(3)?;
     let latest_turn: Option<String> = row.get(9)?;
+    let settled_override: Option<String> = row.get(14)?;
 
     Ok(ThreadRow {
         id: row.get(0)?,
@@ -1923,6 +1977,16 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         latest_user_message_at: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        lifecycle: crate::threads::Lifecycle {
+            archived_at: row.get(13)?,
+            settled_override: settled_override
+                .as_deref()
+                .and_then(crate::threads::settled_override),
+            settled_at: row.get(15)?,
+            snoozed_until: row.get(16)?,
+            snoozed_at: row.get(17)?,
+            deleted_at: row.get(18)?,
+        },
     })
 }
 
@@ -2421,6 +2485,75 @@ mod tests {
         }
     }
 
+    /// The companion the appended migration needs: an existing database gains
+    /// the six lifecycle columns, and the rows already in it read back as never
+    /// archived, settled, snoozed or deleted.
+    ///
+    /// Built by applying the *released* migrations up to v7, which is what a
+    /// file on a developer's disk actually is. A test that wrote the current
+    /// schema by hand and then read it back would be asserting its own setup —
+    /// the claim here is specifically that a database without these columns
+    /// opens.
+    ///
+    /// **Pinned to 7 rather than `MIGRATIONS.len() - 1`.** The relative form
+    /// reads better and quietly stops testing anything the moment a v9 is
+    /// appended: it would then build a v8 database, which already has the six
+    /// columns, and the assertion below would pass on a row that was never
+    /// migrated at all.
+    #[test]
+    fn a_database_at_the_previous_version_gains_the_lifecycle_columns() {
+        const BEFORE_THE_LIFECYCLE: usize = 7;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+
+        {
+            let connection = Connection::open(&path).expect("creates the file");
+            for (index, statements) in MIGRATIONS.iter().take(BEFORE_THE_LIFECYCLE).enumerate() {
+                connection
+                    .execute_batch(&format!(
+                        "BEGIN; {statements} PRAGMA user_version = {}; COMMIT;",
+                        index + 1
+                    ))
+                    .expect("applies a released migration");
+            }
+            // Written by hand rather than through `Database`, which would apply
+            // every migration and defeat the point. Only the columns v7 had.
+            connection
+                .execute(
+                    "INSERT INTO projects \
+                        (id, title, workspace_root, canonical_root, created_at, updated_at) \
+                     VALUES ('project-1', 'A project', '/tmp/p', '/tmp/p', \
+                        '2026-07-26T00:23:04.909Z', '2026-07-26T00:23:04.909Z')",
+                    [],
+                )
+                .expect("a project from before today");
+            connection
+                .execute(
+                    "INSERT INTO threads \
+                        (id, project_id, title, model_selection, runtime_mode, \
+                         interaction_mode, created_at, updated_at) \
+                     VALUES ('thread-1', 'project-1', 'A conversation', \
+                        '{\"instanceId\":\"claudeAgent\"}', 'full-access', 'default', \
+                        '2026-07-26T00:23:04.909Z', '2026-07-26T00:23:04.909Z')",
+                    [],
+                )
+                .expect("a conversation from before today");
+        }
+
+        let database = Database::open(&path).expect("migrates the existing file");
+        let conversations = database.conversations().expect("reads them back");
+
+        assert_eq!(conversations.len(), 1, "the migration lost a conversation");
+        assert_eq!(
+            conversations[0].thread.lifecycle,
+            crate::threads::Lifecycle::default(),
+            "a row older than the columns must be indistinguishable from a \
+             thread nobody has archived, settled, snoozed or deleted"
+        );
+        assert_eq!(conversations[0].thread.title, "A conversation");
+    }
+
     /// A file written by a newer laplus is refused rather than guessed at.
     /// Downgrading and silently ignoring tables you do not understand is how a
     /// registry loses rows.
@@ -2563,6 +2696,7 @@ mod tests {
             latest_user_message_at: None,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),
             updated_at: "2026-07-26T00:23:04.909Z".to_string(),
+            lifecycle: crate::threads::Lifecycle::default(),
         }
     }
 
@@ -2586,6 +2720,16 @@ mod tests {
         });
         thread.latest_user_message_at = Some("2026-07-26T00:23:05.000Z".to_string());
         thread.agent_session_id = Some("session-alpha".to_string());
+        // All six set, and to six *different* values, so a column wired to the
+        // wrong parameter index is a failure here rather than a coincidence.
+        thread.lifecycle = crate::threads::Lifecycle {
+            archived_at: Some("2026-07-26T01:00:00.000Z".to_string()),
+            settled_override: Some("active"),
+            settled_at: Some("2026-07-26T02:00:00.000Z".to_string()),
+            snoozed_until: Some("2026-07-27T03:00:00.000Z".to_string()),
+            snoozed_at: Some("2026-07-26T04:00:00.000Z".to_string()),
+            deleted_at: Some("2026-07-26T05:00:00.000Z".to_string()),
+        };
 
         let messages = vec![
             Message {

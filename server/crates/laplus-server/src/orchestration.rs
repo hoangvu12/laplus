@@ -1423,6 +1423,10 @@ impl CreateThread {
             // Nothing has run yet, so there is no agent session to resume into.
             // The first turn's `init` line is where this is filled in.
             agent_session_id: None,
+            // A new conversation is in the inbox, which is what all six being
+            // absent means. Nothing creates a thread already archived, settled,
+            // snoozed or deleted.
+            lifecycle: crate::threads::Lifecycle::default(),
         }
     }
 }

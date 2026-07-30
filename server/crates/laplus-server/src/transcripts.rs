@@ -348,6 +348,7 @@ mod tests {
             latest_user_message_at: None,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),
             updated_at: "2026-07-26T00:23:04.909Z".to_string(),
+            lifecycle: crate::threads::Lifecycle::default(),
         }
     }
 

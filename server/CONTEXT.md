@@ -195,6 +195,34 @@ different _statuses_ — the developer asked, versus the process went away — a
 both settle a turn as `interrupted`, because from the turn's point of view they
 are the same thing: it did not finish.
 
+**Not inbox state**, below, despite the contract spelling two of that concept's
+fields `settledOverride` and `settledAt`. Settling is a property of a **turn**;
+inbox state is a property of a **thread**. This entry has seniority — it is the
+meaning `crate::settling` owns and the one the code already uses — so the prose
+and the Rust identifiers disambiguate, and the field names, which belong to the
+contract, do not move.
+
+**Inbox state** — whether a conversation belongs in the developer's working
+list, and until when. The contract's six fields on a thread: `archivedAt`,
+`settledOverride`, `settledAt`, `snoozedUntil`, `snoozedAt` and `deletedAt`,
+carried on both renderings of a thread as one shape,
+`crate::threads::Lifecycle`.
+
+**Stored here, classified in the client.** This server keeps the six;
+`effectiveSettled`, `effectiveSnoozed`, `threadRaisedHandWhileSnoozed`,
+`canSettle` and `canSnooze` all already exist in `@t3tools/client-runtime`, with
+their own suite, and are what the developer actually sees. Reimplementing them
+here would be a fourth copy of a rule this repository already keeps three of.
+Two consequences worth naming: a snooze expires by being **read** rather than by
+a timer, so there is nothing to schedule; and a thread raising its hand while
+snoozed does not clear the fields, it only stops them classifying.
+
+**Deleting is soft** — `deletedAt` is a stamp, not a `DELETE`. The row, its
+transcript, its work log and its checkpoints are all meant to stay: a hard delete
+would orphan the git refs the turns wrote and take the transcript with it
+irreversibly. The command that stamps it is ticket 10's; what is here today is
+the field.
+
 **Ending** — how a turn ended, as the driver knows it: completed, failed, or
 stopped. Distinct from turn state because the CLI reports a stopped turn as a
 failed one, so only this server's own knowledge that it asked can tell them
