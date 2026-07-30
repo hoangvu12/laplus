@@ -222,7 +222,19 @@ fn pairing_from(arguments: Vec<String>) -> Result<Invoked, String> {
         return Err("auth pairing revoke needs the id of a code to revoke".to_string());
     }
 
-    let flags = flags_from(rest.into_iter(), &["ttl", "label", "base-url", "port"], &["json"])?;
+    // **`ui` is accepted here and unused, because the launcher always sends
+    // it.** `apps/cli` appends `--ui <its own bundle>` to every invocation it
+    // forwards — it has no notion of verbs, deliberately — so a parser that
+    // refused it would make `npx laplus auth pairing create` impossible while
+    // leaving `laplus-server auth pairing create` working. That is exactly how
+    // this was shipped broken once. It is not a hole in the "an unknown flag is
+    // a refusal" rule either: `--ui` is a real flag of this program's, and the
+    // thing being minted here does not serve pages.
+    let flags = flags_from(
+        rest.into_iter(),
+        &["ttl", "label", "base-url", "port", "ui"],
+        &["json"],
+    )?;
     Ok(Invoked::Pairing(Pairing {
         verb,
         ttl: match flags.get("ttl") {
@@ -814,5 +826,31 @@ mod tests {
         let pairing = pairing_with(&["auth", "pairing", "create", "--label", "  "])
             .expect("a pairing invocation");
         assert_eq!(pairing.label, None);
+    }
+
+    /// **Every verb has to survive the bundle flag.** `apps/cli` appends
+    /// `--ui <bundle>` to everything it forwards, because it is a launcher and
+    /// has no notion of verbs. A verb whose parser refuses it works when run
+    /// directly and fails under `npx laplus`, which is a difference no test
+    /// that runs the binary by hand would ever show — and is how
+    /// `auth pairing create` reached a user broken.
+    #[test]
+    fn every_verb_tolerates_the_bundle_the_launcher_appends() {
+        let bundle = ["--ui", "/home/ubuntu/.npm/_npx/abc/node_modules/laplus/ui/dist"];
+        for verb in [
+            vec!["auth", "pairing", "create"],
+            vec!["auth", "pairing", "list"],
+            vec!["auth", "pairing", "revoke", "pl_123"],
+            vec!["service", "install"],
+            vec!["service", "status"],
+            vec!["service", "uninstall"],
+            vec![],
+        ] {
+            let arguments: Vec<&str> = verb.iter().copied().chain(bundle).collect();
+            assert!(
+                invoked_with(&arguments).is_ok(),
+                "the launcher's own invocation was refused: {arguments:?}"
+            );
+        }
     }
 }
