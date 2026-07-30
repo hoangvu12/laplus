@@ -58,6 +58,16 @@ pub fn iso_from_epoch(seconds: u64, milliseconds: u32) -> String {
     )
 }
 
+/// [`iso_from_epoch`] from one millisecond count rather than two numbers.
+///
+/// For the callers that do arithmetic on an instant before rendering it —
+/// [`crate::threads::Adoption`] draws a window either side of now — where
+/// splitting the seconds off at the call site would be the same division written
+/// out in a place that has no other reason to know about it.
+pub fn iso_from_epoch_millis(millis: u64) -> String {
+    iso_from_epoch(millis / 1_000, (millis % 1_000) as u32)
+}
+
 /// Days since the Unix epoch to a civil year, month and day.
 ///
 /// Howard Hinnant's `civil_from_days`, which is the standard way to do this
@@ -104,9 +114,22 @@ mod tests {
         assert_eq!(iso_from_epoch(4_102_444_800, 0), "2100-01-01T00:00:00.000Z");
     }
 
+    /// The millisecond form renders the same instant the two-number form does,
+    /// which is the whole of what it promises.
+    #[test]
+    fn a_millisecond_count_renders_as_the_same_instant() {
+        assert_eq!(iso_from_epoch_millis(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_from_epoch_millis(1_007), "1970-01-01T00:00:01.007Z");
+        assert_eq!(
+            iso_from_epoch_millis(1_700_000_000_909),
+            iso_from_epoch(1_700_000_000, 909)
+        );
+    }
+
     /// Two timestamps taken in order never go backwards. The registry sorts on
     /// these and the client folds events by them, so a clock that could invert
     /// would reorder a transcript.
+
     #[test]
     fn the_clock_does_not_run_backwards() {
         let first = now_iso();

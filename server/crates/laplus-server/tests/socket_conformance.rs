@@ -118,10 +118,6 @@ const MISSING: &[Declared] = &[
         because: "no server.probe method; the client falls back to probing with server.getConfig",
     },
     Declared {
-        path: "/environment/capabilities/threadSettlement",
-        because: "thread.settle / thread.unsettle are not implemented",
-    },
-    Declared {
         path: "/environment/capabilities/threadSnooze",
         because: "thread.snooze / thread.unsnooze are not implemented",
     },

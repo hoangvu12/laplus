@@ -127,8 +127,32 @@ pub struct Capabilities {
     /// and which is small enough for laplus to serve on repeat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_probe: Option<bool>,
+    /// `thread.settle` and `thread.unsettle`, which ticket 07 of the
+    /// thread-lifecycle effort answers.
+    ///
+    /// **The controls are gated on this**, which is why the flag is part of that
+    /// ticket rather than a note beside it: `useThreadActions.ts` refuses to
+    /// dispatch either command to a server that does not advertise it, and the
+    /// sidebar and the chat view hide the menu items entirely
+    /// (`SidebarV2.tsx`, `ChatView.tsx`). A server that answered both commands and
+    /// left this absent would have built two commands nothing sends.
+    ///
+    /// **It also switches on the client's own inactivity auto-settle**, which is
+    /// the part worth knowing before flipping it: `SidebarV2.tsx` reads the same
+    /// flag before letting `effectiveSettled` classify a thread at all, so a
+    /// conversation nobody has touched for `autoSettleAfterDays` now leaves the
+    /// inbox by itself. That derivation is the client's and ships unmodified
+    /// (ADR-0012), and its premise — that the server un-settles on real
+    /// activity — is only half true until ticket 08 emits the three resets. The
+    /// blockers hold regardless, so live work is never hidden; what can happen
+    /// meanwhile is an auto-settled conversation re-settling once a new turn
+    /// finishes.
+    ///
+    /// This is the whole of what advertising it costs, and the alternative was
+    /// shipping the commands with no control that sends them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_settlement: Option<bool>,
+    /// `thread.snooze` and `thread.unsnooze`. Absent, and ticket 09's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_snooze: Option<bool>,
 }
@@ -445,7 +469,7 @@ impl ServerConfig {
                 capabilities: Capabilities {
                     repository_identity: false,
                     connection_probe: None,
-                    thread_settlement: None,
+                    thread_settlement: Some(true),
                     thread_snooze: None,
                 },
             },
@@ -960,13 +984,15 @@ mod tests {
 
     /// Advertising a capability the server has not built invites the UI to
     /// send commands nothing answers. Every flag here is off until its ticket
-    /// lands.
+    /// lands — and on once it has, because the settle and snooze controls are
+    /// hidden entirely from a server that stays quiet about them.
     #[test]
-    fn no_unbuilt_capability_is_advertised() {
+    fn a_capability_is_advertised_exactly_when_it_has_been_built() {
         let capabilities = ServerConfig::detect().environment.capabilities;
         assert!(!capabilities.repository_identity);
         assert_eq!(capabilities.connection_probe, None);
-        assert_eq!(capabilities.thread_settlement, None);
+        // `thread.settle` and `thread.unsettle`, ticket 07.
+        assert_eq!(capabilities.thread_settlement, Some(true));
         assert_eq!(capabilities.thread_snooze, None);
     }
 
@@ -976,8 +1002,10 @@ mod tests {
         let capabilities = &value["environment"]["capabilities"];
         assert_eq!(capabilities["repositoryIdentity"], serde_json::json!(false));
         assert!(capabilities.get("connectionProbe").is_none());
-        assert!(capabilities.get("threadSettlement").is_none());
         assert!(capabilities.get("threadSnooze").is_none());
+        // And one that is present is the literal `true` the client compares
+        // against, rather than any other truthy shape.
+        assert_eq!(capabilities["threadSettlement"], serde_json::json!(true));
     }
 
     /// Whatever this platform answers, the label is a name rather than an empty

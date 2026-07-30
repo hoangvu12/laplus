@@ -196,11 +196,12 @@ both settle a turn as `interrupted`, because from the turn's point of view they
 are the same thing: it did not finish.
 
 **Not inbox state**, below, despite the contract spelling two of that concept's
-fields `settledOverride` and `settledAt`. Settling is a property of a **turn**;
-inbox state is a property of a **thread**. This entry has seniority — it is the
-meaning `crate::settling` owns and the one the code already uses — so the prose
-and the Rust identifiers disambiguate, and the field names, which belong to the
-contract, do not move.
+fields `settledOverride` and `settledAt` and two of its commands `thread.settle`
+and `thread.unsettle`. Settling is a property of a **turn**; inbox state is a
+property of a **thread**. This entry has seniority — it is the meaning
+`crate::settling` owns and the one the code already uses — so the prose and the
+Rust identifiers disambiguate, and the field names, which belong to the contract,
+do not move. `docs/adr/0024` is the decision and what was weighed against it.
 
 **Inbox state** — whether a conversation belongs in the developer's working
 list, and until when. The contract's six fields on a thread: `archivedAt`,
@@ -237,6 +238,60 @@ is a move between two lists rather than a write of a value the developer chose,
 so a second archive is a click on a control that is no longer there. The refusal
 is decided under the fold's own lock — `crate::threads::Threads::apply_unless`,
 which exists for this.
+
+**Settling a conversation** — the developer's standing answer to "am I finished
+with this?", overriding what the client would otherwise derive.
+`thread.settle` writes `settledOverride: "settled"` and stamps `settledAt`;
+`thread.unsettle` clears the stamp and writes `settledOverride: "active"`.
+`crate::orchestration::Shell::settle` and its twin. **Not `crate::settling`** —
+see the entry above and `docs/adr/0024`.
+
+**The two directions are not symmetrical.** A settle takes a conversation out of
+the inbox. A **user** unsettle _pins_ it active, so the client's own auto-settle
+stays suppressed until real work moves it on — it does not return the
+conversation to no override at all. That neutral reset is the server's own,
+carried on the same event with `reason: "activity"`, and the contract lets a
+command send only `user` so it cannot be forged. Emitting it is ticket 08's.
+
+**What may be settled is enforced here; what counts as settled is not.**
+`effectiveSettled` reads these two fields alongside four other things and lives
+in the bundled client runtime — see **Inbox state**. The _invariants_ are this
+server's, because the client's copy of them exists to avoid a round trip:
+`crate::threads::Busy` is `canSettle` mirrored, and refuses a conversation with
+an unanswered approval or question, one whose session is `starting` or `running`,
+and one whose turn was asked for and not yet adopted. An archived conversation is
+refused by both commands, in the same reading — it is not in the inbox to leave
+and there is no inbox to pin it back into.
+
+**Adoption grace** — how long a user message with no turn behind it is still a
+turn about to start rather than stale data. Two minutes either side of now,
+mirrored from the client, and held as two _rendered_ stamps
+(`crate::threads::Adoption`): every timestamp on this wire is one fixed-width UTC
+shape, so it orders lexicographically and the window needs no calendar.
+
+**Idempotence by re-emission** — a repeat of either command is answered rather
+than refused, and this is where they part company with the archive pair above.
+Both directions are a standing answer rather than a move between two lists, so
+folding the event again lands on the same state. A re-emission carries the
+conversation's _existing_ `updatedAt` and `settledAt` rather than the current
+time, so a double-click neither rewinds the conversation nor moves it in a list
+ordered by when things changed. `crate::threads::Change::re_emitted_at`, and it
+is the one change in this crate that does not stamp the clock.
+
+**The controls are gated on a capability.** `capabilities.threadSettlement` on
+`server.getConfig`: `useThreadActions.ts` refuses to dispatch either command to a
+server that does not advertise it, and the sidebar and chat view hide the menu
+items outright. Answering the commands without advertising the flag would be two
+commands nothing sends.
+
+The same flag also lets the client's **inactivity auto-settle** classify at all
+(`SidebarV2.tsx`), so advertising it does more than reveal two menu items: a
+conversation nobody has touched for `autoSettleAfterDays` now leaves the inbox by
+itself. That derivation is the client's and ships unmodified, and its premise —
+that the server un-settles on real activity — is only half true until ticket 08
+emits the three resets. The blockers above hold either way, so live work is never
+hidden; what can happen meanwhile is an auto-settled conversation re-settling
+once a new turn finishes.
 
 **Deleting is soft** — `deletedAt` is a stamp, not a `DELETE`. The row, its
 transcript, its work log and its checkpoints are all meant to stay: a hard delete

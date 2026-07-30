@@ -100,7 +100,9 @@ use crate::store::{
 };
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::settling::SessionStatus;
-use crate::threads::{self, Change, Given, MetaUpdate, Prompt, Session, Shelf, Thread, Threads};
+use crate::threads::{
+    self, Adoption, Busy, Change, Given, MetaUpdate, Prompt, Session, Shelf, Thread, Threads,
+};
 use crate::transcripts::Transcripts;
 
 /// The tag that carries every write to the registry.
@@ -146,6 +148,15 @@ const RUNTIME_MODES: [&str; 4] = [
 /// checked against, and being a closed set is the only thing that keeps it from
 /// becoming a free-text field the picker cannot render.
 const INTERACTION_MODES: [&str; 2] = ["default", "plan"];
+
+/// Every reason a client may give for unsettling a conversation, which is one.
+///
+/// The *event* carries two — `user` and `activity` — and the command carries only
+/// the first, because the neutral reset belongs to the server. A one-element
+/// closed set rather than an equality check, so it is refused by the same helper
+/// and with the same sentence shape as a mode the contract does not name, and so
+/// that a second reason is a line here rather than a new rule.
+const UNSETTLE_REASONS: [&str; 1] = [threads::BY_THE_USER];
 
 /// The registry, live: what is in it, what changes it, and who is watching.
 ///
@@ -197,6 +208,8 @@ enum Command {
     UpdateThreadMeta(UpdateThreadMetaPayload),
     Archive { thread_id: String },
     Unarchive { thread_id: String },
+    Settle { thread_id: String },
+    Unsettle { thread_id: String },
     StartTurn(Box<StartTurn>),
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -434,6 +447,8 @@ impl Shell {
             Command::UpdateThreadMeta(update) => self.update_thread_meta(update)?,
             Command::Archive { thread_id } => self.set_archived(&thread_id, Shelf::Archived)?,
             Command::Unarchive { thread_id } => self.set_archived(&thread_id, Shelf::Working)?,
+            Command::Settle { thread_id } => self.settle(&thread_id)?,
+            Command::Unsettle { thread_id } => self.unsettle(&thread_id)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
@@ -710,6 +725,111 @@ impl Shell {
                     })
                 },
                 to.arrival(),
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    /// Let a finished conversation leave the inbox.
+    ///
+    /// **This is not [`crate::settling`]**, which reads a session status as how a
+    /// *turn* went, and the collision is the one thing to know before reading
+    /// further: the contract spells these fields `settledOverride` and
+    /// `settledAt`, and the word means something else three lines away in this
+    /// same crate. `docs/adr/0024` and the **Inbox state** entry in `CONTEXT.md`
+    /// are where that is settled — the turn meaning has seniority, the field names
+    /// belong to the contract and do not move, and it is the prose and the Rust
+    /// identifiers that disambiguate.
+    ///
+    /// **The server does not classify.** Which conversations *count* as settled is
+    /// `effectiveSettled` in the bundled client runtime, which ships unmodified
+    /// (ADR-0012) and reads these two fields alongside four other things. This
+    /// stores the override, enforces the invariants and emits the event; what the
+    /// inbox shows is not its decision.
+    ///
+    /// **The invariants are, though.** The client keeps a twin of them so the
+    /// interface can refuse before a round trip, and this is the authoritative
+    /// copy — see [`Busy`], which is the same list `effectiveSettled` refuses to
+    /// classify with, because a conversation that will not classify as settled
+    /// must not be accepted as a settle target either. An archived conversation is
+    /// refused on top of those four: it is not in the inbox to leave it, and
+    /// [`Shelf::holds`] is asked rather than the field read a second time.
+    ///
+    /// **A repeat re-emits rather than being refused**, which is where this parts
+    /// company with [`Shell::set_archived`] — see [`Change::re_emitted_at`] for
+    /// the whole of that argument.
+    fn settle(&self, thread_id: &str) -> Result<i64, CommandError> {
+        // Drawn before the lock is taken rather than inside the guard, so the
+        // window a queued turn is measured against is one instant for the whole
+        // command instead of a clock read per comparison.
+        let adoption = Adoption::now();
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| {
+                    if Shelf::Archived.holds(thread) {
+                        return Some(format!(
+                            "Conversation '{thread_id}' is archived, so it is already out of the \
+                             inbox and there is nothing to settle."
+                        ));
+                    }
+                    thread.busy(&adoption).map(|busy| match busy {
+                        Busy::Approval => format!(
+                            "Conversation '{thread_id}' is waiting for a permission decision, so \
+                             settling it would hide a request that is waiting on you."
+                        ),
+                        Busy::Question => format!(
+                            "Conversation '{thread_id}' is waiting for an answer to a question, so \
+                             settling it would hide a request that is waiting on you."
+                        ),
+                        Busy::Session => format!(
+                            "Conversation '{thread_id}' has an agent still working, so settling it \
+                             would hide work in progress."
+                        ),
+                        Busy::QueuedTurn => format!(
+                            "Conversation '{thread_id}' has a turn no agent has picked up yet, so \
+                             settling it would hide work about to start."
+                        ),
+                    })
+                },
+                Change::Settled,
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    /// Pin a conversation back into the inbox.
+    ///
+    /// [`Shell::settle`]'s twin, and deliberately **not its mirror image**. The
+    /// reason is `user`, which pins the conversation *active* rather than clearing
+    /// the override to neutral, so the client's own auto-settle stays suppressed
+    /// until real work moves it on — see [`crate::threads::pinned_by`]. The
+    /// neutral reset is the server's own and is ticket 08's; the contract lets a
+    /// client send only this reason, so it cannot be forged.
+    ///
+    /// **The invariants are not this command's.** Pinning something back can never
+    /// hide work — it is the direction that makes work visible — so the four
+    /// blockers do not apply and nothing here asks about a session or the work
+    /// log. Archived is refused for [`Shell::settle`]'s reason, which is about the
+    /// inbox rather than about attention: there is no inbox to pin an archived
+    /// conversation back to.
+    fn unsettle(&self, thread_id: &str) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| {
+                    Shelf::Archived.holds(thread).then(|| {
+                        format!(
+                            "Conversation '{thread_id}' is archived, so there is no inbox to pin \
+                             it back to. Unarchive it first."
+                        )
+                    })
+                },
+                Change::Unsettled {
+                    reason: threads::BY_THE_USER,
+                },
             )
             .ok_or_else(|| self.not_open(thread_id))?
             .map_err(CommandError::new)
@@ -1755,7 +1875,8 @@ struct RevertCheckpointPayload {
 
 /// A command whose whole payload is the conversation it is about.
 ///
-/// `thread.session.stop`, `thread.archive` and `thread.unarchive`. All three
+/// `thread.session.stop`, `thread.archive`, `thread.unarchive` and
+/// `thread.settle`. All four
 /// carry a `threadId` and the fields every command carries, and this server reads
 /// none of those — see the module documentation for `commandId` and
 /// [`SetRuntimeModePayload`] for `createdAt`, which is the moment the *client*
@@ -1763,8 +1884,8 @@ struct RevertCheckpointPayload {
 /// [`crate::clock::now_iso`]. So the conversation is the payload, and naming none
 /// is the only thing that can be wrong with one.
 ///
-/// One struct for the three rather than three of one field, because three would
-/// be three places to get the field name wrong. What each command can still be
+/// One struct for the four rather than four of one field, because four would
+/// be four places to get the field name wrong. What each command can still be
 /// refused for is a question about the *thread* — whether it exists, whether an
 /// agent is running behind it, which list it is already on — and each is asked
 /// where the answer lives.
@@ -1777,6 +1898,28 @@ struct RevertCheckpointPayload {
 #[serde(rename_all = "camelCase")]
 struct AboutAThread {
     thread_id: String,
+}
+
+/// `thread.unsettle` — [`AboutAThread`] and the one thing that makes it its own
+/// payload.
+///
+/// The conversation is **flattened in** rather than declared again, which is
+/// [`AboutAThread`]'s own argument applied to the one command that has a fifth
+/// field: a second `thread_id` here would be a second place to get the field name
+/// wrong, and the sentence [`read_about_a_thread`] builds reads the id out of the
+/// raw payload either way.
+///
+/// `reason` is **required rather than defaulted**, and that is the contract's own
+/// shape: `ThreadUnsettleCommand` declares it as a literal, not an optional. A
+/// default of `user` here would accept a payload the contract calls malformed and
+/// then act on a guess about which of the two resets the client meant — and the
+/// two are not the same conversation afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Unsettle {
+    #[serde(flatten)]
+    about: AboutAThread,
+    reason: String,
 }
 
 impl StartTurn {
@@ -1986,6 +2129,34 @@ impl Command {
                     "thread.archive" => Command::Archive { thread_id },
                     _ => Command::Unarchive { thread_id },
                 })
+            }
+            // A conversation and nothing else, as the archive commands are.
+            // Whether it is already settled is deliberately *not* asked here: a
+            // repeat re-emits rather than being refused, which is the one way
+            // these two differ from the pair above — see
+            // [`crate::threads::Change::re_emitted_at`].
+            "thread.settle" => {
+                let about: AboutAThread = read_about_a_thread(payload, kind)?;
+                Ok(Command::Settle {
+                    thread_id: non_blank(about.thread_id, "threadId", kind)?,
+                })
+            }
+            // One field more, and it is the field that cannot be got wrong
+            // quietly. `ThreadUnsettleCommand.reason` is the single literal
+            // `user`, while the *event* carries a union of two — because the
+            // neutral reset belongs to the server and a client that could send
+            // `activity` could forge it. So a reason this contract does not name
+            // is refused at the door rather than pinned as though it said `user`.
+            "thread.unsettle" => {
+                let unsettle: Unsettle = read_about_a_thread(payload, kind)?;
+                let thread_id = non_blank(unsettle.about.thread_id, "threadId", kind)?;
+                named_by_the_contract(
+                    &unsettle.reason,
+                    &UNSETTLE_REASONS,
+                    "reason for unsettling",
+                    &thread_id,
+                )?;
+                Ok(Command::Unsettle { thread_id })
             }
             // A turn carries a mode through *two* doors: the per-turn override
             // the composer sends beside every message, and the thread it asks to
@@ -2506,6 +2677,25 @@ mod tests {
             }))
         }
 
+        /// The `thread.settle` the sidebar's context menu sends.
+        fn settle(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.settle",
+                "commandId": format!("test:settle:{thread_id}"),
+                "threadId": thread_id,
+            }))
+        }
+
+        /// Its twin, carrying the one reason a client is allowed to give.
+        fn unsettle(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.unsettle",
+                "commandId": format!("test:unsettle:{thread_id}"),
+                "threadId": thread_id,
+                "reason": "user",
+            }))
+        }
+
         /// The `thread.checkpoint.revert` the diff panel's undo sends.
         fn revert(&self, thread_id: &str, turn_count: u64) -> Result<Value, CommandError> {
             self.dispatch(&json!({
@@ -2907,7 +3097,7 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and laplus implements fifteen. Each
+    /// Roughly twenty command types exist and laplus implements seventeen. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]
@@ -2915,10 +3105,10 @@ mod tests {
         let fixture = Fixture::new();
 
         let refusal = fixture
-            .dispatch(&json!({"type": "thread.settle", "commandId": "c", "threadId": "t"}))
-            .expect_err("settling is not implemented");
+            .dispatch(&json!({"type": "thread.snooze", "commandId": "c", "threadId": "t"}))
+            .expect_err("snoozing is not implemented");
         assert!(
-            refusal.message().contains("thread.settle"),
+            refusal.message().contains("thread.snooze"),
             "{}",
             refusal.message()
         );
@@ -3660,6 +3850,139 @@ mod tests {
         // conversation back on a list it left.
         assert!(fixture.listed_threads().is_empty());
         assert_eq!(fixture.archived_threads().len(), 1);
+    }
+
+    /// Both settle commands are parsed before the world is consulted, and the
+    /// unsettle has one field more than a blank check.
+    ///
+    /// `reason` is where a client can be wrong in a way that matters: the *event*
+    /// carries two reasons and the *command* carries one, because the neutral
+    /// reset belongs to the server. A payload sending `activity` is asking to
+    /// forge it, and is refused rather than quietly treated as `user` — which
+    /// would leave the conversation in the other of the two states.
+    #[test]
+    fn a_malformed_settle_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        for kind in ["thread.settle", "thread.unsettle"] {
+            for blank in ["", "   "] {
+                let refusal = fixture
+                    .dispatch(
+                        &json!({"type": kind, "commandId": "c", "threadId": blank, "reason": "user"}),
+                    )
+                    .expect_err("a blank thread id names no conversation");
+                assert!(
+                    refusal.message().contains("threadId"),
+                    "{kind}: {}",
+                    refusal.message()
+                );
+            }
+        }
+
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.unsettle",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "reason": "activity",
+            }))
+            .expect_err("the neutral reset is not a client's to send");
+        assert!(
+            refusal.message().contains("activity") && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        // And a payload with no reason at all is malformed rather than defaulted:
+        // the contract declares the field, and guessing which reset was meant
+        // would leave the conversation in the other of the two states.
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.unsettle",
+                "commandId": "c",
+                "threadId": "thread-1",
+            }))
+            .expect_err("a reason is not optional");
+        assert!(
+            refusal.message().contains("malformed") && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        assert_eq!(
+            fixture.detail("thread-1")["settledOverride"],
+            Value::Null,
+            "a refused parse moved the conversation"
+        );
+    }
+
+    /// Settling stores the override and the moment, and a user unsettle pins the
+    /// conversation active rather than clearing it to neutral.
+    ///
+    /// Asserted on the conversation as its own subscription describes it, which is
+    /// where `effectiveSettled` reads the two fields — this server stores them and
+    /// the client decides what the inbox shows.
+    #[test]
+    fn settling_records_the_override_and_the_moment_it_settled_at() {
+        let fixture = Fixture::with_a_conversation();
+
+        fixture.settle("thread-1").expect("settled");
+        let settled = fixture.detail("thread-1");
+        assert_eq!(settled["settledOverride"], "settled");
+        assert_eq!(
+            settled["settledAt"], settled["updatedAt"],
+            "a settle's two stamps are one moment: {settled:#?}"
+        );
+
+        fixture.unsettle("thread-1").expect("unsettled");
+        let pinned = fixture.detail("thread-1");
+        assert_eq!(
+            pinned["settledOverride"], "active",
+            "a user unsettle pins the conversation rather than clearing the override"
+        );
+        assert_eq!(pinned["settledAt"], Value::Null);
+    }
+
+    /// An archived conversation is refused by both commands: it is not in the
+    /// inbox, so there is nothing to take it out of and nothing to pin it back
+    /// into.
+    ///
+    /// The sentence names the conversation and says which of the two things is
+    /// wrong, because it is the whole diagnostic the interface can show.
+    #[test]
+    fn settling_or_unsettling_an_archived_conversation_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+        fixture.archive("thread-1").expect("archived");
+
+        for asked in [fixture.settle("thread-1"), fixture.unsettle("thread-1")] {
+            let refusal = asked.expect_err("it is archived");
+            assert!(
+                refusal.message().contains("thread-1") && refusal.message().contains("archived"),
+                "{}",
+                refusal.message()
+            );
+        }
+
+        fixture.unarchive("thread-1").expect("unarchived");
+        fixture.settle("thread-1").expect("settled once it is back");
+    }
+
+    /// Neither settle command reaches a conversation this server does not hold.
+    #[test]
+    fn settling_an_unknown_conversation_is_refused_by_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        for asked in [
+            fixture.settle("never-created"),
+            fixture.unsettle("never-created"),
+        ] {
+            let refusal = asked.expect_err("there is no such conversation");
+            assert!(
+                refusal.message().contains("never-created"),
+                "{}",
+                refusal.message()
+            );
+        }
     }
 
     /// Neither command reaches a conversation this server does not hold, and the

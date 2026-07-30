@@ -356,6 +356,21 @@ impl Shelf {
     }
 }
 
+/// The developer's standing answer that a conversation is finished.
+pub const SETTLED: &str = "settled";
+
+/// The developer's standing answer that it is not — the pin an unsettle leaves.
+pub const ACTIVE: &str = "active";
+
+/// The reason on a `thread.unsettled` the developer asked for.
+///
+/// One of the contract's two, and the only one a *command* can carry: the
+/// neutral reset is the server's own and must not be forgeable, which is why
+/// `ThreadUnsettleCommand.reason` is the single literal `user` while
+/// `ThreadUnsettledPayload.reason` is a union of two. Ticket 08 of the
+/// thread-lifecycle effort is what emits the other.
+pub const BY_THE_USER: &str = "user";
+
 /// A stored settle override, back as one of the contract's two.
 ///
 /// Same reasoning as [`tone`], with a sharper edge: `settledOverride` is a
@@ -366,10 +381,104 @@ impl Shelf {
 /// thread has before anybody settles it.
 pub fn settled_override(stored: &str) -> Option<&'static str> {
     match stored {
-        "settled" => Some("settled"),
-        "active" => Some("active"),
+        SETTLED => Some(SETTLED),
+        ACTIVE => Some(ACTIVE),
         _ => None,
     }
+}
+
+/// What a `thread.unsettled` carrying this reason leaves behind.
+///
+/// **The two directions are not symmetrical**, and this is where that lives. A
+/// *user* unsettle pins the conversation active, so it stays in the inbox until
+/// real work moves it on; an *activity* unsettle returns it to no override at
+/// all, so it can settle itself again once the burst of work goes stale.
+/// `threadReducer.ts`, `case "thread.unsettled"`, mirrored — a server that
+/// disagreed here would pin a conversation a client had let go of.
+fn pinned_by(reason: &str) -> Option<&'static str> {
+    match reason {
+        BY_THE_USER => Some(ACTIVE),
+        _ => None,
+    }
+}
+
+/// How long a user message with no turn behind it is still a turn about to
+/// start rather than stale data.
+///
+/// `QUEUED_TURN_START_GRACE_MS` in `client-runtime/src/state/threadSettled.ts`.
+/// Session adoption takes seconds, so a message still unadopted after this is a
+/// start that failed — and without the bound such a conversation could never be
+/// settled at all.
+const ADOPTION_GRACE_MILLIS: u64 = 2 * 60 * 1_000;
+
+/// The window a queued turn start is believable in: the grace either side of
+/// now.
+///
+/// **Two rendered stamps rather than a number of milliseconds**, because that is
+/// the shape of everything it is compared against. Every timestamp on this wire
+/// is [`crate::clock`]'s fixed-width UTC rendering — `YYYY-MM-DDTHH:MM:SS.mmmZ`,
+/// one length, one zone — so it orders lexicographically, and drawing the window
+/// once means the comparisons need no calendar and this module needs no parser.
+///
+/// Bounded on *both* sides, which is the client's own guard rather than a
+/// tidiness: a message timestamp originates on whichever device sent it, so a
+/// clock running ahead of this one would otherwise hold a conversation queued
+/// for the whole of the skew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoption {
+    earliest: String,
+    latest: String,
+}
+
+impl Adoption {
+    pub fn now() -> Adoption {
+        Adoption::around(crate::clock::now_epoch_millis())
+    }
+
+    /// The window around a chosen instant. Split out from [`Adoption::now`] for
+    /// [`crate::clock::iso_from_epoch`]'s reason — a window that cannot be given
+    /// a centre is a window that cannot be tested.
+    fn around(millis: u64) -> Adoption {
+        Adoption {
+            earliest: crate::clock::iso_from_epoch_millis(
+                millis.saturating_sub(ADOPTION_GRACE_MILLIS),
+            ),
+            latest: crate::clock::iso_from_epoch_millis(millis + ADOPTION_GRACE_MILLIS),
+        }
+    }
+
+    fn covers(&self, at: &str) -> bool {
+        self.earliest.as_str() <= at && at <= self.latest.as_str()
+    }
+}
+
+/// What stands between a conversation and the developer letting it go.
+///
+/// `canSettle` in `client-runtime/src/state/threadSettled.ts`, where it is
+/// authoritative rather than convenient: the client keeps a twin of this list so
+/// the interface can refuse before a round trip, and the list is deliberately the
+/// same one `effectiveSettled` refuses to *classify* with. Anything that will not
+/// classify as settled must not be accepted as a settle target either, or the
+/// developer would be told a conversation had left the inbox and then watch it
+/// stay.
+///
+/// **The order is the client's order and it is load-bearing**, because it decides
+/// the sentence a refusal shows: an agent that has asked for permission is also
+/// running, and "waiting for your decision" is the more useful of the two things
+/// to say about it.
+///
+/// Snooze refuses on a subset of these — a running session *is* snoozable,
+/// because snooze governs attention and never the agent — which is ticket 09's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    /// The agent asked for permission and has not been answered.
+    Approval,
+    /// The agent asked a question and has not been answered.
+    Question,
+    /// The process is starting or running.
+    Session,
+    /// The developer asked for a turn and no session has picked it up yet.
+    QueuedTurn,
 }
 
 /// A conversation's own row: everything about a thread except what is in it.
@@ -606,8 +715,11 @@ impl Thread {
     /// The first two are real: a thread the agent has asked permission on — or
     /// asked a question of — raises its hand in the thread list, which is what
     /// makes a conversation waiting on the developer findable from another one.
-    /// Both are folded out of the work log rather than counted beside it, for the
-    /// reason below. The third stays `false` and is a later ticket's: a proposed
+    /// Both are folded out of the work log rather than counted beside it — see
+    /// [`Thread::has_pending_approvals`], which is also what
+    /// [`Thread::busy`] refuses a settle with, so the flag the list renders and
+    /// the invariant the command enforces are one answer. The third stays `false`
+    /// and is a later ticket's: a proposed
     /// plan needs `ExitPlanMode` answered rather than merely reported, and a
     /// `true` nothing could act on would put a badge on a thread with nothing
     /// behind it.
@@ -626,19 +738,108 @@ impl Thread {
             "updatedAt": self.updated_at,
             "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
             "latestUserMessageAt": self.latest_user_message_at,
-            // Derived from the work log rather than counted beside it, because
-            // the client derives its own panel from the same rows — a counter
-            // kept here would be a second answer to one question, and the two
-            // would agree until they did not. Linear in the work log, and only
-            // for the shell summary, which a delta and an activity both skip
-            // ([`Change::reaches_the_shell`]).
-            "hasPendingApprovals": !crate::worklog::unanswered(&self.activities).is_empty(),
-            "hasPendingUserInput": !crate::worklog::unanswered_user_input(&self.activities)
-                .is_empty(),
+            // Linear in the work log, and only for the shell summary, which a
+            // delta and an activity both skip ([`Change::reaches_the_shell`]).
+            "hasPendingApprovals": self.has_pending_approvals(),
+            "hasPendingUserInput": self.has_pending_user_input(),
             "hasActionableProposedPlan": false,
         });
         self.lifecycle.write_onto(&mut summary);
         summary
+    }
+
+    /// Is the agent waiting on a permission decision?
+    ///
+    /// **Derived from the work log rather than counted beside it**, because the
+    /// client derives its own panel from the same rows — a counter kept here
+    /// would be a second answer to one question, and the two would agree until
+    /// they did not. Deriving it is also what makes it survive a restart: the
+    /// activities are stored, and a count in memory would not be.
+    ///
+    /// One function rather than the fold written out at each call, because it is
+    /// read from two places that must not be allowed to disagree: the flag
+    /// [`Thread::to_shell_value`] publishes, and the guard [`Thread::busy`]
+    /// refuses a settle with. That the published flag and the enforced invariant
+    /// are one answer is the whole of why the client's twin of the invariant can
+    /// be trusted to agree with this one.
+    fn has_pending_approvals(&self) -> bool {
+        !crate::worklog::unanswered(&self.activities).is_empty()
+    }
+
+    /// Is the agent waiting on an answer to a question?
+    /// [`Thread::has_pending_approvals`]'s twin, and separate for the reason the
+    /// two folds are separate in the client: a question that arrived as an
+    /// approval is a bug, so a reader that accepted either would miss it.
+    fn has_pending_user_input(&self) -> bool {
+        !crate::worklog::unanswered_user_input(&self.activities).is_empty()
+    }
+
+    /// What stands between this conversation and the developer settling it, if
+    /// anything does.
+    ///
+    /// The four checks of `canSettle`, in its order, over the same fields the
+    /// shell summary publishes — which is what makes this and the client's twin
+    /// one rule rather than two: both read the pending flags out of the work log,
+    /// the session's status, and the latest turn against the latest user message.
+    /// The first two are literally the flags the summary carries, because they
+    /// come from the same two functions.
+    pub fn busy(&self, adoption: &Adoption) -> Option<Busy> {
+        if self.has_pending_approvals() {
+            return Some(Busy::Approval);
+        }
+        if self.has_pending_user_input() {
+            return Some(Busy::Question);
+        }
+        if self.session.as_ref().is_some_and(|session| {
+            matches!(
+                session.status,
+                SessionStatus::Starting | SessionStatus::Running
+            )
+        }) {
+            return Some(Busy::Session);
+        }
+        self.has_queued_turn_start(adoption)
+            .then_some(Busy::QueuedTurn)
+    }
+
+    /// A message the developer sent that no session has picked up yet.
+    ///
+    /// `hasQueuedTurnStart`, mirrored. The turn was asked for — the message is in
+    /// the transcript — but no session adopted it, so the work is invisible to the
+    /// status checks above: `session` is still `None` and nothing is running.
+    /// Detected as a user message strictly newer than every stamp on the latest
+    /// turn, because adoption gives the new turn a `requestedAt` at or after the
+    /// message time and so clears the condition by itself.
+    ///
+    /// A session that already **failed** is not queued: the failure is the
+    /// developer's answer about what happened to that message, and it is already
+    /// visible on the conversation.
+    ///
+    /// The comparisons are string comparisons, which [`Adoption`] argues: every
+    /// stamp here was rendered by [`crate::clock`] or by the registry's own
+    /// `strftime` in the one fixed shape, so lexicographic order *is*
+    /// chronological order.
+    fn has_queued_turn_start(&self, adoption: &Adoption) -> bool {
+        let Some(message_at) = self.latest_user_message_at.as_deref() else {
+            return false;
+        };
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.status == SessionStatus::Error)
+        {
+            return false;
+        }
+        if !adoption.covers(message_at) {
+            return false;
+        }
+        let Some(turn) = self.latest_turn.as_ref() else {
+            return true;
+        };
+        [Some(turn.requested_at.as_str()), turn.started_at.as_deref(), turn.completed_at.as_deref()]
+            .into_iter()
+            .flatten()
+            .all(|stamp| stamp < message_at)
     }
 
     /// The model slug to start the agent with, if the selection names one.
@@ -953,6 +1154,34 @@ pub enum Change {
     /// thing as when a conversation stopped being archived — it either is or it
     /// is not.
     Unarchived,
+    /// The developer decided a conversation is finished with. `thread.settled`.
+    ///
+    /// **Not [`crate::settling`]**, which reads a session status as how a *turn*
+    /// went. This is whether a *thread* belongs in the inbox — see [`Lifecycle`]
+    /// and the **Inbox state** entry in `CONTEXT.md`, where the collision and its
+    /// seniority are written down.
+    ///
+    /// It moves two fields and tells nobody else: the agent, if one is there, is
+    /// not spoken to, and the transcript, the work log and the checkpoints are
+    /// exactly where they were. Settling is a decision about the developer's
+    /// attention, in the same way archiving is about their list.
+    ///
+    /// **This server does not decide what the inbox shows.** `effectiveSettled`
+    /// reads the two fields this writes alongside four other things, and it lives
+    /// in the client. What is enforced here is which conversations may be
+    /// *targeted* — see [`Busy`].
+    Settled,
+    /// The developer pinned a conversation back. `thread.unsettled`.
+    ///
+    /// The reason is one of the contract's two and decides what the conversation
+    /// is left in — see [`pinned_by`], where the asymmetry is argued. Ticket 07
+    /// of the thread-lifecycle effort sends only [`BY_THE_USER`]; the neutral
+    /// reset that real activity triggers is ticket 08's.
+    ///
+    /// It clears `settledAt` rather than stamping a second time, for
+    /// [`Change::Unarchived`]'s reason: there is no such thing as when a
+    /// conversation stopped being settled.
+    Unsettled { reason: &'static str },
     /// The developer moved the conversation's runtime mode.
     /// `thread.runtime-mode-set`.
     ///
@@ -1081,6 +1310,49 @@ impl Change {
                 | Change::RevertRequested { .. }
                 | Change::Reverted { .. }
         )
+    }
+
+    /// The moment a repeat of this change reports, when the conversation is
+    /// already where the change would put it.
+    ///
+    /// **Idempotence by re-emission**, which the spec asks for by name and only
+    /// for the inbox-state commands. Settling something already settled is not
+    /// refused — unlike a second archive, which is a click on a control that is no
+    /// longer there ([`Shelf`]) — because both directions of a settle are a
+    /// standing answer the developer gave rather than a move between two lists, so
+    /// folding the event again lands on the same state either way.
+    ///
+    /// What a repeat must not do is *churn*: the client's thread list is ordered
+    /// by when things changed, so a double-click that stamped the clock would move
+    /// a conversation the developer did not touch. So the re-emission carries the
+    /// conversation's existing `updatedAt` — and, through the fold, its existing
+    /// `settledAt` — rather than the current time, which is what makes a duplicate
+    /// neither rewind the thread nor reorder the list.
+    ///
+    /// Every other change stamps the clock unconditionally. [`crate::orchestration::Shell::set_mode`]
+    /// argues why that is right for a write of a value the developer chose, and
+    /// says this is where it would not be.
+    ///
+    /// **The cost is an event whose `occurredAt` is older than the one before
+    /// it**, which is the one place on this feed where that can happen. It is
+    /// safe because nothing orders by it: the client folds by `sequence`, and a
+    /// re-emission takes a fresh one like every other change. `crate::clock`'s
+    /// "two timestamps taken in order never go backwards" is still true of the
+    /// clock — this reads a stamp rather than taking one.
+    ///
+    /// **A caller must still ask whether the change is worth making.** An
+    /// `Unsettled { reason: "activity" }` over a conversation with no override
+    /// lands here as a repeat and would publish a no-op event at a stale
+    /// `updatedAt`. The spec's answer is the guard at the call site — "unsettled
+    /// (activity) *if any override is set*" — and this is a note for ticket 08,
+    /// which is what builds that caller.
+    fn re_emitted_at(&self, thread: &Thread) -> Option<String> {
+        let already = match self {
+            Change::Settled => thread.lifecycle.settled_override == Some(SETTLED),
+            Change::Unsettled { reason } => thread.lifecycle.settled_override == pinned_by(reason),
+            _ => return None,
+        };
+        already.then(|| thread.updated_at.clone())
     }
 }
 
@@ -1429,7 +1701,11 @@ impl Threads {
         // that inverted would lose the earlier one permanently.
         let commit = self.inner.sequences.commit();
         let sequence = commit.sequence();
-        let occurred_at = now_iso();
+        // The clock, unless the change is one the conversation has already had —
+        // see [`Change::re_emitted_at`], where re-emitting rather than refusing is
+        // argued, and why such a repeat must report the moment the conversation
+        // already carried rather than this one.
+        let occurred_at = change.re_emitted_at(thread).unwrap_or_else(now_iso);
         let payload = self.fold(thread, &change, sequence, &occurred_at);
         thread.updated_at = occurred_at.clone();
 
@@ -1525,6 +1801,39 @@ impl Threads {
                 thread.lifecycle.archived_at = None;
                 json!({
                     "threadId": thread.id,
+                    "updatedAt": at,
+                })
+            }
+            // The client's reducer, mirrored: the override goes to `settled` and
+            // the payload's `settledAt` is written straight onto the thread
+            // (`threadReducer.ts`, `case "thread.settled"`).
+            //
+            // A conversation already settled keeps the moment it settled at rather
+            // than being stamped again — and `at` is its existing `updatedAt` on
+            // such a repeat, so the whole re-emission reports where the
+            // conversation already was. See [`Change::re_emitted_at`], which is
+            // where that is decided; here it is one `unwrap_or_else` because the
+            // stamp and the override are written together or not at all.
+            Change::Settled => {
+                let settled_at = thread
+                    .lifecycle
+                    .settled_at
+                    .clone()
+                    .unwrap_or_else(|| at.to_string());
+                thread.lifecycle.settled_override = Some(SETTLED);
+                thread.lifecycle.settled_at = Some(settled_at.clone());
+                json!({
+                    "threadId": thread.id,
+                    "settledAt": settled_at,
+                    "updatedAt": at,
+                })
+            }
+            Change::Unsettled { reason } => {
+                thread.lifecycle.settled_override = pinned_by(reason);
+                thread.lifecycle.settled_at = None;
+                json!({
+                    "threadId": thread.id,
+                    "reason": reason,
                     "updatedAt": at,
                 })
             }
@@ -2437,6 +2746,8 @@ impl Change {
             Change::MetaUpdated(_) => "thread.meta-updated",
             Change::Archived => "thread.archived",
             Change::Unarchived => "thread.unarchived",
+            Change::Settled => "thread.settled",
+            Change::Unsettled { .. } => "thread.unsettled",
             Change::RuntimeModeSet { .. } => "thread.runtime-mode-set",
             Change::InteractionModeSet { .. } => "thread.interaction-mode-set",
             Change::TurnRequested { .. } => "thread.turn-start-requested",
@@ -3573,6 +3884,292 @@ pub(crate) mod tests {
         assert_eq!(settled_override("active"), Some("active"));
         assert_eq!(settled_override("archived"), None);
         assert_eq!(settled_override(""), None);
+    }
+
+    // -- what may be settled -------------------------------------------------
+
+    /// A moment inside the adoption window, and one outside it, as the two ends
+    /// of the same clock: the tests below pick a `now` and then place a message
+    /// relative to it, rather than reading the real clock and hoping.
+    const NOW_MILLIS: u64 = 1_800_000_000_000;
+
+    fn at(offset_millis: i64) -> String {
+        crate::clock::iso_from_epoch_millis(
+            (NOW_MILLIS as i64 + offset_millis).try_into().expect("an instant after the epoch"),
+        )
+    }
+
+    /// A conversation with a message the developer sent a moment ago and nothing
+    /// that has picked it up — the gap between asking for a turn and a session
+    /// adopting one.
+    fn with_a_queued_message(offset_millis: i64) -> Thread {
+        Thread {
+            latest_user_message_at: Some(at(offset_millis)),
+            ..a_thread("thread-1")
+        }
+    }
+
+    /// An unanswered permission request, as the work log records one.
+    fn asked_for_permission(request_id: &str) -> Activity {
+        crate::worklog::requested(
+            &crate::protocol::Permission {
+                request_id: request_id.to_string(),
+                tool_name: "Write".to_string(),
+                input: json!({"file_path": "note.txt"}),
+                tool_use_id: Some("toolu_1".to_string()),
+                description: None,
+                suggestions: Vec::new(),
+            },
+            Some("turn-1".to_string()),
+        )
+    }
+
+    /// A conversation with nothing happening is settleable, which is the case
+    /// every other one below is a departure from.
+    #[test]
+    fn a_quiet_conversation_is_not_busy() {
+        assert_eq!(a_thread("thread-1").busy(&Adoption::around(NOW_MILLIS)), None);
+    }
+
+    /// The four blockers of `canSettle`, each on its own, and in the order the
+    /// client checks them — which is the order the sentences depend on: an agent
+    /// that has asked for permission is *also* running, and the request is the
+    /// more useful of the two things to say.
+    #[test]
+    fn every_blocker_the_client_refuses_to_classify_with_is_refused_as_a_target() {
+        let window = Adoption::around(NOW_MILLIS);
+
+        let waiting = Thread {
+            activities: vec![asked_for_permission("req-1")],
+            session: Some(running("turn-1")),
+            ..a_thread("thread-1")
+        };
+        assert_eq!(
+            waiting.busy(&window),
+            Some(Busy::Approval),
+            "a request waiting on the developer outranks the session it came from"
+        );
+
+        let asked = Thread {
+            activities: vec![crate::worklog::user_input_requested(
+                &crate::protocol::Permission {
+                    request_id: "req-2".to_string(),
+                    tool_name: "AskUserQuestion".to_string(),
+                    input: json!({}),
+                    tool_use_id: None,
+                    description: None,
+                    suggestions: Vec::new(),
+                },
+                vec![json!({"id": "q", "question": "q", "options": []})],
+                Some("turn-1".to_string()),
+            )],
+            ..a_thread("thread-1")
+        };
+        assert_eq!(asked.busy(&window), Some(Busy::Question));
+
+        for status in [SessionStatus::Starting, SessionStatus::Running] {
+            let working = Thread {
+                session: Some(Session {
+                    status,
+                    ..running("turn-1")
+                }),
+                ..a_thread("thread-1")
+            };
+            assert_eq!(
+                working.busy(&window),
+                Some(Busy::Session),
+                "{} is work in progress",
+                status.as_str()
+            );
+        }
+
+        assert_eq!(
+            with_a_queued_message(-1_000).busy(&window),
+            Some(Busy::QueuedTurn),
+            "a turn asked for a second ago and not yet picked up"
+        );
+    }
+
+    /// A session that has *finished* — however it finished — is not work in
+    /// progress. The four statuses the client lets through, kept honest here
+    /// because `starting` and `running` are named rather than everything else
+    /// being excluded.
+    #[test]
+    fn a_session_that_is_over_does_not_hold_a_conversation_open() {
+        let window = Adoption::around(NOW_MILLIS);
+        for status in [
+            SessionStatus::Idle,
+            SessionStatus::Ready,
+            SessionStatus::Interrupted,
+            SessionStatus::Stopped,
+            SessionStatus::Error,
+        ] {
+            let finished = Thread {
+                session: Some(Session {
+                    status,
+                    active_turn_id: None,
+                    ..running("turn-1")
+                }),
+                ..a_thread("thread-1")
+            };
+            assert_eq!(finished.busy(&window), None, "{}", status.as_str());
+        }
+    }
+
+    /// The adoption grace, from both sides. A message older than the window is a
+    /// start that failed rather than one about to happen — without the bound such
+    /// a conversation could never be settled at all — and one *newer* than the
+    /// window came from a device whose clock is ahead, which must not hold the
+    /// conversation open for the whole of the skew either.
+    #[test]
+    fn a_queued_turn_stops_being_queued_once_the_adoption_grace_has_passed() {
+        let window = Adoption::around(NOW_MILLIS);
+        assert_eq!(
+            with_a_queued_message(-(ADOPTION_GRACE_MILLIS as i64) - 1_000).busy(&window),
+            None,
+            "a message this old is a start that never happened"
+        );
+        assert_eq!(
+            with_a_queued_message(ADOPTION_GRACE_MILLIS as i64 + 1_000).busy(&window),
+            None,
+            "a message from a clock this far ahead is not pending work"
+        );
+    }
+
+    /// A turn that *has* been adopted clears the queued state by itself, because
+    /// adoption stamps the new turn at or after the message it picked up. This is
+    /// the ordinary path — `Shell::start_turn` writes the message and then the
+    /// turn — and it is why the guard almost never fires in practice.
+    #[test]
+    fn a_message_a_turn_has_picked_up_is_not_queued() {
+        let window = Adoption::around(NOW_MILLIS);
+        let adopted = Thread {
+            latest_turn: Some(LatestTurn {
+                turn_id: "turn-1".to_string(),
+                state: TurnState::Running,
+                requested_at: at(-500),
+                started_at: None,
+                completed_at: None,
+                assistant_message_id: None,
+            }),
+            ..with_a_queued_message(-1_000)
+        };
+        assert_eq!(adopted.busy(&window), None);
+    }
+
+    /// A failed start is not pending work. The failure is already in front of the
+    /// developer — a status edge and an error — so holding the conversation open
+    /// for it would refuse the settle that is the reasonable response to it.
+    #[test]
+    fn a_message_whose_session_failed_is_not_queued() {
+        let failed = Thread {
+            session: Some(Session {
+                status: SessionStatus::Error,
+                active_turn_id: None,
+                ..running("turn-1")
+            }),
+            ..with_a_queued_message(-1_000)
+        };
+        assert_eq!(failed.busy(&Adoption::around(NOW_MILLIS)), None);
+    }
+
+    // -- idempotence by re-emission ------------------------------------------
+
+    /// Settling twice lands on the same state and does not move the conversation
+    /// in a list ordered by when things changed. The second command is answered
+    /// rather than refused — both directions are a standing answer rather than a
+    /// move between two lists — but it reports the moment the conversation
+    /// already carried.
+    #[test]
+    fn a_repeated_settle_re_emits_without_moving_anything() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        threads
+            .apply("thread-1", Change::Settled)
+            .expect("settled");
+        let settled = threads.get("thread-1").expect("the thread");
+
+        threads
+            .apply("thread-1", Change::Settled)
+            .expect("settled again");
+        let again = threads.get("thread-1").expect("the thread");
+
+        assert_eq!(again.lifecycle, settled.lifecycle, "the state moved");
+        assert_eq!(
+            again.updated_at, settled.updated_at,
+            "a double-click reordered the developer's list"
+        );
+    }
+
+    /// The unsettle side of the same rule, and the asymmetry beside it: a *user*
+    /// unsettle pins the conversation active rather than clearing the override to
+    /// neutral, so the client's own auto-settle stays suppressed until real work
+    /// moves it on.
+    #[test]
+    fn a_user_unsettle_pins_the_conversation_active_and_repeats_harmlessly() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        threads
+            .apply("thread-1", Change::Unsettled { reason: BY_THE_USER })
+            .expect("unsettled");
+        let pinned = threads.get("thread-1").expect("the thread");
+        assert_eq!(pinned.lifecycle.settled_override, Some(ACTIVE));
+        assert_eq!(pinned.lifecycle.settled_at, None);
+
+        threads
+            .apply("thread-1", Change::Unsettled { reason: BY_THE_USER })
+            .expect("unsettled again");
+        let again = threads.get("thread-1").expect("the thread");
+        assert_eq!(again.lifecycle, pinned.lifecycle);
+        assert_eq!(again.updated_at, pinned.updated_at);
+    }
+
+    /// A settle after something else touched the conversation keeps the moment it
+    /// first settled, and moves neither stamp. The case a repeat that re-read the
+    /// clock would get wrong in two places at once.
+    #[test]
+    fn a_settle_repeated_after_an_unrelated_change_keeps_both_stamps() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        threads
+            .apply("thread-1", Change::Settled)
+            .expect("settled");
+        let settled_at = threads
+            .get("thread-1")
+            .expect("the thread")
+            .lifecycle
+            .settled_at
+            .expect("a settle says when");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::MetaUpdated(MetaUpdate {
+                    title: Some("Renamed".to_string()),
+                    model_selection: None,
+                    branch: None,
+                    worktree_path: None,
+                }),
+            )
+            .expect("renamed");
+        let renamed_at = threads.get("thread-1").expect("the thread").updated_at;
+
+        threads
+            .apply("thread-1", Change::Settled)
+            .expect("settled again");
+        let again = threads.get("thread-1").expect("the thread");
+        assert_eq!(
+            again.lifecycle.settled_at,
+            Some(settled_at),
+            "the repeat restamped when the conversation settled"
+        );
+        assert_eq!(
+            again.updated_at, renamed_at,
+            "the repeat moved the conversation in a list it had not changed in"
+        );
     }
 
     // -- coming back from a restart -----------------------------------------
