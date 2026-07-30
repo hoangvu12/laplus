@@ -58,10 +58,11 @@ search. So:
 - `packages/contracts` — effect/Schema schemas for provider events, the socket
   protocol, and model/session types. **Schema-only; no runtime logic.** This is
   the whole vocabulary the UI can speak, and the server implements a subset of
-  it — 33 of the 61 methods declared here, and 7 of the 20 dispatchable
-  orchestration commands. `.scratch/contract-parity/ledger.md` is where the
-  difference is counted and what it costs; re-derive it rather than trusting
-  these figures after the code moves.
+  it: every dispatchable orchestration command, and some of the RPC methods.
+  `.scratch/contract-parity/ledger.md` is where the difference is counted, what
+  each gap costs, and how to re-derive the counts — it is the only file that
+  should carry a figure, because a figure quoted anywhere else goes stale the
+  next time a method lands and nobody notices.
 - `packages/shared` — runtime utilities. Explicit subpath exports
   (`@t3tools/shared/git`); no barrel index.
 - `packages/client-runtime` — shared client runtime. No root export; import an

@@ -1,7 +1,20 @@
 # ADR-0020 — This fork publishes an installer, and does not yet update itself
 
 Date: 2026-07-29
-Status: Accepted
+Status: Accepted; the deferral superseded by [ADR-0031](0031-a-server-says-who-will-restart-it.md)
+
+> **What survives.** Everything about publishing. This fork still ships a Windows
+> installer on a tag and nothing else, with no nightly cron; `tauri.conf.json` is
+> still the version and the tag is checked against it; the Rust suite still runs in
+> the release job; and the two-signatures reasoning is unchanged.
+>
+> **What 0031 lifts** is the last section: "self-update is deferred, not refused."
+> Its own precondition — "unblocked the moment a release exists to update from" —
+> has been met, by `v0.1.0` and `v0.1.1` and by `laplus` on npm.
+>
+> **And one sentence here is wrong about the contract, not merely stale.**
+> `capabilities.serverSelfUpdate` does not "stay false"; it is not a boolean. It
+> is one of three literals under an optional key, and its off state is _absent_.
 
 ## Context
 

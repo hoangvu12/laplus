@@ -24,12 +24,19 @@ because `effect` had changed its request-id encoding underneath the contract
 (ticket 33). It was never used again. At the time of this decision the
 `upstream` remote had not been fetched since the fork.
 
-The reason it stopped being worth using is not fatigue. **laplus answers 26 of
-the 71 methods `packages/contracts` declares.** Upstream shipping a feature adds
-UI that calls methods this server does not implement, so a sync widens the
-parity gap rather than closing it. The tickets 39–70 exist because of the gap
-that is already there; importing more of it has negative value until that number
-is much closer to 71.
+The reason it stopped being worth using is not fatigue. **laplus answers a
+minority of the methods `packages/contracts` declares.** Upstream shipping a
+feature adds UI that calls methods this server does not implement, so a sync
+widens the parity gap rather than closing it. The tickets 39–70 exist because of
+the gap that is already there; importing more of it has negative value until
+that gap is nearly closed.
+
+> **Amended 2026-07-30.** This paragraph read "26 of the 71 methods" and "much
+> closer to 71". Both halves were wrong by then and had been for a while, which
+> is the whole argument for the rule that now holds: a parity figure lives in
+> `.scratch/contract-parity/ledger.md` and nowhere else, because a count written
+> into prose is a claim nothing re-checks. The decision below does not depend on
+> the number — it depends on the direction, and the direction has not changed.
 
 ## Decision
 

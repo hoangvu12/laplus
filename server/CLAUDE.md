@@ -42,19 +42,21 @@ bug in this project rather than a vendoring detail, which is what ticket 32
 changed. `docs/adr/0014` is why the two trees are one repository.
 
 **There is no `upstream` remote and there are no more syncs.** This project
-stopped merging from `pingdotgg/t3code`: laplus answers 33 of the 61 methods the
-contract declares, so every feature upstream ships is more UI calling a method
-this server does not have — a sync widens the gap rather than closing it, which
-is what the one sync that was taken demonstrated (ticket 33). The UI is now
-maintained here.
+stopped merging from `pingdotgg/t3code`. The reason is a direction rather than a
+number: laplus answers a subset of what the contract declares, and a sync brings
+UI, not server — every feature upstream ships arrives here as more of the client
+calling methods this server does not have. So a sync widens the gap it looks
+like it should close, which is what the one sync that was taken demonstrated
+(ticket 33). The UI is now maintained here.
 
-**Where those two numbers come from.** `.scratch/contract-parity/ledger.md`,
-which counts both sides and says what each gap costs — 33 of 61 RPC methods and
-7 of 20 dispatchable commands, as of 2026-07-30. It carries the commands to
-reproduce the counts, and it is those rather than the figures that should be
-trusted once the code has moved. The three lines this replaces read "26 of the
-71" and had been wrong in both halves for long enough to be quoted in two other
-files.
+**How wide the gap is lives in one file.**
+`.scratch/contract-parity/ledger.md` counts both sides, says what each gap
+costs, and carries the commands to reproduce the counts. Read those rather than
+any figure, including its own — the ledger has gone stale once itself, and the
+three documents that quoted it were wrong for long enough to be quoted onward.
+No file outside the ledger carries a parity figure any more, and this line is
+the reason: a count in prose is a claim nothing re-checks, and it is wrong from
+the next commit that lands a method.
 
 The `@t3tools/*` package scope is kept anyway. It appears in over a thousand
 files, and renaming it now buys a nicer name in exchange for touching every

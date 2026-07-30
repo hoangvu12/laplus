@@ -108,8 +108,10 @@ reused, so the run number in `-rc.<run>` is doing real work.
 | `.scratch` | the issue tracker                             |
 
 Start with `AGENTS.md`, then `server/CLAUDE.md` for the Rust half. The server
-answers 33 of the 61 socket methods `packages/contracts` declares; the rest are
-not implemented yet. `.scratch/contract-parity/ledger.md` is the count.
+answers a subset of the socket methods `packages/contracts` declares; the rest
+are refused and say so. `.scratch/contract-parity/ledger.md` is where that
+subset is counted, and the only file that should carry a figure — this line has
+carried one twice and been wrong both times.
 
 ## Licence
 

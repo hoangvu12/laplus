@@ -89,7 +89,7 @@ agent's control channel at the next turn's dispatch — `set_permission_mode`, w
 `set_model` beside it for the model, which had the identical hole. So a mode set
 mid-conversation reaches the process already serving it, without replacing the
 session: no `--resume`, no fresh `init`, no lost context window. The push happens
-when the *next turn* is dispatched rather than when the picker commits, so a turn
+when the _next turn_ is dispatched rather than when the picker commits, so a turn
 already in flight keeps the rules it started under.
 
 **Retune** — telling a `claude` already serving a conversation to change what it
@@ -329,13 +329,13 @@ thing separating it from `thread.session.stop`.
 looking for one. A snooze expires by being **read** — once the wake time is past,
 `effectiveSnoozed` stops classifying and no event fires — and a raised hand stops
 a conversation classifying as snoozed without spending the fields. Both
-derivations ship in the client. So the wake time is a *fact about the
-conversation*: it survives a restart with nothing to re-register, and nothing
+derivations ship in the client. So the wake time is a _fact about the
+conversation_: it survives a restart with nothing to re-register, and nothing
 here has a timer to cancel.
 
 **What may be snoozed is `canSnooze`**, which is `canSettle` minus the live
 session — `crate::threads::Attention` is the whole of that difference, and it
-skips the session *check* rather than filtering the answer, because a
+skips the session _check_ rather than filtering the answer, because a
 conversation can be working and holding an unadopted turn at once. What is
 refused is what a snooze would hide: an unanswered approval or question, and a
 turn no agent has picked up. Archived is refused by both commands for the settle
@@ -358,7 +358,7 @@ mean anything cannot be reached from a socket — a client samples its clock,
 sends, and this server reads its own afterwards.
 
 **A repeat is keyed on the wake time.** Snoozing to the moment a conversation is
-already asleep until re-emits without churn; choosing a *different* time is a new
+already asleep until re-emits without churn; choosing a _different_ time is a new
 decision and restamps both fields. That second half is not tidiness — the client
 measures a raised hand against `snoozedAt`, so a new snooze carrying an old stamp
 would be woken at once by the work the developer had just decided to sleep
@@ -373,10 +373,10 @@ there is real work in it again. The spec's own phrase.
 **There are two resets and they do not share triggers**, which is why `wakes`
 answers a list rather than a `bool`:
 
-| Reset                       | Spent by                                                          | Event                             |
-| --------------------------- | ----------------------------------------------------------------- | --------------------------------- |
-| the inbox override          | a turn request, a working session, a request that blocks on the developer | `thread.unsettled(reason: "activity")` |
-| the snooze                  | a turn request, and nothing else                                  | `thread.unsnoozed(reason: "activity")` |
+| Reset              | Spent by                                                                  | Event                                  |
+| ------------------ | ------------------------------------------------------------------------- | -------------------------------------- |
+| the inbox override | a turn request, a working session, a request that blocks on the developer | `thread.unsettled(reason: "activity")` |
+| the snooze         | a turn request, and nothing else                                          | `thread.unsnoozed(reason: "activity")` |
 
 **Only the developer re-engaging spends a snooze.** A session starting or failing
 does not: the snooze never paused the agent, so work happening is not the
@@ -476,14 +476,14 @@ survives to carry it. `crate::orchestration::Shell::delete`.
 separate withholdings rather than one:
 
 - **Both lists.** `Shelf::holds` answers `false` for a deleted conversation on
-  either shelf. The archived half is the one that had to be *checked* rather than
+  either shelf. The archived half is the one that had to be _checked_ rather than
   assumed — the settings panel takes that snapshot whole and groups it by project,
   filtering on neither `archivedAt` nor `deletedAt`, so a conversation archived and
   then deleted would be drawn there with an unarchive control on it.
 - **The project list's feed.** The change is published as a `thread-removed`
   rather than as a summary, because `OrchestrationThreadShell` does not declare
   `deletedAt` at all and a client therefore cannot filter one out the way it
-  filters an archived conversation. Everything *after* a deletion is withheld too:
+  filters an archived conversation. Everything _after_ a deletion is withheld too:
   an agent may still be running behind one, and its next `thread.session-set`
   would otherwise upsert the conversation straight back onto the list.
   `crate::threads::Change::on_the_list` is the whole of that rule.
@@ -491,11 +491,11 @@ separate withholdings rather than one:
   (`Command::over_a_living_thread`) rather than in nineteen arms, so a stale
   window cannot go on driving a conversation the developer removed.
   `thread.delete` itself is the deliberate exception: whether a conversation is
-  *already* deleted is a question about the field the change is about to move, so
+  _already_ deleted is a question about the field the change is about to move, so
   it is answered under the fold's own lock and a repeat is refused there.
 - **A fresh read.** The thread subscription and `GET
-  /api/orchestration/threads/{threadId}` both refuse one. Both, because the client
-  seeds a pane from the route and then subscribes *with a cursor* because it now
+/api/orchestration/threads/{threadId}` both refuse one. Both, because the client
+  seeds a pane from the route and then subscribes _with a cursor_ because it now
   holds the conversation — a route that answered would leave a window drawing a
   conversation it could never be told was deleted.
 
@@ -507,7 +507,7 @@ Which is also the only door left for reading what the deletion kept.
 **Nothing tells the agent.** A session still running behind a deleted
 conversation writes to a transcript nobody is watching until it ends by itself;
 ending it is `thread.session.stop`'s job. The upstream client sends that command
-*before* this one, which is where the sequencing belongs.
+_before_ this one, which is where the sequencing belongs.
 
 **Ending** — how a turn ended, as the driver knows it: completed, failed, or
 stopped. Distinct from turn state because the CLI reports a stopped turn as a
@@ -575,6 +575,28 @@ rather than invented — the tag says "authorization" where the truth is
 "unimplemented", because no tag in the contract means the latter; see ADR-0017.
 Distinct from a **declined setting** (ADR-0009), which is a value refused on the
 way in rather than a method refused on the way out.
+
+**Capability** — a flag on `server.getConfig` saying what this server can do, and
+the gate on the control that uses it. `environment.capabilities`. Absent is the
+safe answer and the client reads it as unsupported, which is what makes version
+skew survivable in one direction.
+
+The pairing is load-bearing in **both** directions, and each direction has already
+cost something:
+
+- **Answered but not advertised** is a command nothing sends.
+  `useThreadActions.ts` refuses to dispatch a settle or a snooze to a server that
+  does not advertise `threadSettlement` or `threadSnooze`, and the sidebar hides
+  the menu items outright — so the whole thread-lifecycle effort is reachable only
+  because `crate::config` sets both.
+- **Advertised but not answered** is worse. `connectionProbe` makes `session.ts`
+  probe with `server.probe` rather than `server.getConfig`, and that method's
+  refusal tag is the one `session.ts` turns into `ConnectionBlockedError` — a
+  connection refused on _permission_, and not retried. Advertising it before
+  implementing it blocks every connection.
+
+So a capability moves in the same commit as the thing it gates.
+`serverSelfUpdate` is the one that is not a boolean; see **Self-update path**.
 
 ## Working tree
 
@@ -774,9 +796,13 @@ bug.
 executable: a table of names and bytes generated at build time. Source maps are
 the one thing dropped, and they are two thirds of it.
 
-**Upstream** — `pingdotgg/t3code`. Still the origin of every line of the UI and
-of the contract, and still the thing laplus is measured against — but now a
-remote to merge from rather than a checkout to read.
+**Upstream** — `github.com/pingdotgg/t3code`. Still the origin of every line of
+the UI and of the contract, and still the thing laplus is measured against — but
+**neither a checkout nor a remote**. `reference/t3code-server/` was deleted, and
+there is no `upstream` remote to fetch from: `origin` is this repository and it is
+the only one. Upstream is read over the network, in practice `gh api` against the
+public repository, and it is evidence of an implementation rather than a
+dependency. ADR-0018 is why there are no more syncs.
 
 **Assets** — the bundle as the server holds it, and the rules for answering a
 request from it. `crate::ui::Assets`. Empty for every server but the shell's,
@@ -815,6 +841,40 @@ installer writes. Named separately from the **data directory** —
 `keybindings.json` and `logs/` — because until ticket 30 they were one
 directory and nothing in either half said so. Moving the install is what
 separated them; the data has not moved. See ADR-0013.
+
+**Self-update path** — how a newer laplus replaces a running one, reduced to the
+one word the client is told: `desktop-managed`, `boot-service` or `respawn`, or
+absent for "you will relaunch this yourself". `capabilities.serverSelfUpdate`, and
+note it is a **literal, not a flag** — ADR-0020's "stays false" describes a shape
+the contract does not have.
+
+The word names **who restarts the server**, because the server cannot restart the
+thing that is dying:
+
+- **`desktop-managed`** — the shell is supervising, so updating the application
+  updates the server with it, and `server.updateServer` is never called. This is
+  laplus in a window.
+- **`boot-service`** — systemd is supervising. Point the unit at the new version
+  and exit; systemd brings it back. ADR-0028 writes that unit.
+- **`respawn`** — nothing is supervising. Launch a detached replacement and hand
+  off before exiting. This is `npx laplus` in a terminal.
+
+The distinction is not cosmetic: respawning while a supervisor is watching gives
+two servers, which is why the marker has to be written into the unit rather than
+inferred from `INVOCATION_ID`. See ADR-0031.
+
+**Preview host** — whoever owns the webview a preview tab is drawn in, and it is
+**not this server**. The client renders the page; `preview.reportStatus` is the
+_client_ telling the server what that page is doing. The server keeps a registry
+of tabs per thread — with a `revision` and a `serverEpoch` so a client can discard
+a stale answer — and broadcasts changes.
+
+Worth an entry because the opposite is the natural assumption, and it decides
+where work lands: the Electron-versus-Tauri difference between upstream's shell
+and ours falls on `apps/web` and `crates/laplus-shell`, not here. The one preview
+method that does reach the shell is `previewAutomation.focusHost`, which wants a
+verb on ADR-0021's named list. Contract vocabulary; unimplemented here — see
+`.scratch/contract-parity/ledger.md`.
 
 ## Measuring the artifact
 
