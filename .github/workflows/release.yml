@@ -521,8 +521,19 @@ jobs:
       # After staging, never before: `vp pack` inlines `package.json`'s version
       # into the bundle that answers `laplus --version`, so a build that ran
       # first would report 0.0.0 from a tarball that says otherwise.
+      #
+      # **`vp` directly rather than `pnpm --filter laplus build`.** Staging has
+      # just written five `optionalDependencies` into that manifest that are
+      # deliberately not in the lockfile — `launcherManifest` argues why they
+      # cannot be committed — and pnpm verifies the lockfile against every
+      # manifest before it runs a script. So the step that exists to package
+      # that manifest is the one pnpm refuses, with `ERR_PNPM_OUTDATED_LOCKFILE`
+      # about a file it is correct about and that nothing is going to install
+      # from. The bundler needs none of that: it is a binary in this package's
+      # own `node_modules`, and `pnpm install` above already put it there.
       - name: Pack the launcher
-        run: pnpm --filter laplus build
+        working-directory: apps/cli
+        run: ./node_modules/.bin/vp pack
 
       # **`./` is not decoration.** `npm publish apps/cli` is `owner/repo`-shaped,
       # so npm reads it as a GitHub shorthand and goes looking for a repository
