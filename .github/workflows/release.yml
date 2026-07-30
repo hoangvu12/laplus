@@ -345,19 +345,30 @@ jobs:
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             binary: laplus-server.exe
-          # glibc is the floor this sets, and `ubuntu-latest` is 24.04: a binary
-          # built here needs glibc 2.39 or newer, so Debian 12 and RHEL 9 are
-          # out, and `cargo build -p laplus-server` on the box is the answer for
-          # them. `server/docs/running-headless.md` says what that needs.
+          # **musl, statically linked, and that is the whole point.** These were
+          # `-gnu` for one release and the first person to run `npx laplus` on a
+          # real server got four lines of `GLIBC_2.39 not found`: a binary built
+          # on `ubuntu-latest` carries the glibc floor of whatever `ubuntu-latest`
+          # happens to be that month, and the machines people run servers on are
+          # deliberately older than that. The fix cannot be a newer floor — 22.04
+          # is 2.35 and would have failed the same box — because any floor at all
+          # makes `npx laplus` a question about somebody's distribution.
+          #
+          # A musl build links libc in and asks the host for nothing, so it runs
+          # on Ubuntu 20.04, on RHEL 8, and on Alpine, which has no glibc to be
+          # a version of. The cost is musl's allocator, which is slower than
+          # glibc's under threaded load; this server spawns processes and talks
+          # to SQLite rather than allocating in a hot loop, so that is a price
+          # paid in a currency it does not spend.
           - key: linux x64
             slug: linux-x64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             binary: laplus-server
           - key: linux arm64
             slug: linux-arm64
             runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             binary: laplus-server
           - key: darwin arm64
             slug: darwin-arm64
@@ -392,6 +403,13 @@ jobs:
           Add-MpPreference -ExclusionPath "${{ github.workspace }}\server\target"
           Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
 
+      # `musl-gcc`, which rustc links through and which the `cc` crate needs to
+      # compile `rusqlite`'s bundled SQLite against musl rather than against the
+      # host's glibc. Without it the target is installed and cannot be linked.
+      - name: Install the musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -404,8 +422,30 @@ jobs:
           key: ${{ matrix.target }}
           cache-on-failure: true
 
+      # The target-specific spellings rather than `CC`, which would also be read
+      # by build scripts compiling for the *host* — the two are the same machine
+      # here and not the same libc.
       - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build -p laplus-server --release --target ${{ matrix.target }}
+
+      # Proof rather than assumption, and it costs a line. A dynamically linked
+      # binary here is the bug this whole target change exists to remove, and it
+      # would otherwise be found by somebody else on their own server.
+      - name: Check the Linux binaries are static
+        if: contains(matrix.target, 'musl')
+        run: |
+          binary=server/target/${{ matrix.target }}/release/laplus-server
+          file "$binary"
+          if ldd "$binary" 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "$binary is dynamically linked; musl was supposed to make it static." >&2
+            ldd "$binary" >&2
+            exit 1
+          fi
 
       # Named for the platform key rather than the Rust triple, because what
       # reads it back is `artifactName` in `apps/cli/src/release.ts`, which

@@ -18,15 +18,18 @@ Downloads a prebuilt `laplus-server` and the UI, and starts them. Nothing below
 about compilers applies to it, and `--ui` is passed for you, so this is a page
 served and a pairing URL printed in one line.
 
-**It needs glibc 2.39 or newer** — the binaries are built on Ubuntu 24.04, which
-rules out Debian 12 and RHEL 9. It also needs Node 20 or newer, only to run the
-launcher. Everything from _What the server needs at runtime_ onwards applies
-exactly as it does to a build: the `claude` CLI still has to be installed and
-authenticated **on this box**, and the `PATH` section below is still the thing
-that will cost you an hour.
+The Linux binaries are statically linked against musl, so there is no glibc
+version to be short of and no distribution too old — this is the one thing about
+the package that is simpler than a build. It needs Node 20 or newer, only to run
+the launcher.
 
-Build from source when the glibc floor, an unpublished architecture, or a change
-you are making rules the package out.
+Everything from _What the server needs at runtime_ onwards applies exactly as it
+does to a build: the `claude` CLI still has to be installed and authenticated
+**on this box**, and the `PATH` section below is still the thing that will cost
+you an hour.
+
+Build from source for an architecture nothing publishes, or for a change you are
+making.
 
 ## Build prerequisites
 

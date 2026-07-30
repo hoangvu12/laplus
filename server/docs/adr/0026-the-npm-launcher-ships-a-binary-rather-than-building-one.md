@@ -64,11 +64,20 @@ that looks entirely plausible.
 
 ### Only the platforms CI compiles
 
-Five: Windows x64, Linux x64 and arm64, macOS on both architectures. The Linux
-pair are built on Ubuntu 24.04 and therefore need glibc 2.39, which rules out
-Debian 12 and RHEL 9; the Intel Mac binary is cross-compiled from the Apple
-Silicon runner rather than built on a runner label Apple's hardware transition
-keeps taking away.
+Five: Windows x64, Linux x64 and arm64, macOS on both architectures. The Intel
+Mac binary is cross-compiled from the Apple Silicon runner rather than built on
+a runner label Apple's hardware transition keeps taking away.
+
+**The Linux pair are musl, statically linked, and that was learned rather than
+designed.** They were `-gnu` for one published prerelease, and the first person
+to run `npx laplus` on a real server — an aarch64 Ubuntu 20.04 box — got four
+lines of `GLIBC_2.39 not found`. The lesson is not that the floor was set too
+high. It is that a floor is the wrong shape of answer: `ubuntu-latest` is
+whatever it is that month, servers are deliberately older than laptops, and
+22.04 would have failed the same machine. A static binary asks the host for
+nothing and the question stops being asked. What it costs is musl's allocator,
+which is slower than glibc's under threaded load — a currency this server, which
+spawns processes and talks to SQLite, does not spend.
 
 A sixth name in the table with no build behind it would be a package npm
 resolves to nothing — the same failure as an unsupported platform, arriving

@@ -48,9 +48,11 @@ Binaries are published for Windows x64, Linux x64 and arm64, and macOS on both
 architectures. They arrive as `optionalDependencies`, so npm downloads exactly
 one of them and skips the rest.
 
-The Linux binaries are built against glibc 2.39, which rules out Debian 12 and
-RHEL 9. Everywhere else — and on any platform not in that list — build the
-server yourself:
+The Linux binaries are statically linked against musl, so they carry no libc
+dependency and there is no distribution too old for them — Ubuntu 20.04, RHEL 8
+and Alpine all run the same file.
+
+On any platform not in that list, build the server yourself:
 
 ```sh
 git clone https://github.com/hoangvu12/laplus
