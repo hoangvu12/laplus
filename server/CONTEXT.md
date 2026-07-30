@@ -243,7 +243,9 @@ snoozed does not clear the fields, it only stops them classifying.
 **Shelf** — which of the developer's two lists a conversation is on.
 `crate::threads::Shelf`, and the first of the six fields to become something a
 developer can move: `thread.archive` stamps `archivedAt`, `thread.unarchive`
-clears it, and the stamp is the whole of the difference between the two lists.
+clears it, and the stamp is the whole of the difference between the two lists. A
+**deleted** conversation is on neither shelf, which is not symmetry with archive
+but what the client's own reducer needs — see **Deleting is soft**.
 
 **Archiving is not deleting.** The thread, its transcript, its work log and its
 checkpoints all stay exactly as they were, and a running agent is not told
@@ -369,7 +371,10 @@ can settle itself again once the burst of work goes stale.
 both guards as well as by all four commands, so the filter and the rule stay one
 rule: there is no inbox to return an archived conversation to, and clearing state
 the commands themselves refuse to touch would lose the developer's decision the
-moment they unarchived it. Live work is still never hidden, because the client's
+moment they unarchived it. **Nor is a deleted one**, on the same reading, and that
+answer is reachable rather than theoretical: deleting does not stop a session, so
+an agent winding down behind a deleted conversation goes on producing all three
+triggers, and a reset would move a conversation the developer can no longer see. Live work is still never hidden, because the client's
 `effectiveSettled` checks its activity blockers _before_ any override.
 
 The inbox reset's three triggers, two of them narrow on purpose — the snooze
@@ -433,11 +438,50 @@ that the server un-settles on real activity — is what **Lifecycle reset** abov
 is: an auto-settled conversation comes back the moment there is work in it again,
 rather than staying gone until the developer goes looking.
 
-**Deleting is soft** — `deletedAt` is a stamp, not a `DELETE`. The row, its
-transcript, its work log and its checkpoints are all meant to stay: a hard delete
-would orphan the git refs the turns wrote and take the transcript with it
-irreversibly. The command that stamps it is ticket 10's; what is here today is
-the field.
+**Deleting is soft** — `deletedAt` is a stamp, not a `DELETE`. `thread.delete`
+writes it and moves nothing else; the row, its transcript, its work log and its
+checkpoints all stay. Three reasons, and none of them is squeamishness: a hard
+delete would orphan the git refs the turns wrote, the threads table cascades so
+removing the row would take the transcript with it irreversibly, and the contract
+carries a deletion time on the thread that is only meaningful if the thread
+survives to carry it. `crate::orchestration::Shell::delete`.
+
+**What the developer sees is a conversation that is gone**, and that is four
+separate withholdings rather than one:
+
+- **Both lists.** `Shelf::holds` answers `false` for a deleted conversation on
+  either shelf. The archived half is the one that had to be *checked* rather than
+  assumed — the settings panel takes that snapshot whole and groups it by project,
+  filtering on neither `archivedAt` nor `deletedAt`, so a conversation archived and
+  then deleted would be drawn there with an unarchive control on it.
+- **The project list's feed.** The change is published as a `thread-removed`
+  rather than as a summary, because `OrchestrationThreadShell` does not declare
+  `deletedAt` at all and a client therefore cannot filter one out the way it
+  filters an archived conversation. Everything *after* a deletion is withheld too:
+  an agent may still be running behind one, and its next `thread.session-set`
+  would otherwise upsert the conversation straight back onto the list.
+  `crate::threads::Change::on_the_list` is the whole of that rule.
+- **Every later command.** Asked once in `Shell::dispatch`
+  (`Command::over_a_living_thread`) rather than in nineteen arms, so a stale
+  window cannot go on driving a conversation the developer removed.
+  `thread.delete` itself is the deliberate exception: whether a conversation is
+  *already* deleted is a question about the field the change is about to move, so
+  it is answered under the fold's own lock and a repeat is refused there.
+- **A fresh read.** The thread subscription and `GET
+  /api/orchestration/threads/{threadId}` both refuse one. Both, because the client
+  seeds a pane from the route and then subscribes *with a cursor* because it now
+  holds the conversation — a route that answered would leave a window drawing a
+  conversation it could never be told was deleted.
+
+**A resume is the exception, and it is ticket 28's rule unchanged.** A client that
+says it already holds the conversation is owed the `thread.deleted` it has not
+folded yet, and is handed a snapshot stamped `deletedAt` rather than a refusal.
+Which is also the only door left for reading what the deletion kept.
+
+**Nothing tells the agent.** A session still running behind a deleted
+conversation writes to a transcript nobody is watching until it ends by itself;
+ending it is `thread.session.stop`'s job. The upstream client sends that command
+*before* this one, which is where the sequencing belongs.
 
 **Ending** — how a turn ended, as the driver knows it: completed, failed, or
 stopped. Distinct from turn state because the CLI reports a stopped turn as a

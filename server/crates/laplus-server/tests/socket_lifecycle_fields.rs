@@ -1,8 +1,9 @@
 //! The six lifecycle fields, on the wire.
 //!
-//! Ticket 01 of the thread-lifecycle effort. Nothing a developer can do changes
-//! here — there is no command yet — so what these tests are about is the one
-//! thing that did: the thread read model can now *express* an archived, settled,
+//! Ticket 01 of the thread-lifecycle effort. Nothing a developer *does* is
+//! driven here — the commands that move these fields have suites of their own,
+//! one per ticket — so what these tests are about is the one thing ticket 01
+//! changed: the thread read model can now *express* an archived, settled,
 //! snoozed or deleted conversation, and both renderings of a thread carry the
 //! six fields as stored state rather than as hardcoded `null`.
 //!
@@ -37,9 +38,20 @@ const LIFECYCLE_KEYS: [&str; 6] = [
     "deletedAt",
 ];
 
-/// A conversation whose every lifecycle field is set, and to a *different*
+/// A conversation whose lifecycle fields are set, and each to a *different*
 /// value: a field wired to the wrong column then fails these tests rather than
 /// passing by coincidence.
+///
+/// **`deletedAt` is the one left `null`, and it was not always.** When this
+/// ticket was built the field was inert, so curating all six and reading them
+/// back was the whole claim. Ticket 10 gave it a meaning — a deleted
+/// conversation leaves both lists and refuses a fresh subscription — so a
+/// curated deletion here would be a conversation neither of the two feeds below
+/// can be asked about, and these tests are about the *other five* reaching them.
+/// The sixth column is carried across a restart by
+/// `socket_deleting.rs::a_deletion_survives_a_restart` instead, and read back
+/// through the one door a deletion leaves open. Its key is still asserted
+/// present on both renderings, which is what a client's decode needs.
 fn a_curated_lifecycle() -> Lifecycle {
     Lifecycle {
         archived_at: Some("2026-07-26T01:00:00.000Z".to_string()),
@@ -47,7 +59,7 @@ fn a_curated_lifecycle() -> Lifecycle {
         settled_at: Some("2026-07-26T02:00:00.000Z".to_string()),
         snoozed_until: Some("2026-07-27T03:00:00.000Z".to_string()),
         snoozed_at: Some("2026-07-26T04:00:00.000Z".to_string()),
-        deleted_at: Some("2026-07-26T05:00:00.000Z".to_string()),
+        deleted_at: None,
     }
 }
 
@@ -59,7 +71,7 @@ fn on_the_wire() -> Value {
         "settledAt": "2026-07-26T02:00:00.000Z",
         "snoozedUntil": "2026-07-27T03:00:00.000Z",
         "snoozedAt": "2026-07-26T04:00:00.000Z",
-        "deletedAt": "2026-07-26T05:00:00.000Z",
+        "deletedAt": Value::Null,
     })
 }
 

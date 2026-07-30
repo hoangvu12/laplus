@@ -203,7 +203,7 @@ pub use fold::{
     Message, MetaUpdate, Reconciled, Rendered, Session, Shelf, Thread, ThreadRow, TurnState, ACTIVE,
     BY_ACTIVITY, BY_THE_USER, SETTLED,
 };
-use fold::{durable, fresh_id};
+use fold::{durable, fresh_id, Listing};
 
 // ---------------------------------------------------------------------------
 // The registry
@@ -645,7 +645,21 @@ impl Threads {
         }
 
         let event = thread_event(sequence, &thread.id, change.event_type(), payload, &occurred_at);
-        let summary = change.reaches_the_shell().then(|| thread.to_shell_value());
+        // Rendered against the conversation the fold has just left behind, so a
+        // deletion is a removal and everything after one is nothing at all — see
+        // [`Change::on_the_list`], which is where the three cases are argued.
+        let listed = change.on_the_list(thread).map(|listing| match listing {
+            Listing::Summary => json!({
+                "kind": "thread-upserted",
+                "sequence": sequence,
+                "thread": thread.to_shell_value(),
+            }),
+            Listing::Removal => json!({
+                "kind": "thread-removed",
+                "sequence": sequence,
+                "threadId": thread.id,
+            }),
+        });
         // Under the same lock as the fold, so what is written down is what was
         // just folded in and not whatever a later change left behind.
         for write in durable(thread, change) {
@@ -657,12 +671,8 @@ impl Threads {
         // when the buffer is full and a lagging subscriber is resent a snapshot
         // instead — so publishing here cannot stall the caller.
         let _ = entry.events.send(event);
-        if let Some(summary) = summary {
-            let _ = self.inner.shell.send(json!({
-                "kind": "thread-upserted",
-                "sequence": sequence,
-                "thread": summary,
-            }));
+        if let Some(listed) = listed {
+            let _ = self.inner.shell.send(listed);
         }
         Some(Ok(sequence))
     }
@@ -695,13 +705,28 @@ impl Threads {
     /// the same rule read the other way: a client that sent a cursor already
     /// holds the conversation, so it has somewhere to put an event and nothing
     /// to be refused for.
+    ///
+    /// **A conversation the developer deleted is refused on the same footing as
+    /// one that was never created**, and the resume exception is unchanged by
+    /// that: a client holding the conversation is owed the `thread.deleted` it
+    /// has not folded yet, and refusing it would leave that client drawing a
+    /// conversation it will never be told is gone. What a fresh subscriber is
+    /// spared is a snapshot of something the developer removed — which is the
+    /// same sentence a stale window's *commands* are refused with, in
+    /// [`crate::orchestration::Shell::dispatch`].
     pub fn subscribe(&self, call: &Watch) -> Result<EventSource, Value> {
         let thread_id = call.thread_id.as_str();
+        // Three standings, and the two refusals are one answer in two sentences:
+        // there is nothing here a fresh subscriber could draw, and *why* is the
+        // whole of what the message can carry. Asked through [`Threads::deleted`]
+        // rather than read here, so that the guard on the commands and the guard
+        // on the subscriptions are one reading of one field.
+        let deleted = self.deleted(thread_id);
         // Asked for rather than allocated, so that a draft nobody ever sends
         // does not leak a slot on the strength of having been looked at.
         let held = self
             .find(thread_id)
-            .filter(|entry| lock(&entry.state).is_some());
+            .filter(|entry| !deleted && lock(&entry.state).is_some());
         let entry = match held {
             Some(entry) => entry,
             // A resume does allocate, and it is the one caller that allocates
@@ -712,6 +737,16 @@ impl Threads {
             // never exists, which is a few hundred bytes and needs a client that
             // holds a conversation this server does not.
             None if call.resuming() => self.entry(thread_id),
+            // Deleted, and said as deleted: a client polling for a draft that is
+            // about to exist and one reopening a conversation the developer
+            // removed are the same retry loop, and only the sentence can tell
+            // the two apart in a log.
+            None if deleted => {
+                return Err(crate::rpc::declared(
+                    "OrchestrationGetSnapshotError",
+                    format_args!("Thread {thread_id} was deleted"),
+                ))
+            }
             // Nothing to describe and nobody who can draw it: say so, and be
             // asked again.
             None => {
@@ -922,6 +957,26 @@ impl Threads {
     /// Is a thread here?
     pub fn contains(&self, thread_id: &str) -> bool {
         self.get(thread_id).is_some()
+    }
+
+    /// Has the developer deleted this conversation?
+    ///
+    /// `false` for one this server does not hold, and that is not an evasion:
+    /// "there is no such conversation" is a different sentence with a different
+    /// author — the command's own, naming the thread it could not find — and
+    /// answering `true` here would put the deletion sentence on a thread nobody
+    /// ever created.
+    ///
+    /// Reads the field rather than cloning the conversation, which is why it is
+    /// not [`Threads::get`] with a question after it: this is asked for every
+    /// command a client dispatches, and a copy of a long transcript per keystroke
+    /// of an agent's turn is not what the answer costs.
+    pub fn deleted(&self, thread_id: &str) -> bool {
+        self.find(thread_id).is_some_and(|entry| {
+            lock(&entry.state)
+                .as_ref()
+                .is_some_and(|thread| thread.lifecycle.deleted())
+        })
     }
 
     /// A copy of the thread, for a caller that needs to know what to start an
@@ -2400,6 +2455,216 @@ pub(crate) mod tests {
         let woken = threads.get("thread-1").expect("the thread");
         assert_eq!(woken.lifecycle.snoozed_until, None);
         assert_eq!(woken.lifecycle.snoozed_at, None);
+    }
+
+    // -- deleting is soft ----------------------------------------------------
+
+    /// A deletion stamps one field and leaves the conversation where it is —
+    /// which is the whole of what makes it recoverable, and what keeps the git
+    /// refs its turns wrote from being orphaned.
+    #[test]
+    fn deleting_stamps_the_field_and_moves_nothing_else() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply(
+                "thread-1",
+                Change::UserMessage {
+                    message_id: "message-1".to_string(),
+                    text: "hello".to_string(),
+                    turn_id: "turn-1".to_string(),
+                },
+            )
+            .expect("said");
+        let before = threads.get("thread-1").expect("the thread");
+
+        threads.apply("thread-1", Change::Deleted).expect("deleted");
+        let after = threads.get("thread-1").expect("the thread");
+
+        assert_eq!(
+            after.lifecycle.deleted_at,
+            Some(after.updated_at.clone()),
+            "the deletion is stamped at the moment the change committed"
+        );
+        assert_eq!(
+            after.lifecycle,
+            Lifecycle {
+                deleted_at: after.lifecycle.deleted_at.clone(),
+                ..before.lifecycle
+            },
+            "a delete moved a lifecycle field that is not its own"
+        );
+        assert_eq!(
+            after.messages.len(),
+            before.messages.len(),
+            "the transcript went with the deletion"
+        );
+    }
+
+    /// A deleted conversation is on neither of the developer's lists.
+    ///
+    /// Both, and the archived one is the half that had to be checked against the
+    /// client rather than assumed: the settings panel takes the archived snapshot
+    /// whole and groups it by project, filtering on neither field, so a
+    /// conversation archived and then deleted would be drawn there with an
+    /// unarchive control on it.
+    #[test]
+    fn a_deleted_conversation_is_on_neither_shelf() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply("thread-1", Change::Archived)
+            .expect("archived");
+        assert_eq!(threads.shell_summaries(Shelf::Archived).len(), 1);
+
+        threads.apply("thread-1", Change::Deleted).expect("deleted");
+
+        assert!(threads.shell_summaries(Shelf::Working).is_empty());
+        assert!(threads.shell_summaries(Shelf::Archived).is_empty());
+        assert_eq!(
+            threads.latest_change(Shelf::Archived),
+            None,
+            "the archived snapshot is timestamped by a conversation it does not carry"
+        );
+    }
+
+    /// The project list is told the conversation has *gone*, and is told nothing
+    /// about it afterwards.
+    ///
+    /// A summary would not do: `OrchestrationThreadShell` does not declare
+    /// `deletedAt`, so a client cannot filter a deleted conversation out of the
+    /// list the way it filters an archived one. And a session change arriving
+    /// afterwards — an agent deleting does not stop — would upsert the
+    /// conversation straight back onto the list the removal just took it off.
+    #[test]
+    fn the_project_list_is_told_a_removal_and_then_nothing() {
+        let (threads, mut shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        let _ = last_upsert(&mut shell);
+
+        let sequence = threads.apply("thread-1", Change::Deleted).expect("deleted");
+
+        let removal = last_upsert(&mut shell).expect("the list was told");
+        assert_eq!(removal["kind"], "thread-removed");
+        assert_eq!(removal["sequence"], sequence);
+        assert_eq!(removal["threadId"], "thread-1");
+        assert!(
+            removal.get("thread").is_none(),
+            "a removal carries an id and no summary: {removal}"
+        );
+
+        threads.apply("thread-1", Change::Session(running("turn-1")));
+        assert!(
+            last_upsert(&mut shell).is_none(),
+            "an agent still winding down put the conversation back on the list"
+        );
+    }
+
+    /// The conversation's own feed still carries the deletion, because the client
+    /// that is looking at it is exactly the one that has to be told.
+    ///
+    /// The payload is the contract's two keys: a `deletedAt` and no `updatedAt`,
+    /// alone among the lifecycle events, because the reducer keeps none of the
+    /// thread after folding it.
+    #[test]
+    fn the_deletion_is_published_on_the_conversations_own_feed() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        threads.create(a_thread("thread-1")).expect("created");
+        let mut watching = entry.events.subscribe();
+
+        threads.apply("thread-1", Change::Deleted).expect("deleted");
+
+        let published = events(&mut watching);
+        assert_eq!(published.len(), 1, "{published:#?}");
+        let event = &published[0]["event"];
+        assert_eq!(event["type"], "thread.deleted");
+        assert_eq!(event["payload"]["threadId"], "thread-1");
+        assert_eq!(
+            event["payload"]["deletedAt"],
+            json!(threads.get("thread-1").expect("the thread").updated_at)
+        );
+        assert!(
+            event["payload"].get("updatedAt").is_none(),
+            "ThreadDeletedPayload carries two keys: {event}"
+        );
+    }
+
+    /// Work in a deleted conversation does not bring it back.
+    ///
+    /// Reachable rather than theoretical: deleting does not stop a session, so an
+    /// agent still winding down behind a deleted conversation goes on producing
+    /// exactly the changes that reset an override. `Shelf::holds` is what refuses
+    /// both resets, which is the same reading that keeps the conversation off
+    /// both lists — a wake here would move a conversation the developer can no
+    /// longer see, and no command could put the override back.
+    #[test]
+    fn work_in_a_deleted_conversation_does_not_wake_it() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply("thread-1", Change::Settled)
+            .expect("settled");
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        threads.apply("thread-1", Change::Deleted).expect("deleted");
+        let mut watching = entry.events.subscribe();
+
+        // The agent that was already running says it is working, and then asks
+        // the developer something — two of the three triggers, and the two that
+        // can still arrive once the commands are refused.
+        threads.apply("thread-1", Change::Session(running("turn-1")));
+        threads.apply(
+            "thread-1",
+            Change::Activity(crate::worklog::requested(&a_permission(), None)),
+        );
+
+        assert_eq!(
+            published(&mut watching),
+            vec!["thread.session-set", "thread.activity-appended"],
+            "work in a deleted conversation published a lifecycle reset"
+        );
+        let deleted = threads.get("thread-1").expect("the thread");
+        assert_eq!(deleted.lifecycle.settled_override, Some(SETTLED));
+        assert_eq!(deleted.lifecycle.snoozed_until, Some(WAKE.to_string()));
+    }
+
+    /// A fresh subscription to a deleted conversation is refused; one that says
+    /// it already holds the conversation is not.
+    ///
+    /// The resume rule is unchanged by the deletion, and that is the point: a
+    /// client holding the conversation is owed the `thread.deleted` it has not
+    /// folded yet, and refusing it would leave that client drawing a conversation
+    /// it will never be told is gone.
+    #[test]
+    fn a_subscription_to_a_deleted_conversation_is_refused_unless_it_is_a_resume() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.apply("thread-1", Change::Deleted).expect("deleted");
+
+        let refusal = threads
+            .subscribe(&a_watch("thread-1"))
+            .expect_err("a deleted conversation is not described");
+        assert_eq!(refusal["_tag"], "OrchestrationGetSnapshotError");
+        assert!(
+            refusal["message"]
+                .as_str()
+                .expect("a message")
+                .contains("deleted"),
+            "{refusal}"
+        );
+
+        assert!(
+            threads.subscribe(&a_resume("thread-1")).is_ok(),
+            "a client that holds the conversation was refused its own events"
+        );
     }
 
     // -- lifecycle resets on real activity -----------------------------------

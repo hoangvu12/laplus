@@ -129,6 +129,11 @@ impl Lifecycle {
     /// `OrchestrationThreadShell` does not declare it. A `Schema.Struct` ignores
     /// a key it does not name, so this costs the client nothing and saves this
     /// file a second, shorter shape whose only difference would be one omission.
+    /// Since ticket 10 it is also always `null` there — a deleted conversation is
+    /// on neither shelf ([`Shelf::holds`]), so no summary carrying a stamp ever
+    /// reaches a client. The key stays for the reason above: one shape for both
+    /// renderings is what stops a seventh field reaching one and missing the
+    /// other.
     ///
     /// Panics on anything that is not an object, rather than returning and
     /// leaving the six keys off. Both callers pass a `json!({…})` literal, so
@@ -166,6 +171,21 @@ impl Lifecycle {
     fn asleep_until(&self, until: &str) -> bool {
         self.snoozed_until.as_deref() == Some(until)
     }
+
+    /// Has the developer deleted this conversation?
+    ///
+    /// One reading of the field, because the question is asked from four
+    /// directions and each of them would otherwise be a second answer to it:
+    /// [`Shelf::holds`] keeps a deleted conversation off both lists,
+    /// [`Change::on_the_list`] keeps its later changes off the project list's
+    /// feed, `crate::threads::Threads::subscribe` refuses a stream over one, and
+    /// `crate::orchestration::Shell::delete` refuses a second delete.
+    ///
+    /// The stamp *is* the deletion — deleting is soft, so there is no row
+    /// missing and no other field to read.
+    pub fn deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
 }
 
 /// Which of the developer's two lists a snapshot is describing.
@@ -180,6 +200,15 @@ impl Lifecycle {
 /// An archived conversation is still *here*: it stays in the registry, keeps its
 /// transcript and its checkpoints, and is one unarchive away from the list it
 /// left. This decides only which snapshot names it.
+///
+/// **A deleted conversation is on neither.** That is not symmetry with archive —
+/// it is what the client's own reducer needs. The archived section of the
+/// settings panel takes `snapshot.threads` whole and groups it by project
+/// (`SettingsPanels.tsx`, `archivedGroups`), filtering on neither `archivedAt`
+/// nor `deletedAt`, so a conversation that was archived and then deleted would
+/// be drawn there with an unarchive control on it unless this server leaves it
+/// out of the answer. Ticket 10 of the thread-lifecycle effort checked that
+/// against the reducer rather than choosing whichever seemed tidier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shelf {
     /// Everything not archived — the list the developer is working from.
@@ -196,7 +225,16 @@ impl Shelf {
     /// it, and `Shell::set_archived` refuses a move that would not move anything.
     /// A second reading of `archived_at` would be a second answer to one
     /// question.
+    ///
+    /// A deleted conversation is on neither shelf, whatever its `archivedAt`
+    /// says — see the note on [`Shelf`] itself. The two commands that read this
+    /// as "already there?" never see one, because a deleted conversation is
+    /// refused every command before the world is asked
+    /// (`crate::orchestration::Shell::dispatch`).
     pub fn holds(&self, thread: &Thread) -> bool {
+        if thread.lifecycle.deleted() {
+            return false;
+        }
         match self {
             Shelf::Working => thread.lifecycle.archived_at.is_none(),
             Shelf::Archived => thread.lifecycle.archived_at.is_some(),
@@ -210,6 +248,21 @@ impl Shelf {
             Shelf::Archived => Change::Archived,
         }
     }
+}
+
+/// What the project list's feed is sent about one change.
+///
+/// The two things `shellReducer.ts` can be told about a conversation, and the
+/// reason this is an answer rather than a `bool`: a change is either the whole
+/// summary, upserted by id, or the conversation leaving the list. See
+/// [`Change::on_the_list`], which decides which, and
+/// [`crate::threads::Threads::commit`], which renders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Listing {
+    /// The conversation's shell summary, whole. `thread-upserted`.
+    Summary,
+    /// The conversation is off this list. `thread-removed`.
+    Removal,
 }
 
 /// The developer's standing answer that a conversation is finished.
@@ -748,6 +801,11 @@ impl Thread {
     ///   rule stay one rule: an archived conversation has no inbox to be returned
     ///   to, and clearing an override that `thread.unsettle` itself refuses to
     ///   touch would lose the developer's decision the moment they unarchived it.
+    ///   A **deleted** conversation is on neither shelf either, and that answer
+    ///   is reachable rather than theoretical: deleting does not stop a session,
+    ///   so an agent still winding down behind one goes on producing exactly the
+    ///   three triggers. Waking it would move a conversation that has left both
+    ///   of the developer's lists, and no command could put the override back.
     ///
     /// Live work is never hidden either way, and that is what makes the archived
     /// half safe rather than a hole: the client's `effectiveSettled` checks its
@@ -767,7 +825,9 @@ impl Thread {
     /// [`Change::re_emitted_at`] as a repeat, and an archived one is refused for
     /// the reason [`Shelf::holds`] is asked at all — `thread.snooze` and
     /// `thread.unsnooze` both refuse an archived conversation, so a reset that
-    /// did not would spend a snooze no command could have set or cleared.
+    /// did not would spend a snooze no command could have set or cleared. The
+    /// same shelf reading covers a deleted conversation, and for the same reason
+    /// spelled out in [`Thread::wants_waking`].
     pub(crate) fn wants_unsnoozing(&self) -> bool {
         self.lifecycle.snoozed_until.is_some() && Shelf::Working.holds(self)
     }
@@ -1196,6 +1256,29 @@ pub enum Change {
     /// passes; the stored fields simply stop classifying. So an `Unsnoozed` is
     /// always somebody's decision, and that is what makes it worth an event.
     Unsnoozed { reason: &'static str },
+    /// The developer deleted a conversation. `thread.deleted`.
+    ///
+    /// **Deleting is soft, and the stamp is the whole of it.** The row stays,
+    /// and so do its transcript, its work log and its checkpoints. Three reasons,
+    /// none of them squeamishness: the checkpoint refs a turn wrote are real git
+    /// objects in the developer's own repository and a hard delete would orphan
+    /// them; the threads table cascades, so removing the row would take the
+    /// transcript and the work log with it in one statement; and the contract
+    /// carries a deletion time on the thread, which is only meaningful if the
+    /// thread survives to carry it.
+    ///
+    /// **It leaves both lists and takes no further commands.** [`Shelf::holds`]
+    /// is what keeps it off the two snapshots, [`Change::on_the_list`] is what
+    /// keeps its later changes off the project list's feed, and
+    /// `crate::orchestration::Shell::dispatch` is what refuses the commands — a
+    /// stale window must not go on driving a conversation the developer removed.
+    ///
+    /// The payload is the contract's `ThreadDeletedPayload`, which is a
+    /// `threadId` and a `deletedAt` and — alone among the lifecycle events —
+    /// **no `updatedAt`**. The client's reducer folds this to `{kind: "deleted"}`
+    /// (`threadReducer.ts`) and keeps none of the thread, so there is no
+    /// conversation left for a second stamp to describe.
+    Deleted,
     /// The developer moved the conversation's runtime mode.
     /// `thread.runtime-mode-set`.
     ///
@@ -1302,28 +1385,44 @@ pub enum Change {
 }
 
 impl Change {
-    /// Does the project list need to hear about this?
+    /// What the project list is told about this change, if anything.
     ///
-    /// Everything except a delta and an activity. A turn produces hundreds of
-    /// deltas and none of them changes anything the thread *list* renders — the
-    /// title, the session state, the latest turn — so republishing the summary
-    /// per token would be the shell subscription carrying a token stream it has
-    /// no use for.
+    /// `thread` is the conversation **as this change has already left it**, which
+    /// is what lets one answer cover all three cases below rather than the caller
+    /// reading the lifecycle a second time.
     ///
-    /// A checkpoint is in the same position for a different reason: the shell
-    /// summary does not carry `checkpoints` at all, so nothing on the list would
-    /// read one. The two halves of a revert are excluded on that same reading —
-    /// the list renders a conversation's title, session and latest turn, and a
-    /// revert moves a working tree rather than any of the three.
-    pub(crate) fn reaches_the_shell(&self) -> bool {
-        !matches!(
-            self,
+    /// - **A deletion is a removal**, not a summary. `OrchestrationThreadShell`
+    ///   does not declare `deletedAt` at all — a `Schema.Struct` drops a key it
+    ///   does not name — so a client could not filter a deleted conversation out
+    ///   of the list from its summary the way it filters an archived one on
+    ///   `archivedAt`. `thread-removed` is the vocabulary the shell reducer
+    ///   already has for a conversation leaving the list (`shellReducer.ts`), and
+    ///   is what `project.delete` already publishes per conversation.
+    /// - **Nothing else about a deleted conversation is news.** An agent may
+    ///   still be running behind one — deleting does not stop a session — and
+    ///   every `thread.session-set` it publishes would otherwise upsert the
+    ///   conversation straight back onto the list the removal just took it off.
+    /// - **Everything else is the summary, except a delta and an activity.** A
+    ///   turn produces hundreds of deltas and none of them changes anything the
+    ///   thread *list* renders — the title, the session state, the latest turn —
+    ///   so republishing the summary per token would be the shell subscription
+    ///   carrying a token stream it has no use for. A checkpoint is excluded for
+    ///   a different reason: the shell summary does not carry `checkpoints` at
+    ///   all, so nothing on the list would read one. The two halves of a revert
+    ///   go with it on that same reading — the list renders a conversation's
+    ///   title, session and latest turn, and a revert moves a working tree rather
+    ///   than any of the three.
+    pub(crate) fn on_the_list(&self, thread: &Thread) -> Option<Listing> {
+        match self {
+            Change::Deleted => Some(Listing::Removal),
+            _ if thread.lifecycle.deleted() => None,
             Change::AssistantDelta { .. }
-                | Change::Activity(_)
-                | Change::Checkpointed(_)
-                | Change::RevertRequested { .. }
-                | Change::Reverted { .. }
-        )
+            | Change::Activity(_)
+            | Change::Checkpointed(_)
+            | Change::RevertRequested { .. }
+            | Change::Reverted { .. } => None,
+            _ => Some(Listing::Summary),
+        }
     }
 
     /// The moment a repeat of this change reports, when the conversation is
@@ -1683,6 +1782,25 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 "updatedAt": at,
             })
         }
+        // One field, and it is the only one this change touches: the
+        // transcript, the work log, the checkpoints, the session and the other
+        // five lifecycle fields are all left exactly as they were, because
+        // deleting is soft and this stamp is the whole of it.
+        //
+        // The payload is the contract's two keys and no third. `updatedAt` is
+        // absent from `ThreadDeletedPayload` — alone among the lifecycle
+        // payloads — because the client's reducer keeps none of the thread
+        // after folding this (`threadReducer.ts`, `case "thread.deleted"`), so
+        // there is nothing left for a second stamp to describe. The thread's
+        // own `updatedAt` still moves, in `Threads::commit` with every other
+        // change's.
+        Change::Deleted => {
+            thread.lifecycle.deleted_at = Some(at.to_string());
+            json!({
+                "threadId": thread.id,
+                "deletedAt": at,
+            })
+        }
         // The client's reducer, mirrored: one field and `updatedAt`, and
         // nothing else moves. `updatedAt` is the payload's own key here
         // rather than only the thread's, because that is what the reducer
@@ -1998,6 +2116,7 @@ impl Change {
             Change::Unsettled { .. } => "thread.unsettled",
             Change::Snoozed { .. } => "thread.snoozed",
             Change::Unsnoozed { .. } => "thread.unsnoozed",
+            Change::Deleted => "thread.deleted",
             Change::RuntimeModeSet { .. } => "thread.runtime-mode-set",
             Change::InteractionModeSet { .. } => "thread.interaction-mode-set",
             Change::TurnRequested { .. } => "thread.turn-start-requested",

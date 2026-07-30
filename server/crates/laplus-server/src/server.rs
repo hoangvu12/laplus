@@ -842,6 +842,23 @@ async fn shell_snapshot(
 /// server does not hold the thread — which is the ordinary case for a "New
 /// thread" pane, and a typed 404 rather than a bare one for exactly that
 /// reason. See [`crate::http::thread_not_found`].
+///
+/// **A conversation the developer deleted is one of those**, and it is refused
+/// here as well as on the socket because of how the two are used *together*: the
+/// client fetches this snapshot, folds it, and then subscribes with a cursor
+/// because it now holds the conversation (`client-runtime/src/state/threads.ts`).
+/// So a route that answered for a deleted thread would seed a pane with a
+/// conversation the developer removed and then resume past the `thread.deleted`
+/// that would have told it — a stale window with no way left to learn. A client
+/// that held the conversation *before* it asked still resumes into a snapshot
+/// stamped `deletedAt`, which is the resume rule this ticket left alone.
+///
+/// **It is the same refusal as a thread that never existed**, where the socket
+/// gives the two different sentences. Not an oversight: this route's refusal is a
+/// [`crate::http::Refusal`], which carries no message at all — a tag, a code, and
+/// a `reason` whose type is `Schema.Literals(["thread_not_found"])`, one member
+/// wide. There is nowhere for a second sentence to go, and inventing a reason
+/// would fail the typed decode this route exists to keep clean.
 async fn thread_snapshot(
     State(state): State<Arc<ServerState>>,
     Path(thread_id): Path<String>,
@@ -852,7 +869,15 @@ async fn thread_snapshot(
         return refused;
     }
 
-    match state.services.shell.threads().detail_snapshot(&thread_id) {
+    let threads = state.services.shell.threads();
+    // Asked before the conversation is built rather than filtered afterwards:
+    // a detail snapshot is a copy of the whole transcript, and there is no
+    // reason to make one to throw it away.
+    if threads.deleted(&thread_id) {
+        return refuse(http::thread_not_found());
+    }
+
+    match threads.detail_snapshot(&thread_id) {
         Some(snapshot) => Json(snapshot).into_response(),
         None => refuse(http::thread_not_found()),
     }

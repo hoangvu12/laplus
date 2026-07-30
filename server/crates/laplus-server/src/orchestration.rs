@@ -222,6 +222,7 @@ enum Command {
     Unsettle { thread_id: String },
     Snooze { thread_id: String, until: String },
     Unsnooze { thread_id: String },
+    Delete { thread_id: String },
     StartTurn(Box<StartTurn>),
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -443,13 +444,30 @@ impl Shell {
     /// the session as starting — three events, three numbers. The answer is the
     /// last of them, which is the position the log reached, and every one of
     /// them has already been published by the time the client reads it.
+    ///
+    /// **A conversation the developer deleted takes no further commands**, and
+    /// that is decided here rather than command by command: a stale window — one
+    /// that has not folded the `thread.deleted`, or a second one that never
+    /// heard it — must not go on driving a conversation the developer removed,
+    /// and nineteen separate guards would be nineteen places to forget it. See
+    /// [`Command::over_a_living_thread`], which is where the one command that is
+    /// deliberately not covered is argued.
     pub fn dispatch(
         &self,
         payload: &Value,
         index: &Index,
         config: &ServerConfig,
     ) -> Result<Value, CommandError> {
-        let sequence = match Command::parse(payload)? {
+        let command = Command::parse(payload)?;
+        if let Some(thread_id) = command.over_a_living_thread() {
+            if self.inner.threads.deleted(thread_id) {
+                return Err(CommandError::new(format!(
+                    "Conversation '{thread_id}' was deleted, so it takes no further commands."
+                )));
+            }
+        }
+
+        let sequence = match command {
             Command::CreateProject(create) => self.create_project(&create)?,
             Command::RenameProject { project_id, title } => {
                 self.rename_project(&project_id, &title)?
@@ -463,6 +481,7 @@ impl Shell {
             Command::Unsettle { thread_id } => self.unsettle(&thread_id)?,
             Command::Snooze { thread_id, until } => self.snooze(&thread_id, until)?,
             Command::Unsnooze { thread_id } => self.unsnooze(&thread_id)?,
+            Command::Delete { thread_id } => self.delete(&thread_id)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
@@ -936,6 +955,59 @@ impl Shell {
                 Change::Unsnoozed {
                     reason: threads::BY_THE_USER,
                 },
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    /// Take a conversation the developer started by mistake off their list.
+    ///
+    /// **Deleting is soft, and none of the three reasons is squeamishness.** The
+    /// checkpoint refs a turn wrote are real git objects in the developer's own
+    /// repository, and a hard delete would orphan them; the threads table
+    /// cascades, so removing the row would take the transcript and the work log
+    /// with it in one statement; and the contract carries a deletion time on the
+    /// thread, which is only meaningful if the thread survives to carry it. So
+    /// this stamps [`crate::threads::Lifecycle::deleted_at`] and moves nothing
+    /// else — see [`Change::Deleted`].
+    ///
+    /// **What the developer sees is a conversation that is gone.** It leaves both
+    /// snapshots ([`crate::threads::Shelf`]), the project list is told so as a
+    /// `thread-removed` rather than as a summary carrying a field the contract
+    /// does not declare on it ([`crate::threads::Change::on_the_list`]), a fresh
+    /// subscription to it is refused, and every later command against it is
+    /// refused by [`Shell::dispatch`]. The row underneath all that is a recovery
+    /// path rather than a state a client can reach.
+    ///
+    /// **A repeat is refused rather than answered**, as the archive pair is and
+    /// for the same reason: this is not a standing answer the developer gave that
+    /// folding twice lands on either way, it is a conversation leaving a list, and
+    /// a second delete is a click on a control that is no longer there. Refused
+    /// under the same lock the change is folded under — [`Threads::apply_unless`]
+    /// — so two windows deleting at once cannot both be told they did it, which
+    /// is why the general guard in [`Shell::dispatch`] deliberately leaves this
+    /// one command to answer for itself.
+    ///
+    /// **The agent is not spoken to**, which is the archive commands' rule again:
+    /// a session still running behind a deleted conversation goes on writing to a
+    /// transcript nobody is watching until it ends by itself. Ending it is
+    /// `thread.session.stop`'s job, and a delete that stopped a turn mid-flight
+    /// would be a deletion that also interrupted work — see ticket 10's comments,
+    /// where that is left where upstream leaves it.
+    fn delete(&self, thread_id: &str) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| {
+                    thread.lifecycle.deleted().then(|| {
+                        format!(
+                            "Conversation '{thread_id}' was already deleted, so it was left as it \
+                             is."
+                        )
+                    })
+                },
+                Change::Deleted,
             )
             .ok_or_else(|| self.not_open(thread_id))?
             .map_err(CommandError::new)
@@ -2104,8 +2176,10 @@ impl Command {
     ///
     /// The `type` is taken by hand before the rest is deserialized so that an
     /// unimplemented command names itself in the refusal. The contract carries
-    /// roughly twenty command types and laplus implements thirteen, so "which
-    /// one" is the most useful thing a message can say during the build-out.
+    /// twenty commands a client can dispatch and laplus now answers all twenty,
+    /// so what reaches the arm at the bottom is a command the *contract* does not
+    /// name — a server-side one a client cannot send, or a typo — and naming it
+    /// is still the most useful thing the message can do.
     fn parse(payload: &Value) -> Result<Command, CommandError> {
         let kind = payload
             .get("type")
@@ -2317,6 +2391,17 @@ impl Command {
                 )?;
                 Ok(Command::Unsnooze { thread_id })
             }
+            // A conversation and nothing else, as the archive commands are.
+            // Which conversation is the only thing this command carries that
+            // could be wrong; whether it has *already* been deleted is the
+            // world's question and is [`Shell::delete`]'s, decided under the
+            // fold's own lock.
+            "thread.delete" => {
+                let about: AboutAThread = read_about_a_thread(payload, kind)?;
+                Ok(Command::Delete {
+                    thread_id: non_blank(about.thread_id, "threadId", kind)?,
+                })
+            }
             // A turn carries a mode through *two* doors: the per-turn override
             // the composer sends beside every message, and the thread it asks to
             // have created. Both are checked, because both are written onto the
@@ -2451,6 +2536,62 @@ impl Command {
             unimplemented => Err(CommandError::new(format!(
                 "Command not implemented by this server: {unimplemented}"
             ))),
+        }
+    }
+
+    /// The conversation this command needs to still be there, if it names one.
+    ///
+    /// [`Shell::dispatch`] asks this of every command and refuses the ones aimed
+    /// at a conversation the developer deleted. One question in one place, for
+    /// the reason the guard exists at all: a deleted conversation leaves the
+    /// developer's lists and stops taking commands, and a rule spread over
+    /// nineteen dispatch arms is a rule the twentieth forgets.
+    ///
+    /// **`thread.delete` itself is deliberately not covered**, and that is the
+    /// whole of the exception. Whether a conversation is *already* deleted is a
+    /// question about the very field the change is about to move, so it is
+    /// answered under the fold's own lock ([`Shell::delete`]) — asking it here
+    /// and answering it there would let two windows both be told they deleted one
+    /// conversation. It is the same argument [`Shell::set_archived`] makes, and
+    /// the sentence it produces is the specific one.
+    ///
+    /// The three project commands name no conversation. `thread.create` does, and
+    /// is covered: an id the developer deleted is not one a client may quietly
+    /// reuse for a new conversation, and the refusal it would otherwise get —
+    /// that the thread already exists — describes a thread that is no longer on
+    /// any list.
+    ///
+    /// **The guard is read before the lock the change is folded under**, unlike
+    /// the delete's own refusal, so a command dispatched in the instant a delete
+    /// is committing can still get through. That is deliberate rather than
+    /// overlooked: the losing command lands on a conversation that has just left
+    /// both lists and is already refused everything afterwards, and none of the
+    /// nineteen destroys anything — the one that is a *decision* about the same
+    /// field is `thread.delete`, and it is the one decided under the lock.
+    /// Moving this guard inside the fold would mean nineteen refusal closures
+    /// where there is now one question.
+    fn over_a_living_thread(&self) -> Option<&str> {
+        match self {
+            Command::CreateProject(_)
+            | Command::RenameProject { .. }
+            | Command::DeleteProject { .. }
+            | Command::Delete { .. } => None,
+            Command::CreateThread(create) => Some(&create.thread_id),
+            Command::UpdateThreadMeta(update) => Some(&update.thread_id),
+            Command::Archive { thread_id }
+            | Command::Unarchive { thread_id }
+            | Command::Settle { thread_id }
+            | Command::Unsettle { thread_id }
+            | Command::Snooze { thread_id, .. }
+            | Command::Unsnooze { thread_id }
+            | Command::StopSession { thread_id } => Some(thread_id),
+            Command::StartTurn(start) => Some(&start.thread_id),
+            Command::InterruptTurn(interrupt) => Some(&interrupt.thread_id),
+            Command::RespondToApproval(respond) => Some(&respond.thread_id),
+            Command::RespondToUserInput(respond) => Some(&respond.thread_id),
+            Command::SetRuntimeMode(set) => Some(&set.thread_id),
+            Command::SetInteractionMode(set) => Some(&set.thread_id),
+            Command::RevertCheckpoint(revert) => Some(&revert.thread_id),
         }
     }
 }
@@ -2992,6 +3133,16 @@ mod tests {
             }))
         }
 
+        /// The `thread.delete` the sidebar's context menu sends, once the
+        /// developer has answered its confirmation.
+        fn delete_thread(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.delete",
+                "commandId": format!("test:delete-thread:{thread_id}"),
+                "threadId": thread_id,
+            }))
+        }
+
         /// The `thread.checkpoint.revert` the diff panel's undo sends.
         fn revert(&self, thread_id: &str, turn_count: u64) -> Result<Value, CommandError> {
             self.dispatch(&json!({
@@ -3393,18 +3544,24 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and laplus implements nineteen. Each
-    /// refusal has to name what was asked for, or a developer cannot tell which
-    /// of them is missing.
+    /// Every command a client can dispatch is now answered, so what is left to
+    /// refuse by name is a command type the *contract* does not offer a client —
+    /// and a malformed payload for one it does. Each refusal has to name what was
+    /// asked for, or a developer cannot tell what this server made of it.
     #[test]
     fn an_unimplemented_or_malformed_command_is_refused_by_name() {
         let fixture = Fixture::new();
 
+        // A server-side command: `thread.session.set` is in the contract's
+        // `OrchestrationCommand` and deliberately not in the union a client
+        // dispatches from, because this server is what decides a session's
+        // status. Ticket 10 of the thread-lifecycle effort took `thread.delete`
+        // out of this test by answering it.
         let refusal = fixture
-            .dispatch(&json!({"type": "thread.delete", "commandId": "c", "threadId": "t"}))
-            .expect_err("deleting is not implemented");
+            .dispatch(&json!({"type": "thread.session.set", "commandId": "c", "threadId": "t"}))
+            .expect_err("a client does not set a session");
         assert!(
-            refusal.message().contains("thread.delete"),
+            refusal.message().contains("thread.session.set"),
             "{}",
             refusal.message()
         );
@@ -4471,6 +4628,152 @@ mod tests {
                 refusal.message()
             );
         }
+    }
+
+    /// A blank identifier is refused before the world is consulted, an unknown
+    /// conversation is refused by the world, and nothing moves either way.
+    ///
+    /// The blank is the only thing `thread.delete` carries that can be wrong in
+    /// the payload alone — whether the conversation exists, and whether it has
+    /// already been deleted, are the world's questions and are answered under the
+    /// fold's lock.
+    #[test]
+    fn a_blank_or_unknown_conversation_cannot_be_deleted() {
+        let fixture = Fixture::with_a_conversation();
+
+        for blank in ["", "   "] {
+            let refusal = fixture
+                .delete_thread(blank)
+                .expect_err("a blank thread id names no conversation");
+            assert!(
+                refusal.message().contains("threadId"),
+                "{}",
+                refusal.message()
+            );
+        }
+
+        let refusal = fixture
+            .delete_thread("nobody")
+            .expect_err("no such conversation");
+        assert!(
+            refusal.message().contains("nobody"),
+            "{}",
+            refusal.message()
+        );
+
+        assert_eq!(
+            fixture.detail("thread-1")["deletedAt"],
+            Value::Null,
+            "a refused delete stamped the conversation anyway"
+        );
+    }
+
+    /// Deleting stamps the conversation and takes it off both of the developer's
+    /// lists, and a second delete is refused rather than answered.
+    ///
+    /// Refused for the archive pair's reason rather than the settle pair's: this
+    /// is a conversation leaving a list, not a standing answer that folding twice
+    /// lands on either way, so a second delete is a click on a control that is no
+    /// longer there.
+    #[test]
+    fn deleting_takes_the_conversation_off_both_lists_and_refuses_a_repeat() {
+        let fixture = Fixture::with_a_conversation();
+
+        fixture.delete_thread("thread-1").expect("deleted");
+        assert!(
+            fixture.listed_threads().is_empty(),
+            "a deleted conversation is still on the project list: {:#?}",
+            fixture.listed_threads()
+        );
+        assert!(
+            fixture.archived_threads().is_empty(),
+            "a deleted conversation turned up on the archived list: {:#?}",
+            fixture.archived_threads()
+        );
+        // The row is still here, which is the whole of what makes the deletion
+        // soft — and the stamp is on it.
+        assert_eq!(
+            fixture.detail("thread-1")["deletedAt"],
+            fixture.detail("thread-1")["updatedAt"]
+        );
+
+        let refusal = fixture
+            .delete_thread("thread-1")
+            .expect_err("it is already deleted");
+        assert!(
+            refusal.message().contains("thread-1") && refusal.message().contains("already deleted"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// Every command aimed at a deleted conversation is refused, so a stale
+    /// window cannot go on driving one the developer removed.
+    ///
+    /// Every command rather than a representative few: the guard is one question
+    /// asked once in [`Shell::dispatch`], and what this pins is that the list it
+    /// is asked about covers the vocabulary. A command that reached the world
+    /// would move a conversation nobody can see.
+    #[test]
+    fn a_deleted_conversation_takes_no_further_commands() {
+        let fixture = Fixture::with_a_conversation();
+        fixture.delete_thread("thread-1").expect("deleted");
+
+        let refusals = [
+            // The one that matters most: a stale window's next message must not
+            // start a turn in a conversation the developer removed.
+            fixture.start_turn("thread-1", json!({})),
+            fixture.archive("thread-1"),
+            fixture.unarchive("thread-1"),
+            fixture.settle("thread-1"),
+            fixture.unsettle("thread-1"),
+            fixture.snooze("thread-1", &an_hour_from_now()),
+            fixture.unsnooze("thread-1"),
+            fixture.rename_thread("thread-1", "a new name"),
+            fixture.set_runtime_mode("thread-1", "auto"),
+            fixture.set_interaction_mode("thread-1", "plan"),
+            fixture.revert("thread-1", 1),
+            fixture.stop_session("thread-1"),
+            fixture.add_thread("thread-1", "project-1"),
+            fixture.dispatch(&json!({
+                "type": "thread.turn.interrupt",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            })),
+            fixture.dispatch(&json!({
+                "type": "thread.approval.respond",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "requestId": "req-1",
+                "decision": "approve",
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            })),
+            fixture.dispatch(&json!({
+                "type": "thread.user-input.respond",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "requestId": "req-1",
+                "answers": {"Database": "Postgres"},
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            })),
+        ];
+
+        for asked in refusals {
+            let refusal = asked.expect_err("the conversation was deleted");
+            assert!(
+                refusal.message().contains("thread-1") && refusal.message().contains("deleted"),
+                "{}",
+                refusal.message()
+            );
+        }
+
+        // And the conversation is where the delete left it: one stamp, and the
+        // rest of the lifecycle untouched.
+        let detail = fixture.detail("thread-1");
+        assert_eq!(detail["archivedAt"], Value::Null);
+        assert_eq!(detail["settledOverride"], Value::Null);
+        assert_eq!(detail["snoozedUntil"], Value::Null);
     }
 
     /// Settling stores the override and the moment, and a user unsettle pins the
