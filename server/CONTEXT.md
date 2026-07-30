@@ -11,6 +11,28 @@ the reused UI speaks. Where a term exists on both sides, the entry says so.
 **Thread** — one conversation, scoped to a project. What the UI reads. Survives
 a restart; the agent process behind it does not. `crate::threads`.
 
+**Change** — one thing that can happen to a conversation, as a value. Every move
+a thread makes is one of these, whoever asked for it: a command from the
+developer, an event from the agent, or this server's own
+**lifecycle reset**. `crate::threads::Change`.
+
+**Fold** — taking a change and a conversation and answering with the conversation
+as it now is, together with the payload that describes the move to the client.
+`crate::threads::fold`, and the one thing this server does that upstream also
+does, in `threadReducer.ts`.
+
+Given the same conversation and the same change it answers the same way — it
+reads no clock, takes no lock, opens no channel and touches no process. The
+moment a change happened is decided before the fold and handed to it, which is
+why a re-emitted settle can report the stamp the conversation already carried.
+Five constructors in the module do read a clock, and they are named in its doc:
+they build the changes that are handed _to_ the fold, from outside it. ADR-0025
+is the decision and what was weighed against it; ADR-0002 is why the cut is here
+and not between the transcript and the running agent.
+
+Not the refs picker's **folded away**, which drops a remote ref shadowed by a
+local branch. This entry has seniority: it is the meaning an identifier carries.
+
 **Title** — what the developer calls a thread or a project, and the only field
 either one carries purely so that it can be found again. Both are the contract's
 trimmed non-empty string, so a blank one is refused rather than stored — a
@@ -496,9 +518,16 @@ not of a repository: the same branch is current in one worktree and merely
 `HEAD` if there is one, and otherwise whichever of `main` and `master` exists.
 A convention where git has no answer, never a guess where it has none.
 
-**Fold** — dropping a remote ref that has a local branch of the same name.
-`origin/main` beside `main` is a row that says nothing, so the picker does not
-show one unless the client asks (`includeMatchingRemoteRefs`).
+**Folded away** — dropped, of a remote ref that has a local branch of the same
+name. `origin/main` beside `main` is a row that says nothing, so the picker does
+not show one unless the client asks (`includeMatchingRemoteRefs`).
+
+Not the conversation's **fold**, above, which is the older meaning and the one an
+identifier carries — `crate::threads::fold`. This one is prose only: no function
+here is called `fold`, and the contract's word for asking to keep these rows is
+`includeMatchingRemoteRefs`, not a spelling of this one. Named as a participle
+rather than a noun so the two read differently at a glance. See ADR-0025, and
+ADR-0024 for the same disambiguation made between the two meanings of settling.
 
 ## Settings and keybindings
 
