@@ -41,6 +41,13 @@ on:
         description: Also build the Windows installer. Slow, and not needed to try `npx laplus`.
         type: boolean
         default: false
+      publish_npm:
+        description: >
+          Publish the six packages to npm as a prerelease and point `latest` at
+          them, so `npx laplus` works. Permanent — a version, once published,
+          cannot be reused. Publishes no installer and cuts no release.
+        type: boolean
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -455,11 +462,14 @@ jobs:
       # version the other refused. `tauri.conf.json` is the number of record —
       # see the note on that step for why it is not the tag.
       #
-      # **A dispatch gets a prerelease suffix**, so what it packs can never be
-      # mistaken for — or collide with — the release that version number is
-      # going to name later. `0.1.1-dispatch.7` sorts below `0.1.1` and is not
-      # what `npx laplus` resolves to, which is exactly right for a tarball
-      # somebody is installing by hand to try it.
+      # **A dispatch gets a prerelease suffix.** `0.1.1-rc.7` sorts below the
+      # `0.1.1` that version number is going to name later, so a dispatch can
+      # never collide with the release it is rehearsing, and the eventual tag
+      # supersedes everything dispatched before it without any bookkeeping.
+      #
+      # A published prerelease still answers `npx laplus`, because that resolves
+      # the `latest` dist-tag and `latest` is a pointer rather than a judgement
+      # about the version it points at.
       - name: Settle the version
         id: version
         shell: bash
@@ -473,7 +483,7 @@ jobs:
             fi
             version="$configured"
           else
-            version="${configured}-dispatch.${GITHUB_RUN_NUMBER}"
+            version="${configured}-rc.${GITHUB_RUN_NUMBER}"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building $version."
@@ -507,15 +517,19 @@ jobs:
       # called `apps/cli` over ssh instead of packing the directory. The leading
       # `./` is what makes it a path. It cost a dry run to find and would have
       # cost a release.
+      # A tag always publishes; a dispatch publishes only when asked. Both point
+      # `latest` at what they publish — the dispatch because the whole point of
+      # asking is to make `npx laplus` work, and a prerelease sitting under a
+      # dist-tag nobody types would not.
       - name: Publish the binaries, then the launcher
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for package in staged/@laplus/*; do
-            npm publish "./$package" --access public --provenance
+            npm publish "./$package" --access public --provenance --tag latest
           done
-          npm publish ./apps/cli --access public --provenance
+          npm publish ./apps/cli --access public --provenance --tag latest
 
       # What a dispatch produces instead of a publish: the six tarballs, exactly
       # as they would have gone up, left on the run to be downloaded and

@@ -78,20 +78,24 @@ and a `@laplus/server-*` package per platform carrying a `laplus-server` binary.
 That half needs no signing key and an `NPM_TOKEN` secret instead;
 `server/docs/adr/0026` is the shape and why.
 
-A `workflow_dispatch` run builds the same six packages, versions them
-`<version>-dispatch.<run>`, and leaves them on the run as an `npm-tarballs`
-artifact instead of publishing. That is how to try `npx laplus` on a real
-machine before anything reaches the registry:
+A `workflow_dispatch` run builds the same six packages and versions them
+`<version>-rc.<run>`, which sorts below the release that number will name later.
+Two switches decide what happens to them:
 
 ```sh
-gh run download <run-id> -n npm-tarballs -D /tmp/laplus
-mkdir /tmp/try && cd /tmp/try && npm init -y
-npm install /tmp/laplus/laplus-*.tgz /tmp/laplus/laplus-server-linux-x64-*.tgz
-npx laplus --network
+gh workflow run release.yml --ref main                        # pack only
+gh workflow run release.yml --ref main -f publish_npm=true    # publish as latest
 ```
 
-It skips the installer unless asked, because forty minutes of Tauri answers
-nothing about the npm half.
+Without `publish_npm` the tarballs are left on the run as an `npm-tarballs`
+artifact, to be installed from files. With it they go to npm and `latest` moves,
+so `npx laplus` answers — a prerelease under `latest` is still what that command
+resolves. Either way no installer is built and no release is cut; the installer
+needs `-f build_installer=true`, because forty minutes of Tauri answers nothing
+about the npm half.
+
+**A published version is permanent.** npm does not let a version number be
+reused, so the run number in `-rc.<run>` is doing real work.
 
 ## Layout
 

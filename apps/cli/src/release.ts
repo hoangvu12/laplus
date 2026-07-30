@@ -25,7 +25,11 @@ import * as NodeUtil from "node:util";
 
 import { TARGETS } from "./platform.ts";
 
-const REPOSITORY = "https://github.com/hoangvu12/laplus";
+// The canonical `git+https://…​.git` form rather than the browser URL, because
+// npm's provenance attestation matches this field against the workflow that
+// built the tarball, and a URL it has to guess at is a signature it will not
+// issue.
+const REPOSITORY = "git+https://github.com/hoangvu12/laplus.git";
 
 /**
  * The notice that has to travel with what is published, copied into every
