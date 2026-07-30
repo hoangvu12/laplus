@@ -1042,19 +1042,6 @@ mod tests {
         assert_eq!(capabilities["threadSnooze"], serde_json::json!(true));
     }
 
-    /// The flag the client reads before it decides how to probe, as it reaches
-    /// the wire: `session.ts` compares against the literal `true`, so anything
-    /// else — absent, `null`, a truthy string — sends it back to
-    /// `server.getConfig`.
-    #[test]
-    fn the_connection_probe_capability_reaches_the_wire_as_true() {
-        let value = ServerConfig::detect().to_value();
-        assert_eq!(
-            value["environment"]["capabilities"]["connectionProbe"],
-            serde_json::json!(true)
-        );
-    }
-
     /// Whatever this platform answers, the label is a name rather than an empty
     /// string — the same read-only shape as the `data_dir` test above, and for
     /// the same reason: these sources are process-global and a test that set

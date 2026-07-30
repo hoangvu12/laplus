@@ -134,7 +134,13 @@ async fn concurrent_calls_are_correlated_by_request_id() {
 /// `.scratch/contract-parity/ledger.md`'s order and the one cluster whose
 /// usefulness waits on something off-contract entirely: there is no MCP server
 /// here to ask for a click. `crate::rpc`'s enumeration names the same method for
-/// the same reason, and the two are meant to move together.
+/// the same reason.
+///
+/// Both spell it out as a literal rather than sharing a constant, which is the
+/// choice `crate::refusals` already makes for the refusal sentence and makes for
+/// the same reason: a shared constant lets the two agree with each other while
+/// both drift from the contract. So re-pointing one means grepping the method
+/// name and re-pointing the other.
 #[tokio::test]
 async fn an_unimplemented_method_is_reported_without_dropping_the_connection() {
     let server = TestServer::start().await;
