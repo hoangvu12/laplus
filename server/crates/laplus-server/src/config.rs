@@ -143,7 +143,7 @@ pub struct Capabilities {
     /// conversation nobody has touched for `autoSettleAfterDays` now leaves the
     /// inbox by itself. That derivation is the client's and ships unmodified
     /// (ADR-0012), and its premise — that the server un-settles on real
-    /// activity — is now true: [`crate::threads::Change::wakes_the_inbox`] is the
+    /// activity — is now true: [`crate::threads::Change::wakes`] is the
     /// three resets, so an auto-settled conversation comes back the moment there
     /// is work in it again rather than staying gone until the developer opens it.
     ///
@@ -151,7 +151,22 @@ pub struct Capabilities {
     /// shipping the commands with no control that sends them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_settlement: Option<bool>,
-    /// `thread.snooze` and `thread.unsnooze`. Absent, and ticket 09's.
+    /// `thread.snooze` and `thread.unsnooze`, which ticket 09 of the
+    /// thread-lifecycle effort answers.
+    ///
+    /// **The controls are gated on this** exactly as
+    /// [`Capabilities::thread_settlement`]'s are, and for the same reason it is
+    /// part of the ticket rather than a note beside it: `useThreadActions.ts`
+    /// refuses to dispatch either command to a server that does not advertise it,
+    /// so a server that answered both and left this absent would have built two
+    /// commands nothing sends.
+    ///
+    /// What it switches on beyond the menu items is the sidebar's **snoozed
+    /// section** and its "Woke" indicator, both of which are drawn from
+    /// derivations that ship in the client (`effectiveSnoozed`, `threadWokeAt`)
+    /// and read the two fields this server now stores. There is no premise here
+    /// waiting on a later ticket, which is where this differs from settlement:
+    /// a snooze expires by being read, so nothing has to happen for one to end.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_snooze: Option<bool>,
 }
@@ -469,7 +484,7 @@ impl ServerConfig {
                     repository_identity: false,
                     connection_probe: None,
                     thread_settlement: Some(true),
-                    thread_snooze: None,
+                    thread_snooze: Some(true),
                 },
             },
             auth: AuthDescriptor {
@@ -992,7 +1007,8 @@ mod tests {
         assert_eq!(capabilities.connection_probe, None);
         // `thread.settle` and `thread.unsettle`, ticket 07.
         assert_eq!(capabilities.thread_settlement, Some(true));
-        assert_eq!(capabilities.thread_snooze, None);
+        // `thread.snooze` and `thread.unsnooze`, ticket 09.
+        assert_eq!(capabilities.thread_snooze, Some(true));
     }
 
     #[test]
@@ -1001,10 +1017,10 @@ mod tests {
         let capabilities = &value["environment"]["capabilities"];
         assert_eq!(capabilities["repositoryIdentity"], serde_json::json!(false));
         assert!(capabilities.get("connectionProbe").is_none());
-        assert!(capabilities.get("threadSnooze").is_none());
         // And one that is present is the literal `true` the client compares
         // against, rather than any other truthy shape.
         assert_eq!(capabilities["threadSettlement"], serde_json::json!(true));
+        assert_eq!(capabilities["threadSnooze"], serde_json::json!(true));
     }
 
     /// Whatever this platform answers, the label is a name rather than an empty

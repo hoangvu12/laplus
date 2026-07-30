@@ -285,12 +285,77 @@ and one whose turn was asked for and not yet adopted. An archived conversation i
 refused by both commands, in the same reading — it is not in the inbox to leave
 and there is no inbox to pin it back into.
 
+**Snoozing a conversation** — putting it out of sight until a time the developer
+chose. `thread.snooze` stores the wake time they picked as `snoozedUntil` and
+stamps `snoozedAt`; `thread.unsnooze` clears both.
+`crate::orchestration::Shell::snooze` and its twin.
+
+**An overlay, not a destination.** A snoozed conversation stays active in this
+data model — not archived, not settled, not deleted — which is why snooze does
+not sit in the same vocabulary slot as **Shelf**. And it **never touches the
+agent**: a running session is snoozable, because snooze is a decision about the
+developer's attention rather than an interruption of the work. That is the one
+thing separating it from `thread.session.stop`.
+
+**There is no scheduler**, and this is the thing to know before reading the code
+looking for one. A snooze expires by being **read** — once the wake time is past,
+`effectiveSnoozed` stops classifying and no event fires — and a raised hand stops
+a conversation classifying as snoozed without spending the fields. Both
+derivations ship in the client. So the wake time is a *fact about the
+conversation*: it survives a restart with nothing to re-register, and nothing
+here has a timer to cancel.
+
+**What may be snoozed is `canSnooze`**, which is `canSettle` minus the live
+session — `crate::threads::Attention` is the whole of that difference, and it
+skips the session *check* rather than filtering the answer, because a
+conversation can be working and holding an unadopted turn at once. What is
+refused is what a snooze would hide: an unanswered approval or question, and a
+turn no agent has picked up. Archived is refused by both commands for the settle
+pair's reason.
+
+**A wake time is judged, not stored blindly.** It must be one this server can
+place on its own clock (`crate::clock::epoch_millis_from_iso`, the inverse of the
+renderer, strict about both the shape and the calendar) and **strictly ahead of
+now** — a conversation snoozed until a moment that has passed would be snoozed
+and awake at once, carrying state it can never leave. Refused rather than
+normalised, and stored exactly as the client sent it.
+
+One guard, two sentences: a string this server cannot place on a clock is not one
+it can call future either, so it takes the same branch — but "that moment has
+passed" is a lie about a time this server simply does not read, and the sentence
+_is_ the whole diagnostic. `crate::orchestration::Unusable` is the distinction.
+The comparison itself is `wake_time`, which takes the instant to compare against
+rather than reading the clock, because the boundary that makes "strictly future"
+mean anything cannot be reached from a socket — a client samples its clock,
+sends, and this server reads its own afterwards.
+
+**A repeat is keyed on the wake time.** Snoozing to the moment a conversation is
+already asleep until re-emits without churn; choosing a *different* time is a new
+decision and restamps both fields. That second half is not tidiness — the client
+measures a raised hand against `snoozedAt`, so a new snooze carrying an old stamp
+would be woken at once by the work the developer had just decided to sleep
+through.
+
 **Lifecycle reset** — a conversation returning to the inbox on its own, because
 there is real work in it again. The spec's own phrase.
-`crate::threads::Change::wakes_the_inbox` decides what counts,
-`crate::threads::Thread::wants_waking` is the guard, and
-`crate::threads::Threads::wake_the_inbox` emits the `thread.unsettled` carrying
-`reason: "activity"`.
+`crate::threads::Change::wakes` decides which resets a change spends,
+`crate::threads::Woken` is what each one is and what stands in its way, and
+`crate::threads::Threads::woken_by` emits them.
+
+**There are two resets and they do not share triggers**, which is why `wakes`
+answers a list rather than a `bool`:
+
+| Reset                       | Spent by                                                          | Event                             |
+| --------------------------- | ----------------------------------------------------------------- | --------------------------------- |
+| the inbox override          | a turn request, a working session, a request that blocks on the developer | `thread.unsettled(reason: "activity")` |
+| the snooze                  | a turn request, and nothing else                                  | `thread.unsnoozed(reason: "activity")` |
+
+**Only the developer re-engaging spends a snooze.** A session starting or failing
+does not: the snooze never paused the agent, so work happening is not the
+developer changing their mind — and a raised hand already stops the conversation
+classifying without spending it, so clearing the fields there would cost them the
+rest of their snooze the moment they dismissed the request. Sending a new message
+is the one act that says they are back.
 
 **Leaving the inbox must never hide something that needs the developer.** The
 invariants above refuse to create that state when the developer asks, and this is
@@ -300,14 +365,15 @@ blocked on a decision only the developer can make. It resets an override in
 _either_ direction — a conversation pinned active returns to neutral too, so it
 can settle itself again once the burst of work goes stale.
 
-**An archived conversation is not woken.** `Shelf::holds` is asked here as well as
-by both commands, so the filter and the rule stay one rule: there is no inbox to
-return an archived conversation to, and clearing an override the commands
-themselves refuse to touch would lose the developer's decision the moment they
-unarchived it. Live work is still never hidden, because the client's
+**An archived conversation is not woken, either way.** `Shelf::holds` is asked by
+both guards as well as by all four commands, so the filter and the rule stay one
+rule: there is no inbox to return an archived conversation to, and clearing state
+the commands themselves refuse to touch would lose the developer's decision the
+moment they unarchived it. Live work is still never hidden, because the client's
 `effectiveSettled` checks its activity blockers _before_ any override.
 
-Three triggers, two of them narrow on purpose:
+The inbox reset's three triggers, two of them narrow on purpose — the snooze
+reset takes only the first:
 
 | When                                                  | Why it is that narrow                                                                                                                                                                                   |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -315,19 +381,24 @@ Three triggers, two of them narrow on purpose:
 | the session becomes `starting` or `running`           | `ready`, `stopped` and `error` are a status arriving _after_ the fact and must not fight an explicit settle. `SessionStatus::is_working` is the same reading `Busy` refuses a settle with, deliberately |
 | an approval or a question is appended to the work log | `crate::worklog::blocks_on_the_developer` — any work-log row would wake a settled conversation on every tool call of every turn                                                                         |
 
-Two of the three are paths this server already owned, so the reset is a guarded
+Every trigger is a path this server already owned, so a reset is a guarded
 emission _beside_ an event that already fires rather than a new mechanism. The
-guard is `Thread::wants_waking`, and it travels through the refusal
-`Threads::commit` already takes for the archive commands — so it is asked under
-the lock the fold runs under and before a sequence is taken. Without it a reset
-with no override behind it would land in `Change::re_emitted_at` as a repeat and
-put a no-op event on the feed at a stale `updatedAt`, reordering a list the
-developer had not changed anything in.
+guards are `Thread::wants_waking` and `Thread::wants_unsnoozing`, and both travel
+through the refusal `Threads::commit` already takes for the archive commands — so
+each is asked under the lock the fold runs under and before a sequence is taken.
+Without them a reset with nothing behind it would land in
+`Change::re_emitted_at` as a repeat and put a no-op event on the feed at a stale
+`updatedAt`, reordering a list the developer had not changed anything in. Both
+guards read `Shelf::holds` as well, so an archived conversation keeps both its
+inbox state and its snooze through any amount of work — which is one rule with
+the commands, since all four refuse an archived conversation.
 
-**One command, two events.** The reset is published after the change that caused
-it, and the dispatch answers with the last of the sequences it committed — the
-shape a turn request already had when it committed three. Snooze is cleared only
-by a new turn, which is ticket 09's.
+**One command, several events.** The resets are published after the change that
+caused them, and the dispatch answers with the last of the sequences it committed
+— the shape a turn request already had when it committed three. A message in a
+conversation the developer had both settled and snoozed spends both, as two
+events: a client folding one and not the other would hold half a conversation's
+lifecycle.
 
 **Adoption grace** — how long a user message with no turn behind it is still a
 turn about to start rather than stale data. Two minutes either side of now,
@@ -335,20 +406,24 @@ mirrored from the client, and held as two _rendered_ stamps
 (`crate::threads::Adoption`): every timestamp on this wire is one fixed-width UTC
 shape, so it orders lexicographically and the window needs no calendar.
 
-**Idempotence by re-emission** — a repeat of either command is answered rather
-than refused, and this is where they part company with the archive pair above.
-Both directions are a standing answer rather than a move between two lists, so
-folding the event again lands on the same state. A re-emission carries the
-conversation's _existing_ `updatedAt` and `settledAt` rather than the current
-time, so a double-click neither rewinds the conversation nor moves it in a list
-ordered by when things changed. `crate::threads::Change::re_emitted_at`, and it
-is the one change in this crate that does not stamp the clock.
+**Idempotence by re-emission** — a repeat of any of the four inbox-state commands
+is answered rather than refused, and this is where they part company with the
+archive pair above. Each is a standing answer rather than a move between two
+lists, so folding the event again lands on the same state. A re-emission carries
+the conversation's _existing_ `updatedAt` — and, through the fold, its existing
+`settledAt` or `snoozedAt` — rather than the current time, so a double-click
+neither rewinds the conversation nor moves it in a list ordered by when things
+changed. `crate::threads::Change::re_emitted_at`, and it is the one change in
+this crate that does not stamp the clock. What counts as a repeat is per command:
+a settle asks about the override, a snooze about the wake time.
 
-**The controls are gated on a capability.** `capabilities.threadSettlement` on
-`server.getConfig`: `useThreadActions.ts` refuses to dispatch either command to a
-server that does not advertise it, and the sidebar and chat view hide the menu
-items outright. Answering the commands without advertising the flag would be two
-commands nothing sends.
+**The controls are gated on capabilities.** `capabilities.threadSettlement` and
+`capabilities.threadSnooze` on `server.getConfig`: `useThreadActions.ts` refuses
+to dispatch a command to a server that does not advertise its flag, and the
+sidebar and chat view hide the menu items outright. Answering the commands
+without advertising the flag would be commands nothing sends. `threadSnooze` also
+draws the sidebar's snoozed section and its "Woke" indicator, both from
+derivations that ship in the client.
 
 The same flag also lets the client's **inactivity auto-settle** classify at all
 (`SidebarV2.tsx`), so advertising it does more than reveal two menu items: a

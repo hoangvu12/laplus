@@ -621,7 +621,7 @@ pub fn unanswered_user_input(activities: &[Activity]) -> Vec<&str> {
 ///
 /// Asked of **one row as it is appended** rather than of a whole work log, which
 /// is why it is not `unanswered(&[activity])`: the caller
-/// ([`crate::threads::Change::wakes_the_inbox`]) has the row and wants to know
+/// ([`crate::threads::Change::wakes`]) has the row and wants to know
 /// whether *this* is the one that raises a hand. A conversation with a request
 /// already open has already been woken by the row that opened it.
 ///
@@ -1525,7 +1525,7 @@ mod tests {
     /// folds above one reading: [`blocks_on_the_developer`] is asked of one row and
     /// the folds are asked of a whole log, so a third request kind added to either
     /// fold and missed here would silently stop waking a settled conversation —
-    /// see `crate::threads::Change::wakes_the_inbox`, which is the only caller.
+    /// see `crate::threads::Change::wakes`, which is the only caller.
     /// The rows that must *not* block are as much the point: a turn produces dozens
     /// of them, and a conversation woken by each would be one the developer cannot
     /// let go of. Both resolutions are in the set because they are a request

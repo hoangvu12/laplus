@@ -150,6 +150,22 @@ impl Lifecycle {
             fields.insert(key.to_string(), value);
         }
     }
+
+    /// Is this conversation already asleep until exactly this moment?
+    ///
+    /// One snooze asks it twice and from two directions, which is why it is a
+    /// function rather than a comparison written out at each:
+    /// [`Change::re_emitted_at`] asks it to decide whether the clock is read at
+    /// all, and [`fold`] asks it to decide whether `snoozedAt` is restamped. A
+    /// repeat has to answer the same in both, or a double-click would report an
+    /// `updatedAt` from one snooze beside a `snoozedAt` from another.
+    ///
+    /// Keyed on the *time* rather than on being snoozed at all, because choosing
+    /// a different one is a new decision rather than a repeat — see
+    /// [`Change::Snoozed`], where what that costs is argued.
+    fn asleep_until(&self, until: &str) -> bool {
+        self.snoozed_until.as_deref() == Some(until)
+    }
 }
 
 /// Which of the developer's two lists a snapshot is describing.
@@ -219,12 +235,12 @@ pub const BY_THE_USER: &str = "user";
 /// burst of work goes stale. A client able to send it could pin a conversation
 /// the developer had let go of, or clear a pin they had asked for.
 ///
-/// The three places it is emitted from are [`Change::wakes_the_inbox`].
+/// The three places it is emitted from are [`Change::wakes`].
 pub const BY_ACTIVITY: &str = "activity";
 
 /// Why a lifecycle reset was not emitted — a sentence that reaches nobody.
 ///
-/// [`Threads::wake_the_inbox`] asks [`Thread::wants_waking`] through the same
+/// [`Threads::woken_by`] asks [`Thread::wants_waking`] through the same
 /// refusal the archive commands use, because that is the only guard in this
 /// module decided under the fold's own lock. A refusal there is a sentence, and
 /// this is the honest one; it is a constant rather than a `format!` naming the
@@ -232,6 +248,10 @@ pub const BY_ACTIVITY: &str = "activity";
 /// conversation nobody has settled — and a sentence nobody renders is not worth
 /// building per work-log row.
 pub(crate) const NOTHING_TO_WAKE: &str = "There is no inbox state to return this conversation to.";
+
+/// [`NOTHING_TO_WAKE`]'s twin, for the other reset — the ordinary answer for a
+/// conversation nobody put to sleep.
+pub(crate) const NOTHING_TO_UNSNOOZE: &str = "There is no snooze on this conversation to spend.";
 
 /// A stored settle override, back as one of the contract's two.
 ///
@@ -335,7 +355,8 @@ impl Adoption {
 /// to say about it.
 ///
 /// Snooze refuses on a subset of these — a running session *is* snoozable,
-/// because snooze governs attention and never the agent — which is ticket 09's.
+/// because snooze governs attention and never the agent. [`Attention`] is which
+/// subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Busy {
     /// The agent asked for permission and has not been answered.
@@ -346,6 +367,45 @@ pub enum Busy {
     Session,
     /// The developer asked for a turn and no session has picked it up yet.
     QueuedTurn,
+}
+
+/// Which of the developer's two ways of putting a conversation out of sight the
+/// blockers are being asked about.
+///
+/// `canSettle` and `canSnooze` are two readings of one list in
+/// `client-runtime/src/state/threadSettled.ts`, and the difference is a single
+/// entry: a working agent blocks a settle and does not block a snooze. So this
+/// is a parameter on [`Thread::busy`] rather than a second function beside it —
+/// two functions would be two copies of the order, and the order is what decides
+/// which sentence a refusal shows.
+///
+/// **It is asked where the blocker is asked, not applied to the answer.** A
+/// conversation can be both working and holding an unadopted turn, and `busy`
+/// answers with the first blocker in the client's order — so filtering a
+/// `Session` out of the answer would report nothing at all and let a snooze hide
+/// the queued turn behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// Leaving the inbox as finished — `canSettle`, all four blockers.
+    Settling,
+    /// Leaving it until a time the developer chose — `canSnooze`, which is the
+    /// same list without the live session.
+    ///
+    /// The three that remain are the ones a snooze would *hide*: a request the
+    /// agent is blocked on the developer for, and a turn about to start. Work in
+    /// progress is not hidden by a snooze, because the conversation comes back
+    /// on its own.
+    Snoozing,
+}
+
+impl Attention {
+    /// Does a working agent stand in the way of this?
+    ///
+    /// The whole of the difference between the two lists, in the one place it can
+    /// be read — so a third caller cannot invent a third answer to it.
+    fn minds_a_working_agent(&self) -> bool {
+        matches!(self, Attention::Settling)
+    }
 }
 
 /// A conversation's own row: everything about a thread except what is in it.
@@ -650,17 +710,23 @@ impl Thread {
     /// the session's status, and the latest turn against the latest user message.
     /// The first two are literally the flags the summary carries, because they
     /// come from the same two functions.
-    pub fn busy(&self, adoption: &Adoption) -> Option<Busy> {
+    ///
+    /// `canSnooze` is the same list read once more with the session left out, and
+    /// it is [`Attention`] that says so. The session check is *skipped* rather
+    /// than its answer discarded: see [`Attention`], where the conversation that
+    /// makes those two different is written down.
+    pub fn busy(&self, adoption: &Adoption, about: Attention) -> Option<Busy> {
         if self.has_pending_approvals() {
             return Some(Busy::Approval);
         }
         if self.has_pending_user_input() {
             return Some(Busy::Question);
         }
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.status.is_working())
+        if about.minds_a_working_agent()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.status.is_working())
         {
             return Some(Busy::Session);
         }
@@ -670,7 +736,7 @@ impl Thread {
 
     /// Is there an inbox state here for real work to reset?
     ///
-    /// The guard on all three of [`Change::wakes_the_inbox`]'s triggers, and both
+    /// The guard on all three of [`Change::wakes`]'s triggers, and both
     /// halves of it are about not moving something nobody asked to have moved:
     ///
     /// - **An override to clear.** A reset over a conversation with none lands in
@@ -691,6 +757,19 @@ impl Thread {
     /// settled whatever these two fields say.
     pub(crate) fn wants_waking(&self) -> bool {
         self.lifecycle.settled_override.is_some() && Shelf::Working.holds(self)
+    }
+
+    /// Is there a return ticket here for a new message to spend?
+    ///
+    /// [`Thread::wants_waking`]'s twin over the other pair of fields, and both
+    /// halves are the same two questions asked about a snooze: a conversation
+    /// with no wake time set has nothing to clear and would land in
+    /// [`Change::re_emitted_at`] as a repeat, and an archived one is refused for
+    /// the reason [`Shelf::holds`] is asked at all — `thread.snooze` and
+    /// `thread.unsnooze` both refuse an archived conversation, so a reset that
+    /// did not would spend a snooze no command could have set or cleared.
+    pub(crate) fn wants_unsnoozing(&self) -> bool {
+        self.lifecycle.snoozed_until.is_some() && Shelf::Working.holds(self)
     }
 
     /// A message the developer sent that no session has picked up yet.
@@ -1067,12 +1146,56 @@ pub enum Change {
     /// The reason is one of the contract's two and decides what the conversation
     /// is left in — see [`pinned_by`], where the asymmetry is argued. A command
     /// sends only [`BY_THE_USER`]; the neutral [`BY_ACTIVITY`] reset is this
-    /// server's own and is emitted from [`Change::wakes_the_inbox`].
+    /// server's own and is emitted from [`Change::wakes`].
     ///
     /// It clears `settledAt` rather than stamping a second time, for
     /// [`Change::Unarchived`]'s reason: there is no such thing as when a
     /// conversation stopped being settled.
     Unsettled { reason: &'static str },
+    /// The developer put a conversation to sleep until a time they chose.
+    /// `thread.snoozed`.
+    ///
+    /// **An overlay rather than a destination.** A snoozed conversation is still
+    /// active in this data model — it is not archived, not settled and not
+    /// deleted — and these two fields only suppress it from the inbox until the
+    /// wake time passes. That is why snooze does not sit in the same vocabulary
+    /// slot as [`Change::Archived`].
+    ///
+    /// **There is no scheduler behind it.** A snooze expires by being *read*:
+    /// once `until` is in the past, `effectiveSnoozed` simply stops classifying
+    /// the conversation as snoozed, so no event fires when a wake time passes and
+    /// there is nothing here to schedule. The same is true of a raised hand — a
+    /// snoozed conversation whose agent becomes blocked on the developer stops
+    /// classifying without *spending* the snooze, and both derivations live in
+    /// the bundled client runtime.
+    ///
+    /// **And it never touches the agent.** A running session is snoozable, which
+    /// is the one thing that makes this different from
+    /// [`Change::SessionStopRequested`]: a snooze is a decision about the
+    /// developer's attention, not an interruption of the work.
+    ///
+    /// `until` is stored exactly as the developer's client sent it rather than
+    /// re-rendered. A wake time this server cannot place on its own clock is
+    /// refused at the parse — see [`crate::clock::epoch_millis_from_iso`] — so
+    /// what reaches here is already one of this wire's renderings, and
+    /// normalising it again would be a second spelling of a moment two readers
+    /// would then have to agree about.
+    Snoozed { until: String },
+    /// The conversation came back. `thread.unsnoozed`.
+    ///
+    /// [`Change::Unsettled`]'s shape and its asymmetry read the other way round:
+    /// the reason is one of the contract's two and *neither* leaves anything
+    /// behind, because there is no such thing as a pinned-awake conversation —
+    /// both directions clear both fields. What the reason distinguishes is who
+    /// decided, which the client renders and this server must not let a client
+    /// forge: [`BY_THE_USER`] is the developer saying "wake it now", and
+    /// [`BY_ACTIVITY`] is this server spending the return ticket because they
+    /// sent a new message.
+    ///
+    /// **A timer wake is not one of these.** Nothing is emitted when a wake time
+    /// passes; the stored fields simply stop classifying. So an `Unsnoozed` is
+    /// always somebody's decision, and that is what makes it worth an event.
+    Unsnoozed { reason: &'static str },
     /// The developer moved the conversation's runtime mode.
     /// `thread.runtime-mode-set`.
     ///
@@ -1236,12 +1359,22 @@ impl Change {
     /// lands here as a repeat and would publish a no-op event at a stale
     /// `updatedAt` — a conversation reordered, or not, by work that changed
     /// nothing about it. The answer is the guard at the call site, and the one
-    /// caller that sends that reason has it: see [`Threads::wake_the_inbox`], which
+    /// caller that sends that reason has it: see [`Threads::woken_by`], which
     /// refuses the reset when there is no override to reset.
     pub(crate) fn re_emitted_at(&self, thread: &Thread) -> Option<String> {
         let already = match self {
             Change::Settled => thread.lifecycle.settled_override == Some(SETTLED),
             Change::Unsettled { reason } => thread.lifecycle.settled_override == pinned_by(reason),
+            // Keyed on the wake time, because a snooze to a *different* moment is
+            // a new decision and has to stamp the clock — see
+            // [`Lifecycle::asleep_until`], which both this and [`fold`] ask so
+            // that a repeat cannot be a repeat to one of them and not the other.
+            Change::Snoozed { until } => thread.lifecycle.asleep_until(until),
+            // Waking has one destination whoever asked for it, so any wake of a
+            // conversation nobody snoozed is the repeat — there is no second
+            // state for a reason to land in, which is where this parts company
+            // with [`Change::Unsettled`].
+            Change::Unsnoozed { .. } => thread.lifecycle.snoozed_until.is_none(),
             _ => return None,
         };
         already.then(|| thread.updated_at.clone())
@@ -1256,7 +1389,7 @@ impl Change {
     /// settled while quiet whose agent then asks for permission would sit outside
     /// the inbox while blocked on a decision only the developer can make. These
     /// three triggers are what close that, [`Thread::wants_waking`] is the guard
-    /// on all of them, and [`Threads::wake_the_inbox`] is where the reset is
+    /// on all of them, and [`Threads::woken_by`] is where the reset is
     /// emitted.
     ///
     /// **It resets an override in either direction**, which is why the answer is
@@ -1282,13 +1415,81 @@ impl Change {
     /// A turn request is not narrowed, because there is nothing narrower about
     /// it: the developer typed something and pressed enter, which is the
     /// clearest possible statement that they are back in the conversation.
-    pub(crate) fn wakes_the_inbox(&self) -> bool {
+    ///
+    /// **The two resets do not have the same triggers**, which is the whole
+    /// reason this answers a list rather than a `bool` — see [`Woken`].
+    pub(crate) fn wakes(&self) -> &'static [Woken] {
         match self {
-            Change::TurnRequested { .. } => true,
-            Change::Session(session) => session.status.is_working(),
-            Change::Activity(appended) => crate::worklog::blocks_on_the_developer(appended),
-            _ => false,
+            // The developer came back of their own accord, and that spends
+            // both: the pin they left and the return ticket they set.
+            Change::TurnRequested { .. } => &[Woken::Inbox, Woken::Snooze],
+            Change::Session(session) if session.status.is_working() => &[Woken::Inbox],
+            Change::Activity(appended) if crate::worklog::blocks_on_the_developer(appended) => {
+                &[Woken::Inbox]
+            }
+            _ => &[],
         }
+    }
+}
+
+/// A conversation the developer had put out of sight, and what real work in it
+/// takes back.
+///
+/// Two resets rather than one, because they are not spent by the same work and
+/// collapsing them would make each wrong in the other's direction:
+///
+/// - **The inbox override** answers "is this finished?", so an agent that starts
+///   working or blocks on the developer contradicts it and it goes.
+/// - **The snooze** is a return ticket the developer bought. A session starting
+///   or failing does not spend one — the snooze never paused the agent, so work
+///   happening is not the developer changing their mind — and a raised hand
+///   already stops the conversation *classifying* as snoozed without spending
+///   it, which is a derivation that ships in the client. Spending it there would
+///   cost the developer the rest of their snooze the moment they dismissed the
+///   request.
+///
+/// What both share is the guard's shape and its home: each is asked under the
+/// lock the fold runs under, through the refusal [`crate::threads::Threads::commit`]
+/// already takes, and each refuses when there is nothing to reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Woken {
+    /// The developer's standing answer about whether the conversation is
+    /// finished. Ticket 08's three triggers.
+    Inbox,
+    /// The wake time they chose. A new message, and nothing else.
+    Snooze,
+}
+
+impl Woken {
+    /// The change that performs this reset.
+    ///
+    /// Both carry [`BY_ACTIVITY`], which is the reason no command can send: a
+    /// client able to forge one could pin a conversation the developer had let
+    /// go of, or wake one they had put to sleep.
+    pub(crate) fn reset(&self) -> Change {
+        match self {
+            Woken::Inbox => Change::Unsettled {
+                reason: BY_ACTIVITY,
+            },
+            Woken::Snooze => Change::Unsnoozed {
+                reason: BY_ACTIVITY,
+            },
+        }
+    }
+
+    /// Why this reset was not emitted, or `None` when it should be.
+    ///
+    /// A refusal rather than a check before the call, so that "is there anything
+    /// to reset?" is decided under the fold's own lock and before a sequence is
+    /// taken — two triggers arriving at once cannot then both find something and
+    /// both emit. The cost is a sentence no client reads, because nothing
+    /// dispatches these.
+    pub(crate) fn refusal(&self, thread: &Thread) -> Option<String> {
+        let (wanted, why) = match self {
+            Woken::Inbox => (thread.wants_waking(), NOTHING_TO_WAKE),
+            Woken::Snooze => (thread.wants_unsnoozing(), NOTHING_TO_UNSNOOZE),
+        };
+        (!wanted).then(|| why.to_string())
     }
 }
 
@@ -1432,6 +1633,50 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
         Change::Unsettled { reason } => {
             thread.lifecycle.settled_override = pinned_by(reason);
             thread.lifecycle.settled_at = None;
+            json!({
+                "threadId": thread.id,
+                "reason": reason,
+                "updatedAt": at,
+            })
+        }
+        // The client's reducer, mirrored: both fields move and the payload
+        // carries both, because that is what the reducer writes onto the thread
+        // (`threadReducer.ts`, `case "thread.snoozed"`).
+        //
+        // The moment the developer asked is kept only across a *repeat* — a
+        // snooze to a wake time the conversation is already asleep until, where
+        // `at` is its existing `updatedAt` and the whole re-emission reports
+        // where it already was. Choosing a different time restamps it, and that
+        // is the half worth being careful about: the client measures a raised
+        // hand against `snoozedAt` (`threadRaisedHandWhileSnoozed`), so a second
+        // snooze carrying the first one's stamp would be woken immediately by
+        // the work the developer had just decided to sleep through.
+        Change::Snoozed { until } => {
+            let snoozed_at = match thread.lifecycle.asleep_until(until) {
+                true => thread
+                    .lifecycle
+                    .snoozed_at
+                    .clone()
+                    .unwrap_or_else(|| at.to_string()),
+                false => at.to_string(),
+            };
+            thread.lifecycle.snoozed_until = Some(until.clone());
+            thread.lifecycle.snoozed_at = Some(snoozed_at.clone());
+            json!({
+                "threadId": thread.id,
+                "snoozedUntil": until,
+                "snoozedAt": snoozed_at,
+                "updatedAt": at,
+            })
+        }
+        // Both fields, never one. A `snoozedAt` left behind is a conversation
+        // the client reads as never snoozed and this server reads as snoozed at
+        // a moment it no longer is — and `threadWokeAt` renders exactly that
+        // stamp into a "Woke" indicator for a wake the developer has already
+        // dealt with.
+        Change::Unsnoozed { reason } => {
+            thread.lifecycle.snoozed_until = None;
+            thread.lifecycle.snoozed_at = None;
             json!({
                 "threadId": thread.id,
                 "reason": reason,
@@ -1751,6 +1996,8 @@ impl Change {
             Change::Unarchived => "thread.unarchived",
             Change::Settled => "thread.settled",
             Change::Unsettled { .. } => "thread.unsettled",
+            Change::Snoozed { .. } => "thread.snoozed",
+            Change::Unsnoozed { .. } => "thread.unsnoozed",
             Change::RuntimeModeSet { .. } => "thread.runtime-mode-set",
             Change::InteractionModeSet { .. } => "thread.interaction-mode-set",
             Change::TurnRequested { .. } => "thread.turn-start-requested",
@@ -2068,7 +2315,7 @@ pub(crate) mod tests {
     /// every other one below is a departure from.
     #[test]
     fn a_quiet_conversation_is_not_busy() {
-        assert_eq!(a_thread("thread-1").busy(&Adoption::around(NOW_MILLIS)), None);
+        assert_eq!(a_thread("thread-1").busy(&Adoption::around(NOW_MILLIS), Attention::Settling), None);
     }
 
     /// The four blockers of `canSettle`, each on its own, and in the order the
@@ -2085,7 +2332,7 @@ pub(crate) mod tests {
             ..a_thread("thread-1")
         };
         assert_eq!(
-            waiting.busy(&window),
+            waiting.busy(&window, Attention::Settling),
             Some(Busy::Approval),
             "a request waiting on the developer outranks the session it came from"
         );
@@ -2105,7 +2352,7 @@ pub(crate) mod tests {
             )],
             ..a_thread("thread-1")
         };
-        assert_eq!(asked.busy(&window), Some(Busy::Question));
+        assert_eq!(asked.busy(&window, Attention::Settling), Some(Busy::Question));
 
         for status in [SessionStatus::Starting, SessionStatus::Running] {
             let working = Thread {
@@ -2116,7 +2363,7 @@ pub(crate) mod tests {
                 ..a_thread("thread-1")
             };
             assert_eq!(
-                working.busy(&window),
+                working.busy(&window, Attention::Settling),
                 Some(Busy::Session),
                 "{} is work in progress",
                 status.as_str()
@@ -2124,9 +2371,138 @@ pub(crate) mod tests {
         }
 
         assert_eq!(
-            with_a_queued_message(-1_000).busy(&window),
+            with_a_queued_message(-1_000).busy(&window, Attention::Settling),
             Some(Busy::QueuedTurn),
             "a turn asked for a second ago and not yet picked up"
+        );
+    }
+
+    /// A snooze to a moment the conversation is already asleep until is a
+    /// repeat; a snooze to any other moment is a new decision.
+    ///
+    /// Decided here, where no clock is involved, because that is the only place
+    /// it *can* be decided honestly: two snoozes dispatched back to back can land
+    /// in the same millisecond, so a test comparing their stamps would be
+    /// asserting the clock's resolution rather than this rule. What follows from
+    /// it — a new decision restamps `snoozedAt`, which is the baseline the client
+    /// measures a raised hand against — is [`fold`]'s, and reads the same
+    /// question through [`Lifecycle::asleep_until`].
+    #[test]
+    fn a_snooze_to_another_time_is_not_a_repeat_of_the_first() {
+        let wake = "2026-07-31T09:00:00.000Z";
+        let asleep = Thread {
+            lifecycle: Lifecycle {
+                snoozed_until: Some(wake.to_string()),
+                snoozed_at: Some("2026-07-30T09:00:00.000Z".to_string()),
+                ..Lifecycle::default()
+            },
+            ..a_thread("thread-1")
+        };
+
+        assert_eq!(
+            Change::Snoozed {
+                until: wake.to_string()
+            }
+            .re_emitted_at(&asleep),
+            Some(asleep.updated_at.clone()),
+            "the same wake time twice is the double-click, and must not churn"
+        );
+        assert_eq!(
+            Change::Snoozed {
+                until: "2026-08-01T09:00:00.000Z".to_string()
+            }
+            .re_emitted_at(&asleep),
+            None,
+            "a different wake time was folded as a repeat of the first"
+        );
+
+        // And waking: a conversation with a snooze on it is not where an
+        // `Unsnoozed` would leave it, so that is no repeat either.
+        assert_eq!(
+            Change::Unsnoozed {
+                reason: BY_THE_USER
+            }
+            .re_emitted_at(&asleep),
+            None
+        );
+        assert_eq!(
+            Change::Unsnoozed {
+                reason: BY_THE_USER
+            }
+            .re_emitted_at(&a_thread("thread-1")),
+            Some(a_thread("thread-1").updated_at),
+            "waking a conversation nobody snoozed must not stamp the clock"
+        );
+    }
+
+    /// A live agent stands between a conversation and being settled, and not
+    /// between it and being snoozed — the one entry where `canSnooze` and
+    /// `canSettle` differ.
+    ///
+    /// Snooze governs the developer's attention and never the agent: the work
+    /// carries on, and only where the conversation is drawn changes. Settling
+    /// says the conversation is *finished*, which is a claim a running agent
+    /// contradicts.
+    #[test]
+    fn a_working_agent_blocks_a_settle_and_lets_a_snooze_through() {
+        let window = Adoption::around(NOW_MILLIS);
+        let working = Thread {
+            session: Some(running("turn-1")),
+            ..a_thread("thread-1")
+        };
+
+        assert_eq!(working.busy(&window, Attention::Settling), Some(Busy::Session));
+        assert_eq!(
+            working.busy(&window, Attention::Snoozing),
+            None,
+            "a live session is not a blocker for a snooze"
+        );
+    }
+
+    /// Skipping the session does not skip what stands *behind* it.
+    ///
+    /// The case a filter over the settle answer would get wrong rather than
+    /// merely differ on: a conversation with both a working agent and a message
+    /// no turn has adopted answers `Session` for a settle, so dropping that
+    /// answer would report nothing at all and let a snooze hide the queued turn.
+    /// The blocker is skipped where it is *asked*, not where it is answered.
+    #[test]
+    fn a_queued_turn_behind_a_live_session_still_blocks_a_snooze() {
+        let window = Adoption::around(NOW_MILLIS);
+        let both = Thread {
+            session: Some(running("turn-1")),
+            ..with_a_queued_message(-1_000)
+        };
+
+        assert_eq!(both.busy(&window, Attention::Settling), Some(Busy::Session));
+        assert_eq!(both.busy(&window, Attention::Snoozing), Some(Busy::QueuedTurn));
+    }
+
+    /// What blocks a snooze is what would be *hidden* by one: a request the agent
+    /// is waiting on the developer to answer, and a turn about to start.
+    ///
+    /// `canSnooze` in `client-runtime/src/state/threadSettled.ts`, which is the
+    /// list this mirrors and the reason the two must agree exactly — the client
+    /// refuses these before a round trip and this refuses them authoritatively.
+    #[test]
+    fn a_snooze_is_refused_by_everything_that_is_waiting_on_the_developer() {
+        let window = Adoption::around(NOW_MILLIS);
+
+        let waiting = Thread {
+            activities: vec![asked_for_permission("req-1")],
+            session: Some(running("turn-1")),
+            ..a_thread("thread-1")
+        };
+        assert_eq!(waiting.busy(&window, Attention::Snoozing), Some(Busy::Approval));
+
+        assert_eq!(
+            with_a_queued_message(-1_000).busy(&window, Attention::Snoozing),
+            Some(Busy::QueuedTurn)
+        );
+        assert_eq!(
+            a_thread("thread-1").busy(&window, Attention::Snoozing),
+            None,
+            "a quiet conversation is snoozable"
         );
     }
 
@@ -2152,7 +2528,7 @@ pub(crate) mod tests {
                 }),
                 ..a_thread("thread-1")
             };
-            assert_eq!(finished.busy(&window), None, "{}", status.as_str());
+            assert_eq!(finished.busy(&window, Attention::Settling), None, "{}", status.as_str());
         }
     }
 
@@ -2165,12 +2541,12 @@ pub(crate) mod tests {
     fn a_queued_turn_stops_being_queued_once_the_adoption_grace_has_passed() {
         let window = Adoption::around(NOW_MILLIS);
         assert_eq!(
-            with_a_queued_message(-(ADOPTION_GRACE_MILLIS as i64) - 1_000).busy(&window),
+            with_a_queued_message(-(ADOPTION_GRACE_MILLIS as i64) - 1_000).busy(&window, Attention::Settling),
             None,
             "a message this old is a start that never happened"
         );
         assert_eq!(
-            with_a_queued_message(ADOPTION_GRACE_MILLIS as i64 + 1_000).busy(&window),
+            with_a_queued_message(ADOPTION_GRACE_MILLIS as i64 + 1_000).busy(&window, Attention::Settling),
             None,
             "a message from a clock this far ahead is not pending work"
         );
@@ -2194,7 +2570,7 @@ pub(crate) mod tests {
             }),
             ..with_a_queued_message(-1_000)
         };
-        assert_eq!(adopted.busy(&window), None);
+        assert_eq!(adopted.busy(&window, Attention::Settling), None);
     }
 
     /// A failed start is not pending work. The failure is already in front of the
@@ -2210,7 +2586,7 @@ pub(crate) mod tests {
             }),
             ..with_a_queued_message(-1_000)
         };
-        assert_eq!(failed.busy(&Adoption::around(NOW_MILLIS)), None);
+        assert_eq!(failed.busy(&Adoption::around(NOW_MILLIS), Attention::Settling), None);
     }
 
     /// Identifiers appear in a transcript a developer is reading, and two the

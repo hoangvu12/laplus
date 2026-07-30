@@ -94,7 +94,7 @@ impl SessionStatus {
     /// Named rather than matched in place because it is read from two directions
     /// that must not be allowed to disagree:
     /// [`crate::threads::Thread::busy`] refuses a settle with it, and
-    /// [`crate::threads::Change::wakes_the_inbox`] resets an override with it.
+    /// [`crate::threads::Change::wakes`] resets an override with it.
     /// A conversation the developer *cannot settle* because an agent is working
     /// is the same conversation whose settle a starting agent *undoes*, and a
     /// second reading of the enum would let those two part company — which would

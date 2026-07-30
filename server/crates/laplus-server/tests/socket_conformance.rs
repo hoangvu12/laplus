@@ -118,10 +118,6 @@ const MISSING: &[Declared] = &[
         because: "no server.probe method; the client falls back to probing with server.getConfig",
     },
     Declared {
-        path: "/environment/capabilities/threadSnooze",
-        because: "thread.snooze / thread.unsnooze are not implemented",
-    },
-    Declared {
         path: "/providers/0/continuation",
         because: "`groupKey` is how threads are grouped for resumption; ticket 11 \
                   owns multi-turn continuity",

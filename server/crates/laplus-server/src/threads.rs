@@ -198,11 +198,12 @@ pub mod fold;
 // `docs/adr/0025`; the paths callers use are deliberately unchanged by it.
 pub use fold::{
     checkpoint_status, fresh_activity_id, fresh_message_id, fresh_turn_id, settled_override, tone,
-    Activity, Adoption, Busy, Change, Checkpoint, Conversation, Given, LatestTurn, Lifecycle,
+    Activity, Adoption, Attention, Busy, Change, Checkpoint, Conversation, Given, LatestTurn,
+    Lifecycle, Woken,
     Message, MetaUpdate, Reconciled, Rendered, Session, Shelf, Thread, ThreadRow, TurnState, ACTIVE,
     BY_ACTIVITY, BY_THE_USER, SETTLED,
 };
-use fold::{durable, fresh_id, NOTHING_TO_WAKE};
+use fold::{durable, fresh_id};
 
 // ---------------------------------------------------------------------------
 // The registry
@@ -514,7 +515,7 @@ impl Threads {
     ///
     /// **One change can be two events.** Real work in a conversation the
     /// developer had settled returns it to the inbox, and the answer is then the
-    /// reset's number rather than the change's — see [`Threads::wake_the_inbox`]. Every
+    /// reset's number rather than the change's — see [`Threads::woken_by`]. Every
     /// caller here is already right for that, because the answer is the log
     /// position reached either way.
     pub fn apply(&self, thread_id: &str, change: Change) -> Option<i64> {
@@ -552,35 +553,39 @@ impl Threads {
         // numbers, which is the shape a turn already answers with when it commits
         // several events — the log position reached, with everything before it
         // already published.
-        Some(Ok(self.wake_the_inbox(&entry, &change).unwrap_or(sequence)))
+        Some(Ok(self.woken_by(&entry, &change).unwrap_or(sequence)))
     }
 
-    /// Return an overridden conversation to the inbox, because real work turned
-    /// up in it.
+    /// Bring a conversation the developer had put out of sight back, because
+    /// real work turned up in it.
     ///
-    /// The three trigger points are [`Change::wakes_the_inbox`], and two of them
-    /// are paths this server already owned — a session change and a work-log
-    /// append — so this is a guarded emission *beside* an event that already
-    /// fires rather than a new mechanism.
+    /// The trigger points are [`Change::wakes`], and every one of them is a path
+    /// this server already owned — a turn request, a session change, a work-log
+    /// append — so these are guarded emissions *beside* events that already fire
+    /// rather than a new mechanism.
     ///
-    /// [`Thread::wants_waking`] is the guard, and it travels through the refusal
-    /// [`Threads::commit`] already takes for the archive commands rather than
-    /// being asked before the call: that is what puts it under the lock the fold
-    /// runs under and before a sequence is taken, so two triggers arriving at once
-    /// cannot both find an override and both emit. The cost is [`NOTHING_TO_WAKE`]
-    /// — a refusal sentence no client reads, because nothing dispatches this.
-    fn wake_the_inbox(&self, entry: &Arc<Entry>, change: &Change) -> Option<i64> {
-        if !change.wakes_the_inbox() {
-            return None;
+    /// [`Woken`] is what says which resets a change spends and what stands in the
+    /// way of each. Both guards travel through the refusal [`Threads::commit`]
+    /// already takes for the archive commands rather than being asked before the
+    /// call: that is what puts them under the lock the fold runs under and before
+    /// a sequence is taken, so two triggers arriving at once cannot both find
+    /// something to reset and both emit.
+    ///
+    /// **The answer is the last number reached**, so a message that spends both
+    /// answers with the second of them. Each reset is its own event and its own
+    /// commit — a client folding one and not the other would hold half a
+    /// conversation's lifecycle — and a reset that was refused leaves the number
+    /// where it was.
+    fn woken_by(&self, entry: &Arc<Entry>, change: &Change) -> Option<i64> {
+        let mut reached = None;
+        for woken in change.wakes() {
+            if let Some(Ok(sequence)) =
+                self.commit(entry, |thread| woken.refusal(thread), &woken.reset())
+            {
+                reached = Some(sequence);
+            }
         }
-        self.commit(
-            entry,
-            |thread| (!thread.wants_waking()).then(|| NOTHING_TO_WAKE.to_string()),
-            &Change::Unsettled {
-                reason: BY_ACTIVITY,
-            },
-        )?
-        .ok()
+        reached
     }
 
     /// Fold one change into the conversation this entry holds and publish it.
@@ -2251,6 +2256,152 @@ pub(crate) mod tests {
         );
     }
 
+    /// A wake time, in the one shape this wire renders — the shape
+    /// `Date.toISOString()` produces, which is what the client sends.
+    const WAKE: &str = "2026-07-31T09:00:00.000Z";
+
+    /// The same rule for snooze, and it is keyed on the *wake time* rather than
+    /// on being snoozed at all: a second snooze to the moment the conversation is
+    /// already asleep until is the double-click, and it must not reorder a list.
+    #[test]
+    fn a_repeated_snooze_re_emits_without_moving_anything() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        let snoozed = threads.get("thread-1").expect("the thread");
+        assert_eq!(snoozed.lifecycle.snoozed_until, Some(WAKE.to_string()));
+        assert!(snoozed.lifecycle.snoozed_at.is_some(), "a snooze says when");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed again");
+        let again = threads.get("thread-1").expect("the thread");
+        assert_eq!(again.lifecycle, snoozed.lifecycle, "the state moved");
+        assert_eq!(
+            again.updated_at, snoozed.updated_at,
+            "a double-click reordered the developer's list"
+        );
+    }
+
+    /// Choosing a *different* time is a new decision, not a repeat: both stamps
+    /// move.
+    ///
+    /// `snoozedAt` moving is the half that matters and it is not tidiness. The
+    /// client measures a raised hand against it — a session that failed or a turn
+    /// that completed *after* the snooze wakes the conversation early
+    /// (`threadRaisedHandWhileSnoozed`) — so a second snooze that kept the first
+    /// one's stamp would be woken immediately by the work the developer had just
+    /// decided to sleep through.
+    #[test]
+    fn snoozing_to_a_new_time_is_a_new_decision_and_restamps_both() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        let first = threads.get("thread-1").expect("the thread");
+
+        let later = "2026-08-01T09:00:00.000Z";
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: later.to_string(),
+                },
+            )
+            .expect("snoozed later");
+        let second = threads.get("thread-1").expect("the thread");
+
+        assert_eq!(second.lifecycle.snoozed_until, Some(later.to_string()));
+        // The two stamps are one moment, which is what a snooze that took the
+        // clock looks like. It is not the whole of the pin — two calls this
+        // close together can land in the same millisecond, so *comparing* the
+        // two snoozes would assert the clock's resolution rather than this
+        // rule. `a_snooze_to_another_time_is_not_a_repeat_of_the_first` is
+        // where it is decided, and it needs no clock at all.
+        assert_eq!(
+            second.lifecycle.snoozed_at,
+            Some(second.updated_at.clone()),
+            "the second snooze's two stamps came from different moments"
+        );
+        assert!(second.updated_at >= first.updated_at);
+    }
+
+    /// Waking a conversation nobody snoozed lands on the state it is already in,
+    /// and reports the moment it already carried — the unsettle half of the rule,
+    /// asked about the other pair of fields.
+    #[test]
+    fn waking_a_conversation_that_is_not_snoozed_moves_nothing() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        let before = threads.get("thread-1").expect("the thread");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Unsnoozed {
+                    reason: BY_THE_USER,
+                },
+            )
+            .expect("woken");
+        let after = threads.get("thread-1").expect("the thread");
+
+        assert_eq!(after.lifecycle, before.lifecycle);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    /// Waking a snoozed conversation clears both fields rather than one.
+    ///
+    /// A `snoozedAt` left behind would be a conversation the client reads as
+    /// never having been snoozed and this server reads as snoozed at a moment it
+    /// no longer is — and `threadWokeAt` renders that stamp into a "Woke"
+    /// indicator the developer already dealt with.
+    #[test]
+    fn waking_by_hand_clears_both_stamps() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        threads
+            .apply(
+                "thread-1",
+                Change::Unsnoozed {
+                    reason: BY_THE_USER,
+                },
+            )
+            .expect("woken");
+
+        let woken = threads.get("thread-1").expect("the thread");
+        assert_eq!(woken.lifecycle.snoozed_until, None);
+        assert_eq!(woken.lifecycle.snoozed_at, None);
+    }
+
     // -- lifecycle resets on real activity -----------------------------------
     //
     // Leaving the inbox must never hide something that needs the developer.
@@ -2571,6 +2722,197 @@ pub(crate) mod tests {
             pinned_by(BY_ACTIVITY),
             None,
             "the neutral reason pinned the conversation instead of releasing it"
+        );
+    }
+
+    /// Snoozing a conversation and then sending it a message spends the return
+    /// ticket: the developer came back of their own accord, so there is nothing
+    /// left to bring them back to.
+    #[test]
+    fn a_new_message_spends_the_return_ticket() {
+        let (threads, mut shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        let _ = published(&mut watching);
+        while shell.try_recv().is_ok() {}
+
+        let answered = threads
+            .apply("thread-1", a_turn_request())
+            .expect("the turn was requested");
+
+        let lifecycle = threads.get("thread-1").expect("the thread").lifecycle;
+        assert_eq!(lifecycle.snoozed_until, None);
+        assert_eq!(lifecycle.snoozed_at, None);
+        assert_eq!(
+            published(&mut watching),
+            vec!["thread.turn-start-requested", "thread.unsnoozed"],
+            "the wake did not accompany the message that caused it"
+        );
+        let listed = last_upsert(&mut shell).expect("the project list heard the wake");
+        assert_eq!(listed["sequence"], json!(answered));
+        assert_eq!(listed["thread"]["snoozedUntil"], Value::Null);
+        assert_eq!(listed["thread"]["snoozedAt"], Value::Null);
+    }
+
+    /// A session coming alive and an agent raising its hand leave the snooze
+    /// exactly where it was.
+    ///
+    /// This is the difference between the two resets rather than an omission. A
+    /// snooze never paused the agent, so an agent starting is not the developer
+    /// changing their mind — and a raised hand already stops the conversation
+    /// *classifying* as snoozed without spending it, which is a derivation that
+    /// ships in the client. Clearing the fields here would spend a return ticket
+    /// the developer might still want: dismiss the request and the conversation
+    /// would stay in the inbox rather than going back to sleep.
+    #[test]
+    fn a_session_or_a_raised_hand_does_not_spend_the_snooze() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        let asleep = threads.get("thread-1").expect("the thread").lifecycle;
+        let _ = published(&mut watching);
+
+        for work in [
+            Change::Session(running("turn-1")),
+            Change::Session(Session {
+                status: SessionStatus::Error,
+                ..running("turn-1")
+            }),
+            Change::Activity(crate::worklog::requested(&a_permission(), None)),
+        ] {
+            threads.apply("thread-1", work).expect("applied");
+        }
+
+        assert_eq!(
+            threads.get("thread-1").expect("the thread").lifecycle,
+            asleep,
+            "work the developer did not do spent their snooze"
+        );
+        assert!(
+            !published(&mut watching)
+                .iter()
+                .any(|kind| kind == "thread.unsnoozed"),
+            "a wake was announced for a snooze nothing had spent"
+        );
+    }
+
+    /// One message can spend both, and each is announced as its own event.
+    ///
+    /// The two resets are separate decisions about separate fields, so a
+    /// conversation the developer settled *and* snoozed comes back from both —
+    /// and a client that folded one event would otherwise be left holding half a
+    /// conversation's lifecycle.
+    #[test]
+    fn a_message_can_spend_both_the_pin_and_the_return_ticket() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.apply("thread-1", Change::Settled).expect("settled");
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        let _ = published(&mut watching);
+
+        threads.apply("thread-1", a_turn_request()).expect("a turn");
+
+        assert_eq!(
+            published(&mut watching),
+            vec![
+                "thread.turn-start-requested",
+                "thread.unsettled",
+                "thread.unsnoozed"
+            ]
+        );
+        let lifecycle = threads.get("thread-1").expect("the thread").lifecycle;
+        assert_eq!(lifecycle.settled_override, None);
+        assert_eq!(lifecycle.snoozed_until, None);
+    }
+
+    /// The wake carries the server's own reason, for the reason a reset does: a
+    /// client cannot forge it, and the developer's `user` wake is a different
+    /// account of what happened.
+    #[test]
+    fn a_spent_return_ticket_carries_the_neutral_reason() {
+        let (threads, _shell) = threads();
+        let entry = threads.entry("thread-1");
+        let mut watching = entry.events.subscribe();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        while watching.try_recv().is_ok() {}
+
+        threads.apply("thread-1", a_turn_request()).expect("a turn");
+
+        let reasons: Vec<Value> = events(&mut watching)
+            .iter()
+            .filter(|item| item["event"]["type"] == "thread.unsnoozed")
+            .map(|item| item["event"]["payload"]["reason"].clone())
+            .collect();
+        assert_eq!(reasons, vec![json!(BY_ACTIVITY)]);
+    }
+
+    /// An archived conversation keeps its snooze through real work, which is
+    /// [`Thread::wants_waking`]'s archived reading asked about the other pair of
+    /// fields — and it has to be the same reading, because `thread.snooze` and
+    /// `thread.unsnooze` both refuse an archived conversation too.
+    #[test]
+    fn an_archived_conversation_keeps_its_snooze_through_real_work() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: WAKE.to_string(),
+                },
+            )
+            .expect("snoozed");
+        threads
+            .apply("thread-1", Change::Archived)
+            .expect("archived");
+
+        threads
+            .apply("thread-1", a_turn_request())
+            .expect("the turn was requested");
+
+        assert_eq!(
+            threads
+                .get("thread-1")
+                .expect("the thread")
+                .lifecycle
+                .snoozed_until,
+            Some(WAKE.to_string()),
+            "work in an archived conversation spent a snooze no command could"
         );
     }
 

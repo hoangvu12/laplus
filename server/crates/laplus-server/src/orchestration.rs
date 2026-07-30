@@ -101,7 +101,8 @@ use crate::store::{
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::settling::SessionStatus;
 use crate::threads::{
-    self, Adoption, Busy, Change, Given, MetaUpdate, Prompt, Session, Shelf, Thread, Threads,
+    self, Adoption, Attention, Busy, Change, Given, MetaUpdate, Prompt, Session, Shelf, Thread,
+    Threads,
 };
 use crate::transcripts::Transcripts;
 
@@ -158,6 +159,15 @@ const INTERACTION_MODES: [&str; 2] = ["default", "plan"];
 /// that a second reason is a line here rather than a new rule.
 const UNSETTLE_REASONS: [&str; 1] = [threads::BY_THE_USER];
 
+/// The same one reason for `thread.unsnooze`, and its own constant rather than
+/// [`UNSETTLE_REASONS`] read twice.
+///
+/// The two are equal today and are not the same rule: they are two declarations
+/// in the contract about two commands, and sharing one array here would mean a
+/// reason added to either widened both. The sentence names which command it was
+/// refused for, which is the diagnostic a developer with a stale client needs.
+const UNSNOOZE_REASONS: [&str; 1] = [threads::BY_THE_USER];
+
 /// The registry, live: what is in it, what changes it, and who is watching.
 ///
 /// Cheap to clone, and every clone is the same shell — a subscription outlives
@@ -210,6 +220,8 @@ enum Command {
     Unarchive { thread_id: String },
     Settle { thread_id: String },
     Unsettle { thread_id: String },
+    Snooze { thread_id: String, until: String },
+    Unsnooze { thread_id: String },
     StartTurn(Box<StartTurn>),
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -449,6 +461,8 @@ impl Shell {
             Command::Unarchive { thread_id } => self.set_archived(&thread_id, Shelf::Working)?,
             Command::Settle { thread_id } => self.settle(&thread_id)?,
             Command::Unsettle { thread_id } => self.unsettle(&thread_id)?,
+            Command::Snooze { thread_id, until } => self.snooze(&thread_id, until)?,
+            Command::Unsnooze { thread_id } => self.unsnooze(&thread_id)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
@@ -761,7 +775,7 @@ impl Shell {
     ///
     /// **And a settle is not permanent.** The invariants above refuse to hide
     /// live work at the moment the developer asks, and
-    /// `crate::threads::Threads::wake_the_inbox` is what stops that being reachable a
+    /// `crate::threads::Threads::woken_by` is what stops that being reachable a
     /// minute later: real activity in the conversation returns it to the inbox by
     /// itself, without this command being sent again.
     fn settle(&self, thread_id: &str) -> Result<i64, CommandError> {
@@ -780,24 +794,9 @@ impl Shell {
                              inbox and there is nothing to settle."
                         ));
                     }
-                    thread.busy(&adoption).map(|busy| match busy {
-                        Busy::Approval => format!(
-                            "Conversation '{thread_id}' is waiting for a permission decision, so \
-                             settling it would hide a request that is waiting on you."
-                        ),
-                        Busy::Question => format!(
-                            "Conversation '{thread_id}' is waiting for an answer to a question, so \
-                             settling it would hide a request that is waiting on you."
-                        ),
-                        Busy::Session => format!(
-                            "Conversation '{thread_id}' has an agent still working, so settling it \
-                             would hide work in progress."
-                        ),
-                        Busy::QueuedTurn => format!(
-                            "Conversation '{thread_id}' has a turn no agent has picked up yet, so \
-                             settling it would hide work about to start."
-                        ),
-                    })
+                    thread
+                        .busy(&adoption, Attention::Settling)
+                        .map(|busy| would_hide(thread_id, busy, Attention::Settling))
                 },
                 Change::Settled,
             )
@@ -811,7 +810,7 @@ impl Shell {
     /// reason is `user`, which pins the conversation *active* rather than clearing
     /// the override to neutral, so the client's own auto-settle stays suppressed
     /// until real work moves it on — see [`crate::threads::pinned_by`]. The
-    /// neutral reset is the server's own — `crate::threads::Threads::wake_the_inbox`,
+    /// neutral reset is the server's own — `crate::threads::Threads::woken_by`,
     /// which real work triggers — and the contract lets a client send only this
     /// reason, so it cannot be forged.
     ///
@@ -840,6 +839,101 @@ impl Shell {
                     })
                 },
                 Change::Unsettled {
+                    reason: threads::BY_THE_USER,
+                },
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    /// Put a conversation to sleep until a time the developer chose.
+    ///
+    /// **An overlay rather than a destination.** A snoozed conversation stays
+    /// active in this data model — not archived, not settled, not deleted — and
+    /// the two fields this writes only suppress it from the inbox until the wake
+    /// time passes. Which is why it is not in the same vocabulary slot as
+    /// [`Shell::set_archived`]'s two.
+    ///
+    /// **And there is no scheduler.** A snooze expires by being *read*: once the
+    /// wake time is in the past, `effectiveSnoozed` stops classifying the
+    /// conversation as snoozed and no event fires. Nothing here starts a timer,
+    /// registers a task, or has anything to cancel — see [`Change::Snoozed`],
+    /// which is where the whole of that is written down.
+    ///
+    /// **The invariants are `canSnooze`'s**, which is `canSettle` minus the live
+    /// session: a running agent is snoozable, because snooze is a decision about
+    /// the developer's attention and never an interruption of the work. What is
+    /// refused is what a snooze would *hide* — a request the agent is blocked on
+    /// them for, and a turn about to start. [`Attention`] is that difference, and
+    /// an archived conversation is refused on top for [`Shell::settle`]'s reason:
+    /// it is not in the inbox for a snooze to take it out of.
+    ///
+    /// **A repeat re-emits rather than being refused**, and it is keyed on the
+    /// wake time — a second snooze to a *different* moment is a new decision and
+    /// stamps the clock. See [`Change::re_emitted_at`] for the first half and
+    /// [`Change::Snoozed`] for why the second is not tidiness.
+    ///
+    /// The wake time itself was judged at the parse ([`a_moment_still_ahead`]),
+    /// because it needs the clock and no conversation at all.
+    fn snooze(&self, thread_id: &str, until: String) -> Result<i64, CommandError> {
+        // [`Shell::settle`]'s reason: one instant for the whole command rather
+        // than a clock read per comparison.
+        let adoption = Adoption::now();
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| {
+                    if Shelf::Archived.holds(thread) {
+                        return Some(format!(
+                            "Conversation '{thread_id}' is archived, so it is already out of the \
+                             inbox and there is nothing to snooze."
+                        ));
+                    }
+                    thread
+                        .busy(&adoption, Attention::Snoozing)
+                        .map(|busy| would_hide(thread_id, busy, Attention::Snoozing))
+                },
+                Change::Snoozed { until },
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    /// Wake a conversation now, because the developer chose the time badly.
+    ///
+    /// [`Shell::snooze`]'s twin, and — unlike [`Shell::unsettle`] — a true mirror
+    /// image: there is no such thing as a conversation pinned *awake*, so both
+    /// reasons clear both fields and the only thing the reason distinguishes is
+    /// who decided. A command carries [`threads::BY_THE_USER`] and can carry
+    /// nothing else; the neutral wake is this server's own, emitted when the
+    /// developer sends a new message and spends the return ticket
+    /// (`crate::threads::Threads::woken_by`).
+    ///
+    /// **The invariants are not this command's**, for [`Shell::unsettle`]'s
+    /// reason: waking is the direction that makes work visible, so nothing it can
+    /// do could hide a request. Archived is refused all the same, and that is one
+    /// rule with the snooze half rather than symmetry for its own sake — there is
+    /// no inbox for an archived conversation to come back to, and the activity
+    /// wake reads the same shelf ([`Thread::wants_unsnoozing`]).
+    ///
+    /// **Waking one that is not asleep is answered rather than refused.** It
+    /// lands on the state it is already in, so it re-emits at the moment the
+    /// conversation already carried — see [`Change::re_emitted_at`].
+    fn unsnooze(&self, thread_id: &str) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| {
+                    Shelf::Archived.holds(thread).then(|| {
+                        format!(
+                            "Conversation '{thread_id}' is archived, so there is no inbox to wake \
+                             it into. Unarchive it first."
+                        )
+                    })
+                },
+                Change::Unsnoozed {
                     reason: threads::BY_THE_USER,
                 },
             )
@@ -1912,26 +2006,45 @@ struct AboutAThread {
     thread_id: String,
 }
 
-/// `thread.unsettle` — [`AboutAThread`] and the one thing that makes it its own
-/// payload.
+/// `thread.unsettle` and `thread.unsnooze` — [`AboutAThread`] and the one thing
+/// that makes the two of them their own payload.
 ///
 /// The conversation is **flattened in** rather than declared again, which is
-/// [`AboutAThread`]'s own argument applied to the one command that has a fifth
+/// [`AboutAThread`]'s own argument applied to the two commands that have a fifth
 /// field: a second `thread_id` here would be a second place to get the field name
 /// wrong, and the sentence [`read_about_a_thread`] builds reads the id out of the
-/// raw payload either way.
+/// raw payload either way. One struct for both for the same reason there is one
+/// for the four — the shape is one shape, and the *values* the reason may take
+/// belong to each command rather than to this.
 ///
 /// `reason` is **required rather than defaulted**, and that is the contract's own
-/// shape: `ThreadUnsettleCommand` declares it as a literal, not an optional. A
-/// default of `user` here would accept a payload the contract calls malformed and
-/// then act on a guess about which of the two resets the client meant — and the
-/// two are not the same conversation afterwards.
+/// shape: `ThreadUnsettleCommand` and `ThreadUnsnoozeCommand` both declare it as a
+/// literal, not an optional. A default of `user` here would accept a payload the
+/// contract calls malformed and then act on a guess about what the client meant —
+/// and for an unsettle the two reasons do not leave the conversation in the same
+/// state.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Unsettle {
+struct WithAReason {
     #[serde(flatten)]
     about: AboutAThread,
     reason: String,
+}
+
+/// `thread.snooze` — the conversation and the moment it should come back.
+///
+/// The wake time is the only field on any of these commands that this server has
+/// to *judge* rather than store: everything else is a value the developer chose
+/// among ones the contract names, and this one is a moment that has to be ahead
+/// of now. [`Command::parse`] is where that is decided, because it needs the
+/// clock and nothing else — no conversation has to be looked at to know that a
+/// time which has already passed is not a time to wake at.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Snooze {
+    #[serde(flatten)]
+    about: AboutAThread,
+    snoozed_until: String,
 }
 
 impl StartTurn {
@@ -2160,7 +2273,7 @@ impl Command {
             // `activity` could forge it. So a reason this contract does not name
             // is refused at the door rather than pinned as though it said `user`.
             "thread.unsettle" => {
-                let unsettle: Unsettle = read_about_a_thread(payload, kind)?;
+                let unsettle: WithAReason = read_about_a_thread(payload, kind)?;
                 let thread_id = non_blank(unsettle.about.thread_id, "threadId", kind)?;
                 named_by_the_contract(
                     &unsettle.reason,
@@ -2169,6 +2282,40 @@ impl Command {
                     &thread_id,
                 )?;
                 Ok(Command::Unsettle { thread_id })
+            }
+            // One field more again, and this one is judged rather than checked
+            // against a list: a wake time has to be *ahead of now*, and a
+            // conversation snoozed until a moment that has already passed would be
+            // snoozed and awake at once, carrying state it can never leave.
+            //
+            // Decided here rather than beside the world's refusals because it is a
+            // question about the payload and the clock alone — see
+            // [`a_moment_still_ahead`], where an unparseable time taking the same
+            // branch is argued.
+            "thread.snooze" => {
+                let snooze: Snooze = read_about_a_thread(payload, kind)?;
+                let thread_id = non_blank(snooze.about.thread_id, "threadId", kind)?;
+                a_moment_still_ahead(&snooze.snoozed_until, &thread_id)?;
+                Ok(Command::Snooze {
+                    thread_id,
+                    until: snooze.snoozed_until,
+                })
+            }
+            // `thread.unsettle`'s shape and its rule: the *event* carries two
+            // reasons and the command carries one, because the neutral wake is
+            // this server's own and a client that could send `activity` could wake
+            // a conversation the developer had put to sleep and have it read as
+            // their own doing.
+            "thread.unsnooze" => {
+                let unsnooze: WithAReason = read_about_a_thread(payload, kind)?;
+                let thread_id = non_blank(unsnooze.about.thread_id, "threadId", kind)?;
+                named_by_the_contract(
+                    &unsnooze.reason,
+                    &UNSNOOZE_REASONS,
+                    "reason for waking",
+                    &thread_id,
+                )?;
+                Ok(Command::Unsnooze { thread_id })
             }
             // A turn carries a mode through *two* doors: the per-turn override
             // the composer sends beside every message, and the thread it asks to
@@ -2449,6 +2596,123 @@ fn named_by_the_contract(
     )))
 }
 
+/// Why a conversation cannot be put out of the developer's sight, as the
+/// sentence they are shown.
+///
+/// One function for [`Shell::settle`] and [`Shell::snooze`] rather than a cascade
+/// apiece, because the two differed by a gerund and nothing else — and the copy
+/// would have had to carry a `Busy::Session` arm that [`Attention::Snoozing`]
+/// cannot produce, which is a sentence written to be unreachable. Here every arm
+/// is reached, by one caller or the other.
+///
+/// **The order the blocker was chosen in is [`Thread::busy`]'s**, and it is the
+/// client's. This only turns the answer into words: an agent that has asked for
+/// permission is also running, and which of those two facts is worth saying was
+/// decided before this was called.
+///
+/// The sentence names the conversation as well as the reason, because
+/// `OrchestrationDispatchCommandError` carries nothing else machine-readable and
+/// a developer with two windows open cannot act on a sentence that does not say
+/// which one it is about.
+fn would_hide(thread_id: &str, busy: Busy, about: Attention) -> String {
+    let doing = match about {
+        Attention::Settling => "settling",
+        Attention::Snoozing => "snoozing",
+    };
+    match busy {
+        Busy::Approval => format!(
+            "Conversation '{thread_id}' is waiting for a permission decision, so {doing} it would \
+             hide a request that is waiting on you."
+        ),
+        Busy::Question => format!(
+            "Conversation '{thread_id}' is waiting for an answer to a question, so {doing} it \
+             would hide a request that is waiting on you."
+        ),
+        Busy::Session => format!(
+            "Conversation '{thread_id}' has an agent still working, so {doing} it would hide work \
+             in progress."
+        ),
+        Busy::QueuedTurn => format!(
+            "Conversation '{thread_id}' has a turn no agent has picked up yet, so {doing} it would \
+             hide work about to start."
+        ),
+    }
+}
+
+/// A wake time worth storing: one this server can place on its own clock, and
+/// strictly ahead of the instant it is read at.
+///
+/// [`named_by_the_contract`]'s neighbour and the one field that cannot be
+/// checked the same way: a wake time is not a value out of a closed set, so what
+/// makes one acceptable is arithmetic rather than membership.
+///
+/// **Refused rather than quietly normalised.** A conversation snoozed until a
+/// moment that has already passed is snoozed and awake at once — the client's
+/// `effectiveSnoozed` stops classifying it the instant it reads the field — so it
+/// would carry snooze state it can never leave and a "Woke" indicator for a wake
+/// nobody chose. Clamping it to now would be the same conversation with the
+/// developer told it worked.
+///
+/// **Strictly ahead**, so a wake time equal to the instant this reads is refused
+/// with the past ones: it has already elapsed by the time anything else reads it,
+/// and the conversation it would produce is exactly the one above. The clock is
+/// read *here* rather than passed in, so "equal to now" is a case that cannot be
+/// reached from a socket — a client's `now` is always a little older than this
+/// one by the time it arrives. `a_wake_time_must_be_ahead_of_the_instant_it_is_read_at`
+/// is where the comparison itself is pinned, because that is the only place the
+/// two instants can be made the same one.
+///
+/// **An unparseable time is refused by the same guard and named by its own
+/// sentence.** One check, because a string this server cannot place on a clock
+/// is not one it can call future either; two sentences, because "that moment has
+/// passed" is a lie about a time this server simply does not read, and the
+/// sentence *is* the whole diagnostic. Refusing it is what keeps it out of a
+/// field the contract types as an `IsoDateTime` — see
+/// [`crate::clock::epoch_millis_from_iso`], where what counts as one is decided,
+/// and where the one shape this wire renders is argued.
+///
+/// Both sentences name the time as well as the conversation, because a snooze is
+/// sent from a preset menu (`Sidebar.snooze.ts`) and "that time will not do"
+/// without saying which time is not something a developer can act on.
+fn a_moment_still_ahead(until: &str, thread_id: &str) -> Result<(), CommandError> {
+    match wake_time(until, crate::clock::now_epoch_millis()) {
+        Ok(()) => Ok(()),
+        Err(Unusable::Unreadable) => Err(CommandError::new(format!(
+            "'{until}' is not a time this server can read, so conversation '{thread_id}' was left \
+             awake. Send one like '2026-07-31T09:00:00.000Z'."
+        ))),
+        Err(Unusable::Elapsed) => Err(CommandError::new(format!(
+            "'{until}' is not a moment still to come, so conversation '{thread_id}' was left \
+             awake. Send a wake time in the future."
+        ))),
+    }
+}
+
+/// What is wrong with a wake time, if anything is.
+///
+/// Two, because they want different sentences — see [`a_moment_still_ahead`],
+/// which is the only thing that turns one into words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unusable {
+    /// Not one of this wire's renderings, so not a moment at all.
+    Unreadable,
+    /// A real moment, and not one still to come.
+    Elapsed,
+}
+
+/// [`a_moment_still_ahead`]'s judgement, against an instant it can be given.
+///
+/// Split out for [`crate::clock::iso_from_epoch`]'s reason — a comparison that
+/// cannot be told what "now" is is a comparison whose boundary cannot be tested,
+/// and the boundary is the whole of what "strictly future" means. It is not
+/// reachable through a socket: a client samples its clock, sends, and this server
+/// reads its own afterwards, so a wake time of "now" has always already elapsed
+/// by the time the guard sees it.
+fn wake_time(until: &str, now: u64) -> Result<(), Unusable> {
+    let wake = crate::clock::epoch_millis_from_iso(until).ok_or(Unusable::Unreadable)?;
+    (wake > now).then_some(()).ok_or(Unusable::Elapsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2703,6 +2967,26 @@ mod tests {
             self.dispatch(&json!({
                 "type": "thread.unsettle",
                 "commandId": format!("test:unsettle:{thread_id}"),
+                "threadId": thread_id,
+                "reason": "user",
+            }))
+        }
+
+        /// The `thread.snooze` the sidebar's snooze presets send.
+        fn snooze(&self, thread_id: &str, until: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.snooze",
+                "commandId": format!("test:snooze:{thread_id}"),
+                "threadId": thread_id,
+                "snoozedUntil": until,
+            }))
+        }
+
+        /// Its twin — "wake it now", carrying the one reason a client may give.
+        fn unsnooze(&self, thread_id: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.unsnooze",
+                "commandId": format!("test:unsnooze:{thread_id}"),
                 "threadId": thread_id,
                 "reason": "user",
             }))
@@ -3109,7 +3393,7 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and laplus implements seventeen. Each
+    /// Roughly twenty command types exist and laplus implements nineteen. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]
@@ -3117,10 +3401,10 @@ mod tests {
         let fixture = Fixture::new();
 
         let refusal = fixture
-            .dispatch(&json!({"type": "thread.snooze", "commandId": "c", "threadId": "t"}))
-            .expect_err("snoozing is not implemented");
+            .dispatch(&json!({"type": "thread.delete", "commandId": "c", "threadId": "t"}))
+            .expect_err("deleting is not implemented");
         assert!(
-            refusal.message().contains("thread.snooze"),
+            refusal.message().contains("thread.delete"),
             "{}",
             refusal.message()
         );
@@ -3926,6 +4210,267 @@ mod tests {
             Value::Null,
             "a refused parse moved the conversation"
         );
+    }
+
+    /// An hour from now, in the shape the client builds one with
+    /// (`Date.toISOString()` in `Sidebar.snooze.ts`).
+    ///
+    /// Drawn from the clock rather than written out, because a hard-coded wake
+    /// time is a test that passes until that date and then fails for a reason
+    /// that has nothing to do with what it asserts.
+    fn an_hour_from_now() -> String {
+        crate::clock::iso_from_epoch_millis(crate::clock::now_epoch_millis() + 3_600_000)
+    }
+
+    fn an_hour_ago() -> String {
+        crate::clock::iso_from_epoch_millis(crate::clock::now_epoch_millis() - 3_600_000)
+    }
+
+    /// Everything about a snooze that can be wrong in the payload alone, refused
+    /// before the world is consulted and without touching the conversation.
+    ///
+    /// The wake time is the field that is new here, and it is refused rather than
+    /// normalised for one reason: a conversation snoozed until a moment that has
+    /// already passed is snoozed and awake at once, carrying state it can never
+    /// leave. `now` itself is refused with it, because the comparison is strictly
+    /// future — a wake time equal to this instant has already elapsed by the time
+    /// anything reads it.
+    #[test]
+    fn a_malformed_snooze_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        for kind in ["thread.snooze", "thread.unsnooze"] {
+            for blank in ["", "   "] {
+                let refusal = fixture
+                    .dispatch(&json!({
+                        "type": kind,
+                        "commandId": "c",
+                        "threadId": blank,
+                        "reason": "user",
+                        "snoozedUntil": an_hour_from_now(),
+                    }))
+                    .expect_err("a blank thread id names no conversation");
+                assert!(
+                    refusal.message().contains("threadId"),
+                    "{kind}: {}",
+                    refusal.message()
+                );
+            }
+        }
+
+        // A time that has passed, this very instant, and a string that is not a
+        // time at all — one refusal, because a wake time this server cannot place
+        // on its own clock is not one it can call future either.
+        for hopeless in [
+            an_hour_ago(),
+            crate::clock::now_iso(),
+            "tomorrow".to_string(),
+            "2026-13-45T09:00:00.000Z".to_string(),
+        ] {
+            let refusal = fixture
+                .snooze("thread-1", &hopeless)
+                .expect_err("a wake time that is not ahead of now");
+            assert!(
+                refusal.message().contains(&hopeless) && refusal.message().contains("thread-1"),
+                "the sentence names neither the time nor the conversation: {}",
+                refusal.message()
+            );
+        }
+
+        // The neutral wake belongs to the server, for `thread.unsettle`'s reason:
+        // a client that could send it could wake a conversation the developer had
+        // put to sleep and have it read as their own doing.
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.unsnooze",
+                "commandId": "c",
+                "threadId": "thread-1",
+                "reason": "activity",
+            }))
+            .expect_err("the neutral wake is not a client's to send");
+        assert!(
+            refusal.message().contains("activity") && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        assert_eq!(
+            fixture.detail("thread-1")["snoozedUntil"],
+            Value::Null,
+            "a refused parse put the conversation to sleep"
+        );
+    }
+
+    /// The boundary itself: a wake time equal to the instant it is read at is
+    /// refused, and one a millisecond later is taken.
+    ///
+    /// Its own test against [`still_ahead_of`] rather than a case in the one
+    /// above, because the boundary cannot be reached through a socket — a client
+    /// samples its clock, sends, and this server reads its own afterwards, so a
+    /// wake time of "now" has always already elapsed by the time the guard sees
+    /// it. That makes the dispatch tests unable to tell `>` from `>=`, which is
+    /// the whole of the criterion. Here the two instants can be made the same
+    /// one.
+    #[test]
+    fn a_wake_time_must_be_ahead_of_the_instant_it_is_read_at() {
+        let now = 1_800_000_000_000;
+        let rendered = crate::clock::iso_from_epoch_millis(now);
+
+        assert_eq!(
+            wake_time(&rendered, now),
+            Err(Unusable::Elapsed),
+            "{rendered} is this instant, not one still to come"
+        );
+        assert_eq!(
+            wake_time(&crate::clock::iso_from_epoch_millis(now - 1), now),
+            Err(Unusable::Elapsed),
+            "a millisecond ago is not the future"
+        );
+        assert_eq!(
+            wake_time(&crate::clock::iso_from_epoch_millis(now + 1), now),
+            Ok(())
+        );
+
+        // A time this server cannot place on a clock is refused by the same
+        // guard and told apart, because "that moment has passed" is a lie about
+        // a string that names no moment.
+        for unreadable in ["tomorrow", "2026-13-45T09:00:00.000Z", ""] {
+            assert_eq!(wake_time(unreadable, now), Err(Unusable::Unreadable));
+        }
+    }
+
+    /// A snooze records the wake time the developer chose and the moment they
+    /// chose it, and waking by hand clears both.
+    ///
+    /// The wake time is stored exactly as it arrived rather than re-rendered:
+    /// the client parses it back with `Date.parse` and compares it against its
+    /// own clock, so a second spelling of one moment would be a field this server
+    /// and that one describe differently.
+    #[test]
+    fn snoozing_records_the_wake_time_and_the_moment_it_was_asked_for() {
+        let fixture = Fixture::with_a_conversation();
+        let wake = an_hour_from_now();
+
+        fixture.snooze("thread-1", &wake).expect("snoozed");
+        let asleep = fixture.detail("thread-1");
+        assert_eq!(asleep["snoozedUntil"], json!(wake));
+        assert_eq!(
+            asleep["snoozedAt"], asleep["updatedAt"],
+            "a snooze's two stamps are one moment: {asleep:#?}"
+        );
+
+        fixture.unsnooze("thread-1").expect("woken");
+        let awake = fixture.detail("thread-1");
+        assert_eq!(awake["snoozedUntil"], Value::Null);
+        assert_eq!(awake["snoozedAt"], Value::Null);
+    }
+
+    /// A live agent is not a blocker for a snooze, and everything waiting on the
+    /// developer is.
+    ///
+    /// `canSnooze` mirrored where it is authoritative — the client keeps a twin so
+    /// the interface can refuse before a round trip. The running session is the
+    /// entry that makes the two lists different: snooze governs the developer's
+    /// attention and never the agent, so the work carries on and only where the
+    /// conversation is drawn changes.
+    #[test]
+    fn a_snooze_is_refused_by_a_raised_hand_and_not_by_a_working_agent() {
+        let fixture = Fixture::with_a_conversation();
+        let wake = an_hour_from_now();
+
+        fixture
+            .shell
+            .threads()
+            .apply(
+                "thread-1",
+                Change::Session(Session {
+                    status: crate::settling::SessionStatus::Running,
+                    runtime_mode: "full-access".to_string(),
+                    active_turn_id: Some("turn-1".to_string()),
+                    last_error: None,
+                    updated_at: crate::clock::now_iso(),
+                }),
+            )
+            .expect("a session");
+        fixture
+            .snooze("thread-1", &wake)
+            .expect("a live session is not a blocker for a snooze");
+        assert_eq!(fixture.detail("thread-1")["snoozedUntil"], json!(wake));
+        fixture.unsnooze("thread-1").expect("woken");
+
+        fixture
+            .shell
+            .threads()
+            .apply(
+                "thread-1",
+                Change::Activity(crate::worklog::requested(
+                    &crate::protocol::Permission {
+                        request_id: "req-1".to_string(),
+                        tool_name: "Write".to_string(),
+                        input: json!({"file_path": "note.txt"}),
+                        tool_use_id: Some("toolu_1".to_string()),
+                        description: None,
+                        suggestions: Vec::new(),
+                    },
+                    Some("turn-1".to_string()),
+                )),
+            )
+            .expect("a request");
+        let refusal = fixture
+            .snooze("thread-1", &wake)
+            .expect_err("a request waiting on the developer cannot be slept through");
+        assert!(
+            refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+        assert_eq!(
+            fixture.detail("thread-1")["snoozedUntil"],
+            Value::Null,
+            "a refused snooze put the conversation to sleep anyway"
+        );
+    }
+
+    /// An archived conversation is refused by both commands, for the reason the
+    /// settle pair refuses one: it is not in the inbox, so there is nothing to
+    /// suppress it from and nothing to bring it back to.
+    #[test]
+    fn an_archived_conversation_can_be_neither_snoozed_nor_woken() {
+        let fixture = Fixture::with_a_conversation();
+        fixture.archive("thread-1").expect("archived");
+
+        for refusal in [
+            fixture
+                .snooze("thread-1", &an_hour_from_now())
+                .expect_err("archived"),
+            fixture.unsnooze("thread-1").expect_err("archived"),
+        ] {
+            assert!(
+                refusal.message().contains("thread-1") && refusal.message().contains("archived"),
+                "{}",
+                refusal.message()
+            );
+        }
+    }
+
+    /// A conversation this server does not hold is refused by both, with the
+    /// sentence every command uses for one.
+    #[test]
+    fn snoozing_a_conversation_this_server_does_not_hold_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        for refusal in [
+            fixture
+                .snooze("nobody", &an_hour_from_now())
+                .expect_err("no such conversation"),
+            fixture.unsnooze("nobody").expect_err("no such conversation"),
+        ] {
+            assert!(
+                refusal.message().contains("nobody"),
+                "{}",
+                refusal.message()
+            );
+        }
     }
 
     /// Settling stores the override and the moment, and a user unsettle pins the
