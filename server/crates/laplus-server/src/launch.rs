@@ -146,6 +146,28 @@ pub enum Invoked {
         /// `remote-access.json` rather than from the command line.
         arguments: Vec<String>,
     },
+    /// `auth pairing <verb> [id] [flags…]`. Mints, lists and revokes pairing
+    /// codes against the database a *running* server is using — see
+    /// [`crate::codes`] for why that works without talking to it.
+    Pairing(Pairing),
+}
+
+/// What `auth pairing` was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pairing {
+    pub verb: crate::codes::Verb,
+    /// Already turned into SQLite's modifier form, so a bad `--ttl` is refused
+    /// before the database is opened rather than by it.
+    pub ttl: String,
+    pub label: Option<String>,
+    pub base_url: Option<String>,
+    pub json: bool,
+    /// The port to put in a printed URL. Not the port anything binds — this
+    /// process is not a server — so it is taken the same way a run would take
+    /// it purely so the two agree.
+    pub port: u16,
+    /// The code to revoke, for the verb that needs one.
+    pub id: Option<String>,
 }
 
 /// Read the command line as a verb and its flags.
@@ -154,22 +176,65 @@ pub fn invoked() -> Result<Invoked, String> {
 }
 
 fn invoked_from(arguments: Vec<String>) -> Result<Invoked, String> {
-    let Some(first) = arguments.first() else {
-        return Ok(Invoked::Serve(requested_from(arguments.into_iter())?));
-    };
-    if first != "service" {
-        return Ok(Invoked::Serve(requested_from(arguments.into_iter())?));
+    match arguments.first().map(String::as_str) {
+        Some("service") => {
+            let verb = arguments.get(1).ok_or_else(|| {
+                "service needs a command — install, status or uninstall".to_string()
+            })?;
+            let verb = crate::service::Verb::parse(verb)?;
+            let rest: Vec<String> = arguments.into_iter().skip(2).collect();
+            Ok(Invoked::Service {
+                verb,
+                requested: requested_from(rest.clone().into_iter())?,
+                arguments: rest,
+            })
+        }
+        Some("auth") => pairing_from(arguments),
+        _ => Ok(Invoked::Serve(requested_from(arguments.into_iter())?)),
+    }
+}
+
+/// `auth pairing <verb> [id] [flags…]`.
+///
+/// The noun is spelled out even though `pairing` is the only one, because this
+/// mirrors upstream's `t3 auth pairing …` and because the group it belongs to —
+/// credentials this server issues — has more than one member the moment
+/// sessions get a command.
+fn pairing_from(arguments: Vec<String>) -> Result<Invoked, String> {
+    match arguments.get(1).map(String::as_str) {
+        Some("pairing") => {}
+        Some(other) => return Err(format!("unrecognised auth command {other} — pairing")),
+        None => return Err("auth needs a command — pairing".to_string()),
     }
     let verb = arguments
-        .get(1)
-        .ok_or_else(|| "service needs a command — install, status or uninstall".to_string())?;
-    let verb = crate::service::Verb::parse(verb)?;
-    let rest: Vec<String> = arguments.into_iter().skip(2).collect();
-    Ok(Invoked::Service {
+        .get(2)
+        .ok_or_else(|| "auth pairing needs a command — create, list or revoke".to_string())?;
+    let verb = crate::codes::Verb::parse(verb)?;
+
+    // The id is positional, as it is upstream, so it has to come off before the
+    // flag parser sees an argument with no `--` and refuses the lot.
+    let mut rest: Vec<String> = arguments.into_iter().skip(3).collect();
+    let id = match rest.first() {
+        Some(first) if !first.starts_with("--") => Some(rest.remove(0)),
+        _ => None,
+    };
+    if verb == crate::codes::Verb::Revoke && id.is_none() {
+        return Err("auth pairing revoke needs the id of a code to revoke".to_string());
+    }
+
+    let flags = flags_from(rest.into_iter(), &["ttl", "label", "base-url", "port"], &["json"])?;
+    Ok(Invoked::Pairing(Pairing {
         verb,
-        requested: requested_from(rest.clone().into_iter())?,
-        arguments: rest,
-    })
+        ttl: match flags.get("ttl") {
+            Some(given) => crate::codes::ttl_from(given)?,
+            None => crate::pairing::PAIRING_CODE_TTL.0.to_string(),
+        },
+        label: flags.get("label").map(|label| label.trim().to_string()).filter(|label| !label.is_empty()),
+        base_url: flags.get("base-url").cloned(),
+        json: flags.get("json").map(String::as_str) == Some("true"),
+        port: port_in(&flags, std::env::var("LAPLUS_PORT").ok())?,
+        id,
+    }))
 }
 
 /// The flags this process was given, by name and without the `--`.
@@ -669,5 +734,85 @@ mod tests {
     #[test]
     fn an_unknown_flag_after_the_verb_is_still_refused() {
         assert!(invoked_with(&["service", "install", "--porrt", "5000"]).is_err());
+    }
+
+    fn pairing_with(arguments: &[&str]) -> Result<Pairing, String> {
+        match invoked_with(arguments)? {
+            Invoked::Pairing(pairing) => Ok(pairing),
+            other => panic!("expected a pairing invocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pairing_code_takes_a_lifetime_a_label_and_an_address() {
+        let pairing = pairing_with(&[
+            "auth",
+            "pairing",
+            "create",
+            "--ttl",
+            "2h",
+            "--label",
+            "phone",
+            "--base-url",
+            "https://box.ts.net",
+        ])
+        .expect("a pairing invocation");
+        assert_eq!(pairing.verb, crate::codes::Verb::Create);
+        assert_eq!(pairing.ttl, "+2 hours");
+        assert_eq!(pairing.label.as_deref(), Some("phone"));
+        assert_eq!(pairing.base_url.as_deref(), Some("https://box.ts.net"));
+        assert!(!pairing.json);
+    }
+
+    /// Five minutes, like the code Settings mints — see
+    /// [`crate::pairing::PAIRING_CODE_TTL`].
+    #[test]
+    fn a_code_with_no_lifetime_gets_the_one_settings_uses() {
+        let pairing = pairing_with(&["auth", "pairing", "create"]).expect("a pairing invocation");
+        assert_eq!(pairing.ttl, crate::pairing::PAIRING_CODE_TTL.0);
+    }
+
+    /// A bad `--ttl` is refused here rather than by SQLite, so nothing is
+    /// written and the message names the flag.
+    #[test]
+    fn an_unreadable_lifetime_is_refused_before_the_database_is_opened() {
+        assert!(pairing_with(&["auth", "pairing", "create", "--ttl", "soon"]).is_err());
+    }
+
+    /// The id is positional, as it is upstream, so it has to come off before
+    /// the flag parser sees an argument with no leading dashes.
+    #[test]
+    fn revoking_takes_the_id_as_an_argument() {
+        let pairing = pairing_with(&["auth", "pairing", "revoke", "pl_123", "--json"])
+            .expect("a pairing invocation");
+        assert_eq!(pairing.verb, crate::codes::Verb::Revoke);
+        assert_eq!(pairing.id.as_deref(), Some("pl_123"));
+        assert!(pairing.json);
+    }
+
+    #[test]
+    fn revoking_nothing_in_particular_is_refused() {
+        let failure = pairing_with(&["auth", "pairing", "revoke"]).unwrap_err();
+        assert!(failure.contains("id"), "{failure}");
+    }
+
+    #[test]
+    fn the_auth_group_says_what_it_has_when_asked_for_something_else() {
+        assert!(invoked_with(&["auth"]).unwrap_err().contains("pairing"));
+        assert!(invoked_with(&["auth", "session"])
+            .unwrap_err()
+            .contains("pairing"));
+        assert!(invoked_with(&["auth", "pairing"])
+            .unwrap_err()
+            .contains("create"));
+    }
+
+    /// A blank `--label` is no label rather than an empty one, for the reason
+    /// [`ui_in`] gives about a blank bundle path.
+    #[test]
+    fn a_blank_label_is_no_label() {
+        let pairing = pairing_with(&["auth", "pairing", "create", "--label", "  "])
+            .expect("a pairing invocation");
+        assert_eq!(pairing.label, None);
     }
 }

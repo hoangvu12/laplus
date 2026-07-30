@@ -51,13 +51,20 @@ pub enum Line {
     Said(String),
     /// Something is not as it was asked for. Belongs on stderr.
     Warned(String),
+    /// A picture rather than a sentence — the pairing QR code.
+    ///
+    /// Its own variant because it is the one thing here that must be printed
+    /// **verbatim**: the caller prefixes every other line with `laplus: `, and a
+    /// prefix on the first row of a QR code lands inside its quiet zone and
+    /// stops a camera finding the edge.
+    Drawn(String),
 }
 
 impl Line {
     /// The text, whichever kind it is.
     pub fn text(&self) -> &str {
         match self {
-            Line::Said(text) | Line::Warned(text) => text,
+            Line::Said(text) | Line::Warned(text) | Line::Drawn(text) => text,
         }
     }
 }
@@ -139,13 +146,28 @@ pub fn announce(announcement: &Announcement) -> Vec<Line> {
             // phone, and `http://192.168.1.42:4773/` followed by twelve
             // characters into the box on the pairing screen is a great deal
             // less to get right than the same thing with `/#token=` in the
-            // middle of it. A QR code would beat both and is a dependency;
-            // ticket 03 left it as a follow-up.
+            // middle of it.
             if let Some(code) = &announcement.credential {
                 lines.push(Line::Said(format!(
                     "or open {} and pair with {code}",
                     lan.plain
                 )));
+            }
+            // **And a QR code, which beats both.** Ticket 03 left this as a
+            // follow-up because it needed a dependency; `crate::qr` is now that
+            // dependency, and upstream prints one here for the same reason
+            // (`formatHeadlessServeOutput`). Only for the LAN URL: the square is
+            // for a phone, and a phone cannot reach the loopback address the
+            // `None` arm below prints.
+            //
+            // Bare rather than prefixed with `laplus: `, because every other
+            // line here is a sentence and this one is a picture — a prefix on
+            // its first row only would put a stray word inside the quiet zone
+            // and stop it scanning.
+            if let Some(paired) = &lan.paired {
+                if let Some(drawn) = crate::qr::drawn(paired) {
+                    lines.push(Line::Drawn(drawn));
+                }
             }
             // A host the operator named while the server sits on loopback is
             // either a tunnel — right, and the reason the flag is honoured
@@ -262,8 +284,66 @@ mod tests {
         Some(Network { exposure, source })
     }
 
+    /// The sentences, which is what every assertion about wording means by
+    /// "the output". The QR code is a picture and is checked by shape below.
     fn said(lines: &[Line]) -> Vec<&str> {
-        lines.iter().map(Line::text).collect()
+        lines
+            .iter()
+            .filter(|line| !matches!(line, Line::Drawn(_)))
+            .map(Line::text)
+            .collect()
+    }
+
+    fn drawn(lines: &[Line]) -> Option<&str> {
+        lines.iter().find_map(|line| match line {
+            Line::Drawn(text) => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The follow-up ticket 03 left open. A phone that can point a camera at
+    /// the terminal never types the twelve characters at all.
+    #[test]
+    fn a_reachable_server_prints_a_square_to_scan() {
+        let announcement = Announcement {
+            exposure: Exposure::NetworkAccessible,
+            lan: Some(lan()),
+            ..loopback()
+        };
+        let lines = announce(&announcement);
+        let square = drawn(&lines).expect("a QR code");
+        assert!(square.contains('█'));
+        // The picture comes after the URL it encodes, so a reader who scrolls
+        // to the code can still read what it is.
+        let squares = lines
+            .iter()
+            .position(|line| matches!(line, Line::Drawn(_)))
+            .expect("a QR code");
+        assert!(squares > 0);
+    }
+
+    /// A loopback server has nothing a camera could usefully carry: the address
+    /// the square would encode is one the phone holding it cannot reach.
+    #[test]
+    fn a_loopback_server_prints_no_square() {
+        assert_eq!(drawn(&announce(&loopback())), None);
+    }
+
+    /// The prefix belongs on sentences. On the first row of a QR code it lands
+    /// inside the quiet zone and stops a camera finding the edge, which is the
+    /// whole reason this is a third variant rather than another `Said`.
+    #[test]
+    fn the_square_is_kept_apart_from_the_sentences() {
+        let announcement = Announcement {
+            exposure: Exposure::NetworkAccessible,
+            lan: Some(lan()),
+            ..loopback()
+        };
+        for line in announce(&announcement) {
+            if let Line::Said(text) | Line::Warned(text) = &line {
+                assert!(!text.contains('█'), "a square leaked into a sentence: {text}");
+            }
+        }
     }
 
     /// An operator-supplied host on a server that never left loopback is the one
@@ -333,7 +413,7 @@ mod tests {
             ]
         );
         assert!(
-            lines.iter().all(|line| matches!(line, Line::Said(_))),
+            lines.iter().all(|line| !matches!(line, Line::Warned(_))),
             "nothing went wrong here: {lines:?}"
         );
     }

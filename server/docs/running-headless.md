@@ -242,12 +242,17 @@ Two states that are not that:
 ## Pairing a phone
 
 1. Put the phone on the same network as the box.
-2. Either type the whole `open http://<lan-address>:4773/#token=…` line into it,
-   or type the bare address from the `or open …` line and put the twelve
-   characters into the pairing screen. The credential is not optional in either
-   case: the address on its own lands on a pairing screen with nothing to type
-   into it.
-3. That is it. The page trades the token at `POST /oauth/token` for a bearer,
+2. **Point its camera at the QR code.** A reachable server prints one at
+   startup, under the URLs, and `auth pairing create` prints one on demand. It
+   encodes the whole pairing URL including the credential, so there is nothing
+   to type and nothing to get wrong.
+3. Failing that — a terminal that mangles the square, a font without block
+   characters — either type the whole `open http://<lan-address>:4773/#token=…`
+   line into the phone, or type the bare address from the `or open …` line and
+   put the twelve characters into the pairing screen. The credential is not
+   optional in either case: the address on its own lands on a pairing screen
+   with nothing to type into it.
+4. That is it. The page trades the token at `POST /oauth/token` for a bearer,
    stores a connection profile, and opens the socket. There is no code to read
    off a second screen, because on a headless box there is no second screen to
    read it off.
@@ -266,6 +271,37 @@ with this server for the next day. Restarting the server retires the old grant
 and mints a new one.
 
 Once paired, the phone holds a session that is good for thirty days.
+
+### Minting a code instead
+
+The boot grant is what the server prints at startup. For every other device
+after the first — and for a server running in the background, which has no
+terminal to print to — mint one:
+
+```sh
+laplus-server auth pairing create                     # code, URL and a QR code
+laplus-server auth pairing create --ttl 1h --label "wife's ipad"
+laplus-server auth pairing create --base-url https://box.tailnet.ts.net
+laplus-server auth pairing list                       # what is outstanding
+laplus-server auth pairing revoke <id>
+```
+
+**Single use, five minutes**, unlike the boot grant — a code minted to be
+carried to one device has no business working twice. `--ttl` takes `90s`, `5m`,
+`2h`, `30d`; a bare number is refused rather than assumed.
+
+`--base-url` is the answer for anything this machine cannot see from its own
+routing table: a tunnel, a tailnet name, a reverse proxy. Without it the LAN
+address is used, and on a box with no route off itself the code is printed
+without a URL rather than with a `127.0.0.1` one that works nowhere.
+
+`list` never prints credentials — it is for deciding what to revoke. `--json` on
+any of them for a script.
+
+**This works while the server is running, and does not talk to it.** A pairing
+code is a row in `state.sqlite` with no in-memory half, so a second process
+writes one that the running server honours. That is also why it works with no
+idea what address the server is listening on.
 
 ## Reaching this server from the desktop application
 
@@ -384,17 +420,22 @@ boot. `--network` is worth saying out loud: without it the service binds
 loopback and nothing on your network can reach it, which on a VPS is a service
 that runs perfectly and answers nobody.
 
-**The pairing URL goes to the log**, because there is no terminal for it any
-more:
+**To pair a device, mint a code.** There is no terminal for the service to print
+its startup credential to, so it goes to the log — but reading a log to get in
+is a bad answer, and it is not the one:
 
 ```sh
-tail -f ~/.laplus/logs/service.log
+npx laplus@latest auth pairing create
 ```
 
-Restarting mints a new credential and retires the old one, so that file is where
-you look after every restart — and it is a secret, for the reason _Pairing a
-phone_ gives. Already-paired devices are unaffected: a session is good for
-thirty days and a restart does not end it.
+That prints a code, a URL and a QR code to scan. It works against a server that
+is already running, because a pairing code is a row in the database and nothing
+else, so a second process can write one the running server will honour. See
+_Pairing a phone_ below.
+
+The log is for diagnosing a server that will not start, and it does still carry
+the startup credential — treat it as a secret accordingly. Already-paired
+devices are unaffected by a restart: a session is good for thirty days.
 
 ### What the unit gets right, and why it is not a snippet
 

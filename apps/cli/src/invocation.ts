@@ -44,14 +44,27 @@ export const HELP = `laplus — the laplus server, and the UI it serves.
   npx laplus                  listen on 127.0.0.1:4773 and print a URL to open
   npx laplus --network        also listen off loopback, for a phone on this network
 
+Pairing another device:
+
+  npx laplus auth pairing create        a code, a URL, and a QR code to scan
+  npx laplus auth pairing list          what is outstanding (never the secrets)
+  npx laplus auth pairing revoke <id>
+
+  --ttl 1h        how long it lives (90s, 5m, 2h, 30d). Default 5 minutes
+  --label "ipad"  what it is for, to recognise in the list
+  --base-url URL  for a tunnel or tailnet this machine cannot see itself
+  --json          for a script
+
+Works against a server that is already running, including one started by the
+service below — a pairing code is a database row, not server state.
+
 Keeping it running (Linux with systemd):
 
   npx laplus service install [flags]   start at boot, and survive logging out
   npx laplus service status            whether one is installed, and up to date
   npx laplus service uninstall         stop it and take it off startup
 
-The flags given to \`service install\` are the ones the service runs with. The
-pairing URL then goes to ~/.laplus/logs/service.log rather than to a terminal.
+The flags given to \`service install\` are the ones the service runs with.
 
 Flags, all of them the server's own:
 

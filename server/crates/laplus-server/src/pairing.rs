@@ -67,11 +67,11 @@ const PAIRING_CODE_REJECTION_LIMIT: usize = (256 / PAIRING_CODE_ALPHABET.len()) 
 /// How long a minted pair code stays good for. The reference server's five
 /// minutes, and for its reason: this is a user-facing code being carried between
 /// two devices, not a credential being stored.
-pub const PAIRING_CODE_TTL: Ttl = Ttl("+5 minutes");
+pub const PAIRING_CODE_TTL: Ttl<'static> = Ttl("+5 minutes");
 
 /// How long a paired client stays paired. Thirty days, matching the reference
 /// server's `SessionStore`.
-pub const SESSION_TTL: Ttl = Ttl("+30 days");
+pub const SESSION_TTL: Ttl<'static> = Ttl("+30 days");
 
 /// How long the desktop window's own boot grant lives.
 ///
@@ -83,7 +83,7 @@ pub const SESSION_TTL: Ttl = Ttl("+30 days");
 ///
 /// A server that is still up after a day mints a fresh one; see
 /// [`DESKTOP_BOOT_SUBJECT`].
-pub const DESKTOP_BOOT_TTL: Ttl = Ttl("+24 hours");
+pub const DESKTOP_BOOT_TTL: Ttl<'static> = Ttl("+24 hours");
 
 /// Who the desktop window's own boot grant is issued to.
 ///
@@ -104,7 +104,7 @@ pub const DESKTOP_BOOT_SUBJECT: &str = "desktop-bootstrap";
 /// How long a socket ticket stays good for. Five minutes: long enough for a
 /// page to finish loading and open its socket, short enough that a ticket left
 /// in a proxy log is worthless by the time anyone reads it.
-pub const WEBSOCKET_TICKET_TTL: Ttl = Ttl("+5 minutes");
+pub const WEBSOCKET_TICKET_TTL: Ttl<'static> = Ttl("+5 minutes");
 
 /// A lifetime, in the form SQLite's `strftime` takes as a modifier.
 ///
@@ -112,10 +112,16 @@ pub const WEBSOCKET_TICKET_TTL: Ttl = Ttl("+5 minutes");
 /// clock — see [`crate::store`]'s own note on `strftime` — and an expiry
 /// computed in Rust from a `SystemTime` would be a second answer to "what time
 /// is it" that could disagree with the `created_at` beside it.
+///
+/// **Borrowed rather than `&'static`**, so that a lifetime an operator typed can
+/// be one of these too. The four below are the constants this server mints on
+/// its own; `laplus-server auth pairing create --ttl 1h` builds a fifth at
+/// runtime, and a `&'static str` would have forced either a leak or an owned
+/// string in a type that is otherwise `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ttl(pub &'static str);
+pub struct Ttl<'a>(pub &'a str);
 
-impl fmt::Display for Ttl {
+impl fmt::Display for Ttl<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.0)
     }

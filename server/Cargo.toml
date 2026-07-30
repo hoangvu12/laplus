@@ -57,6 +57,15 @@ notify = "8"
 # Windows this is a thin wrapper over ConPTY, which ships with the operating
 # system, so what it costs the artifact is the wrapper and not an emulator.
 portable-pty = "0.9"
+# A pairing code is twelve characters read off an SSH window and typed into a
+# phone, which is the worst way to move a credential between two devices that
+# are looking at each other. Encoding the pairing URL as a QR code is the whole
+# fix, and encoding one is Reed-Solomon, mask selection and version fitting —
+# not something to hand-roll for a feature this size. Default features off drops
+# `image` and `svg`: what is wanted is the built-in unicode renderer, which
+# draws the thing with half-block characters into a terminal. Pure Rust, no
+# build script and no C, so the musl targets of ADR-0026 are unaffected.
+qrcode = { version = "0.14", default-features = false }
 # `bundled` compiles SQLite into the binary. The alternative is linking whatever
 # the machine happens to have, which on Windows is usually nothing — and a
 # desktop app that asks the user to install a database first has given up the

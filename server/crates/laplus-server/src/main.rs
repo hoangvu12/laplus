@@ -22,6 +22,7 @@
 
 use std::process::ExitCode;
 
+use laplus_server::codes;
 use laplus_server::launch::{self, Invoked};
 use laplus_server::service;
 use laplus_server::startup::{self, Announcement, Line, Reachable};
@@ -40,6 +41,9 @@ async fn main() -> ExitCode {
             requested,
             arguments,
         }) => return manage_service(verb, requested, arguments),
+        // Mints against the database rather than against the running server, so
+        // this works while a service is up and needs no address to reach it at.
+        Ok(Invoked::Pairing(pairing)) => return manage_codes(&pairing),
         Err(message) => {
             eprintln!("laplus: {message}");
             return ExitCode::FAILURE;
@@ -139,11 +143,81 @@ async fn main() -> ExitCode {
         match line {
             Line::Said(text) => println!("laplus: {text}"),
             Line::Warned(text) => eprintln!("laplus: {text}"),
+            // Verbatim, and the variant's own note says why.
+            Line::Drawn(text) => println!("\n{text}"),
         }
     }
 
     server.serve_until_interrupted().await;
     ExitCode::SUCCESS
+}
+
+/// `laplus-server auth pairing <verb>`: mint, list or revoke a pairing code.
+///
+/// **This opens the running server's database and does not talk to the server.**
+/// A pairing code is a row and nothing else — `crate::codes` carries the whole
+/// argument — so a code minted here is honoured by a server this process never
+/// found, at an address it never had to discover.
+fn manage_codes(pairing: &launch::Pairing) -> ExitCode {
+    let outcome = (|| -> Result<(), String> {
+        let database = laplus_server::store::Database::open(&laplus_server::store::default_path())
+            .map_err(|error| error.to_string())?;
+        match pairing.verb {
+            codes::Verb::Create => {
+                let link = codes::create(&database, &pairing.ttl, pairing.label.as_deref())?;
+                let url = codes::base_url(pairing.base_url.as_deref(), pairing.port)
+                    .map(|base| codes::pairing_url(&base, &link.credential));
+                println!(
+                    "{}",
+                    if pairing.json {
+                        codes::created_json(&link, url.as_deref())
+                    } else {
+                        codes::created_text(&link, url.as_deref())
+                    }
+                );
+                Ok(())
+            }
+            codes::Verb::List => {
+                let links = database
+                    .active_pairing_links()
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    if pairing.json {
+                        codes::list_json(&links)
+                    } else {
+                        codes::list_text(&links)
+                    }
+                );
+                Ok(())
+            }
+            codes::Verb::Revoke => {
+                let id = pairing.id.as_deref().unwrap_or_default();
+                let revoked = database
+                    .revoke_pairing_link(id)
+                    .map_err(|error| error.to_string())?;
+                // Not an error: an operator revoking a code that has already
+                // been spent or has expired got what they wanted either way.
+                println!(
+                    "laplus: {}",
+                    if revoked {
+                        format!("revoked {id}.")
+                    } else {
+                        format!("no active code has the id {id}.")
+                    }
+                );
+                Ok(())
+            }
+        }
+    })();
+
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("laplus: {failure}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `laplus-server service <verb>`: write, inspect or remove the systemd user

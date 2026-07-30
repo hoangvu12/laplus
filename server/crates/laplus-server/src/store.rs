@@ -392,7 +392,7 @@ pub struct NewPairingLink<'a> {
     pub label: Option<&'a str>,
     /// How long this code lives. Five minutes for one a human carries;
     /// [`crate::pairing::DESKTOP_BOOT_TTL`] for the window's own.
-    pub ttl: crate::pairing::Ttl,
+    pub ttl: crate::pairing::Ttl<'a>,
     /// Survives being spent. True for the boot grant and false for everything
     /// else — see the `reusable` column's note in the migration.
     pub reusable: bool,
@@ -746,6 +746,22 @@ impl Database {
         connection
             .pragma_update(None, "foreign_keys", true)
             .map_err(StorageError::while_("enable foreign keys"))?;
+
+        // **There can be two processes on this file.** Since
+        // `laplus-server auth pairing create` (see [`crate::codes`]), a second
+        // process opens the same database while a server is running and writes
+        // a row to it. SQLite's default is to fail a busy write *immediately*
+        // rather than wait, so without this the command would report
+        // `database is locked` whenever it landed during a turn — a failure
+        // that depends on timing, appears only under load, and is indeed how
+        // this class of bug is usually met.
+        //
+        // Five seconds is far longer than any write here takes and far shorter
+        // than a person's patience. The server benefits by the same rule: it
+        // now waits for the CLI rather than the other way round.
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(StorageError::while_("set the busy timeout"))?;
 
         migrate(&connection)?;
 

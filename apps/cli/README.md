@@ -46,9 +46,28 @@ npx laplus@latest service status
 npx laplus@latest service uninstall
 ```
 
-The flags you pass to `service install` are the ones the service runs with. The
-pairing URL then goes to `~/.laplus/logs/service.log` instead of your terminal,
-so `tail -f` that after a restart.
+The flags you pass to `service install` are the ones the service runs with.
+
+## Pairing another device
+
+A server started at boot has no terminal to print a pairing URL to, and any
+server has only one startup credential. Mint a code whenever you need one:
+
+```sh
+npx laplus@latest auth pairing create
+npx laplus@latest auth pairing create --ttl 1h --label "ipad"
+npx laplus@latest auth pairing list
+npx laplus@latest auth pairing revoke <id>
+```
+
+`create` prints the code, a URL, and **a QR code** — point a phone's camera at
+it and there is nothing to type. Codes are single-use and last five minutes
+unless `--ttl` says otherwise. Add `--base-url` when the address a device
+reaches you at is a tunnel or a tailnet name this machine cannot discover, and
+`--json` for a script.
+
+This works against a server that is already running, and never has to find it:
+a pairing code is a row in the database rather than server state.
 
 `--network` turns the listener off loopback **for one run** and does not change
 what the desktop app does next time it starts. Anything it can reach can drive
