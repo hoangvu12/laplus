@@ -1,0 +1,33 @@
+{
+  "name": "laplus",
+  "version": "0.0.0",
+  "description": "Run the laplus server and its UI without building either.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoangvu12/laplus",
+    "directory": "apps/cli"
+  },
+  "bin": {
+    "laplus": "./dist/bin.mjs"
+  },
+  "files": [
+    "dist",
+    "ui",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "vp pack",
+    "dev": "node src/bin.ts",
+    "typecheck": "tsgo --noEmit",
+    "test": "vp test run"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

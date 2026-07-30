@@ -1,17 +1,24 @@
-# How a laplus installer reaches somebody who is not the developer.
+# How laplus reaches somebody who is not the developer.
 #
-# `cargo xtask release` already builds the artifact and weighs it; this is that
-# command run on a machine nobody has touched, with the result attached to a
-# GitHub Release. Windows only, because laplus ships one installer and nothing
-# else.
+# **Two artifacts, two audiences, and they do not depend on each other.**
 #
-# Upstream's `release.yml` is what this borrows its shape from, and most of it
-# does not apply: five platform artifacts, an npm CLI, a Vercel deploy, a relay
-# configuration and a three-hourly nightly cron all belong to a product with a
-# hosted half and a team behind it. What transfers is the useful part — GitHub
-# Releases is the feed, and `softprops/action-gh-release` is what puts files on
-# it. The nightly cron is deliberately not copied: this fork has one maintainer
-# and a scheduled publish is noise with a version number on it.
+# `release` builds the Windows installer: `cargo xtask release` run on a machine
+# nobody has touched, attached to a GitHub Release. Windows only, because the
+# desktop shell is what installs and it ships one installer.
+#
+# `server` and `npm` build the plain server for five platforms and publish it to
+# npm as `laplus`, so `npx laplus` starts a server and its UI on a machine with
+# nothing installed but Node. That is the reference server's `npx t3@latest`,
+# arrived at differently: upstream's server is Node and packs to one bundle that
+# runs everywhere, ours is Rust and needs a binary per platform behind a
+# launcher that picks one. `apps/cli/src/platform.ts` is the argument for that
+# shape and `apps/cli/src/release.ts` is what assembles it.
+#
+# Upstream's `release.yml` is what this borrows its shape from, and some of it
+# still does not apply: a Vercel deploy, a relay configuration and a three-hourly
+# nightly cron all belong to a product with a hosted half and a team behind it.
+# The nightly cron is deliberately not copied: this fork has one maintainer and a
+# scheduled publish is noise with a version number on it.
 #
 # **Nothing here signs the artifact for Windows.** Upstream pays for Azure
 # Trusted Signing; this fork does not, so SmartScreen warns about an unknown
@@ -24,9 +31,16 @@ on:
   push:
     tags:
       - "v*.*.*"
-  # A dispatch builds, tests and measures without publishing anything, so the
-  # pipeline can be exercised without cutting a release nobody wanted.
+  # A dispatch builds and packs without publishing anything, so the pipeline can
+  # be exercised without cutting a release nobody wanted — and, since it leaves
+  # the tarballs on the run as an artifact, so the packages can be installed
+  # from files on a real machine before the registry has ever heard of them.
   workflow_dispatch:
+    inputs:
+      build_installer:
+        description: Also build the Windows installer. Slow, and not needed to try `npx laplus`.
+        type: boolean
+        default: false
 
 concurrency:
   group: release-${{ github.ref }}
@@ -47,6 +61,10 @@ env:
 jobs:
   release:
     name: Build, measure, publish
+    # Forty minutes of Tauri that answers nothing about the npm half. A tag
+    # always builds it; a dispatch has to ask, because the usual reason to
+    # dispatch this workflow is to exercise the packages rather than the window.
+    if: github.event_name != 'workflow_dispatch' || inputs.build_installer
     runs-on: windows-latest
     timeout-minutes: 60
 
@@ -293,3 +311,236 @@ jobs:
             latest.json
             server/docs/artifact-size.md
           fail_on_unmatched_files: true
+
+  # The plain server, once per platform `apps/cli/src/platform.ts` names.
+  #
+  # Cheap next to the job above: `laplus-server` is not Tauri, so there is no
+  # WebView2, no three hundred crates and no bundler — a cold build is minutes,
+  # and `rust.yml` already proves two of these five compile on every push.
+  #
+  # `--target` even where it is the host's own, so the output lands at
+  # `target/<triple>/release/` on every runner and the upload step has one path
+  # to know rather than five.
+  server:
+    name: Server binary (${{ matrix.key }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    strategy:
+      # Each platform's answer is worth having on its own — and a red matrix
+      # here is a release that does not publish, rather than one that publishes
+      # a set with a hole in it. `stage` refuses to assemble that set.
+      fail-fast: false
+      matrix:
+        include:
+          - key: win32 x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: laplus-server.exe
+          # glibc is the floor this sets, and `ubuntu-latest` is 24.04: a binary
+          # built here needs glibc 2.39 or newer, so Debian 12 and RHEL 9 are
+          # out, and `cargo build -p laplus-server` on the box is the answer for
+          # them. `server/docs/running-headless.md` says what that needs.
+          - key: linux x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: laplus-server
+          - key: linux arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: laplus-server
+          - key: darwin arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            binary: laplus-server
+          # Cross-compiled from the Apple Silicon runner rather than built on an
+          # Intel one. Xcode's clang targets both architectures, which is all
+          # the bundled SQLite needs, and it costs a `rustup target add` instead
+          # of a runner label that Apple's hardware transition keeps taking away.
+          - key: darwin x64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            binary: laplus-server
+
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # See the note in `rust.yml`. Defender scans every object file rustc
+      # emits, and on Windows that is the largest tax this job pays.
+      - name: Exclude the build directories from Defender
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: powershell
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}\server\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build -p laplus-server --release --target ${{ matrix.target }}
+
+      # Named for the platform key rather than the Rust triple, because what
+      # reads it back is `artifactName` in `apps/cli/src/release.ts`, which
+      # thinks in Node's platform names. The triple stops mattering here.
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.key }}
+          path: server/target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  # `npx laplus`.
+  #
+  # **Six packages, and the order they go up in matters.** The five platform
+  # packages are optional dependencies of the launcher, pinned to this exact
+  # version — so a launcher published first is an `npm install laplus` that
+  # resolves against versions the registry has not seen yet. Binaries, then
+  # launcher.
+  #
+  # The `@laplus` scope has to exist on npm, and `NPM_TOKEN` has to be allowed
+  # to publish to it *and* to the unscoped `laplus` — the launcher belongs to a
+  # user account rather than to the org, so a token scoped to the org alone
+  # publishes five packages and fails on the sixth. **Nothing before the first
+  # tagged run proves that.** A dispatch does not contact the registry at all;
+  # it packs instead, and the first real publish is the first thing that tests
+  # the credential.
+  npm:
+    name: Publish the server to npm
+    needs: server
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      # Provenance: npm records which workflow at which commit built the
+      # tarball, and that record is the only thing standing between `npx laplus`
+      # and taking a stranger's word for what is in it.
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # The same check the installer job makes, repeated rather than shared: the
+      # two publish to different places and neither should be able to ship a
+      # version the other refused. `tauri.conf.json` is the number of record —
+      # see the note on that step for why it is not the tag.
+      #
+      # **A dispatch gets a prerelease suffix**, so what it packs can never be
+      # mistaken for — or collide with — the release that version number is
+      # going to name later. `0.1.1-dispatch.7` sorts below `0.1.1` and is not
+      # what `npx laplus` resolves to, which is exactly right for a tarball
+      # somebody is installing by hand to try it.
+      - name: Settle the version
+        id: version
+        shell: bash
+        run: |
+          configured=$(node -p "require('./server/crates/laplus-shell/tauri.conf.json').version")
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [[ "$configured" != "$tagged" ]]; then
+              echo "Tag $GITHUB_REF_NAME says $tagged; tauri.conf.json says $configured." >&2
+              exit 1
+            fi
+            version="$configured"
+          else
+            version="${configured}-dispatch.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building $version."
+
+      - name: Download the server binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: server-*
+          path: binaries
+
+      # What the launcher serves at `/`. The staging step refuses to assemble a
+      # package without it rather than publish an `npx laplus` that 404s.
+      - name: Build web bundle
+        run: pnpm build:web
+
+      - name: Stage the packages
+        run: >
+          node apps/cli/src/release.ts
+          --version ${{ steps.version.outputs.version }}
+          --binaries binaries
+          --out staged
+
+      # After staging, never before: `vp pack` inlines `package.json`'s version
+      # into the bundle that answers `laplus --version`, so a build that ran
+      # first would report 0.0.0 from a tarball that says otherwise.
+      - name: Pack the launcher
+        run: pnpm --filter laplus build
+
+      # **`./` is not decoration.** `npm publish apps/cli` is `owner/repo`-shaped,
+      # so npm reads it as a GitHub shorthand and goes looking for a repository
+      # called `apps/cli` over ssh instead of packing the directory. The leading
+      # `./` is what makes it a path. It cost a dry run to find and would have
+      # cost a release.
+      - name: Publish the binaries, then the launcher
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package in staged/@laplus/*; do
+            npm publish "./$package" --access public --provenance
+          done
+          npm publish ./apps/cli --access public --provenance
+
+      # What a dispatch produces instead of a publish: the six tarballs, exactly
+      # as they would have gone up, left on the run to be downloaded and
+      # installed from files.
+      #
+      # `npm pack` rather than `npm publish --dry-run`, which was what this did
+      # first. A dry run prints the same file list and proves less than it
+      # looks: it never contacts the registry at all — it succeeds against a
+      # deliberately invalid token — so it says nothing about whether the
+      # credential works or the scope exists. Only a real publish answers that.
+      # Packing at least leaves something a person can install.
+      - name: Pack what a tag would publish
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          mkdir -p tarballs
+          for package in staged/@laplus/*; do
+            npm pack "./$package" --pack-destination tarballs
+          done
+          npm pack ./apps/cli --pack-destination tarballs
+          ls -la tarballs
+
+      - name: Upload the tarballs
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: tarballs/*.tgz
+          if-no-files-found: error

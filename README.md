@@ -6,6 +6,24 @@ Tauri window that hosts it, and a React UI.
 The UI derives from [t3code](https://github.com/pingdotgg/t3code) (MIT, T3 Tools,
 Inc.) and is maintained here. The server and shell are this project's own.
 
+## Running it without building it
+
+```sh
+npx laplus@latest
+```
+
+Downloads the server for your platform, starts it on `http://127.0.0.1:4773` and
+prints a URL with a pairing token in it. `--network` makes it reachable from a
+phone on the same network; `npx laplus@latest --help` lists the rest.
+
+The machine the server runs on needs its own `claude` installed and
+authenticated — laplus drives the agent where the server is, not where the
+browser is. `server/docs/running-headless.md` is the long version, and
+`apps/cli/` is the launcher itself.
+
+This is the server and the page, not the window. The desktop application is the
+installer on [Releases](https://github.com/hoangvu12/laplus/releases).
+
 ## Building it
 
 The two halves are built by different tools, and the shell needs the UI's output
@@ -55,11 +73,32 @@ The installer is not code-signed for Windows, which is a different signature
 entirely, so SmartScreen will warn about an unknown publisher.
 `server/docs/adr/0020` records both, and ticket 74 the update path.
 
+The same tag also publishes `laplus` to npm — the launcher behind `npx laplus`,
+and a `@laplus/server-*` package per platform carrying a `laplus-server` binary.
+That half needs no signing key and an `NPM_TOKEN` secret instead;
+`server/docs/adr/0026` is the shape and why.
+
+A `workflow_dispatch` run builds the same six packages, versions them
+`<version>-dispatch.<run>`, and leaves them on the run as an `npm-tarballs`
+artifact instead of publishing. That is how to try `npx laplus` on a real
+machine before anything reaches the registry:
+
+```sh
+gh run download <run-id> -n npm-tarballs -D /tmp/laplus
+mkdir /tmp/try && cd /tmp/try && npm init -y
+npm install /tmp/laplus/laplus-*.tgz /tmp/laplus/laplus-server-linux-x64-*.tgz
+npx laplus --network
+```
+
+It skips the installer unless asked, because forty minutes of Tauri answers
+nothing about the npm half.
+
 ## Layout
 
 | Path       | What it is                                    |
 | ---------- | --------------------------------------------- |
 | `apps/web` | the UI                                        |
+| `apps/cli` | `npx laplus` — the launcher published to npm  |
 | `packages` | `@t3tools/{contracts,client-runtime,shared}`  |
 | `server`   | the Rust server, the Tauri shell, the release |
 | `.scratch` | the issue tracker                             |

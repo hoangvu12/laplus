@@ -6,6 +6,16 @@ node_modules/
 
 apps/*/dist
 packages/*/dist
+
+# The UI bundle, copied into the npm launcher at release time so `npx laplus`
+# has a page to serve. Built output that happens to sit outside a `dist/` —
+# `apps/cli/src/release.ts` puts it there because that is where `bin.ts` looks
+# for it in an installed package, not because it is source.
+apps/cli/ui/
+
+# Copied in beside it at the same moment, from `server/`, which is where it is
+# written. The tarball has to carry the notice; the tree only has to have one.
+apps/cli/THIRD_PARTY_NOTICES.md
 .vite-plus/
 .tanstack
 .vitest-*

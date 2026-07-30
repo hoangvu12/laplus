@@ -9,6 +9,7 @@ This file covers the TypeScript half and the repository as a whole.
 
 ```
 apps/web/       the UI. React + Vite, built by pnpm, embedded into the shell
+apps/cli/       `npx laplus` — the npm launcher for the server, published on a tag
 packages/       @t3tools/{contracts,client-runtime,shared} — the contract
 server/         the Rust server, the Tauri shell, the release. Cargo root
 .scratch/       the issue tracker, for both halves
@@ -49,6 +50,11 @@ search. So:
 
 - `apps/web` — React/Vite UI. Owns session UX, conversation and event
   rendering, and client-side state. Talks to the server over a WebSocket.
+- `apps/cli` — the `laplus` npm package: `spawn` and `process.exit` in front of
+  a prebuilt `laplus-server`, plus the UI bundle it is pointed at. **The only
+  package here that is published**, and the only one with no Effect in it —
+  `src/bin.ts` says why. `src/release.ts` is what assembles the release, and is
+  run by `.github/workflows/release.yml` rather than by anything at runtime.
 - `packages/contracts` — effect/Schema schemas for provider events, the socket
   protocol, and model/session types. **Schema-only; no runtime logic.** This is
   the whole vocabulary the UI can speak, and the server implements a subset of
