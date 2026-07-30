@@ -41,14 +41,18 @@
 //!
 //! ## What this ticket does not do
 //!
-//! - **`afterSequence` is answered at its two ends and not in between.** The
-//!   contract lets a client with a cached snapshot ask for a replay from a
-//!   sequence. A cursor that is still [`Sequences::current`] is a replay of no
-//!   events, and that is answered exactly: the opening carries no snapshot, and
-//!   for the real client — which asks for no completion marker — no chunk at
-//!   all. Any other cursor is answered with the whole snapshot, because
-//!   replaying from a position needs a log of events and this server keeps
-//!   none. See ADR-0016 for why it keeps none and why the two ends are enough.
+//! - **`afterSequence` is answered at its two ends and not in between.** This is
+//!   the cursor the two *subscriptions* carry, and it is all that is left of
+//!   resumption here: `orchestration.replayEvents` was the method that asked for
+//!   a log outright, and it left the contract rather than gaining one — for the
+//!   same reason this bullet gives. The contract lets a client with a cached
+//!   snapshot ask for a replay from a sequence. A cursor that is still
+//!   [`Sequences::current`] is a replay of no events, and that is answered
+//!   exactly: the opening carries no snapshot, and for the real client — which
+//!   asks for no completion marker — no chunk at all. Any other cursor is
+//!   answered with the whole snapshot, because replaying from a position needs a
+//!   log of events and this server keeps none. See ADR-0016 for why it keeps
+//!   none and why the two ends are enough.
 //! - **`commandId` is not remembered.** Upstream uses it to recognise a command
 //!   it has already run. laplus keeps no log of ids, so a re-dispatched
 //!   `project.create` is *refused* ("already exists") rather than answered with

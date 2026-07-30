@@ -24,7 +24,7 @@
 //!
 //! ## Why every entry says the same thing
 //!
-//! Every one of the sixty-one methods `rpc.ts` declares has
+//! Every one of the methods `rpc.ts` declares has
 //! `EnvironmentAuthorizationError` in its error union — it is the union of one
 //! for thirteen of them, including every page the surface walk found, and the
 //! last member of the union for the rest. So the per-method answer happens to be
@@ -119,7 +119,7 @@ const NOT_IMPLEMENTED: &str = "ServerMethodNotImplementedError";
 /// Every method `packages/contracts/src/rpc.ts` declares, and the error tag a
 /// refusal of it carries.
 ///
-/// All sixty-one, not just the ones this server has yet to implement: an
+/// All of them, not just the ones this server has yet to implement: an
 /// implemented method never reaches this table, and listing only the gap would
 /// mean deleting a row every time one closes — a second place to forget. The
 /// order is the contract's own, so the two can be read side by side.
@@ -191,7 +191,6 @@ const REFUSALS: &[(&str, Tag)] = &[
     ("orchestration.dispatchCommand", Tag::EnvironmentAuthorization),
     ("orchestration.getTurnDiff", Tag::EnvironmentAuthorization),
     ("orchestration.getFullThreadDiff", Tag::EnvironmentAuthorization),
-    ("orchestration.replayEvents", Tag::EnvironmentAuthorization),
     ("orchestration.getArchivedShellSnapshot", Tag::EnvironmentAuthorization),
     ("orchestration.subscribeShell", Tag::EnvironmentAuthorization),
     ("orchestration.subscribeThread", Tag::EnvironmentAuthorization),
@@ -226,8 +225,8 @@ pub fn refusal(method: &str) -> Value {
             "requiredScope": REFUSAL_SCOPE,
         }),
         // Not the contract's method, so there is no union to answer inside.
-        // `method` is the only thing that says which of the sixty-one a
-        // developer has mistyped, so it survives into the error.
+        // `method` is the only thing that says which method a developer has
+        // mistyped, so it survives into the error.
         None => json!({
             "_tag": NOT_IMPLEMENTED,
             "method": method,
