@@ -115,6 +115,29 @@ const DEFAULT_RUNTIME_MODE: &str = "full-access";
 /// The contract's `DEFAULT_PROVIDER_INTERACTION_MODE`.
 const DEFAULT_INTERACTION_MODE: &str = "default";
 
+/// Every runtime mode the contract names (`RuntimeMode` in `orchestration.ts`),
+/// in its order.
+///
+/// Written down here rather than inferred from [`crate::agent::permission_mode_for`],
+/// which is a different question with a colliding shape: that table maps a mode
+/// to the CLI's `--permission-mode` and answers `None` for `approval-required`
+/// *and* for a mode nobody named, because upstream expresses the first by passing
+/// no flag. A validator built on it would accept anything.
+const RUNTIME_MODES: [&str; 4] = [
+    "approval-required",
+    "auto-accept-edits",
+    "auto",
+    "full-access",
+];
+
+/// Every interaction mode the contract names (`ProviderInteractionMode`).
+///
+/// Nothing in this server reads one — it is carried on the thread, published,
+/// and never reaches the CLI — so this list is the whole of what the value is
+/// checked against, and being a closed set is the only thing that keeps it from
+/// becoming a free-text field the picker cannot render.
+const INTERACTION_MODES: [&str; 2] = ["default", "plan"];
+
 /// The registry, live: what is in it, what changes it, and who is watching.
 ///
 /// Cheap to clone, and every clone is the same shell — a subscription outlives
@@ -165,6 +188,8 @@ enum Command {
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
     RespondToUserInput(RespondToUserInput),
+    SetRuntimeMode(SetRuntimeModePayload),
+    SetInteractionMode(SetInteractionModePayload),
 }
 
 /// Everything a diff of a conversation needs that is not about git.
@@ -392,9 +417,64 @@ impl Shell {
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
             Command::RespondToUserInput(respond) => self.respond_to_user_input(&respond)?,
+            Command::SetRuntimeMode(set) => self.set_mode(
+                &set.thread_id,
+                Change::RuntimeModeSet {
+                    runtime_mode: set.runtime_mode,
+                },
+            )?,
+            Command::SetInteractionMode(set) => self.set_mode(
+                &set.thread_id,
+                Change::InteractionModeSet {
+                    interaction_mode: set.interaction_mode,
+                },
+            )?,
         };
 
         Ok(json!({ "sequence": sequence }))
+    }
+
+    /// Move one of the conversation's two modes, for the turns after this one.
+    ///
+    /// **The mode applies to the next turn, not the one already running.** That
+    /// falls out of where each value is read rather than being enforced here:
+    /// this writes the *thread*, which is what the composer's pickers read
+    /// (`ChatView.tsx`'s `activeThread?.runtimeMode`), and touches neither the
+    /// session nor the agent — [`crate::turn::Start`] was built when the session
+    /// opened and the child was given its `--permission-mode` then. So the turn
+    /// in flight stays under the rules it started with, which is the point: the
+    /// rules an agent is working under must not move under its feet.
+    ///
+    /// The other side of that is a gap this ticket did not close, recorded in
+    /// `.scratch/thread-lifecycle/issues/11-…`: one child serves a whole
+    /// conversation, so a *reused* process goes on applying the mode it was
+    /// launched with even for turns requested under the new one. The per-turn
+    /// override has always had the same hole.
+    ///
+    /// **A repeat is answered rather than refused.** Both commands are a write
+    /// of one field, and folding the event a second time lands on the same
+    /// state, so a double-click or a stale client costs a sequence and nothing
+    /// else. The value being new is not something either side promised.
+    ///
+    /// It is *not* the spec's "idempotence by re-emission", which carries the
+    /// existing `updatedAt` so a duplicate cannot churn a list ordered by when
+    /// things changed: [`Threads::apply`] stamps the clock for every change, and
+    /// that rule was written for settle and snooze. The cost here is a repeat
+    /// moving the thread's `updatedAt`, which the client's own list does not sort
+    /// on — it prefers `latestUserMessageAt` (`threadSort.ts`). Worth knowing
+    /// before the settle commands reuse this path, where it would matter.
+    ///
+    /// An unknown thread is refused by [`Threads::apply`]'s own `None` rather
+    /// than by a lookup before it. Deliberately not the shape
+    /// [`Shell::interrupt_turn`] uses: [`Shell::open_thread`] *clones the whole
+    /// conversation* — every message and every activity — and a pre-check would
+    /// copy a long transcript to ask a question the write answers anyway, with
+    /// the same sentence.
+    fn set_mode(&self, thread_id: &str, change: Change) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply(thread_id, change)
+            .ok_or_else(|| self.not_open(thread_id))
     }
 
     /// Hand the developer's permission decision to the agent waiting on it.
@@ -1167,6 +1247,36 @@ struct RespondToUserInput {
     answers: Value,
 }
 
+/// `thread.runtime-mode.set` — the composer's runtime picker, moved
+/// mid-conversation.
+///
+/// The mode is a plain `String` rather than an enum for the reason
+/// [`RespondToApproval::decision`] is one: an unreadable value is refused with a
+/// sentence naming it and the thread, instead of failing the whole command's
+/// deserialization with serde's own account of which variants it knows.
+///
+/// `createdAt` is in the contract and deliberately absent here. It is the moment
+/// the *client* built the command, and what the thread's `updatedAt` and the
+/// event's have to be is the moment this server committed — every other change
+/// on this feed is stamped by [`crate::clock::now_iso`], and one that was not
+/// would let a client with a skewed clock reorder the thread list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetRuntimeModePayload {
+    thread_id: String,
+    runtime_mode: String,
+}
+
+/// `thread.interaction-mode.set` — the composer's plan-mode toggle, moved
+/// mid-conversation. [`SetRuntimeModePayload`]'s twin, and everything argued there
+/// applies unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetInteractionModePayload {
+    thread_id: String,
+    interaction_mode: String,
+}
+
 impl StartTurn {
     fn prepares_a_worktree(&self) -> bool {
         self.bootstrap
@@ -1224,7 +1334,7 @@ impl Command {
     ///
     /// The `type` is taken by hand before the rest is deserialized so that an
     /// unimplemented command names itself in the refusal. The contract carries
-    /// roughly twenty command types and laplus implements six, so "which
+    /// roughly twenty command types and laplus implements nine, so "which
     /// one" is the most useful thing a message can say during the build-out.
     fn parse(payload: &Value) -> Result<Command, CommandError> {
         let kind = payload
@@ -1309,6 +1419,35 @@ impl Command {
                     ..respond
                 }))
             }
+            "thread.runtime-mode.set" => {
+                let set: SetRuntimeModePayload = read_about_a_thread(payload, kind)?;
+                // The thread first, so the mode's refusal has a conversation to
+                // name — and so a payload with two things wrong with it is
+                // refused for the one the developer can act on.
+                let thread_id = non_blank(set.thread_id, "threadId", kind)?;
+                Ok(Command::SetRuntimeMode(SetRuntimeModePayload {
+                    runtime_mode: named_by_the_contract(
+                        set.runtime_mode,
+                        &RUNTIME_MODES,
+                        "runtime mode",
+                        &thread_id,
+                    )?,
+                    thread_id,
+                }))
+            }
+            "thread.interaction-mode.set" => {
+                let set: SetInteractionModePayload = read_about_a_thread(payload, kind)?;
+                let thread_id = non_blank(set.thread_id, "threadId", kind)?;
+                Ok(Command::SetInteractionMode(SetInteractionModePayload {
+                    interaction_mode: named_by_the_contract(
+                        set.interaction_mode,
+                        &INTERACTION_MODES,
+                        "interaction mode",
+                        &thread_id,
+                    )?,
+                    thread_id,
+                }))
+            }
             unimplemented => Err(CommandError::new(format!(
                 "Command not implemented by this server: {unimplemented}"
             ))),
@@ -1321,6 +1460,32 @@ fn read<T: serde::de::DeserializeOwned>(payload: &Value, kind: &str) -> Result<T
         .map_err(|error| CommandError::new(format!("{kind} is malformed: {error}")))
 }
 
+/// [`read`], with the conversation the payload was about named in the refusal.
+///
+/// serde says which *field* it could not read and has no idea which thread the
+/// command was for, so the sentence a client shows for a malformed payload is
+/// otherwise the only refusal on this wire that does not say what it applies to.
+/// The `threadId` is taken out of the raw payload rather than out of the struct,
+/// because the struct is what failed to build.
+///
+/// Silent when the payload carries no readable `threadId` — that is the one case
+/// where there is no thread to name, and it is exactly the case
+/// [`non_blank`] would refuse next anyway.
+fn read_about_a_thread<T: serde::de::DeserializeOwned>(
+    payload: &Value,
+    kind: &str,
+) -> Result<T, CommandError> {
+    read(payload, kind).map_err(|refusal| {
+        match payload.get("threadId").and_then(Value::as_str) {
+            Some(thread_id) if !thread_id.trim().is_empty() => CommandError::new(format!(
+                "{} Thread '{thread_id}' was left as it was.",
+                refusal.message()
+            )),
+            _ => refusal,
+        }
+    })
+}
+
 /// The contract types every identifier as a trimmed non-empty string. A blank
 /// one would register a project nothing could later name, so it is refused at
 /// the door rather than stored and puzzled over.
@@ -1329,6 +1494,41 @@ fn non_blank(value: String, field: &str, kind: &str) -> Result<String, CommandEr
         return Err(CommandError::new(format!("{kind} needs a {field}.")));
     }
     Ok(value)
+}
+
+/// One value out of a closed set the contract spells out, or a refusal naming
+/// what was sent and which conversation it was sent about.
+///
+/// **Refused rather than rounded to the nearest mode this server understands.**
+/// A declined setting, in ADR-0009's sense — a value refused on the way in — and
+/// the shape is [`crate::settings`]'s `ENV_MODES` rather than anything new: a
+/// closed array of the contract's own literals, and a sentence that lists them.
+/// The reason to refuse rather than round is [`Shell::respond_to_approval`]'s:
+/// the nearest mode this server has a `--permission-mode` for is `full-access`,
+/// so rounding a typo would *widen* what the agent may do.
+///
+/// A blank value is refused here as well as an unknown one — it names no mode,
+/// and the contract's own literals are what the picker renders.
+///
+/// The accepted values are in the message because the sentence is the whole
+/// diagnostic `OrchestrationDispatchCommandError` can carry, and "not a runtime
+/// mode" without saying what one is is not something a developer can act on.
+/// Joined with `", "` rather than `settings`'s `" or "`, because four is a list
+/// and two is a choice.
+fn named_by_the_contract(
+    value: String,
+    named: &[&str],
+    what: &str,
+    thread_id: &str,
+) -> Result<String, CommandError> {
+    if named.contains(&value.as_str()) {
+        return Ok(value);
+    }
+    Err(CommandError::new(format!(
+        "'{value}' is not a {what} this contract names, so thread '{thread_id}' was left as it \
+         was. Send one of: {}.",
+        named.join(", ")
+    )))
 }
 
 #[cfg(test)]
@@ -1426,6 +1626,51 @@ mod tests {
                 "worktreePath": Value::Null,
                 "createdAt": "2026-07-26T00:23:04.909Z",
             }))
+        }
+
+        /// The `thread.runtime-mode.set` the composer's runtime picker sends.
+        fn set_runtime_mode(&self, thread_id: &str, mode: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.runtime-mode.set",
+                "commandId": format!("test:runtime-mode:{thread_id}"),
+                "threadId": thread_id,
+                "runtimeMode": mode,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+        }
+
+        /// The `thread.interaction-mode.set` the composer's plan-mode toggle
+        /// sends.
+        fn set_interaction_mode(&self, thread_id: &str, mode: &str) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.interaction-mode.set",
+                "commandId": format!("test:interaction-mode:{thread_id}"),
+                "threadId": thread_id,
+                "interactionMode": mode,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+        }
+
+        /// A registry with one project and one conversation in it, which is the
+        /// least the mode commands need to have something to act on.
+        fn with_a_conversation() -> Fixture {
+            let fixture = Fixture::new();
+            let folder = fixture.folder("modes");
+            fixture.add("project-1", &folder).expect("registered");
+            fixture
+                .add_thread("thread-1", "project-1")
+                .expect("created");
+            fixture
+        }
+
+        /// The conversation as its own subscription describes it — where the
+        /// picker reads the mode in force.
+        fn detail(&self, thread_id: &str) -> Value {
+            self.shell
+                .threads()
+                .detail_snapshot(thread_id)
+                .expect("the thread is held")["thread"]
+                .clone()
         }
 
         fn snapshot(&self) -> Value {
@@ -1785,7 +2030,7 @@ mod tests {
         );
     }
 
-    /// Roughly twenty command types exist and laplus implements six. Each
+    /// Roughly twenty command types exist and laplus implements nine. Each
     /// refusal has to name what was asked for, or a developer cannot tell which
     /// of them is missing.
     #[test]
@@ -2030,6 +2275,167 @@ mod tests {
         assert!(
             thread.messages.is_empty(),
             "a refused turn must not leave the prompt in the transcript"
+        );
+    }
+
+    // -- the two modes -------------------------------------------------------
+    //
+    // Payload validation only, which is the seam the spec assigns this file:
+    // "each of these is one sentence about one payload". The sequence, the two
+    // feeds, the second connection, the fresh subscriber, the restart and the
+    // turn in flight are all `tests/socket_thread_modes.rs`, and asserting them
+    // twice would be two accounts of one decision.
+
+    /// Every mode the contract names is accepted, and the two commands stay in
+    /// their own vocabularies — an interaction mode is not a runtime mode.
+    #[test]
+    fn every_mode_the_contract_names_is_accepted_and_no_other() {
+        let fixture = Fixture::with_a_conversation();
+
+        for mode in RUNTIME_MODES {
+            fixture
+                .set_runtime_mode("thread-1", mode)
+                .unwrap_or_else(|refused| panic!("{mode}: {}", refused.message()));
+            assert_eq!(fixture.detail("thread-1")["runtimeMode"], mode);
+        }
+        for mode in INTERACTION_MODES {
+            fixture
+                .set_interaction_mode("thread-1", mode)
+                .unwrap_or_else(|refused| panic!("{mode}: {}", refused.message()));
+            assert_eq!(fixture.detail("thread-1")["interactionMode"], mode);
+        }
+
+        fixture
+            .set_runtime_mode("thread-1", "plan")
+            .expect_err("'plan' is an interaction mode, not a runtime one");
+        fixture
+            .set_interaction_mode("thread-1", "full-access")
+            .expect_err("'full-access' is a runtime mode, not an interaction one");
+    }
+
+    /// A mode the contract does not name is refused rather than rounded to the
+    /// nearest one the server understands — the nearest one might be the one
+    /// that lets the agent run anything. The sentence names the mode, the thread
+    /// it was wrong about, and what would have been accepted, because the
+    /// sentence is the whole diagnostic the UI can show.
+    #[test]
+    fn a_mode_the_contract_does_not_name_is_refused_rather_than_rounded() {
+        let fixture = Fixture::with_a_conversation();
+
+        for sent in ["bypassPermissions", "FULL-ACCESS", "", "  "] {
+            let refusal = fixture
+                .set_runtime_mode("thread-1", sent)
+                .expect_err("not a runtime mode the contract names");
+            assert!(
+                refusal.message().contains("thread-1")
+                    && refusal.message().contains("full-access"),
+                "{sent:?}: {}",
+                refusal.message()
+            );
+        }
+
+        let refusal = fixture
+            .set_interaction_mode("thread-1", "planning")
+            .expect_err("not an interaction mode the contract names");
+        assert!(
+            refusal.message().contains("thread-1") && refusal.message().contains("plan"),
+            "{}",
+            refusal.message()
+        );
+
+        // Nothing moved, on either field.
+        assert_eq!(fixture.detail("thread-1")["runtimeMode"], "full-access");
+        assert_eq!(fixture.detail("thread-1")["interactionMode"], "default");
+    }
+
+    /// Both commands are parsed before the world is consulted, so a payload
+    /// that cannot be read is refused at the door: a blank identifier, a
+    /// missing mode, and — the case that shows the ordering — an unreadable
+    /// mode for a thread that does not exist, which is refused for the mode
+    /// rather than for the thread.
+    #[test]
+    fn a_malformed_mode_command_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .set_runtime_mode("  ", "auto")
+            .expect_err("a blank thread id names no conversation");
+        assert!(
+            refusal.message().contains("threadId"),
+            "{}",
+            refusal.message()
+        );
+        let refusal = fixture
+            .set_interaction_mode("  ", "plan")
+            .expect_err("a blank thread id names no conversation");
+        assert!(
+            refusal.message().contains("threadId"),
+            "{}",
+            refusal.message()
+        );
+
+        // A payload that will not deserialize at all still says which
+        // conversation it was about. serde knows the field it could not read and
+        // nothing about the thread, so without this the one refusal a client
+        // shows for a malformed mode command is the only one on this wire that
+        // does not name what it applies to.
+        for kind in ["thread.runtime-mode.set", "thread.interaction-mode.set"] {
+            let refusal = fixture
+                .dispatch(&json!({"type": kind, "commandId": "c", "threadId": "thread-1"}))
+                .expect_err("a mode command needs a mode");
+            assert!(
+                refusal.message().contains(kind)
+                    && refusal.message().contains("malformed")
+                    && refusal.message().contains("thread-1"),
+                "{kind}: {}",
+                refusal.message()
+            );
+        }
+
+        // And a payload with no thread in it at all falls back to serde's own
+        // sentence rather than inventing a conversation to blame.
+        let refusal = fixture
+            .dispatch(&json!({"type": "thread.runtime-mode.set", "commandId": "c"}))
+            .expect_err("no thread and no mode");
+        assert!(
+            refusal.message().contains("malformed") && !refusal.message().contains("Thread '"),
+            "{}",
+            refusal.message()
+        );
+
+        let refusal = fixture
+            .set_runtime_mode("never-created", "not-a-mode")
+            .expect_err("both are wrong");
+        assert!(
+            refusal.message().contains("not-a-mode"),
+            "the world was consulted before the payload was read: {}",
+            refusal.message()
+        );
+    }
+
+    /// An unknown thread is refused by name. A mode written against a
+    /// conversation this server has never heard of would be state no client
+    /// could ever read back.
+    #[test]
+    fn a_mode_for_an_unknown_thread_is_refused_by_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .set_runtime_mode("never-created", "auto")
+            .expect_err("there is no such thread");
+        assert!(
+            refusal.message().contains("never-created"),
+            "{}",
+            refusal.message()
+        );
+
+        let refusal = fixture
+            .set_interaction_mode("never-created", "plan")
+            .expect_err("there is no such thread");
+        assert!(
+            refusal.message().contains("never-created"),
+            "{}",
+            refusal.message()
         );
     }
 

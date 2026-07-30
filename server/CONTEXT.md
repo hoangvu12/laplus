@@ -29,6 +29,30 @@ one real loss is recorded in `crate::turn`, `Folded::Initialized` — the mode t
 CLI reports is the one _in force_, and the picker shows the one that was asked
 for.
 
+**Runtime mode** — how much latitude the agent is given, as the contract's four
+closed literals: `approval-required`, `auto-accept-edits`, `auto`, `full-access`.
+A property of the **thread**, editable between turns by
+`thread.runtime-mode.set`, and `crate::orchestration::RUNTIME_MODES` is the whole
+of what one may be.
+
+Not to be confused with the CLI's **permission mode**, which is what a runtime
+mode is _translated into_ — `--permission-mode`, one of the agent protocol's own
+words, and the translation is `crate::agent::permission_mode_for`. The two are
+not one vocabulary renamed: the table is lossy in both directions.
+`approval-required` maps to _no flag at all_, because upstream expresses it by
+answering the CLI's permission callback instead, and so the reverse reading of a
+missing flag is ambiguous.
+
+A mode is read **when a session opens** and given to the child then, so a mode
+set mid-conversation reaches the thread and not the process already serving it.
+That gap is a known one; see the thread-lifecycle tracker.
+
+**Interaction mode** — whether the developer is planning or acting:
+`default` or `plan`. Also a property of the thread, also editable by a command of
+its own, and the one mode this server never acts on — it is stored, published,
+and never reaches the CLI. Carried so the picker has something true to show
+across a restart.
+
 **Work log** — the row-per-thing-that-happened view beside the transcript: tool
 calls, thinking, permission requests and their resolutions. `crate::worklog`.
 
@@ -119,6 +143,28 @@ exists.
 
 **Turn state** — how the most recent turn went. The contract's four: `running`,
 `completed`, `interrupted`, `error`. `crate::settling::TurnState`.
+
+**Runtime mode** — how much latitude the agent is given, as the composer's
+picker offers it. The contract's four: `approval-required`, `auto-accept-edits`,
+`auto`, `full-access`. `crate::orchestration::RUNTIME_MODES` is the closed set a
+command is checked against; `crate::agent::permission_mode_for` is the separate
+question of which `--permission-mode` each one becomes, and answers nothing for
+`approval-required` because upstream expresses that by passing no flag.
+
+Read **once per session**, when the agent is launched. A thread carries the mode
+and a change to it reaches the next session, not the child already running — see
+`crate::orchestration::Shell::set_mode`, and `.scratch/thread-lifecycle/issues/11`
+for the consequence.
+
+**Interaction mode** — whether the developer is planning or acting: the
+contract's `default` and `plan`. Carried on the thread, published, and **never
+sent to the CLI** — nothing in this server reads one, so it is a value the client
+keeps here rather than a behaviour this server has. The closed set is
+`crate::orchestration::INTERACTION_MODES`.
+
+Both are **per-thread and editable**, by a command each, and both also arrive as
+a per-turn override on a turn request. Absent on a turn means unchanged; the
+command is how a picker moves one between turns.
 
 **Settling** — reading a session status as a turn state. Leaving `running` is
 the end of a turn, not the last assistant message, which is what makes a turn's

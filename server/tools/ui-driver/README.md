@@ -26,23 +26,27 @@ cargo build -p laplus-shell --release
 node tools/ui-driver/repro.mjs 40
 ```
 
-| File                         | What it does                                                                                                                                                                                                                                                            |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cdp.mjs`                    | Launches headless Chrome, attaches, and exposes the DOM, the console, and **every WebSocket frame in both directions**                                                                                                                                                  |
-| `probe-boot.mjs`             | Boots the UI and dumps what it says on the socket. Start here. Takes the URL as an argument, for the second-instance recipe below                                                                                                                                       |
-| `probe-open-thread.mjs`      | Clicks a conversation in the sidebar and prints the pane. Ticket 28's free discriminator                                                                                                                                                                                |
-| `repro.mjs`                  | Types a prompt into the composer of a new thread and watches the pane. Exit code 1 if the reply never renders                                                                                                                                                           |
-| `first-turn.mjs`             | The same, sampling four times a second. Ticket 35's "the first message doesn't show anything"                                                                                                                                                                           |
-| `probe-context-meter.mjs`    | Runs a turn and reads the composer's context meter. Exit code 1 if no meter is drawn — which is what a server that never emits `context-window.updated` looks like from the outside                                                                                     |
-| `titlebar-boxes.mjs`         | Where everything in the topbar's right-hand corner is, in pixels in from the window edge. `--plain` measures the browser layout for comparison                                                                                                                          |
-| `remote-pairing.mjs`         | Pairs a page served by one laplus with a **second laplus on another origin**, and reports every preflight Chrome sent. Ticket 02 of the headless-Linux effort; wants two servers                                                                                        |
-| `add-remote-environment.mjs` | The same, through the real Settings form rather than `fetch`. Takes **one or more** `<remote-url> <code>` pairs and insists the list grows by one each time — ticket 06's acceptance check, which was two servers colliding on `environmentId: "local"` until it landed |
-| `surface-walk.mjs`           | Navigates every route, enumerates the visible controls, and reports refusals, empty renders and console errors per route                                                                                                                                                |
-| `surface-actions.mjs`        | Presses controls and reports what the server answered, plus every failed HTTP request the page made                                                                                                                                                                     |
+| File                         | What it does                                                                                                                                                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cdp.mjs`                    | Launches headless Chrome, attaches, and exposes the DOM, the console, and **every WebSocket frame in both directions**                                                                                                                                                    |
+| `probe-boot.mjs`             | Boots the UI and dumps what it says on the socket. Start here. Takes the URL as an argument, for the second-instance recipe below                                                                                                                                         |
+| `probe-open-thread.mjs`      | Clicks a conversation in the sidebar and prints the pane. Ticket 28's free discriminator                                                                                                                                                                                  |
+| `repro.mjs`                  | Types a prompt into the composer of a new thread and watches the pane. Exit code 1 if the reply never renders                                                                                                                                                             |
+| `first-turn.mjs`             | The same, sampling four times a second. Ticket 35's "the first message doesn't show anything"                                                                                                                                                                             |
+| `probe-context-meter.mjs`    | Runs a turn and reads the composer's context meter. Exit code 1 if no meter is drawn — which is what a server that never emits `context-window.updated` looks like from the outside                                                                                       |
+| `titlebar-boxes.mjs`         | Where everything in the topbar's right-hand corner is, in pixels in from the window edge. `--plain` measures the browser layout for comparison                                                                                                                            |
+| `remote-pairing.mjs`         | Pairs a page served by one laplus with a **second laplus on another origin**, and reports every preflight Chrome sent. Ticket 02 of the headless-Linux effort; wants two servers                                                                                          |
+| `add-remote-environment.mjs` | The same, through the real Settings form rather than `fetch`. Takes **one or more** `<remote-url> <code>` pairs and insists the list grows by one each time — ticket 06's acceptance check, which was two servers colliding on `environmentId: "local"` until it landed   |
+| `probe-thread-modes.mjs`     | Picks a runtime mode and toggles the interaction mode on a conversation that already exists, sends a message, and reads both modes back **off the server**. Thread-lifecycle ticket 02; wants a boot credential and an agent binary that is not an agent — see its header |
+| `surface-walk.mjs`           | Navigates every route, enumerates the visible controls, and reports refusals, empty renders and console errors per route                                                                                                                                                  |
+| `surface-actions.mjs`        | Presses controls and reports what the server answered, plus every failed HTTP request the page made                                                                                                                                                                       |
 
 `repro.mjs`, `first-turn.mjs` and `probe-context-meter.mjs` each spend a **real
 agent turn** against the configured `claude` binary and the project the sidebar
-opens on. Everything else here spends nothing.
+opens on. `probe-thread-modes.mjs` also _sends a message_ — the commands it is
+about only go out on send — but it is meant to be pointed at a laplus whose
+`binaryPath` is a text file, so the turn dies at the child and the API is never
+reached. Everything else here spends nothing.
 
 The two `surface-*` files answer a different question from the rest: not "why is
 this one thing wrong" but "of everything the application offers, what does
@@ -100,6 +104,23 @@ LOCALAPPDATA=/tmp/lc-probe LAPLUS_PORT=4774 ./target/release/laplus.exe &
 node tools/ui-driver/probe-boot.mjs http://127.0.0.1:4774/
 ```
 
+**Stop it by its pid, never by its name.** `taskkill /IM laplus.exe /F` does not
+mean "the one I started" — it means every laplus on the machine, and the
+installed one at `%LOCALAPPDATA%\Programs\laplus\laplus.exe` is somebody's open
+window with a conversation in it. `/F` is a hard kill, so the tail of whatever
+`crate::transcripts` had queued goes with it. Keep the pid the launch gave you:
+
+```
+LOCALAPPDATA=/tmp/lc-probe LAPLUS_PORT=4774 ./target/release/laplus.exe & probe=$!
+...
+kill "$probe"          # and on Windows: taskkill //PID "$probe"
+```
+
+Two ports and two profiles is the whole separation, and it only holds if the
+teardown respects it as well as the launch. `Get-Process laplus | select Id, Path`
+is how to tell which is which after the fact — the installed build and
+`target/release/` are different paths.
+
 `LOCALAPPDATA` gives it a profile of its own — an empty registry, and no share of
 the running instance's SQLite file. Copy `state.sqlite` in from the real one if
 the screen you are looking at needs a project to exist. The port is what makes it
@@ -124,7 +145,10 @@ server forever, because that is what it was.
 one the prompt was submitted at. It is rewritten on every run and gitignored —
 it is output, and it is a transcript of a live session.
 
-## Two things that will waste an hour
+## Five things that will waste an hour
+
+The first two are ticket 28's and ticket 26's. The last three are what writing
+`probe-thread-modes.mjs` cost.
 
 - **A subscription needs `Ack`.** The server sends one unacknowledged chunk and
   stops (`crate::subscriptions`, first rule). This is not a problem for the
@@ -134,3 +158,38 @@ it is output, and it is a transcript of a live session.
   `repro.mjs` looked for the reply text anywhere on the page and went green
   immediately: the sidebar shows the thread's title, and the title is the
   prompt. It now reads the pane only, and asserts the spinner has stopped.
+- **A browser on a fresh profile has no credential**, so it lands on `/pair` and
+  every `/api` call is a 401 — which is indistinguishable from a broken server
+  if the probe does not print the URL it ended up at. The shell does not print
+  its boot code (only `laplus-server` does); it is in
+  `auth_pairing_links.credential` in plaintext, and it goes in the URL
+  **fragment** as `#token=…`. `probe-thread-modes.mjs`'s header has the query.
+- **`history.pushState` does not navigate this UI.** TanStack Router does not
+  hear a hand-fired `popstate`, so the address bar reads `/local/<id>` and the
+  pane never mounts. It looks like the composer is missing half its controls.
+  Click a sidebar row; the row is reachable through its own `aria-label="Archive
+…"` button, which is the only stable label in it.
+- **`session.evaluate` wraps its expression in a synchronous arrow**, so a bare
+  `await` is a `SyntaxError`. Put the awaits in an `(async () => {…})()` and
+  return its promise — `Runtime.evaluate` is called with `awaitPromise`, so the
+  driver resolves it for you.
+
+## What the mode probe found, which no server test could
+
+`ChatView` does **not** dispatch when a picker moves. `handleRuntimeModeChange`
+writes the composer's own draft — `localStorage`, via `composerDraftStore` — and
+the command goes out from `persistThreadSettingsForNextTurn` on **send**.
+
+Two consequences, and both are things a probe has to be written around rather
+than discovered by:
+
+- **The label lies.** `ChatView` reads `composerRuntimeMode ?? activeThread?.runtimeMode`,
+  so a mode the server refused still survives a reload on the same origin. A
+  probe that believed the picker's text would go green against a server that
+  implemented none of this. Read the server's copy over
+  `/api/orchestration/threads/{id}`.
+- **The send is guarded.** `startThreadTurn` runs only `if (failure === null)`,
+  and the metadata and mode commands are all attempted before it. So one refused
+  command there does not merely lose a setting — **it stops the message being
+  sent.** With `thread.meta.update` still unimplemented, that is what a developer
+  who changes the model picker on an existing conversation gets.

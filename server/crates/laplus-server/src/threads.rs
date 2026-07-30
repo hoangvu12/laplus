@@ -754,6 +754,20 @@ pub enum Change {
         runtime_mode: Option<String>,
         interaction_mode: Option<String>,
     },
+    /// The developer moved the conversation's runtime mode.
+    /// `thread.runtime-mode-set`.
+    ///
+    /// The same field [`Change::TurnRequested`] writes when the composer sends a
+    /// per-turn override, reached by its own command instead — which is the whole
+    /// of what makes the picker mean something between turns rather than only at
+    /// the start of one. It does not touch [`Session::runtime_mode`], and that is
+    /// the point: a session is a process that was launched with a mode, so the
+    /// turn in flight stays under the rules it started with and the next one is
+    /// started under this.
+    RuntimeModeSet { runtime_mode: String },
+    /// The developer moved the conversation's interaction mode.
+    /// `thread.interaction-mode-set`. [`Change::RuntimeModeSet`]'s twin.
+    InteractionModeSet { interaction_mode: String },
     /// The developer stopped a turn. `thread.turn-interrupt-requested`.
     ///
     /// Published when the agent has been *asked* to stop rather than when it
@@ -1152,6 +1166,27 @@ impl Threads {
             } => {
                 thread.latest_user_message_at = Some(at.to_string());
                 self.message_sent(thread, message_id, "user", text, Some(turn_id), false, at)
+            }
+            // The client's reducer, mirrored: one field and `updatedAt`, and
+            // nothing else moves. `updatedAt` is the payload's own key here
+            // rather than only the thread's, because that is what the reducer
+            // reads it out of (`threadReducer.ts`,
+            // `case "thread.runtime-mode-set"`).
+            Change::RuntimeModeSet { runtime_mode } => {
+                thread.runtime_mode = runtime_mode.clone();
+                json!({
+                    "threadId": thread.id,
+                    "runtimeMode": thread.runtime_mode,
+                    "updatedAt": at,
+                })
+            }
+            Change::InteractionModeSet { interaction_mode } => {
+                thread.interaction_mode = interaction_mode.clone();
+                json!({
+                    "threadId": thread.id,
+                    "interactionMode": thread.interaction_mode,
+                    "updatedAt": at,
+                })
             }
             Change::TurnRequested {
                 turn_id,
@@ -1895,6 +1930,8 @@ impl Change {
             Change::UserMessage { .. }
             | Change::AssistantDelta { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
+            Change::RuntimeModeSet { .. } => "thread.runtime-mode-set",
+            Change::InteractionModeSet { .. } => "thread.interaction-mode-set",
             Change::TurnRequested { .. } => "thread.turn-start-requested",
             Change::InterruptRequested { .. } => "thread.turn-interrupt-requested",
             Change::Session(_) => "thread.session-set",
