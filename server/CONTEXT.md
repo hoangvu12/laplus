@@ -92,6 +92,19 @@ session: no `--resume`, no fresh `init`, no lost context window. The push happen
 when the *next turn* is dispatched rather than when the picker commits, so a turn
 already in flight keeps the rules it started under.
 
+**Retune** — telling a `claude` already serving a conversation to change what it
+_is_: its permission mode, its model, or both. The name for the act and for what
+carries it — `crate::threads::Retune` travels with the prompt, `crate::turn::retune`
+spends it, and `session.retune-refused` and `session.retune-failed` are what the
+developer is told when it does not land. Distinct from the two other things this
+server says to a running agent: an **interrupt** ends the turn and a **permission
+decision** answers a question, and neither changes what the agent is.
+
+It travels with the **prompt** rather than as a signal, and that is the pairing
+rule: a mode belongs to one turn, so two turns queued behind a running one — with
+the picker moved between them — must each be answered under the mode they were
+requested under.
+
 **Interaction mode** — whether the developer is planning or acting:
 `default` or `plan`. Also a property of the thread, also editable by a command of
 its own, and the one mode this server never acts on — it is stored, published,

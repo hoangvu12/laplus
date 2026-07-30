@@ -242,7 +242,7 @@ its premise is now false.
       which is what the absence of one caused this ticket to conclude.
 - [x] The line builder is unit-tested in place, as the interrupt and context-usage
       builders are; the socket seam asserts a mode change followed by a turn.
-- [x] Driven in the window, because a green suite is not evidence here — the
+- [ ] Driven in the window, because a green suite is not evidence here — the
       question is what a real child does with a real permission prompt.
 
 **Out of scope:**
@@ -284,7 +284,9 @@ it, the real `claude` 2.1.220 was driven twice: once directly, to record
 socket, a first turn under `full-access` that wrote a file unasked, a mode
 tightened between turns, and a second turn stopped on `Write needs permission`,
 with both of that turn's session events reporting `approval-required`. That is
-the last criterion's substance; it was not driven in the browser window, because
-nothing in this change is client-side and both things the UI renders — the badge
-and the approval panel — were asserted on the wire.
+the last criterion's substance, and its box is deliberately left unticked: it was
+**not** driven in the browser window. Nothing in this change is client-side and
+both things the UI renders — the badge beside the session state and the approval
+panel — were asserted on the wire, so the remaining risk is judged small; but the
+criterion says the window, and the window is not what was driven.
 

@@ -377,15 +377,10 @@ impl Agent {
             .await
     }
 
-    /// One JSON object on one line, which is the whole of what this server ever
-    /// says to the agent.
-    ///
-    /// Flushed rather than left to the buffer, because the agent is waiting for
-    /// it and a line that sat in a write buffer would look exactly like a hang.
     /// Move this agent to another permission mode without replacing it.
     ///
     /// The third question this server asks, and the first that changes what the
-    /// child *does* rather than reporting on it: `--permission-mode` is read once
+    /// child *is* rather than what it is doing: `--permission-mode` is read once
     /// at launch, so before this a mode the developer changed mid-conversation
     /// reached the picker, the database and the next turn's request and never
     /// reached the process serving them.
@@ -413,6 +408,11 @@ impl Agent {
             .await
     }
 
+    /// One JSON object on one line, which is the whole of what this server ever
+    /// says to the agent.
+    ///
+    /// Flushed rather than left to the buffer, because the agent is waiting for
+    /// it and a line that sat in a write buffer would look exactly like a hang.
     async fn write_line(&mut self, mut line: String) -> std::io::Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(

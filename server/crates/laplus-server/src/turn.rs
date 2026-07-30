@@ -221,9 +221,11 @@
 //! [`retune`] closes that, and the shape is worth stating because three
 //! properties fall out of it rather than being enforced anywhere:
 //!
-//! - **The moment is the next turn's dispatch**, not the moment the picker's
-//!   command commits. So a change made while a turn is running does not move the
-//!   rules under it, which is what ticket 02 and the spec's story 29 asked for.
+//! - **The moment is the turn's own dispatch**, not the moment the picker's
+//!   command commits. What a turn wants rides on its [`Prompt`], so it is spent
+//!   when that turn is handed to the agent and not before: a change made while a
+//!   turn is running does not move the rules under it, and a turn queued behind
+//!   another keeps its own. Ticket 02 and the spec's story 29.
 //! - **The comparison is against [`Start`]**, which is this driver's account of
 //!   what the child in front of it is running under rather than of what the
 //!   thread last said. That is what makes "no push when nothing changed" true,
@@ -250,7 +252,8 @@ use crate::protocol::{
 };
 use crate::settling::SessionStatus;
 use crate::threads::{
-    Activity, Answered, Change, Prompt, Session, Signal, Thread, Threads, UserInputAnswered,
+    Activity, Answered, Change, Prompt, Retune, Session, Signal, Thread, Threads,
+    UserInputAnswered,
 };
 use crate::worklog::{Call, Decision, Returned};
 
@@ -289,30 +292,29 @@ pub struct Start {
 /// must be free to take the next frame. The failure it can return is the prompt
 /// channel being full or closed, which means a session that is not consuming —
 /// and that is worth telling the client about rather than dropping.
-pub fn send(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
+pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
     let prompts = threads.attach(&start.thread_id, move |incoming, signals, epoch| {
         tokio::spawn(drive(driving, starting, incoming, signals, epoch))
     });
 
-    // What this turn wants the agent to be, sent *before* the turn itself and on
-    // the channel that overtakes it. A session started a line above is already
-    // launched with these, and the driver's guard makes that the no-op it should
-    // be; what this is for is every turn after the first, where the launch flags
-    // are the only place these values had ever reached the child.
-    //
-    // Ahead of the prompt in the queue rather than merely on a faster channel:
-    // the driver takes a prompt into a holding slot and dispatches it on the next
-    // pass round its loop, and the signal drain at the top of that loop is what
-    // guarantees the mode moves before the turn is written rather than after.
-    threads.retune(
-        &start.thread_id,
-        crate::threads::Retune {
+    // The whole prompt is built here rather than by the caller, because what a
+    // turn carries is more than what the developer typed: it also carries what
+    // the conversation said the agent should be running under when this turn was
+    // dispatched, and that is read off the same [`Start`] the session was opened
+    // from. A session started a line above is already launched with those values
+    // and the driver's guard makes it the no-op it should be; what this is for is
+    // every turn after the first, where the launch flags were the only place they
+    // had ever reached the child.
+    let prompt = Prompt {
+        turn_id,
+        text,
+        wanted: Retune {
             runtime_mode: start.runtime_mode.clone(),
             model: start.model.clone(),
         },
-    )?;
+    };
 
     prompts.try_send(prompt).map_err(|error| match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
@@ -371,7 +373,6 @@ async fn drive(
         interrupts: 0,
         measurements: 0,
         retunes: 0,
-        wanted: None,
         pushed: HashMap::new(),
         unmeasured: false,
         drift_reported: Drift::default(),
@@ -424,12 +425,6 @@ async fn drive(
                 Signal::Interrupt { turn_id } => {
                     interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await
                 }
-                // Recorded rather than acted on, and that is the whole of how
-                // ticket 02's rule survives this one: the mode a turn asks for
-                // reaches the agent when *that turn* is dispatched, so a change
-                // the developer made while another turn was running does not move
-                // the rules under it. Held here; spent below.
-                Signal::Retune(wanted) => driving.wanted = Some(wanted),
                 // Taken here as well as in the `select!` below, and it belongs
                 // here most: the drain exists so that what was owed to the turn
                 // that just ended is dealt with before the next one starts, and
@@ -451,7 +446,13 @@ async fn drive(
                 // `start`, so the three session events below — `starting` from
                 // the thread, `running` from here, and whatever ends the turn —
                 // all report the same thing.
-                retune(&threads, &mut start, &mut agent, &mut driving).await;
+                //
+                // **Here rather than when the prompt was taken off the channel**,
+                // and that is what keeps a mode off the turn already in flight:
+                // a turn queued behind a running one waits in `waiting` with its
+                // own mode still attached, and spends it when its own turn comes.
+                // Ticket 02's rule, and the spec's story 29.
+                retune(&threads, &mut start, &mut agent, &mut driving, &prompt.wanted).await;
 
                 // The turn is under way, and *this* is where the session enters
                 // `running` — not the agent's `init` line, which a long-lived
@@ -565,8 +566,6 @@ async fn drive(
             Next::Signal(Some(Signal::Interrupt { turn_id })) => {
                 interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await;
             }
-            // Held, not spent. See the drain at the top of the loop.
-            Next::Signal(Some(Signal::Retune(wanted))) => driving.wanted = Some(wanted),
             // The session is over. Left by leaving the loop rather than by
             // closing the agent's input and draining, which is what the *channel
             // closing* means below: everything this function does after the loop
@@ -975,14 +974,6 @@ struct Driving {
     measurements: u32,
     /// How many mode and model pushes this session has sent, on the same terms.
     retunes: u32,
-    /// What the next turn dispatched wants the agent to be running under, as the
-    /// thread said when that turn was sent.
-    ///
-    /// Held rather than acted on the moment it arrives, which is what keeps a
-    /// mode change off the turn already in flight — ticket 02's rule, and the
-    /// spec's story 29. The latest one wins: a developer who moved the picker
-    /// twice while a turn ran meant the second.
-    wanted: Option<crate::threads::Retune>,
     /// Pushes written to the agent and not yet answered, by the id this server
     /// minted.
     ///
@@ -1404,44 +1395,45 @@ async fn measure(agent: &mut Agent, driving: &mut Driving) {
 ///   none cannot be expressed as a request — there is nothing that means "go back
 ///   to your default" — so the child keeps what it has, and `start` keeps saying
 ///   so.
-async fn retune(threads: &Threads, start: &mut Start, agent: &mut Agent, driving: &mut Driving) {
-    let Some(wanted) = driving.wanted.take() else {
-        return;
-    };
+async fn retune(
+    threads: &Threads,
+    start: &mut Start,
+    agent: &mut Agent,
+    driving: &mut Driving,
+    wanted: &Retune,
+) {
+    // Decided before anything is written, so "has it moved" is asked of the same
+    // capture both questions are asked of — and so the loop below is one shape
+    // rather than two nearly-identical ones.
+    let mode = (wanted.runtime_mode != start.runtime_mode).then(|| Pushed::Mode {
+        previous: start.runtime_mode.clone(),
+        asked: wanted.runtime_mode.clone(),
+    });
+    let model = wanted
+        .model
+        .clone()
+        .filter(|wanted| Some(wanted) != start.model.as_ref())
+        .map(|asked| Pushed::Model {
+            previous: start.model.clone(),
+            asked,
+        });
 
-    if wanted.runtime_mode != start.runtime_mode {
+    for asked in [mode, model].into_iter().flatten() {
         let request_id = driving.next_retune_id();
-        let mode = crate::agent::pushed_permission_mode_for(&wanted.runtime_mode);
-        match agent.set_permission_mode(&request_id, mode).await {
-            Ok(()) => {
-                driving.pushed.insert(
-                    request_id,
-                    Pushed::Mode {
-                        previous: std::mem::replace(
-                            &mut start.runtime_mode,
-                            wanted.runtime_mode.clone(),
-                        ),
-                        asked: wanted.runtime_mode.clone(),
-                    },
-                );
+        let written = match &asked {
+            Pushed::Mode { asked, .. } => {
+                let mode = crate::agent::pushed_permission_mode_for(asked);
+                agent.set_permission_mode(&request_id, mode).await
             }
-            Err(error) => unreachable_agent(threads, start, "runtime mode", &error),
-        }
-    }
+            Pushed::Model { asked, .. } => agent.set_model(&request_id, asked).await,
+        };
 
-    if let Some(model) = wanted.model.filter(|model| Some(model) != start.model.as_ref()) {
-        let request_id = driving.next_retune_id();
-        match agent.set_model(&request_id, &model).await {
+        match written {
             Ok(()) => {
-                driving.pushed.insert(
-                    request_id,
-                    Pushed::Model {
-                        previous: start.model.replace(model.clone()),
-                        asked: model,
-                    },
-                );
+                asked.apply(start);
+                driving.pushed.insert(request_id, asked);
             }
-            Err(error) => unreachable_agent(threads, start, "model", &error),
+            Err(error) => unreachable_agent(threads, start, &asked, &error),
         }
     }
 }
@@ -1454,7 +1446,8 @@ async fn retune(threads: &Threads, start: &mut Start, agent: &mut Agent, driving
 /// regardless — refusing to send it would leave a conversation with a message in
 /// it and nothing running, which is worse than a turn answered under the old
 /// rules with a row saying so.
-fn unreachable_agent(threads: &Threads, start: &Start, what: &str, error: &std::io::Error) {
+fn unreachable_agent(threads: &Threads, start: &Start, asked: &Pushed, error: &std::io::Error) {
+    let what = asked.what();
     eprintln!("laplus: cannot tell the agent its {what}: {error}");
     threads.apply(
         &start.thread_id,
@@ -1480,6 +1473,29 @@ enum Pushed {
 }
 
 impl Pushed {
+    /// Which of the two this is, in the words the developer's own picker uses.
+    ///
+    /// Read off the variant rather than passed alongside it, so there is one
+    /// place that decides what a mode and a model are called.
+    fn what(&self) -> &'static str {
+        match self {
+            Pushed::Mode { .. } => "runtime mode",
+            Pushed::Model { .. } => "model",
+        }
+    }
+
+    /// Take the driver's capture to what the child was just asked to become.
+    ///
+    /// Called only where the write succeeded, which is the whole of the rule:
+    /// [`Start`] is what every session event reads, so moving it before the line
+    /// was written would publish a claim about a child nobody had told.
+    fn apply(&self, start: &mut Start) {
+        match self {
+            Pushed::Mode { asked, .. } => start.runtime_mode = asked.clone(),
+            Pushed::Model { asked, .. } => start.model = Some(asked.clone()),
+        }
+    }
+
     /// What the developer is told, when the CLI would not take it.
     ///
     /// Names what was refused, in this server's own vocabulary rather than the
@@ -2522,7 +2538,6 @@ mod tests {
             interrupts: 0,
             measurements: 0,
             retunes: 0,
-            wanted: None,
             pushed: HashMap::new(),
             unmeasured: false,
             drift_reported: Drift::default(),
@@ -3142,6 +3157,39 @@ mod tests {
             kinds(&decided),
             vec!["context-window.updated"],
             "the row is decided before the match and the arm gave up after it"
+        );
+
+        // And on the fourth, which ticket 11 added: the answer to a mode push
+        // returns before the match, so it is the one early return in front of
+        // the rest rather than inside them. A reading that arrived on the same
+        // line still has to come out.
+        let mut driving = driver(None);
+        driving.pushed.insert(
+            "retune-1".to_string(),
+            Pushed::Mode {
+                previous: "full-access".to_string(),
+                asked: "approval-required".to_string(),
+            },
+        );
+        let mut folding = SessionState::new();
+        folding.token_usage = Some(TokenUsage {
+            used_tokens: 10,
+            total_processed_tokens: None,
+            max_tokens: Some(200_000),
+            input_tokens: None,
+            output_tokens: None,
+            compacts_automatically: None,
+        });
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"retune-1","error":"Cannot set permission mode"}}"#,
+        );
+        assert_eq!(
+            kinds(&decided),
+            vec!["context-window.updated", "session.retune-refused"],
+            "the reading the meter is waiting for was dropped by the arm that \
+             reports a refused push"
         );
     }
 

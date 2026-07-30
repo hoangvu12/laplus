@@ -851,3 +851,162 @@ async fn a_model_changed_mid_conversation_reaches_the_agent_without_adding_a_tur
     client.close().await;
     server.stop().await;
 }
+
+/// A push the CLI will not take, end to end: the id this server minted, the
+/// refusal that names it, the sentence the developer reads, and the badge
+/// correcting itself rather than going on claiming a mode nothing is running
+/// under.
+///
+/// The unit tests in `crate::turn` decide what the *answer* means; this is the
+/// only place that says the id the driver mints and the id it matches against
+/// are the same one.
+#[tokio::test]
+async fn a_push_the_agent_refuses_is_said_and_the_badge_goes_back() {
+    let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"retune-1","error":"Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"}}"#;
+    let agent = ScriptedAgent::per_turn(&[vec![REPLY, ENDED], vec![refused, REPLY, ENDED]]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "first"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            set_runtime_mode("thread-1", "approval-required"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up_taking_the_threads_word("thread-1", "message-2"),
+        )
+        .await
+        .expect_success();
+    let turn = client.events_through_the_turn(&subscription).await;
+
+    let said = turn
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .find(|activity| activity["kind"] == "session.retune-refused")
+        .unwrap_or_else(|| panic!("the refusal was never said: {:?}", kinds(&turn)));
+    let summary = said["summary"].as_str().expect("a sentence");
+    assert!(
+        summary.contains("approval-required") && summary.contains("full-access"),
+        "the sentence has to name what was refused and what is still running: {summary}"
+    );
+
+    // And the last thing said about the session reports what the child is really
+    // running under rather than what it was asked for.
+    let last = turn
+        .iter()
+        .map(|item| &item["event"])
+        .rfind(|event| event["type"] == "thread.session-set")
+        .expect("the session said something");
+    assert_eq!(
+        last["payload"]["session"]["runtimeMode"], "full-access",
+        "the session went on claiming a mode the agent had refused: {last}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// Two turns queued behind a running one, with the picker moved between them.
+///
+/// The pairing this rests on is why what a turn wants travels *with the prompt*
+/// rather than in a slot beside the queue: a single latest-wins slot collapses
+/// these two onto the second's mode, and the first turn is then answered under
+/// rules it was never requested under.
+#[tokio::test]
+async fn a_turn_queued_behind_another_keeps_its_own_mode() {
+    let agent = ScriptedAgent::per_turn(&[
+        vec![REPLY, PAUSE, ENDED],
+        vec![REPLY, ENDED],
+        vec![REPLY, ENDED],
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "first"),
+        )
+        .await
+        .expect_success();
+
+    // Both follow-ups are dispatched while the first turn is still running, so
+    // they are queued rather than served — and each carries a different mode.
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            set_runtime_mode("thread-1", "auto-accept-edits"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up_taking_the_threads_word("thread-1", "message-2"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            set_runtime_mode("thread-1", "approval-required"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up_taking_the_threads_word("thread-1", "message-3"),
+        )
+        .await
+        .expect_success();
+
+    // Read until all three turns have ended, counted rather than assumed: a
+    // follow-up dispatched while another turn is running claims the conversation
+    // before the turn ahead of it finishes, so the settle that turn would have
+    // published is skipped — see `spend` — and how many times the session goes
+    // quiet is therefore not the number of turns.
+    let mut ended = 0;
+    while ended < 3 {
+        ended += client
+            .events_through_the_turn(&subscription)
+            .await
+            .iter()
+            .filter(|item| item["event"]["payload"]["activity"]["kind"] == "turn.completed")
+            .count();
+    }
+
+    let modes: Vec<Value> = pushes(&agent)
+        .iter()
+        .map(|push| push["request"]["mode"].clone())
+        .collect();
+    assert_eq!(
+        modes,
+        vec![json!("acceptEdits"), json!("default")],
+        "the second turn was answered under the third's mode: {:?}",
+        pushes(&agent)
+    );
+    assert_eq!(agent.starts(), 1);
+
+    client.close().await;
+    server.stop().await;
+}

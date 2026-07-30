@@ -101,7 +101,7 @@ use crate::store::{
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::settling::SessionStatus;
 use crate::threads::{
-    self, Adoption, Attention, Busy, Change, Given, MetaUpdate, Prompt, Session, Shelf, Thread,
+    self, Adoption, Attention, Busy, Change, Given, MetaUpdate, Session, Shelf, Thread,
     Threads,
 };
 use crate::transcripts::Transcripts;
@@ -1306,10 +1306,8 @@ impl Shell {
         if let Err(why) = crate::turn::send(
             &self.inner.threads,
             &starting,
-            Prompt {
-                turn_id,
-                text: start.message.text.clone(),
-            },
+            turn_id,
+            start.message.text.clone(),
         ) {
             // The prompt is already in the transcript and the turn is already
             // marked running, so the refusal has to end them as well as being

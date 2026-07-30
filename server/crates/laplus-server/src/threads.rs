@@ -316,6 +316,33 @@ pub struct Reconciliation {
 pub struct Prompt {
     pub turn_id: String,
     pub text: String,
+    /// What the conversation said the agent should be running under when *this*
+    /// turn was dispatched. See [`Retune`].
+    pub wanted: Retune,
+}
+
+/// What the conversation says the agent should be running under, as of the turn
+/// this travels with.
+///
+/// **It travels with the prompt, and the pairing is the whole point.** A mode
+/// belongs to one turn — it is the mode that turn was requested under and the
+/// mode it has to be answered under — so it cannot live in a slot beside the
+/// queue: two turns queued behind a running one, with the picker moved between
+/// them, would collapse onto whichever arrived last and the first would be
+/// answered under the second's rules.
+///
+/// Two fields rather than two messages because they are one question asked of
+/// one child at one moment, and because the driver has to compare both against
+/// its own capture before it says anything: a push for a value that has not
+/// moved is a request the CLI has to answer for nothing.
+///
+/// The model is optional because a selection may name none, and there is no
+/// request that means "go back to the default model" — so `None` leaves the
+/// child on whatever it has, which is honest about what can be asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retune {
+    pub runtime_mode: String,
+    pub model: Option<String>,
 }
 
 /// Something owed to the turn the agent is working on right now.
@@ -345,18 +372,6 @@ pub enum Signal {
     /// `None` is the client saying "whatever is running", which is what it sends
     /// when it does not believe anything is.
     Interrupt { turn_id: Option<String> },
-    /// What the thread now says the agent should be running under.
-    ///
-    /// Sent beside every turn rather than when the developer moves a picker, and
-    /// that is the whole of how "a mode set now applies to the *next* turn"
-    /// survives: the driver holds this until it dispatches, so a change made
-    /// while a turn is in flight does not move the rules under it.
-    ///
-    /// It travels this channel for the reason [`Signal::Interrupt`] does — it is
-    /// owed to the driver *ahead of* the prompts queued for it, and a mode that
-    /// arrived behind the turn it was meant to govern would be a mode one turn
-    /// late, for ever.
-    Retune(Retune),
     /// The developer ended the session.
     ///
     /// **Not an interrupt, and travelling this channel for the same reason one
@@ -373,23 +388,6 @@ pub enum Signal {
     /// interrupt, where naming the wrong turn would stop work the developer
     /// never saw start.
     Stop,
-}
-
-/// What the conversation says the agent should be running under, as of the turn
-/// this travels with.
-///
-/// Two fields rather than two signals because they are one question asked of one
-/// child on one channel at one moment, and because the driver has to compare both
-/// against its own capture before it says anything: a push for a value that has
-/// not moved is a request the CLI has to answer for nothing.
-///
-/// The model is optional because a selection may name none, and there is no
-/// request that means "go back to the default model" — so `None` leaves the child
-/// on whatever it has, which is honest about what can be asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Retune {
-    pub runtime_mode: String,
-    pub model: Option<String>,
 }
 
 /// One permission decision on its way to the agent waiting for it.
@@ -1176,41 +1174,6 @@ impl Threads {
             Err(mpsc::error::TrySendError::Full(_)) => Err(
                 "The agent has not read the signals already sent to it, so it was not asked to \
                  stop."
-                    .to_string(),
-            ),
-        }
-    }
-
-    /// Tell this conversation's session what the thread now says it should be
-    /// running under.
-    ///
-    /// **A session that is not there is not an error**, as with
-    /// [`Threads::interrupt`] and for a stronger reason: the session about to be
-    /// started for this turn is opened with these values as launch flags, so
-    /// there is nothing to move. This is only ever the *second* and later turns
-    /// of a conversation doing anything at all.
-    ///
-    /// Whether either value has actually changed is the driver's question, for
-    /// the same reason the turn id is: the driver is the only thing that knows
-    /// what the child in front of it is running under.
-    ///
-    /// The one failure left is a driver that has stopped reading its signals,
-    /// which the caller refuses the turn for — dispatching it anyway would run it
-    /// under rules the developer had changed and been shown the change of.
-    pub fn retune(&self, thread_id: &str, retune: Retune) -> Result<(), String> {
-        let Some(running) = self.live(thread_id)? else {
-            return Ok(());
-        };
-
-        match running.try_send(Signal::Retune(retune)) {
-            Ok(()) => Ok(()),
-            // The session ended between the lookup and the send. The turn behind
-            // this one is about to be refused for the same reason, in a sentence
-            // about the turn rather than about the mode.
-            Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(
-                "The agent has not read the signals already sent to it, so it could not be told \
-                 which mode and model this turn wants."
                     .to_string(),
             ),
         }
