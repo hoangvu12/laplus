@@ -66,6 +66,60 @@
 //! the developer can see: `git log`, `git branch --contains` and a push all
 //! ignore it, and the only way to reach one is to name its ref.
 //!
+//! ## Putting one back
+//!
+//! A revert is the same idea run backwards, and it is three commands rather
+//! than five: describe the tree as it is now in a scratch index, then ask git to
+//! move from there to the photograph.
+//!
+//! | | |
+//! |---|---|
+//! | `read-tree <checkpoint>` | seed a **temporary** index from the photograph |
+//! | `add -A -- .` | overwrite the project's own folder in it with the tree as it is now |
+//! | `read-tree -m -u <checkpoint>` | move the index *and the working tree* back to the photograph |
+//!
+//! The third command is the whole revert, and using it rather than a
+//! `checkout-index` of the recorded tree is what makes the four criteria fall
+//! out instead of being implemented:
+//!
+//! - **A file the turn modified** differs between the staged index and the
+//!   photograph, so it is written back.
+//! - **A file the turn created** is in the index and not in the photograph, so
+//!   it is removed — and the directory it was alone in goes with it.
+//! - **A file the turn deleted** is in the photograph and not in the index, so
+//!   it is written out again.
+//! - **A file the turn left untracked** is in both, because `add -A` put it
+//!   there and the capture did the same — so it is restored to the contents the
+//!   checkpoint recorded rather than being left alone or swept away.
+//!
+//! Two more properties come from the *seed* rather than from the merge, and
+//! this is the one place a revert deliberately does not mirror a capture. A
+//! capture seeds from `HEAD`, because the tree it writes has to describe the
+//! whole repository for a later diff to run over. A revert seeds from the
+//! photograph, because everything it must not touch then starts out already
+//! agreeing:
+//!
+//! - **Nothing outside the project's own folder moves.** `add -A -- .` restates
+//!   that folder and nothing above it, so every entry above it is still the
+//!   photograph's own and there is nothing for the merge to write. A project
+//!   opened as one package inside a monorepo reverts that package, *and goes on
+//!   doing so after the developer has committed somewhere else in the
+//!   repository* — seeding from `HEAD` instead would make every such commit a
+//!   difference the merge had to resolve, and `read-tree -m` would abort the
+//!   whole revert rather than pick a side.
+//! - **A file neither side changed is not touched at all**, mtime included.
+//!   `read-tree -m` writes only what differs, so a revert on a large repository
+//!   does not restat every file in it or wake the watcher for one.
+//!
+//! Ignored files are outside all of it, on both sides, so `node_modules` and
+//! `target` survive a revert for the same reason they are not photographed.
+//!
+//! `read-tree -m` also refuses rather than clobbers: if it were about to
+//! overwrite a working-tree file that does not match what the index says, it
+//! stops and says so. That case cannot arise here — the index was built from
+//! the working tree a moment earlier — and it is worth keeping as the floor
+//! under a revert that raced something else.
+//!
 //! An identity is supplied in the environment because `commit-tree` refuses
 //! without one, and a machine that has never run `git config --global user.email`
 //! is an ordinary machine.
@@ -188,27 +242,20 @@ pub fn reference(thread_id: &str, turn_count: u64) -> String {
 pub fn capture(root: &Path, reference: &str) -> Result<(), Unavailable> {
     let index = ScratchIndex::new();
     let environment = index.environment();
-    let run = |arguments: &[&str]| -> Result<String, Unavailable> {
-        let output = git::output_with(root, arguments, &environment)?;
-        if !output.status.success() {
-            return Err(git::refusal(&output));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    };
 
     // Only when there is a commit to read. A repository the developer has just
     // run `git init` in has a `HEAD` that names a branch with nothing behind it,
     // and `read-tree` on that is an error rather than an empty tree.
     if present(root, "HEAD") {
-        run(&["read-tree", "HEAD"])?;
+        run(root, &environment, &["read-tree", "HEAD"])?;
     }
     // The path is `.` rather than the whole repository, so a project opened as
     // one package inside a monorepo checkpoints that package. `-A` is what puts
     // untracked files in — the agent's brand new file — and it obeys
     // `.gitignore`, which is what keeps a build directory out.
-    run(&["add", "-A", "--", "."])?;
+    run(root, &environment, &["add", "-A", "--", "."])?;
 
-    let tree = run(&["write-tree"])?;
+    let tree = object(root, &environment, &["write-tree"])?;
     if tree.is_empty() {
         return Err(Unavailable::Refused {
             detail: "git write-tree named no tree, so there is nothing to checkpoint."
@@ -219,7 +266,11 @@ pub fn capture(root: &Path, reference: &str) -> Result<(), Unavailable> {
 
     // Parentless: see this module's documentation. The message is for a
     // developer who goes looking with `git show`.
-    let commit = run(&["commit-tree", &tree, "-m", &format!("laplus {reference}")])?;
+    let commit = object(
+        root,
+        &environment,
+        &["commit-tree", &tree, "-m", &format!("laplus {reference}")],
+    )?;
     if commit.is_empty() {
         return Err(Unavailable::Refused {
             detail: "git commit-tree named no commit, so there is nothing to checkpoint."
@@ -228,8 +279,56 @@ pub fn capture(root: &Path, reference: &str) -> Result<(), Unavailable> {
         });
     }
 
-    run(&["update-ref", reference, &commit])?;
+    run(root, &environment, &["update-ref", reference, &commit])?;
     Ok(())
+}
+
+/// Put the working tree back to the photograph under `reference`.
+///
+/// See this module's documentation for the sequence, for which of the ticket's
+/// criteria fall out of it, and for why the seed is the photograph rather than
+/// `HEAD`. As with a capture, nothing here touches the developer's index, their
+/// `HEAD` or their branches: the conversation is not moved by a revert and
+/// neither is their history — only the files.
+///
+/// **The whole of the project's folder, not the files a diff would list.** A
+/// revert restores what was photographed, which includes a file the developer
+/// edited by hand between two turns. That is ADR-0008's model followed to its
+/// end rather than an oversight: a checkpoint does not know who moved a file, so
+/// "put it back to how it looked before that turn ran" cannot mean "put back
+/// only the agent's half". It is also what the turn's own diff has been showing
+/// them all along.
+pub fn restore(root: &Path, reference: &str) -> Result<(), Unavailable> {
+    let index = ScratchIndex::new();
+    let environment = index.environment();
+    let photograph = commitish(reference);
+
+    run(root, &environment, &["read-tree", &photograph])?;
+    run(root, &environment, &["add", "-A", "--", "."])?;
+    run(root, &environment, &["read-tree", "-m", "-u", &photograph])
+}
+
+/// One git in the scratch index, refusing on anything but success.
+fn run(
+    root: &Path,
+    environment: &[(&str, &std::ffi::OsStr)],
+    arguments: &[&str],
+) -> Result<(), Unavailable> {
+    object(root, environment, arguments).map(|_| ())
+}
+
+/// The same, for the two commands whose stdout *is* the answer: the name of the
+/// object git has just written.
+fn object(
+    root: &Path,
+    environment: &[(&str, &std::ffi::OsStr)],
+    arguments: &[&str],
+) -> Result<String, Unavailable> {
+    let output = git::output_with(root, arguments, environment)?;
+    if !output.status.success() {
+        return Err(git::refusal(&output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Does this revision name a commit in this repository?
@@ -257,7 +356,7 @@ fn commitish(reference: &str) -> String {
     format!("{reference}^{{commit}}")
 }
 
-/// The scratch index a capture stages into, removed when the capture is over.
+/// The scratch index a capture and a revert stage into, removed when it is over.
 ///
 /// In the system's temporary directory rather than beside the repository, and
 /// that is not tidiness: everything under `.git` that is not an object or a log
@@ -296,10 +395,10 @@ impl ScratchIndex {
 }
 
 impl Drop for ScratchIndex {
-    /// Removed however the capture ended, including through the `?` on any of
-    /// the five commands. A file left behind is a few hundred kilobytes of the
-    /// developer's temporary directory per turn, which is small and is still
-    /// litter.
+    /// Removed however the capture or the revert ended, including through the
+    /// `?` on any of their commands. A file left behind is a few hundred
+    /// kilobytes of the developer's temporary directory per turn, which is small
+    /// and is still litter.
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }

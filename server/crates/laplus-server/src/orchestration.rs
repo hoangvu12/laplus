@@ -194,6 +194,7 @@ enum Command {
     RespondToUserInput(RespondToUserInput),
     SetRuntimeMode(SetRuntimeModePayload),
     SetInteractionMode(SetInteractionModePayload),
+    RevertCheckpoint(RevertCheckpointPayload),
 }
 
 /// Everything a diff of a conversation needs that is not about git.
@@ -437,6 +438,7 @@ impl Shell {
                     interaction_mode: set.interaction_mode,
                 },
             )?,
+            Command::RevertCheckpoint(revert) => self.revert_checkpoint(revert)?,
         };
 
         Ok(json!({ "sequence": sequence }))
@@ -483,6 +485,112 @@ impl Shell {
             .threads
             .apply(thread_id, change)
             .ok_or_else(|| self.not_open(thread_id))
+    }
+
+    /// Put the developer's working tree back to how it looked before a turn ran.
+    ///
+    /// **Answered in two stages**, which is the shape the contract declares and
+    /// the reason it declares two events for one command. This records that a
+    /// revert was asked for and answers with the sequence it committed at; the
+    /// restore itself runs on a blocking thread, because it is a `git` over a
+    /// repository whose size is the developer's and the socket's only reader must
+    /// never wait on a disk. Completion is [`Change::Reverted`], published when
+    /// the tree has actually been written.
+    ///
+    /// Everything the world can refuse is decided *before* the answer, from
+    /// memory:
+    ///
+    /// - an unknown conversation, by [`Shell::reviewing`], with
+    ///   [`Shell::not_open`]'s sentence;
+    /// - a turn this conversation has no photograph of, which is a revert with
+    ///   nothing behind it. Refused rather than attempted, for the reason a
+    ///   checkpoint row is never published before its tree has been written: an
+    ///   undo offered over nothing is worse than no undo.
+    ///
+    /// The count is compared against [`Reviewing::checkpoints`] rather than
+    /// against the ref on disk, which is the same authority
+    /// [`crate::checkpoints::Diff::run`] asks and is the point of asking it here:
+    /// it is a question about the registry, and answering it needs no git. A
+    /// conversation with no recorded turns has no baseline either — turn zero is
+    /// the tree *before the first turn*, and until one has finished nothing has
+    /// promised to have written it — so it is refused with the rest.
+    ///
+    /// **Turn zero is otherwise an ordinary target**, and is the common one: the
+    /// panel reverts a user message by asking for `max(0, n - 1)`
+    /// (`ChatView.tsx`), so undoing the first turn of a conversation names the
+    /// baseline. A range check that started at one would refuse exactly the
+    /// revert the control is most often used for.
+    ///
+    /// Whether the project folder is still there is *not* decided here. It is a
+    /// disk, this is the read loop, and a folder that has been moved is reported
+    /// the same way a `git` that refused is: as a failure on the conversation
+    /// rather than as a refusal of a command that had already been accepted.
+    fn revert_checkpoint(&self, revert: RevertCheckpointPayload) -> Result<i64, CommandError> {
+        let RevertCheckpointPayload {
+            thread_id,
+            turn_count,
+        } = revert;
+        let reviewing = self.reviewing(&thread_id)?;
+        if reviewing.checkpoints == 0 || turn_count > reviewing.checkpoints {
+            return Err(CommandError::new(format!(
+                "The state of this project at turn {turn_count} was not recorded, so there is \
+                 nothing to put it back to. This conversation has {} recorded turn{}.",
+                reviewing.checkpoints,
+                match reviewing.checkpoints {
+                    1 => "",
+                    _ => "s",
+                }
+            )));
+        }
+
+        let reference = crate::checkpoints::reference(&thread_id, turn_count);
+        let sequence = self
+            .inner
+            .threads
+            .apply(&thread_id, Change::RevertRequested { turn_count })
+            .ok_or_else(|| self.not_open(&thread_id))?;
+
+        // Off the read loop, like every other git in this server. The registry is
+        // cloned into the task rather than borrowed: the connection that asked may
+        // be gone by the time the tree has been written, and the conversation is
+        // owed the answer either way.
+        let threads = self.inner.threads.clone();
+        let workspace_root = reviewing.workspace_root;
+        tokio::task::spawn_blocking(move || {
+            let restored = WorkspaceRoot::check(&workspace_root)
+                .map_err(|rejection| rejection.message())
+                .and_then(|root| {
+                    crate::checkpoints::restore(root.path(), &reference)
+                        .map_err(|why| why.detail())
+                });
+
+            // **A failure is never published as a completion**, which is the
+            // criterion this arm exists for: a client that folded
+            // `thread.reverted` would show the developer a conversation put back
+            // to a turn while their files still held the one they were undoing.
+            // Said in the conversation rather than only to a log, the way a
+            // checkpoint that could not be taken is — the developer is looking at
+            // the conversation, and this is the only place left to tell them.
+            match restored {
+                Ok(()) => {
+                    threads.apply(&thread_id, Change::Reverted { turn_count });
+                }
+                Err(why) => {
+                    threads.apply(
+                        &thread_id,
+                        Change::Activity(crate::threads::Activity::failed(
+                            "revert.failed",
+                            &format!(
+                                "The project could not be put back to how it looked at turn \
+                                 {turn_count}, so it is still as this conversation left it: {why}"
+                            ),
+                        )),
+                    );
+                }
+            }
+        });
+
+        Ok(sequence)
     }
 
     /// Rename a conversation — and, on the same command, move the three other
@@ -1454,6 +1562,26 @@ struct SetInteractionModePayload {
     interaction_mode: String,
 }
 
+/// `thread.checkpoint.revert` — the working tree, put back to a turn boundary.
+///
+/// The count is a `u64` because the contract types it `NonNegativeInt`, and
+/// reading it as one is the whole of the check: a negative number, a fraction or
+/// a string fails the deserialization and is refused as a malformed payload
+/// naming the conversation. Which turns this conversation actually has is a
+/// question about the registry rather than about the payload, and is
+/// [`Shell::revert_checkpoint`]'s.
+///
+/// `createdAt` is in the contract and deliberately absent here, for
+/// [`SetRuntimeModePayload`]'s reason: it is the moment the *client* built the
+/// command, and every event on this feed is stamped by [`crate::clock::now_iso`]
+/// so that a skewed clock cannot reorder a conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevertCheckpointPayload {
+    thread_id: String,
+    turn_count: u64,
+}
+
 impl StartTurn {
     fn prepares_a_worktree(&self) -> bool {
         self.bootstrap
@@ -1511,7 +1639,7 @@ impl Command {
     ///
     /// The `type` is taken by hand before the rest is deserialized so that an
     /// unimplemented command names itself in the refusal. The contract carries
-    /// roughly twenty command types and laplus implements eleven, so "which
+    /// roughly twenty command types and laplus implements twelve, so "which
     /// one" is the most useful thing a message can say during the build-out.
     fn parse(payload: &Value) -> Result<Command, CommandError> {
         let kind = payload
@@ -1722,6 +1850,16 @@ impl Command {
                         &thread_id,
                     )?,
                     thread_id,
+                }))
+            }
+            // The thread first, as the two mode commands do it: a payload with
+            // two things wrong with it is refused for the one the developer can
+            // act on, and every refusal after this has a conversation to name.
+            "thread.checkpoint.revert" => {
+                let revert: RevertCheckpointPayload = read_about_a_thread(payload, kind)?;
+                Ok(Command::RevertCheckpoint(RevertCheckpointPayload {
+                    thread_id: non_blank(revert.thread_id, "threadId", kind)?,
+                    ..revert
                 }))
             }
             unimplemented => Err(CommandError::new(format!(
@@ -2024,6 +2162,17 @@ mod tests {
                 "commandId": format!("test:interaction-mode:{thread_id}"),
                 "threadId": thread_id,
                 "interactionMode": mode,
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            }))
+        }
+
+        /// The `thread.checkpoint.revert` the diff panel's undo sends.
+        fn revert(&self, thread_id: &str, turn_count: u64) -> Result<Value, CommandError> {
+            self.dispatch(&json!({
+                "type": "thread.checkpoint.revert",
+                "commandId": format!("test:revert:{thread_id}:{turn_count}"),
+                "threadId": thread_id,
+                "turnCount": turn_count,
                 "createdAt": "2026-07-26T00:23:04.909Z",
             }))
         }
@@ -2788,6 +2937,96 @@ mod tests {
             "the world was consulted before the payload was read: {}",
             refusal.message()
         );
+    }
+
+    /// A revert is parsed before the world is consulted, so a payload that
+    /// cannot be read is refused at the door — and every one of these is a
+    /// conversation that exists, so nothing here could have been refused for a
+    /// later reason.
+    ///
+    /// The turn count is the interesting half. It is `NonNegativeInt` on the
+    /// contract, so a negative one is not a small number, it is not a turn — and
+    /// reading it as a `u64` is the whole of the check.
+    #[test]
+    fn a_malformed_revert_is_refused_before_the_world_is_consulted() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .revert("  ", 0)
+            .expect_err("a blank thread id names no conversation");
+        assert!(
+            refusal.message().contains("threadId"),
+            "{}",
+            refusal.message()
+        );
+
+        for unreadable in [json!(-1), json!(1.5), json!("2"), Value::Null] {
+            let refusal = fixture
+                .dispatch(&json!({
+                    "type": "thread.checkpoint.revert",
+                    "commandId": "c",
+                    "threadId": "thread-1",
+                    "turnCount": unreadable,
+                }))
+                .expect_err("not a turn count");
+            assert!(
+                refusal.message().contains("malformed") && refusal.message().contains("thread-1"),
+                "{unreadable}: {}",
+                refusal.message()
+            );
+        }
+
+        // A revert with no turn on it names no turn, which is a different thing
+        // from naming turn zero — and turn zero is a revert of the whole
+        // conversation, so defaulting to it would be the largest possible guess.
+        let refusal = fixture
+            .dispatch(&json!({
+                "type": "thread.checkpoint.revert",
+                "commandId": "c",
+                "threadId": "thread-1",
+            }))
+            .expect_err("a revert needs a turn");
+        assert!(
+            refusal.message().contains("malformed") && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// A revert with nothing behind it is refused rather than attempted, and the
+    /// sentence names the turn — the whole diagnostic the panel can show.
+    ///
+    /// Both halves are here because they are the same refusal reached two ways:
+    /// a conversation this server has never heard of, and one it holds that has
+    /// finished no turn. The second is the one a developer meets, because the
+    /// undo control is on a message and the first message of a conversation has
+    /// one the moment it is sent.
+    #[test]
+    fn a_revert_of_a_turn_with_no_checkpoint_is_refused() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .revert("never-created", 1)
+            .expect_err("no such conversation");
+        assert!(
+            refusal.message().contains("never-created"),
+            "{}",
+            refusal.message()
+        );
+
+        // The conversation is real and has recorded nothing, so even turn zero —
+        // the baseline, and the target the panel names most often — has no tree
+        // behind it yet.
+        for turn in [0, 1, 9] {
+            let refusal = fixture
+                .revert("thread-1", turn)
+                .expect_err("nothing has been recorded");
+            assert!(
+                refusal.message().contains(&format!("turn {turn}")),
+                "the refusal has to name the turn: {}",
+                refusal.message()
+            );
+        }
     }
 
     /// An unknown thread is refused by name. A mode written against a

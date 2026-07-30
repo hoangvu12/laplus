@@ -281,6 +281,27 @@ A checkpoint is a _photograph_, not a record of authorship — see ADR-0008. It
 does not know who changed a file, so an edit the developer made by hand between
 two turns belongs to the turn it happened during, beside the agent's own.
 
+**Revert** — putting the working tree back to a checkpoint. The restore of a
+photograph this server already took, and therefore three git commands rather
+than new machinery: a scratch index seeded from the checkpoint, the project's
+own folder restated into it from the tree as it is now, then `read-tree -m -u`
+back to the checkpoint. Files the turn created go, files it deleted come back,
+files it modified and files it left untracked return to what was recorded — and
+nothing above the project's folder is touched, whatever `HEAD` has done since.
+`crate::checkpoints::restore`.
+
+A revert moves the working tree and not the conversation: the transcript, the
+work log and the list of turns are all left as they were. The client's own
+reducer is more eager and trims them, so a window that watched a revert shows a
+shorter conversation than one that reloads afterwards — deliberate, and recorded
+in `.scratch/thread-lifecycle/issues/05-…`.
+
+It is answered in two stages. `thread.checkpoint.revert` answers with a sequence
+the moment it is accepted, and `thread.reverted` follows once the tree has
+actually been written, because the socket's only reader must never wait on a
+disk. A restore that fails says so in the work log as `revert.failed` and never
+publishes a completion, so a failed revert cannot be read as a finished one.
+
 **Checkpoint status** — how the turn a checkpoint records _went_, not whether
 recording it worked. The contract's three (`ready`, `missing`, `error`), of which
 this server sends two: the client reads the status back into the turn's state, so

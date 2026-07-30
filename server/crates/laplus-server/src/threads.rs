@@ -843,6 +843,34 @@ pub enum Change {
     /// actually been written, never before: a row naming a ref that is not
     /// there is a turn the developer can select and cannot open.
     Checkpointed(Box<Checkpoint>),
+    /// The developer asked for the working tree to be put back to a turn
+    /// boundary. `thread.checkpoint-revert-requested`.
+    ///
+    /// Published when the revert has been *accepted* rather than when it has
+    /// happened, which is the same two-stage shape
+    /// [`Change::InterruptRequested`] has and is why the contract declares two
+    /// events for one command: restoring a tree touches a disk, and the socket's
+    /// only reader must never wait on one. The client folds this as `unchanged`
+    /// (`threadReducer.ts`) — it is the receipt, and [`Change::Reverted`] is the
+    /// answer.
+    RevertRequested { turn_count: u64 },
+    /// The working tree has been put back. `thread.reverted`.
+    ///
+    /// Published *after* the tree has actually been written, never before — the
+    /// same rule [`Change::Checkpointed`] follows, for the same reason: an event
+    /// that ran ahead of the disk would tell the developer their project had
+    /// been restored while it still held the turn they were undoing.
+    ///
+    /// **This does not move the conversation**, and that is the ticket's own
+    /// criterion: a revert moves the working tree, and the thread, its
+    /// transcript and its work log are left as they were. The client's reducer
+    /// is more eager — it drops the messages, checkpoints and activities after
+    /// the turn reverted to — so a window that watched the revert shows a
+    /// shorter conversation than one that reloads afterwards. That divergence is
+    /// deliberate here and is written down in
+    /// `.scratch/thread-lifecycle/issues/05-…`; trimming a transcript is a
+    /// deletion, and this ticket is about a tree.
+    Reverted { turn_count: u64 },
 }
 
 impl Change {
@@ -856,11 +884,17 @@ impl Change {
     ///
     /// A checkpoint is in the same position for a different reason: the shell
     /// summary does not carry `checkpoints` at all, so nothing on the list would
-    /// read one.
+    /// read one. The two halves of a revert are excluded on that same reading —
+    /// the list renders a conversation's title, session and latest turn, and a
+    /// revert moves a working tree rather than any of the three.
     fn reaches_the_shell(&self) -> bool {
         !matches!(
             self,
-            Change::AssistantDelta { .. } | Change::Activity(_) | Change::Checkpointed(_)
+            Change::AssistantDelta { .. }
+                | Change::Activity(_)
+                | Change::Checkpointed(_)
+                | Change::RevertRequested { .. }
+                | Change::Reverted { .. }
         )
     }
 }
@@ -1397,6 +1431,20 @@ impl Threads {
                 payload["threadId"] = json!(thread.id);
                 payload
             }
+            // Neither half of a revert folds anything in, which is what the
+            // ticket asks for: the conversation is left as it was and the
+            // working tree is what moved. So both are payload only — the
+            // `ThreadCheckpointRevertRequestedPayload` and `ThreadRevertedPayload`
+            // the contract declares, which differ in exactly one field.
+            Change::RevertRequested { turn_count } => json!({
+                "threadId": thread.id,
+                "turnCount": turn_count,
+                "createdAt": at,
+            }),
+            Change::Reverted { turn_count } => json!({
+                "threadId": thread.id,
+                "turnCount": turn_count,
+            }),
         }
     }
 
@@ -2003,6 +2051,8 @@ impl Change {
             Change::Session(_) => "thread.session-set",
             Change::Activity(_) => "thread.activity-appended",
             Change::Checkpointed(_) => "thread.turn-diff-completed",
+            Change::RevertRequested { .. } => "thread.checkpoint-revert-requested",
+            Change::Reverted { .. } => "thread.reverted",
         }
     }
 }
