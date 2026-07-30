@@ -443,12 +443,20 @@ jobs:
           # in — unlike the upload step below, where the path is the action's
           # and therefore the workspace's.
           binary=target/${{ matrix.target }}/release/laplus-server
-          file "$binary"
-          if ldd "$binary" 2>&1 | grep -qv "not a dynamic executable"; then
-            echo "$binary is dynamically linked; musl was supposed to make it static." >&2
-            ldd "$binary" >&2
-            exit 1
-          fi
+          described=$(file -b "$binary")
+          echo "$described"
+          # `file`, not `ldd`. A static-pie binary is reported by `ldd` as
+          # "statically linked" and by a non-pie one as "not a dynamic
+          # executable", so a check written against either sentence calls the
+          # other a failure — which is how this step first rejected a binary
+          # that was exactly what it was asking for.
+          case "$described" in
+            *static*) ;;
+            *)
+              echo "$binary is dynamically linked; musl was supposed to make it static." >&2
+              exit 1
+              ;;
+          esac
 
       # Named for the platform key rather than the Rust triple, because what
       # reads it back is `artifactName` in `apps/cli/src/release.ts`, which
