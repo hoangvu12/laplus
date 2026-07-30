@@ -117,21 +117,30 @@ async fn concurrent_calls_are_correlated_by_request_id() {
     server.stop().await;
 }
 
-/// Most of the seventy methods are unimplemented at this ticket, and the UI's own
+/// A method the contract declares and this server has not built, and the UI's own
 /// boot sequence asks for several of them. Each refusal must cost one call and
 /// nothing else.
 ///
-/// Since ticket 39 the refusal also has to be *readable*: `orchestration.replayEvents`
-/// declares `OrchestrationReplayEventsError | EnvironmentAuthorizationError`, and
-/// an error outside that union costs the call and then puts the schema decoder's
-/// complaint on the screen. `crate::refusals` holds the per-method table and the
-/// test that reads it back out of the contract.
+/// Since ticket 39 the refusal also has to be *readable*:
+/// `previewAutomation.respond` declares
+/// `PreviewAutomationError | EnvironmentAuthorizationError`, and an error outside
+/// that union costs the call and then puts the schema decoder's complaint on the
+/// screen. `crate::refusals` holds the per-method table and the test that reads it
+/// back out of the contract.
+///
+/// **The subject is chosen to outlive the parity work**, which is why it is not
+/// `orchestration.replayEvents` any more — that method left the contract rather
+/// than getting an implementation. Preview automation is last in
+/// `.scratch/contract-parity/ledger.md`'s order and the one cluster whose
+/// usefulness waits on something off-contract entirely: there is no MCP server
+/// here to ask for a click. `crate::rpc`'s enumeration names the same method for
+/// the same reason, and the two are meant to move together.
 #[tokio::test]
 async fn an_unimplemented_method_is_reported_without_dropping_the_connection() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    match client.call("orchestration.replayEvents", json!({})).await {
+    match client.call("previewAutomation.respond", json!({})).await {
         Outcome::Failure(cause) => {
             assert_eq!(cause.len(), 1, "one cause entry: {cause:?}");
             assert_eq!(cause[0]["_tag"], "Fail");
@@ -139,7 +148,7 @@ async fn an_unimplemented_method_is_reported_without_dropping_the_connection() {
             assert_eq!(cause[0]["error"]["requiredScope"], "orchestration:read");
             assert_eq!(
                 cause[0]["error"]["message"],
-                "Method not implemented by this server: orchestration.replayEvents"
+                "Method not implemented by this server: previewAutomation.respond"
             );
         }
         other => panic!("expected a typed failure, got {other:?}"),

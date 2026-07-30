@@ -849,9 +849,18 @@ mod tests {
         // build. It is the method `tests/socket_handshake.rs` refuses end to
         // end, and it is here to catch the loop above running zero times —
         // which is how an enumeration passes while checking nothing.
+        //
+        // It was `orchestration.replayEvents` until that method left the
+        // contract. The replacement is chosen to be the last one standing:
+        // preview automation is last in `.scratch/contract-parity/ledger.md`'s
+        // order, and it is the one cluster that waits on something the contract
+        // does not declare at all — there is no MCP server here to ask for a
+        // click, so answering the method would build a router with no traffic.
+        // When even this is implemented the whole assertion goes, because
+        // `refused` will be empty and there will be nothing left to name.
         assert!(
-            refused.contains("orchestration.replayEvents"),
-            "dispatch answers orchestration.replayEvents, so this checked \
+            refused.contains("previewAutomation.respond"),
+            "dispatch answers previewAutomation.respond, so this checked \
              nothing it was written to check: {refused:?}"
         );
     }
