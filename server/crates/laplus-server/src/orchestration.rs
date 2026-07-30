@@ -1307,6 +1307,29 @@ struct ThreadFields {
     created_at: Option<String>,
 }
 
+impl ThreadFields {
+    /// Both modes checked against the contract's own vocabularies, or a refusal
+    /// naming the conversation that was not created.
+    ///
+    /// Here rather than in either parse arm for the reason the struct is one
+    /// struct: the fields arrive through two doors and are identical in both, so
+    /// a check in one arm would leave the other open — which is exactly the
+    /// shape of the hole ticket 12 was written about.
+    ///
+    /// The modes are the only two fields with a closed vocabulary. `title` is
+    /// free text, `modelSelection` is the client's own, and `branch` and
+    /// `worktreePath` are carried and never acted on.
+    fn modes_the_contract_names(&self, thread_id: &str) -> Result<(), CommandError> {
+        named_by_the_contract(&self.runtime_mode, &RUNTIME_MODES, "runtime mode", thread_id)?;
+        named_by_the_contract(
+            &self.interaction_mode,
+            &INTERACTION_MODES,
+            "interaction mode",
+            thread_id,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct CreateThread {
     thread_id: String,
@@ -1705,8 +1728,12 @@ impl Command {
             }
             "thread.create" => {
                 let create: CreateThreadPayload = read(payload, kind)?;
+                // The thread first, so the modes below have a conversation to
+                // name — the same order the two mode commands take.
+                let thread_id = non_blank(create.thread_id, "threadId", kind)?;
+                create.thread.modes_the_contract_names(&thread_id)?;
                 Ok(Command::CreateThread(CreateThread {
-                    thread_id: non_blank(create.thread_id, "threadId", kind)?,
+                    thread_id,
                     thread: ThreadFields {
                         project_id: non_blank(create.thread.project_id, "projectId", kind)?,
                         ..create.thread
@@ -1771,10 +1798,37 @@ impl Command {
                     thread_id,
                 }))
             }
+            // A turn carries a mode through *two* doors: the per-turn override
+            // the composer sends beside every message, and the thread it asks to
+            // have created. Both are checked, because both are written onto the
+            // thread and published — see [`Shell::start_turn`].
+            //
+            // The overrides are checked only where one arrived, which is what
+            // keeps absent meaning "leave the thread's alone" — see
+            // [`StartTurn`], where that is why the fields have no default.
             "thread.turn.start" => {
                 let start: StartTurn = read(payload, kind)?;
+                let thread_id = non_blank(start.thread_id, "threadId", kind)?;
+                if let Some(runtime_mode) = &start.runtime_mode {
+                    named_by_the_contract(runtime_mode, &RUNTIME_MODES, "runtime mode", &thread_id)?;
+                }
+                if let Some(interaction_mode) = &start.interaction_mode {
+                    named_by_the_contract(
+                        interaction_mode,
+                        &INTERACTION_MODES,
+                        "interaction mode",
+                        &thread_id,
+                    )?;
+                }
+                if let Some(create) = start
+                    .bootstrap
+                    .as_ref()
+                    .and_then(|bootstrap| bootstrap.create_thread.as_ref())
+                {
+                    create.modes_the_contract_names(&thread_id)?;
+                }
                 Ok(Command::StartTurn(Box::new(StartTurn {
-                    thread_id: non_blank(start.thread_id, "threadId", kind)?,
+                    thread_id,
                     message: TurnMessage {
                         message_id: non_blank(start.message.message_id, "messageId", kind)?,
                         ..start.message
@@ -1829,26 +1883,28 @@ impl Command {
                 // name — and so a payload with two things wrong with it is
                 // refused for the one the developer can act on.
                 let thread_id = non_blank(set.thread_id, "threadId", kind)?;
+                named_by_the_contract(
+                    &set.runtime_mode,
+                    &RUNTIME_MODES,
+                    "runtime mode",
+                    &thread_id,
+                )?;
                 Ok(Command::SetRuntimeMode(SetRuntimeModePayload {
-                    runtime_mode: named_by_the_contract(
-                        set.runtime_mode,
-                        &RUNTIME_MODES,
-                        "runtime mode",
-                        &thread_id,
-                    )?,
+                    runtime_mode: set.runtime_mode,
                     thread_id,
                 }))
             }
             "thread.interaction-mode.set" => {
                 let set: SetInteractionModePayload = read_about_a_thread(payload, kind)?;
                 let thread_id = non_blank(set.thread_id, "threadId", kind)?;
+                named_by_the_contract(
+                    &set.interaction_mode,
+                    &INTERACTION_MODES,
+                    "interaction mode",
+                    &thread_id,
+                )?;
                 Ok(Command::SetInteractionMode(SetInteractionModePayload {
-                    interaction_mode: named_by_the_contract(
-                        set.interaction_mode,
-                        &INTERACTION_MODES,
-                        "interaction mode",
-                        &thread_id,
-                    )?,
+                    interaction_mode: set.interaction_mode,
                     thread_id,
                 }))
             }
@@ -1971,8 +2027,12 @@ fn cleared_or_named(
     }
 }
 
-/// One value out of a closed set the contract spells out, or a refusal naming
+/// One value out of a closed set the contract spells out — or a refusal naming
 /// what was sent and which conversation it was sent about.
+///
+/// Checks rather than hands the value back, because two of the four doors a mode
+/// arrives through carry theirs inside a [`ThreadFields`], where taking the
+/// string out to return it would mean rebuilding the struct around it.
 ///
 /// **Refused rather than rounded to the nearest mode this server understands.**
 /// A declined setting, in ADR-0009's sense — a value refused on the way in — and
@@ -1991,13 +2051,13 @@ fn cleared_or_named(
 /// Joined with `", "` rather than `settings`'s `" or "`, because four is a list
 /// and two is a choice.
 fn named_by_the_contract(
-    value: String,
+    value: &str,
     named: &[&str],
     what: &str,
     thread_id: &str,
-) -> Result<String, CommandError> {
-    if named.contains(&value.as_str()) {
-        return Ok(value);
+) -> Result<(), CommandError> {
+    if named.contains(&value) {
+        return Ok(());
     }
     Err(CommandError::new(format!(
         "'{value}' is not a {what} this contract names, so thread '{thread_id}' was left as it \
@@ -2088,7 +2148,23 @@ mod tests {
         /// The `thread.create` payload the client-runtime's `createThread`
         /// builds.
         fn add_thread(&self, id: &str, project_id: &str) -> Result<Value, CommandError> {
-            self.dispatch(&json!({
+            self.add_thread_with(id, project_id, json!({}))
+        }
+
+        /// The same, with whichever of the thread's fields the caller means to
+        /// move off the value the client-runtime would have sent.
+        ///
+        /// Merged into the envelope rather than taken as arguments, for
+        /// [`Fixture::update_thread_meta`]'s reason turned one notch: the two
+        /// modes are separate vocabularies that are both bare strings, so an
+        /// argument list would let a test swap them and still compile.
+        fn add_thread_with(
+            &self,
+            id: &str,
+            project_id: &str,
+            fields: Value,
+        ) -> Result<Value, CommandError> {
+            let mut command = json!({
                 "type": "thread.create",
                 "commandId": format!("test:thread:{id}"),
                 "threadId": id,
@@ -2100,7 +2176,44 @@ mod tests {
                 "branch": Value::Null,
                 "worktreePath": Value::Null,
                 "createdAt": "2026-07-26T00:23:04.909Z",
-            }))
+            });
+            let envelope = command.as_object_mut().expect("the envelope is an object");
+            for (field, value) in fields.as_object().expect("the fields are an object") {
+                envelope.insert(field.clone(), value.clone());
+            }
+            self.dispatch(&command)
+        }
+
+        /// The `thread.turn.start` the composer sends, carrying whichever of the
+        /// per-turn fields the caller means to test.
+        ///
+        /// Merged into the envelope for [`Fixture::update_thread_meta`]'s
+        /// reason: *which fields are present* is the whole question, because an
+        /// absent mode means "leave the thread's alone" and an argument list
+        /// would have to spell absent and blank differently.
+        ///
+        /// Every caller here expects a refusal. A turn this fixture lets through
+        /// reaches `turn::send`, which wants a runtime and an agent to start —
+        /// see [`Fixture::new`], and `tests/socket_turn.rs` for the turns that
+        /// really run.
+        fn start_turn(&self, thread_id: &str, fields: Value) -> Result<Value, CommandError> {
+            let mut command = json!({
+                "type": "thread.turn.start",
+                "commandId": format!("test:turn:{thread_id}"),
+                "threadId": thread_id,
+                "message": {
+                    "messageId": "message-1",
+                    "role": "user",
+                    "text": "hello",
+                    "attachments": [],
+                },
+                "createdAt": "2026-07-26T00:23:04.909Z",
+            });
+            let envelope = command.as_object_mut().expect("the envelope is an object");
+            for (field, value) in fields.as_object().expect("the fields are an object") {
+                envelope.insert(field.clone(), value.clone());
+            }
+            self.dispatch(&command)
         }
 
         /// The `thread.meta.update` `updateThreadMetadata` builds, carrying
@@ -2936,6 +3049,169 @@ mod tests {
             refusal.message().contains("not-a-mode"),
             "the world was consulted before the payload was read: {}",
             refusal.message()
+        );
+    }
+
+    /// The composer's own door, and the one almost every mode change actually
+    /// goes through: it sends the per-turn override on *every* send, beside the
+    /// command the picker dispatched. Ticket 02 guarded the picker's command and
+    /// left this one open.
+    ///
+    /// The cost of letting one through is not a wrong badge. The contract types
+    /// the field as a closed union, so the client's decode of the whole thread
+    /// payload fails on a literal it does not know — and the conversation cannot
+    /// be drawn at all.
+    #[test]
+    fn a_turn_cannot_carry_a_mode_the_contract_does_not_name() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .start_turn("thread-1", json!({"runtimeMode": "bypassPermissions"}))
+            .expect_err("not a runtime mode the contract names");
+        assert!(
+            refusal.message().contains("bypassPermissions")
+                && refusal.message().contains("thread-1")
+                && refusal.message().contains("full-access"),
+            "{}",
+            refusal.message()
+        );
+
+        let refusal = fixture
+            .start_turn("thread-1", json!({"interactionMode": "planning"}))
+            .expect_err("not an interaction mode the contract names");
+        assert!(
+            refusal.message().contains("planning") && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        // Refused at the door, so the turn left nothing behind: no prompt in the
+        // transcript, and neither mode moved. The same guarantee the worktree
+        // refusal has, for the same reason.
+        let thread = fixture.shell.threads().get("thread-1").expect("the thread");
+        assert!(
+            thread.messages.is_empty(),
+            "a refused turn must not leave the prompt in the transcript"
+        );
+        assert_eq!(fixture.detail("thread-1")["runtimeMode"], "full-access");
+        assert_eq!(fixture.detail("thread-1")["interactionMode"], "default");
+
+        // And read before the world is consulted, which a thread that does not
+        // exist is what shows: the mode is the payload's answer and the unknown
+        // thread is the world's.
+        let refusal = fixture
+            .start_turn("never-created", json!({"runtimeMode": "bypassPermissions"}))
+            .expect_err("both are wrong");
+        assert!(
+            refusal.message().contains("bypassPermissions"),
+            "the world was consulted before the payload was read: {}",
+            refusal.message()
+        );
+    }
+
+    /// An absent per-turn mode still means "leave the thread's alone" rather
+    /// than "the default": the guard is on the value that arrived, not on the
+    /// field.
+    ///
+    /// Asserted against a thread that does not exist, because that is the only
+    /// answer a turn this fixture lets through can give without an agent to
+    /// start — and it is one only the *world* could have given, so the payload
+    /// was read and found to be asking for nothing.
+    #[test]
+    fn a_turn_that_names_no_mode_is_not_refused_for_one() {
+        let fixture = Fixture::with_a_conversation();
+
+        let refusal = fixture
+            .start_turn("never-created", json!({}))
+            .expect_err("there is no such thread");
+        assert!(
+            refusal.message().contains("never-created")
+                && !refusal.message().contains("runtime mode")
+                && !refusal.message().contains("interaction mode"),
+            "a turn that named no mode was refused for one: {}",
+            refusal.message()
+        );
+    }
+
+    /// The other door on the same command. A turn for a conversation this server
+    /// has never heard of carries the thread it wants created, and the modes in
+    /// that are the ones it would be created with — the composer's own path for
+    /// a first message, so this is not the edge case it looks like.
+    #[test]
+    fn a_bootstrapped_thread_cannot_be_created_in_a_mode_the_contract_does_not_name() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("workspace");
+        fixture.add("project-1", &folder).expect("registered");
+
+        let refusal = fixture
+            .start_turn(
+                "thread-1",
+                json!({
+                    "bootstrap": {
+                        "createThread": {
+                            "projectId": "project-1",
+                            "title": "A conversation",
+                            "modelSelection": {
+                                "instanceId": "claudeAgent",
+                                "model": "claude-opus-5",
+                            },
+                            "runtimeMode": "bypassPermissions",
+                            "interactionMode": "default",
+                            "branch": Value::Null,
+                            "worktreePath": Value::Null,
+                            "createdAt": "2026-07-26T00:23:04.909Z",
+                        },
+                    },
+                }),
+            )
+            .expect_err("not a runtime mode the contract names");
+        assert!(
+            refusal.message().contains("bypassPermissions")
+                && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        assert!(
+            fixture.listed_threads().is_empty(),
+            "a refused turn must not create the conversation it asked for"
+        );
+    }
+
+    /// The oldest door of the three, and the one the client-runtime uses when a
+    /// conversation is started somewhere other than the composer's draft.
+    ///
+    /// Both modes, because they are separate vocabularies: a creation that named
+    /// a runtime mode the contract knows and an interaction mode it does not
+    /// would be just as undrawable.
+    #[test]
+    fn a_thread_cannot_be_created_in_a_mode_the_contract_does_not_name() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("workspace");
+        fixture.add("project-1", &folder).expect("registered");
+
+        let refusal = fixture
+            .add_thread_with("thread-1", "project-1", json!({"runtimeMode": "bypassPermissions"}))
+            .expect_err("not a runtime mode the contract names");
+        assert!(
+            refusal.message().contains("bypassPermissions")
+                && refusal.message().contains("thread-1"),
+            "{}",
+            refusal.message()
+        );
+
+        let refusal = fixture
+            .add_thread_with("thread-2", "project-1", json!({"interactionMode": "planning"}))
+            .expect_err("not an interaction mode the contract names");
+        assert!(
+            refusal.message().contains("planning") && refusal.message().contains("thread-2"),
+            "{}",
+            refusal.message()
+        );
+
+        assert!(
+            fixture.listed_threads().is_empty(),
+            "a refused creation must not leave a conversation behind"
         );
     }
 

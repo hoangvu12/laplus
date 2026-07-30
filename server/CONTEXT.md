@@ -162,9 +162,12 @@ exists.
 
 **Runtime mode** — how much latitude the agent is given, as the composer's
 picker offers it. The contract's four: `approval-required`, `auto-accept-edits`,
-`auto`, `full-access`. `crate::orchestration::RUNTIME_MODES` is the closed set a
-command is checked against; `crate::agent::permission_mode_for` is the separate
-question of which `--permission-mode` each one becomes, and answers nothing for
+`auto`, `full-access`. `crate::orchestration::RUNTIME_MODES` is the closed set
+**every** door is checked against — the picker's own command, a turn's per-turn
+override, and the two that create a thread — because a literal the contract does
+not name fails the client's decode of the whole conversation rather than drawing
+a wrong badge. `crate::agent::permission_mode_for` is the separate question of
+which `--permission-mode` each one becomes, and answers nothing for
 `approval-required` because upstream expresses that by passing no flag.
 
 Read **once per session**, when the agent is launched. A thread carries the mode
