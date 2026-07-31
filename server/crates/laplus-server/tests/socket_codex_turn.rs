@@ -6,7 +6,7 @@ use harness::codex::ScriptedCodex;
 use harness::agent::ScriptedAgent;
 use harness::conversation::{
     activities, activity, assistant_sends, create_project, create_thread, follow_up, follow_up_in,
-    interrupt_turn, respond_to_approval,
+    interrupt_turn, last_session, respond_to_approval,
 };
 use harness::workspace::Workspace;
 use harness::{SocketClient, TestServer};
@@ -29,6 +29,54 @@ fn codex_thread(runtime_mode: &str) -> Value {
     })
 }
 
+fn codex_follow_up_in(
+    message_id: &str,
+    text: &str,
+    model: &str,
+    runtime_mode: &str,
+) -> Value {
+    json!({
+        "type": "thread.turn.start",
+        "commandId": format!("test:turn:{message_id}"),
+        "threadId": "codex-thread",
+        "message": {
+            "messageId": message_id,
+            "role": "user",
+            "text": text,
+            "attachments": [],
+        },
+        "modelSelection": {"instanceId": "codex", "model": model},
+        "runtimeMode": runtime_mode,
+        "interactionMode": "default",
+        "createdAt": "2026-07-31T00:00:01.000Z",
+    })
+}
+
+fn codex_follow_up_using_thread_settings(message_id: &str, text: &str) -> Value {
+    json!({
+        "type": "thread.turn.start",
+        "commandId": format!("test:turn:{message_id}"),
+        "threadId": "codex-thread",
+        "message": {
+            "messageId": message_id,
+            "role": "user",
+            "text": text,
+            "attachments": [],
+        },
+        "createdAt": "2026-07-31T00:00:01.000Z",
+    })
+}
+
+fn set_codex_runtime_mode(runtime_mode: &str) -> Value {
+    json!({
+        "type": "thread.runtime-mode.set",
+        "commandId": format!("test:runtime-mode:{runtime_mode}"),
+        "threadId": "codex-thread",
+        "runtimeMode": runtime_mode,
+        "createdAt": "2026-07-31T00:00:01.000Z",
+    })
+}
+
 fn aggregates(events: &[Value]) -> Vec<String> {
     let mut ids: Vec<String> = events
         .iter()
@@ -38,6 +86,381 @@ fn aggregates(events: &[Value]) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+async fn complete_first_codex_turn(
+    codex: &ScriptedCodex,
+    database: &std::path::Path,
+    workspace: &Workspace,
+) {
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(database, config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-1",
+                "Reply with exactly one short sentence saying hello. Do not use any tools.",
+            ),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_codex_thread_id_survives_a_restart_and_resumes_the_captured_context() {
+    let codex = ScriptedCodex::resumable_conversation();
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let workspace = Workspace::with(&["src/main.rs"]);
+    complete_first_codex_turn(&codex, &database, &workspace).await;
+
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config).await;
+    let mut client = server.connect().await;
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-2",
+                "What exactly did I ask you in my previous message? Quote it.",
+            ),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        assistant_sends(&events).last(),
+        Some(&(
+            "\u{201c}Reply with exactly one short sentence saying hello. Do not use any tools.\u{201d}"
+                .to_string(),
+            false,
+        )),
+        "the app-server did not replay the answer that demonstrates earlier context"
+    );
+    let requests: Vec<Value> = codex.thread_requests().into_iter().skip(1).collect();
+    let [resume] = requests.as_slice() else {
+        panic!("the restarted conversation made unexpected thread requests: {requests:?}");
+    };
+    assert_eq!(resume["method"], "thread/resume");
+    assert_eq!(resume["params"]["threadId"], "codex-thread-1");
+    assert_eq!(resume["params"]["approvalPolicy"], "never");
+    assert_eq!(resume["params"]["sandbox"], "danger-full-access");
+    let resumed_turn = codex
+        .turn_start_requests()
+        .into_iter()
+        .last()
+        .expect("the resumed turn request");
+    assert_eq!(resumed_turn["params"]["model"], "gpt-5.4-mini");
+    assert_eq!(resumed_turn["params"]["approvalPolicy"], "never");
+    assert_eq!(
+        resumed_turn["params"]["sandboxPolicy"],
+        "danger-full-access"
+    );
+    assert_eq!(resumed_turn["params"]["approvalsReviewer"], "user");
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn malformed_startup_traffic_is_counted_after_the_correlated_response_and_open_continues() {
+    let codex = ScriptedCodex::initialization_drift_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Say hello after startup noise."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        assistant_sends(&events).last(),
+        Some(&("Hello.".to_string(), false))
+    );
+    assert_eq!(
+        last_session(&events, "the turn after startup drift")["payload"]["session"]["status"],
+        "ready"
+    );
+    let completed = &activity(&events, "turn.completed")["payload"]["activity"];
+    assert!(completed["summary"]
+        .as_str()
+        .is_some_and(|summary| summary.contains("4 unrecognised events and 2 unreadable lines")));
+    assert_eq!(completed["payload"]["unknownEvents"], 4);
+    assert_eq!(completed["payload"]["parseErrors"], 2);
+    assert_eq!(
+        codex.unsupported_answers(),
+        vec![json!({
+            "jsonrpc": "2.0",
+            "id": "startup-request",
+            "error": {
+                "code": -32601,
+                "message": "laplus does not handle app-server request 'future/request' during a provider probe"
+            }
+        })]
+    );
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn malformed_noise_before_resume_does_not_replace_the_captured_continuity() {
+    let codex = ScriptedCodex::resumable_conversation();
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let workspace = Workspace::with(&["src/main.rs"]);
+    complete_first_codex_turn(&codex, &database, &workspace).await;
+    codex.add_resume_drift();
+
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config).await;
+    let mut client = server.connect().await;
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-2",
+                "What exactly did I ask you in my previous message? Quote it.",
+            ),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        assistant_sends(&events).last(),
+        Some(&(
+            "\u{201c}Reply with exactly one short sentence saying hello. Do not use any tools.\u{201d}"
+                .to_string(),
+            false,
+        )),
+        "malformed startup noise caused a fresh thread to lose captured context"
+    );
+    assert!(!activities(&events)
+        .iter()
+        .any(|row| row["kind"] == "session.resume-failed"));
+    let requests: Vec<Value> = codex.thread_requests().into_iter().skip(1).collect();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec!["thread/resume"]
+    );
+    let completed = &activity(&events, "turn.completed")["payload"]["activity"];
+    assert!(completed["summary"]
+        .as_str()
+        .is_some_and(|summary| summary.contains("1 unrecognised event and 1 unreadable line")));
+    assert_eq!(completed["payload"]["unknownEvents"], 1);
+    assert_eq!(completed["payload"]["parseErrors"], 1);
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn an_empty_correlated_turn_start_result_is_counted_and_the_completion_still_settles() {
+    let codex = ScriptedCodex::malformed_turn_start_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Settle despite a malformed result."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    assert_eq!(
+        last_session(&events, "the malformed correlated turn")["payload"]["session"]["status"],
+        "ready"
+    );
+    let completed = &activity(&events, "turn.completed")["payload"]["activity"];
+    assert!(completed["summary"]
+        .as_str()
+        .is_some_and(|summary| summary.contains("1 unrecognised event")));
+    assert_eq!(completed["payload"]["unknownEvents"], 1);
+    assert_eq!(completed["payload"]["parseErrors"], 0);
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn the_captured_missing_rollout_starts_fresh_and_tells_the_developer() {
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let initial = ScriptedCodex::plain_conversation();
+    complete_first_codex_turn(&initial, &database, &workspace).await;
+    initial.assert_conversation_reaped();
+
+    let codex = ScriptedCodex::missing_resume_conversation();
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config).await;
+    let mut client = server.connect().await;
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-2", "Carry on after the restart."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let failed = &activity(&events, "session.resume-failed")["payload"]["activity"];
+    assert_eq!(failed["tone"], "error");
+    let summary = failed["summary"].as_str().expect("a resume explanation");
+    assert!(summary.contains("codex-thread-1"), "{summary}");
+    assert!(summary.contains("previous context"), "{summary}");
+    assert!(
+        summary.contains("no rollout found for thread id codex-thread-1"),
+        "{summary}"
+    );
+    assert_eq!(
+        last_session(&events, "the fallback turn")["payload"]["session"]["status"],
+        "ready",
+        "the recoverable resume failure killed the conversation: {events:#?}"
+    );
+    let requests = codex.thread_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        vec!["thread/resume", "thread/start"]
+    );
+    assert_eq!(
+        codex
+            .turn_start_requests()
+            .last()
+            .expect("the fallback turn request")["params"]["threadId"],
+        "codex-thread-fresh"
+    );
+    codex.assert_missing_resume_capture_prefix();
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn an_unclassified_resume_error_takes_the_same_recoverable_fallback() {
+    const REFUSAL: &str = "history service refused this account";
+    let codex = ScriptedCodex::arbitrary_resume_failure_conversation(REFUSAL);
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let workspace = Workspace::with(&["src/main.rs"]);
+    complete_first_codex_turn(&codex, &database, &workspace).await;
+
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config).await;
+    let mut client = server.connect().await;
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-2", "Try after an unrelated error."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let summary = activity(&events, "session.resume-failed")["payload"]["activity"]["summary"]
+        .as_str()
+        .expect("a resume explanation");
+    assert!(summary.contains(REFUSAL), "{summary}");
+    assert_eq!(
+        last_session(&events, "the fallback turn")["payload"]["session"]["status"],
+        "ready"
+    );
+    let methods: Vec<String> = codex
+        .thread_requests()
+        .into_iter()
+        .skip(1)
+        .filter_map(|request| request["method"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(methods, vec!["thread/resume", "thread/start"]);
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
 }
 
 struct AskedCodex {
@@ -169,6 +592,416 @@ async fn every_runtime_mode_reaches_codex_as_its_approval_policy_and_sandbox() {
         server.stop().await;
         codex.assert_conversation_reaped();
     }
+}
+
+#[tokio::test]
+async fn a_model_changed_between_codex_turns_applies_without_replacing_the_conversation() {
+    let codex = ScriptedCodex::command_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "First turn."),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_follow_up_in("message-2", "Second turn.", "gpt-5.5", "full-access"),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let turns = codex.turn_start_requests();
+    assert_eq!(turns.len(), 2, "unexpected Codex turns: {turns:#?}");
+    assert_eq!(turns[1]["params"]["model"], "gpt-5.5");
+    assert_eq!(turns[1]["params"]["approvalPolicy"], "never");
+    assert_eq!(turns[1]["params"]["sandboxPolicy"], "danger-full-access");
+    assert_eq!(turns[1]["params"]["approvalsReviewer"], "user");
+    assert_eq!(codex.conversation_starts(), 1);
+    assert_eq!(codex.thread_requests().len(), 1);
+    assert!(!activities(&events)
+        .iter()
+        .any(|activity| activity["kind"] == "session.retune-failed"));
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn an_access_mode_changed_between_codex_turns_applies_consistently_to_the_next_turn() {
+    let codex = ScriptedCodex::command_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "First turn."),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            set_codex_runtime_mode("approval-required"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_follow_up_using_thread_settings("message-2", "Second turn."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let turns = codex.turn_start_requests();
+    assert_eq!(turns.len(), 2, "unexpected Codex turns: {turns:#?}");
+    assert_eq!(turns[1]["params"]["model"], "gpt-5.4-mini");
+    assert_eq!(turns[1]["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(turns[1]["params"]["sandboxPolicy"], "read-only");
+    assert_eq!(turns[1]["params"]["approvalsReviewer"], "user");
+    let sessions: Vec<&Value> = events
+        .iter()
+        .filter(|item| item["event"]["type"] == "thread.session-set")
+        .map(|item| &item["event"]["payload"]["session"])
+        .collect();
+    assert!(sessions.iter().any(|session| session["status"] == "starting"));
+    assert!(sessions.iter().any(|session| session["status"] == "running"));
+    assert!(sessions.iter().any(|session| session["status"] == "ready"));
+    assert!(sessions
+        .iter()
+        .all(|session| session["runtimeMode"] == "approval-required"));
+    assert_eq!(codex.conversation_starts(), 1);
+    assert_eq!(codex.thread_requests().len(), 1);
+    assert!(!activities(&events)
+        .iter()
+        .any(|activity| activity["kind"] == "session.retune-failed"));
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn queued_codex_prompts_keep_the_model_and_access_mode_they_were_sent_with() {
+    let codex = ScriptedCodex::conversation_paused_after_first_delta();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "First turn."),
+        )
+        .await
+        .expect_success();
+    let mut events = client.events_until_streaming(&subscription).await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_follow_up_in("message-2", "Second turn.", "gpt-5.5", "auto"),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_follow_up_in(
+                "message-3",
+                "Third turn.",
+                "gpt-5.6",
+                "approval-required",
+            ),
+        )
+        .await
+        .expect_success();
+
+    assert_eq!(
+        codex.turn_start_requests().len(),
+        1,
+        "a queued prompt retuned the turn already running"
+    );
+    codex.release_turn();
+    let mut completed = 0;
+    while completed < 3 {
+        let next = client.events_through_the_turn(&subscription).await;
+        completed += activities(&next)
+            .iter()
+            .filter(|activity| activity["kind"] == "turn.completed")
+            .count();
+        events.extend(next);
+    }
+
+    let turns = codex.turn_start_requests();
+    assert_eq!(turns.len(), 3, "unexpected Codex turns: {turns:#?}");
+    assert!(turns[0]["params"].get("model").is_none());
+    assert!(turns[0]["params"].get("approvalPolicy").is_none());
+    assert_eq!(turns[1]["params"]["model"], "gpt-5.5");
+    assert_eq!(turns[1]["params"]["approvalPolicy"], "on-request");
+    assert_eq!(turns[1]["params"]["sandboxPolicy"], "workspace-write");
+    assert_eq!(turns[1]["params"]["approvalsReviewer"], "user");
+    assert_eq!(turns[2]["params"]["model"], "gpt-5.6");
+    assert_eq!(turns[2]["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(turns[2]["params"]["sandboxPolicy"], "read-only");
+    assert_eq!(turns[2]["params"]["approvalsReviewer"], "user");
+
+    // Model selection is a thread/turn property in the TypeScript contract;
+    // OrchestrationSession carries runtimeMode but deliberately has no model.
+    let requested: Vec<(&str, &str)> = events
+        .iter()
+        .filter(|item| item["event"]["type"] == "thread.turn-start-requested")
+        .map(|item| {
+            let payload = &item["event"]["payload"];
+            (
+                payload["modelSelection"]["model"].as_str().unwrap_or(""),
+                payload["runtimeMode"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        requested,
+        vec![
+            ("gpt-5.4-mini", "full-access"),
+            ("gpt-5.5", "auto"),
+            ("gpt-5.6", "approval-required"),
+        ]
+    );
+
+    let mut session_modes = std::collections::HashMap::<String, Vec<String>>::new();
+    for session in events
+        .iter()
+        .filter(|item| item["event"]["type"] == "thread.session-set")
+        .map(|item| &item["event"]["payload"]["session"])
+    {
+        let Some(turn_id) = session["activeTurnId"].as_str() else {
+            continue;
+        };
+        session_modes
+            .entry(turn_id.to_string())
+            .or_default()
+            .push(session["runtimeMode"].as_str().unwrap_or("").to_string());
+    }
+    let modes: Vec<String> = session_modes
+        .values()
+        .map(|modes| {
+            assert!(modes.iter().all(|mode| mode == &modes[0]), "{modes:?}");
+            modes[0].clone()
+        })
+        .collect();
+    assert_eq!(session_modes.len(), 3, "session events: {session_modes:?}");
+    for expected in ["full-access", "auto", "approval-required"] {
+        assert!(modes.iter().any(|mode| mode == expected), "{session_modes:?}");
+    }
+    let snapshot = server.connect().await.into_thread_snapshot("codex-thread").await;
+    assert_eq!(
+        snapshot["thread"]["modelSelection"]["model"],
+        "gpt-5.6",
+        "the thread did not retain the model published for its latest turn"
+    );
+    assert_eq!(codex.conversation_starts(), 1);
+    assert_eq!(codex.thread_requests().len(), 1);
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn a_codex_turn_that_refuses_its_retune_reports_the_failure_to_the_developer() {
+    let codex = ScriptedCodex::command_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "First turn."),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    codex.reject_turns();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_follow_up_in(
+                "message-2",
+                "Retuned turn.",
+                "gpt-5.5",
+                "approval-required",
+            ),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let failed = activity(&events, "turn.completed");
+    assert_eq!(failed["payload"]["activity"]["tone"], "error");
+    assert!(failed["payload"]["activity"]["summary"]
+        .as_str()
+        .is_some_and(|summary| summary.contains("fixture turn start rejected")));
+    let session = last_session(&events, "the refused retuned turn");
+    assert_eq!(session["payload"]["session"]["status"], "error");
+    assert!(session["payload"]["session"]["lastError"]
+        .as_str()
+        .is_some_and(|error| error.contains("fixture turn start rejected")));
+    let request = codex
+        .turn_start_requests()
+        .into_iter()
+        .last()
+        .expect("the refused retuned request");
+    assert_eq!(request["params"]["model"], "gpt-5.5");
+    assert_eq!(request["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(request["params"]["sandboxPolicy"], "read-only");
+    assert_eq!(request["params"]["approvalsReviewer"], "user");
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn a_retuned_codex_turn_whose_request_cannot_be_written_reports_the_failure() {
+    let codex = ScriptedCodex::command_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+
+    codex.fail_next_turn_write();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "First turn."),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_follow_up_in("message-2", "Retuned turn.", "gpt-5.5", "full-access"),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let failed = &activity(&events, "session.failed")["payload"]["activity"];
+    assert_eq!(failed["tone"], "error");
+    assert!(failed["summary"]
+        .as_str()
+        .is_some_and(|summary| summary.contains("could not be sent to the agent")));
+    let session = last_session(&events, "the unwritable retuned turn");
+    assert_eq!(session["payload"]["session"]["status"], "error");
+    assert!(session["payload"]["session"]["lastError"]
+        .as_str()
+        .is_some_and(|error| error.contains("could not be sent to the agent")));
+    assert_eq!(codex.turn_start_requests().len(), 1);
+
+    let snapshot = server.connect().await.into_thread_snapshot("codex-thread").await;
+    assert_eq!(snapshot["thread"]["latestTurn"]["state"], "error");
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
 }
 
 #[tokio::test]
@@ -682,6 +1515,75 @@ async fn a_codex_turn_streams_settles_reuses_its_process_and_is_reaped() {
 
     client.close().await;
     server.stop().await;
+}
+
+#[tokio::test]
+async fn codex_protocol_drift_is_per_turn_the_payload_is_cumulative_and_the_session_carries_on() {
+    let codex = ScriptedCodex::synthetic_drift_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+
+    for (message_id, expected_turn, expected_total, expected_parse_errors) in [
+        ("message-1", 17, 17, 1),
+        ("message-2", 16, 33, 2),
+    ] {
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                follow_up("codex-thread", message_id, "Keep going after protocol drift."),
+            )
+            .await
+            .expect_success();
+        let events = client.events_through_the_turn(&subscription).await;
+
+        assert_eq!(
+            assistant_sends(&events).last(),
+            Some(&("Still here.".to_string(), false)),
+            "recognized output after drift was lost"
+        );
+        assert_eq!(
+            last_session(&events, "the drifting Codex turn")["payload"]["session"]["status"],
+            "ready",
+            "protocol drift killed the Codex session"
+        );
+        let completed = &activity(&events, "turn.completed")["payload"]["activity"];
+        let summary = completed["summary"].as_str().expect("a turn summary");
+        assert!(
+            summary.contains(&format!(
+                "{expected_turn} unrecognised events and 1 unreadable line"
+            )),
+            "the turn did not report only its own drift: {summary}"
+        );
+        assert_eq!(completed["payload"]["unknownEvents"], expected_total);
+        assert_eq!(
+            completed["payload"]["parseErrors"],
+            expected_parse_errors,
+            "the payload is the session's cumulative total"
+        );
+    }
+    assert_eq!(codex.conversation_starts(), 1, "drift replaced the session");
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
 }
 
 #[tokio::test]

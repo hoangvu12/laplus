@@ -59,30 +59,53 @@ fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-#[test]
-fn every_codex_turn_fixture_folds_through_a_fresh_state() {
+fn codex_captures() -> Vec<PathBuf> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/codex-app-server");
-    for fixture in [
-        "01-plain-turn",
-        "02-command-execution",
-        "03-write-approval",
-        "04-interrupt",
-    ] {
-        let capture = fs::read_to_string(directory.join(format!("{fixture}.jsonl")))
-            .unwrap_or_else(|error| panic!("reads the Codex turn fixture {fixture}: {error}"));
+    let mut captures: Vec<PathBuf> = fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", directory.display()))
+        .map(|entry| entry.expect("a Codex fixture directory entry").path())
+        .filter(|path| path.extension() == Some(OsStr::new("jsonl")))
+        .collect();
+    captures.sort();
+    captures
+}
+
+#[test]
+fn every_codex_fixture_folds_through_a_fresh_state() {
+    let captures = codex_captures();
+    assert!(!captures.is_empty(), "there are no Codex fixtures to fold");
+
+    for path in captures {
+        let fixture = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .expect("a UTF-8 Codex fixture name");
+        let capture = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reads the Codex fixture {fixture}: {error}"));
         let mut state = ConversationState::new();
-        for record in capture.lines().map(|line| {
-            serde_json::from_str::<Value>(line).expect("a Codex fixture record")
-        }) {
-            if record["dir"] == "recv" {
-                state.fold_message(record["msg"].clone());
+        for record in capture
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a Codex fixture record"))
+        {
+            match record["dir"].as_str() {
+                Some("recv") => {
+                    state.fold_message(record["msg"].clone());
+                }
+                Some("recv-raw") => {
+                    state.fold_line(
+                        record["msg"]
+                            .as_str()
+                            .expect("a raw Codex fixture line is a string"),
+                    );
+                }
+                _ => {}
             }
         }
 
         let actual = serde_json::to_value(&state).expect("Codex state serializes");
         let expected: Value = serde_json::from_str(
-            &fs::read_to_string(directory.join(format!("{fixture}.expected.json")))
+            &fs::read_to_string(path.with_extension("expected.json"))
                 .unwrap_or_else(|error| panic!("reads the expected Codex fold {fixture}: {error}")),
         )
         .unwrap_or_else(|error| panic!("parses the expected Codex fold {fixture}: {error}"));

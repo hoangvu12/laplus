@@ -142,7 +142,7 @@ use crate::clock::iso_from_epoch;
 use crate::process::Search;
 use crate::protocol::{Compaction, ContentBlock, Drift, Folded, RateLimit, SessionState, TokenUsage};
 use crate::session::{
-    Decided, Driver, Driving, Finished, InFlight, Pushed, Reaped, Reply, Settles, Start,
+    Decided, Driver, Driving, Finished, InFlight, Opened, Pushed, Reaped, Reply, Settles, Start,
 };
 use crate::settling::SessionStatus;
 use crate::threads::{Activity, Change};
@@ -181,7 +181,7 @@ pub(crate) struct Claude {
 
 impl Driver for Claude {
     /// Resolve the binary and start the agent, or say why not.
-    async fn open(start: &Start) -> Result<Claude, String> {
+    async fn open(start: &Start) -> Result<Opened<Claude>, String> {
         // Resolved here rather than on the dispatch path: it is a walk of every
         // `PATH` directory, and the read loop is answering a developer who has
         // just pressed enter. Resolved per session rather than once at boot
@@ -208,10 +208,13 @@ impl Driver for Claude {
             )
         })?;
 
-        Ok(Claude {
-            agent,
-            folding: SessionState::new(),
-            resume: start.resume.clone(),
+        Ok(Opened {
+            driver: Claude {
+                agent,
+                folding: SessionState::new(),
+                resume: start.resume.clone(),
+            },
+            decided: Decided::default(),
         })
     }
 

@@ -44,6 +44,11 @@ The harness is not committed — it is thirty lines of `subprocess` and `select`
 and rewriting it is cheaper than maintaining it. What matters is the handshake
 these were recorded under, because it changes what the server sends:
 
+Re-record after a Codex release even when the existing golden files still
+match. Once reduced under `server/fixtures/codex-app-server/`, every capture does
+both jobs: its received half is a fresh-state protocol golden and the same
+exchange drives the scripted app-server through the real socket session loop.
+
 ```json
 {
   "jsonrpc": "2.0",

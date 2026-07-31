@@ -92,10 +92,10 @@ const MIGRATIONS: &[&str] = &[
         interaction_mode       TEXT NOT NULL,
         branch                 TEXT,
         worktree_path          TEXT,
-        -- The `claude` session this conversation is being held in, as the agent
-        -- itself reported it. What `--resume` is given, and therefore the whole
-        -- of how continuity survives a restart: the context is in the agent's
-        -- own store and this is the handle on it.
+        -- The driver's own handle on this conversation: a Claude session id or
+        -- a Codex thread id. What the next process resumes, and therefore the
+        -- whole of how continuity survives a restart: the context is in the
+        -- agent's own store and this is the handle on it.
         agent_session_id       TEXT,
         latest_turn            TEXT,
         latest_user_message_at TEXT,

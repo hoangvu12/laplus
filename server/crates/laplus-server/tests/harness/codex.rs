@@ -26,6 +26,10 @@ fn rewrite_conversation_ids(value: &mut Value) {
 }
 
 impl ScriptedCodex {
+    pub fn plain_conversation() -> ScriptedCodex {
+        ScriptedCodex::conversation_from_fixture("01-plain-turn", None)
+    }
+
     pub fn conversation_paused_after_first_delta() -> ScriptedCodex {
         let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", Some(5));
         std::fs::write(codex.directory.path().join("pause-turn"), "")
@@ -35,6 +39,42 @@ impl ScriptedCodex {
 
     pub fn command_conversation() -> ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("02-command-execution", None)
+    }
+
+    pub fn initialization_drift_conversation() -> ScriptedCodex {
+        let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
+        std::fs::write(
+            codex
+                .directory
+                .path()
+                .join("initialize-events-before-response"),
+            concat!(
+                "{\"method\":\"future/startup\",\"params\":{}}\n",
+                "[]\n",
+                "{\"method\":\n",
+                "{\"id\":\"startup-request\",\"method\":\"future/request\",\"params\":{}}\n",
+            ),
+        )
+        .expect("writes initialization drift");
+        std::fs::write(
+            codex.directory.path().join("thread-events-before-response"),
+            "}{\n[\"future thread envelope\"]\n",
+        )
+        .expect("writes thread/start drift");
+        std::fs::write(codex.directory.path().join("await-initialize-answer"), "")
+            .expect("marks the startup server request");
+        codex
+    }
+
+    pub fn malformed_turn_start_conversation() -> ScriptedCodex {
+        let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
+        std::fs::write(codex.directory.path().join("conversation-turn-result"), "{}")
+            .expect("writes the malformed turn/start result");
+        codex
+    }
+
+    pub fn synthetic_drift_conversation() -> ScriptedCodex {
+        ScriptedCodex::conversation_from_fixture("07-synthetic-drift", None)
     }
 
     pub fn approval_conversation() -> ScriptedCodex {
@@ -120,6 +160,120 @@ impl ScriptedCodex {
         codex
     }
 
+    pub fn resumable_conversation() -> ScriptedCodex {
+        ScriptedCodex::conversation_from_fixture("05-resume", None)
+    }
+
+    pub fn add_resume_drift(&self) {
+        let path = self.directory.path().join("thread-events-before-response");
+        let mut events = std::fs::read_to_string(&path).expect("reads captured resume events");
+        events.push_str("}{\n[\"future resume envelope\"]\n");
+        std::fs::write(path, events).expect("adds drift before the resume response");
+    }
+
+    pub fn missing_resume_conversation() -> ScriptedCodex {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex-app-server/06-resume-missing.jsonl");
+        let records: Vec<Value> = std::fs::read_to_string(&fixture)
+            .expect("reads the missing-resume fixture")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a missing-resume record"))
+            .collect();
+        let initialize = records
+            .iter()
+            .find(|record| record["dir"] == "recv" && record["msg"]["id"] == 1)
+            .expect("the captured initialize response")["msg"]["result"]
+            .clone();
+        let refusal = records
+            .iter()
+            .find(|record| record["dir"] == "recv" && record["msg"]["error"].is_object())
+            .expect("the captured resume refusal")["msg"]["error"]
+            .clone();
+        let before_refusal = records
+            .iter()
+            .skip_while(|record| record["dir"] != "send" || record["msg"]["id"] != 2)
+            .skip(1)
+            .take_while(|record| record["dir"] != "recv" || !record["msg"]["error"].is_object())
+            .filter(|record| record["dir"] == "recv")
+            .map(|record| format!("{}\n", record["msg"]))
+            .collect::<String>();
+
+        let codex = ScriptedCodex::provider_probe();
+        for (name, content) in [
+            ("conversation-initialize-result", initialize.to_string()),
+            ("initialize-events-before-response", String::new()),
+            ("thread-events-before-response", before_refusal),
+            ("resume-error", refusal.to_string()),
+            (
+                "conversation-fallback-thread-result",
+                serde_json::json!({"thread": {"id": "codex-thread-fresh"}}).to_string(),
+            ),
+            (
+                "conversation-turn-result",
+                serde_json::json!({
+                    "turn": {"id": "codex-turn-fresh", "status": "inProgress", "error": null}
+                })
+                .to_string(),
+            ),
+            ("turn-events-before-pause", String::new()),
+            ("turn-events-after-pause", String::new()),
+            (
+                "turn-terminal",
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "codex-thread-fresh",
+                            "turn": {
+                                "id": "codex-turn-fresh",
+                                "status": "completed",
+                                "error": null,
+                                "durationMs": 1
+                            }
+                        }
+                    })
+                ),
+            ),
+        ] {
+            std::fs::write(codex.directory.path().join(name), content)
+                .unwrap_or_else(|error| panic!("writes {name}: {error}"));
+        }
+        std::fs::write(codex.directory.path().join("skip-provider-startup-noise"), "")
+            .expect("keeps the capture 06 replay free of provider-fixture noise");
+        std::fs::write(codex.app_server_path(), codex.conversation_script())
+            .expect("writes the missing-resume app-server");
+        codex
+    }
+
+    pub fn arbitrary_resume_failure_conversation(message: &str) -> ScriptedCodex {
+        ScriptedCodex::resume_failure_conversation(serde_json::json!({
+            "code": -32099,
+            "message": message,
+        }))
+    }
+
+    fn resume_failure_conversation(refusal: Value) -> ScriptedCodex {
+        let codex = ScriptedCodex::conversation_from_fixture("05-resume", None);
+        std::fs::write(
+            codex.directory.path().join("resume-error"),
+            refusal.to_string(),
+        )
+        .expect("writes the captured resume refusal");
+        let mut fresh: Value = serde_json::from_str(
+            &std::fs::read_to_string(codex.directory.path().join("conversation-thread-result"))
+                .expect("reads the captured thread result"),
+        )
+        .expect("the thread result is JSON");
+        fresh["thread"]["id"] = Value::String("codex-thread-fresh".to_string());
+        std::fs::write(
+            codex.directory.path().join("conversation-fallback-thread-result"),
+            fresh.to_string(),
+        )
+        .expect("writes the fallback thread result");
+        codex
+    }
+
     pub fn unrestricted_write_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::approval_conversation();
         codex.rewrite_turn_events(|message| {
@@ -198,18 +352,16 @@ impl ScriptedCodex {
         let codex = ScriptedCodex::provider_probe();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../fixtures/codex-app-server/{fixture}.jsonl"));
-        let received: Vec<Value> = std::fs::read_to_string(&fixture)
+        let records: Vec<Value> = std::fs::read_to_string(&fixture)
             .unwrap_or_else(|error| panic!("reading {}: {error}", fixture.display()))
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("a turn fixture record"))
-            .filter(|record| record["dir"] == "recv")
-            .map(|record| record["msg"].clone())
             .collect();
         for (name, id) in [("initialize", 1), ("thread", 2), ("turn", 3)] {
-            let result = received
+            let result = records
                 .iter()
-                .find(|message| message["id"] == id)
-                .unwrap_or_else(|| panic!("the fixture has the {name} response"))["result"]
+                .find(|record| record["dir"] == "recv" && record["msg"]["id"] == id)
+                .unwrap_or_else(|| panic!("the fixture has the {name} response"))["msg"]["result"]
                 .clone();
             std::fs::write(
                 codex.directory.path().join(format!("conversation-{name}-result")),
@@ -217,16 +369,47 @@ impl ScriptedCodex {
             )
             .expect("writes a fixture response");
         }
-        let events: Vec<&Value> = received
+        let before_thread_response = records
             .iter()
-            .skip_while(|message| message["id"] != 3)
+            .skip_while(|record| record["dir"] != "send" || record["msg"]["id"] != 2)
             .skip(1)
+            .take_while(|record| record["dir"] != "recv" || record["msg"]["id"] != 2)
+            .filter(|record| record["dir"] == "recv" || record["dir"] == "recv-raw")
+            .map(|record| match record["dir"].as_str() {
+                Some("recv") => format!("{}\n", record["msg"]),
+                Some("recv-raw") => format!(
+                    "{}\n",
+                    record["msg"]
+                        .as_str()
+                        .expect("a raw Codex fixture line is a string")
+                ),
+                direction => panic!("unexpected Codex fixture direction {direction:?}"),
+            })
+            .collect::<String>();
+        std::fs::write(
+            codex.directory.path().join("thread-events-before-response"),
+            before_thread_response,
+        )
+        .expect("writes fixture events before the thread response");
+        std::fs::write(
+            codex
+                .directory
+                .path()
+                .join("initialize-events-before-response"),
+            "",
+        )
+        .expect("writes the empty initialization prelude");
+        let events: Vec<&Value> = records
+            .iter()
+            .skip_while(|record| record["dir"] != "recv" || record["msg"]["id"] != 3)
+            .skip(1)
+            .filter(|record| record["dir"] == "recv" || record["dir"] == "recv-raw")
             .collect();
         let terminal = events.last().expect("the fixture has a terminal turn event");
         let approval_pause = events
             .iter()
-            .position(|message| {
-                message["method"]
+            .position(|record| {
+                record["msg"]["method"]
                     .as_str()
                     .is_some_and(|method| method.ends_with("/requestApproval"))
             })
@@ -236,20 +419,30 @@ impl ScriptedCodex {
             std::fs::write(codex.directory.path().join("await-approval"), "")
                 .expect("marks the fixture approval stop");
         }
+        let line = |record: &&Value| match record["dir"].as_str() {
+            Some("recv") => format!("{}\n", record["msg"]),
+            Some("recv-raw") => format!(
+                "{}\n",
+                record["msg"]
+                    .as_str()
+                    .expect("a raw Codex fixture line is a string")
+            ),
+            direction => panic!("unexpected Codex fixture direction {direction:?}"),
+        };
         let before = events[..events.len() - 1]
             .iter()
             .take(pause_after)
-            .map(|message| format!("{message}\n"))
+            .map(line)
             .collect::<String>();
         let after = events[..events.len() - 1]
             .iter()
             .skip(pause_after)
-            .map(|message| format!("{message}\n"))
+            .map(line)
             .collect::<String>();
         for (name, content) in [
             ("turn-events-before-pause", before),
             ("turn-events-after-pause", after),
-            ("turn-terminal", format!("{terminal}\n")),
+            ("turn-terminal", line(terminal)),
         ] {
             std::fs::write(codex.directory.path().join(name), content)
                 .expect("writes fixture turn events");
@@ -379,6 +572,16 @@ impl ScriptedCodex {
             .expect("releases the paused turn");
     }
 
+    pub fn reject_turns(&self) {
+        std::fs::write(self.directory.path().join("reject-turn"), "")
+            .expect("marks later turn starts as rejected");
+    }
+
+    pub fn fail_next_turn_write(&self) {
+        std::fs::write(self.directory.path().join("close-input-after-turn"), "")
+            .expect("marks the app-server input for closing after this turn");
+    }
+
     pub fn release_interrupt(&self) {
         std::fs::write(self.directory.path().join("release-interrupt"), "")
             .expect("releases the interrupt acknowledgement");
@@ -423,6 +626,27 @@ impl ScriptedCodex {
             .into_iter()
             .filter(|message| message["result"]["decision"].is_string())
             .collect()
+    }
+
+    pub fn unsupported_answers(&self) -> Vec<Value> {
+        self.requests()
+            .into_iter()
+            .filter(|message| message["error"]["code"] == -32601)
+            .collect()
+    }
+
+    pub fn assert_missing_resume_capture_prefix(&self) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex-app-server/06-resume-missing.jsonl");
+        let expected: Vec<Value> = std::fs::read_to_string(fixture)
+            .expect("reads capture 06")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a capture 06 record"))
+            .filter(|record| record["dir"] == "send")
+            .map(|record| record["msg"].clone())
+            .collect();
+        let actual: Vec<Value> = self.requests().into_iter().take(expected.len()).collect();
+        assert_eq!(actual, expected, "the missing-resume replay drifted from capture 06");
     }
 
     fn conversation_requests(&self) -> Vec<Value> {
@@ -669,11 +893,18 @@ function Send-Json([string]$json) {
 }
 
 $initialize = (Read-Request | ConvertFrom-Json)
+[Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'initialize-events-before-response')))
+[Console]::Out.Flush()
+if (Test-Path (Join-Path $root 'await-initialize-answer')) { $null = Read-Request }
 Send-Json ('{"id":' + $initialize.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'conversation-initialize-result')) + '}')
-1..3 | ForEach-Object { Send-File $_ }
+if (-not (Test-Path (Join-Path $root 'skip-provider-startup-noise'))) {
+  1..3 | ForEach-Object { Send-File $_ }
+}
 $null = Read-Request
 $nextLine = Read-Request
 $next = $nextLine | ConvertFrom-Json
+[Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'thread-events-before-response')))
+[Console]::Out.Flush()
 if ($next.method -eq 'thread/start') {
   [IO.File]::AppendAllText((Join-Path $root 'conversation-starts'), "$PID`n")
   [IO.File]::WriteAllText((Join-Path $root 'conversation-pid'), [string]$PID)
@@ -681,6 +912,24 @@ if ($next.method -eq 'thread/start') {
   [IO.File]::AppendAllText($conversationRequests, $nextLine + [Environment]::NewLine)
   Send-Json ('{"id":' + $next.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'conversation-thread-result')) + '}')
   $turn = 0
+} elseif ($next.method -eq 'thread/resume') {
+  [IO.File]::WriteAllText((Join-Path $root 'conversation-pid'), [string]$PID)
+  [IO.File]::WriteAllText((Join-Path $root 'conversation-cwd'), (Get-Location).Path)
+  [IO.File]::AppendAllText($conversationRequests, $nextLine + [Environment]::NewLine)
+  if (Test-Path (Join-Path $root 'resume-error')) {
+    Send-Json ('{"id":' + $next.id + ',"error":' + [IO.File]::ReadAllText((Join-Path $root 'resume-error')) + '}')
+    $nextLine = Read-Request
+    $next = $nextLine | ConvertFrom-Json
+    if ($next.method -ne 'thread/start') { exit 4 }
+    [IO.File]::AppendAllText((Join-Path $root 'conversation-starts'), "$PID`n")
+    [IO.File]::AppendAllText($conversationRequests, $nextLine + [Environment]::NewLine)
+    Send-Json ('{"id":' + $next.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'conversation-fallback-thread-result')) + '}')
+  } else {
+    Send-Json ('{"id":' + $next.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'conversation-thread-result')) + '}')
+  }
+  $turn = 0
+}
+if ($next.method -eq 'thread/start' -or $next.method -eq 'thread/resume') {
   while ($true) {
     $line = Read-Request
     [IO.File]::AppendAllText($conversationRequests, $line + [Environment]::NewLine)
@@ -727,8 +976,14 @@ if ($next.method -eq 'thread/start') {
     if (Test-Path (Join-Path $root 'fail-turn')) {
       Send-Json '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
     } else {
+      if (Test-Path (Join-Path $root 'close-input-after-turn')) {
+        [Console]::In.Close()
+      }
       [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-terminal')))
       [Console]::Out.Flush()
+      if (Test-Path (Join-Path $root 'close-input-after-turn')) {
+        while ($true) { Start-Sleep -Seconds 1 }
+      }
     }
   }
 }
@@ -765,13 +1020,18 @@ send_file() {
 
 read_request
 id=$(request_id "$line")
+cat "$root/initialize-events-before-response"
+if [ -f "$root/await-initialize-answer" ]; then read_request; fi
 printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/conversation-initialize-result")"
-send_file 1
-send_file 2
-send_file 3
+if [ ! -f "$root/skip-provider-startup-noise" ]; then
+  send_file 1
+  send_file 2
+  send_file 3
+fi
 read_request
 read_request
 next="$line"
+cat "$root/thread-events-before-response"
 case "$next" in
   *'"method":"thread/start"'*)
     printf '%s\n' "$$" >> "$root/conversation-starts"
@@ -780,6 +1040,31 @@ case "$next" in
     printf '%s\n' "$next" >> "$conversation_requests"
     id=$(request_id "$next")
     printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/conversation-thread-result")"
+    ;;
+  *'"method":"thread/resume"'*)
+    printf '%s\n' "$$" > "$root/conversation-pid"
+    pwd > "$root/conversation-cwd"
+    printf '%s\n' "$next" >> "$conversation_requests"
+    id=$(request_id "$next")
+    if [ -f "$root/resume-error" ]; then
+      printf '{"id":%s,"error":%s}\n' "$id" "$(cat "$root/resume-error")"
+      read_request
+      next="$line"
+      case "$next" in
+        *'"method":"thread/start"'*) ;;
+        *) exit 4 ;;
+      esac
+      printf '%s\n' "$$" >> "$root/conversation-starts"
+      printf '%s\n' "$next" >> "$conversation_requests"
+      id=$(request_id "$next")
+      printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/conversation-fallback-thread-result")"
+    else
+      printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/conversation-thread-result")"
+    fi
+    ;;
+esac
+case "$next" in
+  *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
     turn=0
     while read_request; do
       printf '%s\n' "$line" >> "$conversation_requests"
@@ -826,7 +1111,13 @@ case "$next" in
           if [ -f "$root/fail-turn" ]; then
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
           else
+            if [ -f "$root/close-input-after-turn" ]; then
+              exec 0<&-
+            fi
             cat "$root/turn-terminal"
+            if [ -f "$root/close-input-after-turn" ]; then
+              while true; do sleep 1; done
+            fi
           fi
           ;;
       esac

@@ -35,20 +35,20 @@ rollout.
 
 **Blocked by:** 04.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A Codex thread id is stored where the agent session id lives, and survives
+- [x] A Codex thread id is stored where the agent session id lives, and survives
       a restart.
-- [ ] After a restart, sending a message to a Codex conversation resumes the
+- [x] After a restart, sending a message to a Codex conversation resumes the
       existing thread rather than starting a new one, and the agent has the
       earlier context.
-- [ ] A resume that fails for **any** reason starts a fresh thread rather than
+- [x] A resume that fails for **any** reason starts a fresh thread rather than
       leaving a dead conversation.
-- [ ] That fallback publishes an activity telling the developer the previous
+- [x] That fallback publishes an activity telling the developer the previous
       context could not be resumed.
-- [ ] The specific message the current codex emits for a missing rollout is
+- [x] The specific message the current codex emits for a missing rollout is
       covered, and no list of error phrases is introduced.
-- [ ] The **agent session id** entry in `server/CONTEXT.md` reads as the driver's
+- [x] The **agent session id** entry in `server/CONTEXT.md` reads as the driver's
       own handle rather than as one CLI's flag.
-- [ ] `05-resume` and `06-resume-missing` are committed as fixtures with expected
+- [x] `05-resume` and `06-resume-missing` are committed as fixtures with expected
       folds, and both are replayed through the socket.

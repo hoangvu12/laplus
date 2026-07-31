@@ -81,17 +81,25 @@ conversation by ADR-0032. `crate::codex_protocol` is the pure wire vocabulary
 and decoder; `crate::codex` owns both app-server lifetimes and implements the
 Codex driver.
 
-**Agent session id** — the `claude` CLI's own handle on a conversation, given
-back to it as `--resume`. The one piece of agent-protocol vocabulary that
-reaches the database, because continuity depends on it outliving the process.
+**Agent session id** — a driver's own handle on a conversation, given back to
+that driver when a new process continues it: a Claude session id passed as
+`--resume`, or a Codex thread id sent to `thread/resume`. The one piece of
+agent-protocol vocabulary that reaches the database, because continuity depends
+on it outliving the process.
 
-Writing it down is the whole of what the agent's announcement does. The `init`
-line produces **no activity**: it used to open every conversation with a row
-naming the model, the permission mode and the tool count, and that row was a
-standing difference from upstream restating what the composer already shows. Its
-one real loss is recorded in `crate::turn`, `Folded::Initialized` — the mode the
-CLI reports is the one _in force_, and the picker shows the one that was asked
-for.
+Writing it down is the whole of what a successful open does. Claude announces
+the handle on its `init` line; Codex returns it from `thread/start` or
+`thread/resume`. A successful start or resume produces no activity: `init` used
+to open every conversation with a row naming the model, the permission mode and
+the tool count, and that row was a standing difference from upstream restating
+what the composer already shows. Its one real loss is recorded in `crate::turn`,
+`Folded::Initialized` — the mode the CLI reports is the one _in force_, and the
+picker shows the one that was asked for.
+
+A Codex resume refusal is recoverable rather than a dead session: every error,
+without classifying its wording, falls back to `thread/start`, replaces this id
+with the fresh thread id, and publishes `session.resume-failed` so the developer
+knows the agent no longer has the previous context. `crate::codex`.
 
 **Runtime mode** — how much latitude the agent is given, as the contract's four
 closed literals: `approval-required`, `auto-accept-edits`, `auto`, `full-access`.
@@ -121,15 +129,26 @@ developer is always named as the reviewer, including on resume. `auto`
 deliberately matches `auto-accept-edits` until the client can render the OpenAI
 reviewer's work; the mapping carries the reason for that divergence.
 
-A mode is given to the child at launch and **pushed to it afterwards**, on the
-agent's control channel at the next turn's dispatch — `set_permission_mode`, with
-`set_model` beside it for the model, which had the identical hole. So a mode set
-mid-conversation reaches the process already serving it, without replacing the
-session: no `--resume`, no fresh `init`, no lost context window. The push happens
-when the _next turn_ is dispatched rather than when the picker commits, so a turn
-already in flight keeps the rules it started under.
+A mode is given to the child at launch and **retuned afterwards**, at the next
+turn's dispatch. Claude uses its control channel: `set_permission_mode`, with
+`set_model` beside it for the model. Codex makes the same change through sticky
+`turn/start` overrides: the model, approval policy, `sandboxPolicy`, and the
+explicit `user` reviewer travel together. Once one value moves, later turns keep
+sending the full set rather than inheriting an unknown remainder from the thread.
 
-**Retune** — telling a `claude` already serving a conversation to change what it
+Both paths keep the process and its history: no `--resume`, no fresh
+initialization, no lost context window. Retuning at dispatch rather than when the
+picker commits also means a turn already in flight keeps the rules it started
+under. A Codex `turn/start` refusal is the acknowledgement that its retune did not
+land, and is published as the turn's correlated error rather than dropped.
+
+The wire publishes the two values at different established boundaries:
+`runtimeMode` is on `OrchestrationSession`, while `modelSelection` is on the
+thread and each `thread.turn-start-requested` event. Session events therefore
+stay mode-consistent for a turn, and the turn request records the model paired
+with it; adding a model to `OrchestrationSession` would not match the contract.
+
+**Retune** — telling an agent already serving a conversation to change what it
 _is_: its permission mode, its model, or both. The name for the act and for what
 carries it — `crate::threads::Retune` travels with the prompt,
 `crate::session::retune` spends it through the driver, and `session.retune-refused` and `session.retune-failed` are what the
@@ -601,7 +620,11 @@ recognise. Unknown variants increment it instead of failing, so a CLI upgrade is
 learned from a number rather than a bug report. Two of them, because they are two
 failures: an unrecognised event type and a line that is not JSON at all.
 `crate::protocol::Drift`, which is subtractable — a turn reports its own, the
-session reports its total.
+session reports its total. Both drivers use that same tally: Claude folds it in
+`crate::protocol::SessionState`, and Codex in
+`crate::codex_protocol::ConversationState`. Parsed Codex JSON whose method, item
+kind, or claimed shape this build cannot read is an unrecognised event; only a
+line that cannot be parsed is an unreadable line.
 
 **Compaction** — the agent summarising its own conversation to make room, and
 carrying on. A fact about what the _agent_ can still see; the transcript is this

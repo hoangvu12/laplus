@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::approval::ApprovalRequest as SharedApprovalRequest;
 use crate::config::{AuthStatus, ProviderAuth, ProviderModel};
+use crate::protocol::Drift;
 use crate::worklog::Decision;
 
 /// The one handshake policy that controls both what laplus advertises and which
@@ -164,10 +165,25 @@ impl ConversationState {
         }
     }
 
+    /// Fold a response already correlated to `turn/start` by the transport.
+    /// A bare result cannot identify its method, so this validation belongs at
+    /// the point where correlation has supplied that missing context.
+    pub(crate) fn fold_turn_start_response(&mut self, result: Value) -> ConversationFold {
+        if result
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .filter(|turn_id| !turn_id.trim().is_empty())
+            .is_none()
+        {
+            return self.unknown_event();
+        }
+        self.fold_message(json!({"result": result}))
+    }
+
     pub fn fold_message(&mut self, message: Value) -> ConversationFold {
         let Some(object) = message.as_object() else {
-            self.parse_errors += 1;
-            return ConversationFold::Nothing;
+            return self.unknown_event();
         };
 
         if let Some(method) = object.get("method").and_then(Value::as_str) {
@@ -179,7 +195,10 @@ impl ConversationState {
         }
 
         let Some(result) = object.get("result") else {
-            return ConversationFold::Nothing;
+            return match (object.get("id"), object.get("error")) {
+                (Some(_), Some(_)) => ConversationFold::Nothing,
+                _ => self.unknown_event(),
+            };
         };
         if let Some(thread_id) = result
             .get("thread")
@@ -193,7 +212,7 @@ impl ConversationState {
         }
         if let Some(turn) = result.get("turn") {
             let Some(turn_id) = turn.get("id").and_then(Value::as_str) else {
-                return ConversationFold::Nothing;
+                return self.unknown_event();
             };
             self.turn_id = Some(turn_id.to_string());
             self.turn_status = turn
@@ -217,7 +236,7 @@ impl ConversationState {
                     .and_then(|status| status.get("type"))
                     .and_then(Value::as_str)
                 else {
-                    return ConversationFold::Nothing;
+                    return self.unknown_event();
                 };
                 self.thread_status = Some(status.to_string());
                 ConversationFold::ThreadStatus {
@@ -227,7 +246,7 @@ impl ConversationState {
             "item/started" => {
                 let item = &params["item"];
                 let Some(item_id) = item["id"].as_str() else {
-                    return ConversationFold::Nothing;
+                    return self.unknown_event();
                 };
                 match item["type"].as_str() {
                     Some("reasoning") => {
@@ -252,19 +271,24 @@ impl ConversationState {
                     }
                     Some("commandExecution") => {
                         let Some(command) = command_execution(item) else {
-                            return ConversationFold::Nothing;
+                            return self.unknown_event();
                         };
                         self.upsert_command(command.clone());
                         ConversationFold::CommandStarted(command)
                     }
-                    _ => ConversationFold::Nothing,
+                    Some("userMessage" | "fileChange" | "mcpToolCall") => {
+                        ConversationFold::Nothing
+                    }
+                    _ => self.unknown_event(),
                 }
             }
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
                 let Some(item_id) = params["itemId"].as_str() else {
-                    return ConversationFold::Nothing;
+                    return self.unknown_event();
                 };
-                let text = params["delta"].as_str().unwrap_or_default().to_string();
+                let Some(text) = params["delta"].as_str().map(str::to_string) else {
+                    return self.unknown_event();
+                };
                 if let Some(item) = self.reasoning_items.iter_mut().find(|item| item.id == item_id) {
                     item.text.push_str(&text);
                 }
@@ -274,8 +298,13 @@ impl ConversationState {
                 }
             }
             "item/agentMessage/delta" => {
-                let item_id = params["itemId"].as_str().unwrap_or_default().to_string();
-                let text = params["delta"].as_str().unwrap_or_default().to_string();
+                let (Some(item_id), Some(text)) =
+                    (params["itemId"].as_str(), params["delta"].as_str())
+                else {
+                    return self.unknown_event();
+                };
+                let item_id = item_id.to_string();
+                let text = text.to_string();
                 if let Some(message) = self
                     .assistant_messages
                     .iter_mut()
@@ -291,7 +320,7 @@ impl ConversationState {
             "item/completed" => {
                 let item = &params["item"];
                 let Some(item_id) = item["id"].as_str() else {
-                    return ConversationFold::Nothing;
+                    return self.unknown_event();
                 };
                 match item["type"].as_str() {
                     Some("agentMessage") => {
@@ -336,18 +365,21 @@ impl ConversationState {
                     }
                     Some("commandExecution") => {
                         let Some(command) = command_execution(item) else {
-                            return ConversationFold::Nothing;
+                            return self.unknown_event();
                         };
                         self.upsert_command(command.clone());
                         ConversationFold::CommandCompleted(command)
                     }
-                    _ => ConversationFold::Nothing,
+                    Some("userMessage" | "fileChange" | "mcpToolCall") => {
+                        ConversationFold::Nothing
+                    }
+                    _ => self.unknown_event(),
                 }
             }
             "turn/completed" => {
                 let turn = &params["turn"];
                 let Some(turn_id) = turn["id"].as_str() else {
-                    return ConversationFold::Nothing;
+                    return self.unknown_event();
                 };
                 self.turn_id = Some(turn_id.to_string());
                 self.turn_status = turn["status"].as_str().map(str::to_string);
@@ -366,8 +398,7 @@ impl ConversationState {
             | "thread/tokenUsage/updated"
             | "account/rateLimits/updated" => ConversationFold::Nothing,
             _ => {
-                self.unknown_events += 1;
-                ConversationFold::Nothing
+                self.unknown_event()
             }
         }
     }
@@ -385,8 +416,7 @@ impl ConversationState {
             "item/fileRead/requestApproval" => ("file-read", "Read", params.clone()),
             "item/fileChange/requestApproval" => ("file-change", "Write", params.clone()),
             _ => {
-                self.unknown_events += 1;
-                return ConversationFold::Nothing;
+                return self.unknown_event();
             }
         };
         let available_decisions = params
@@ -429,6 +459,18 @@ impl ConversationState {
         {
             Some(existing) => *existing = command,
             None => self.command_executions.push(command),
+        }
+    }
+
+    fn unknown_event(&mut self) -> ConversationFold {
+        self.unknown_events += 1;
+        ConversationFold::Nothing
+    }
+
+    pub fn drift(&self) -> Drift {
+        Drift {
+            unknown_events: self.unknown_events,
+            parse_errors: self.parse_errors,
         }
     }
 }
@@ -509,6 +551,14 @@ impl Access {
             "approvalsReviewer": "user",
         })
     }
+
+    fn turn_params(&self) -> Value {
+        json!({
+            "approvalPolicy": self.approval_policy,
+            "sandboxPolicy": self.sandbox,
+            "approvalsReviewer": "user",
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -522,11 +572,13 @@ pub(crate) enum Request {
         model: Option<String>,
         access: Access,
     },
-    // Ticket 09 activates resume; defining its access envelope here prevents
-    // that path from inheriting a previous reviewer by omission.
-    #[allow(dead_code)]
     ThreadResume { thread_id: String, access: Access },
-    TurnStart { thread_id: String, text: String },
+    TurnStart {
+        thread_id: String,
+        text: String,
+        model: Option<String>,
+        access: Option<Access>,
+    },
     TurnInterrupt { thread_id: String, turn_id: String },
 }
 
@@ -573,10 +625,22 @@ impl Request {
                 params["threadId"] = json!(thread_id);
                 params
             }
-            Request::TurnStart { thread_id, text } => json!({
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": text}],
-            }),
+            Request::TurnStart {
+                thread_id,
+                text,
+                model,
+                access,
+            } => {
+                let mut params = access
+                    .map(|access| access.turn_params())
+                    .unwrap_or_else(|| json!({}));
+                params["threadId"] = json!(thread_id);
+                params["input"] = json!([{"type": "text", "text": text}]);
+                if let Some(model) = model {
+                    params["model"] = json!(model);
+                }
+                params
+            }
             Request::TurnInterrupt { thread_id, turn_id } => json!({
                 "threadId": thread_id,
                 "turnId": turn_id,
@@ -1072,7 +1136,7 @@ mod tests {
             "serverRequests": server_requests,
         });
         let expected: Value = serde_json::from_str(
-            &std::fs::read_to_string(directory.join("01-provider-probe.expected.json"))
+            &std::fs::read_to_string(directory.join("01-provider-probe.probe.expected.json"))
                 .expect("reads the expected provider fold"),
         )
         .expect("the expected provider fold is JSON");
@@ -1138,6 +1202,8 @@ mod tests {
                 thread_id: "codex-thread-1".to_string(),
                 text: "Reply with exactly one short sentence saying hello. Do not use any tools."
                     .to_string(),
+                model: None,
+                access: None,
             }
             .message(3),
         ];
@@ -1149,6 +1215,19 @@ mod tests {
     fn the_handshake_policy_selects_the_terminal_fallback() {
         assert!(!Capabilities::current().idle_is_terminal());
         assert!(Capabilities::experimental().idle_is_terminal());
+    }
+
+    #[test]
+    fn a_turn_result_without_an_id_is_unknown_protocol_drift() {
+        let mut state = ConversationState::new();
+
+        let folded = state.fold_message(json!({
+            "result": {"turn": {"status": "inProgress", "error": null}}
+        }));
+
+        assert!(matches!(folded, ConversationFold::Nothing));
+        assert_eq!(state.unknown_events, 1);
+        assert_eq!(state.parse_errors, 0);
     }
 
     #[test]
@@ -1186,6 +1265,30 @@ mod tests {
                 vec![Decision::AcceptForSession, Decision::Decline]
             );
             assert_eq!(state.unknown_events, 0, "{method}");
+        }
+    }
+
+    #[test]
+    fn a_correlated_turn_start_with_no_usable_turn_is_unknown_drift() {
+        for result in [
+            json!({}),
+            json!({"turn": {}}),
+            json!({"turn": {"id": ""}}),
+            json!({"turn": {"id": " \t\n"}}),
+        ] {
+            let mut state = ConversationState::new();
+
+            assert_eq!(
+                state.fold_turn_start_response(result),
+                ConversationFold::Nothing
+            );
+            assert_eq!(
+                state.drift(),
+                Drift {
+                    unknown_events: 1,
+                    parse_errors: 0,
+                }
+            );
         }
     }
 

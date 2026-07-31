@@ -1,0 +1,28 @@
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.1"},"capabilities":{}}}}
+{"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (synthetic) unknown"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","method":"initialized"}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"<workspace>","model":"gpt-5.4-mini","approvalPolicy":"never","sandbox":"danger-full-access","approvalsReviewer":"user"}}}
+{"dir":"recv","msg":{"method":"future/sessionMetadata/changed","params":{"threadId":"codex-thread-1","revision":1}}}
+{"dir":"recv","msg":{"id":2,"result":{"thread":{"id":"codex-thread-1"},"cwd":"<workspace>"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"codex-thread-1","input":[{"type":"text","text":"Keep going after protocol drift."}]}}}
+{"dir":"recv","msg":{"id":3,"result":{"turn":{"status":"inProgress","error":null}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"hookPrompt","id":"unknown-hook-prompt"}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"plan","id":"unknown-plan"}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"dynamicToolCall","id":"unknown-dynamic-tool"}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"collabAgentToolCall","id":"unknown-collab-agent-tool"}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"subAgentActivity","id":"unknown-sub-agent-activity"}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"webSearch","id":"unknown-web-search"}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"imageView","id":"unknown-image-view"}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"sleep","id":"unknown-sleep"}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"imageGeneration","id":"unknown-image-generation"}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"enteredReviewMode","id":"unknown-entered-review"}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"exitedReviewMode","id":"unknown-exited-review"}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"contextCompaction","id":"unknown-context-compaction"}}}}
+{"dir":"recv","msg":{"method":"turn/plan/updated","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","plan":[]}}}
+{"dir":"recv","msg":{"method":"item/commandExecution/outputDelta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"future-command","delta":"future output"}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":"not the item object this envelope claims"}}}
+{"dir":"recv-raw","msg":"{\"method\":\"item/started\",\"params\":"}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"message-after-drift","text":"","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"message-after-drift","delta":"Still here."}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"message-after-drift","text":"Still here.","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","items":[{"type":"agentMessage","id":"message-after-drift","text":"Still here.","phase":"final_answer"}],"status":"completed","error":null,"durationMs":20}}}}

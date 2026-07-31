@@ -11,7 +11,7 @@
 //! agent did. Keeping the item ids separate preserves Codex's phase boundary
 //! without inventing an activity kind that the other driver does not produce.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -30,8 +30,9 @@ use crate::codex_protocol::{
 };
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
 use crate::config_store::ProviderProcessLifetime;
+use crate::protocol::Drift;
 use crate::session::{
-    Decided, Driver, Driving, Finished, Pushed, Reaped, Reply, Settles, Start,
+    Decided, Driver, Driving, Finished, Opened, Pushed, Reaped, Reply, Settles, Start,
 };
 use crate::settling::SessionStatus;
 use crate::threads::{Activity, Change};
@@ -106,11 +107,15 @@ pub(crate) struct Codex {
     folding: ConversationState,
     thread_id: String,
     active_turn_id: Option<String>,
+    turn_id_unavailable: bool,
+    model: Option<String>,
+    access: Access,
+    explicit_turn_config: bool,
     capabilities: Capabilities,
 }
 
 impl Driver for Codex {
-    async fn open(start: &Start) -> Result<Codex, String> {
+    async fn open(start: &Start) -> Result<Opened<Codex>, String> {
         let settings = start.driver.codex()?;
         let capabilities = Capabilities::current();
         let (binary, _) = crate::provider::resolve_codex(
@@ -132,35 +137,85 @@ impl Driver for Codex {
             )
         })?;
 
-        let opened = async {
-            let initialized = app_server.request(Request::Initialize).await?;
-            protocol::decode_initialize(initialized)?;
-            app_server.write(&protocol::initialized()).await?;
-            let access = Access::for_runtime_mode(&start.runtime_mode)?;
-            let thread = app_server
-                .request(Request::ThreadStart {
-                    cwd: start.workspace_root.clone(),
-                    model: start.model.clone(),
-                    access,
-                })
-                .await?;
-            protocol::decode_thread_start(thread)
-        }
-        .await;
-        let thread_id = match opened {
-            Ok(thread_id) => thread_id,
+        let access = match Access::for_runtime_mode(&start.runtime_mode) {
+            Ok(access) => access,
             Err(error) => {
                 app_server.stop().await;
                 return Err(error);
             }
         };
+        let opened = async {
+            let initialized = app_server.request(Request::Initialize).await?;
+            protocol::decode_initialize(initialized)?;
+            app_server.write(&protocol::initialized()).await?;
+            match &start.resume {
+                Some(resume) => {
+                    match app_server
+                        .request(Request::ThreadResume {
+                            thread_id: resume.clone(),
+                            access,
+                        })
+                        .await
+                        .and_then(protocol::decode_thread_start)
+                    {
+                        Ok(thread_id) => Ok((thread_id, None)),
+                        Err(error) => {
+                            let thread = app_server
+                                .request(Request::ThreadStart {
+                                    cwd: start.workspace_root.clone(),
+                                    model: start.model.clone(),
+                                    access,
+                                })
+                                .await?;
+                            let thread_id = protocol::decode_thread_start(thread)?;
+                            Ok((thread_id, Some(resume_failed(resume, &error))))
+                        }
+                    }
+                }
+                None => {
+                    let thread = app_server
+                        .request(Request::ThreadStart {
+                            cwd: start.workspace_root.clone(),
+                            model: start.model.clone(),
+                            access,
+                        })
+                        .await?;
+                    protocol::decode_thread_start(thread).map(|thread_id| (thread_id, None))
+                }
+            }
+        }
+        .await;
+        let (thread_id, resume_failure) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                app_server.stop().await;
+                return Err(error);
+            }
+        };
+        let changes = resume_failure
+            .map(|why| Change::Activity(Activity::failed("session.resume-failed", &why)))
+            .into_iter()
+            .collect();
 
-        Ok(Codex {
-            app_server,
-            folding: ConversationState::new(),
-            thread_id,
-            active_turn_id: None,
-            capabilities,
+        Ok(Opened {
+            driver: Codex {
+                app_server,
+                folding: ConversationState::new(),
+                thread_id: thread_id.clone(),
+                active_turn_id: None,
+                turn_id_unavailable: false,
+                model: start.model.clone(),
+                access,
+                // `thread/resume` has no model field. Restate the complete
+                // configuration on its first turn as well as after a retune.
+                explicit_turn_config: start.resume.is_some(),
+                capabilities,
+            },
+            decided: Decided {
+                changes,
+                agent_session: Some(thread_id),
+                ..Decided::default()
+            },
         })
     }
 
@@ -174,16 +229,25 @@ impl Driver for Codex {
                 result: Ok(result),
                 ..
             } if method == "turn/start" => {
-                self.folding
-                    .fold_message(serde_json::json!({"result": result}))
+                driving.pushed.clear();
+                let folded = self.folding.fold_turn_start_response(result);
+                self.turn_id_unavailable = !matches!(folded, ConversationFold::TurnStarted { .. });
+                folded
             }
             Observed::Response {
                 method,
                 result: Err(error),
                 ..
             } if method == "turn/start" => {
+                driving.pushed.clear();
                 self.active_turn_id = None;
-                return Some(settle(driving, Ending::Failed(error), None));
+                self.turn_id_unavailable = false;
+                return Some(settle(
+                    driving,
+                    Ending::Failed(error),
+                    None,
+                    self.folding.drift(),
+                ));
             }
             Observed::Response {
                 method,
@@ -193,7 +257,7 @@ impl Driver for Codex {
                 && self.active_turn_id.as_deref() == Some(interrupted_turn.as_str()) =>
             {
                 self.active_turn_id = None;
-                return Some(settle_interrupted(driving));
+                return Some(settle_interrupted(driving, self.folding.drift()));
             }
             Observed::Response {
                 method,
@@ -226,43 +290,55 @@ impl Driver for Codex {
             &folded,
             ConversationFold::ThreadStatus { status } if status == "idle"
         );
-                let stale_completion = matches!(
-                    &folded,
-                    ConversationFold::TurnCompleted(completion)
-                        if self.active_turn_id.as_deref() != Some(completion.turn_id.as_str())
-                );
-                if stale_completion {
-                    return Some(Decided::default());
-                }
-                match &folded {
-                    ConversationFold::TurnStarted { turn_id } => {
-                        self.active_turn_id = Some(turn_id.clone());
-                    }
-                    ConversationFold::TurnCompleted(_) => {
-                        self.active_turn_id = None;
-                    }
-                    _ => {}
-                }
-                let decided = decide(folded, driving);
-                // Empty capabilities promise the completion that carries the
-                // outcome, so idle cannot win that race. Experimental API omits
-                // completion; the handshake policy flips this fallback with it.
-                if idle
-                    && self.capabilities.idle_is_terminal()
-                    && driving.turn.is_some()
-                    && decided.settles.is_none()
-                {
-                    self.active_turn_id = None;
-                    return Some(settle(driving, Ending::Completed, None));
-                }
-                Some(decided)
+        let stale_completion = match (&folded, self.active_turn_id.as_deref()) {
+            (ConversationFold::TurnCompleted(completion), Some(active_turn_id)) => {
+                active_turn_id != completion.turn_id
+            }
+            (ConversationFold::TurnCompleted(_), None) => !self.turn_id_unavailable,
+            _ => false,
+        };
+        if stale_completion {
+            return Some(Decided::default());
+        }
+        match &folded {
+            ConversationFold::TurnStarted { turn_id } => {
+                self.active_turn_id = Some(turn_id.clone());
+                self.turn_id_unavailable = false;
+            }
+            ConversationFold::TurnCompleted(_) => {
+                self.active_turn_id = None;
+                self.turn_id_unavailable = false;
+            }
+            _ => {}
+        }
+        let drift = self.folding.drift();
+        let decided = decide(folded, driving, drift);
+        // Empty capabilities promise the completion that carries the outcome,
+        // so idle cannot win that race. Experimental API omits completion; the
+        // handshake policy flips this fallback with it.
+        if idle
+            && self.capabilities.idle_is_terminal()
+            && driving.turn.is_some()
+            && decided.settles.is_none()
+        {
+            self.active_turn_id = None;
+            return Some(settle(driving, Ending::Completed, None, drift));
+        }
+        Some(decided)
     }
 
     async fn send(&mut self, text: &str) -> std::io::Result<()> {
+        self.turn_id_unavailable = false;
+        let (model, access) = match self.explicit_turn_config {
+            true => (self.model.clone(), Some(self.access)),
+            false => (None, None),
+        };
         self.app_server
             .send_request(Request::TurnStart {
                 thread_id: self.thread_id.clone(),
                 text: text.to_string(),
+                model,
+                access,
             })
             .await
             .map(|_| ())
@@ -312,10 +388,17 @@ impl Driver for Codex {
         Ok(())
     }
 
-    async fn retune(&mut self, _request_id: &str, _asked: &Pushed) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "Codex model and access changes have not been implemented",
-        ))
+    async fn retune(&mut self, _request_id: &str, asked: &Pushed) -> std::io::Result<()> {
+        match asked {
+            Pushed::Model { asked, .. } => {
+                self.model = Some(asked.clone());
+            }
+            Pushed::Mode { asked, .. } => {
+                self.access = Access::for_runtime_mode(asked).map_err(std::io::Error::other)?;
+            }
+        }
+        self.explicit_turn_config = true;
+        Ok(())
     }
 
     fn close_input(&mut self) {
@@ -337,7 +420,14 @@ impl Driver for Codex {
     }
 }
 
-fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
+fn resume_failed(thread_id: &str, error: &str) -> String {
+    format!(
+        "Codex could not resume thread {thread_id}, so it started a fresh thread. The previous \
+         context is no longer available to the agent. The resume failed with: {error}"
+    )
+}
+
+fn decide(folded: ConversationFold, driving: &mut Driving, drift: Drift) -> Decided {
     let mut decided = Decided::default();
     match folded {
         ConversationFold::Nothing
@@ -432,7 +522,7 @@ fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
                 (false, Some(error)) => Ending::Failed(error),
                 (false, None) => Ending::Completed,
             };
-            return settle(driving, ending, completion.duration_ms);
+            return settle(driving, ending, completion.duration_ms, drift);
         }
     }
     decided
@@ -495,7 +585,12 @@ impl Ending {
     }
 }
 
-fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> Decided {
+fn settle(
+    driving: &mut Driving,
+    ending: Ending,
+    duration_ms: Option<u64>,
+    total_drift: Drift,
+) -> Decided {
     let Some(finished) = driving.turn.take() else {
         return Decided::default();
     };
@@ -508,7 +603,11 @@ fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> De
         });
     }
 
-    let summary = ending.summary(duration_ms);
+    let drift = driving.drift_to_report(total_drift);
+    let mut summary = ending.summary(duration_ms);
+    if let Some(drifted) = drift_clause(drift) {
+        summary.push_str(&format!(" · {drifted}"));
+    }
     let mut activity = Activity::info(
         "turn.completed",
         &summary,
@@ -517,6 +616,8 @@ fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> De
             "totalCostUsd": Value::Null,
             "isError": failed,
             "interrupted": ending.stopped(),
+            "unknownEvents": total_drift.unknown_events,
+            "parseErrors": total_drift.parse_errors,
         }),
         Some(turn_id.clone()),
     );
@@ -535,7 +636,7 @@ fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> De
     }
 }
 
-fn settle_interrupted(driving: &mut Driving) -> Decided {
+fn settle_interrupted(driving: &mut Driving, drift: Drift) -> Decided {
     let Some(active) = driving.turn.as_mut() else {
         return Decided::default();
     };
@@ -552,17 +653,34 @@ fn settle_interrupted(driving: &mut Driving) -> Decided {
             // text closes the stream while preserving its accumulated deltas.
             text: String::new(),
         });
-    let mut decided = settle(driving, Ending::Stopped, None);
+    let mut decided = settle(driving, Ending::Stopped, None, drift);
     if let Some(closing) = closing {
         decided.changes.insert(0, closing);
     }
     decided
 }
 
+fn drift_clause(drift: Drift) -> Option<String> {
+    if drift.is_clean() {
+        return None;
+    }
+    let mut said = Vec::new();
+    if drift.unknown_events > 0 {
+        let events = if drift.unknown_events == 1 { "event" } else { "events" };
+        said.push(format!("{} unrecognised {events}", drift.unknown_events));
+    }
+    if drift.parse_errors > 0 {
+        let lines = if drift.parse_errors == 1 { "line" } else { "lines" };
+        said.push(format!("{} unreadable {lines}", drift.parse_errors));
+    }
+    Some(said.join(" and "))
+}
+
 struct AppServer {
     child: AsyncChild,
     stdin: Option<AsyncChildStdin>,
     output: async_mpsc::Receiver<String>,
+    deferred: VecDeque<String>,
     pending: HashMap<u64, Pending>,
     next_id: u64,
     complaint: Arc<Mutex<Option<String>>>,
@@ -628,6 +746,7 @@ impl AppServer {
             child,
             stdin: Some(stdin),
             output,
+            deferred: VecDeque::new(),
             pending: HashMap::new(),
             next_id: 1,
             complaint,
@@ -642,13 +761,15 @@ impl AppServer {
                 .await
                 .map_err(|_| "Codex stopped answering a request".to_string())?
                 .ok_or_else(|| "Codex stopped before answering a request".to_string())?;
-            match protocol::decode_incoming(&line)? {
-                Incoming::Request { id, method, .. } => {
+            match protocol::decode_incoming(&line) {
+                Ok(Incoming::Request { id, method, .. }) => {
                     self.write(&protocol::unsupported_request(&id, &method)).await?;
+                    self.deferred.push_back(line);
                 }
-                Incoming::Notification => {}
-                Incoming::Response { id: response_id, result } => {
+                Ok(Incoming::Notification) | Err(_) => self.deferred.push_back(line),
+                Ok(Incoming::Response { id: response_id, result }) => {
                     if self.pending.remove(&response_id).is_none() {
+                        self.deferred.push_back(line);
                         continue;
                     }
                     if response_id == id {
@@ -692,6 +813,9 @@ impl AppServer {
     }
 
     async fn next_line(&mut self) -> Option<String> {
+        if let Some(line) = self.deferred.pop_front() {
+            return Some(line);
+        }
         self.output.recv().await
     }
 

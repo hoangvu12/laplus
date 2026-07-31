@@ -205,7 +205,7 @@ use crate::worklog::{Call, Decision};
 pub(crate) trait Driver: Send + Sized {
     /// Start the agent for this session, or say why not in a sentence the
     /// developer will read in the conversation.
-    fn open(start: &Start) -> impl Future<Output = Result<Self, String>> + Send;
+    fn open(start: &Start) -> impl Future<Output = Result<Opened<Self>, String>> + Send;
 
     /// The next thing the agent said, folded and translated into what the
     /// conversation is owed. `None` once it has stopped producing.
@@ -291,6 +291,17 @@ pub(crate) enum Reply<'a> {
     /// What the developer typed into a question. Carried unread — the answers
     /// are their own words, and nothing here has any business parsing them.
     Answers(&'a Value),
+}
+
+/// A driver and everything its successful startup already decided.
+///
+/// Startup sits outside the selectable event loop, so these changes cannot be
+/// dropped when a prompt and an agent event are ready together. Claude has
+/// nothing to report here; Codex returns its continuity handle and, after a
+/// recoverable resume refusal, the activity explaining its fresh thread.
+pub(crate) struct Opened<D> {
+    pub(crate) driver: D,
+    pub(crate) decided: Decided,
 }
 
 /// What a driver leaves behind when the agent has gone.
@@ -447,8 +458,11 @@ async fn drive<D: Driver>(
     mut signals: tokio::sync::mpsc::Receiver<Signal>,
     epoch: u64,
 ) {
-    let mut driver = match D::open(&start).await {
-        Ok(driver) => driver,
+    let Opened {
+        mut driver,
+        decided: opened,
+    } = match D::open(&start).await {
+        Ok(opened) => opened,
         Err(why) => {
             // The session never existed, so there is no turn to attribute the
             // failure to beyond the one that asked for it. Reported in the
@@ -472,6 +486,7 @@ async fn drive<D: Driver>(
             return;
         }
     };
+    spend(&threads, &start, opened);
 
     let mut driving = Driving {
         turn: None,
@@ -502,6 +517,10 @@ async fn drive<D: Driver>(
     // function, where the difference it makes is that a turn cut short by *this*
     // is not reported as the agent having died: they asked.
     let mut asked_to_stop = false;
+    // A prompt write failed before the driver could begin the turn. Kept until
+    // reaping so the shared ending reports the error without pretending the
+    // agent had started work or asking either driver to duplicate this policy.
+    let mut send_failure = None;
 
     'session: loop {
         // Anything already owed to the turn that just ended is dealt with before
@@ -594,6 +613,9 @@ async fn drive<D: Driver>(
                 baseline(&threads, &start).await;
                 if let Err(error) = driver.send(&prompt.text).await {
                     eprintln!("laplus: cannot send a turn to the agent: {error}");
+                    send_failure = Some(format!(
+                        "The turn could not be sent to the agent: {error}"
+                    ));
                     break;
                 }
                 driving.turn = Some(InFlight {
@@ -770,6 +792,12 @@ async fn drive<D: Driver>(
     // (`CONTEXT.md`, *Settling*): from the turn's point of view it did not finish,
     // and nothing went wrong.
     let Reaped { refused, death } = driver.stop(&mut driving, asked_to_stop).await;
+    if let Some(why) = &send_failure {
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(Activity::failed("session.failed", why)),
+        );
+    }
     if let Some(why) = &refused {
         threads.apply(
             &start.thread_id,
@@ -804,7 +832,7 @@ async fn drive<D: Driver>(
     // running now.
     let ours = threads.detach(&start.thread_id, epoch);
 
-    let failure = refused.or(death);
+    let failure = send_failure.or(refused).or(death);
     if ours {
         threads.apply(
             &start.thread_id,

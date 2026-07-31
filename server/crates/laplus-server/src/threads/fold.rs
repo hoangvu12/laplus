@@ -918,7 +918,7 @@ impl Thread {
     ///
     /// - **There is no session.** A session is a running process, and after a
     ///   restart there is none. The first turn on this thread starts one, with
-    ///   `--resume` pointed at [`Thread::agent_session_id`].
+    ///   the driver's resume request pointed at [`Thread::agent_session_id`].
     /// - **A turn that was still `running` becomes `interrupted`.** The app
     ///   stopped in the middle of it and nothing is going to finish it, so
     ///   leaving it `running` would show a conversation working forever. The

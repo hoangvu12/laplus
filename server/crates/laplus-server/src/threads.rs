@@ -905,16 +905,16 @@ impl Threads {
             .max()
     }
 
-    /// Remember the `claude` session the agent announced for this thread.
+    /// Remember the driver's own continuity handle for this thread.
     ///
     /// Nothing is published, and that is not an omission: no event in the
     /// contract describes this and no client renders it. It is the server's own
-    /// handle on the agent's memory — what `--resume` will be given — so what it
-    /// owes is a durable write and nothing else. The `session.init` activity
-    /// beside it is where the same id becomes visible.
+    /// handle on the agent's memory — Claude receives it as `--resume` and Codex
+    /// as the id in `thread/resume` — so what it owes is a durable write and
+    /// nothing else.
     ///
     /// An id the thread already holds is dropped rather than rewritten. A
-    /// resumed session announces one on every start, and a row that says what it
+    /// resumed driver returns one on every open, and a row that says what it
     /// already said is a disk touch for nothing.
     pub fn remember_agent_session(&self, thread_id: &str, session_id: &str) {
         let Some(entry) = self.find(thread_id) else {

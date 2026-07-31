@@ -1,0 +1,64 @@
+{
+  "version": "0.146.0",
+  "auth": {
+    "status": "authenticated",
+    "type": "chatgpt",
+    "label": "ChatGPT Pro 5x Subscription",
+    "email": "developer@example.com"
+  },
+  "models": [
+    {
+      "slug": "gpt-5.6-sol",
+      "name": "gpt-5.6-sol",
+      "isCustom": false,
+      "capabilities": {
+        "optionDescriptors": [
+          {
+            "id": "reasoningEffort",
+            "label": "Reasoning",
+            "type": "select",
+            "options": [
+              { "id": "low", "label": "Low" },
+              { "id": "high", "label": "High", "isDefault": true }
+            ],
+            "currentValue": "high"
+          }
+        ]
+      }
+    },
+    {
+      "slug": "gpt-5.6-luna",
+      "name": "gpt-5.6-luna",
+      "isCustom": false,
+      "isDefault": true,
+      "capabilities": {
+        "optionDescriptors": [
+          {
+            "id": "reasoningEffort",
+            "label": "Reasoning",
+            "type": "select",
+            "options": [
+              { "id": "minimal", "label": "Minimal" },
+              { "id": "medium", "label": "Medium", "isDefault": true },
+              { "id": "high", "label": "High" }
+            ],
+            "currentValue": "medium"
+          }
+        ]
+      }
+    }
+  ],
+  "skills": [
+    {
+      "name": "tdd",
+      "path": "<workspace>/.agents/skills/tdd/SKILL.md",
+      "enabled": true,
+      "description": "Build one observable slice at a time.",
+      "scope": "repo",
+      "shortDescription": "Red, green, refactor.",
+      "displayName": "Test Driven Development"
+    }
+  ],
+  "notificationsIgnored": 3,
+  "serverRequests": [{ "id": 2, "method": "fixture/request" }]
+}

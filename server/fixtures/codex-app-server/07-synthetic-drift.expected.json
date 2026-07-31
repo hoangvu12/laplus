@@ -1,0 +1,18 @@
+{
+  "threadId": "codex-thread-1",
+  "turnId": "codex-turn-1",
+  "threadStatus": null,
+  "turnStatus": "completed",
+  "turnError": null,
+  "assistantMessages": [
+    {
+      "id": "message-after-drift",
+      "text": "Still here.",
+      "phase": "final_answer"
+    }
+  ],
+  "reasoningItems": [],
+  "commandExecutions": [],
+  "unknownEvents": 17,
+  "parseErrors": 1
+}
