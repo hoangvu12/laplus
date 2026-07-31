@@ -1,6 +1,11 @@
 //! Method dispatch: a request tag in, an answer out.
 //!
-//! The vocabulary is roughly sixty methods. Twenty-five are implemented — the
+//! The vocabulary is roughly sixty methods, and what this server answers of it
+//! is counted in `.scratch/contract-parity/ledger.md` rather than here — a
+//! figure in prose is a claim nothing re-checks, and this one had gone stale by
+//! ten.
+//!
+//! What is answered is the
 //! configuration the UI fetches before it can do anything else and the
 //! subscription that keeps it current, the command that writes the project
 //! registry and starts a conversation, the subscription that *is* the project
@@ -10,8 +15,9 @@
 //! and save one of those files, the one that hands a file to the developer's
 //! own editor, the five that open a terminal, read it, type into it, resize
 //! it and list them, the two that say what has changed in the working tree
-//! and keep saying it, the four that list the branches, move between them,
-//! make one and make the repository a project has not got yet, and the two that
+//! and keep saying it, the five that list the branches, move between them,
+//! make one, take a second checkout off disk and make the repository a project
+//! has not got yet, and the two that
 //! read one turn and a whole conversation back as a diff — and every other tag
 //! lands in the unknown-method path, which is itself part of the contract, is
 //! pinned by a capture, and refuses under a tag the method it names declares.
@@ -40,7 +46,7 @@ use crate::filesystem::{self, Browse, Index, ListEntries, SearchEntries};
 use crate::git::{self, Repositories, StatusCall};
 use crate::keybindings::{self, Upsert};
 use crate::orchestration::{self, Shell};
-use crate::refs::{self, CreateRef, Init, ListRefs, SwitchRef};
+use crate::refs::{self, CreateRef, Init, ListRefs, RemoveWorktree, SwitchRef};
 use crate::settings;
 use crate::subscriptions::EventSource;
 use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
@@ -429,8 +435,8 @@ pub fn dispatch(
                 Answer::Deferred(Deferred::new(move || repositories.refresh(&call)))
             })
             .map_err(DispatchError::Declared),
-        // The four branch methods. All of them run git and none of them
-        // streams, so all of them are deferred — and the three that change
+        // The five ref-shaped methods. All of them run git and none of them
+        // streams, so all of them are deferred — and the four that change
         // something take the registry with them, because a working tree they
         // moved is one a panel is still describing from before.
         refs::LIST_REFS => ListRefs::read(payload)
@@ -440,6 +446,9 @@ pub fn dispatch(
             .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
             .map_err(DispatchError::Declared),
         refs::SWITCH_REF => SwitchRef::read(payload)
+            .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
+            .map_err(DispatchError::Declared),
+        refs::REMOVE_WORKTREE => RemoveWorktree::read(payload)
             .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
             .map_err(DispatchError::Declared),
         refs::INIT => Init::read(payload)

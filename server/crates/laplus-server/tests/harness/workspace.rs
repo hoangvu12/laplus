@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::SocketClient;
+
 /// A throwaway project, written out from a list of paths.
 ///
 /// A path ending in `/` is an empty directory; anything else is a file, and
@@ -155,6 +157,38 @@ impl Workspace {
     /// Delete a file, the way a developer or an agent would.
     pub fn remove(&self, path: &str) {
         std::fs::remove_file(self.path().join(path)).expect("removes the file");
+    }
+}
+
+impl SocketClient {
+    /// Read a `subscribeVcsStatus` subscription until it says something, and
+    /// hand back the local half of what it said.
+    ///
+    /// The one way a test asks "and can the developer see it?", which is half of
+    /// `socket_branches.rs`'s doctrine and so is wanted by every file that
+    /// changes a working tree. It lives here rather than in each of them because
+    /// the second copy is where a shared reader stops being one — the same rule
+    /// that moved `revert_checkpoint` and `turn_diff` into
+    /// [`super::conversation`].
+    ///
+    /// Every event is asserted to be a `snapshot`: this server never sends the
+    /// union's other two variants, and a test that quietly folded one would be
+    /// describing a server that does not exist. See `Status::to_snapshot`.
+    pub async fn status_until(
+        &mut self,
+        request_id: &str,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let seen = self
+            .values_until(request_id, |event| {
+                assert_eq!(event["_tag"], Value::from("snapshot"), "unexpected event: {event}");
+                wanted(&event["local"])
+            })
+            .await;
+        seen.into_iter()
+            .last()
+            .expect("at least one status")["local"]
+            .clone()
     }
 }
 

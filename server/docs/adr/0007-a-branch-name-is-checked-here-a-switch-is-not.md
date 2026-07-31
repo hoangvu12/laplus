@@ -1,7 +1,24 @@
 # ADR-0007 — A branch name is checked here; a switch is not
 
 Date: 2026-07-27
-Status: Accepted
+Status: Accepted; one sentence in Consequences amended on 2026-07-31
+
+> **`crate::refs` now contains a `--force`.** `vcs.removeWorktree` landed there
+> (ticket 02 of `.scratch/vcs/`), and it passes the flag through when the caller
+> asks for it — so "there is no flag anywhere in `crate::refs` that could throw
+> work away" is no longer true as written. The decision above is unchanged, and
+> so is the sentence's intent, which was about a **switch**: nothing here forces
+> a checkout over the developer's uncommitted work, and `SwitchRef` still carries
+> git's refusal through untouched.
+>
+> What the removal does is narrower, and it is why the same reasoning permits it.
+> The flag is **never this server's idea** — it is a field on the payload,
+> defaulting to false, and without it git refuses a worktree with modified or
+> untracked files in exactly the words this ADR argues for. The only caller that
+> sends `true` is the delete-conversation dialogue, where the developer has
+> already been asked and has already answered. So the property survives in the
+> form that mattered: this server does not decide that work is expendable.
+> Someone else does, and says so.
 
 ## Context
 
@@ -70,6 +87,9 @@ Nothing here passes `--force`, `--discard-changes` or `-B`. That is what makes
 there is no flag anywhere in `crate::refs` that could throw work away, so the
 only way to lose uncommitted changes through this server is for git itself to
 decide they were not at risk.
+
+<!-- Amended 2026-07-31; see the note under Status. The paragraph above is kept
+as written because it is the reasoning the amendment narrows. -->
 
 The validator is one of the few places in this repository where a rule is
 copied from another program rather than delegated to it. If that copy is ever

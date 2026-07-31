@@ -19,7 +19,7 @@ The counts below are cheap to reproduce. Reproduce them.
 
 | Surface                              | Declared | Answered |
 | ------------------------------------ | -------- | -------- |
-| RPC methods (`Rpc.make` in `rpc.ts`) | 60       | **35**   |
+| RPC methods (`Rpc.make` in `rpc.ts`) | 60       | **36**   |
 | Dispatchable orchestration commands  | 20       | **20**   |
 
 `projects.list`, `projects.add` and `projects.remove` appear in `WS_METHODS` but
@@ -88,9 +88,9 @@ to `DEFAULT_RUNTIME_MODE` (`full-access`) or `DEFAULT_PROVIDER_INTERACTION_MODE`
 the identical `model_selection` degradation that already sits in the same
 function. Low priority, behind everything in Gap 2.
 
-## Gap 2 — RPC methods: 35 of 60
+## Gap 2 — RPC methods: 36 of 60
 
-Twenty-five refused. `refusals.rs` enumerates all sixty and the error tag a
+Twenty-four refused. `refusals.rs` enumerates all sixty and the error tag a
 refusal carries, so it is the place to read what a client sees.
 
 **Two of the twenty-seven this file first counted are gone**, in the two commits
@@ -105,7 +105,7 @@ record than one that says which entries have closed.
 | -------------------------- | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Preview + automation       | 12  | `preview.{open,navigate,resize,refresh,close,list,reportStatus}`, `previewAutomation.{connect,respond,focusHost}`, `subscribePreviewEvents`, `subscribeDiscoveredLocalServers` |
 | Server admin + diagnostics | 7   | `server.{refreshProviders,updateProvider,updateServer,getTraceDiagnostics,getProcessDiagnostics,getProcessResourceHistory,signalProcess}`                                      |
-| Worktrees + pull           | 3   | `vcs.{pull,createWorktree,removeWorktree}`                                                                                                                                     |
+| Worktrees + pull           | 2   | `vcs.{pull,createWorktree}` — `removeWorktree` is answered                                                                                                                     |
 | Streams                    | 2   | `subscribeTerminalEvents`, `subscribeServerLifecycle`                                                                                                                          |
 | Review                     | 1   | `review.getDiffPreview`                                                                                                                                                        |
 
@@ -115,9 +115,9 @@ record than one that says which entries have closed.
 `previewAutomation.connect` had four, `subscribeTerminalEvents` and
 `server.probe` three each. Every other one had at least one. The single exception
 was `replayEvents`, and that is what decided its fate. Past tense throughout,
-because two of the twenty-seven have since closed; the finding it supports —
+because three of the twenty-seven have since closed; the finding it supports —
 that this gap is UI calling a server that does not answer — is unchanged for the
-twenty-five that remain.
+twenty-four that remain.
 
 ### `orchestration.replayEvents` should be deleted, not implemented — **done**
 
@@ -315,7 +315,7 @@ walks straight into the removed surface.
 ## What the clusters cost
 
 Non-test TypeScript under `apps/server/src/`, as a rough sizing signal only —
-laplus does not reimplement upstream line for line, and 35 of 60 methods already
+laplus does not reimplement upstream line for line, and 36 of 60 methods already
 fit in 54k lines of `crates/laplus-server/src` (`find . -name '*.rs' | xargs wc -l`,
 so comments and unit tests included; `cargo xtask release` reports the
 production-code figure separately).
@@ -348,7 +348,11 @@ one sequence.
    an empty payload and stream one event type, and their siblings
    `subscribeTerminalMetadata`, `subscribeAuthAccess` and `subscribeServerConfig`
    are already implemented in that shape.
-5. `vcs.pull`, then the two worktree methods.
+5. `vcs.pull`, then the two worktree methods. **In progress** as
+   `.scratch/vcs/`, which took the cluster in its own order rather than this
+   one: `removeWorktree` first, because it is the only one of the three with a
+   live UI path — the delete-conversation flow offers to remove a worktree and
+   until then could not. `createWorktree` and `pull` remain.
 6. Server admin and diagnostics: `refreshProviders` + `updateProvider` together,
    the diagnostics trio, `signalProcess`, then self-update as three tickets —
    `desktop-managed`, `respawn`, `boot-service`.
@@ -401,7 +405,7 @@ which resolve against the `as const` map in
 `packages/contracts/src/orchestration.ts:25`. The two maps hold 57 and 6 keys;
 `projects.{list,add,remove}` have no `Rpc.make`, so 63 strings are 60 methods.
 
-**Answered RPC methods — 35.** The arms of the `match tag` in
+**Answered RPC methods — 36.** The arms of the `match tag` in
 `server/crates/laplus-server/src/rpc.rs`, with each `pub const … &str` resolved.
 Bounded by the function rather than by line numbers, which is the correction this
 file's first version needed: it hardcoded `NR>=262 && NR<=470`, and `dispatch`
@@ -412,7 +416,7 @@ awk '/^pub fn dispatch\(/,/^}/' server/crates/laplus-server/src/rpc.rs \
   | grep -oE '^        [A-Za-z_:]+ =>' | sed 's/ =>//;s/^ *//' | grep -v '^unknown$' | wc -l
 ```
 
-**The refused set — 25.** `REFUSALS` in `refusals.rs` is the contract's own list
+**The refused set — 24.** `REFUSALS` in `refusals.rs` is the contract's own list
 read out, so subtracting the answered set from it gives the gap without a second
 list to drift:
 
@@ -420,7 +424,7 @@ list to drift:
 awk '/const REFUSALS: &\[\(&str, Tag\)\] = &\[/,/^\];/' \
   server/crates/laplus-server/src/refusals.rs \
   | grep -oE '^\s+\("[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' | sort > /tmp/declared.txt
-# resolve the 35 arms above to their wire strings into /tmp/implemented.txt, then
+# resolve the 36 arms above to their wire strings into /tmp/implemented.txt, then
 comm -23 /tmp/declared.txt /tmp/implemented.txt
 ```
 

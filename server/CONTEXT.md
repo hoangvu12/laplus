@@ -621,9 +621,9 @@ becomes one read.
 because a status that cannot be watched cannot stay true.
 
 **Disturb** — telling a kept working tree it is stale because _this server_
-just changed it, rather than waiting for the watcher to notice. What a switch
-and an init do. The same door a file change comes through, opened from the
-inside; see ADR-0006 for why it marks rather than reads.
+just changed it, rather than waiting for the watcher to notice. What a switch,
+an init and a worktree removal do. The same door a file change comes through,
+opened from the inside; see ADR-0006 for why it marks rather than reads.
 
 ## Review
 

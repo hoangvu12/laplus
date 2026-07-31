@@ -1,12 +1,18 @@
-//! Refs: the branches a project has, the one it is on, and the repository it
-//! does not have yet.
+//! Refs: the branches a project has, the one it is on, the checkouts they live
+//! in, and the repository it does not have yet.
 //!
-//! Four method tags land here and they are one job: keeping a developer out of
+//! Five method tags land here and they are one job: keeping a developer out of
 //! a shell. `vcs.listRefs` is the branch picker, `vcs.switchRef` is choosing
 //! from it, `vcs.createRef` is starting work that does not have a branch yet,
-//! and `vcs.init` is the project that is not a repository at all — which
-//! [`crate::git`] already reports as a status rather than as a failure,
+//! `vcs.removeWorktree` is tidying up a second checkout that has outlived what
+//! it was for, and `vcs.init` is the project that is not a repository at all —
+//! which [`crate::git`] already reports as a status rather than as a failure,
 //! precisely so that this call has somewhere to land.
+//!
+//! A worktree method is here rather than in a module of its own because it is
+//! ref-shaped in every way that costs anything: the same `cwd`-rooted payload,
+//! the same error union, the same registry, and the same question — what can
+//! the developer do to a ref without opening a terminal.
 //!
 //! Git is driven by shelling out, the same as the status is, and through the
 //! same [`crate::git::output`] — which is where `--no-optional-locks`, the
@@ -17,7 +23,8 @@
 //!
 //! A switch moves `HEAD`, which changes the branch the status panel shows and
 //! usually the files it lists. An init turns "this is not a repository" into a
-//! status. So each of the three calls that change something tells
+//! status. A removal takes a folder off disk, which is a folder the status may
+//! have been listing. So each of the calls that change something tells
 //! [`crate::git::Repositories`] the working tree is stale, and the refresh that
 //! already exists publishes the new status to whoever is watching. The watcher
 //! would eventually notice `.git/HEAD` moving on its own; saying so directly is
@@ -25,7 +32,7 @@
 //!
 //! ## Where the work happens
 //!
-//! All four are unary and all four run git, so all four are
+//! All five are unary and all five run git, so all five are
 //! [`crate::rpc::Deferred`] — off the connection's read loop, like every other
 //! method that waits on the world. None of them streams.
 //!
@@ -37,14 +44,18 @@
 //! typed, and that a name arriving from a text field is the one input here that
 //! is neither a path nor a flag.
 //!
-//! What is deliberately *not* checked here is whether a switch is safe. git
-//! already refuses a switch that would overwrite uncommitted work, names the
-//! files, and says what to do about it — so that refusal is carried through
-//! verbatim rather than pre-empted by a worse sentence of this module's own.
+//! What is deliberately *not* checked here is whether a switch is safe, and
+//! whether a path is a worktree. git already refuses a switch that would
+//! overwrite uncommitted work, names the files, and says what to do about it;
+//! it already refuses to remove a path that is not a checkout of this
+//! repository, and says which path. Both refusals are carried through verbatim
+//! rather than pre-empted by a worse sentence of this module's own — and for the
+//! removal that is not only a matter of prose, since a pre-check that got the
+//! answer wrong would be a folder deleted on this module's authority.
 //!
 //! Shapes are hand-written from `VcsListRefsInput`, `VcsListRefsResult`,
 //! `VcsRef`, `VcsCreateRefInput`, `VcsCreateRefResult`, `VcsSwitchRefInput`,
-//! `VcsSwitchRefResult` and `VcsInitInput` in
+//! `VcsSwitchRefResult`, `VcsRemoveWorktreeInput` and `VcsInitInput` in
 //! `t3code/packages/contracts/src/git.ts`, and the errors from `GitCommandError`
 //! in the same file and the `VcsError` union in `vcs.ts`.
 
@@ -65,6 +76,9 @@ pub const CREATE_REF: &str = "vcs.createRef";
 
 /// Moving the working tree to another branch.
 pub const SWITCH_REF: &str = "vcs.switchRef";
+
+/// Taking a second checkout off disk when it has outlived what it was for.
+pub const REMOVE_WORKTREE: &str = "vcs.removeWorktree";
 
 /// Making a repository in a project that has none.
 pub const INIT: &str = "vcs.init";
@@ -703,6 +717,102 @@ impl SwitchRef {
 }
 
 // ---------------------------------------------------------------------------
+// Removing a worktree
+// ---------------------------------------------------------------------------
+
+/// A validated `vcs.removeWorktree`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveWorktree {
+    /// The repository the worktree belongs to — the project's own folder, not
+    /// the checkout being removed. git is run there, so a call that named the
+    /// worktree as its own `cwd` would be asking a folder to delete itself.
+    cwd: String,
+    path: String,
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveWorktreePayload {
+    cwd: String,
+    path: String,
+    force: Option<bool>,
+}
+
+impl RemoveWorktree {
+    pub fn read(payload: &Value) -> Result<RemoveWorktree, Value> {
+        let read: RemoveWorktreePayload = serde_json::from_value(payload.clone())
+            .map_err(|error| Unavailable::malformed(error).to_error(REMOVE_WORKTREE, ""))?;
+        let cwd = workspace(&read.cwd, REMOVE_WORKTREE)?;
+        // The one thing checked about the path, and it is the same thing
+        // [`git::workspace`] checks about a `cwd`: an empty path is not a
+        // mistyped one. It means the *server process's* own directory to git,
+        // so letting one through would ask git to remove a checkout nobody
+        // named. Everything else about the path is git's to judge.
+        let path = read.path.trim();
+        if path.is_empty() {
+            return Err(Unavailable::Unusable {
+                detail: "This call needs the path of a worktree; none was given.".to_string(),
+            }
+            .to_error(REMOVE_WORKTREE, &cwd));
+        }
+        Ok(RemoveWorktree {
+            cwd,
+            path: path.to_string(),
+            force: read.force.unwrap_or(false),
+        })
+    }
+
+    /// Remove the checkout at this path, and leave the ref it held alone.
+    ///
+    /// **Removing a checkout is not deleting a branch**, and nothing here makes
+    /// it one: `git worktree remove` takes a path, and the branch that was
+    /// current in that folder is still in the picker afterwards. Deleting it as
+    /// well would be a second operation nobody asked for and the one that could
+    /// lose work.
+    ///
+    /// **Force is passed through and not softened.** Without it git refuses a
+    /// worktree with modified or untracked files in it, names that as the
+    /// reason and says which flag would go ahead anyway — a better sentence
+    /// than this module could compose, and the refusal that stops laplus
+    /// quietly discarding a developer's uncommitted work. The
+    /// delete-conversation flow sends `force: true` because the developer has
+    /// already answered that question in the dialogue.
+    ///
+    /// **This is the one `--force` in this module, and ADR-0007 said there
+    /// would be none.** Its amendment note is why the reasoning still holds:
+    /// the flag is a field on the payload rather than a decision made here, it
+    /// defaults to false, and a switch — which is what that sentence was about
+    /// — still cannot be forced through anything.
+    ///
+    /// **Answers with `null`.** `vcs.removeWorktree` declares no success value,
+    /// and `Schema.Void` encodes to `null` over this wire.
+    pub fn run(self, repositories: &Repositories) -> Result<Value, Value> {
+        let root = root(&self.cwd, REMOVE_WORKTREE)?;
+
+        let mut arguments = vec!["worktree", "remove"];
+        if self.force {
+            arguments.push("--force");
+        }
+        // `--` because the path is the one argument here that is neither a flag
+        // nor a name this module checked, and a path beginning with `-` would
+        // otherwise be read as an option — by a command whose options include
+        // `--force`.
+        arguments.push("--");
+        arguments.push(&self.path);
+        change(root.path(), &arguments).map_err(|why| why.to_error(REMOVE_WORKTREE, &self.cwd))?;
+
+        // A folder went, and the status panel is describing the repository from
+        // before it did — which for a worktree nested under the project is a
+        // path it was listing as untracked. See ADR-0006 for why this marks
+        // rather than reads; a workspace nobody is watching makes it a no-op, so
+        // failing to disturb cannot fail a removal that already happened.
+        repositories.disturb(&root);
+        Ok(Value::Null)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Initialising
 // ---------------------------------------------------------------------------
 
@@ -1122,6 +1232,10 @@ mod tests {
         let error = SwitchRef::read(&json!({"cwd": "  ", "refName": "x"})).expect_err("a refusal");
         assert_eq!(error["_tag"], "GitCommandError");
 
+        let error =
+            RemoveWorktree::read(&json!({"cwd": "  ", "path": "/x"})).expect_err("a refusal");
+        assert_eq!(error["_tag"], "GitCommandError");
+
         // `vcs.init` declares a different error union entirely — `VcsError`,
         // which has no `GitCommandError` in it.
         let error = Init::read(&json!({"cwd": "  "})).expect_err("a refusal");
@@ -1148,6 +1262,45 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The one thing a removal checks about its path, and the reason it is
+    /// checked here rather than left to git: an empty path is not a path git
+    /// would refuse, it is the *server process's* own directory — so the call
+    /// that named nothing would have git considering a folder nobody in this
+    /// conversation has mentioned.
+    ///
+    /// Everything else about the path is git's, including whether it is a
+    /// worktree at all.
+    #[test]
+    fn a_removal_that_names_no_worktree_is_refused_before_git_sees_one() {
+        for path in ["", "   "] {
+            let error = RemoveWorktree::read(&json!({"cwd": "/project", "path": path}))
+                .expect_err("a refusal");
+            assert_eq!(error["_tag"], "GitCommandError");
+            assert_eq!(error["operation"], REMOVE_WORKTREE);
+            assert_eq!(error["cwd"], "/project");
+            assert!(
+                error["detail"]
+                    .as_str()
+                    .expect("a detail")
+                    .contains("none was given"),
+                "{error}"
+            );
+        }
+
+        // A path that is merely unlikely is *not* refused: only git knows
+        // whether it is a worktree of this repository, and its answer is the
+        // one the developer can act on.
+        let call = RemoveWorktree::read(&json!({"cwd": "/project", "path": "  /elsewhere  "}))
+            .expect("a call");
+        assert_eq!(call.path, "/elsewhere");
+        assert!(!call.force, "force is asked for, never assumed");
+
+        let forced =
+            RemoveWorktree::read(&json!({"cwd": "/project", "path": "/x", "force": true}))
+                .expect("a call");
+        assert!(forced.force);
     }
 
     /// `jj` is a kind the contract has and this server does not drive. The

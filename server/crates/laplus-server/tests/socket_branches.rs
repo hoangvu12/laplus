@@ -85,25 +85,6 @@ fn cloned() -> (Workspace, Workspace) {
     (clone, origin)
 }
 
-/// Read the status subscription until it says something, and hand back the
-/// local half.
-async fn status_until(
-    client: &mut SocketClient,
-    request_id: &str,
-    wanted: impl Fn(&Value) -> bool,
-) -> Value {
-    let seen = client
-        .values_until(request_id, |event| {
-            assert_eq!(event["_tag"], json!("snapshot"), "unexpected event: {event}");
-            wanted(&event["local"])
-        })
-        .await;
-    seen.into_iter()
-        .last()
-        .expect("at least one status")["local"]
-        .clone()
-}
-
 // ---------------------------------------------------------------------------
 // Listing
 // ---------------------------------------------------------------------------
@@ -377,7 +358,7 @@ async fn switching_moves_the_working_tree_and_the_status_follows() {
     let watching = client
         .subscribe("subscribeVcsStatus", json!({"cwd": workspace.cwd()}))
         .await;
-    status_until(&mut client, &watching, |status| {
+    client.status_until(&watching, |status| {
         status["refName"] == json!("main")
     })
     .await;
@@ -398,7 +379,7 @@ async fn switching_moves_the_working_tree_and_the_status_follows() {
     );
 
     // …and what the developer can see. Nothing asked for this.
-    let told = status_until(&mut client, &watching, |status| {
+    let told = client.status_until(&watching, |status| {
         status["refName"] == json!("feature/branches")
     })
     .await;
@@ -597,7 +578,7 @@ async fn a_branch_can_be_created_and_switched_to_in_one_call() {
     let watching = client
         .subscribe("subscribeVcsStatus", json!({"cwd": workspace.cwd()}))
         .await;
-    status_until(&mut client, &watching, |status| {
+    client.status_until(&watching, |status| {
         status["refName"] == json!("main")
     })
     .await;
@@ -616,7 +597,7 @@ async fn a_branch_can_be_created_and_switched_to_in_one_call() {
         "feature/started"
     );
 
-    let told = status_until(&mut client, &watching, |status| {
+    let told = client.status_until(&watching, |status| {
         status["refName"] == json!("feature/started")
     })
     .await;
@@ -772,7 +753,7 @@ async fn a_project_with_no_repository_can_be_initialised_and_then_has_a_status()
     let watching = client
         .subscribe("subscribeVcsStatus", json!({"cwd": workspace.cwd()}))
         .await;
-    let before = status_until(&mut client, &watching, |_| true).await;
+    let before = client.status_until(&watching, |_| true).await;
     assert_eq!(before["isRepo"], json!(false), "the fixture already had one");
     server.await_watched_workspaces(1).await;
 
@@ -788,7 +769,7 @@ async fn a_project_with_no_repository_can_be_initialised_and_then_has_a_status()
 
     // The panel finds out without being asked, which is what "after which
     // status works" has to mean for a panel that is already open.
-    let after = status_until(&mut client, &watching, |status| {
+    let after = client.status_until(&watching, |status| {
         status["isRepo"] == json!(true)
     })
     .await;
