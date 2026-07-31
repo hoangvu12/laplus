@@ -597,6 +597,17 @@ impl TestServer {
             .expect("the probe finishes");
     }
 
+    pub fn refresh_providers_in_background(
+        &self,
+        search: Search,
+    ) -> tokio::task::JoinHandle<()> {
+        let config = self.server.state().config().clone();
+        let roots = self.server.state().workspace_roots();
+        tokio::task::spawn_blocking(move || {
+            laplus_server::provider::refresh(&config, &search, &roots)
+        })
+    }
+
     /// Wait for the provider instance to appear in `state`, or fail saying what it
     /// was instead.
     ///

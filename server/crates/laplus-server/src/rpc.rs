@@ -303,9 +303,10 @@ pub fn dispatch(
                 // command rescans nothing.
                 if changes_where_skills_live(payload) {
                     let config = services.config.clone();
+                    let probes = crate::provider::reserve_skill_rescan(&config);
                     let roots = services.shell.workspace_roots();
                     tokio::task::spawn_blocking(move || {
-                        crate::provider::rescan_skills(&config, &roots)
+                        crate::provider::rescan_skills_reserved(&config, &roots, probes)
                     });
                 }
                 Answer::Value(answer)

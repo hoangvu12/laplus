@@ -62,7 +62,7 @@ use crate::clock::now_iso;
 use crate::config::{
     AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
 };
-use crate::config_store::{ConfigChange, ConfigStore};
+use crate::config_store::{ConfigStore, ProviderProbe};
 use crate::process::Search;
 
 /// The routing key for the Claude provider instance.
@@ -955,41 +955,78 @@ fn snapshot(
 /// Claude's skills are files and cost only a scan. Codex exposes them through
 /// `skills/list`, so its existing provider is re-probed with the new roots; one
 /// app-server still answers version, account, models and skills together.
+pub(crate) struct ProbeReservations {
+    claude: Option<ProviderProbe>,
+    codex: Option<ProviderProbe>,
+}
+
+pub(crate) fn reserve_probes(config: &ConfigStore) -> ProbeReservations {
+    ProbeReservations {
+        claude: Some(config.begin_provider_probe(CLAUDE_INSTANCE_ID)),
+        codex: Some(config.begin_provider_probe(CODEX_INSTANCE_ID)),
+    }
+}
+
+pub(crate) fn reserve_skill_rescan(config: &ConfigStore) -> ProbeReservations {
+    let current = config.current();
+    let present = |instance_id| {
+        current
+            .providers
+            .iter()
+            .any(|provider| provider.instance_id == instance_id)
+    };
+    ProbeReservations {
+        claude: (current.settings.providers.claude_agent.enabled
+            && present(CLAUDE_INSTANCE_ID))
+        .then(|| config.begin_provider_probe(CLAUDE_INSTANCE_ID)),
+        codex: (current.settings.providers.codex.enabled && present(CODEX_INSTANCE_ID))
+            .then(|| config.begin_provider_probe(CODEX_INSTANCE_ID)),
+    }
+}
+
 pub fn rescan_skills(config: &ConfigStore, roots: &[PathBuf]) {
+    let probes = reserve_skill_rescan(config);
+    rescan_skills_reserved(config, roots, probes);
+}
+
+pub(crate) fn rescan_skills_reserved(
+    config: &ConfigStore,
+    roots: &[PathBuf],
+    probes: ProbeReservations,
+) {
     let current = config.current();
     let settings = current.settings.providers.clone();
-    let mut providers = current.providers.clone();
-    let mut changed = false;
 
-    if settings.claude_agent.enabled {
-        if let Some(provider) = providers
-            .iter_mut()
+    if let Some(probe) = probes.claude {
+        if let Some(mut provider) = current
+            .providers
+            .iter()
             .find(|provider| provider.instance_id == CLAUDE_INSTANCE_ID)
+            .cloned()
         {
             let skills = catalogue::skills(&settings.claude_agent, roots);
-            if provider.skills != skills {
-                provider.skills = skills;
-                changed = true;
-            }
-        }
-    }
-
-    if settings.codex.enabled {
-        if let Some(index) = providers
-            .iter()
-            .position(|provider| provider.instance_id == CODEX_INSTANCE_ID)
-        {
-            providers[index] = describe_codex(
-                &settings.codex,
-                &Search::from_environment(),
-                roots,
+            provider.skills = skills;
+            publish_one(
+                config,
+                probe,
+                ExpectedSettings::Claude(settings.claude_agent.clone()),
+                provider,
             );
-            changed = true;
         }
     }
 
-    if changed {
-        config.apply(ConfigChange::Providers(providers));
+    if let Some(probe) = probes.codex {
+        let provider = describe_codex(
+            &settings.codex,
+            &Search::from_environment(),
+            roots,
+        );
+        publish_one(
+            config,
+            probe,
+            ExpectedSettings::Codex(settings.codex),
+            provider,
+        );
     }
 }
 
@@ -1007,7 +1044,7 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
                 label: None,
                 email: None,
             },
-            codex_custom_models(settings),
+            crate::codex_protocol::custom_models(&settings.custom_models),
             Vec::new(),
         );
     }
@@ -1029,7 +1066,7 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
                     label: None,
                     email: None,
                 },
-                codex_custom_models(settings),
+                crate::codex_protocol::custom_models(&settings.custom_models),
                 Vec::new(),
             )
         }
@@ -1043,9 +1080,13 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
                     ProviderState::Error,
                     Some("Codex CLI is not authenticated. Run `codex login` and try again.".to_string()),
                 ),
-                AuthStatus::Authenticated | AuthStatus::Unknown => (ProviderState::Ready, None),
+                AuthStatus::Authenticated => (ProviderState::Ready, None),
+                AuthStatus::Unknown => (
+                    ProviderState::Warning,
+                    Some("Codex account status could not be verified.".to_string()),
+                ),
             };
-            let message = match source {
+            let fallback_message = match source {
                 Source::OnPath {
                     instead_of: Some(configured),
                 } => Some(format!(
@@ -1054,7 +1095,12 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
                     configured.display(),
                     path.display(),
                 )),
-                _ => auth_message,
+                _ => None,
+            };
+            let message = match (fallback_message, auth_message) {
+                (Some(fallback), Some(auth)) => Some(format!("{fallback} {auth}")),
+                (Some(message), None) | (None, Some(message)) => Some(message),
+                (None, None) => None,
             };
             codex_snapshot(
                 settings,
@@ -1079,26 +1125,10 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
                 label: None,
                 email: None,
             },
-            codex_custom_models(settings),
+            crate::codex_protocol::custom_models(&settings.custom_models),
             Vec::new(),
         ),
     }
-}
-
-fn codex_custom_models(settings: &CodexSettings) -> Vec<ProviderModel> {
-    settings
-        .custom_models
-        .iter()
-        .map(|slug| slug.trim())
-        .filter(|slug| !slug.is_empty())
-        .map(|slug| ProviderModel {
-            slug: slug.to_string(),
-            name: slug.to_string(),
-            is_custom: true,
-            is_default: None,
-            capabilities: None,
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1131,44 +1161,91 @@ fn codex_snapshot(
 }
 
 pub fn refresh(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
+    let probes = reserve_probes(config);
+    refresh_reserved(config, search, roots, probes);
+}
+
+pub(crate) fn refresh_reserved(
+    config: &ConfigStore,
+    search: &Search,
+    roots: &[PathBuf],
+    probes: ProbeReservations,
+) {
     let settings = config.current().settings.providers.clone();
     let claude = describe(&settings.claude_agent, search, roots);
     if let Some(message) = &claude.message {
         eprintln!("laplus: provider claudeAgent: {message}");
     }
+    publish_one(
+        config,
+        probes.claude.expect("a full refresh reserves Claude"),
+        ExpectedSettings::Claude(settings.claude_agent),
+        claude,
+    );
+
     let codex = describe_codex(&settings.codex, search, roots);
     if let Some(message) = &codex.message {
         eprintln!("laplus: provider codex: {message}");
     }
-    config.apply(ConfigChange::Providers(vec![claude, codex]));
+    publish_one(
+        config,
+        probes.codex.expect("a full refresh reserves Codex"),
+        ExpectedSettings::Codex(settings.codex),
+        codex,
+    );
 }
 
 pub fn refresh_claude(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
+    let probe = config.begin_provider_probe(CLAUDE_INSTANCE_ID);
     let settings = config.current().settings.providers.claude_agent.clone();
-    publish_one(config, describe(&settings, search, roots));
+    let provider = describe(&settings, search, roots);
+    publish_one(config, probe, ExpectedSettings::Claude(settings), provider);
 }
 
 pub fn refresh_codex(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
+    let probe = config.begin_provider_probe(CODEX_INSTANCE_ID);
     let settings = config.current().settings.providers.codex.clone();
-    publish_one(config, describe_codex(&settings, search, roots));
+    let provider = describe_codex(&settings, search, roots);
+    publish_one(config, probe, ExpectedSettings::Codex(settings), provider);
 }
 
-fn publish_one(config: &ConfigStore, provider: Provider) {
-    let mut providers = config.current().providers.clone();
-    match providers
-        .iter()
-        .position(|held| held.instance_id == provider.instance_id)
-    {
-        Some(index) => providers[index] = provider,
-        None => providers.push(provider),
-    }
-    providers.sort_by_key(|provider| {
-        REGISTRY
-            .iter()
-            .position(|registered| registered.instance_id == provider.instance_id)
-            .unwrap_or(usize::MAX)
-    });
-    config.apply(ConfigChange::Providers(providers));
+enum ExpectedSettings {
+    Claude(ClaudeSettings),
+    Codex(CodexSettings),
+}
+
+fn publish_one(
+    config: &ConfigStore,
+    probe: ProviderProbe,
+    expected: ExpectedSettings,
+    provider: Provider,
+) {
+    config.apply_providers_if_current(
+        probe,
+        move |current| match &expected {
+            ExpectedSettings::Claude(expected) => {
+                current.settings.providers.claude_agent == *expected
+            }
+            ExpectedSettings::Codex(expected) => current.settings.providers.codex == *expected,
+        },
+        move |current| {
+            let mut providers = current.to_vec();
+            match providers
+                .iter()
+                .position(|held| held.instance_id == provider.instance_id)
+            {
+                Some(index) => providers[index] = provider,
+                None => providers.push(provider),
+            }
+            providers.sort_by_key(|provider| {
+                REGISTRY
+                    .iter()
+                    .position(|registered| registered.instance_id == provider.instance_id)
+                    .unwrap_or(usize::MAX)
+            });
+            providers
+        },
+    );
 }
 
 #[cfg(test)]

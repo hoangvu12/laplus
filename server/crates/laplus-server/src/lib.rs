@@ -6,13 +6,14 @@
 //! - [`protocol`] is what the **agent** speaks — the `claude` CLI's stdio
 //!   NDJSON, lifted out of the STEP 1 spike (`spike-claude-protocol/README.md`)
 //!   once it had answered its question. Pinned by `fixtures/claude-cli/`.
-//! - [`codex`] is the JSON-RPC stdio protocol spoken by `codex app-server`,
-//!   currently for provider probing and pinned by `fixtures/codex-app-server/`.
+//! - `codex_protocol` is the pure JSON-RPC subset spoken by `codex app-server`,
+//!   pinned in both directions by `fixtures/codex-app-server/`; [`codex`] owns
+//!   the child process, pipes and deadlines around it.
 //! - [`wire`] is what the **UI** speaks — JSON messages inside WebSocket text
 //!   frames. Pinned by `fixtures/socket-wire/` and described in
 //!   `docs/socket-wire-format.md`.
 //!
-//! Both are pure: parsing and types, no I/O. That is what keeps a format
+//! The protocol modules are pure: parsing and types, no I/O. That is what keeps a format
 //! change to a blast radius of one file, and what lets the golden-file tests
 //! act as drift detectors without standing a server up.
 //!
@@ -69,6 +70,7 @@ pub mod checkpoints;
 pub mod clock;
 pub mod codes;
 pub mod codex;
+mod codex_protocol;
 pub mod config;
 pub mod config_store;
 pub mod editor;

@@ -77,8 +77,8 @@ to over newline-delimited JSON on stdio. Responses omit `jsonrpc`, may arrive ou
 of order, and are correlated by client request id; requests travelling the other
 way have their own id space. A provider probe owns one short-lived app-server.
 Each Codex conversation will own another for its session, one process per
-conversation by ADR-0032. `crate::codex` is the provider-probe transport and
-decoder.
+conversation by ADR-0032. `crate::codex_protocol` is the pure wire vocabulary
+and decoder; `crate::codex` owns the provider probe's process and pipes.
 
 **Agent session id** — the `claude` CLI's own handle on a conversation, given
 back to it as `--resume`. The one piece of agent-protocol vocabulary that

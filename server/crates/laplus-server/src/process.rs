@@ -11,7 +11,9 @@
 //! [`Search`] answers.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+#[cfg(windows)]
+use std::process::Stdio;
 
 /// Start this child without giving it a console window.
 ///
@@ -33,6 +35,35 @@ pub fn without_a_console(command: &mut Command) -> &mut Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+/// Terminate a child and everything it launched, then wait for the child.
+///
+/// Windows command shims are processes, not aliases: starting `codex.cmd`
+/// gives this server a `cmd.exe` whose Codex process is its child. Killing only
+/// the handle returned by [`Command::spawn`] leaves the process that owns the
+/// protocol alive. `taskkill /T` follows that tree before terminating it. Other
+/// platforms start the resolved native Codex executable directly, so the child
+/// itself is the tree root that needs reaping.
+pub fn terminate_tree_and_wait(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill.exe");
+        command
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        without_a_console(&mut command);
+        let _ = command.status();
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Where to look for a program, and what counts as startable when it is found.

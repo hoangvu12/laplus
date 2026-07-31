@@ -17,14 +17,15 @@
 //!   writers must not be able to publish in the opposite order to the one they
 //!   wrote in, or a client's projection ends up on the losing value.
 //!
-//! One thing mutates the configuration: [`crate::provider::refresh`] publishes
-//! `providers` when it has resolved the `claude` binary, which is the first real
-//! use these two invariants were built for. Ticket 22 owns keybindings and
-//! settings. [`ConfigChange`] is the vocabulary, and it is closed on purpose: it
-//! mirrors `ServerConfigStreamEvent` in the contract, which has exactly these
-//! three update members plus the snapshot.
+//! Provider probes add one constraint to those invariants: blocking work may
+//! finish out of order. A per-instance generation is reserved before that work
+//! starts, and [`ConfigStore::apply_providers_if_current`] compares and publishes
+//! under the same locks so an old account, model or skill snapshot cannot replace
+//! a newer one. Ticket 22 owns keybindings and settings. [`ConfigChange`] is the
+//! event vocabulary, closed to the contract's three update members.
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -45,7 +46,15 @@ pub struct ConfigStore {
 #[derive(Debug)]
 struct Inner {
     current: RwLock<Arc<ServerConfig>>,
+    provider_probes: Mutex<HashMap<String, u64>>,
     updates: broadcast::Sender<Value>,
+}
+
+/// One provider probe's place in the start order for that provider instance.
+#[derive(Debug)]
+pub(crate) struct ProviderProbe {
+    instance_id: String,
+    generation: u64,
 }
 
 /// A change to the server configuration, in the terms the client can project.
@@ -113,6 +122,7 @@ impl ConfigStore {
         ConfigStore {
             inner: Arc::new(Inner {
                 current: RwLock::new(Arc::new(config)),
+                provider_probes: Mutex::new(HashMap::new()),
                 updates: broadcast::channel(BACKLOG).0,
             }),
         }
@@ -167,6 +177,69 @@ impl ConfigStore {
         // full — so this cannot deadlock, and it is what makes concurrent
         // changes announce themselves in the order they were applied.
         let _ = self.inner.updates.send(event);
+    }
+
+    /// Reserve the next publication slot for one provider instance.
+    ///
+    /// Reserved before blocking work starts. A later reservation supersedes an
+    /// earlier one, so completion order cannot turn into publication order.
+    pub(crate) fn begin_provider_probe(&self, instance_id: &str) -> ProviderProbe {
+        let mut probes = self
+            .inner
+            .provider_probes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = probes.entry(instance_id.to_string()).or_default();
+        *generation = generation.wrapping_add(1);
+        ProviderProbe {
+            instance_id: instance_id.to_string(),
+            generation: *generation,
+        }
+    }
+
+    /// Publish a provider result only if no newer probe or relevant settings
+    /// change has made it stale.
+    ///
+    /// The generation lock stays held through the configuration write, and the
+    /// event is sent under that write lock exactly as in [`ConfigStore::apply`].
+    /// That keeps the store's two ordering invariants intact while making the
+    /// probe's compare-and-publish one atomic operation.
+    pub(crate) fn apply_providers_if_current(
+        &self,
+        probe: ProviderProbe,
+        settings_are_current: impl FnOnce(&ServerConfig) -> bool,
+        update: impl FnOnce(&[Provider]) -> Vec<Provider>,
+    ) -> bool {
+        let mut probes = self
+            .inner
+            .provider_probes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(generation) = probes.get_mut(&probe.instance_id) else {
+            return false;
+        };
+        if *generation != probe.generation {
+            return false;
+        }
+        *generation = generation.wrapping_add(1);
+
+        let mut current = self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !settings_are_current(&current) {
+            return false;
+        }
+
+        let providers = update(&current.providers);
+        let change = ConfigChange::Providers(providers);
+        let event = change.to_event();
+        let mut next = (**current).clone();
+        change.apply_to(&mut next);
+        *current = Arc::new(next);
+        let _ = self.inner.updates.send(event);
+        true
     }
 
     /// Change the settings, write them down, then publish them.
@@ -332,6 +405,72 @@ mod tests {
         let mut settings = store.current().settings.clone();
         settings.enable_assistant_streaming = streaming;
         ConfigChange::Settings(Box::new(settings))
+    }
+
+    fn provider(version: &str) -> Provider {
+        Provider {
+            instance_id: "codex".to_string(),
+            driver: "codex".to_string(),
+            display_name: "Codex".to_string(),
+            enabled: true,
+            installed: true,
+            version: Some(version.to_string()),
+            status: crate::config::ProviderState::Ready,
+            message: None,
+            auth: crate::config::ProviderAuth {
+                status: crate::config::AuthStatus::Authenticated,
+                r#type: None,
+                label: None,
+                email: None,
+            },
+            checked_at: "2026-07-31T00:00:00.000Z".to_string(),
+            models: Vec::new(),
+            slash_commands: Vec::new(),
+            skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_older_workspace_rescan_cannot_replace_newer_provider_skills() {
+        let store = store();
+        let older = store.begin_provider_probe("codex");
+        let newer = store.begin_provider_probe("codex");
+
+        assert!(store.apply_providers_if_current(newer, |_| true, |_| {
+            let mut provider = provider("new");
+            provider.skills = vec![json!({"name": "new-workspace"})];
+            vec![provider]
+        }));
+        assert!(!store.apply_providers_if_current(older, |_| true, |_| {
+            let mut provider = provider("old");
+            provider.skills = vec![json!({"name": "old-workspace"})];
+            vec![provider]
+        }));
+
+        assert_eq!(store.current().providers[0].version.as_deref(), Some("new"));
+        assert_eq!(
+            store.current().providers[0].skills,
+            vec![json!({"name": "new-workspace"})]
+        );
+    }
+
+    #[test]
+    fn a_probe_for_old_settings_cannot_publish_after_settings_change() {
+        let store = store();
+        let expected = store.current().settings.providers.codex.clone();
+        let probe = store.begin_provider_probe("codex");
+        let mut changed = expected.clone();
+        changed.binary_path = "new-codex".to_string();
+        let mut settings = store.current().settings.clone();
+        settings.providers.codex = changed;
+        store.apply(ConfigChange::Settings(Box::new(settings)));
+
+        assert!(!store.apply_providers_if_current(
+            probe,
+            |current| current.settings.providers.codex == expected,
+            |_| vec![provider("stale")],
+        ));
+        assert!(store.current().providers.is_empty());
     }
 
     #[test]

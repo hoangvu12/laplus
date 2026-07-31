@@ -167,6 +167,50 @@ async fn codex_paths_saved_in_settings_drive_the_next_provider_probe() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn a_slow_old_codex_probe_cannot_replace_a_new_settings_probe() {
+    let old = harness::codex::ScriptedCodex::blocked_provider_probe_with_email("old@example.com");
+    let new = harness::codex::ScriptedCodex::provider_probe_with_email("new@example.com");
+    let mut config = laplus_server::config::ServerConfig::detect();
+    config.settings.providers.codex.binary_path = old.configured();
+    let server = TestServer::start_with(config).await;
+
+    let old_refresh = server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !old.started() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old probe never reached its deterministic stop point"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let mut client = server.connect().await;
+    update(
+        &mut client,
+        json!({"providers": {"codex": {"binaryPath": new.configured()}}}),
+    )
+    .await
+    .expect_success();
+
+    old.release();
+    old_refresh.await.expect("the old probe finishes");
+
+    let config = client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let codex = config["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["instanceId"] == "codex")
+        .expect("Codex provider");
+    assert_eq!(codex["auth"]["email"], "new@example.com", "{codex}");
+
+    server.stop().await;
+}
+
 /// The Claude instance, configured — and the model list that comes out of it,
 /// which is what "including model selection" means from the composer's side.
 ///

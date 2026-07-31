@@ -629,11 +629,17 @@ impl Server {
     /// the thread comes back.
     pub fn probe_provider(&self) {
         let config = self.state.config().clone();
+        let probes = crate::provider::reserve_probes(&config);
         // Taken before the task rather than inside it, so the blocking half holds
         // paths and not a handle to the registry they came from.
         let roots = self.state.workspace_roots();
         tokio::task::spawn_blocking(move || {
-            crate::provider::refresh(&config, &Search::from_environment(), &roots)
+            crate::provider::refresh_reserved(
+                &config,
+                &Search::from_environment(),
+                &roots,
+                probes,
+            )
         });
     }
 

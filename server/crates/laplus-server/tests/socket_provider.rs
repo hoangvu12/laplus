@@ -104,6 +104,7 @@ async fn codex_probe_reports_its_account_paged_models_reasoning_and_workspace_sk
 
     server.refresh_providers(Search::over(&[])).await;
     codex.assert_reaped();
+    codex.assert_exchange();
     let provider = provider_named(&server, "codex").await;
 
     assert_eq!(provider["driver"], "codex", "{provider}");
@@ -165,6 +166,13 @@ async fn codex_probe_reports_its_account_paged_models_reasoning_and_workspace_sk
         codex.arguments()
     );
     assert_eq!(codex.codex_home(), home.path().display().to_string());
+    assert_eq!(
+        codex.skill_cwds(),
+        vec![std::env::current_dir()
+            .expect("the test has a working directory")
+            .display()
+            .to_string()]
+    );
 
     server.stop().await;
 }
@@ -186,6 +194,52 @@ async fn a_logged_out_codex_is_named_as_unauthenticated_without_losing_its_model
     assert_eq!(provider["auth"]["status"], "unauthenticated", "{provider}");
     assert!(message(&provider).contains("codex login"), "{provider}");
     assert_eq!(slugs(&provider), vec!["gpt-5.6-sol", "gpt-5.6-luna"]);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn malformed_required_codex_responses_are_reported_as_broken_not_ready_and_empty() {
+    for (codex, field) in [
+        (harness::codex::ScriptedCodex::missing_user_agent(), "userAgent"),
+        (harness::codex::ScriptedCodex::missing_model_data(), "data"),
+        (harness::codex::ScriptedCodex::missing_skills_data(), "data"),
+    ] {
+        let mut config = ServerConfig::detect();
+        config.settings.providers.codex.binary_path = codex.configured();
+        let server = TestServer::start_with(config).await;
+
+        server.refresh_providers(Search::over(&[])).await;
+        let provider = provider_named(&server, "codex").await;
+
+        assert_eq!(provider["status"], "error", "{provider}");
+        assert_eq!(provider["auth"]["status"], "unknown", "{provider}");
+        assert!(message(&provider).contains(field), "{provider}");
+        codex.assert_reaped();
+        server.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_logged_out_codex_keeps_login_guidance_when_a_stale_path_falls_back() {
+    let codex = harness::codex::ScriptedCodex::logged_out_provider_probe();
+    let missing = tempfile::tempdir()
+        .expect("a stale install directory")
+        .path()
+        .join("codex.cmd");
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = missing.display().to_string();
+    let server = TestServer::start_with(config).await;
+
+    server
+        .refresh_providers(Search::over(&[codex.directory()]))
+        .await;
+    let provider = provider_named(&server, "codex").await;
+
+    assert_eq!(provider["auth"]["status"], "unauthenticated", "{provider}");
+    let diagnostic = message(&provider);
+    assert!(diagnostic.contains(&missing.display().to_string()), "{diagnostic}");
+    assert!(diagnostic.contains("codex login"), "{diagnostic}");
 
     server.stop().await;
 }
