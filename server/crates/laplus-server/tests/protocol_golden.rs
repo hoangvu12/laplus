@@ -75,12 +75,14 @@ fn every_codex_turn_fixture_folds_through_a_fresh_state() {
             }
         }
 
-        let mut actual = serde_json::to_string_pretty(&state).expect("Codex state serializes");
-        actual.push('\n');
-        let expected = fs::read_to_string(directory.join(format!("{fixture}.expected.json")))
-            .unwrap_or_else(|error| panic!("reads the expected Codex fold {fixture}: {error}"));
+        let actual = serde_json::to_value(&state).expect("Codex state serializes");
+        let expected: Value = serde_json::from_str(
+            &fs::read_to_string(directory.join(format!("{fixture}.expected.json")))
+                .unwrap_or_else(|error| panic!("reads the expected Codex fold {fixture}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("parses the expected Codex fold {fixture}: {error}"));
 
-        assert_eq!(actual, normalize(&expected), "Codex fixture {fixture}");
+        assert_eq!(actual, expected, "Codex fixture {fixture}");
     }
 }
 
