@@ -1,0 +1,7 @@
+{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "laplus", "title": "laplus", "version": "0.0.1"}, "capabilities": {}}}}
+{"dir": "recv", "msg": {"id": 1, "result": {"userAgent": "laplus/0.146.0 (Ubuntu 20.4.0; aarch64) unknown (laplus; 0.0.1)", "codexHome": "/home/ubuntu/.codex", "platformFamily": "unix", "platformOs": "linux"}}}
+{"dir": "send", "msg": {"jsonrpc": "2.0", "method": "initialized"}}
+{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 2, "method": "thread/resume", "params": {"threadId": "019f0000-0000-7000-8000-000000000000"}}}
+{"dir": "recv", "msg": {"method": "configWarning", "params": {"summary": "Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.", "details": null}, "emittedAtMs": 1785457972557}}
+{"dir": "recv", "msg": {"method": "remoteControl/status/changed", "params": {"status": "disabled", "serverName": "redacted-host", "installationId": "00000000-0000-0000-0000-000000000000", "environmentId": null}, "emittedAtMs": 1785457972557}}
+{"dir": "recv", "msg": {"error": {"code": -32600, "message": "no rollout found for thread id 019f0000-0000-7000-8000-000000000000"}, "id": 2}}
