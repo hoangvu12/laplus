@@ -99,6 +99,9 @@ A property of the **thread**, editable between turns by
 `thread.runtime-mode.set`, and `crate::orchestration::RUNTIME_MODES` is the whole
 of what one may be.
 
+On restore, a stored value outside that set is rounded to `full-access`; the
+reader does not migrate the database row.
+
 Not to be confused with the CLI's **permission mode**, which is what a runtime
 mode is _translated into_ — `--permission-mode`, one of the agent protocol's own
 words. There are **two translations**, because the question is asked at two
@@ -144,6 +147,9 @@ requested under.
 its own, and the one mode this server never acts on — it is stored, published,
 and never reaches the CLI. Carried so the picker has something true to show
 across a restart.
+
+On restore, a stored value outside that set is rounded to `default`; the reader
+does not migrate the database row.
 
 **Work log** — the row-per-thing-that-happened view beside the transcript: tool
 calls, thinking, permission requests and their resolutions. `crate::worklog`.
@@ -264,6 +270,9 @@ which `--permission-mode` each one becomes, and answers nothing for
 running child, where the omission cannot stand and `approval-required` becomes
 `default`.
 
+A historical stored value outside the closed set is rounded to `full-access` on
+read without migrating the database row.
+
 Given to the agent **at launch and again at every turn whose mode has moved** —
 `crate::session::retune` pushes it through the driver before the turn is
 written, and the session's own copy moves with it, so every session event for one
@@ -277,6 +286,9 @@ contract's `default` and `plan`. Carried on the thread, published, and **never
 sent to the CLI** — nothing in this server reads one, so it is a value the client
 keeps here rather than a behaviour this server has. The closed set is
 `crate::orchestration::INTERACTION_MODES`.
+
+A historical stored value outside the closed set is rounded to `default` on
+read without migrating the database row.
 
 Both are **per-thread and editable**, by a command each, and both also arrive as
 a per-turn override on a turn request. Absent on a turn means unchanged; the

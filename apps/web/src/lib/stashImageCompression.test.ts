@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { compressImageForStash, MAX_STASH_IMAGE_DATA_URL_CHARS } from "./stashImageCompression";
+import { compressImageForStash } from "./stashImageCompression";
 
 /**
- * jsdom has no real canvas/codec, so the re-encode path is exercised with
+ * The Node test environment has no real canvas/codec, so the re-encode path is exercised with
  * stubbed `createImageBitmap` + `OffscreenCanvas`. The encoder stub returns a
  * payload whose size scales with quality, mirroring how a real JPEG encoder
  * shrinks as quality drops — enough to verify the ladder logic and budget
@@ -12,6 +12,7 @@ import { compressImageForStash, MAX_STASH_IMAGE_DATA_URL_CHARS } from "./stashIm
 
 const originalCreateImageBitmap = globalThis.createImageBitmap;
 const originalOffscreenCanvas = globalThis.OffscreenCanvas;
+const TEST_BUDGET_CHARS = 1_300;
 
 function makeFile(sizeBytes: number, type = "image/png"): File {
   return new File([new Uint8Array(sizeBytes).fill(7)], "shot.png", { type });
@@ -80,25 +81,25 @@ describe("compressImageForStash", () => {
 
   it("re-encodes an oversized image to WebP within the budget", async () => {
     // Comfortably under budget at the very first quality step.
-    const { close, fillRect } = stubCanvasPipeline(() => 120_000);
+    const { close, fillRect } = stubCanvasPipeline(() => 120);
 
-    const result = await compressImageForStash(makeFile(4_000_000));
+    const result = await compressImageForStash(makeFile(4_000), TEST_BUDGET_CHARS);
 
     expect(result.ok).toBe(true);
     expect(result.ok && result.image.recompressed).toBe(true);
     expect(result.ok && result.image.mimeType).toBe("image/webp");
-    expect(result.ok && result.image.dataUrl.length <= MAX_STASH_IMAGE_DATA_URL_CHARS).toBe(true);
-    // sizeBytes should describe the re-encoded payload, not the 4MB original.
-    expect(result.ok && result.image.sizeBytes).toBeLessThan(4_000_000);
+    expect(result.ok && result.image.dataUrl.length <= TEST_BUDGET_CHARS).toBe(true);
+    // sizeBytes should describe the re-encoded payload, not the 4,000-byte original.
+    expect(result.ok && result.image.sizeBytes).toBeLessThan(4_000);
     // WebP keeps alpha, so no white matte should be painted.
     expect(fillRect).not.toHaveBeenCalled();
     expect(close).toHaveBeenCalled();
   });
 
   it("falls back to JPEG with a white matte when WebP encoding is unavailable", async () => {
-    const { fillRect } = stubCanvasPipeline(() => 120_000, { supportsWebp: false });
+    const { fillRect } = stubCanvasPipeline(() => 120, { supportsWebp: false });
 
-    const result = await compressImageForStash(makeFile(4_000_000));
+    const result = await compressImageForStash(makeFile(4_000), TEST_BUDGET_CHARS);
 
     expect(result.ok && result.image.recompressed).toBe(true);
     expect(result.ok && result.image.mimeType).toBe("image/jpeg");
@@ -108,19 +109,19 @@ describe("compressImageForStash", () => {
 
   it("steps quality down until the encoded image fits", async () => {
     // Only the lowest quality step (0.68) lands under the budget.
-    const { close } = stubCanvasPipeline((quality) => (quality <= 0.68 ? 400_000 : 3_000_000));
+    const { close } = stubCanvasPipeline((quality) => (quality <= 0.68 ? 400 : 3_000));
 
-    const result = await compressImageForStash(makeFile(9_000_000));
+    const result = await compressImageForStash(makeFile(9_000), TEST_BUDGET_CHARS);
 
     expect(result.ok && result.image.recompressed).toBe(true);
-    expect(result.ok && result.image.dataUrl.length <= MAX_STASH_IMAGE_DATA_URL_CHARS).toBe(true);
+    expect(result.ok && result.image.dataUrl.length <= TEST_BUDGET_CHARS).toBe(true);
     expect(close).toHaveBeenCalled();
   });
 
   it("reports too-large when even the smallest encoding overflows the budget", async () => {
-    const { close } = stubCanvasPipeline(() => 8_000_000);
+    const { close } = stubCanvasPipeline(() => 8_000);
 
-    const result = await compressImageForStash(makeFile(9_000_000));
+    const result = await compressImageForStash(makeFile(9_000), TEST_BUDGET_CHARS);
 
     expect(result).toEqual({ ok: false, reason: "too-large" });
     // The bitmap must still be released on the give-up path.
@@ -131,7 +132,7 @@ describe("compressImageForStash", () => {
     vi.stubGlobal("createImageBitmap", undefined);
     vi.stubGlobal("OffscreenCanvas", undefined);
 
-    expect(await compressImageForStash(makeFile(4_000_000))).toEqual({
+    expect(await compressImageForStash(makeFile(4_000), TEST_BUDGET_CHARS)).toEqual({
       ok: false,
       reason: "too-large",
     });
@@ -153,7 +154,7 @@ describe("compressImageForStash", () => {
       },
     );
 
-    expect(await compressImageForStash(makeFile(4_000_000))).toEqual({
+    expect(await compressImageForStash(makeFile(4_000), TEST_BUDGET_CHARS)).toEqual({
       ok: false,
       reason: "unreadable",
     });
@@ -182,13 +183,13 @@ describe("compressImageForStash", () => {
         }
         async convertToBlob({ type }: { type: string; quality: number }) {
           // Only a genuinely downscaled pass fits the budget.
-          const size = smallestRequested < 800 ? 100_000 : 5_000_000;
+          const size = smallestRequested < 800 ? 100 : 5_000;
           return new Blob([new Uint8Array(size)], { type });
         }
       },
     );
 
-    const result = await compressImageForStash(makeFile(4_000_000));
+    const result = await compressImageForStash(makeFile(4_000), TEST_BUDGET_CHARS);
 
     expect(result.ok).toBe(true);
     // Fallback passes must scale off the bitmap, not a fixed 2048 ceiling

@@ -180,11 +180,22 @@ impl Pane {
     /// Read until the shell has said `wanted`, answering whatever it asks along
     /// the way.
     pub async fn wait_for(&mut self, client: &mut SocketClient, wanted: &str) {
+        self.wait_for_occurrences(client, wanted, 1).await;
+    }
+
+    /// Read until the shell has said `wanted` this many times. Command lines are
+    /// echoed by a pty, so the second occurrence proves the command ran.
+    pub async fn wait_for_occurrences(
+        &mut self,
+        client: &mut SocketClient,
+        wanted: &str,
+        count: usize,
+    ) {
         let deadline = Instant::now() + PATIENCE;
-        while !self.screen.contains(wanted) {
+        while self.screen.matches(wanted).count() < count {
             assert!(
                 Instant::now() < deadline,
-                "the terminal never said {wanted:?}. What it did say:\n{}",
+                "the terminal never said {wanted:?} {count} times. What it did say:\n{}",
                 self.screen
             );
             self.pump(client).await;

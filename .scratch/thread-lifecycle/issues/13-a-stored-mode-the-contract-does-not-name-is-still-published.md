@@ -96,4 +96,11 @@ repair.
 
 **Blocked by:** None.
 
-**Status:** ready-for-agent
+**Status:** done
+
+## Comments
+
+Implemented 2026-07-31. `thread_from_row` now reuses the orchestration mode
+vocabularies and defaults to round unnameable stored values on read. The
+`unnameable_stored_modes_are_rounded_on_read_without_rewriting_the_row`
+regression covers both modes and confirms the database row is not migrated.

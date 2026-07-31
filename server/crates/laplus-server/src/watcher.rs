@@ -421,10 +421,14 @@ mod tests {
     #[test]
     fn a_file_written_outside_the_server_is_reported_relative_to_its_workspace() {
         let directory = tempfile::tempdir().expect("a temporary directory");
+        // Linux adds recursive watches one directory at a time. Keep creating a
+        // new subtree out of this path-spelling test; the directory event alone
+        // is enough to invalidate the held listing.
+        std::fs::create_dir(directory.path().join("src")).expect("creates the directory");
+
         let (watcher, received) = recording();
         watcher.watch("workspace", directory.path());
 
-        std::fs::create_dir(directory.path().join("src")).expect("creates the directory");
         std::fs::write(directory.path().join("src").join("main.rs"), "fn main() {}")
             .expect("writes the file");
 

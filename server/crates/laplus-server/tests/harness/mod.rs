@@ -1294,6 +1294,13 @@ impl SocketClient {
         self.recv().await
     }
 
+    /// `Ping` and its answer while subscriptions may still be producing frames.
+    /// Interleaved traffic stays buffered for its subscription reader.
+    pub async fn ping_amid_traffic(&mut self) -> Value {
+        self.send(json!({"_tag": "Ping"})).await;
+        self.take_frame(|frame| frame["_tag"] == "Pong").await
+    }
+
     /// Send a frame exactly as given. For malformed and unrecognised frames,
     /// which the typed helpers cannot express.
     pub async fn send(&mut self, frame: Value) {

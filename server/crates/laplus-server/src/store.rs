@@ -34,6 +34,9 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
+use crate::orchestration::{
+    DEFAULT_PROVIDER_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, INTERACTION_MODES, RUNTIME_MODES,
+};
 use crate::pairing::{CredentialRefusal, Grant, PairingLink, Session, WebSocketTicket};
 use crate::projects::{Project, WorkspaceRoot};
 use crate::threads::{Activity, Checkpoint, Conversation, LatestTurn, Message, ThreadRow};
@@ -1986,6 +1989,8 @@ fn remember_agent_session(
 
 fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
     let model_selection: String = row.get(3)?;
+    let runtime_mode: String = row.get(4)?;
+    let interaction_mode: String = row.get(5)?;
     let latest_turn: Option<String> = row.get(9)?;
     let settled_override: Option<String> = row.get(14)?;
 
@@ -2001,8 +2006,14 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         // `null` decodes on the client as "no selection", which is a worse answer
         // than the stored one and a much better one than no conversation.
         model_selection: serde_json::from_str(&model_selection).unwrap_or(serde_json::Value::Null),
-        runtime_mode: row.get(4)?,
-        interaction_mode: row.get(5)?,
+        runtime_mode: match RUNTIME_MODES.contains(&runtime_mode.as_str()) {
+            true => runtime_mode,
+            false => DEFAULT_RUNTIME_MODE.to_string(),
+        },
+        interaction_mode: match INTERACTION_MODES.contains(&interaction_mode.as_str()) {
+            true => interaction_mode,
+            false => DEFAULT_PROVIDER_INTERACTION_MODE.to_string(),
+        },
         branch: row.get(6)?,
         worktree_path: row.get(7)?,
         agent_session_id: row.get(8)?,
@@ -2896,6 +2907,39 @@ mod tests {
                 checkpoints: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn unnameable_stored_modes_are_rounded_on_read_without_rewriting_the_row() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        fixture
+            .database
+            .transcribe(&[Write::Thread(Box::new(a_thread("thread-1", "project-1")))])
+            .expect("stores");
+        fixture
+            .database
+            .lock()
+            .execute(
+                "UPDATE threads SET runtime_mode = ?1, interaction_mode = ?2 WHERE id = ?3",
+                ("bypassPermissions", "planning", "thread-1"),
+            )
+            .expect("simulates a historical row with unnameable modes");
+
+        let restored = fixture.database.conversations().expect("reads");
+
+        assert_eq!(restored[0].thread.runtime_mode, "full-access");
+        assert_eq!(restored[0].thread.interaction_mode, "default");
+        let stored: (String, String) = fixture
+            .database
+            .lock()
+            .query_row(
+                "SELECT runtime_mode, interaction_mode FROM threads WHERE id = ?1",
+                ["thread-1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reads the stored modes directly");
+        assert_eq!(stored, ("bypassPermissions".to_string(), "planning".to_string()));
     }
 
     /// The one column that arrives from somewhere else. The agent's `init` line

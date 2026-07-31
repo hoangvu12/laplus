@@ -276,7 +276,8 @@ async fn a_call_that_names_no_size_does_not_resize_the_terminal() {
     let before = pane.text().len();
     pane.run(&mut client, &report_size()).await;
     pane.run(&mut client, &echo("size-reported")).await;
-    pane.wait_for(&mut client, "size-reported").await;
+    pane.wait_for_occurrences(&mut client, "size-reported", 2)
+        .await;
     assert!(
         reported_size(&pane.text()[before..], 97, 41),
         "the terminal was resized by a call that named no size:\n{}",

@@ -387,23 +387,15 @@ async fn a_flood_of_output_neither_stalls_the_socket_nor_loses_the_terminal() {
     pane.wait_for(&mut client, "ready").await;
 
     pane.run(&mut client, &flood()).await;
-    pane.wait_for(&mut client, "flood-finished").await;
+    pane.wait_for_occurrences(&mut client, "flood-finished", 2)
+        .await;
 
     // The connection is still the connection: the terminal still takes
     // commands, and a plain call is answered.
-    //
-    // **In that order, and the order is the point.** The terminal's feed is
-    // ack-gated — `Pane::pump` acks each chunk it reads — so pinging first only
-    // worked on Windows, where ConPTY delivers the flood in small enough pieces
-    // that it has drained by the time the ping goes out. On Linux the tail is
-    // still queued, and a `Ping` sent into that gets a chunk back rather than
-    // its `Pong`. Draining through the pane first is not a workaround: it is
-    // the client half of the flow control this test is driving, and reading
-    // frames off the socket without acking them (which is what an earlier
-    // attempt at this did) stalls the feed by design rather than by fault.
+    assert_eq!(client.ping_amid_traffic().await, json!({"_tag": "Pong"}));
     pane.run(&mut client, &echo("still-here")).await;
-    pane.wait_for(&mut client, "still-here").await;
-    assert_eq!(client.ping().await, json!({"_tag": "Pong"}));
+    pane.wait_for_occurrences(&mut client, "still-here", 2)
+        .await;
 
     client.close().await;
     server.stop().await;
@@ -600,4 +592,3 @@ fn flood() -> String {
         false => "for i in $(seq 1 400); do echo line-$i; done; echo flood-finished".to_string(),
     }
 }
-

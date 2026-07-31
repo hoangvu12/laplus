@@ -126,10 +126,10 @@ pub const GET_ARCHIVED_SHELL_SNAPSHOT: &str = "orchestration.getArchivedShellSna
 /// The contract's default when a client sends no runtime mode
 /// (`DEFAULT_RUNTIME_MODE` in `orchestration.ts`). Repeated here rather than
 /// inferred, because it decides how much latitude the agent is given.
-const DEFAULT_RUNTIME_MODE: &str = "full-access";
+pub(crate) const DEFAULT_RUNTIME_MODE: &str = "full-access";
 
 /// The contract's `DEFAULT_PROVIDER_INTERACTION_MODE`.
-const DEFAULT_INTERACTION_MODE: &str = "default";
+pub(crate) const DEFAULT_PROVIDER_INTERACTION_MODE: &str = "default";
 
 /// Every runtime mode the contract names (`RuntimeMode` in `orchestration.ts`),
 /// in its order.
@@ -139,7 +139,7 @@ const DEFAULT_INTERACTION_MODE: &str = "default";
 /// to the CLI's `--permission-mode` and answers `None` for `approval-required`
 /// *and* for a mode nobody named, because upstream expresses the first by passing
 /// no flag. A validator built on it would accept anything.
-const RUNTIME_MODES: [&str; 4] = [
+pub(crate) const RUNTIME_MODES: [&str; 4] = [
     "approval-required",
     "auto-accept-edits",
     "auto",
@@ -152,7 +152,7 @@ const RUNTIME_MODES: [&str; 4] = [
 /// and never reaches the CLI — so this list is the whole of what the value is
 /// checked against, and being a closed set is the only thing that keeps it from
 /// becoming a free-text field the picker cannot render.
-const INTERACTION_MODES: [&str; 2] = ["default", "plan"];
+pub(crate) const INTERACTION_MODES: [&str; 2] = ["default", "plan"];
 
 /// Every reason a client may give for unsettling a conversation, which is one.
 ///
@@ -2244,7 +2244,7 @@ fn default_runtime_mode() -> String {
 }
 
 fn default_interaction_mode() -> String {
-    DEFAULT_INTERACTION_MODE.to_string()
+    DEFAULT_PROVIDER_INTERACTION_MODE.to_string()
 }
 
 /// Keep a client's `createdAt` only if it is one.
