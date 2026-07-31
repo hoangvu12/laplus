@@ -1939,7 +1939,11 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
       normalizeCompactToolLabel(heading).toLowerCase()
       ? null
       : rawPreview;
-  const displayText = preview ? `${heading} - ${preview}` : heading;
+  const exitStatus =
+    workEntry.exitCode !== undefined ? `exit ${workEntry.exitCode.toLocaleString()}` : null;
+  const displayText = [preview ? `${heading} - ${preview}` : heading, exitStatus]
+    .filter(Boolean)
+    .join(", ");
   const expandedBody = buildToolCallExpandedBody(workEntry, workspaceRoot);
   const canExpand = expandedBody !== null;
   const showFailedIndicator = workEntryIndicatesToolFailure(workEntry);
@@ -2007,6 +2011,14 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-px text-muted-foreground/55">
+            {exitStatus && (
+              <span
+                className="mr-1 font-mono text-[10px] tabular-nums"
+                aria-label={`Process exit status ${workEntry.exitCode}`}
+              >
+                {exitStatus}
+              </span>
+            )}
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               aria-hidden={!canExpand}

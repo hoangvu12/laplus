@@ -23,17 +23,17 @@ sandbox escape, not the policy name.
 
 **Blocked by:** 04.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] A command the agent runs appears in the work log with its command line.
-- [ ] Its exit status is recorded when the command finishes, paired to the row
+- [x] A command the agent runs appears in the work log with its command line.
+- [x] Its exit status is recorded when the command finishes, paired to the row
       that announced it.
-- [ ] The `commentary` / `final_answer` phase distinction is handled by a
+- [x] The `commentary` / `final_answer` phase distinction is handled by a
       deliberate choice, and the choice is written down where the next reader
       finds it.
-- [ ] A command that fails is distinguishable from one that succeeded.
-- [ ] `02-command-execution` is committed as a fixture with an expected fold.
-- [ ] The same capture is replayed through the socket, and the assertions are on
+- [x] A command that fails is distinguishable from one that succeeded.
+- [x] `02-command-execution` is committed as a fixture with an expected fold.
+- [x] The same capture is replayed through the socket, and the assertions are on
       the work log the UI receives.
-- [ ] The capture's own finding holds: a command that does not escape the sandbox
+- [x] The capture's own finding holds: a command that does not escape the sandbox
       runs without an approval request even under `untrusted`.

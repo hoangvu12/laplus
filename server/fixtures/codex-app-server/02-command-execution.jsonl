@@ -1,0 +1,20 @@
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.1"},"capabilities":{}}}}
+{"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (Linux; aarch64) unknown"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","method":"initialized"}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"<workspace>","model":"gpt-5.4-mini","approvalPolicy":"untrusted","sandbox":"read-only","approvalsReviewer":"user"}}}
+{"dir":"recv","msg":{"id":2,"result":{"thread":{"id":"codex-thread-2"},"cwd":"<workspace>","approvalPolicy":"untrusted","sandbox":{"type":"readOnly","networkAccess":false}}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"codex-thread-2","input":[{"type":"text","text":"Run the shell command `ls` in the current directory, then tell me the file names you saw."}]}}}
+{"dir":"recv","msg":{"id":3,"result":{"turn":{"id":"codex-turn-2","status":"inProgress","error":null}}}}
+{"dir":"recv","msg":{"method":"thread/status/changed","params":{"threadId":"codex-thread-2","status":{"type":"active","activeFlags":[]}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"reasoning","id":"reasoning-2","summary":[],"content":[]}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"reasoning","id":"reasoning-2","summary":[],"content":[]}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"agentMessage","id":"commentary-2","text":"","phase":"commentary"}}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","itemId":"commentary-2","delta":"I'm checking the current directory contents with `ls`, then I'll report the names exactly as shown."}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"agentMessage","id":"commentary-2","text":"I'm checking the current directory contents with `ls`, then I'll report the names exactly as shown.","phase":"commentary"}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"commandExecution","id":"command-2","command":"/bin/bash -lc ls","cwd":"<workspace>","processId":"40283","status":"inProgress","aggregatedOutput":null,"exitCode":null,"durationMs":null}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"commandExecution","id":"command-2","command":"/bin/bash -lc ls","cwd":"<workspace>","processId":"40283","status":"completed","aggregatedOutput":"README.md\nmain.rs\n","exitCode":0,"durationMs":0}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"agentMessage","id":"answer-2","text":"","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","itemId":"answer-2","delta":"`README.md`\n`main.rs`"}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-2","turnId":"codex-turn-2","item":{"type":"agentMessage","id":"answer-2","text":"`README.md`\n`main.rs`","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"thread/status/changed","params":{"threadId":"codex-thread-2","status":{"type":"idle"}}}}
+{"dir":"recv","msg":{"method":"turn/completed","params":{"threadId":"codex-thread-2","turn":{"id":"codex-turn-2","items":[{"type":"agentMessage","id":"answer-2","text":"`README.md`\n`main.rs`","phase":"final_answer"}],"status":"completed","error":null,"durationMs":7532}}}}

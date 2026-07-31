@@ -54,6 +54,7 @@ pub struct ConversationState {
     pub turn_error: Option<String>,
     pub assistant_messages: Vec<AssistantMessage>,
     pub reasoning_items: Vec<ReasoningItem>,
+    pub command_executions: Vec<CommandExecution>,
     pub unknown_events: usize,
     pub parse_errors: usize,
 }
@@ -72,6 +73,19 @@ pub struct ReasoningItem {
     pub completed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecution {
+    pub id: String,
+    pub command: String,
+    pub cwd: String,
+    pub process_id: Option<String>,
+    pub status: String,
+    pub aggregated_output: Option<String>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationFold {
     Nothing,
@@ -83,6 +97,8 @@ pub enum ConversationFold {
     ReasoningCompleted { item_id: String, text: String },
     AssistantDelta { item_id: String, text: String },
     AssistantCompleted { item_id: String, text: String },
+    CommandStarted(CommandExecution),
+    CommandCompleted(CommandExecution),
     TurnCompleted(Completion),
 }
 
@@ -166,21 +182,38 @@ impl ConversationState {
             }
             "item/started" => {
                 let item = &params["item"];
-                if item["type"] != "reasoning" {
-                    return ConversationFold::Nothing;
-                }
                 let Some(item_id) = item["id"].as_str() else {
                     return ConversationFold::Nothing;
                 };
-                if !self.reasoning_items.iter().any(|item| item.id == item_id) {
-                    self.reasoning_items.push(ReasoningItem {
-                        id: item_id.to_string(),
-                        text: text_in(item),
-                        completed: false,
-                    });
-                }
-                ConversationFold::ReasoningStarted {
-                    item_id: item_id.to_string(),
+                match item["type"].as_str() {
+                    Some("reasoning") => {
+                        if !self.reasoning_items.iter().any(|item| item.id == item_id) {
+                            self.reasoning_items.push(ReasoningItem {
+                                id: item_id.to_string(),
+                                text: text_in(item),
+                                completed: false,
+                            });
+                        }
+                        ConversationFold::ReasoningStarted {
+                            item_id: item_id.to_string(),
+                        }
+                    }
+                    Some("agentMessage") => {
+                        self.upsert_assistant(AssistantMessage {
+                            id: item_id.to_string(),
+                            text: item["text"].as_str().unwrap_or_default().to_string(),
+                            phase: item["phase"].as_str().map(str::to_string),
+                        });
+                        ConversationFold::Nothing
+                    }
+                    Some("commandExecution") => {
+                        let Some(command) = command_execution(item) else {
+                            return ConversationFold::Nothing;
+                        };
+                        self.upsert_command(command.clone());
+                        ConversationFold::CommandStarted(command)
+                    }
+                    _ => ConversationFold::Nothing,
                 }
             }
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
@@ -196,10 +229,13 @@ impl ConversationState {
                     text,
                 }
             }
-            "item/agentMessage/delta" => ConversationFold::AssistantDelta {
-                item_id: params["itemId"].as_str().unwrap_or_default().to_string(),
-                text: params["delta"].as_str().unwrap_or_default().to_string(),
-            },
+            "item/agentMessage/delta" => {
+                let item_id = params["itemId"].as_str().unwrap_or_default().to_string();
+                ConversationFold::AssistantDelta {
+                    item_id,
+                    text: params["delta"].as_str().unwrap_or_default().to_string(),
+                }
+            }
             "item/completed" => {
                 let item = &params["item"];
                 let Some(item_id) = item["id"].as_str() else {
@@ -212,15 +248,7 @@ impl ConversationState {
                             text: item["text"].as_str().unwrap_or_default().to_string(),
                             phase: item["phase"].as_str().map(str::to_string),
                         };
-                        if let Some(existing) = self
-                            .assistant_messages
-                            .iter_mut()
-                            .find(|message| message.id == item_id)
-                        {
-                            *existing = message.clone();
-                        } else {
-                            self.assistant_messages.push(message.clone());
-                        }
+                        self.upsert_assistant(message.clone());
                         ConversationFold::AssistantCompleted {
                             item_id: item_id.to_string(),
                             text: message.text,
@@ -254,6 +282,13 @@ impl ConversationState {
                             text,
                         }
                     }
+                    Some("commandExecution") => {
+                        let Some(command) = command_execution(item) else {
+                            return ConversationFold::Nothing;
+                        };
+                        self.upsert_command(command.clone());
+                        ConversationFold::CommandCompleted(command)
+                    }
                     _ => ConversationFold::Nothing,
                 }
             }
@@ -283,6 +318,44 @@ impl ConversationState {
             }
         }
     }
+
+    fn upsert_assistant(&mut self, message: AssistantMessage) {
+        match self
+            .assistant_messages
+            .iter_mut()
+            .find(|existing| existing.id == message.id)
+        {
+            Some(existing) => *existing = message,
+            None => self.assistant_messages.push(message),
+        }
+    }
+
+    fn upsert_command(&mut self, command: CommandExecution) {
+        match self
+            .command_executions
+            .iter_mut()
+            .find(|existing| existing.id == command.id)
+        {
+            Some(existing) => *existing = command,
+            None => self.command_executions.push(command),
+        }
+    }
+}
+
+fn command_execution(item: &Value) -> Option<CommandExecution> {
+    Some(CommandExecution {
+        id: item.get("id")?.as_str()?.to_string(),
+        command: item.get("command")?.as_str()?.to_string(),
+        cwd: item.get("cwd")?.as_str()?.to_string(),
+        process_id: item.get("processId").and_then(Value::as_str).map(str::to_string),
+        status: item.get("status")?.as_str()?.to_string(),
+        aggregated_output: item
+            .get("aggregatedOutput")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        exit_code: item.get("exitCode").and_then(Value::as_i64),
+        duration_ms: item.get("durationMs").and_then(Value::as_u64),
+    })
 }
 
 fn error_message(error: Option<&Value>) -> Option<String> {

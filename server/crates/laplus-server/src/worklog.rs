@@ -112,6 +112,17 @@ pub struct Returned<'a> {
     pub failed: bool,
 }
 
+/// A Codex command's structured terminal result. Unlike a Messages API tool
+/// result, the process outcome is separate from its output and belongs in the
+/// durable record behind the row.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandReturned<'a> {
+    pub output: &'a str,
+    pub status: &'a str,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<u64>,
+}
+
 impl Call {
     /// The tool call as the work log will render it, while it is still running.
     pub fn invoked(&self, turn_id: Option<String>) -> Activity {
@@ -147,6 +158,31 @@ impl Call {
         }
 
         Activity::tool("tool.completed", self.title(), payload, turn_id)
+    }
+
+    /// A command once its process has exited, retaining the numeric process
+    /// result while using the work log's existing success/failure vocabulary.
+    pub fn command_returned(
+        &self,
+        result: CommandReturned<'_>,
+        turn_id: Option<String>,
+    ) -> Activity {
+        let output = Value::String(result.output.to_string());
+        let failed = result.status != "completed" || result.exit_code.is_some_and(|code| code != 0);
+        let mut activity = self.returned(
+            Returned {
+                content: &output,
+                failed,
+            },
+            turn_id,
+        );
+        activity.payload["data"]["result"] = json!({
+            "status": result.status,
+            "exitCode": result.exit_code,
+            "output": result.output,
+            "durationMs": result.duration_ms,
+        });
+        activity
     }
 
     /// A call whose invocation this driver never saw.
@@ -993,6 +1029,44 @@ mod tests {
         // Still a tool row rather than a server error: the tool failed, this
         // server did not, and the UI styles the two differently.
         assert_eq!(returned.tone, "tool");
+    }
+
+    #[test]
+    fn a_command_completion_keeps_its_exit_status_in_the_paired_row() {
+        let command = call(
+            "Command",
+            json!({
+                "command": "/bin/bash -lc ls",
+                "cwd": "<workspace>",
+                "processId": "40283",
+            }),
+        );
+        let succeeded = command.command_returned(
+            CommandReturned {
+                output: "README.md\nmain.rs\n",
+                status: "completed",
+                exit_code: Some(0),
+                duration_ms: Some(12),
+            },
+            None,
+        );
+        let failed = command.command_returned(
+            CommandReturned {
+                output: "ls: cannot access 'missing': No such file or directory\n",
+                status: "failed",
+                exit_code: Some(2),
+                duration_ms: Some(8),
+            },
+            None,
+        );
+
+        assert_eq!(succeeded.payload["status"], "completed");
+        assert_eq!(succeeded.payload["data"]["result"]["exitCode"], 0);
+        assert_eq!(succeeded.payload["data"]["result"]["status"], "completed");
+        assert_eq!(succeeded.payload["data"]["result"]["durationMs"], 12);
+        assert_eq!(succeeded.payload["detail"], "README.md\nmain.rs\n");
+        assert_eq!(failed.payload["status"], "failed");
+        assert_eq!(failed.payload["data"]["result"]["exitCode"], 2);
     }
 
     /// A tool that returned nothing must not blank the row it collapses into: the

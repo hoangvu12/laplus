@@ -1019,6 +1019,55 @@ describe("deriveWorkLogEntries", () => {
     );
   });
 
+  it("keeps a paired Codex command's numeric exit status", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "codex-command-running",
+        kind: "tool.updated",
+        summary: "Command run",
+        payload: {
+          itemType: "command_execution",
+          status: "inProgress",
+          title: "Command run",
+          data: {
+            toolCallId: "command-2",
+            command: "/bin/bash -lc ls",
+            input: { command: "/bin/bash -lc ls", cwd: "<workspace>", processId: "40283" },
+          },
+        },
+      }),
+      makeActivity({
+        id: "codex-command-completed",
+        kind: "tool.completed",
+        summary: "Command run",
+        payload: {
+          itemType: "command_execution",
+          status: "completed",
+          title: "Command run",
+          detail: "README.md\nmain.rs\n",
+          data: {
+            toolCallId: "command-2",
+            command: "/bin/bash -lc ls",
+            input: { command: "/bin/bash -lc ls", cwd: "<workspace>", processId: "40283" },
+            result: {
+              status: "completed",
+              exitCode: 0,
+              output: "README.md\nmain.rs\n",
+              durationMs: 0,
+            },
+          },
+        },
+      }),
+    ];
+
+    const [entry] = deriveWorkLogEntries(activities);
+    expect(entry).toMatchObject({
+      command: "ls",
+      exitCode: 0,
+      toolLifecycleStatus: "completed",
+    });
+  });
+
   it("unwraps PowerShell command wrappers from argv-style command payloads", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

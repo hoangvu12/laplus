@@ -13,30 +13,34 @@ pub struct ScriptedCodex {
 
 impl ScriptedCodex {
     pub fn conversation_paused_after_first_delta() -> ScriptedCodex {
-        let codex = ScriptedCodex::conversation();
+        let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", Some(5));
         std::fs::write(codex.directory.path().join("pause-turn"), "")
             .expect("marks the first turn as paused");
         codex
     }
 
+    pub fn command_conversation() -> ScriptedCodex {
+        ScriptedCodex::conversation_from_fixture("02-command-execution", None)
+    }
+
     pub fn failed_conversation() -> ScriptedCodex {
-        let codex = ScriptedCodex::conversation();
+        let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
         std::fs::write(codex.directory.path().join("fail-turn"), "")
             .expect("marks turns as failed");
         codex
     }
 
     pub fn rejected_conversation() -> ScriptedCodex {
-        let codex = ScriptedCodex::conversation();
+        let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
         std::fs::write(codex.directory.path().join("reject-turn"), "")
             .expect("rejects turn/start");
         codex
     }
 
-    fn conversation() -> ScriptedCodex {
+    fn conversation_from_fixture(fixture: &str, pause_after: Option<usize>) -> ScriptedCodex {
         let codex = ScriptedCodex::provider_probe();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/codex-app-server/01-plain-turn.jsonl");
+            .join(format!("../../fixtures/codex-app-server/{fixture}.jsonl"));
         let received: Vec<Value> = std::fs::read_to_string(&fixture)
             .unwrap_or_else(|error| panic!("reading {}: {error}", fixture.display()))
             .lines()
@@ -56,17 +60,30 @@ impl ScriptedCodex {
             )
             .expect("writes a fixture response");
         }
-        for (index, message) in received
+        let events: Vec<&Value> = received
             .iter()
             .skip_while(|message| message["id"] != 3)
             .skip(1)
-            .enumerate()
-        {
-            std::fs::write(
-                codex.directory.path().join(format!("turn-event-{index}")),
-                format!("{message}\n"),
-            )
-            .expect("writes a fixture turn event");
+            .collect();
+        let terminal = events.last().expect("the fixture has a terminal turn event");
+        let pause_after = pause_after.unwrap_or(events.len() - 1);
+        let before = events[..events.len() - 1]
+            .iter()
+            .take(pause_after)
+            .map(|message| format!("{message}\n"))
+            .collect::<String>();
+        let after = events[..events.len() - 1]
+            .iter()
+            .skip(pause_after)
+            .map(|message| format!("{message}\n"))
+            .collect::<String>();
+        for (name, content) in [
+            ("turn-events-before-pause", before),
+            ("turn-events-after-pause", after),
+            ("turn-terminal", format!("{terminal}\n")),
+        ] {
+            std::fs::write(codex.directory.path().join(name), content)
+                .expect("writes fixture turn events");
         }
         std::fs::write(codex.app_server_path(), codex.conversation_script())
             .expect("writes the conversation app-server");
@@ -468,17 +485,17 @@ if ($next.method -eq 'thread/start') {
       continue
     }
     Send-Json ('{"id":' + $request.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'conversation-turn-result')) + '}')
-    0..4 | ForEach-Object { [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root "turn-event-$_"))) }
+    [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-events-before-pause')))
     [Console]::Out.Flush()
     if ($turn -eq 1 -and (Test-Path (Join-Path $root 'pause-turn'))) {
       while (-not (Test-Path (Join-Path $root 'release-turn'))) { Start-Sleep -Milliseconds 20 }
     }
-    5..7 | ForEach-Object { [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root "turn-event-$_"))) }
+    [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-events-after-pause')))
     [Console]::Out.Flush()
     if (Test-Path (Join-Path $root 'fail-turn')) {
       Send-Json '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
     } else {
-      [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-event-8')))
+      [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-terminal')))
       [Console]::Out.Flush()
     }
   }
@@ -543,21 +560,15 @@ case "$next" in
             continue
           fi
           printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/conversation-turn-result")"
-          cat "$root/turn-event-0"
-          cat "$root/turn-event-1"
-          cat "$root/turn-event-2"
-          cat "$root/turn-event-3"
-          cat "$root/turn-event-4"
+          cat "$root/turn-events-before-pause"
           if [ "$turn" -eq 1 ] && [ -f "$root/pause-turn" ]; then
             while [ ! -f "$root/release-turn" ]; do sleep 0.02; done
           fi
-          cat "$root/turn-event-5"
-          cat "$root/turn-event-6"
-          cat "$root/turn-event-7"
+          cat "$root/turn-events-after-pause"
           if [ -f "$root/fail-turn" ]; then
             printf '%s\n' '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
           else
-            cat "$root/turn-event-8"
+            cat "$root/turn-terminal"
           fi
           ;;
       esac

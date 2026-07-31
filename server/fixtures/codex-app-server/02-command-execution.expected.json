@@ -1,0 +1,40 @@
+{
+  "threadId": "codex-thread-2",
+  "turnId": "codex-turn-2",
+  "threadStatus": "idle",
+  "turnStatus": "completed",
+  "turnError": null,
+  "assistantMessages": [
+    {
+      "id": "commentary-2",
+      "text": "I'm checking the current directory contents with `ls`, then I'll report the names exactly as shown.",
+      "phase": "commentary"
+    },
+    {
+      "id": "answer-2",
+      "text": "`README.md`\n`main.rs`",
+      "phase": "final_answer"
+    }
+  ],
+  "reasoningItems": [
+    {
+      "id": "reasoning-2",
+      "text": "",
+      "completed": true
+    }
+  ],
+  "commandExecutions": [
+    {
+      "id": "command-2",
+      "command": "/bin/bash -lc ls",
+      "cwd": "<workspace>",
+      "processId": "40283",
+      "status": "completed",
+      "aggregatedOutput": "README.md\nmain.rs\n",
+      "exitCode": 0,
+      "durationMs": 0
+    }
+  ],
+  "unknownEvents": 0,
+  "parseErrors": 0
+}

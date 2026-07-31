@@ -142,6 +142,13 @@ calls, thinking, permission requests and their resolutions. `crate::worklog`.
 
 **Activity** — one row in the work log.
 
+Codex's **commentary** phase is not one. `agentMessage` labels prose before tool
+use `commentary` and prose after it `final_answer`; both are messages addressed
+to the developer and are published in the transcript as separate messages. The
+work log records what the agent did between them. Treating commentary as an
+activity would require a generic kind the Claude driver does not produce and
+would trade streamed prose for a status row. `crate::codex`.
+
 **Approval** — a permission request and the developer's decision on it: one of
 `accept`, `acceptForSession`, `decline`, `cancel`. `crate::worklog::Decision`,
 which is contract vocabulary; the agent protocol's own is two behaviours with a

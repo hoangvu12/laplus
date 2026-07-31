@@ -4,7 +4,7 @@ mod harness;
 
 use harness::codex::ScriptedCodex;
 use harness::agent::ScriptedAgent;
-use harness::conversation::{assistant_sends, create_project, create_thread, follow_up};
+use harness::conversation::{activities, assistant_sends, create_project, create_thread, follow_up};
 use harness::workspace::Workspace;
 use harness::TestServer;
 use laplus_server::config::ServerConfig;
@@ -147,6 +147,91 @@ async fn a_codex_turn_streams_settles_reuses_its_process_and_is_reaped() {
 
     client.close().await;
     server.stop().await;
+}
+
+#[tokio::test]
+async fn a_captured_codex_command_reaches_the_socket_work_log() {
+    let codex = ScriptedCodex::command_conversation();
+    let workspace = Workspace::with(&["README.md", "main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread())
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-1",
+                "Run the shell command `ls` in the current directory, then tell me the file names you saw.",
+            ),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+    let work_log = activities(&events);
+    let commands: Vec<&Value> = work_log
+        .iter()
+        .copied()
+        .filter(|activity| activity["payload"]["itemType"] == "command_execution")
+        .collect();
+
+    assert_eq!(commands.len(), 2, "work log: {work_log:?}");
+    let [started, completed] = commands.as_slice() else {
+        unreachable!("the length was checked")
+    };
+    assert_eq!(started["kind"], "tool.updated");
+    assert_eq!(started["tone"], "tool");
+    assert_eq!(started["payload"]["status"], "inProgress");
+    assert_eq!(started["payload"]["data"]["command"], "/bin/bash -lc ls");
+    assert_eq!(started["payload"]["data"]["input"]["cwd"], "<workspace>");
+    assert_eq!(started["payload"]["data"]["input"]["processId"], "40283");
+    assert_eq!(completed["kind"], "tool.completed");
+    assert_eq!(completed["payload"]["status"], "completed");
+    assert_eq!(completed["payload"]["data"]["result"]["exitCode"], 0);
+    assert_eq!(completed["payload"]["data"]["result"]["output"], "README.md\nmain.rs\n");
+    assert_eq!(
+        started["payload"]["data"]["toolCallId"],
+        completed["payload"]["data"]["toolCallId"]
+    );
+    assert_eq!(
+        completed["sequence"].as_i64(),
+        started["sequence"].as_i64().map(|sequence| sequence + 1),
+        "paired lifecycle rows stay adjacent for the UI fold"
+    );
+    assert!(!work_log
+        .iter()
+        .any(|activity| activity["kind"] == "approval.requested"));
+
+    let completed_messages: Vec<String> = assistant_sends(&events)
+        .into_iter()
+        .filter_map(|(text, streaming)| (!streaming).then_some(text))
+        .collect();
+    assert_eq!(
+        completed_messages,
+        vec![
+            "I'm checking the current directory contents with `ls`, then I'll report the names exactly as shown.".to_string(),
+            "`README.md`\n`main.rs`".to_string(),
+        ],
+        "commentary and the final answer are separate transcript messages"
+    );
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
 }
 
 #[tokio::test]

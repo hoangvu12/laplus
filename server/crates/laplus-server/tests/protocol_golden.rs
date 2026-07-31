@@ -60,26 +60,50 @@ fn normalize(text: &str) -> String {
 }
 
 #[test]
-fn the_plain_codex_turn_folds_through_a_fresh_state() {
+fn every_codex_turn_fixture_folds_through_a_fresh_state() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/codex-app-server");
-    let capture = fs::read_to_string(directory.join("01-plain-turn.jsonl"))
-        .expect("reads the Codex turn fixture");
-    let mut state = ConversationState::new();
-    for record in capture.lines().map(|line| {
-        serde_json::from_str::<Value>(line).expect("a Codex fixture record")
-    }) {
-        if record["dir"] == "recv" {
-            state.fold_message(record["msg"].clone());
+    for fixture in ["01-plain-turn", "02-command-execution"] {
+        let capture = fs::read_to_string(directory.join(format!("{fixture}.jsonl")))
+            .unwrap_or_else(|error| panic!("reads the Codex turn fixture {fixture}: {error}"));
+        let mut state = ConversationState::new();
+        for record in capture.lines().map(|line| {
+            serde_json::from_str::<Value>(line).expect("a Codex fixture record")
+        }) {
+            if record["dir"] == "recv" {
+                state.fold_message(record["msg"].clone());
+            }
         }
+
+        let mut actual = serde_json::to_string_pretty(&state).expect("Codex state serializes");
+        actual.push('\n');
+        let expected = fs::read_to_string(directory.join(format!("{fixture}.expected.json")))
+            .unwrap_or_else(|error| panic!("reads the expected Codex fold {fixture}: {error}"));
+
+        assert_eq!(actual, normalize(&expected), "Codex fixture {fixture}");
     }
+}
 
-    let mut actual = serde_json::to_string_pretty(&state).expect("Codex state serializes");
-    actual.push('\n');
-    let expected = fs::read_to_string(directory.join("01-plain-turn.expected.json"))
-        .expect("reads the expected Codex turn fold");
+#[test]
+fn the_untrusted_read_only_command_capture_contains_no_approval_request() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/codex-app-server/02-command-execution.jsonl");
+    let records: Vec<Value> = fs::read_to_string(&fixture)
+        .expect("reads the command fixture")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a Codex fixture record"))
+        .collect();
+    let thread_start = records
+        .iter()
+        .find(|record| record["dir"] == "send" && record["msg"]["method"] == "thread/start")
+        .expect("the captured thread/start request");
 
-    assert_eq!(actual, normalize(&expected));
+    assert_eq!(thread_start["msg"]["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(thread_start["msg"]["params"]["sandbox"], "read-only");
+    assert!(!records.iter().any(|record| {
+        record["dir"] == "recv"
+            && record["msg"]["method"] == "item/commandExecution/requestApproval"
+    }));
 }
 
 #[test]

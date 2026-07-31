@@ -24,3 +24,13 @@ assistant deltas, authoritative completed message, and the recorded order where
 idle arrives immediately before `turn/completed`. The socket stand-in reads this
 fixture, rewrites response ids to the requests it actually received, and replays
 the received half; the adjacent expected file is its fresh conversation fold.
+
+`02-command-execution.jsonl` reduces
+`.scratch/codex-driver/captures/02-command-execution.jsonl`. It preserves the
+commentary before the command, the command's running and completed items, its
+process result, and the final answer. Its captured `thread/start` deliberately
+still says `approvalPolicy: untrusted` with a read-only sandbox: `ls` ran with no
+approval request under that handshake, establishing that a sandbox escape, not
+the policy's name alone, triggers the request. The socket stand-in replays the
+received half; translating laplus runtime modes into that outbound handshake is
+separate work.

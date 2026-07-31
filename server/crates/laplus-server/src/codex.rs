@@ -4,6 +4,12 @@
 //! requests sent by app-server use an independent id space. Classification is
 //! therefore by shape first and client responses are correlated only through
 //! the ids this client has in `pending`.
+//!
+//! Codex labels agent messages `commentary` before tool use and `final_answer`
+//! afterwards. Both are published as transcript messages: they are agent-authored
+//! prose addressed to the developer, while the work log is reserved for what the
+//! agent did. Keeping the item ids separate preserves Codex's phase boundary
+//! without inventing an activity kind that the other driver does not produce.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -18,7 +24,8 @@ use tokio::process::{Child as AsyncChild, ChildStdin as AsyncChildStdin, Command
 use tokio::sync::mpsc as async_mpsc;
 
 use crate::codex_protocol::{
-    self as protocol, Capabilities, ConversationFold, ConversationState, Incoming, Request,
+    self as protocol, Capabilities, CommandExecution, ConversationFold, ConversationState,
+    Incoming, Request,
 };
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
 use crate::config_store::ProviderProcessLifetime;
@@ -286,6 +293,8 @@ fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
                 decided.changes.push(Change::Activity(thinking));
             }
         }
+        // Commentary and final answers deliberately share the transcript path;
+        // the module-level policy explains why the phase is not an activity kind.
         ConversationFold::AssistantDelta { text, .. } => {
             let Some(active) = driving.turn.as_mut() else {
                 return decided;
@@ -314,6 +323,26 @@ fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
                 text,
             });
         }
+        ConversationFold::CommandStarted(command) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(command_call(&command).invoked(turn_id)));
+        }
+        ConversationFold::CommandCompleted(command) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided.changes.push(Change::Activity(
+                command_call(&command).command_returned(
+                    crate::worklog::CommandReturned {
+                        output: command.aggregated_output.as_deref().unwrap_or_default(),
+                        status: &command.status,
+                        exit_code: command.exit_code,
+                        duration_ms: command.duration_ms,
+                    },
+                    turn_id,
+                ),
+            ));
+        }
         ConversationFold::TurnCompleted(completion) => {
             let ending = match completion.error {
                 Some(error) => Ending::Failed(error),
@@ -323,6 +352,18 @@ fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
         }
     }
     decided
+}
+
+fn command_call(command: &CommandExecution) -> crate::worklog::Call {
+    crate::worklog::Call {
+        id: command.id.clone(),
+        name: "Command".to_string(),
+        input: serde_json::json!({
+            "command": command.command,
+            "cwd": command.cwd,
+            "processId": command.process_id,
+        }),
+    }
 }
 
 enum Ending {
