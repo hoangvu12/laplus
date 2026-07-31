@@ -25,8 +25,8 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::approval::ApprovalRequest;
 use crate::codex_protocol::{
-    self as protocol, Capabilities, CommandExecution, ConversationFold, ConversationState,
-    Incoming, Request,
+    self as protocol, Access, Capabilities, CommandExecution, ConversationFold,
+    ConversationState, Incoming, Request,
 };
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
 use crate::config_store::ProviderProcessLifetime;
@@ -136,10 +136,12 @@ impl Driver for Codex {
             let initialized = app_server.request(Request::Initialize).await?;
             protocol::decode_initialize(initialized)?;
             app_server.write(&protocol::initialized()).await?;
+            let access = Access::for_runtime_mode(&start.runtime_mode)?;
             let thread = app_server
                 .request(Request::ThreadStart {
                     cwd: start.workspace_root.clone(),
                     model: start.model.clone(),
+                    access,
                 })
                 .await?;
             protocol::decode_thread_start(thread)

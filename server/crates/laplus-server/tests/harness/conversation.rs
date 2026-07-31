@@ -158,6 +158,15 @@ pub fn revert_checkpoint(thread_id: &str, turn_count: u64) -> Value {
 /// A follow-up, which asks for no thread to be created because there already is
 /// one.
 pub fn follow_up(thread_id: &str, message_id: &str, text: &str) -> Value {
+    follow_up_in(thread_id, message_id, text, "full-access")
+}
+
+pub fn follow_up_in(
+    thread_id: &str,
+    message_id: &str,
+    text: &str,
+    runtime_mode: &str,
+) -> Value {
     json!({
         "type": "thread.turn.start",
         "commandId": format!("test:turn:{message_id}"),
@@ -168,7 +177,7 @@ pub fn follow_up(thread_id: &str, message_id: &str, text: &str) -> Value {
             "text": text,
             "attachments": [],
         },
-        "runtimeMode": "full-access",
+        "runtimeMode": runtime_mode,
         "interactionMode": "default",
         "createdAt": "2026-07-26T00:23:04.909Z",
     })

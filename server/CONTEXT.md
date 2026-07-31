@@ -110,6 +110,14 @@ total, mapping `approval-required` to the CLI's `default`. A push has no way to
 say "pass no flag", and `default`'s behaviour is to ask, which is what the mode
 means.
 
+Codex translates the same runtime mode into an approval policy and sandbox at
+`crate::codex_protocol::Access::for_runtime_mode`: `approval-required` is
+`untrusted` and read-only, the two middle modes are `on-request` and
+workspace-write, and `full-access` is `never` and danger-full-access. The
+developer is always named as the reviewer, including on resume. `auto`
+deliberately matches `auto-accept-edits` until the client can render the OpenAI
+reviewer's work; the mapping carries the reason for that divergence.
+
 A mode is given to the child at launch and **pushed to it afterwards**, on the
 agent's control channel at the next turn's dispatch — `set_permission_mode`, with
 `set_model` beside it for the model, which had the identical hole. So a mode set

@@ -32,8 +32,8 @@ process result, and the final answer. Its captured `thread/start` deliberately
 still says `approvalPolicy: untrusted` with a read-only sandbox: `ls` ran with no
 approval request under that handshake, establishing that a sandbox escape, not
 the policy's name alone, triggers the request. The socket stand-in replays the
-received half; translating laplus runtime modes into that outbound handshake is
-separate work.
+received half; the socket test runs it as `approval-required` and separately
+pins every runtime mode's outbound handshake.
 
 `03-write-approval.jsonl` reduces
 `.scratch/codex-driver/captures/03-write-approval.jsonl`. It preserves the

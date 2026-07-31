@@ -35,16 +35,16 @@ and the tests should assert it rather than treat it as a gap.
 
 **Blocked by:** 06.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Each of the four runtime modes sends the approval policy and sandbox the
+- [x] Each of the four runtime modes sends the approval policy and sandbox the
       table above names.
-- [ ] The approvals reviewer is sent explicitly on every thread start and every
+- [x] The approvals reviewer is sent explicitly on every thread start and every
       resume, never omitted.
-- [ ] On supervised, the agent runs under a read-only sandbox and an attempt to
+- [x] On supervised, the agent runs under a read-only sandbox and an attempt to
       escape it opens an approval panel.
-- [ ] On supervised, an action that stays inside the sandbox runs without a
+- [x] On supervised, an action that stays inside the sandbox runs without a
       question.
-- [ ] On full access, no permission question is asked.
-- [ ] `auto` behaves as `auto-accept-edits`, and the divergence from upstream is
+- [x] On full access, no permission question is asked.
+- [x] `auto` behaves as `auto-accept-edits`, and the divergence from upstream is
       recorded with its reason where the mapping lives.

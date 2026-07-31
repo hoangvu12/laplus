@@ -470,13 +470,54 @@ fn text_in(value: &Value) -> String {
     text.join("\n")
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Access {
+    approval_policy: &'static str,
+    sandbox: &'static str,
+}
+
+impl Access {
+    pub(crate) fn for_runtime_mode(mode: &str) -> Result<Access, String> {
+        let (approval_policy, sandbox) = match mode {
+            "approval-required" => ("untrusted", "read-only"),
+            "auto-accept-edits" => ("on-request", "workspace-write"),
+            // Upstream delegates `auto` approvals to an OpenAI reviewer. Until
+            // its review notifications are rendered, laplus keeps the user as
+            // reviewer so an invisible subagent cannot make decisions for them.
+            "auto" => ("on-request", "workspace-write"),
+            "full-access" => ("never", "danger-full-access"),
+            other => return Err(format!("Codex cannot use runtime mode '{other}'")),
+        };
+        Ok(Access {
+            approval_policy,
+            sandbox,
+        })
+    }
+
+    fn params(&self) -> Value {
+        json!({
+            "approvalPolicy": self.approval_policy,
+            "sandbox": self.sandbox,
+            "approvalsReviewer": "user",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Request {
     Initialize,
     Account,
     Models { cursor: Option<String> },
     Skills { cwds: Vec<String> },
-    ThreadStart { cwd: String, model: Option<String> },
+    ThreadStart {
+        cwd: String,
+        model: Option<String>,
+        access: Access,
+    },
+    // Ticket 09 activates resume; defining its access envelope here prevents
+    // that path from inheriting a previous reviewer by omission.
+    #[allow(dead_code)]
+    ThreadResume { thread_id: String, access: Access },
     TurnStart { thread_id: String, text: String },
 }
 
@@ -488,6 +529,7 @@ impl Request {
             Request::Models { .. } => "model/list",
             Request::Skills { .. } => "skills/list",
             Request::ThreadStart { .. } => "thread/start",
+            Request::ThreadResume { .. } => "thread/resume",
             Request::TurnStart { .. } => "turn/start",
         }
     }
@@ -508,16 +550,17 @@ impl Request {
                 cursor: Some(cursor),
             } => json!({"cursor": cursor}),
             Request::Skills { cwds } => json!({"cwds": cwds}),
-            Request::ThreadStart { cwd, model } => {
-                let mut params = json!({
-                    "cwd": cwd,
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "approvalsReviewer": "user",
-                });
+            Request::ThreadStart { cwd, model, access } => {
+                let mut params = access.params();
+                params["cwd"] = json!(cwd);
                 if let Some(model) = model {
                     params["model"] = json!(model);
                 }
+                params
+            }
+            Request::ThreadResume { thread_id, access } => {
+                let mut params = access.params();
+                params["threadId"] = json!(thread_id);
                 params
             }
             Request::TurnStart { thread_id, text } => json!({
@@ -1024,6 +1067,35 @@ mod tests {
     }
 
     #[test]
+    fn every_runtime_mode_sets_access_explicitly_on_start_and_resume() {
+        for (mode, approval_policy, sandbox) in [
+            ("approval-required", "untrusted", "read-only"),
+            ("auto-accept-edits", "on-request", "workspace-write"),
+            ("auto", "on-request", "workspace-write"),
+            ("full-access", "never", "danger-full-access"),
+        ] {
+            let access = Access::for_runtime_mode(mode).expect("a contract runtime mode");
+            let start = Request::ThreadStart {
+                cwd: "<workspace>".to_string(),
+                model: None,
+                access,
+            }
+            .message(1);
+            let resume = Request::ThreadResume {
+                thread_id: "codex-thread-1".to_string(),
+                access,
+            }
+            .message(2);
+
+            for request in [start, resume] {
+                assert_eq!(request["params"]["approvalPolicy"], approval_policy);
+                assert_eq!(request["params"]["sandbox"], sandbox);
+                assert_eq!(request["params"]["approvalsReviewer"], "user");
+            }
+        }
+    }
+
+    #[test]
     fn the_turn_fixture_pins_every_message_laplus_sends() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/codex-app-server/01-plain-turn.jsonl");
@@ -1040,6 +1112,12 @@ mod tests {
             Request::ThreadStart {
                 cwd: "<workspace>".to_string(),
                 model: Some("gpt-5.4-mini".to_string()),
+                // This fixture preserves an observed experimental combination,
+                // rather than one of laplus's runtime-mode mappings.
+                access: Access {
+                    approval_policy: "never",
+                    sandbox: "read-only",
+                },
             }
             .message(2),
             Request::TurnStart {

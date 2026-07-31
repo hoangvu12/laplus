@@ -27,22 +27,25 @@ impl ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("03-write-approval", None)
     }
 
+    pub fn unrestricted_write_conversation() -> ScriptedCodex {
+        let codex = ScriptedCodex::approval_conversation();
+        codex.rewrite_turn_events(|message| {
+            (message["method"] != "item/commandExecution/requestApproval").then_some(message)
+        });
+        std::fs::remove_file(codex.directory.path().join("await-approval"))
+            .expect("removes the fixture approval stop");
+        codex
+    }
+
     pub fn declinable_approval_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::approval_conversation();
-        let path = codex.directory.path().join("turn-events-before-pause");
-        let rewritten = std::fs::read_to_string(&path)
-            .expect("reads approval events")
-            .lines()
-            .map(|line| {
-                let mut message: Value = serde_json::from_str(line).expect("an approval event");
-                if message["method"] == "item/commandExecution/requestApproval" {
-                    message["params"]["availableDecisions"] =
-                        serde_json::json!(["accept", "decline", "cancel"]);
-                }
-                format!("{message}\n")
-            })
-            .collect::<String>();
-        std::fs::write(path, rewritten).expect("writes declinable approval events");
+        codex.rewrite_turn_events(|mut message| {
+            if message["method"] == "item/commandExecution/requestApproval" {
+                message["params"]["availableDecisions"] =
+                    serde_json::json!(["accept", "decline", "cancel"]);
+            }
+            Some(message)
+        });
         codex
     }
 
@@ -56,26 +59,32 @@ impl ScriptedCodex {
 
     fn file_approval_conversation(method: &str) -> ScriptedCodex {
         let codex = ScriptedCodex::approval_conversation();
-        let path = codex.directory.path().join("turn-events-before-pause");
+        codex.rewrite_turn_events(|mut message| {
+            if message["method"] == "item/started"
+                && message["params"]["item"]["type"] == "commandExecution"
+            {
+                return None;
+            }
+            if message["method"] == "item/commandExecution/requestApproval" {
+                message["method"] = Value::String(method.to_string());
+                message["params"]["path"] = Value::String("hello.txt".to_string());
+            }
+            Some(message)
+        });
+        codex
+    }
+
+    fn rewrite_turn_events(&self, mut rewrite: impl FnMut(Value) -> Option<Value>) {
+        let path = self.directory.path().join("turn-events-before-pause");
         let rewritten = std::fs::read_to_string(&path)
             .expect("reads approval events")
             .lines()
             .filter_map(|line| {
-                let mut message: Value = serde_json::from_str(line).expect("an approval event");
-                if message["method"] == "item/started"
-                    && message["params"]["item"]["type"] == "commandExecution"
-                {
-                    return None;
-                }
-                if message["method"] == "item/commandExecution/requestApproval" {
-                    message["method"] = Value::String(method.to_string());
-                    message["params"]["path"] = Value::String("hello.txt".to_string());
-                }
-                Some(format!("{message}\n"))
+                let message = serde_json::from_str(line).expect("an approval event");
+                rewrite(message).map(|message| format!("{message}\n"))
             })
             .collect::<String>();
-        std::fs::write(path, rewritten).expect("writes file approval events");
-        codex
+        std::fs::write(path, rewritten).expect("writes rewritten approval events");
     }
 
     pub fn failed_conversation() -> ScriptedCodex {
@@ -285,20 +294,33 @@ impl ScriptedCodex {
     }
 
     pub fn turn_requests(&self) -> usize {
-        std::fs::read_to_string(self.directory.path().join("conversation-requests"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        self.conversation_requests()
+            .into_iter()
             .filter(|message| message["method"] == "turn/start")
             .count()
     }
 
+    pub fn thread_requests(&self) -> Vec<Value> {
+        self.conversation_requests()
+            .into_iter()
+            .filter(|message| {
+                message["method"] == "thread/start" || message["method"] == "thread/resume"
+            })
+            .collect()
+    }
+
     pub fn approval_answers(&self) -> Vec<Value> {
+        self.conversation_requests()
+            .into_iter()
+            .filter(|message| message["result"]["decision"].is_string())
+            .collect()
+    }
+
+    fn conversation_requests(&self) -> Vec<Value> {
         std::fs::read_to_string(self.directory.path().join("conversation-requests"))
             .unwrap_or_default()
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|message| message["result"]["decision"].is_string())
             .collect()
     }
 

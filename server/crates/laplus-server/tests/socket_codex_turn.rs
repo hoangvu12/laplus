@@ -5,7 +5,7 @@ mod harness;
 use harness::codex::ScriptedCodex;
 use harness::agent::ScriptedAgent;
 use harness::conversation::{
-    activities, activity, assistant_sends, create_project, create_thread, follow_up,
+    activities, activity, assistant_sends, create_project, create_thread, follow_up, follow_up_in,
     respond_to_approval,
 };
 use harness::workspace::Workspace;
@@ -13,7 +13,7 @@ use harness::{SocketClient, TestServer};
 use laplus_server::config::ServerConfig;
 use serde_json::{json, Value};
 
-fn codex_thread() -> Value {
+fn codex_thread(runtime_mode: &str) -> Value {
     json!({
         "type": "thread.create",
         "commandId": "test:thread:codex-thread",
@@ -21,7 +21,7 @@ fn codex_thread() -> Value {
         "projectId": "project-1",
         "title": "A Codex conversation",
         "modelSelection": {"instanceId": "codex", "model": "gpt-5.4-mini"},
-        "runtimeMode": "full-access",
+        "runtimeMode": runtime_mode,
         "interactionMode": "default",
         "branch": Value::Null,
         "worktreePath": Value::Null,
@@ -63,17 +63,18 @@ async fn ask_codex(codex: &ScriptedCodex) -> AskedCodex {
         .await
         .expect_success();
     client
-        .call("orchestration.dispatchCommand", codex_thread())
+        .call("orchestration.dispatchCommand", codex_thread("approval-required"))
         .await
         .expect_success();
     let subscription = client.watch_conversation("codex-thread").await;
     client
         .call(
             "orchestration.dispatchCommand",
-            follow_up(
+            follow_up_in(
                 "codex-thread",
                 "message-1",
                 "Write hi to hello.txt with a shell command.",
+                "approval-required",
             ),
         )
         .await
@@ -111,6 +112,118 @@ async fn a_captured_sandbox_escape_waits_with_only_its_supported_decisions() {
 
     asked.client.close().await;
     asked.server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn every_runtime_mode_reaches_codex_as_its_approval_policy_and_sandbox() {
+    for (mode, approval_policy, sandbox) in [
+        ("approval-required", "untrusted", "read-only"),
+        ("auto-accept-edits", "on-request", "workspace-write"),
+        ("auto", "on-request", "workspace-write"),
+        ("full-access", "never", "danger-full-access"),
+    ] {
+        let codex = ScriptedCodex::conversation_paused_after_first_delta();
+        let workspace = Workspace::with(&["src/main.rs"]);
+        let mut config = ServerConfig::detect();
+        config.settings.providers.codex.binary_path = codex.configured();
+        let server = TestServer::start_with(config).await;
+        let mut client = server.connect().await;
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                create_project("project-1", workspace.path()),
+            )
+            .await
+            .expect_success();
+        client
+            .call("orchestration.dispatchCommand", codex_thread(mode))
+            .await
+            .expect_success();
+        let subscription = client.watch_conversation("codex-thread").await;
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                follow_up_in("codex-thread", "message-1", "Say hello.", mode),
+            )
+            .await
+            .expect_success();
+        client
+            .values_until(&subscription, |item| {
+                item["event"]["type"] == "thread.message-sent"
+                    && item["event"]["payload"]["role"] == "assistant"
+            })
+            .await;
+
+        let requests = codex.thread_requests();
+        let [opened] = requests.as_slice() else {
+            panic!("{mode} opened Codex with unexpected requests: {requests:?}");
+        };
+        assert_eq!(opened["params"]["approvalPolicy"], approval_policy);
+        assert_eq!(opened["params"]["sandbox"], sandbox);
+        assert_eq!(opened["params"]["approvalsReviewer"], "user");
+
+        codex.release_turn();
+        client.events_through_the_turn(&subscription).await;
+        client.close().await;
+        server.stop().await;
+        codex.assert_conversation_reaped();
+    }
+}
+
+#[tokio::test]
+async fn a_full_access_sandbox_escape_runs_without_a_permission_question() {
+    let codex = ScriptedCodex::unrestricted_write_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-1",
+                "Write hi to hello.txt with a shell command.",
+            ),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+    let work_log = activities(&events);
+
+    assert!(work_log.iter().any(|activity| {
+        activity["kind"] == "tool.completed"
+            && activity["payload"]["data"]["toolCallId"] == "command-3"
+    }));
+    assert!(!work_log
+        .iter()
+        .any(|activity| activity["kind"] == "approval.requested"));
+    let requests = codex.thread_requests();
+    let [opened] = requests.as_slice() else {
+        panic!("full access did not open exactly one Codex thread");
+    };
+    assert_eq!(opened["params"]["approvalPolicy"], "never");
+    assert_eq!(opened["params"]["sandbox"], "danger-full-access");
+
+    client.close().await;
+    server.stop().await;
     codex.assert_conversation_reaped();
 }
 
@@ -345,7 +458,7 @@ async fn a_codex_turn_streams_settles_reuses_its_process_and_is_reaped() {
     client
         .call(
             "orchestration.dispatchCommand",
-            codex_thread(),
+            codex_thread("full-access"),
         )
         .await
         .expect_success();
@@ -454,7 +567,10 @@ async fn a_captured_codex_command_reaches_the_socket_work_log() {
         .await
         .expect_success();
     client
-        .call("orchestration.dispatchCommand", codex_thread())
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("approval-required"),
+        )
         .await
         .expect_success();
     let subscription = client.watch_conversation("codex-thread").await;
@@ -462,10 +578,11 @@ async fn a_captured_codex_command_reaches_the_socket_work_log() {
     client
         .call(
             "orchestration.dispatchCommand",
-            follow_up(
+            follow_up_in(
                 "codex-thread",
                 "message-1",
                 "Run the shell command `ls` in the current directory, then tell me the file names you saw.",
+                "approval-required",
             ),
         )
         .await
@@ -539,7 +656,10 @@ async fn turn_completed_error_fails_the_turn_and_records_codexs_reason() {
         .await
         .expect_success();
     client
-        .call("orchestration.dispatchCommand", codex_thread())
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
         .await
         .expect_success();
     let subscription = client.watch_conversation("codex-thread").await;
@@ -601,7 +721,10 @@ async fn a_rejected_turn_start_fails_the_turn_with_the_correlated_reason() {
         .await
         .expect_success();
     client
-        .call("orchestration.dispatchCommand", codex_thread())
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
         .await
         .expect_success();
     let subscription = client.watch_conversation("codex-thread").await;
@@ -653,7 +776,10 @@ async fn codex_and_claude_conversations_run_concurrently_without_crossing() {
             .expect_success();
     }
     client
-        .call("orchestration.dispatchCommand", codex_thread())
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
         .await
         .expect_success();
     client
