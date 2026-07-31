@@ -328,11 +328,14 @@ async fn a_restored_conversation_is_continued_by_resuming_the_agents_own_session
         .expect_success();
     let events = client.events_through_the_turn(&subscription).await;
 
+    let continued = &last_session(&events, "the follow-up")["payload"]["session"];
     assert_eq!(
-        last_session(&events, "the follow-up")["payload"]["session"]["status"],
+        continued["status"],
         "ready",
         "the continued turn did not settle: {events:#?}"
     );
+    assert_eq!(continued["providerName"], "claudeAgent");
+    assert_eq!(continued["providerInstanceId"], "claudeAgent");
     assert_eq!(
         agent.resumed(),
         vec![SESSION.to_string()],

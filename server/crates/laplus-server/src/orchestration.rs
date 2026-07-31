@@ -736,6 +736,10 @@ impl Shell {
             branch,
             worktree_path,
         } = update;
+        if let Some(selection) = &model_selection {
+            let thread = self.open_thread(&thread_id)?;
+            selection_for(&thread, selection)?;
+        }
         self.inner
             .threads
             .apply(
@@ -1255,7 +1259,7 @@ impl Shell {
         let project = self.project(&create.thread.project_id)?;
         self.inner
             .threads
-            .create(create.to_thread(&project))
+            .create(create.to_thread(&project)?)
             .map_err(CommandError::new)
     }
 
@@ -1272,12 +1276,11 @@ impl Shell {
             ));
         }
 
-        // Bootstrapping is how the UI's composer starts a *new* conversation:
-        // the thread is a client-side draft until the first turn, which carries
-        // the thread it wants created alongside the message. Creating it here
-        // rather than expecting a separate `thread.create` is not a shortcut —
-        // it is the only path the real composer takes.
-        if !self.inner.threads.contains(&start.thread_id) {
+        // Bootstrapping is how the UI's composer starts a *new* conversation.
+        // Build the candidate now, but do not publish it until every part of its
+        // first turn has passed the same preflight as an existing thread. A
+        // refused first turn must leave a draft as what it was: absent here.
+        let pending = if !self.inner.threads.contains(&start.thread_id) {
             let Some(create) = start.bootstrap_thread() else {
                 return Err(CommandError::new(format!(
                     "There is no thread '{}' on this server, and the turn did not ask for one to \
@@ -1285,14 +1288,33 @@ impl Shell {
                     start.thread_id
                 )));
             };
-            self.create_thread(&create)?;
-        }
+            let project = self.project(&create.thread.project_id)?;
+            Some(create.to_thread(&project)?)
+        } else {
+            None
+        };
 
         // Everything that can still refuse the turn happens before anything is
-        // published. A refusal that had already put the prompt in the transcript
-        // would leave a conversation showing a message and a turn marked running
-        // with nothing left alive to settle it.
-        let project = self.project(&self.open_thread(&start.thread_id)?.project_id)?;
+        // published. A refusal that had already created the draft or put the
+        // prompt in its transcript would leave a conversation with no agent
+        // alive to settle it.
+        let thread = match &pending {
+            Some(thread) => thread.clone(),
+            None => self.open_thread(&start.thread_id)?,
+        };
+        let project = self.project(&thread.project_id)?;
+        if let Some(selection) = &start.model_selection {
+            selection_for(&thread, selection)?;
+        }
+        let prepared =
+            crate::session::prepare(&thread, &config.settings).map_err(CommandError::new)?;
+
+        if let Some(thread) = pending {
+            self.inner
+                .threads
+                .create(thread)
+                .map_err(CommandError::new)?;
+        }
 
         let turn_id = threads::fresh_turn_id();
         // The developer's own message first, so it is in the transcript before
@@ -1308,22 +1330,31 @@ impl Shell {
                 },
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;
-        self.inner.threads.apply(
-            &start.thread_id,
-            Change::TurnRequested {
-                turn_id: turn_id.clone(),
-                message_id: start.message.message_id.clone(),
-                model_selection: start.model_selection.clone(),
-                runtime_mode: start.runtime_mode.clone(),
-                interaction_mode: start.interaction_mode.clone(),
-            },
+        let (_, thread) = self
+            .inner
+            .threads
+            .apply_and_read(
+                &start.thread_id,
+                Change::TurnRequested {
+                    turn_id: turn_id.clone(),
+                    message_id: start.message.message_id.clone(),
+                    model_selection: start.model_selection.clone(),
+                    runtime_mode: start.runtime_mode.clone(),
+                    interaction_mode: start.interaction_mode.clone(),
+                },
+            )
+            .ok_or_else(|| self.not_open(&start.thread_id))?;
+
+        // Read by the same commit that folded the request, so another window's
+        // next metadata change cannot retune this turn before it starts.
+        // Driver availability was already checked above and provider identity
+        // cannot be changed by a thread event, so this step is infallible.
+        let starting = crate::session::starting(
+            &thread,
+            &where_the_work_happens(&thread, &project),
+            prepared,
         );
 
-        // Read *after* the turn request, because that is what carries the
-        // composer's current selection: a model or a runtime mode picked for
-        // this turn has to be the one the agent is started with, not the one the
-        // thread was created with.
-        let thread = self.open_thread(&start.thread_id)?;
         let sequence = self
             .inner
             .threads
@@ -1331,7 +1362,7 @@ impl Shell {
                 &start.thread_id,
                 Change::Session(Session {
                     status: SessionStatus::Starting,
-                    runtime_mode: thread.runtime_mode.clone(),
+                    runtime_mode: starting.runtime_mode.clone(),
                     active_turn_id: Some(turn_id.clone()),
                     last_error: None,
                     updated_at: now_iso(),
@@ -1339,15 +1370,6 @@ impl Shell {
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;
 
-        // [`where_the_work_happens`], the same call [`Shell::reviewing`] makes
-        // — so the folder the agent edits is the folder the checkpoint records
-        // and the revert puts back. Read off the thread as it stands after the
-        // turn request, for the same reason the model and the runtime mode are.
-        let starting = crate::session::starting(
-            &thread,
-            &where_the_work_happens(&thread, &project),
-            &config.settings.providers.claude_agent,
-        );
         if let Err(why) = crate::session::send(
             &self.inner.threads,
             &starting,
@@ -1831,7 +1853,7 @@ impl CreateThread {
     /// The project supplies the title when the client did not, the same way it
     /// does for a project with a blank name — the composer normally sends one,
     /// and a conversation called "" would be unreachable in the thread list.
-    fn to_thread(&self, project: &Project) -> Thread {
+    fn to_thread(&self, project: &Project) -> Result<Thread, CommandError> {
         let created_at = self
             .thread
             .created_at
@@ -1843,10 +1865,20 @@ impl CreateThread {
             given => given.to_string(),
         };
 
-        Thread {
+        let instance_id = provider_instance(&self.thread.model_selection, &self.thread_id)?;
+        let registered = crate::provider::registration(instance_id).ok_or_else(|| {
+            CommandError::new(format!(
+                "Provider instance '{instance_id}' is not registered, so thread '{}' was not \
+                 created.",
+                self.thread_id
+            ))
+        })?;
+
+        Ok(Thread {
             id: self.thread_id.clone(),
             project_id: self.thread.project_id.clone(),
             title,
+            provider: registered.identity(),
             model_selection: self.thread.model_selection.clone(),
             runtime_mode: self.thread.runtime_mode.clone(),
             interaction_mode: self.thread.interaction_mode.clone(),
@@ -1867,8 +1899,32 @@ impl CreateThread {
             // absent means. Nothing creates a thread already archived, settled,
             // snoozed or deleted.
             lifecycle: crate::threads::Lifecycle::default(),
-        }
+        })
     }
+}
+
+fn provider_instance<'a>(selection: &'a Value, thread_id: &str) -> Result<&'a str, CommandError> {
+    selection
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .filter(|instance_id| !instance_id.trim().is_empty())
+        .ok_or_else(|| {
+            CommandError::new(format!(
+                "Thread '{thread_id}' needs a model selection naming a provider instance."
+            ))
+        })
+}
+
+fn selection_for(thread: &Thread, selection: &Value) -> Result<(), CommandError> {
+    let selected = provider_instance(selection, &thread.id)?;
+    if selected == thread.provider.instance_id {
+        return Ok(());
+    }
+    Err(CommandError::new(format!(
+        "Thread '{}' belongs to provider instance '{}', so its model selection cannot name \
+         provider instance '{selected}'. Start a new conversation to use another provider.",
+        thread.id, thread.provider.instance_id
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -5308,6 +5364,97 @@ mod tests {
             fixture.detail("thread-1")["modelSelection"],
             json!({"instanceId": "claudeAgent", "model": "claude-opus-5"}),
             "a refused selection was stored anyway"
+        );
+    }
+
+    #[test]
+    fn a_model_selection_cannot_move_a_conversation_to_another_provider() {
+        let fixture = Fixture::with_a_conversation();
+        let codex = json!({"instanceId": "codex", "model": "gpt-5.6-luna"});
+
+        let metadata = fixture
+            .update_thread_meta("thread-1", json!({"modelSelection": codex}))
+            .expect_err("provider ownership is fixed for a conversation");
+        assert!(metadata.message().contains("claudeAgent"), "{metadata:?}");
+        assert!(metadata.message().contains("codex"), "{metadata:?}");
+
+        let turn = fixture
+            .start_turn("thread-1", json!({"modelSelection": codex}))
+            .expect_err("a turn cannot switch providers");
+        assert!(turn.message().contains("claudeAgent"), "{turn:?}");
+        assert!(turn.message().contains("codex"), "{turn:?}");
+
+        let thread = fixture.detail("thread-1");
+        assert_eq!(
+            thread["modelSelection"],
+            json!({"instanceId": "claudeAgent", "model": "claude-opus-5"})
+        );
+        assert_eq!(thread["messages"], json!([]));
+        assert_eq!(thread["latestTurn"], Value::Null);
+    }
+
+    #[test]
+    fn an_unregistered_stored_provider_is_refused_before_the_turn_is_published() {
+        let fixture = Fixture::with_a_conversation();
+        let mut thread = crate::threads::tests::a_thread("thread-with-old-driver");
+        thread.provider = crate::provider::ProviderIdentity {
+            instance_id: "driver-removed-since-last-run".to_string(),
+            driver: "removed".to_string(),
+        };
+        fixture
+            .shell
+            .inner
+            .threads
+            .create(thread)
+            .expect("the stored conversation is loaded");
+
+        let refusal = fixture
+            .start_turn("thread-with-old-driver", json!({}))
+            .expect_err("an unavailable driver cannot take a turn");
+        assert!(refusal.message().contains("not registered"), "{refusal:?}");
+
+        let thread = fixture.detail("thread-with-old-driver");
+        assert_eq!(thread["messages"], json!([]));
+        assert_eq!(thread["latestTurn"], Value::Null);
+        assert_eq!(thread["session"], Value::Null);
+    }
+
+    #[test]
+    fn a_refused_first_turn_leaves_the_draft_absent_from_the_server() {
+        let fixture = Fixture::new();
+        let folder = fixture.folder("project");
+        fixture.add("project-1", &folder).expect("project created");
+
+        let refusal = fixture
+            .start_turn(
+                "draft-1",
+                json!({
+                    "modelSelection": {"instanceId": "codex", "model": "gpt-5.6-luna"},
+                    "bootstrap": {
+                        "createThread": {
+                            "projectId": "project-1",
+                            "title": "A conversation",
+                            "modelSelection": {
+                                "instanceId": "claudeAgent",
+                                "model": "claude-opus-5"
+                            },
+                            "runtimeMode": "full-access",
+                            "interactionMode": "default",
+                            "branch": Value::Null,
+                            "worktreePath": Value::Null,
+                            "createdAt": "2026-07-26T00:23:04.909Z"
+                        }
+                    }
+                }),
+            )
+            .expect_err("the first turn cannot switch providers");
+        assert!(refusal.message().contains("codex"), "{refusal:?}");
+        assert!(
+            fixture
+                .listed_threads()
+                .iter()
+                .all(|thread| thread["id"] != "draft-1"),
+            "a refused first turn stored its draft"
         );
     }
 

@@ -188,8 +188,9 @@ impl Driver for Claude {
         // just pressed enter. Resolved per session rather than once at boot
         // because the setting can change and an install can move, and this is the
         // moment the answer actually matters.
+        let settings = start.driver.claude()?;
         let (path, _) =
-            crate::provider::resolve(&start.settings.binary_path, &Search::from_environment())
+            crate::provider::resolve(&settings.binary_path, &Search::from_environment())
                 .startable()?;
 
         let agent = Agent::start(&Launch {
@@ -1068,13 +1069,13 @@ mod tests {
             model: None,
             runtime_mode: "full-access".to_string(),
             resume: None,
-            settings: ClaudeSettings {
+            driver: crate::session::DriverStart::Claude(ClaudeSettings {
                 enabled: true,
                 binary_path: "claude".to_string(),
                 home_path: String::new(),
                 launch_args: String::new(),
                 custom_models: Vec::new(),
-            },
+            }),
         }
     }
 

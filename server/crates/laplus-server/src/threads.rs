@@ -553,6 +553,18 @@ impl Threads {
         self.apply_unless(thread_id, |_| None, change)?.ok()
     }
 
+    /// Fold one change and return the conversation that exact fold produced.
+    /// Used when a caller must act on the committed value rather than race a
+    /// second read against another window's next change.
+    pub fn apply_and_read(&self, thread_id: &str, change: Change) -> Option<(i64, Thread)> {
+        let entry = self.find(thread_id)?;
+        let (sequence, thread) = self
+            .commit(&entry, |_| None, &change, Clone::clone)?
+            .ok()?;
+        let reached = self.woken_by(&entry, &change).unwrap_or(sequence);
+        Some((reached, thread))
+    }
+
     /// [`Threads::apply`], with the world's own refusal decided under the lock
     /// the fold runs under.
     ///
@@ -574,8 +586,8 @@ impl Threads {
         change: Change,
     ) -> Option<Result<i64, String>> {
         let entry = self.find(thread_id)?;
-        let sequence = match self.commit(&entry, refused, &change)? {
-            Ok(sequence) => sequence,
+        let sequence = match self.commit(&entry, refused, &change, |_| ())? {
+            Ok((sequence, ())) => sequence,
             Err(why) => return Some(Err(why)),
         };
         // *After* the change that caused it, and after the refusal: a reset
@@ -611,9 +623,14 @@ impl Threads {
         let mut reached = None;
         for woken in change.wakes() {
             if let Some(Ok(sequence)) =
-                self.commit(entry, |thread| woken.refusal(thread), &woken.reset())
+                self.commit(
+                    entry,
+                    |thread| woken.refusal(thread),
+                    &woken.reset(),
+                    |_| (),
+                )
             {
-                reached = Some(sequence);
+                reached = Some(sequence.0);
             }
         }
         reached
@@ -625,12 +642,13 @@ impl Threads {
     /// its callers: the reset is a second change against the same conversation,
     /// and going back through `apply_unless` would ask whether *it* wakes
     /// anything.
-    fn commit(
+    fn commit<T>(
         &self,
         entry: &Arc<Entry>,
         refused: impl FnOnce(&Thread) -> Option<String>,
         change: &Change,
-    ) -> Option<Result<i64, String>> {
+        read: impl FnOnce(&Thread) -> T,
+    ) -> Option<Result<(i64, T), String>> {
         let mut state = lock(&entry.state);
         let thread = state.as_mut()?;
         if let Some(why) = refused(thread) {
@@ -696,6 +714,7 @@ impl Threads {
         for write in durable(thread, change) {
             self.inner.transcripts.queue(write);
         }
+        let read = read(thread);
         drop(state);
 
         // `send` on a broadcast channel never blocks — it drops the oldest value
@@ -705,7 +724,7 @@ impl Threads {
         if let Some(listed) = listed {
             let _ = self.inner.shell.send(listed);
         }
-        Some(Ok(sequence))
+        Some(Ok((sequence, read)))
     }
 
     /// Open an `orchestration.subscribeThread` subscription: the thread now,
@@ -2123,7 +2142,12 @@ pub(crate) mod tests {
     #[test]
     fn both_renderings_carry_every_key_the_contract_declares() {
         let (threads, _shell) = threads();
-        threads.create(a_thread("thread-1")).expect("created");
+        let mut created = a_thread("thread-1");
+        created.provider = crate::provider::ProviderIdentity {
+            instance_id: "codex-work".to_string(),
+            driver: "codex".to_string(),
+        };
+        threads.create(created).expect("created");
         threads.apply("thread-1", Change::Session(running("turn-1")));
         let thread = threads.get("thread-1").expect("the thread");
 
@@ -2194,7 +2218,10 @@ pub(crate) mod tests {
         let session = &summary["session"];
         assert_eq!(session["threadId"], "thread-1");
         assert_eq!(session["status"], "running");
-        assert_eq!(session["providerName"], crate::provider::INSTANCE_ID);
+        assert_eq!(session["providerName"], "codex");
+        assert_eq!(session["providerInstanceId"], "codex-work");
+        assert_eq!(detail["session"]["providerName"], "codex");
+        assert_eq!(detail["session"]["providerInstanceId"], "codex-work");
     }
 
     /// Ticket 01 of the thread-lifecycle effort: the six fields are one shape

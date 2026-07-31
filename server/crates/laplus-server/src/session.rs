@@ -169,7 +169,7 @@ use std::future::Future;
 use serde_json::{json, Value};
 
 use crate::clock::now_iso;
-use crate::config::ClaudeSettings;
+use crate::config::{ClaudeSettings, Settings};
 use crate::protocol::{Drift, Permission, TokenUsage};
 use crate::settling::SessionStatus;
 use crate::threads::{
@@ -341,11 +341,28 @@ pub struct Start {
     /// Read once, when the turn is dispatched. A settings change mid-session
     /// does not move a running agent, which is honest — the process was started
     /// with the old value and cannot be told otherwise.
-    ///
-    /// **The one field here that names an agent**, and the one thing this type
-    /// still owes the second driver: a settings section per driver, chosen by
-    /// the slug the conversation recorded, is ticket 02's whole subject.
-    pub settings: ClaudeSettings,
+    /// Selected from the conversation's registry entry together, so a driver's
+    /// implementation cannot be paired with another driver's settings.
+    pub driver: DriverStart,
+}
+
+#[derive(Debug, Clone)]
+pub enum DriverStart {
+    Claude(ClaudeSettings),
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedDriver {
+    registered: crate::provider::Registration,
+    driver: DriverStart,
+}
+
+impl DriverStart {
+    pub(crate) fn claude(&self) -> Result<&ClaudeSettings, String> {
+        match self {
+            DriverStart::Claude(settings) => Ok(settings),
+        }
+    }
 }
 
 /// Send one turn, starting a session for the thread if it has none.
@@ -355,20 +372,22 @@ pub struct Start {
 /// channel being full or closed, which means a session that is not consuming —
 /// and that is worth telling the client about rather than dropping.
 ///
-/// **The one line in this file that chooses an agent** is the driver the session
-/// is opened with, below. Everything the loop does afterwards is written against
-/// [`Driver`], so running a second agent is a choice made here rather than a
-/// change made throughout — which is what ticket 02 turns into a registry and a
-/// slug the conversation records. (The other place this file still names one is
-/// [`Start::settings`], and it is the same ticket's.)
+/// The registry choice is carried in [`Start::driver`], pairing one driver's
+/// settings with its implementation. Everything after this match is written
+/// against [`Driver`], so a second agent adds an arm here rather than another
+/// session loop.
 pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
-    let prompts = threads.attach(&start.thread_id, move |incoming, signals, epoch| {
-        tokio::spawn(drive::<crate::turn::Claude>(
-            driving, starting, incoming, signals, epoch,
-        ))
-    });
+    let prompts = match &start.driver {
+        DriverStart::Claude(_) => {
+            threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+                tokio::spawn(drive::<crate::turn::Claude>(
+                    driving, starting, incoming, signals, epoch,
+                ))
+            })
+        }
+    };
 
     // The whole prompt is built here rather than by the caller, because what a
     // turn carries is more than what the developer typed: it also carries what
@@ -1750,7 +1769,32 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
 /// A free function rather than a method on either, because it is the one place
 /// three things meet: the thread says which model and how much latitude, the
 /// project says where, and the settings say which binary.
-pub fn starting(thread: &Thread, workspace_root: &str, settings: &ClaudeSettings) -> Start {
+pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, String> {
+    let registered = crate::provider::registration(&thread.provider.instance_id).ok_or_else(|| {
+        format!(
+            "Provider instance '{}' is not registered, so thread '{}' cannot start a turn.",
+            thread.provider.instance_id, thread.id
+        )
+    })?;
+    if registered.driver != thread.provider.driver {
+        return Err(format!(
+            "Provider instance '{}' is registered for driver '{}', but thread '{}' records '{}'.",
+            thread.provider.instance_id, registered.driver, thread.id, thread.provider.driver
+        ));
+    }
+    let driver = match registered.kind {
+        crate::provider::DriverKind::Claude => {
+            DriverStart::Claude(settings.providers.claude_agent.clone())
+        }
+    };
+
+    Ok(PreparedDriver { registered, driver })
+}
+
+pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver) -> Start {
+    debug_assert_eq!(prepared.registered.instance_id, thread.provider.instance_id);
+    debug_assert_eq!(prepared.registered.driver, thread.provider.driver);
+
     Start {
         thread_id: thread.id.clone(),
         workspace_root: workspace_root.to_string(),
@@ -1761,7 +1805,6 @@ pub fn starting(thread: &Thread, workspace_root: &str, settings: &ClaudeSettings
         // for a thread that has none starts a fresh conversation and reports its
         // own id back a moment later.
         resume: thread.agent_session_id.clone(),
-        settings: settings.clone(),
+        driver: prepared.driver,
     }
 }
-

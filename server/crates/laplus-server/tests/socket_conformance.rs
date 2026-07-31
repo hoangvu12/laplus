@@ -143,8 +143,9 @@ const MISSING: &[Declared] = &[
         because: "as auth/type — no credential is read, so there is no account to name",
     },
     Declared {
-        path: "/settings/providers/codex",
-        because: "v1 ships one driver — Claude Code",
+        path: "/settings/providers/codex/shadowHomePath",
+        because: "it selects a Codex account, while this server runs one account and refuses \
+                  the setting rather than storing a value it cannot honour",
     },
     Declared {
         path: "/settings/providers/cursor",
@@ -222,6 +223,10 @@ const UNCOMPARED: &[Declared] = &[
     },
     Declared {
         path: "/settings/providers/claudeAgent/customModels[]",
+        because: "empty in the capture too — no custom models were configured",
+    },
+    Declared {
+        path: "/settings/providers/codex/customModels[]",
         because: "empty in the capture too — no custom models were configured",
     },
 ];

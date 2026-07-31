@@ -42,6 +42,10 @@ pub struct Thread {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    /// The provider instance this conversation was created under and its
+    /// registered driver. Durable so a later model choice cannot silently
+    /// change which agent owns the thread.
+    pub provider: crate::provider::ProviderIdentity,
     /// `{instanceId, model}` — what the agent is asked for with `--model`, and
     /// what the UI shows in the composer's picker.
     pub model_selection: Value,
@@ -470,6 +474,7 @@ pub struct ThreadRow {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    pub provider: crate::provider::ProviderIdentity,
     pub model_selection: Value,
     pub runtime_mode: String,
     pub interaction_mode: String,
@@ -683,7 +688,10 @@ impl Thread {
                 .iter()
                 .map(Checkpoint::to_value)
                 .collect::<Vec<Value>>(),
-            "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
+            "session": self.session.as_ref().map(|session| session.to_value(
+                &self.id,
+                &self.provider,
+            )),
         });
         self.lifecycle.write_onto(&mut detail);
         detail
@@ -716,7 +724,10 @@ impl Thread {
             "latestTurn": self.latest_turn.as_ref().map(LatestTurn::to_value),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "session": self.session.as_ref().map(|session| session.to_value(&self.id)),
+            "session": self.session.as_ref().map(|session| session.to_value(
+                &self.id,
+                &self.provider,
+            )),
             "latestUserMessageAt": self.latest_user_message_at,
             // Linear in the work log, and only for the shell summary, which a
             // delta and an activity both skip ([`Change::reaches_the_shell`]).
@@ -886,6 +897,7 @@ impl Thread {
             id: self.id.clone(),
             project_id: self.project_id.clone(),
             title: self.title.clone(),
+            provider: self.provider.clone(),
             model_selection: self.model_selection.clone(),
             runtime_mode: self.runtime_mode.clone(),
             interaction_mode: self.interaction_mode.clone(),
@@ -927,6 +939,7 @@ impl Thread {
             id: row.id,
             project_id: row.project_id,
             title: row.title,
+            provider: row.provider,
             model_selection: row.model_selection,
             runtime_mode: row.runtime_mode,
             interaction_mode: row.interaction_mode,
@@ -1062,14 +1075,16 @@ impl Session {
     /// `threadId` is a field of the session in the contract and is the key the
     /// client re-attaches it by, so it comes from the thread rather than being
     /// stored twice.
-    fn to_value(&self, thread_id: &str) -> Value {
+    fn to_value(
+        &self,
+        thread_id: &str,
+        provider: &crate::provider::ProviderIdentity,
+    ) -> Value {
         json!({
             "threadId": thread_id,
             "status": self.status.as_str(),
-            // The driver slug, which is what upstream puts here and what the UI
-            // renders beside the session state.
-            "providerName": crate::provider::INSTANCE_ID,
-            "providerInstanceId": crate::provider::INSTANCE_ID,
+            "providerName": provider.driver,
+            "providerInstanceId": provider.instance_id,
             "runtimeMode": self.runtime_mode,
             "activeTurnId": self.active_turn_id,
             "lastError": self.last_error,
@@ -1917,7 +1932,10 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             thread.session = Some(session.clone());
             json!({
                 "threadId": thread.id,
-                "session": session.to_value(&thread.id),
+                "session": session.to_value(
+                    &thread.id,
+                    &thread.provider,
+                ),
             })
         }
         // The client's reducer, mirrored down to what it leaves alone: the
@@ -2364,6 +2382,9 @@ pub(crate) mod tests {
             id: id.to_string(),
             project_id: "project-1".to_string(),
             title: "A conversation".to_string(),
+            provider: crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID)
+                .expect("the Claude driver is registered")
+                .identity(),
             model_selection: json!({"instanceId": "claudeAgent", "model": "claude-opus-5"}),
             runtime_mode: "full-access".to_string(),
             interaction_mode: "default".to_string(),

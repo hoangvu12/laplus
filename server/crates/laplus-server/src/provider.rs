@@ -66,16 +66,60 @@ use crate::config::{
 use crate::config_store::{ConfigChange, ConfigStore};
 use crate::process::Search;
 
-/// The routing key the client uses for the one provider instance v1 ships, and
-/// the driver slug that selects the implementation behind it.
-///
-/// Both are `claudeAgent`, and neither is a closed literal in the contract —
-/// `ProviderDriverKind` is a deliberately open slug so a fork can add a driver.
-/// What makes this the only usable value is that the UI keys tables off it:
-/// `DEFAULT_MODEL_BY_PROVIDER`, the settings map at
-/// `settings.providers.claudeAgent`, and the driver's own label. A slug of our
-/// own invention would decode and then miss every one of them.
-pub const INSTANCE_ID: &str = "claudeAgent";
+/// The routing key for the Claude provider instance.
+pub const CLAUDE_INSTANCE_ID: &str = "claudeAgent";
+
+/// The slug selecting the Claude driver implementation. It currently has the
+/// same spelling as its instance id, but it is a separate concept and registry
+/// field: another instance of this driver would keep this slug and get its own
+/// routing key.
+pub const CLAUDE_DRIVER: &str = "claudeAgent";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverKind {
+    Claude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Registration {
+    pub instance_id: &'static str,
+    pub driver: &'static str,
+    pub kind: DriverKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderIdentity {
+    pub instance_id: String,
+    pub driver: String,
+}
+
+impl Registration {
+    pub fn identity(self) -> ProviderIdentity {
+        ProviderIdentity {
+            instance_id: self.instance_id.to_string(),
+            driver: self.driver.to_string(),
+        }
+    }
+}
+
+/// The drivers this build can run. Settings may know about a driver before it
+/// joins this registry; registration means turns can actually be dispatched.
+pub const REGISTRY: &[Registration] = &[Registration {
+    instance_id: CLAUDE_INSTANCE_ID,
+    driver: CLAUDE_DRIVER,
+    kind: DriverKind::Claude,
+}];
+
+pub fn registration(instance_id: &str) -> Option<Registration> {
+    REGISTRY
+        .iter()
+        .copied()
+        .find(|registered| registered.instance_id == instance_id)
+}
+
+fn claude_registration() -> Registration {
+    registration(CLAUDE_INSTANCE_ID).expect("the Claude driver is registered")
+}
 
 /// What the UI calls this provider. `displayName` is optional in the contract
 /// and the client falls back to title-casing the driver slug, which would read
@@ -834,9 +878,10 @@ fn snapshot(
     message: Option<String>,
     catalogue: catalogue::Catalogue,
 ) -> Provider {
+    let registered = claude_registration();
     Provider {
-        instance_id: INSTANCE_ID.to_string(),
-        driver: INSTANCE_ID.to_string(),
+        instance_id: registered.instance_id.to_string(),
+        driver: registered.driver.to_string(),
         display_name: DISPLAY_NAME.to_string(),
         enabled: settings.enabled,
         installed: installed == Installed::Yes,
@@ -882,7 +927,7 @@ pub fn rescan_skills(config: &ConfigStore, roots: &[PathBuf]) {
     let mut providers = current.providers.clone();
     let Some(provider) = providers
         .iter_mut()
-        .find(|provider| provider.instance_id == INSTANCE_ID)
+        .find(|provider| provider.instance_id == CLAUDE_INSTANCE_ID)
     else {
         // Nothing has looked for the agent yet, so there is no snapshot to
         // amend. The startup probe is still coming and will scan these roots.

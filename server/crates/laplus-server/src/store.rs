@@ -351,6 +351,13 @@ const MIGRATIONS: &[&str] = &[
     -- turn wrote are not orphaned.
     ALTER TABLE threads ADD COLUMN deleted_at       TEXT;
     "#,
+    // v9 — codex-driver ticket 02, the provider a conversation belongs to.
+    // Every older row necessarily ran under the only driver the server had, so
+    // the defaults are a migration of known history rather than a guess.
+    r#"
+    ALTER TABLE threads ADD COLUMN provider_instance_id TEXT NOT NULL DEFAULT 'claudeAgent';
+    ALTER TABLE threads ADD COLUMN provider_driver      TEXT NOT NULL DEFAULT 'claudeAgent';
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -442,7 +449,8 @@ fn pairing_link_from_row(row: &Row<'_>) -> rusqlite::Result<PairingLink> {
 const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mode, \
      interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
      latest_user_message_at, created_at, updated_at, archived_at, settled_override, \
-     settled_at, snoozed_until, snoozed_at, deleted_at";
+     settled_at, snoozed_until, snoozed_at, deleted_at, provider_instance_id, \
+     provider_driver";
 
 /// The registry's durable half.
 #[derive(Debug)]
@@ -1771,9 +1779,10 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
             "INSERT INTO threads (id, project_id, title, model_selection, runtime_mode, \
                 interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
                 latest_user_message_at, created_at, updated_at, archived_at, \
-                settled_override, settled_at, snoozed_until, snoozed_at, deleted_at) \
+                settled_override, settled_at, snoozed_until, snoozed_at, deleted_at, \
+                provider_instance_id, provider_driver) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                ?16, ?17, ?18, ?19) \
+                ?16, ?17, ?18, ?19, ?20, ?21) \
              ON CONFLICT (id) DO UPDATE SET \
                 project_id = excluded.project_id, \
                 title = excluded.title, \
@@ -1791,7 +1800,9 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 settled_at = excluded.settled_at, \
                 snoozed_until = excluded.snoozed_until, \
                 snoozed_at = excluded.snoozed_at, \
-                deleted_at = excluded.deleted_at",
+                deleted_at = excluded.deleted_at, \
+                provider_instance_id = excluded.provider_instance_id, \
+                provider_driver = excluded.provider_driver",
             rusqlite::params![
                 thread.id,
                 thread.project_id,
@@ -1817,6 +1828,8 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 thread.lifecycle.snoozed_until,
                 thread.lifecycle.snoozed_at,
                 thread.lifecycle.deleted_at,
+                thread.provider.instance_id,
+                thread.provider.driver,
             ],
         )
         .map_err(StorageError::while_("store the conversation"))?;
@@ -1980,6 +1993,10 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
+        provider: crate::provider::ProviderIdentity {
+            instance_id: row.get(19)?,
+            driver: row.get(20)?,
+        },
         // A selection that will not parse is a row somebody edited by hand.
         // `null` decodes on the client as "no selection", which is a worse answer
         // than the stored one and a much better one than no conversation.
@@ -2570,6 +2587,45 @@ mod tests {
         assert_eq!(conversations[0].thread.title, "A conversation");
     }
 
+    #[test]
+    fn a_conversation_from_before_driver_identity_is_named_as_claude() {
+        const BEFORE_DRIVER_IDENTITY: usize = 8;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+        {
+            let connection = Connection::open(&path).expect("creates the file");
+            for (index, statements) in MIGRATIONS.iter().take(BEFORE_DRIVER_IDENTITY).enumerate() {
+                connection
+                    .execute_batch(&format!(
+                        "BEGIN; {statements} PRAGMA user_version = {}; COMMIT;",
+                        index + 1
+                    ))
+                    .expect("applies a released migration");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO projects \
+                        (id, title, workspace_root, canonical_root, created_at, updated_at) \
+                     VALUES ('project-1', 'A project', '/tmp/p', '/tmp/p', \
+                        '2026-07-26T00:23:04.909Z', '2026-07-26T00:23:04.909Z'); \
+                     INSERT INTO threads \
+                        (id, project_id, title, model_selection, runtime_mode, \
+                         interaction_mode, created_at, updated_at) \
+                     VALUES ('thread-1', 'project-1', 'A conversation', \
+                        '{\"instanceId\":\"claudeAgent\"}', 'full-access', 'default', \
+                        '2026-07-26T00:23:04.909Z', '2026-07-26T00:23:04.909Z');",
+                )
+                .expect("a conversation from before driver identity");
+        }
+
+        let database = Database::open(&path).expect("migrates the existing file");
+        let conversations = database.conversations().expect("reads them back");
+
+        assert_eq!(conversations[0].thread.provider.instance_id, "claudeAgent");
+        assert_eq!(conversations[0].thread.provider.driver, "claudeAgent");
+    }
+
     /// A file written by a newer laplus is refused rather than guessed at.
     /// Downgrading and silently ignoring tables you do not understand is how a
     /// registry loses rows.
@@ -2699,6 +2755,10 @@ mod tests {
             id: id.to_string(),
             project_id: project_id.to_string(),
             title: "A conversation".to_string(),
+            provider: crate::provider::ProviderIdentity {
+                instance_id: "codex-work".to_string(),
+                driver: "codex".to_string(),
+            },
             model_selection: serde_json::json!({
                 "instanceId": "claudeAgent",
                 "model": "claude-opus-5",

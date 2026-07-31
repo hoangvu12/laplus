@@ -24,18 +24,31 @@ failed by the setting that accepted their input.
 
 **Blocked by:** 01.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Driver slug and provider instance id are separate concepts; neither is a
+- [x] Driver slug and provider instance id are separate concepts; neither is a
       single compiled-in constant standing for both.
-- [ ] A conversation stores which driver ran it, and publishes that rather than a
+- [x] A conversation stores which driver ran it, and publishes that rather than a
       default — on the snapshot and on every rendering of a thread that carries a
       provider.
-- [ ] A conversation created before this ticket still reads correctly.
-- [ ] `settings.providers.codex` round-trips: a saved binary path, `CODEX_HOME`
+- [x] A conversation created before this ticket still reads correctly.
+- [x] `settings.providers.codex` round-trips: a saved binary path, `CODEX_HOME`
       and launch arguments come back on the next read.
-- [ ] Saving `shadowHomePath` is refused, and the refusal says it is an
+- [x] Saving `shadowHomePath` is refused, and the refusal says it is an
       account-selection setting this server cannot honour — not a generic
       "unknown field".
-- [ ] The existing socket conformance suite passes against the real field rather
+- [x] The existing socket conformance suite passes against the real field rather
       than a constant.
+
+**Where it landed.** `crate::provider` now owns a registry whose entries separate
+instance identity from driver kind. That identity is stored on every thread by a
+v9 migration, with pre-existing rows backfilled to Claude, and the session fold
+publishes the stored pair on snapshots, shell summaries and session events.
+Dispatch binds the registered driver and its settings before publishing a turn,
+then takes the model and runtime mode from the exact `TurnRequested` fold so a
+second window cannot retune a turn in the gap.
+
+`Settings.providers` now carries Codex's binary path, `CODEX_HOME`, launch
+arguments and custom models. `shadowHomePath` is deliberately absent from the
+stored shape and is refused as unsupported account selection. The conformance
+declaration narrowed from the entire Codex section to that one absent field.

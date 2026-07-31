@@ -389,13 +389,13 @@ pub struct Settings {
     pub observability: ObservabilitySettings,
 }
 
-/// Only the one driver v1 ships. Upstream's struct has five keys, each with a
-/// decoding default, so the four laplus does not implement are simply
-/// absent rather than described as disabled.
+/// Settings for the drivers this server knows. A settings section may precede
+/// the driver that reads it so a developer's choices survive that rollout.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSettings {
     pub claude_agent: ClaudeSettings,
+    pub codex: CodexSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -407,6 +407,17 @@ pub struct ClaudeSettings {
     /// `claude` and the empty string — is a name to look up on `PATH`. See
     /// [`crate::provider::resolve`], which owns the rule.
     pub binary_path: String,
+    pub home_path: String,
+    pub launch_args: String,
+    pub custom_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSettings {
+    pub enabled: bool,
+    pub binary_path: String,
+    /// `CODEX_HOME`, separate from the process home directory.
     pub home_path: String,
     pub launch_args: String,
     pub custom_models: Vec<String>,
@@ -532,13 +543,20 @@ impl ServerConfig {
                 // The cheapest model this server offers, because the work is
                 // a thread title rather than the developer's own turn.
                 text_generation_model_selection: serde_json::json!({
-                    "instanceId": crate::provider::INSTANCE_ID,
+                    "instanceId": crate::provider::CLAUDE_INSTANCE_ID,
                     "model": "claude-haiku-4-5",
                 }),
                 providers: ProviderSettings {
                     claude_agent: ClaudeSettings {
                         enabled: true,
                         binary_path: "claude".to_string(),
+                        home_path: String::new(),
+                        launch_args: String::new(),
+                        custom_models: Vec::new(),
+                    },
+                    codex: CodexSettings {
+                        enabled: true,
+                        binary_path: "codex".to_string(),
                         home_path: String::new(),
                         launch_args: String::new(),
                         custom_models: Vec::new(),

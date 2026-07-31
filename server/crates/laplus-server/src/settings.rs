@@ -52,7 +52,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use crate::config::{ClaudeSettings, Settings};
+use crate::config::{ClaudeSettings, CodexSettings, Settings};
 
 /// Reading the settings, without the rest of the configuration around them.
 pub const GET: &str = "server.getSettings";
@@ -242,12 +242,16 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
                             next.providers.claude_agent =
                                 claude(next.providers.claude_agent.clone(), object(driver, value)?)?
                         }
-                        // The four drivers upstream has and v1 does not. Refused
-                        // by name so the sentence says what is missing rather
-                        // than "unknown field".
-                        "codex" | "cursor" | "grok" | "opencode" => {
+                        "codex" => {
+                            next.providers.codex =
+                                codex(next.providers.codex.clone(), object(driver, value)?)?
+                        }
+                        // The three drivers upstream has and this server does
+                        // not. Refused by name so the sentence says what is
+                        // missing rather than "unknown field".
+                        "cursor" | "grok" | "opencode" => {
                             return Err(format!(
-                                "This server has one provider, Claude Code, so '{driver}' \
+                                "This server has no '{driver}' driver, so it \
                                  cannot be configured."
                             ))
                         }
@@ -327,6 +331,49 @@ fn claude(mut claude: ClaudeSettings, patch: &Map<String, Value>) -> Result<Clau
         }
     }
     Ok(claude)
+}
+
+/// Codex settings are stored before the Codex driver consumes them. Shadow
+/// homes are deliberately excluded: they select an account, and this server
+/// runs one Codex account.
+fn codex(mut codex: CodexSettings, patch: &Map<String, Value>) -> Result<CodexSettings, String> {
+    for (field, value) in patch {
+        match field.as_str() {
+            "enabled" => codex.enabled = boolean(field, value)?,
+            "binaryPath" => codex.binary_path = text(field, value)?,
+            "homePath" => codex.home_path = text(field, value)?,
+            "launchArgs" => codex.launch_args = text(field, value)?,
+            "customModels" => codex.custom_models = models(value)?,
+            "shadowHomePath" => {
+                return Err(
+                    "'providers.codex.shadowHomePath' is an account-selection setting, and \
+                     this server runs one Codex account, so it cannot honour or store it."
+                        .to_string(),
+                )
+            }
+            unknown => return Err(unrecognised(&format!("providers.codex.{unknown}"))),
+        }
+    }
+    Ok(codex)
+}
+
+fn models(value: &Value) -> Result<Vec<String>, String> {
+    let listed = value.as_array().ok_or_else(|| {
+        format!("'customModels' has to be a list of model names, and was {value}.")
+    })?;
+    listed
+        .iter()
+        .map(|model| {
+            model
+                .as_str()
+                .map(str::trim)
+                .filter(|named| !named.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!("'customModels' has to hold model names, and held {model}.")
+                })
+        })
+        .collect()
 }
 
 /// A `ModelSelectionPatch`, which is an instance and a model.
@@ -446,11 +493,15 @@ impl Update {
         store: &crate::config_store::ConfigStore,
         roots: &[std::path::PathBuf],
     ) -> Result<Value, Value> {
-        let changes_the_provider = self.patch.contains_key("providers");
+        let changes_claude = self
+            .patch
+            .get("providers")
+            .and_then(Value::as_object)
+            .is_some_and(|providers| providers.contains_key("claudeAgent"));
         let settings = store.reconfigure(|settings| apply(settings, &self.patch))?;
 
-        // **The provider is re-checked when its configuration moved**, and only
-        // then. A new `binaryPath` points at a different install with a
+        // **Claude is re-checked when its configuration moved**, and only then.
+        // A new `binaryPath` points at a different install with a
         // different version, and a new `customModels` list is a different set of
         // slugs to offer — neither of which the picker would show until
         // something looked. Without this the criterion "a configuration change
@@ -459,8 +510,10 @@ impl Update {
         //
         // After the write rather than before, so a refused patch cannot start a
         // process; and inline, because this is already off the read loop and the
-        // developer is waiting for the answer that says it worked.
-        if changes_the_provider {
+        // developer is waiting for the answer that says it worked. Codex
+        // settings are stored but do not launch or probe anything until its
+        // driver lands.
+        if changes_claude {
             crate::provider::refresh(store, &crate::process::Search::from_environment(), roots);
         }
         Ok(settings)
@@ -625,7 +678,10 @@ mod tests {
                 "providers.claudeAgent",
             ),
             (json!({"defaultThreadEnvMode": "worktree"}), "own worktree"),
-            (json!({"providers": {"codex": {"enabled": true}}}), "one provider"),
+            (
+                json!({"providers": {"codex": {"shadowHomePath": "/accounts/work"}}}),
+                "account-selection",
+            ),
         ] {
             let why = patched(patch.clone()).expect_err("a refusal");
             assert!(why.contains(expected), "{patch} was refused with {why}");
@@ -666,7 +722,14 @@ mod tests {
                 settings,
                 json!({
                     "addProjectBaseDirectory": "/work",
-                    "providers": {"claudeAgent": {"customModels": ["claude-opus-5"]}},
+                    "providers": {
+                        "claudeAgent": {"customModels": ["claude-opus-5"]},
+                        "codex": {
+                            "binaryPath": "/opt/codex",
+                            "homePath": "/home/developer/.codex",
+                            "launchArgs": "--config model_reasoning_effort=high"
+                        }
+                    },
                 })
                 .as_object()
                 .expect("an object"),
@@ -680,6 +743,12 @@ mod tests {
         assert_eq!(
             loaded.providers.claude_agent.custom_models,
             vec!["claude-opus-5".to_string()]
+        );
+        assert_eq!(loaded.providers.codex.binary_path, "/opt/codex");
+        assert_eq!(loaded.providers.codex.home_path, "/home/developer/.codex");
+        assert_eq!(
+            loaded.providers.codex.launch_args,
+            "--config model_reasoning_effort=high"
         );
     }
 

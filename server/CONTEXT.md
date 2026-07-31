@@ -66,6 +66,12 @@ event the client reads. Per-agent by construction — ADR-0001 is why an encoder
 belongs to a driver and the decoder does not. `crate::turn` is the one
 implementation there is, and it drives the `claude` CLI.
 
+Selected through `crate::provider::REGISTRY`: a provider instance id is the
+routing key a conversation records, while the driver slug says which
+implementation runs it. They happen to both be `claudeAgent` for the first
+entry and are separate fields; `crate::provider::ProviderIdentity` keeps the
+pair durable on the thread.
+
 **Agent session id** — the `claude` CLI's own handle on a conversation, given
 back to it as `--resume`. The one piece of agent-protocol vocabulary that
 reaches the database, because continuity depends on it outliving the process.

@@ -88,7 +88,14 @@ async fn settings_survive_a_restart() {
         json!({
             "addProjectBaseDirectory": "/work",
             "enableProviderUpdateChecks": true,
-            "providers": {"claudeAgent": {"customModels": ["claude-opus-5-ultra"]}},
+            "providers": {
+                "claudeAgent": {"customModels": ["claude-opus-5-ultra"]},
+                "codex": {
+                    "binaryPath": "/opt/codex",
+                    "homePath": "/home/developer/.codex",
+                    "launchArgs": "--config model_reasoning_effort=high"
+                }
+            },
         }),
     )
     .await
@@ -105,6 +112,15 @@ async fn settings_survive_a_restart() {
     assert_eq!(
         after["providers"]["claudeAgent"]["customModels"],
         json!(["claude-opus-5-ultra"])
+    );
+    assert_eq!(after["providers"]["codex"]["binaryPath"], "/opt/codex");
+    assert_eq!(
+        after["providers"]["codex"]["homePath"],
+        "/home/developer/.codex"
+    );
+    assert_eq!(
+        after["providers"]["codex"]["launchArgs"],
+        "--config model_reasoning_effort=high"
     );
 
     restarted.stop().await;
@@ -203,6 +219,28 @@ async fn an_invalid_setting_is_refused_and_leaves_the_previous_values_intact() {
         "/before",
         "a refused patch was half applied"
     );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let error = update(
+        &mut client,
+        json!({
+            "addProjectBaseDirectory": "/after",
+            "providers": {"codex": {"shadowHomePath": "/accounts/work"}},
+        }),
+    )
+    .await
+    .expect_declared("ServerSettingsError");
+    let cause = error["cause"].as_str().expect("a sentence the panel can show");
+    assert!(cause.contains("account-selection"), "{error}");
+    assert!(cause.contains("one Codex account"), "{error}");
+    assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "");
 
     server.stop().await;
 }
