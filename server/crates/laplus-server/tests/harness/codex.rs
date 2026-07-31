@@ -11,6 +11,20 @@ pub struct ScriptedCodex {
     directory: tempfile::TempDir,
 }
 
+fn rewrite_conversation_ids(value: &mut Value) {
+    match value {
+        Value::String(text) if text == "codex-thread-1" => {
+            *text = "codex-thread-4".to_string();
+        }
+        Value::String(text) if text == "codex-turn-1" => {
+            *text = "codex-turn-5".to_string();
+        }
+        Value::Array(values) => values.iter_mut().for_each(rewrite_conversation_ids),
+        Value::Object(fields) => fields.values_mut().for_each(rewrite_conversation_ids),
+        _ => {}
+    }
+}
+
 impl ScriptedCodex {
     pub fn conversation_paused_after_first_delta() -> ScriptedCodex {
         let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", Some(5));
@@ -25,6 +39,85 @@ impl ScriptedCodex {
 
     pub fn approval_conversation() -> ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("03-write-approval", None)
+    }
+
+    pub fn interrupted_conversation() -> ScriptedCodex {
+        let codex = ScriptedCodex::conversation_from_fixture("04-interrupt", None);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex-app-server/04-interrupt.jsonl");
+        let records: Vec<Value> = std::fs::read_to_string(&fixture)
+            .expect("reads the interrupt fixture")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("an interrupt fixture record"))
+            .collect();
+        let turn_response = records
+            .iter()
+            .position(|record| record["dir"] == "recv" && record["msg"]["id"] == 3)
+            .expect("the turn/start response");
+        let interrupt = records
+            .iter()
+            .position(|record| {
+                record["dir"] == "send" && record["msg"]["method"] == "turn/interrupt"
+            })
+            .expect("the interrupt request");
+        let acknowledgement = records
+            .iter()
+            .position(|record| record["dir"] == "recv" && record["msg"]["id"] == 4)
+            .expect("the interrupt acknowledgement");
+        let received = |records: &[Value]| {
+            records
+                .iter()
+                .filter(|record| record["dir"] == "recv")
+                .map(|record| format!("{}\n", record["msg"]))
+                .collect::<String>()
+        };
+        std::fs::write(
+            codex.directory.path().join("turn-events-before-pause"),
+            received(&records[turn_response + 1..interrupt]),
+        )
+        .expect("writes pre-interrupt events");
+        std::fs::write(
+            codex.directory.path().join("turn-events-after-pause"),
+            received(&records[interrupt + 1..acknowledgement]),
+        )
+        .expect("writes post-interrupt events");
+        std::fs::write(codex.directory.path().join("await-interrupt"), "")
+            .expect("marks the fixture interrupt stop");
+        let correction_fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex-app-server/01-plain-turn.jsonl");
+        let correction: Vec<Value> = std::fs::read_to_string(&correction_fixture)
+            .expect("reads the captured correction turn")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a correction fixture record"))
+            .collect();
+        let correction_start = correction
+            .iter()
+            .position(|record| record["dir"] == "recv" && record["msg"]["id"] == 3)
+            .expect("the captured correction turn response");
+        let mut correction_result = correction[correction_start]["msg"]["result"].clone();
+        correction_result["turn"]["id"] = Value::String("codex-turn-5".to_string());
+        std::fs::write(
+            codex.directory.path().join("correction-turn-result"),
+            correction_result.to_string(),
+        )
+        .expect("writes the correction result");
+        let correction_events = correction[correction_start + 1..]
+            .iter()
+            .filter(|record| record["dir"] == "recv")
+            .map(|record| {
+                let mut message = record["msg"].clone();
+                rewrite_conversation_ids(&mut message);
+                format!("{message}\n")
+            })
+            .collect::<String>();
+        std::fs::write(
+            codex.directory.path().join("correction-turn-events"),
+            correction_events,
+        )
+        .expect("writes the captured correction events");
+        std::fs::write(codex.app_server_path(), codex.conversation_script())
+            .expect("rewrites the interrupt app-server");
+        codex
     }
 
     pub fn unrestricted_write_conversation() -> ScriptedCodex {
@@ -286,6 +379,11 @@ impl ScriptedCodex {
             .expect("releases the paused turn");
     }
 
+    pub fn release_interrupt(&self) {
+        std::fs::write(self.directory.path().join("release-interrupt"), "")
+            .expect("releases the interrupt acknowledgement");
+    }
+
     pub fn conversation_starts(&self) -> usize {
         std::fs::read_to_string(self.directory.path().join("conversation-starts"))
             .unwrap_or_default()
@@ -294,10 +392,21 @@ impl ScriptedCodex {
     }
 
     pub fn turn_requests(&self) -> usize {
+        self.turn_start_requests().len()
+    }
+
+    pub fn turn_start_requests(&self) -> Vec<Value> {
         self.conversation_requests()
             .into_iter()
             .filter(|message| message["method"] == "turn/start")
-            .count()
+            .collect()
+    }
+
+    pub fn interrupt_requests(&self) -> Vec<Value> {
+        self.conversation_requests()
+            .into_iter()
+            .filter(|message| message["method"] == "turn/interrupt")
+            .collect()
     }
 
     pub fn thread_requests(&self) -> Vec<Value> {
@@ -582,9 +691,26 @@ if ($next.method -eq 'thread/start') {
       Send-Json ('{"id":' + $request.id + ',"error":{"code":-32603,"message":"fixture turn start rejected"}}')
       continue
     }
+    if ($turn -gt 1 -and (Test-Path (Join-Path $root 'await-interrupt'))) {
+      Send-Json ('{"id":' + $request.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'correction-turn-result')) + '}')
+      [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'correction-turn-events')))
+      [Console]::Out.Flush()
+      continue
+    }
     Send-Json ('{"id":' + $request.id + ',"result":' + [IO.File]::ReadAllText((Join-Path $root 'conversation-turn-result')) + '}')
     [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-events-before-pause')))
     [Console]::Out.Flush()
+    if (Test-Path (Join-Path $root 'await-interrupt')) {
+      $interruptLine = Read-Request
+      [IO.File]::AppendAllText($conversationRequests, $interruptLine + [Environment]::NewLine)
+      $interrupt = $interruptLine | ConvertFrom-Json
+      if ($interrupt.method -ne 'turn/interrupt') { exit 3 }
+      [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-events-after-pause')))
+      [Console]::Out.Flush()
+      while (-not (Test-Path (Join-Path $root 'release-interrupt'))) { Start-Sleep -Milliseconds 20 }
+      Send-Json ('{"id":' + $interrupt.id + ',"result":{}}')
+      continue
+    }
     if (Test-Path (Join-Path $root 'await-approval')) {
       $approvalLine = Read-Request
       [IO.File]::AppendAllText($conversationRequests, $approvalLine + [Environment]::NewLine)
@@ -665,8 +791,26 @@ case "$next" in
             printf '{"id":%s,"error":{"code":-32603,"message":"fixture turn start rejected"}}\n' "$id"
             continue
           fi
+          if [ "$turn" -gt 1 ] && [ -f "$root/await-interrupt" ]; then
+            printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/correction-turn-result")"
+            cat "$root/correction-turn-events"
+            continue
+          fi
           printf '{"id":%s,"result":%s}\n' "$id" "$(cat "$root/conversation-turn-result")"
           cat "$root/turn-events-before-pause"
+          if [ -f "$root/await-interrupt" ]; then
+            read_request
+            printf '%s\n' "$line" >> "$conversation_requests"
+            case "$line" in
+              *'"method":"turn/interrupt"'*) ;;
+              *) exit 3 ;;
+            esac
+            id=$(request_id "$line")
+            cat "$root/turn-events-after-pause"
+            while [ ! -f "$root/release-interrupt" ]; do sleep 0.02; done
+            printf '{"id":%s,"result":{}}\n' "$id"
+            continue
+          fi
           if [ -f "$root/await-approval" ]; then
              read_request
              printf '%s\n' "$line" >> "$conversation_requests"

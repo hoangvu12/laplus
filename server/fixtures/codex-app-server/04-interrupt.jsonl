@@ -1,0 +1,15 @@
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.1"},"capabilities":{}}}}
+{"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (Linux; aarch64) unknown"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","method":"initialized"}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"<workspace>","model":"gpt-5.4-mini","approvalPolicy":"never","sandbox":"read-only","approvalsReviewer":"user"}}}
+{"dir":"recv","msg":{"id":2,"result":{"thread":{"id":"codex-thread-4"},"cwd":"<workspace>"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"codex-thread-4","input":[{"type":"text","text":"Write a long essay about the history of text editors."}]}}}
+{"dir":"recv","msg":{"id":3,"result":{"turn":{"id":"codex-turn-4","status":"inProgress","error":null}}}}
+{"dir":"recv","msg":{"method":"thread/status/changed","params":{"threadId":"codex-thread-4","status":{"type":"active","activeFlags":[]}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-4","turnId":"codex-turn-4","item":{"type":"agentMessage","id":"message-4","text":"","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-4","turnId":"codex-turn-4","itemId":"message-4","delta":"The"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":4,"method":"turn/interrupt","params":{"threadId":"codex-thread-4","turnId":"codex-turn-4"}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-4","turnId":"codex-turn-4","itemId":"message-4","delta":" history"}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-4","turnId":"codex-turn-4","itemId":"message-4","delta":" of text editors"}}}
+{"dir":"recv","msg":{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex"}}}}
+{"dir":"recv","msg":{"id":4,"result":{}}}

@@ -42,3 +42,13 @@ request's accept/execpolicy-amendment/cancel decision list, and the response
 that releases the turn. The socket stand-in stops when it sends the request and
 does not replay anything after it until laplus answers; the structured amendment
 is recognized but never offered or sent by laplus.
+
+`04-interrupt.jsonl` reduces
+`.scratch/codex-driver/captures/04-interrupt.jsonl`. It preserves the streamed
+message beginning, the outbound `turn/interrupt`, more deltas arriving after
+that request, and the acknowledgement as the final message. There is no
+completed assistant item, completed turn or idle notification. The stand-in
+stops at the outbound request, reads and records laplus's real interrupt, then
+replays the late deltas and pauses immediately before answering with the real
+request id. Its second turn replays `01-plain-turn` through the same app-server
+and Codex thread to prove they can take an immediate correction.

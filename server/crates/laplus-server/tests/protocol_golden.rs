@@ -63,7 +63,12 @@ fn normalize(text: &str) -> String {
 fn every_codex_turn_fixture_folds_through_a_fresh_state() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/codex-app-server");
-    for fixture in ["01-plain-turn", "02-command-execution", "03-write-approval"] {
+    for fixture in [
+        "01-plain-turn",
+        "02-command-execution",
+        "03-write-approval",
+        "04-interrupt",
+    ] {
         let capture = fs::read_to_string(directory.join(format!("{fixture}.jsonl")))
             .unwrap_or_else(|error| panic!("reads the Codex turn fixture {fixture}: {error}"));
         let mut state = ConversationState::new();
@@ -84,6 +89,39 @@ fn every_codex_turn_fixture_folds_through_a_fresh_state() {
 
         assert_eq!(actual, expected, "Codex fixture {fixture}");
     }
+}
+
+#[test]
+fn the_interrupt_capture_keeps_output_between_the_request_and_acknowledgement() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/codex-app-server/04-interrupt.jsonl");
+    let records: Vec<Value> = fs::read_to_string(&fixture)
+        .expect("reads the interrupt fixture")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a Codex fixture record"))
+        .collect();
+    let request_index = records
+        .iter()
+        .position(|record| {
+            record["dir"] == "send" && record["msg"]["method"] == "turn/interrupt"
+        })
+        .expect("the captured interrupt request");
+    let acknowledgement_index = records
+        .iter()
+        .position(|record| record["dir"] == "recv" && record["msg"]["id"] == 4)
+        .expect("the captured interrupt acknowledgement");
+
+    assert!(records[request_index + 1..acknowledgement_index]
+        .iter()
+        .any(|record| record["msg"]["method"] == "item/agentMessage/delta"));
+    assert_eq!(acknowledgement_index, records.len() - 1);
+    assert!(!records.iter().any(|record| {
+        (record["msg"]["method"] == "item/completed"
+            && record["msg"]["params"]["item"]["type"] == "agentMessage")
+            || record["msg"]["method"] == "turn/completed"
+            || (record["msg"]["method"] == "thread/status/changed"
+                && record["msg"]["params"]["status"]["type"] == "idle")
+    }));
 }
 
 #[test]

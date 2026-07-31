@@ -39,18 +39,26 @@ the wire so it is not in the recording.
 
 **Blocked by:** 04.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Interrupting a running Codex turn stops it.
-- [ ] The turn settles on the interrupt's response, with no completion and no
+- [x] Interrupting a running Codex turn stops it.
+- [x] The turn settles on the interrupt's response, with no completion and no
       idle required.
-- [ ] Deltas arriving after the interrupt was sent and before it was acknowledged
+- [x] Deltas arriving after the interrupt was sent and before it was acknowledged
       are kept, not discarded.
-- [ ] The partial reply is recorded as it was on screen; no reconciliation is
+- [x] The partial reply is recorded as it was on screen; no reconciliation is
       attempted against a buffered message that never arrives.
-- [ ] The app-server child survives the interrupt.
-- [ ] A message sent immediately afterwards continues the same conversation.
-- [ ] The divergence from `claude`'s reconciliation is written into
+- [x] The app-server child survives the interrupt.
+- [x] A message sent immediately afterwards continues the same conversation.
+- [x] The divergence from `claude`'s reconciliation is written into
       `server/CONTEXT.md`.
-- [ ] `04-interrupt` is committed as a fixture with an expected fold, and is
+- [x] `04-interrupt` is committed as a fixture with an expected fold, and is
       replayed with a stop before the acknowledgement.
+
+**Where it landed.** `crate::codex` writes `turn/interrupt` without waiting on
+the transport, so the normal receive loop keeps folding output until the
+correlated response settles the turn. That response closes any streamed reply
+with empty authoritative text, preserving and persisting the accumulation
+without recording a reconciliation. The `04-interrupt` golden and socket replay
+pin the request-side stop, post-request deltas, terminal acknowledgement and a
+correction through the same app-server thread.

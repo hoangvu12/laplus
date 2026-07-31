@@ -6,7 +6,7 @@ use harness::codex::ScriptedCodex;
 use harness::agent::ScriptedAgent;
 use harness::conversation::{
     activities, activity, assistant_sends, create_project, create_thread, follow_up, follow_up_in,
-    respond_to_approval,
+    interrupt_turn, respond_to_approval,
 };
 use harness::workspace::Workspace;
 use harness::{SocketClient, TestServer};
@@ -225,6 +225,139 @@ async fn a_full_access_sandbox_escape_runs_without_a_permission_question() {
     client.close().await;
     server.stop().await;
     codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn interrupt_keeps_late_deltas_and_the_same_codex_takes_the_correction() {
+    let codex = ScriptedCodex::interrupted_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            codex_thread("full-access"),
+        )
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-1",
+                "Write a long essay about the history of text editors.",
+            ),
+        )
+        .await
+        .expect_success();
+    let streaming = client.events_until_streaming(&subscription).await;
+    let turn_id = harness::conversation::last_session(&streaming, "the running Codex turn")
+        ["payload"]["session"]["activeTurnId"]
+        .as_str()
+        .expect("the running turn has an id")
+        .to_string();
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("codex-thread", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+    let before_acknowledgement = client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.message-sent"
+                && item["event"]["payload"]["role"] == "assistant"
+                && item["event"]["payload"]["text"] == " of text editors"
+                && item["event"]["payload"]["streaming"] == true
+        })
+        .await;
+    assert!(!activities(&before_acknowledgement)
+        .iter()
+        .any(|activity| activity["kind"] == "turn.completed"));
+    codex.release_interrupt();
+    let interrupted = client.events_through_the_turn(&subscription).await;
+
+    let requests = codex.interrupt_requests();
+    let [request] = requests.as_slice() else {
+        panic!("Codex received unexpected interrupt requests: {requests:?}");
+    };
+    assert_eq!(request["params"]["threadId"], "codex-thread-4");
+    assert_eq!(request["params"]["turnId"], "codex-turn-4");
+    assert_eq!(
+        harness::conversation::last_session(&interrupted, "the interrupted Codex turn")
+            ["payload"]["session"]["status"],
+        "interrupted"
+    );
+    let completed = activity(&interrupted, "turn.completed");
+    assert_eq!(completed["payload"]["activity"]["payload"]["interrupted"], true);
+    assert_eq!(completed["payload"]["activity"]["payload"]["isError"], false);
+    assert_eq!(server.reconciliation().reconciled, 0);
+    assert_eq!(server.live_agents(), 1, "the interrupt stopped app-server");
+
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await;
+    let partial = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("thread messages")
+        .iter()
+        .rfind(|message| message["role"] == "assistant")
+        .expect("the partial Codex reply");
+    assert_eq!(partial["text"], "The history of text editors");
+    assert_eq!(partial["streaming"], false);
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-2", "Never mind, just say hello."),
+        )
+        .await
+        .expect_success();
+    let correction = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        assistant_sends(&correction).last(),
+        Some(&("Hello.".to_string(), false))
+    );
+    assert_eq!(codex.conversation_starts(), 1);
+    assert_eq!(codex.thread_requests().len(), 1);
+    assert_eq!(codex.turn_requests(), 2);
+    let turns = codex.turn_start_requests();
+    assert_eq!(turns[1]["params"]["threadId"], "codex-thread-4");
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+
+    let restarted = TestServer::start_at(&database).await;
+    let restored = restarted
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await;
+    let partial = restored["thread"]["messages"]
+        .as_array()
+        .expect("restored messages")
+        .iter()
+        .find(|message| message["text"] == "The history of text editors")
+        .expect("the interrupted reply survived restart");
+    assert_eq!(partial["streaming"], false);
+    restarted.stop().await;
 }
 
 #[tokio::test]

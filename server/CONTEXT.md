@@ -615,6 +615,10 @@ equivalent, so it reaches the developer as an activity rather than as a field.
 **Reconciliation** — assistant text arrives twice, as deltas and again as a
 buffered message. The deltas drive live rendering; the buffered message is
 authoritative and replaces the accumulation. Whether the two agreed is recorded.
+An interrupted Codex turn is the deliberate exception: app-server sends no
+completed message after the interrupt, so the accumulated deltas are closed with
+empty authoritative text and kept exactly as rendered. No reconciliation is
+recorded because there was no second copy to compare.
 
 **Join** — a place where the agent protocol and the contract meet. `crate::turn`
 is the declared one, and it is one **driver**'s: the join is per-agent, while the

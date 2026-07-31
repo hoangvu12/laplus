@@ -172,6 +172,7 @@ impl Driver for Codex {
             Observed::Response {
                 method,
                 result: Ok(result),
+                ..
             } if method == "turn/start" => {
                 self.folding
                     .fold_message(serde_json::json!({"result": result}))
@@ -179,9 +180,42 @@ impl Driver for Codex {
             Observed::Response {
                 method,
                 result: Err(error),
+                ..
             } if method == "turn/start" => {
                 self.active_turn_id = None;
                 return Some(settle(driving, Ending::Failed(error), None));
+            }
+            Observed::Response {
+                method,
+                result: Ok(_),
+                turn_id: Some(interrupted_turn),
+            } if method == "turn/interrupt"
+                && self.active_turn_id.as_deref() == Some(interrupted_turn.as_str()) =>
+            {
+                self.active_turn_id = None;
+                return Some(settle_interrupted(driving));
+            }
+            Observed::Response {
+                method,
+                result: Err(error),
+                turn_id: Some(interrupted_turn),
+            } if method == "turn/interrupt"
+                && self.active_turn_id.as_deref() == Some(interrupted_turn.as_str()) =>
+            {
+                let Some(active) = driving.turn.as_mut() else {
+                    return Some(Decided::default());
+                };
+                if !active.was_stopped() {
+                    return Some(Decided::default());
+                }
+                active.carries_on();
+                return Some(Decided {
+                    changes: vec![Change::Activity(Activity::failed(
+                        "turn.interrupt-failed",
+                        &format!("Codex would not stop the turn: {error}"),
+                    ))],
+                    ..Decided::default()
+                });
             }
             Observed::Malformed => self.folding.fold_line(&line),
             Observed::Request => self.folding.fold_line(&line),
@@ -236,9 +270,18 @@ impl Driver for Codex {
     }
 
     async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "Codex turn interruption has not been implemented",
-        ))
+        let turn_id = self
+            .active_turn_id
+            .clone()
+            .ok_or_else(|| std::io::Error::other("Codex has not started the turn yet"))?;
+        self.app_server
+            .send_request(Request::TurnInterrupt {
+                thread_id: self.thread_id.clone(),
+                turn_id,
+            })
+            .await
+            .map(|_| ())
+            .map_err(std::io::Error::other)
     }
 
     async fn answer(&mut self, asked: &ApprovalRequest, reply: Reply<'_>) -> std::io::Result<()> {
@@ -492,11 +535,35 @@ fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> De
     }
 }
 
+fn settle_interrupted(driving: &mut Driving) -> Decided {
+    let Some(active) = driving.turn.as_mut() else {
+        return Decided::default();
+    };
+    if !active.was_stopped() {
+        return Decided::default();
+    }
+    let closing = active
+        .assistant_message_id
+        .take()
+        .map(|message_id| Change::AssistantMessage {
+            message_id,
+            turn_id: active.turn_id.clone(),
+            // Codex sends no authoritative message after an interrupt. Empty
+            // text closes the stream while preserving its accumulated deltas.
+            text: String::new(),
+        });
+    let mut decided = settle(driving, Ending::Stopped, None);
+    if let Some(closing) = closing {
+        decided.changes.insert(0, closing);
+    }
+    decided
+}
+
 struct AppServer {
     child: AsyncChild,
     stdin: Option<AsyncChildStdin>,
     output: async_mpsc::Receiver<String>,
-    pending: HashMap<u64, String>,
+    pending: HashMap<u64, Pending>,
     next_id: u64,
     complaint: Arc<Mutex<Option<String>>>,
     stderr: Option<tokio::task::JoinHandle<()>>,
@@ -595,8 +662,15 @@ impl AppServer {
     async fn send_request(&mut self, request: Request) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
+        let pending = Pending {
+            method: request.method().to_string(),
+            turn_id: match &request {
+                Request::TurnInterrupt { turn_id, .. } => Some(turn_id.clone()),
+                _ => None,
+            },
+        };
         self.write(&request.message(id)).await?;
-        self.pending.insert(id, request.method().to_string());
+        self.pending.insert(id, pending);
         Ok(id)
     }
 
@@ -626,9 +700,14 @@ impl AppServer {
             Ok(Incoming::Notification) => Observed::Notification,
             Ok(Incoming::Request { .. }) => Observed::Request,
             Ok(Incoming::Response { id, result }) => match self.pending.remove(&id) {
-                Some(method) => Observed::Response { method, result },
+                Some(pending) => Observed::Response {
+                    method: pending.method,
+                    turn_id: pending.turn_id,
+                    result,
+                },
                 None => Observed::Response {
                     method: String::new(),
+                    turn_id: None,
                     result,
                 },
             },
@@ -684,9 +763,15 @@ enum Observed {
     Request,
     Response {
         method: String,
+        turn_id: Option<String>,
         result: Result<Value, String>,
     },
     Malformed,
+}
+
+struct Pending {
+    method: String,
+    turn_id: Option<String>,
 }
 
 fn missing_async_pipe() -> std::io::Error {

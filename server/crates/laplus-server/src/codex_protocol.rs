@@ -275,9 +275,17 @@ impl ConversationState {
             }
             "item/agentMessage/delta" => {
                 let item_id = params["itemId"].as_str().unwrap_or_default().to_string();
+                let text = params["delta"].as_str().unwrap_or_default().to_string();
+                if let Some(message) = self
+                    .assistant_messages
+                    .iter_mut()
+                    .find(|message| message.id == item_id)
+                {
+                    message.text.push_str(&text);
+                }
                 ConversationFold::AssistantDelta {
                     item_id,
-                    text: params["delta"].as_str().unwrap_or_default().to_string(),
+                    text,
                 }
             }
             "item/completed" => {
@@ -519,6 +527,7 @@ pub(crate) enum Request {
     #[allow(dead_code)]
     ThreadResume { thread_id: String, access: Access },
     TurnStart { thread_id: String, text: String },
+    TurnInterrupt { thread_id: String, turn_id: String },
 }
 
 impl Request {
@@ -531,6 +540,7 @@ impl Request {
             Request::ThreadStart { .. } => "thread/start",
             Request::ThreadResume { .. } => "thread/resume",
             Request::TurnStart { .. } => "turn/start",
+            Request::TurnInterrupt { .. } => "turn/interrupt",
         }
     }
 
@@ -566,6 +576,10 @@ impl Request {
             Request::TurnStart { thread_id, text } => json!({
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": text}],
+            }),
+            Request::TurnInterrupt { thread_id, turn_id } => json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
             }),
         };
         json!({

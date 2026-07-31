@@ -250,6 +250,15 @@ impl TestServer {
         .await
     }
 
+    pub async fn start_at_with_config(database: &Path, config: ServerConfig) -> TestServer {
+        TestServer::start_on(
+            Some(config),
+            Database::open(database).expect("the database opens"),
+            Assets::none(),
+        )
+        .await
+    }
+
     /// The one place a server here is actually started.
     ///
     /// Whatever the caller's configuration said about where the developer's
