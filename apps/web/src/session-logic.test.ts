@@ -117,6 +117,34 @@ describe("derivePendingApprovals", () => {
     ]);
   });
 
+  it("carries only supported request-specific decisions to the approval panel", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        kind: "approval.requested",
+        tone: "approval",
+        payload: {
+          requestId: "codex:0",
+          requestKind: "command",
+          availableDecisions: [
+            "accept",
+            { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["printf", "hi"] } },
+            "cancel",
+            "not-a-contract-decision",
+          ],
+        },
+      }),
+    ];
+
+    expect(derivePendingApprovals(activities)).toEqual([
+      {
+        requestId: "codex:0",
+        requestKind: "command",
+        createdAt: "2026-02-23T00:00:00.000Z",
+        availableDecisions: ["accept", "cancel"],
+      },
+    ]);
+  });
+
   it("clears stale pending approvals when provider reports unknown pending request", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

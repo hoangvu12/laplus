@@ -2440,13 +2440,15 @@ pub(crate) mod tests {
     /// An unanswered permission request, as the work log records one.
     fn asked_for_permission(request_id: &str) -> Activity {
         crate::worklog::requested(
-            &crate::protocol::Permission {
+            &crate::approval::ApprovalRequest {
                 request_id: request_id.to_string(),
                 tool_name: "Write".to_string(),
                 input: json!({"file_path": "note.txt"}),
                 tool_use_id: Some("toolu_1".to_string()),
                 description: None,
                 suggestions: Vec::new(),
+                available_decisions: None,
+                provider_request_id: None,
             },
             Some("turn-1".to_string()),
         )
@@ -2480,13 +2482,15 @@ pub(crate) mod tests {
 
         let asked = Thread {
             activities: vec![crate::worklog::user_input_requested(
-                &crate::protocol::Permission {
+                &crate::approval::ApprovalRequest {
                     request_id: "req-2".to_string(),
                     tool_name: "AskUserQuestion".to_string(),
                     input: json!({}),
                     tool_use_id: None,
                     description: None,
                     suggestions: Vec::new(),
+                    available_decisions: None,
+                    provider_request_id: None,
                 },
                 vec![json!({"id": "q", "question": "q", "options": []})],
                 Some("turn-1".to_string()),

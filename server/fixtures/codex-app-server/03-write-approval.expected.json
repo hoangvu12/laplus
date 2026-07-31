@@ -1,0 +1,43 @@
+{
+  "threadId": "codex-thread-3",
+  "turnId": "codex-turn-3",
+  "threadStatus": "idle",
+  "turnStatus": "completed",
+  "turnError": null,
+  "assistantMessages": [
+    {
+      "id": "answer-3",
+      "text": "Created `hello.txt`.",
+      "phase": "final_answer"
+    }
+  ],
+  "reasoningItems": [],
+  "commandExecutions": [
+    {
+      "id": "command-3",
+      "command": "/bin/bash -lc \"printf 'hi' > hello.txt\"",
+      "cwd": "<workspace>",
+      "processId": "77892",
+      "status": "completed",
+      "aggregatedOutput": "",
+      "exitCode": 0,
+      "durationMs": 0
+    }
+  ],
+  "approvalRequests": [
+    {
+      "requestId": "codex:0",
+      "serverRequestId": 0,
+      "requestKind": "command",
+      "itemId": "command-3",
+      "toolName": "Command",
+      "input": {
+        "command": "/bin/bash -lc \"printf 'hi' > hello.txt\"",
+        "cwd": "<workspace>"
+      },
+      "availableDecisions": ["accept", "cancel"]
+    }
+  ],
+  "unknownEvents": 0,
+  "parseErrors": 0
+}

@@ -120,7 +120,7 @@
       },
       "tool_use_id": "toolu_01J2F4TDdNQpGvrDirs1gCwf",
       "description": "second.txt",
-      "permission_suggestions": [
+      "suggestions": [
         {
           "destination": "session",
           "mode": "acceptEdits",

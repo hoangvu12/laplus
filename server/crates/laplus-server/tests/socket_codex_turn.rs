@@ -4,9 +4,12 @@ mod harness;
 
 use harness::codex::ScriptedCodex;
 use harness::agent::ScriptedAgent;
-use harness::conversation::{activities, assistant_sends, create_project, create_thread, follow_up};
+use harness::conversation::{
+    activities, activity, assistant_sends, create_project, create_thread, follow_up,
+    respond_to_approval,
+};
 use harness::workspace::Workspace;
-use harness::TestServer;
+use harness::{SocketClient, TestServer};
 use laplus_server::config::ServerConfig;
 use serde_json::{json, Value};
 
@@ -35,6 +38,292 @@ fn aggregates(events: &[Value]) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+struct AskedCodex {
+    server: TestServer,
+    client: SocketClient,
+    subscription: String,
+    request_id: String,
+    events: Vec<Value>,
+    _workspace: Workspace,
+}
+
+async fn ask_codex(codex: &ScriptedCodex) -> AskedCodex {
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread())
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up(
+                "codex-thread",
+                "message-1",
+                "Write hi to hello.txt with a shell command.",
+            ),
+        )
+        .await
+        .expect_success();
+    let (events, request_id) = client.events_until_permission(&subscription).await;
+    AskedCodex {
+        server,
+        client,
+        subscription,
+        request_id,
+        events,
+        _workspace: workspace,
+    }
+}
+
+#[tokio::test]
+async fn a_captured_sandbox_escape_waits_with_only_its_supported_decisions() {
+    let codex = ScriptedCodex::approval_conversation();
+    let asked = ask_codex(&codex).await;
+    let work_log = activities(&asked.events);
+    let request = activity(&asked.events, "approval.requested");
+    let payload = &request["payload"]["activity"]["payload"];
+
+    assert_eq!(payload["requestId"], asked.request_id);
+    assert_eq!(payload["requestKind"], "command");
+    assert_eq!(payload["availableDecisions"], json!(["accept", "cancel"]));
+    assert_eq!(payload["data"]["toolCallId"], "command-3");
+    assert_eq!(codex.approval_answers(), Vec::<Value>::new());
+    let relevant: Vec<&str> = work_log
+        .iter()
+        .filter_map(|row| row["kind"].as_str())
+        .filter(|kind| *kind == "tool.updated" || *kind == "approval.requested")
+        .collect();
+    assert_eq!(relevant, vec!["tool.updated", "approval.requested"]);
+
+    asked.client.close().await;
+    asked.server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn file_approvals_publish_their_tool_context_before_the_panel() {
+    for (codex, request_kind) in [
+        (ScriptedCodex::file_read_approval_conversation(), "file-read"),
+        (
+            ScriptedCodex::file_change_approval_conversation(),
+            "file-change",
+        ),
+    ] {
+        let asked = ask_codex(&codex).await;
+        let work_log = activities(&asked.events);
+        let relevant: Vec<&Value> = work_log
+            .iter()
+            .copied()
+            .filter(|row| row["kind"] == "tool.updated" || row["kind"] == "approval.requested")
+            .collect();
+        let [tool, approval] = relevant.as_slice() else {
+            panic!("{request_kind} context and panel were not both published: {work_log:?}");
+        };
+
+        assert_eq!(tool["kind"], "tool.updated");
+        assert_eq!(approval["kind"], "approval.requested");
+        assert_eq!(approval["payload"]["requestKind"], request_kind);
+        assert_eq!(
+            tool["payload"]["data"]["toolCallId"],
+            approval["payload"]["data"]["toolCallId"]
+        );
+
+        asked.client.close().await;
+        asked.server.stop().await;
+        codex.assert_conversation_reaped();
+    }
+}
+
+#[tokio::test]
+async fn approving_a_codex_request_answers_its_json_rpc_id_and_releases_the_turn() {
+    let codex = ScriptedCodex::approval_conversation();
+    let mut asked = ask_codex(&codex).await;
+    asked
+        .client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval("codex-thread", &asked.request_id, "accept"),
+        )
+        .await
+        .expect_success();
+    let rest = asked.client.events_through_the_turn(&asked.subscription).await;
+
+    assert_eq!(
+        codex.approval_answers(),
+        vec![json!({"jsonrpc": "2.0", "id": 0, "result": {"decision": "accept"}})]
+    );
+    assert_eq!(
+        activity(&rest, "approval.resolved")["payload"]["activity"]["payload"]["decision"],
+        "accept"
+    );
+    assert_eq!(
+        harness::conversation::last_session(&rest, "the approved Codex turn")["payload"]
+            ["session"]["status"],
+        "ready"
+    );
+
+    asked.client.close().await;
+    asked.server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn declining_when_codex_offers_it_returns_control_without_stopping_the_turn() {
+    let codex = ScriptedCodex::declinable_approval_conversation();
+    let mut asked = ask_codex(&codex).await;
+    asked
+        .client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval("codex-thread", &asked.request_id, "decline"),
+        )
+        .await
+        .expect_success();
+    let rest = asked
+        .client
+        .values_until(&asked.subscription, |item| {
+            item["event"]["type"] == "thread.activity-appended"
+                && item["event"]["payload"]["activity"]["kind"] == "approval.resolved"
+        })
+        .await;
+
+    assert_eq!(codex.approval_answers()[0]["result"]["decision"], "decline");
+    assert!(!rest
+        .iter()
+        .any(|item| item["event"]["type"] == "thread.turn-interrupt-requested"));
+    assert_eq!(asked.server.live_agents(), 1, "decline ended the Codex session");
+
+    asked
+        .client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.session.stop",
+                "commandId": "test:stop:declined-codex",
+                "threadId": "codex-thread",
+                "createdAt": "2026-07-31T00:00:02.000Z"
+            }),
+        )
+        .await
+        .expect_success();
+    asked.server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn cancelling_a_codex_request_interrupts_the_turn() {
+    let codex = ScriptedCodex::approval_conversation();
+    let mut asked = ask_codex(&codex).await;
+    asked
+        .client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval("codex-thread", &asked.request_id, "cancel"),
+        )
+        .await
+        .expect_success();
+    let rest = asked
+        .client
+        .values_until(&asked.subscription, |item| {
+            item["event"]["type"] == "thread.turn-interrupt-requested"
+        })
+        .await;
+
+    assert_eq!(codex.approval_answers()[0]["result"]["decision"], "cancel");
+    let stopped = rest
+        .iter()
+        .find(|item| item["event"]["type"] == "thread.turn-interrupt-requested")
+        .expect("cancel immediately marks the turn stopped");
+    assert!(stopped["event"]["payload"]["turnId"].is_string());
+
+    asked
+        .client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.session.stop",
+                "commandId": "test:stop:cancelled-codex",
+                "threadId": "codex-thread",
+                "createdAt": "2026-07-31T00:00:02.000Z"
+            }),
+        )
+        .await
+        .expect_success();
+    asked.server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn an_unanswered_codex_approval_is_closed_when_the_session_ends() {
+    let codex = ScriptedCodex::approval_conversation();
+    let mut asked = ask_codex(&codex).await;
+    asked
+        .client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.session.stop",
+                "commandId": "test:stop:codex-approval",
+                "threadId": "codex-thread",
+                "createdAt": "2026-07-31T00:00:01.000Z"
+            }),
+        )
+        .await
+        .expect_success();
+    let ending = asked
+        .client
+        .values_until(&asked.subscription, |item| {
+            item["event"]["type"] == "thread.session-set"
+                && item["event"]["payload"]["session"]["status"] == "stopped"
+        })
+        .await;
+    let resolved = activity(&ending, "approval.resolved");
+    assert_eq!(
+        resolved["payload"]["activity"]["payload"]["requestId"],
+        asked.request_id
+    );
+    assert_eq!(
+        resolved["payload"]["activity"]["payload"]["decision"],
+        "cancel"
+    );
+
+    let snapshot = asked
+        .server
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await;
+    let pending = snapshot["thread"]["activities"]
+        .as_array()
+        .expect("stored activities")
+        .iter()
+        .filter(|row| row["kind"] == "approval.requested")
+        .count()
+        - snapshot["thread"]["activities"]
+            .as_array()
+            .expect("stored activities")
+            .iter()
+            .filter(|row| row["kind"] == "approval.resolved")
+            .count();
+    assert_eq!(pending, 0, "the stored work log still has an open approval");
+
+    asked.client.close().await;
+    asked.server.stop().await;
+    codex.assert_conversation_reaped();
 }
 
 #[tokio::test]

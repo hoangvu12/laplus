@@ -137,11 +137,10 @@
 use serde_json::json;
 
 use crate::agent::{permission_mode_for, Agent, Launch};
+use crate::approval::ApprovalRequest;
 use crate::clock::iso_from_epoch;
 use crate::process::Search;
-use crate::protocol::{
-    Compaction, ContentBlock, Drift, Folded, Permission, RateLimit, SessionState, TokenUsage,
-};
+use crate::protocol::{Compaction, ContentBlock, Drift, Folded, RateLimit, SessionState, TokenUsage};
 use crate::session::{
     Decided, Driver, Driving, Finished, InFlight, Pushed, Reaped, Reply, Settles, Start,
 };
@@ -237,7 +236,7 @@ impl Driver for Claude {
         self.agent.interrupt(request_id).await
     }
 
-    async fn answer(&mut self, asked: &Permission, reply: Reply<'_>) -> std::io::Result<()> {
+    async fn answer(&mut self, asked: &ApprovalRequest, reply: Reply<'_>) -> std::io::Result<()> {
         // The contract's vocabulary on the way in, the CLI's on the way out.
         // Which is the encoder, and it is per-driver for ADR-0001's reason: a
         // `cancel` is a denial carrying `interrupt: true` *here*, and something

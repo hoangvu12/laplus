@@ -63,6 +63,7 @@
 //! all of that. [`turn`] drives Claude and [`codex`] drives Codex app-server.
 
 pub mod agent;
+pub mod approval;
 pub mod assets;
 pub mod auth;
 pub mod catalogue;

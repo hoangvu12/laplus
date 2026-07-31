@@ -63,7 +63,7 @@ fn normalize(text: &str) -> String {
 fn every_codex_turn_fixture_folds_through_a_fresh_state() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/codex-app-server");
-    for fixture in ["01-plain-turn", "02-command-execution"] {
+    for fixture in ["01-plain-turn", "02-command-execution", "03-write-approval"] {
         let capture = fs::read_to_string(directory.join(format!("{fixture}.jsonl")))
             .unwrap_or_else(|error| panic!("reads the Codex turn fixture {fixture}: {error}"));
         let mut state = ConversationState::new();
@@ -82,6 +82,38 @@ fn every_codex_turn_fixture_folds_through_a_fresh_state() {
 
         assert_eq!(actual, normalize(&expected), "Codex fixture {fixture}");
     }
+}
+
+#[test]
+fn the_write_capture_stops_at_a_request_and_filters_structured_decisions() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/codex-app-server/03-write-approval.jsonl");
+    let records: Vec<Value> = fs::read_to_string(&fixture)
+        .expect("reads the approval fixture")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a Codex fixture record"))
+        .collect();
+    let request_index = records
+        .iter()
+        .position(|record| {
+            record["dir"] == "recv"
+                && record["msg"]["method"] == "item/commandExecution/requestApproval"
+        })
+        .expect("the captured approval request");
+    let response_index = records
+        .iter()
+        .position(|record| record["dir"] == "send" && record["msg"]["id"] == 0)
+        .expect("the captured approval response");
+
+    assert_eq!(response_index, request_index + 1, "replay must stop at the request");
+    assert_eq!(
+        records[request_index]["msg"]["params"]["availableDecisions"],
+        serde_json::json!([
+            "accept",
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["/bin/bash", "-lc", "printf 'hi' > hello.txt"]}},
+            "cancel"
+        ])
+    );
 }
 
 #[test]

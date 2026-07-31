@@ -151,8 +151,13 @@ would trade streamed prose for a status row. `crate::codex`.
 
 **Approval** — a permission request and the developer's decision on it: one of
 `accept`, `acceptForSession`, `decline`, `cancel`. `crate::worklog::Decision`,
-which is contract vocabulary; the agent protocol's own is two behaviours with a
-modifier on each, and the two meet in `Decision::answer`.
+which is contract vocabulary. Claude always exposes the four decisions and
+translates them to two wire behaviours with a modifier on each. Codex carries
+the decisions each request permits; structured execpolicy and network-policy
+amendments are recognized but not offered onward. Its JSON-RPC request id stays
+opaque beside the client-facing request id so the answer preserves the original
+JSON type. `crate::approval::ApprovalRequest`,
+`crate::codex_protocol::ApprovalRequest`.
 
 **User input** — the agent asking the developer a multiple-choice question, and
 the answers. On the wire it is an approval — a `can_use_tool` for the

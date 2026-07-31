@@ -40,19 +40,19 @@ everything after that line in the recording happened _because of_ the answer.
 
 **Blocked by:** 05.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] A sandbox-escaping action opens an approval panel rather than proceeding.
-- [ ] The panel offers exactly the decisions the request carried — no more, and
+- [x] A sandbox-escaping action opens an approval panel rather than proceeding.
+- [x] The panel offers exactly the decisions the request carried — no more, and
       not a fixed set of four.
-- [ ] A request offering an execpolicy or network policy amendment is handled
+- [x] A request offering an execpolicy or network policy amendment is handled
       without offering that amendment onward, and without failing to render the
       request.
-- [ ] The tool call is on screen before the approval request that belongs to it.
-- [ ] Declining, where declining is offered, lets the turn carry on.
-- [ ] Cancelling stops the turn.
-- [ ] An approval left unanswered when the driver ends is closed rather than left
+- [x] The tool call is on screen before the approval request that belongs to it.
+- [x] Declining, where declining is offered, lets the turn carry on.
+- [x] Cancelling stops the turn.
+- [x] An approval left unanswered when the driver ends is closed rather than left
       open, so a restart does not leave a composer the developer cannot type
       into.
-- [ ] `03-write-approval` is committed as a fixture with an expected fold, and is
+- [x] `03-write-approval` is committed as a fixture with an expected fold, and is
       replayed with a stop where the request is.

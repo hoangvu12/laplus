@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::approval::ApprovalRequest;
+
 // ---------------------------------------------------------------------------
 // Wire format
 // ---------------------------------------------------------------------------
@@ -75,45 +77,38 @@ pub enum Event {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum Ask {
-    CanUseTool(Box<Permission>),
+    CanUseTool(Box<PermissionRequest>),
     #[serde(other)]
     Other,
 }
 
-/// The agent asking to use a tool, and everything needed to answer.
-///
-/// Recorded rather than read off a contract: `fixtures/claude-cli/07`–`10` are
-/// real requests from `claude` 2.1.220, and the optionality below is theirs —
-/// only `tool_name` and `input` were present on every one.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct Permission {
-    /// The envelope's `request_id`, copied in by [`SessionState::reduce`] so a
-    /// request is one thing rather than two.
-    ///
-    /// Never read from the body: the id lives on the envelope, and a body that
-    /// carried one of its own would be describing a different request.
-    #[serde(default, skip_deserializing)]
-    pub request_id: String,
-    pub tool_name: String,
-    /// What the tool would be run with. Sent back verbatim on an approval —
-    /// `updatedInput` is where a host that wanted to *edit* the call would put
-    /// its edit, and this server does not.
+/// Claude's `can_use_tool` body before the control-envelope id is attached.
+#[derive(Debug, Deserialize)]
+pub struct PermissionRequest {
+    tool_name: String,
     #[serde(default)]
-    pub input: Value,
-    /// The `tool_use` block this permission is for, when the CLI names one.
-    ///
-    /// What joins the approval row to the tool row beside it in the work log.
+    input: Value,
     #[serde(default)]
-    pub tool_use_id: Option<String>,
-    /// The CLI's own one-line summary of what is being asked — `note.txt` for a
-    /// `Write`. Shown in preference to anything this server could derive.
+    tool_use_id: Option<String>,
     #[serde(default)]
-    pub description: Option<String>,
-    /// Permission updates the CLI suggests if the developer wants to stop being
-    /// asked. Carried verbatim and handed straight back on "always allow", which
-    /// is the whole of how that answer works — see [`Answer::Allow`].
+    description: Option<String>,
     #[serde(default, rename = "permission_suggestions")]
-    pub suggestions: Vec<Value>,
+    suggestions: Vec<Value>,
+}
+
+impl PermissionRequest {
+    fn with_request_id(self, request_id: String) -> ApprovalRequest {
+        ApprovalRequest {
+            request_id,
+            tool_name: self.tool_name,
+            input: self.input,
+            tool_use_id: self.tool_use_id,
+            description: self.description,
+            suggestions: self.suggestions,
+            available_decisions: None,
+            provider_request_id: None,
+        }
+    }
 }
 
 /// The CLI's answer to a request this server made.
@@ -1051,7 +1046,7 @@ pub struct SessionState {
     /// Kept rather than only reported, for the same reason `transcript` is: the
     /// driver reads the request back out by index, and a golden file that showed
     /// the requests is how a change to their shape becomes visible.
-    pub permissions: Vec<Permission>,
+    pub permissions: Vec<ApprovalRequest>,
 
     pub last_result: Option<ResultSummary>,
 
@@ -1520,10 +1515,7 @@ impl SessionState {
                 request: Ask::CanUseTool(asked),
             } => {
                 self.bump("control_request/can_use_tool");
-                self.permissions.push(Permission {
-                    request_id,
-                    ..*asked
-                });
+                self.permissions.push(asked.with_request_id(request_id));
                 Folded::PermissionRequested {
                     index: self.permissions.len() - 1,
                 }

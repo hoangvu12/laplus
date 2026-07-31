@@ -6,6 +6,7 @@ import {
   type OrchestrationLatestTurn,
   type OrchestrationThreadActivity,
   type OrchestrationProposedPlanId,
+  type ProviderApprovalDecision,
   ProviderDriverKind,
   type ToolLifecycleItemType,
   type UserInputQuestion,
@@ -92,6 +93,7 @@ export interface PendingApproval {
   requestKind: "command" | "file-read" | "file-change";
   createdAt: string;
   detail?: string;
+  availableDecisions?: ReadonlyArray<ProviderApprovalDecision>;
 }
 
 export interface PendingUserInput {
@@ -353,6 +355,20 @@ function isStalePendingRequestFailureDetail(detail: string | undefined): boolean
   );
 }
 
+function parseApprovalDecisions(value: unknown): ProviderApprovalDecision[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const supported = value.filter(
+    (decision): decision is ProviderApprovalDecision =>
+      decision === "accept" ||
+      decision === "acceptForSession" ||
+      decision === "decline" ||
+      decision === "cancel",
+  );
+  return [...new Set(supported)];
+}
+
 export function derivePendingApprovals(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
 ): PendingApproval[] {
@@ -378,6 +394,7 @@ export function derivePendingApprovals(
           ? requestKindFromRequestType(payload.requestType)
           : null;
     const detail = payload && typeof payload.detail === "string" ? payload.detail : undefined;
+    const availableDecisions = parseApprovalDecisions(payload?.availableDecisions);
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {
       openByRequestId.set(requestId, {
@@ -385,6 +402,7 @@ export function derivePendingApprovals(
         requestKind,
         createdAt: activity.createdAt,
         ...(detail ? { detail } : {}),
+        ...(availableDecisions ? { availableDecisions } : {}),
       });
       continue;
     }

@@ -27,18 +27,11 @@
 //! What it must *not* answer with is anything shaped like the agent it ran —
 //! that is the whole of what stops this loop knowing.
 //!
-//! **Three types on this seam still live in [`crate::protocol`], which is the
-//! `claude` wire format's module**: [`Permission`], [`Drift`] and [`TokenUsage`].
-//! They are the shared vocabulary in practice rather than in placement —
-//! [`crate::worklog`] already reads a `Permission` to draw the client's approval
-//! panel, and the two counters describe a session rather than a protocol — but
-//! the placement is a real loose end, and `Permission` is the one that will not
-//! survive contact with a second agent unchanged: it is a deserialized
-//! `can_use_tool` body, and Codex's approvals carry the decisions each request
-//! allows. Splitting `protocol` into a shared vocabulary and a module per driver
-//! is the codex-driver spec's own plan and belongs to the ticket that writes the
-//! second protocol, not to this prefactor, whose proof is a suite that did not
-//! move.
+//! [`crate::approval::ApprovalRequest`] is the provider-neutral request this loop
+//! holds while an agent waits. Each protocol decodes into it and each driver owns
+//! its answer encoding; provider correlation data crosses the loop opaquely.
+//! [`Drift`] and [`TokenUsage`] still live in Claude's protocol module even though
+//! they describe a session, which remains a placement loose end.
 //!
 //! ## One long-lived driver, not one per turn
 //!
@@ -168,9 +161,10 @@ use std::future::Future;
 
 use serde_json::{json, Value};
 
+use crate::approval::ApprovalRequest;
 use crate::clock::now_iso;
 use crate::config::{ClaudeSettings, Settings};
-use crate::protocol::{Drift, Permission, TokenUsage};
+use crate::protocol::{Drift, TokenUsage};
 use crate::settling::SessionStatus;
 use crate::threads::{
     Activity, Answered, Change, Prompt, Retune, Session, Signal, Thread, Threads,
@@ -242,7 +236,7 @@ pub(crate) trait Driver: Send + Sized {
     /// conversation rather than a lost message.
     fn answer(
         &mut self,
-        asked: &Permission,
+        asked: &ApprovalRequest,
         reply: Reply<'_>,
     ) -> impl Future<Output = std::io::Result<()>> + Send;
 
@@ -1011,7 +1005,7 @@ pub(crate) struct Driving {
     /// left to answer it, while a permission that outlives its turn is a *panel
     /// the developer is still looking at*. Settling one is a thing that has to
     /// happen, so it must not be dropped with the turn.
-    pub(crate) outstanding: HashMap<String, Permission>,
+    pub(crate) outstanding: HashMap<String, ApprovalRequest>,
     /// How many interrupts this session has sent, which is what the next one's
     /// id is minted from.
     ///
@@ -1151,8 +1145,8 @@ impl Driving {
     }
 
     /// Take every request still waiting, so the caller can close it.
-    fn take_outstanding(&mut self) -> Vec<Permission> {
-        let mut open: Vec<Permission> = std::mem::take(&mut self.outstanding)
+    fn take_outstanding(&mut self) -> Vec<ApprovalRequest> {
+        let mut open: Vec<ApprovalRequest> = std::mem::take(&mut self.outstanding)
             .into_values()
             .collect();
         // A map has no order and these become rows in a work log. Ordered by the

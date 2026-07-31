@@ -1150,6 +1150,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
 
   const isComposerApprovalState = activePendingApproval !== null;
+  const pendingApprovalActions = activePendingApproval ? (
+    <ComposerPendingApprovalActions
+      requestId={activePendingApproval.requestId}
+      {...(activePendingApproval.availableDecisions
+        ? { availableDecisions: activePendingApproval.availableDecisions }
+        : {})}
+      isResponding={respondingRequestIds.includes(activePendingApproval.requestId)}
+      onRespondToApproval={onRespondToApproval}
+    />
+  ) : null;
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const hasComposerHeader =
     isComposerApprovalState ||
@@ -2707,11 +2717,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 pendingCount={pendingApprovals.length}
               />
               <div className="flex flex-wrap items-center justify-end gap-2 px-3 pb-3 sm:px-4">
-                <ComposerPendingApprovalActions
-                  requestId={activePendingApproval.requestId}
-                  isResponding={respondingRequestIds.includes(activePendingApproval.requestId)}
-                  onRespondToApproval={onRespondToApproval}
-                />
+                {pendingApprovalActions}
               </div>
             </div>
           ) : isComposerCollapsedMobile && pendingUserInputs.length > 0 ? (
@@ -3063,11 +3069,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           {/* Bottom toolbar */}
           {isComposerCollapsedMobile ? null : activePendingApproval ? (
             <div className="flex items-center justify-end gap-2 px-2.5 pb-2.5 sm:px-3 sm:pb-3">
-              <ComposerPendingApprovalActions
-                requestId={activePendingApproval.requestId}
-                isResponding={respondingRequestIds.includes(activePendingApproval.requestId)}
-                onRespondToApproval={onRespondToApproval}
-              />
+              {pendingApprovalActions}
             </div>
           ) : (
             <div

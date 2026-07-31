@@ -4679,13 +4679,15 @@ mod tests {
             .apply(
                 "thread-1",
                 Change::Activity(crate::worklog::requested(
-                    &crate::protocol::Permission {
+                    &crate::approval::ApprovalRequest {
                         request_id: "req-1".to_string(),
                         tool_name: "Write".to_string(),
                         input: json!({"file_path": "note.txt"}),
                         tool_use_id: Some("toolu_1".to_string()),
                         description: None,
                         suggestions: Vec::new(),
+                        available_decisions: None,
+                        provider_request_id: None,
                     },
                     Some("turn-1".to_string()),
                 )),

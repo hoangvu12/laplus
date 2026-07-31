@@ -34,3 +34,11 @@ approval request under that handshake, establishing that a sandbox escape, not
 the policy's name alone, triggers the request. The socket stand-in replays the
 received half; translating laplus runtime modes into that outbound handshake is
 separate work.
+
+`03-write-approval.jsonl` reduces
+`.scratch/codex-driver/captures/03-write-approval.jsonl`. It preserves the
+sandbox-escaping command's `item/started` before its approval request, the
+request's accept/execpolicy-amendment/cancel decision list, and the response
+that releases the turn. The socket stand-in stops when it sends the request and
+does not replay anything after it until laplus answers; the structured amendment
+is recognized but never offered or sent by laplus.

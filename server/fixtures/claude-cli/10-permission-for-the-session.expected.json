@@ -98,7 +98,7 @@
       },
       "tool_use_id": "toolu_01BubBMY2apnb9T8JRtLbRZS",
       "description": "note.txt",
-      "permission_suggestions": [
+      "suggestions": [
         {
           "destination": "session",
           "mode": "acceptEdits",

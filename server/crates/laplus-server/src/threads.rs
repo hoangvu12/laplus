@@ -2737,14 +2737,16 @@ pub(crate) mod tests {
 
     /// A permission request as the module that writes them writes it — so the
     /// wiring under test is the same constant [`crate::worklog`] reads.
-    fn a_permission() -> crate::protocol::Permission {
-        crate::protocol::Permission {
+    fn a_permission() -> crate::approval::ApprovalRequest {
+        crate::approval::ApprovalRequest {
             request_id: "req-1".to_string(),
             tool_name: "Bash".to_string(),
             input: json!({"command": "ls"}),
             tool_use_id: Some("toolu_1".to_string()),
             description: None,
             suggestions: Vec::new(),
+            available_decisions: None,
+            provider_request_id: None,
         }
     }
 

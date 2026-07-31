@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::approval::ApprovalRequest as SharedApprovalRequest;
 use crate::config::{AuthStatus, ProviderAuth, ProviderModel};
+use crate::worklog::Decision;
 
 /// The one handshake policy that controls both what laplus advertises and which
 /// terminal event a conversation expects in return.
@@ -55,6 +57,8 @@ pub struct ConversationState {
     pub assistant_messages: Vec<AssistantMessage>,
     pub reasoning_items: Vec<ReasoningItem>,
     pub command_executions: Vec<CommandExecution>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub approval_requests: Vec<ApprovalRequest>,
     pub unknown_events: usize,
     pub parse_errors: usize,
 }
@@ -86,6 +90,41 @@ pub struct CommandExecution {
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    pub server_request_id: Value,
+    pub request_kind: String,
+    pub item_id: Option<String>,
+    pub tool_name: String,
+    pub input: Value,
+    pub available_decisions: Vec<Decision>,
+}
+
+impl ApprovalRequest {
+    pub(crate) fn permission(&self) -> SharedApprovalRequest {
+        SharedApprovalRequest {
+            request_id: self.request_id.clone(),
+            tool_name: self.tool_name.clone(),
+            input: self.input.clone(),
+            tool_use_id: self.item_id.clone(),
+            description: None,
+            suggestions: Vec::new(),
+            available_decisions: Some(self.available_decisions.clone()),
+            provider_request_id: Some(self.server_request_id.clone()),
+        }
+    }
+
+    pub(crate) fn call(&self) -> crate::worklog::Call {
+        crate::worklog::Call {
+            id: self.item_id.clone().unwrap_or_else(|| self.request_id.clone()),
+            name: self.tool_name.clone(),
+            input: self.input.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationFold {
     Nothing,
@@ -99,6 +138,7 @@ pub enum ConversationFold {
     AssistantCompleted { item_id: String, text: String },
     CommandStarted(CommandExecution),
     CommandCompleted(CommandExecution),
+    ApprovalRequested(ApprovalRequest),
     TurnCompleted(Completion),
 }
 
@@ -131,7 +171,11 @@ impl ConversationState {
         };
 
         if let Some(method) = object.get("method").and_then(Value::as_str) {
-            return self.fold_notification(method, object.get("params").unwrap_or(&Value::Null));
+            let params = object.get("params").unwrap_or(&Value::Null);
+            if let Some(id) = object.get("id") {
+                return self.fold_request(method, id, params);
+            }
+            return self.fold_notification(method, params);
         }
 
         let Some(result) = object.get("result") else {
@@ -307,6 +351,7 @@ impl ConversationState {
                 })
             }
             "thread/started"
+            | "serverRequest/resolved"
             | "configWarning"
             | "remoteControl/status/changed"
             | "mcpServer/startupStatus/updated"
@@ -317,6 +362,44 @@ impl ConversationState {
                 ConversationFold::Nothing
             }
         }
+    }
+
+    fn fold_request(&mut self, method: &str, id: &Value, params: &Value) -> ConversationFold {
+        let (request_kind, tool_name, input) = match method {
+            "item/commandExecution/requestApproval" => (
+                "command",
+                "Command",
+                json!({
+                    "command": params.get("command").cloned().unwrap_or(Value::Null),
+                    "cwd": params.get("cwd").cloned().unwrap_or(Value::Null),
+                }),
+            ),
+            "item/fileRead/requestApproval" => ("file-read", "Read", params.clone()),
+            "item/fileChange/requestApproval" => ("file-change", "Write", params.clone()),
+            _ => {
+                self.unknown_events += 1;
+                return ConversationFold::Nothing;
+            }
+        };
+        let available_decisions = params
+            .get("availableDecisions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(Decision::parse)
+            .collect();
+        let request = ApprovalRequest {
+            request_id: format!("codex:{id}"),
+            server_request_id: id.clone(),
+            request_kind: request_kind.to_string(),
+            item_id: params.get("itemId").and_then(Value::as_str).map(str::to_string),
+            tool_name: tool_name.to_string(),
+            input,
+            available_decisions,
+        };
+        self.approval_requests.push(request.clone());
+        ConversationFold::ApprovalRequested(request)
     }
 
     fn upsert_assistant(&mut self, message: AssistantMessage) {
@@ -465,6 +548,14 @@ pub(crate) fn unsupported_request(id: &Value, method: &str) -> Value {
                 "laplus does not handle app-server request '{method}' during a provider probe"
             ),
         }
+    })
+}
+
+pub(crate) fn approval_response(id: &Value, decision: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"decision": decision},
     })
 }
 
@@ -891,7 +982,7 @@ mod tests {
         {
             match decode_incoming(&record["msg"].to_string()).expect("a received message") {
                 Incoming::Notification => notifications += 1,
-                Incoming::Request { id, method } => {
+                Incoming::Request { id, method, .. } => {
                     server_requests.push(json!({"id": id, "method": method}));
                 }
                 Incoming::Response { id, result } => {
@@ -966,6 +1057,44 @@ mod tests {
     fn the_handshake_policy_selects_the_terminal_fallback() {
         assert!(!Capabilities::current().idle_is_terminal());
         assert!(Capabilities::experimental().idle_is_terminal());
+    }
+
+    #[test]
+    fn every_approval_kind_keeps_only_contract_decisions() {
+        for (method, kind, tool) in [
+            ("item/commandExecution/requestApproval", "command", "Command"),
+            ("item/fileRead/requestApproval", "file-read", "Read"),
+            ("item/fileChange/requestApproval", "file-change", "Write"),
+        ] {
+            let mut state = ConversationState::new();
+            let folded = state.fold_message(json!({
+                "id": "request-1",
+                "method": method,
+                "params": {
+                    "itemId": "item-1",
+                    "command": "printf hi",
+                    "cwd": "<workspace>",
+                    "availableDecisions": [
+                        "acceptForSession",
+                        {"acceptWithNetworkPolicyAmendment": {"host": "example.com"}},
+                        "decline"
+                    ]
+                }
+            }));
+            let ConversationFold::ApprovalRequested(request) = folded else {
+                panic!("{method} did not become an approval request");
+            };
+
+            assert_eq!(request.server_request_id, json!("request-1"));
+            assert_eq!(request.request_id, "codex:\"request-1\"");
+            assert_eq!(request.request_kind, kind);
+            assert_eq!(request.tool_name, tool);
+            assert_eq!(
+                request.available_decisions,
+                vec![Decision::AcceptForSession, Decision::Decline]
+            );
+            assert_eq!(state.unknown_events, 0, "{method}");
+        }
     }
 
     #[test]

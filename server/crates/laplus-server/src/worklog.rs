@@ -74,9 +74,11 @@
 //! is more useful than not — and rendering a plan as a plan is ticket 13's, which
 //! is where the suppression starts to mean something.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::protocol::{text_content, Answer, Permission};
+use crate::approval::ApprovalRequest;
+use crate::protocol::{text_content, Answer};
 use crate::threads::Activity;
 
 /// How much of a detail a row shows. Upstream's `truncateDetail` limit, matched
@@ -449,7 +451,8 @@ pub fn unanswered(activities: &[Activity]) -> Vec<&str> {
 /// [`crate::protocol::Answer`] — and this is deliberately not that: the CLI's
 /// vocabulary is what `claude` accepts and this one is what the developer
 /// clicked, and [`Decision::answer`] is the single place the two meet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Decision {
     /// Approve once. The tool runs and the next one like it asks again.
     Accept,
@@ -478,7 +481,7 @@ impl Decision {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Decision::Accept => "accept",
             Decision::AcceptForSession => "acceptForSession",
@@ -496,7 +499,7 @@ impl Decision {
     /// *own* suggestions handed back rather than a rule this server composed —
     /// the CLI knows what would stop it asking about this call, and inventing a
     /// broader rule than it offered would grant latitude nobody chose.
-    pub fn answer(self, request: &Permission) -> Answer {
+    pub fn answer(self, request: &ApprovalRequest) -> Answer {
         match self {
             Decision::Accept => Answer::Allow {
                 input: request.input.clone(),
@@ -524,8 +527,9 @@ impl Decision {
     /// answered it, because [`Decision::answer`] has nothing to send. The two
     /// have to be one fact, or a row would claim a session-wide rule the agent
     /// never received and the developer would expect silence they will not get.
-    fn remembers(self, request: &Permission) -> bool {
-        matches!(self, Decision::AcceptForSession) && !request.suggestions.is_empty()
+    fn remembers(self, request: &ApprovalRequest) -> bool {
+        matches!(self, Decision::AcceptForSession)
+            && (!request.suggestions.is_empty() || request.available_decisions.is_some())
     }
 
     /// What the resolved row says happened, given what the agent was actually
@@ -542,30 +546,34 @@ impl Decision {
 }
 
 /// The agent asking, as the pending-approval panel will read it.
-pub fn requested(request: &Permission, turn_id: Option<String>) -> Activity {
+pub fn requested(request: &ApprovalRequest, turn_id: Option<String>) -> Activity {
+    let mut payload = json!({
+        REQUEST_ID: request.request_id,
+        "requestKind": request_kind(&request.tool_name),
+        "detail": truncate(&summarize(request), DETAIL),
+        "data": {
+            "toolName": request.tool_name,
+            "toolCallId": request.tool_use_id,
+            "input": request.input,
+        },
+    });
+    if let Some(decisions) = &request.available_decisions {
+        payload["availableDecisions"] = json!(decisions);
+    }
     Activity::approval(
         REQUESTED,
         &format!("{} needs permission", request.tool_name),
-        json!({
-            // The three the panel reads. Without the id nothing can be answered;
-            // without the kind the request is dropped from the panel outright.
-            REQUEST_ID: request.request_id,
-            "requestKind": request_kind(&request.tool_name),
-            "detail": truncate(&summarize(request), DETAIL),
-            // The call it is about, so the row and the tool row beside it are
-            // visibly one piece of work. Whole, like every other `data` here.
-            "data": {
-                "toolName": request.tool_name,
-                "toolCallId": request.tool_use_id,
-                "input": request.input,
-            },
-        }),
+        payload,
         turn_id,
     )
 }
 
 /// The developer having answered, which is what closes the panel.
-pub fn resolved(request: &Permission, decision: Decision, turn_id: Option<String>) -> Activity {
+pub fn resolved(
+    request: &ApprovalRequest,
+    decision: Decision,
+    turn_id: Option<String>,
+) -> Activity {
     Activity::approval(
         RESOLVED,
         &format!(
@@ -702,7 +710,7 @@ pub fn blocks_on_the_developer(activity: &Activity) -> bool {
 /// by `id`. Anything else and the answers arrive somewhere the agent does not
 /// read. Upstream carries the same rule, with the issue that taught it:
 /// `ClaudeAdapter.ts`, `handleAskUserQuestion`.
-pub fn questions(request: &Permission) -> Option<Vec<Value>> {
+pub fn questions(request: &ApprovalRequest) -> Option<Vec<Value>> {
     if request.tool_name != ASK_USER_QUESTION {
         return None;
     }
@@ -754,7 +762,7 @@ fn option(offered: &Value) -> Option<Value> {
 
 /// The agent asking, as the composer's question header will read it.
 pub fn user_input_requested(
-    request: &Permission,
+    request: &ApprovalRequest,
     questions: Vec<Value>,
     turn_id: Option<String>,
 ) -> Activity {
@@ -805,7 +813,7 @@ pub fn unanswerable_user_input(request_id: &str) -> Activity {
 /// answered. Declining to answer is not a thing the composer offers, and a
 /// session ending on an unanswered question is closed by
 /// [`unanswerable_user_input`] rather than by pretending an answer.
-pub fn answers_for(request: &Permission, answers: &Value) -> Answer {
+pub fn answers_for(request: &ApprovalRequest, answers: &Value) -> Answer {
     Answer::Allow {
         input: json!({
             "questions": request.input.get("questions").cloned().unwrap_or(Value::Null),
@@ -847,7 +855,7 @@ fn command_in(input: &Value) -> Option<&str> {
 /// The CLI's own `description` when it sent one, because it knows what it is
 /// asking about — `note.txt` for a `Write` whose input is the whole file — and
 /// this server only knows how to print the arguments.
-fn summarize(request: &Permission) -> String {
+fn summarize(request: &ApprovalRequest) -> String {
     match request.description.as_deref().map(str::trim) {
         Some(description) if !description.is_empty() => {
             format!("{}: {description}", request.tool_name)
@@ -1167,14 +1175,16 @@ mod tests {
 
     // -- permission requests --------------------------------------------------
 
-    fn asking(tool_name: &str, input: Value) -> Permission {
-        Permission {
+    fn asking(tool_name: &str, input: Value) -> ApprovalRequest {
+        ApprovalRequest {
             request_id: "req-1".to_string(),
             tool_name: tool_name.to_string(),
             input,
             tool_use_id: Some("toolu_1".to_string()),
             description: None,
             suggestions: Vec::new(),
+            available_decisions: None,
+            provider_request_id: None,
         }
     }
 
@@ -1213,7 +1223,7 @@ mod tests {
     #[test]
     fn the_clis_own_summary_is_preferred_to_one_derived_from_the_arguments() {
         let row = requested(
-            &Permission {
+            &ApprovalRequest {
                 description: Some("note.txt".to_string()),
                 ..asking("Write", json!({"file_path": "note.txt", "content": "hello"}))
             },
@@ -1258,7 +1268,7 @@ mod tests {
     /// resolution names its request, so the id has to be the same one.
     #[test]
     fn a_resolution_names_the_request_it_closes_and_what_was_decided() {
-        let request = Permission {
+        let request = ApprovalRequest {
             // A request the CLI offered a way to stop asking about, so
             // "for this session" is a thing that can actually be said.
             suggestions: vec![json!({"type": "setMode", "mode": "acceptEdits"})],
@@ -1307,7 +1317,7 @@ mod tests {
     /// declined is the one failure this whole ticket exists to prevent.
     #[test]
     fn each_decision_becomes_the_answer_the_agent_is_owed() {
-        let request = Permission {
+        let request = ApprovalRequest {
             suggestions: vec![json!({"type": "setMode", "mode": "acceptEdits"})],
             ..asking("Write", json!({"file_path": "note.txt"}))
         };
@@ -1375,7 +1385,7 @@ mod tests {
     #[test]
     fn a_request_is_pending_from_being_asked_until_it_is_answered() {
         let first = asking("Write", Value::Null);
-        let second = Permission {
+        let second = ApprovalRequest {
             request_id: "req-2".to_string(),
             ..asking("Bash", Value::Null)
         };
@@ -1555,7 +1565,7 @@ mod tests {
     #[test]
     fn a_question_is_open_until_it_is_answered_and_approvals_do_not_close_it() {
         let question = asking(ASK_USER_QUESTION, a_question());
-        let permission = Permission {
+        let permission = ApprovalRequest {
             request_id: "req-2".to_string(),
             ..asking("Bash", json!({"command": "ls"}))
         };

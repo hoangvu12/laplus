@@ -23,13 +23,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::process::{Child as AsyncChild, ChildStdin as AsyncChildStdin, Command as AsyncCommand};
 use tokio::sync::mpsc as async_mpsc;
 
+use crate::approval::ApprovalRequest;
 use crate::codex_protocol::{
     self as protocol, Capabilities, CommandExecution, ConversationFold, ConversationState,
     Incoming, Request,
 };
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
 use crate::config_store::ProviderProcessLifetime;
-use crate::protocol::Permission;
 use crate::session::{
     Decided, Driver, Driving, Finished, Pushed, Reaped, Reply, Settles, Start,
 };
@@ -182,7 +182,8 @@ impl Driver for Codex {
                 return Some(settle(driving, Ending::Failed(error), None));
             }
             Observed::Malformed => self.folding.fold_line(&line),
-            Observed::Request | Observed::Response { .. } => ConversationFold::Nothing,
+            Observed::Request => self.folding.fold_line(&line),
+            Observed::Response { .. } => ConversationFold::Nothing,
         };
 
         let idle = matches!(
@@ -238,10 +239,28 @@ impl Driver for Codex {
         ))
     }
 
-    async fn answer(&mut self, _asked: &Permission, _reply: Reply<'_>) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "Codex approval responses have not been implemented",
-        ))
+    async fn answer(&mut self, asked: &ApprovalRequest, reply: Reply<'_>) -> std::io::Result<()> {
+        let Reply::Decided(decision) = reply else {
+            return Err(std::io::Error::other("Codex did not ask an approval question"));
+        };
+        let response_id = asked
+            .provider_request_id
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Codex approval lost its JSON-RPC request id"))?;
+        if !asked
+            .available_decisions
+            .as_ref()
+            .is_some_and(|offered| offered.contains(&decision))
+        {
+            return Err(std::io::Error::other(format!(
+                "Codex did not offer the '{}' approval decision",
+                decision.as_str()
+            )));
+        }
+        self.app_server
+            .write(&protocol::approval_response(response_id, decision.as_str()))
+            .await
+            .map_err(std::io::Error::other)
     }
 
     async fn measure(&mut self, _request_id: &str) -> std::io::Result<()> {
@@ -343,10 +362,30 @@ fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
                 ),
             ));
         }
+        ConversationFold::ApprovalRequested(request) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            // Command executions have their own item lifecycle. The other two
+            // approval methods do not yet have a rendered lifecycle, so publish
+            // their call here before publishing the panel that asks about it.
+            if request.request_kind != "command" {
+                decided
+                    .changes
+                    .push(Change::Activity(request.call().invoked(turn_id.clone())));
+            }
+            let asked = request.permission();
+            decided
+                .changes
+                .push(Change::Activity(crate::worklog::requested(&asked, turn_id)));
+            driving.outstanding.insert(asked.request_id.clone(), asked);
+        }
         ConversationFold::TurnCompleted(completion) => {
-            let ending = match completion.error {
-                Some(error) => Ending::Failed(error),
-                None => Ending::Completed,
+            let ending = match (
+                driving.turn.as_ref().is_some_and(|turn| turn.was_stopped()),
+                completion.error,
+            ) {
+                (true, _) => Ending::Stopped,
+                (false, Some(error)) => Ending::Failed(error),
+                (false, None) => Ending::Completed,
             };
             return settle(driving, ending, completion.duration_ms);
         }
@@ -369,6 +408,7 @@ fn command_call(command: &CommandExecution) -> crate::worklog::Call {
 enum Ending {
     Completed,
     Failed(String),
+    Stopped,
 }
 
 impl Ending {
@@ -376,9 +416,14 @@ impl Ending {
         matches!(self, Ending::Failed(_))
     }
 
+    fn stopped(&self) -> bool {
+        matches!(self, Ending::Stopped)
+    }
+
     fn summary(&self, duration_ms: Option<u64>) -> String {
         match self {
             Ending::Failed(error) => format!("Turn failed. Codex said: {error}"),
+            Ending::Stopped => "Turn stopped by the developer.".to_string(),
             Ending::Completed => match duration_ms {
                 Some(duration) => {
                     format!("Turn completed in {:.1}s.", duration as f64 / 1_000.0)
@@ -392,13 +437,15 @@ impl Ending {
         match self {
             Ending::Completed => SessionStatus::Ready,
             Ending::Failed(_) => SessionStatus::Error,
+            Ending::Stopped => SessionStatus::Interrupted,
         }
     }
 
-    fn checkpoint_status(&self) -> &'static str {
+    fn checkpoint_status(&self) -> Option<&'static str> {
         match self {
-            Ending::Completed => "ready",
-            Ending::Failed(_) => "error",
+            Ending::Completed => Some("ready"),
+            Ending::Failed(_) => Some("error"),
+            Ending::Stopped => None,
         }
     }
 }
@@ -409,10 +456,12 @@ fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> De
     };
     let turn_id = finished.turn_id;
     let failed = ending.failed();
-    driving.finished = Some(Finished {
-        turn_id: turn_id.clone(),
-        status: ending.checkpoint_status(),
-    });
+    if let Some(status) = ending.checkpoint_status() {
+        driving.finished = Some(Finished {
+            turn_id: turn_id.clone(),
+            status,
+        });
+    }
 
     let summary = ending.summary(duration_ms);
     let mut activity = Activity::info(
@@ -422,7 +471,7 @@ fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> De
             "durationMs": duration_ms,
             "totalCostUsd": Value::Null,
             "isError": failed,
-            "interrupted": false,
+            "interrupted": ending.stopped(),
         }),
         Some(turn_id.clone()),
     );
@@ -525,7 +574,7 @@ impl AppServer {
                 .map_err(|_| "Codex stopped answering a request".to_string())?
                 .ok_or_else(|| "Codex stopped before answering a request".to_string())?;
             match protocol::decode_incoming(&line)? {
-                Incoming::Request { id, method } => {
+                Incoming::Request { id, method, .. } => {
                     self.write(&protocol::unsupported_request(&id, &method)).await?;
                 }
                 Incoming::Notification => {}
@@ -767,7 +816,7 @@ impl Client {
             match protocol::decode_incoming(&line)? {
                 // A method plus an id is app-server asking us something. Its id
                 // is independent from, and never looked up in, `pending`.
-                Incoming::Request { id, method } => {
+                Incoming::Request { id, method, .. } => {
                     self.write(&protocol::unsupported_request(&id, &method))?;
                 }
                 Incoming::Notification => {}
