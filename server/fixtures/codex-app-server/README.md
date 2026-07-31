@@ -16,3 +16,11 @@ independently recorded server-request id overlap from `03-write-approval.jsonl`,
 and splits the model response into two pages to exercise the schema's cursor.
 Account, model and skill data are minimized so upgrades produce a reviewable
 golden diff rather than one dominated by the developer's installed skills.
+
+`01-plain-turn.jsonl` is the same kind of reduction of
+`.scratch/codex-driver/captures/01-plain-turn.jsonl`. It preserves the empty
+capabilities handshake, thread and turn requests, reasoning lifecycle, streamed
+assistant deltas, authoritative completed message, and the recorded order where
+idle arrives immediately before `turn/completed`. The socket stand-in reads this
+fixture, rewrites response ids to the requests it actually received, and replays
+the received half; the adjacent expected file is its fresh conversation fold.

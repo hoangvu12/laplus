@@ -16,7 +16,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use laplus_server::codex_protocol::ConversationState;
 use laplus_server::protocol::{ContentBlock, SessionState};
+use serde_json::Value;
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude-cli")
@@ -55,6 +57,29 @@ fn render(state: &SessionState) -> String {
 /// round-tripped through a CRLF checkout should not read as protocol drift.
 fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n")
+}
+
+#[test]
+fn the_plain_codex_turn_folds_through_a_fresh_state() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/codex-app-server");
+    let capture = fs::read_to_string(directory.join("01-plain-turn.jsonl"))
+        .expect("reads the Codex turn fixture");
+    let mut state = ConversationState::new();
+    for record in capture.lines().map(|line| {
+        serde_json::from_str::<Value>(line).expect("a Codex fixture record")
+    }) {
+        if record["dir"] == "recv" {
+            state.fold_message(record["msg"].clone());
+        }
+    }
+
+    let mut actual = serde_json::to_string_pretty(&state).expect("Codex state serializes");
+    actual.push('\n');
+    let expected = fs::read_to_string(directory.join("01-plain-turn.expected.json"))
+        .expect("reads the expected Codex turn fold");
+
+    assert_eq!(actual, normalize(&expected));
 }
 
 #[test]

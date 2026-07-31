@@ -205,6 +205,10 @@ impl Located {
         self.startable_for("Claude Code")
     }
 
+    pub(crate) fn startable_codex(self) -> Result<(PathBuf, Source), String> {
+        self.startable_for("Codex")
+    }
+
     fn startable_for(self, product: &str) -> Result<(PathBuf, Source), String> {
         match self {
             Located::Binary { path, source } => Ok((path, source)),
@@ -265,7 +269,7 @@ pub fn resolve(configured: &str, search: &Search) -> Located {
     resolve_named(configured, DEFAULT_NAME, search)
 }
 
-fn resolve_codex(configured: &str, search: &Search) -> Located {
+pub(crate) fn resolve_codex(configured: &str, search: &Search) -> Located {
     resolve_named(configured, "codex", search)
 }
 

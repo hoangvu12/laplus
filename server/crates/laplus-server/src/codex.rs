@@ -1,4 +1,4 @@
-//! The provider-probe subset of the `codex app-server` JSON-RPC transport.
+//! The `codex app-server` transport for provider probes and conversations.
 //!
 //! Responses on this wire omit `jsonrpc` and may arrive in any order, while
 //! requests sent by app-server use an independent id space. Classification is
@@ -13,13 +13,27 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::process::{Child as AsyncChild, ChildStdin as AsyncChildStdin, Command as AsyncCommand};
+use tokio::sync::mpsc as async_mpsc;
 
-use crate::codex_protocol::{self as protocol, Incoming, Request};
+use crate::codex_protocol::{
+    self as protocol, Capabilities, ConversationFold, ConversationState, Incoming, Request,
+};
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
 use crate::config_store::ProviderProcessLifetime;
+use crate::protocol::Permission;
+use crate::session::{
+    Decided, Driver, Driving, Finished, Pushed, Reaped, Reply, Settles, Start,
+};
+use crate::settling::SessionStatus;
+use crate::threads::{Activity, Change};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
+const OUTPUT_QUEUE: usize = 256;
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+const EXIT_POLL: Duration = Duration::from_millis(20);
 pub struct Snapshot {
     pub version: Option<String>,
     pub auth: ProviderAuth,
@@ -77,6 +91,514 @@ pub(crate) fn probe(
         models,
         skills,
     })
+}
+
+/// One long-lived `codex app-server` behind one conversation.
+pub(crate) struct Codex {
+    app_server: AppServer,
+    folding: ConversationState,
+    thread_id: String,
+    active_turn_id: Option<String>,
+    capabilities: Capabilities,
+}
+
+impl Driver for Codex {
+    async fn open(start: &Start) -> Result<Codex, String> {
+        let settings = start.driver.codex()?;
+        let capabilities = Capabilities::current();
+        let (binary, _) = crate::provider::resolve_codex(
+            &settings.binary_path,
+            &crate::process::Search::from_environment(),
+        )
+        .startable_codex()?;
+        let mut app_server = AppServer::start(
+            &binary,
+            settings,
+            Path::new(&start.workspace_root),
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "The Codex binary {} could not be started in {}: {error}",
+                binary.display(),
+                start.workspace_root
+            )
+        })?;
+
+        let opened = async {
+            let initialized = app_server.request(Request::Initialize).await?;
+            protocol::decode_initialize(initialized)?;
+            app_server.write(&protocol::initialized()).await?;
+            let thread = app_server
+                .request(Request::ThreadStart {
+                    cwd: start.workspace_root.clone(),
+                    model: start.model.clone(),
+                })
+                .await?;
+            protocol::decode_thread_start(thread)
+        }
+        .await;
+        let thread_id = match opened {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                app_server.stop().await;
+                return Err(error);
+            }
+        };
+
+        Ok(Codex {
+            app_server,
+            folding: ConversationState::new(),
+            thread_id,
+            active_turn_id: None,
+            capabilities,
+        })
+    }
+
+    async fn next(&mut self, driving: &mut Driving) -> Option<Decided> {
+        let line = self.app_server.next_line().await?;
+        let observed = self.app_server.observe(&line);
+        let folded = match observed {
+            Observed::Notification => self.folding.fold_line(&line),
+            Observed::Response {
+                method,
+                result: Ok(result),
+            } if method == "turn/start" => {
+                self.folding
+                    .fold_message(serde_json::json!({"result": result}))
+            }
+            Observed::Response {
+                method,
+                result: Err(error),
+            } if method == "turn/start" => {
+                self.active_turn_id = None;
+                return Some(settle(driving, Ending::Failed(error), None));
+            }
+            Observed::Malformed => self.folding.fold_line(&line),
+            Observed::Request | Observed::Response { .. } => ConversationFold::Nothing,
+        };
+
+        let idle = matches!(
+            &folded,
+            ConversationFold::ThreadStatus { status } if status == "idle"
+        );
+                let stale_completion = matches!(
+                    &folded,
+                    ConversationFold::TurnCompleted(completion)
+                        if self.active_turn_id.as_deref() != Some(completion.turn_id.as_str())
+                );
+                if stale_completion {
+                    return Some(Decided::default());
+                }
+                match &folded {
+                    ConversationFold::TurnStarted { turn_id } => {
+                        self.active_turn_id = Some(turn_id.clone());
+                    }
+                    ConversationFold::TurnCompleted(_) => {
+                        self.active_turn_id = None;
+                    }
+                    _ => {}
+                }
+                let decided = decide(folded, driving);
+                // Empty capabilities promise the completion that carries the
+                // outcome, so idle cannot win that race. Experimental API omits
+                // completion; the handshake policy flips this fallback with it.
+                if idle
+                    && self.capabilities.idle_is_terminal()
+                    && driving.turn.is_some()
+                    && decided.settles.is_none()
+                {
+                    self.active_turn_id = None;
+                    return Some(settle(driving, Ending::Completed, None));
+                }
+                Some(decided)
+    }
+
+    async fn send(&mut self, text: &str) -> std::io::Result<()> {
+        self.app_server
+            .send_request(Request::TurnStart {
+                thread_id: self.thread_id.clone(),
+                text: text.to_string(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    }
+
+    async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "Codex turn interruption has not been implemented",
+        ))
+    }
+
+    async fn answer(&mut self, _asked: &Permission, _reply: Reply<'_>) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "Codex approval responses have not been implemented",
+        ))
+    }
+
+    async fn measure(&mut self, _request_id: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn retune(&mut self, _request_id: &str, _asked: &Pushed) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "Codex model and access changes have not been implemented",
+        ))
+    }
+
+    fn close_input(&mut self) {
+        self.app_server.close_input();
+    }
+
+    async fn stop(self, driving: &mut Driving, asked_to_stop: bool) -> Reaped {
+        let complaint = self.app_server.stop().await;
+        let death = (driving.turn.is_some() && !asked_to_stop).then(|| match complaint {
+            Some(complaint) => format!(
+                "Codex stopped before the turn finished. The agent said: {complaint}"
+            ),
+            None => "Codex stopped before the turn finished.".to_string(),
+        });
+        Reaped {
+            refused: None,
+            death,
+        }
+    }
+}
+
+fn decide(folded: ConversationFold, driving: &mut Driving) -> Decided {
+    let mut decided = Decided::default();
+    match folded {
+        ConversationFold::Nothing
+        | ConversationFold::ThreadStarted { .. }
+        | ConversationFold::TurnStarted { .. } => {}
+        ConversationFold::ThreadStatus { .. } => {}
+        ConversationFold::ReasoningStarted { .. } => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(crate::worklog::thinking_started(turn_id)));
+        }
+        ConversationFold::ReasoningDelta { .. } => {}
+        ConversationFold::ReasoningCompleted { text, .. } => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            if let Some(thinking) = crate::worklog::thinking(&text, turn_id) {
+                decided.changes.push(Change::Activity(thinking));
+            }
+        }
+        ConversationFold::AssistantDelta { text, .. } => {
+            let Some(active) = driving.turn.as_mut() else {
+                return decided;
+            };
+            let message_id = active
+                .assistant_message_id
+                .get_or_insert_with(crate::threads::fresh_message_id)
+                .clone();
+            decided.changes.push(Change::AssistantDelta {
+                message_id,
+                turn_id: active.turn_id.clone(),
+                text,
+            });
+        }
+        ConversationFold::AssistantCompleted { text, .. } => {
+            let Some(active) = driving.turn.as_mut() else {
+                return decided;
+            };
+            let message_id = active
+                .assistant_message_id
+                .take()
+                .unwrap_or_else(crate::threads::fresh_message_id);
+            decided.changes.push(Change::AssistantMessage {
+                message_id,
+                turn_id: active.turn_id.clone(),
+                text,
+            });
+        }
+        ConversationFold::TurnCompleted(completion) => {
+            let ending = match completion.error {
+                Some(error) => Ending::Failed(error),
+                None => Ending::Completed,
+            };
+            return settle(driving, ending, completion.duration_ms);
+        }
+    }
+    decided
+}
+
+enum Ending {
+    Completed,
+    Failed(String),
+}
+
+impl Ending {
+    fn failed(&self) -> bool {
+        matches!(self, Ending::Failed(_))
+    }
+
+    fn summary(&self, duration_ms: Option<u64>) -> String {
+        match self {
+            Ending::Failed(error) => format!("Turn failed. Codex said: {error}"),
+            Ending::Completed => match duration_ms {
+                Some(duration) => {
+                    format!("Turn completed in {:.1}s.", duration as f64 / 1_000.0)
+                }
+                None => "Turn completed.".to_string(),
+            },
+        }
+    }
+
+    fn session_status(&self) -> SessionStatus {
+        match self {
+            Ending::Completed => SessionStatus::Ready,
+            Ending::Failed(_) => SessionStatus::Error,
+        }
+    }
+
+    fn checkpoint_status(&self) -> &'static str {
+        match self {
+            Ending::Completed => "ready",
+            Ending::Failed(_) => "error",
+        }
+    }
+}
+
+fn settle(driving: &mut Driving, ending: Ending, duration_ms: Option<u64>) -> Decided {
+    let Some(finished) = driving.turn.take() else {
+        return Decided::default();
+    };
+    let turn_id = finished.turn_id;
+    let failed = ending.failed();
+    driving.finished = Some(Finished {
+        turn_id: turn_id.clone(),
+        status: ending.checkpoint_status(),
+    });
+
+    let summary = ending.summary(duration_ms);
+    let mut activity = Activity::info(
+        "turn.completed",
+        &summary,
+        serde_json::json!({
+            "durationMs": duration_ms,
+            "totalCostUsd": Value::Null,
+            "isError": failed,
+            "interrupted": false,
+        }),
+        Some(turn_id.clone()),
+    );
+    if failed {
+        activity.tone = "error";
+    }
+
+    Decided {
+        changes: vec![Change::Activity(activity)],
+        settles: Some(Settles {
+            turn_id: Some(turn_id),
+            status: ending.session_status(),
+            last_error: failed.then_some(summary),
+        }),
+        ..Decided::default()
+    }
+}
+
+struct AppServer {
+    child: AsyncChild,
+    stdin: Option<AsyncChildStdin>,
+    output: async_mpsc::Receiver<String>,
+    pending: HashMap<u64, String>,
+    next_id: u64,
+    complaint: Arc<Mutex<Option<String>>>,
+    stderr: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AppServer {
+    async fn start(
+        binary: &Path,
+        settings: &CodexSettings,
+        cwd: &Path,
+    ) -> std::io::Result<AppServer> {
+        let launch_args = shell_words::split(&settings.launch_args).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+        })?;
+        let mut command = AsyncCommand::new(binary);
+        command
+            .arg("app-server")
+            .args(launch_args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if !settings.home_path.trim().is_empty() {
+            command.env(
+                "CODEX_HOME",
+                crate::projects::expand_home(settings.home_path.trim()),
+            );
+        }
+        crate::process::without_a_console(command.as_std_mut());
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take().ok_or_else(missing_async_pipe)?;
+        let stdout = child.stdout.take().ok_or_else(missing_async_pipe)?;
+        let child_stderr = child.stderr.take().ok_or_else(missing_async_pipe)?;
+
+        let (lines, output) = async_mpsc::channel(OUTPUT_QUEUE);
+        tokio::spawn(async move {
+            let mut reader = AsyncBufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if lines.send(line).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let complaint = Arc::new(Mutex::new(None));
+        let latest = Arc::clone(&complaint);
+        let stderr = tokio::spawn(async move {
+            let mut reader = AsyncBufReader::new(child_stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                eprintln!("laplus: codex: {line}");
+                if !line.trim().is_empty() {
+                    *latest
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(line.trim().to_string());
+                }
+            }
+        });
+
+        Ok(AppServer {
+            child,
+            stdin: Some(stdin),
+            output,
+            pending: HashMap::new(),
+            next_id: 1,
+            complaint,
+            stderr: Some(stderr),
+        })
+    }
+
+    async fn request(&mut self, request: Request) -> Result<Value, String> {
+        let id = self.send_request(request).await?;
+        loop {
+            let line = tokio::time::timeout(RESPONSE_TIMEOUT, self.output.recv())
+                .await
+                .map_err(|_| "Codex stopped answering a request".to_string())?
+                .ok_or_else(|| "Codex stopped before answering a request".to_string())?;
+            match protocol::decode_incoming(&line)? {
+                Incoming::Request { id, method } => {
+                    self.write(&protocol::unsupported_request(&id, &method)).await?;
+                }
+                Incoming::Notification => {}
+                Incoming::Response { id: response_id, result } => {
+                    if self.pending.remove(&response_id).is_none() {
+                        continue;
+                    }
+                    if response_id == id {
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_request(&mut self, request: Request) -> Result<u64, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(&request.message(id)).await?;
+        self.pending.insert(id, request.method().to_string());
+        Ok(id)
+    }
+
+    async fn write(&mut self, message: &Value) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "Codex stdin is closed".to_string())?;
+        let mut line = message.to_string();
+        line.push('\n');
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|error| format!("Codex request could not be written: {error}"))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|error| format!("Codex request could not be written: {error}"))
+    }
+
+    async fn next_line(&mut self) -> Option<String> {
+        self.output.recv().await
+    }
+
+    fn observe(&mut self, line: &str) -> Observed {
+        match protocol::decode_incoming(line) {
+            Ok(Incoming::Notification) => Observed::Notification,
+            Ok(Incoming::Request { .. }) => Observed::Request,
+            Ok(Incoming::Response { id, result }) => match self.pending.remove(&id) {
+                Some(method) => Observed::Response { method, result },
+                None => Observed::Response {
+                    method: String::new(),
+                    result,
+                },
+            },
+            Err(_) => Observed::Malformed,
+        }
+    }
+
+    fn close_input(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    async fn stop(mut self) -> Option<String> {
+        drop(self.stdin.take());
+        let deadline = tokio::time::Instant::now() + EXIT_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return self.last_words().await,
+                Err(_) => break,
+                Ok(None) if tokio::time::Instant::now() >= deadline => break,
+                Ok(None) => tokio::time::sleep(EXIT_POLL).await,
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(pid) = self.child.id() {
+            let mut command = AsyncCommand::new("taskkill.exe");
+            command
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::process::without_a_console(command.as_std_mut());
+            let _ = command.status().await;
+        }
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+        self.last_words().await
+    }
+
+    async fn last_words(&mut self) -> Option<String> {
+        if let Some(stderr) = self.stderr.take() {
+            let _ = tokio::time::timeout(EXIT_GRACE, stderr).await;
+        }
+        self.complaint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+enum Observed {
+    Notification,
+    Request,
+    Response {
+        method: String,
+        result: Result<Value, String>,
+    },
+    Malformed,
+}
+
+fn missing_async_pipe() -> std::io::Error {
+    std::io::Error::other("Codex was started without one of its stdio pipes")
 }
 
 struct Client {

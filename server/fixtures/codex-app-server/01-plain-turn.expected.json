@@ -1,0 +1,23 @@
+{
+  "threadId": "codex-thread-1",
+  "turnId": "codex-turn-1",
+  "threadStatus": "idle",
+  "turnStatus": "completed",
+  "turnError": null,
+  "assistantMessages": [
+    {
+      "id": "message-1",
+      "text": "Hello.",
+      "phase": "final_answer"
+    }
+  ],
+  "reasoningItems": [
+    {
+      "id": "reasoning-1",
+      "text": "",
+      "completed": true
+    }
+  ],
+  "unknownEvents": 0,
+  "parseErrors": 0
+}

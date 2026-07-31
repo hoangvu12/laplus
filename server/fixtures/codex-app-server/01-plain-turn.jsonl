@@ -1,0 +1,16 @@
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.1"},"capabilities":{}}}}
+{"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (Linux; aarch64) unknown"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","method":"initialized"}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"<workspace>","model":"gpt-5.4-mini","approvalPolicy":"never","sandbox":"read-only","approvalsReviewer":"user"}}}
+{"dir":"recv","msg":{"id":2,"result":{"thread":{"id":"codex-thread-1"},"cwd":"<workspace>"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"codex-thread-1","input":[{"type":"text","text":"Reply with exactly one short sentence saying hello. Do not use any tools."}]}}}
+{"dir":"recv","msg":{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress","error":null}}}}
+{"dir":"recv","msg":{"method":"thread/status/changed","params":{"threadId":"codex-thread-1","status":{"type":"active","activeFlags":[]}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"reasoning","id":"reasoning-1","summary":[],"content":[]}}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"reasoning","id":"reasoning-1","summary":[],"content":[]}}}}
+{"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"message-1","text":"","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"message-1","delta":"Hello"}}}
+{"dir":"recv","msg":{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"message-1","delta":"."}}}
+{"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"message-1","text":"Hello.","phase":"final_answer"}}}}
+{"dir":"recv","msg":{"method":"thread/status/changed","params":{"threadId":"codex-thread-1","status":{"type":"idle"}}}}
+{"dir":"recv","msg":{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","items":[{"type":"agentMessage","id":"message-1","text":"Hello.","phase":"final_answer"}],"status":"completed","error":null,"durationMs":5750}}}}

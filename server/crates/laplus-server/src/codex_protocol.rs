@@ -1,9 +1,318 @@
-//! Pure types and folds for the provider-probe subset of Codex JSON-RPC.
+//! Pure types and folds for the Codex app-server JSON-RPC used by provider
+//! probing and conversation turns.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{AuthStatus, ProviderAuth, ProviderModel};
+
+/// The one handshake policy that controls both what laplus advertises and which
+/// terminal event a conversation expects in return.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Capabilities {
+    experimental_api: bool,
+}
+
+impl Capabilities {
+    pub(crate) fn current() -> Capabilities {
+        Capabilities {
+            experimental_api: false,
+        }
+    }
+
+    fn message(self) -> Value {
+        match self.experimental_api {
+            true => json!({"experimentalApi": true}),
+            false => json!({}),
+        }
+    }
+
+    pub(crate) fn idle_is_terminal(self) -> bool {
+        self.experimental_api
+    }
+
+    #[cfg(test)]
+    fn experimental() -> Capabilities {
+        Capabilities {
+            experimental_api: true,
+        }
+    }
+}
+
+/// The app-server state a conversation accumulates while messages are folded.
+///
+/// Provider probing decodes individual responses below. A conversation is a
+/// stream instead: responses and notifications jointly describe one thread and
+/// its turns, so this state is deliberately fresh per app-server process.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationState {
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub thread_status: Option<String>,
+    pub turn_status: Option<String>,
+    pub turn_error: Option<String>,
+    pub assistant_messages: Vec<AssistantMessage>,
+    pub reasoning_items: Vec<ReasoningItem>,
+    pub unknown_events: usize,
+    pub parse_errors: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssistantMessage {
+    pub id: String,
+    pub text: String,
+    pub phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasoningItem {
+    pub id: String,
+    pub text: String,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationFold {
+    Nothing,
+    ThreadStarted { thread_id: String },
+    TurnStarted { turn_id: String },
+    ThreadStatus { status: String },
+    ReasoningStarted { item_id: String },
+    ReasoningDelta { item_id: String, text: String },
+    ReasoningCompleted { item_id: String, text: String },
+    AssistantDelta { item_id: String, text: String },
+    AssistantCompleted { item_id: String, text: String },
+    TurnCompleted(Completion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub turn_id: String,
+    pub error: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+impl ConversationState {
+    pub fn new() -> ConversationState {
+        ConversationState::default()
+    }
+
+    pub fn fold_line(&mut self, line: &str) -> ConversationFold {
+        match serde_json::from_str(line) {
+            Ok(message) => self.fold_message(message),
+            Err(_) => {
+                self.parse_errors += 1;
+                ConversationFold::Nothing
+            }
+        }
+    }
+
+    pub fn fold_message(&mut self, message: Value) -> ConversationFold {
+        let Some(object) = message.as_object() else {
+            self.parse_errors += 1;
+            return ConversationFold::Nothing;
+        };
+
+        if let Some(method) = object.get("method").and_then(Value::as_str) {
+            return self.fold_notification(method, object.get("params").unwrap_or(&Value::Null));
+        }
+
+        let Some(result) = object.get("result") else {
+            return ConversationFold::Nothing;
+        };
+        if let Some(thread_id) = result
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+        {
+            self.thread_id = Some(thread_id.to_string());
+            return ConversationFold::ThreadStarted {
+                thread_id: thread_id.to_string(),
+            };
+        }
+        if let Some(turn) = result.get("turn") {
+            let Some(turn_id) = turn.get("id").and_then(Value::as_str) else {
+                return ConversationFold::Nothing;
+            };
+            self.turn_id = Some(turn_id.to_string());
+            self.turn_status = turn
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            self.turn_error = error_message(turn.get("error"));
+            return ConversationFold::TurnStarted {
+                turn_id: turn_id.to_string(),
+            };
+        }
+
+        ConversationFold::Nothing
+    }
+
+    fn fold_notification(&mut self, method: &str, params: &Value) -> ConversationFold {
+        match method {
+            "thread/status/changed" => {
+                let Some(status) = params
+                    .get("status")
+                    .and_then(|status| status.get("type"))
+                    .and_then(Value::as_str)
+                else {
+                    return ConversationFold::Nothing;
+                };
+                self.thread_status = Some(status.to_string());
+                ConversationFold::ThreadStatus {
+                    status: status.to_string(),
+                }
+            }
+            "item/started" => {
+                let item = &params["item"];
+                if item["type"] != "reasoning" {
+                    return ConversationFold::Nothing;
+                }
+                let Some(item_id) = item["id"].as_str() else {
+                    return ConversationFold::Nothing;
+                };
+                if !self.reasoning_items.iter().any(|item| item.id == item_id) {
+                    self.reasoning_items.push(ReasoningItem {
+                        id: item_id.to_string(),
+                        text: text_in(item),
+                        completed: false,
+                    });
+                }
+                ConversationFold::ReasoningStarted {
+                    item_id: item_id.to_string(),
+                }
+            }
+            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                let Some(item_id) = params["itemId"].as_str() else {
+                    return ConversationFold::Nothing;
+                };
+                let text = params["delta"].as_str().unwrap_or_default().to_string();
+                if let Some(item) = self.reasoning_items.iter_mut().find(|item| item.id == item_id) {
+                    item.text.push_str(&text);
+                }
+                ConversationFold::ReasoningDelta {
+                    item_id: item_id.to_string(),
+                    text,
+                }
+            }
+            "item/agentMessage/delta" => ConversationFold::AssistantDelta {
+                item_id: params["itemId"].as_str().unwrap_or_default().to_string(),
+                text: params["delta"].as_str().unwrap_or_default().to_string(),
+            },
+            "item/completed" => {
+                let item = &params["item"];
+                let Some(item_id) = item["id"].as_str() else {
+                    return ConversationFold::Nothing;
+                };
+                match item["type"].as_str() {
+                    Some("agentMessage") => {
+                        let message = AssistantMessage {
+                            id: item_id.to_string(),
+                            text: item["text"].as_str().unwrap_or_default().to_string(),
+                            phase: item["phase"].as_str().map(str::to_string),
+                        };
+                        if let Some(existing) = self
+                            .assistant_messages
+                            .iter_mut()
+                            .find(|message| message.id == item_id)
+                        {
+                            *existing = message.clone();
+                        } else {
+                            self.assistant_messages.push(message.clone());
+                        }
+                        ConversationFold::AssistantCompleted {
+                            item_id: item_id.to_string(),
+                            text: message.text,
+                        }
+                    }
+                    Some("reasoning") => {
+                        let completed_text = text_in(item);
+                        let text = match self
+                            .reasoning_items
+                            .iter_mut()
+                            .find(|reasoning| reasoning.id == item_id)
+                        {
+                            Some(reasoning) => {
+                                if !completed_text.is_empty() {
+                                    reasoning.text = completed_text;
+                                }
+                                reasoning.completed = true;
+                                reasoning.text.clone()
+                            }
+                            None => {
+                                self.reasoning_items.push(ReasoningItem {
+                                    id: item_id.to_string(),
+                                    text: completed_text.clone(),
+                                    completed: true,
+                                });
+                                completed_text
+                            }
+                        };
+                        ConversationFold::ReasoningCompleted {
+                            item_id: item_id.to_string(),
+                            text,
+                        }
+                    }
+                    _ => ConversationFold::Nothing,
+                }
+            }
+            "turn/completed" => {
+                let turn = &params["turn"];
+                let Some(turn_id) = turn["id"].as_str() else {
+                    return ConversationFold::Nothing;
+                };
+                self.turn_id = Some(turn_id.to_string());
+                self.turn_status = turn["status"].as_str().map(str::to_string);
+                self.turn_error = error_message(turn.get("error"));
+                ConversationFold::TurnCompleted(Completion {
+                    turn_id: turn_id.to_string(),
+                    error: self.turn_error.clone(),
+                    duration_ms: turn["durationMs"].as_u64(),
+                })
+            }
+            "thread/started"
+            | "configWarning"
+            | "remoteControl/status/changed"
+            | "mcpServer/startupStatus/updated"
+            | "thread/tokenUsage/updated"
+            | "account/rateLimits/updated" => ConversationFold::Nothing,
+            _ => {
+                self.unknown_events += 1;
+                ConversationFold::Nothing
+            }
+        }
+    }
+}
+
+fn error_message(error: Option<&Value>) -> Option<String> {
+    let error = error.filter(|error| !error.is_null())?;
+    Some(error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Codex reported a turn error".to_string()))
+}
+
+fn text_in(value: &Value) -> String {
+    let mut text = Vec::new();
+    for key in ["summary", "content"] {
+        if let Some(parts) = value.get(key).and_then(Value::as_array) {
+            for part in parts {
+                if let Some(part) = part
+                    .as_str()
+                    .or_else(|| part.get("text").and_then(Value::as_str))
+                {
+                    if !part.trim().is_empty() {
+                        text.push(part.trim());
+                    }
+                }
+            }
+        }
+    }
+    text.join("\n")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum Request {
@@ -11,6 +320,8 @@ pub(crate) enum Request {
     Account,
     Models { cursor: Option<String> },
     Skills { cwds: Vec<String> },
+    ThreadStart { cwd: String, model: Option<String> },
+    TurnStart { thread_id: String, text: String },
 }
 
 impl Request {
@@ -20,6 +331,8 @@ impl Request {
             Request::Account => "account/read",
             Request::Models { .. } => "model/list",
             Request::Skills { .. } => "skills/list",
+            Request::ThreadStart { .. } => "thread/start",
+            Request::TurnStart { .. } => "turn/start",
         }
     }
 
@@ -31,7 +344,7 @@ impl Request {
                     "title": "laplus",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "capabilities": {},
+                "capabilities": Capabilities::current().message(),
             }),
             Request::Account => json!({}),
             Request::Models { cursor: None } => json!({}),
@@ -39,6 +352,22 @@ impl Request {
                 cursor: Some(cursor),
             } => json!({"cursor": cursor}),
             Request::Skills { cwds } => json!({"cwds": cwds}),
+            Request::ThreadStart { cwd, model } => {
+                let mut params = json!({
+                    "cwd": cwd,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "approvalsReviewer": "user",
+                });
+                if let Some(model) = model {
+                    params["model"] = json!(model);
+                }
+                params
+            }
+            Request::TurnStart { thread_id, text } => json!({
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": text}],
+            }),
         };
         json!({
             "jsonrpc": "2.0",
@@ -122,6 +451,16 @@ pub(crate) fn decode_initialize(response: Value) -> Result<String, String> {
     let result: InitializeResult = decode("initialize", response)?;
     version_in(&result.user_agent)
         .ok_or_else(|| "Codex initialize.userAgent did not contain a three-part version".to_string())
+}
+
+pub(crate) fn decode_thread_start(response: Value) -> Result<String, String> {
+    response
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Codex thread/start response did not carry a thread id".to_string())
 }
 
 #[derive(Deserialize)]
@@ -518,6 +857,42 @@ mod tests {
         .expect("the expected provider fold is JSON");
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn the_turn_fixture_pins_every_message_laplus_sends() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex-app-server/01-plain-turn.jsonl");
+        let expected: Vec<Value> = std::fs::read_to_string(&fixture)
+            .expect("reads the turn fixture")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a fixture record"))
+            .filter(|record| record["dir"] == "send")
+            .map(|record| record["msg"].clone())
+            .collect();
+        let actual = vec![
+            Request::Initialize.message(1),
+            initialized(),
+            Request::ThreadStart {
+                cwd: "<workspace>".to_string(),
+                model: Some("gpt-5.4-mini".to_string()),
+            }
+            .message(2),
+            Request::TurnStart {
+                thread_id: "codex-thread-1".to_string(),
+                text: "Reply with exactly one short sentence saying hello. Do not use any tools."
+                    .to_string(),
+            }
+            .message(3),
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn the_handshake_policy_selects_the_terminal_fallback() {
+        assert!(!Capabilities::current().idle_is_terminal());
+        assert!(Capabilities::experimental().idle_is_terminal());
     }
 
     #[test]

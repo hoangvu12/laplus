@@ -63,8 +63,8 @@ stopped for, ask how full the window is, retune, say there will be no more
 turns, reap. Everything a session does _around_ those is `crate::session`'s and
 is written once: baselines, checkpoints, epochs, settling, and every session
 event the client reads. Per-agent by construction — ADR-0001 is why an encoder
-belongs to a driver and the decoder does not. `crate::turn` is the one
-implementation there is, and it drives the `claude` CLI.
+belongs to a driver and the decoder does not. `crate::turn` drives the `claude`
+CLI and `crate::codex` drives Codex app-server.
 
 Selected through `crate::provider::REGISTRY`: a provider instance id is the
 routing key a conversation records, while the driver slug says which
@@ -76,9 +76,10 @@ pair durable on the thread.
 to over newline-delimited JSON on stdio. Responses omit `jsonrpc`, may arrive out
 of order, and are correlated by client request id; requests travelling the other
 way have their own id space. A provider probe owns one short-lived app-server.
-Each Codex conversation will own another for its session, one process per
+Each Codex conversation owns another for its session, one process per
 conversation by ADR-0032. `crate::codex_protocol` is the pure wire vocabulary
-and decoder; `crate::codex` owns the provider probe's process and pipes.
+and decoder; `crate::codex` owns both app-server lifetimes and implements the
+Codex driver.
 
 **Agent session id** — the `claude` CLI's own handle on a conversation, given
 back to it as `--resume`. The one piece of agent-protocol vocabulary that

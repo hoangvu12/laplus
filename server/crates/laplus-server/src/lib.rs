@@ -60,7 +60,7 @@
 //! other side of it: a conversation's baselines, checkpoints, epochs, settling
 //! and session events are written once, over the `session::Driver` trait, so a
 //! second agent brings a protocol and an encoder rather than a second copy of
-//! all of that. [`turn`] is the one implementation of that trait there is.
+//! all of that. [`turn`] drives Claude and [`codex`] drives Codex app-server.
 
 pub mod agent;
 pub mod assets;
@@ -70,7 +70,7 @@ pub mod checkpoints;
 pub mod clock;
 pub mod codes;
 pub mod codex;
-mod codex_protocol;
+pub mod codex_protocol;
 pub mod config;
 pub mod config_store;
 pub mod editor;

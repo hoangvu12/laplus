@@ -328,6 +328,19 @@ pub fn thinking(reasoning: &str, turn_id: Option<String>) -> Option<Activity> {
     ))
 }
 
+/// The visible sign that reasoning has begun when the provider discloses no
+/// reasoning text. Codex emits this lifecycle even when its summary and content
+/// are empty, and publishing it at the start distinguishes thinking from a
+/// stalled turn while the session remains running.
+pub fn thinking_started(turn_id: Option<String>) -> Activity {
+    Activity::info(
+        "task.progress",
+        "Thinking",
+        json!({"summary": "Thinking"}),
+        turn_id,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Permission requests
 // ---------------------------------------------------------------------------

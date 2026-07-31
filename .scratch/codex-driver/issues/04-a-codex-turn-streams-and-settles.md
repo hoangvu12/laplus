@@ -38,21 +38,50 @@ ids and answers requests rather than printing a stream.
 
 **Blocked by:** 01, 03.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Selecting a Codex model and sending a prompt starts an app-server for that
+- [x] Selecting a Codex model and sending a prompt starts an app-server for that
       conversation and streams the reply as it arrives.
-- [ ] The agent's reasoning is visible while the turn runs.
-- [ ] The turn settles on `turn/completed`; its error decides completed versus
+- [x] The agent's reasoning is visible while the turn runs.
+- [x] The turn settles on `turn/completed`; its error decides completed versus
       failed, and a failure records the reason.
-- [ ] A status change to idle settles the turn as a fallback when no completion
+- [x] A status change to idle settles the turn as a fallback when no completion
       arrives, so flipping the capability flag later does not break the settle.
-- [ ] Session status tracks the agent through the turn and back to rest.
-- [ ] The conversation runs in the project's folder.
-- [ ] A Codex conversation and a Claude conversation run concurrently, and
+- [x] Session status tracks the agent through the turn and back to rest.
+- [x] The conversation runs in the project's folder.
+- [x] A Codex conversation and a Claude conversation run concurrently, and
       neither's events, statuses or settling reach the other.
-- [ ] The app-server survives between turns and is reaped when the session ends.
-- [ ] `01-plain-turn` is committed as a fixture with an expected fold, and the
+- [x] The app-server survives between turns and is reaped when the session ends.
+- [x] `01-plain-turn` is committed as a fixture with an expected fold, and the
       golden suite folds it through a fresh Codex state.
-- [ ] The same capture is replayed through the socket by a Codex stand-in, with
+- [x] The same capture is replayed through the socket by a Codex stand-in, with
       the assertions on what the UI receives.
+
+**Where it landed.** `crate::codex` now implements the shared session loop's
+driver for one long-lived app-server per conversation. It performs the empty-
+capability handshake and `thread/start` in the project's folder, correlates each
+`turn/start` response, streams assistant deltas, exposes the reasoning lifecycle,
+and settles from `turn/completed` with its error. One handshake policy controls
+both the capabilities sent and whether idle is terminal, so enabling the
+experimental API switches to the idle fallback without introducing a race with
+the completion that today's handshake promises.
+
+`fixtures/codex-app-server/01-plain-turn.jsonl` is the deterministic reduction of
+the recorded exchange, with an expected fresh-state fold. The socket stand-in
+loads that same fixture, rewrites response ids to the requests it actually
+received, and exercises streaming, failure reasons, process reuse, cwd, reaping,
+and concurrent Claude/Codex isolation. The required two-axis review found no
+remaining spec issue; the retained probe and conversation transports are
+separate because one is synchronous and cancellation-polled while the other is
+an async, cancel-safe session driver.
+
+**Verification.** The Codex protocol units, fresh-state golden, provider socket
+suite, concurrency socket suite, and all four Codex turn socket cases pass.
+`cargo check -p laplus-server` is clean. Clippy reports only the three existing
+warnings in `protocol`, `server`, and `pairing`; the changed code adds none. The
+final `cargo test --no-fail-fast` ran every binary: every integration and `xtask`
+test passed, while the documented Linux inotify flake
+`watcher::tests::a_file_written_outside_the_server_is_reported_relative_to_its_workspace`
+timed out after the other 752 library tests passed. The window was not driven;
+ticket 12 owns the real-Codex hand walk after the remaining protocol surfaces
+land.

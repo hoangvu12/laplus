@@ -365,6 +365,15 @@ impl DriverStart {
             DriverStart::Codex(_) => Err("the Codex turn driver has not landed yet".to_string()),
         }
     }
+
+    pub(crate) fn codex(&self) -> Result<&crate::config::CodexSettings, String> {
+        match self {
+            DriverStart::Codex(settings) => Ok(settings),
+            DriverStart::Claude(_) => {
+                Err("Codex settings were paired with the Claude driver".to_string())
+            }
+        }
+    }
 }
 
 /// Send one turn, starting a session for the thread if it has none.
@@ -390,8 +399,11 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> 
             })
         }
         DriverStart::Codex(_) => {
-            return Err("Codex provider probing is available, but Codex turns are not yet supported."
-                .to_string())
+            threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+                tokio::spawn(drive::<crate::codex::Codex>(
+                    driving, starting, incoming, signals, epoch,
+                ))
+            })
         }
     };
 
