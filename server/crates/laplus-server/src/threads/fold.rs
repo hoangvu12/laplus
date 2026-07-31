@@ -18,7 +18,7 @@
 //! [`Activity::info`], [`Activity::tool`], [`Activity::approval`],
 //! [`Activity::failed`] and [`Adoption::now`] stamp the clock and mint
 //! identifiers. They are not a hole in the paragraph above: none of them is
-//! called by [`fold`]. They are called from `turn`, `worklog` and
+//! called by [`fold`]. They are called from `session`, `turn`, `worklog` and
 //! `orchestration` to build the [`Change`] that is then handed to it, so the
 //! clock enters *upstream* of the fold exactly as it did before this module
 //! existed. Adding a sixth is a decision, not a tidy-up — `docs/adr/0025` is
@@ -1288,8 +1288,8 @@ pub enum Change {
     /// the start of one. It does not touch [`Session::runtime_mode`], and that is
     /// the point: the turn in flight stays under the rules it started with, and
     /// the mode reaches the child when the *next* turn is dispatched — see
-    /// `crate::turn::retune`, which pushes it on the agent's control channel and
-    /// moves the session's own copy with it.
+    /// `crate::session::retune`, which pushes it on the driver and moves the
+    /// session's own copy with it.
     RuntimeModeSet { runtime_mode: String },
     /// The developer moved the conversation's interaction mode.
     /// `thread.interaction-mode-set`. [`Change::RuntimeModeSet`]'s twin.
@@ -1332,7 +1332,7 @@ pub enum Change {
     /// with a session change alone: the process takes a moment to go, and the
     /// developer's click is what should stop the session being drawn as alive.
     /// The `thread.session-set` carrying `stopped` follows once it really has —
-    /// see [`crate::turn`], where reaping precedes it.
+    /// see [`crate::session`], where reaping precedes it.
     ///
     /// It folds what the client folds and no more (`threadReducer.ts`,
     /// `case "thread.session-stop-requested"`): the session goes to `stopped`

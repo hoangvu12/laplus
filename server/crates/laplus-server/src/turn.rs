@@ -1,31 +1,19 @@
-//! Running a turn: the agent's NDJSON on one side, the thread's events on the
+//! The `claude` driver: the CLI's NDJSON on one side, the thread's events on the
 //! other.
 //!
 //! This is the join between the two protocols the crate keeps apart. Neither
 //! side is implemented here — [`crate::protocol`] parses and folds what the
 //! agent says, [`crate::threads`] holds what the UI reads, and [`crate::agent`]
-//! owns the process — so what is left is the translation and the lifetime, and
-//! that is deliberately all this file is.
-//!
-//! ## One long-lived driver, not one per turn
-//!
-//! A session is a task that owns an agent and a channel of prompts. Dispatching
-//! a turn puts a prompt in the channel and returns; it never waits for a process
-//! to exist, which is what lets the socket acknowledge the developer's message
-//! immediately. The task starts the agent on its first prompt and then stays,
-//! because the agent stays: `--input-format stream-json` means the CLI reads
-//! turns until its stdin closes, and re-spawning per turn would throw away the
-//! conversation the developer is having.
-//!
-//! Everything the task does after that is one loop over two sources — a line
-//! from the agent, or another prompt — and the loop ends when the agent's output
-//! does or when the channel closes. Both endings reap the child.
+//! owns the process — so what is left is the translation, and that is
+//! deliberately all this file is. The *lifetime* around it is
+//! [`crate::session`]'s, and is written once for every driver there will ever
+//! be: this file is one implementation of [`Driver`] and currently the only one.
 //!
 //! ## The translation
 //!
 //! | The agent says | The thread publishes |
 //! |---|---|
-//! | `system`/`init` | an activity naming the model, the permission mode and the tool count |
+//! | `system`/`init` | nothing — the id is written down and the window is measured |
 //! | a text delta | `thread.message-sent` with `streaming: true` — the client appends it |
 //! | a buffered `assistant` message's text | `thread.message-sent` with `streaming: false` — the client replaces with it |
 //! | a `tool_use` block | a `tool.updated` activity naming the tool and its input |
@@ -49,12 +37,17 @@
 //!
 //! [`decide`] is that table in code — one match over [`crate::protocol::Folded`]
 //! — and it answers with a [`Decided`] rather than publishing as it goes.
-//! [`spend`] is what publishes. The split is `docs/adr/0027` and it is
-//! ADR-0025's, taken again one level down: a function that applies its own
+//! [`crate::session::spend`] is what publishes. The split is `docs/adr/0027` and
+//! it is ADR-0025's, taken again one level down: a function that applies its own
 //! results can be tested only by watching what it did to a live world, and this
-//! one's world is a [`Threads`] with a running `claude` behind it. Nothing about
+//! one's world is a [`crate::threads::Threads`] with a running `claude` behind
+//! it. Nothing about
 //! the wire changed — the same events, in the same order, under the same numbers
 //! — and the tests at the bottom of this file are what the change was for.
+//!
+//! It is also what makes this file a driver rather than a loop. [`Decided`] is
+//! the shared vocabulary a session is answered in, so everything below reads the
+//! `claude` CLI and nothing below knows what a checkpoint is.
 //!
 //! Nothing in that table makes the session `running`, and that is deliberate:
 //! `init` is printed once for the whole conversation, so the transition belongs
@@ -81,110 +74,41 @@
 //! module documentation covers the rest — what the rows look like, and why they
 //! are the kinds they are.
 //!
-//! ## A permission request is the one thing the agent waits for
+//! ## What this CLI needs that the trait's verbs are the shape of
 //!
-//! Everything else in the table above is the agent talking. A `control_request`
-//! is the agent *asking*, and it has stopped until it is answered — so the loop
-//! polls the decision channel unconditionally, where it deliberately does not
-//! poll for a second prompt while one is in flight. A decision deferred behind a
-//! queued turn would be the deadlock the ticket is about.
+//! Every write in [`Agent`] is one line of JSON on the child's stdin, and four of
+//! them carry an id the CLI answers on stdout. That is why a request id travels
+//! into [`Driver::interrupt`], [`Driver::measure`] and [`Driver::retune`] and
+//! comes back out through [`decide`]: the answer is the only thing that says
+//! whether a push landed, and matching it is this driver's problem rather than
+//! the session's.
 //!
-//! Three things follow from the agent being stopped rather than merely busy:
-//!
-//! - **The request is remembered here, not in the fold.** The client answers by
-//!   naming an id; what has to go back to the CLI is the whole request, because
-//!   an approval carries the input the tool will run with. [`Driving`] is where
-//!   the two are joined.
-//! - **The agent is written to before the resolution is published.** The panel
-//!   closing is what the developer sees; the write is what unsticks the
-//!   conversation. Publishing first would risk a closed panel over a session
-//!   still stopped.
-//! - **Whatever is still outstanding when the driver ends is closed.** The
-//!   client's panel is folded out of `approval.requested` minus
-//!   `approval.resolved` and those activities are *stored*, so a request left
-//!   open would be a composer the developer cannot type into — after a restart as
-//!   well as before one. Ending the driver settles them as cancelled, which is
-//!   what actually happened.
-//!
-//! An unanswered request costs a tool call and nothing else: closing the agent's
-//! stdin closes the permission stream with it, the CLI abandons the request, and
-//! the turn finishes. `fixtures/claude-cli/09-permission-unanswered.ndjson` is a
-//! recording of exactly that, and [`crate::agent`] documents the mechanism.
-//!
-//! ## Stopping a turn is not stopping a session, and the difference is the point
-//!
-//! A turn is interrupted by a `control_request` on the agent's stdin — the same
-//! envelope a permission arrives in, going the other way. It leaves the child
-//! running, which is what makes the correction the developer types next a
-//! *correction* rather than the first message of a conversation that has
-//! forgotten what it was about.
-//!
-//! Four things follow, and the recordings in `fixtures/claude-cli/11`–`14` are
-//! where each of them came from rather than from documentation:
-//!
+//! - **An interrupt** is a `control_request` on stdin — the same envelope a
+//!   permission arrives in, going the other way — and it leaves the child
+//!   running. `fixtures/claude-cli/12-interrupt-then-continue.ndjson` is the
+//!   recording that settles it.
 //! - **The CLI reports a stopped turn as a failed one.** Its `result` carries
-//!   `"is_error": true` and the subtype `error_during_execution`. Nothing in the
-//!   output distinguishes "the developer pressed stop" from "the turn went
+//!   `"is_error": true` and the subtype `error_during_execution`, and nothing in
+//!   the output distinguishes "the developer pressed stop" from "the turn went
 //!   wrong" — so [`InFlight::stopped`] is the only thing that can, and it is why
-//!   the flag exists rather than the turn being read off the wire.
+//!   the flag exists rather than the ending being read off the wire.
 //! - **The partial reply is kept, and the CLI hands it over whole.** After the
 //!   acknowledgement comes a buffered `assistant` message carrying exactly what
-//!   had streamed. So "output produced before the interrupt is retained" needs
+//!   had streamed, so "output produced before the interrupt is retained" needs
 //!   nothing special here: it is the ordinary reconcile, on a shorter message.
-//! - **The turn settles twice, on purpose, and the first one is the click.**
-//!   `thread.turn-interrupt-requested` goes up the moment the request has been
-//!   written, and the client's reducer moves the latest turn to `interrupted` on
-//!   it — so the turn stops being reported as running when the developer stops
-//!   it rather than when the agent gets round to admitting it. The session
-//!   follows when the agent's `result` arrives, as `interrupted` rather than
-//!   `ready` or `error`. Both are the contract's own vocabulary; neither alone
-//!   is enough, because the event does not describe the session and the session
-//!   status arrives too late to be what the developer sees.
-//! - **The session change at the end of a turn is conditional.** A developer who
-//!   stops the agent can send the next turn while this one is still winding
-//!   down, and by then the session describes *that* turn. Settling it here would
-//!   report a turn that had just started as finished.
+//!   A second driver need not have that property, and Codex does not.
+//! - **`--permission-mode` and `--model` are read once, at launch**, so a
+//!   developer who changed either mid-conversation was answered by a process
+//!   still running under the old one until [`Driver::retune`] pushed it. Ticket
+//!   11 of `thread-lifecycle`, and
+//!   `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson` is a real
+//!   `claude` being moved between two turns.
 //!
-//! An interrupt for a turn that is not running is a no-op rather than an error,
-//! at every layer: the client sends one when it believes nothing is running, the
-//! registry takes it with no session to route it to, and the driver drops it
-//! with no turn to stop. See [`interrupt`], where the three races are named.
-//!
-//! The other act — ending the session — arrives on the same channel as
-//! [`Signal::Stop`] and is answered by *leaving this loop*. Everything below the
-//! loop is the ending a session is owed, and [`Agent::stop`] at the end of it
-//! closes stdin, waits, and kills if waiting was not enough. That bound is why
-//! it is a signal rather than only the prompt channel closing, which is the
-//! gentler "no more turns" a shutdown and a deleted project use: the case the
-//! stop command exists for is an agent that is not answering, and closing a pipe
-//! at one of those is a hope. Two things follow from the developer having asked,
-//! and both are marked in the ending: the turn it cut short is not reported as
-//! the agent having died, and it gets no checkpoint — for
-//! [`Ending::checkpoint_status`]'s reason, since no checkpoint status means "the
-//! developer ended the session" and both the ones there are would relabel the
-//! turn.
-//!
-//! ## A turn is also a point in time, and this is the only place that knows when
-//!
-//! Ticket 20 asks for a turn to be reviewable as a diff, and a diff needs a
-//! *before*. Nothing in git records what the working tree looked like when the
-//! developer pressed enter, so this file records it: a checkpoint is written
-//! before the prompt reaches the agent and again when the turn ends, and
-//! [`crate::checkpoints`] owns everything about how. Two properties come from
-//! the placement rather than from that module:
-//!
-//! - **The baseline is awaited before the agent is written to.** A capture
-//!   racing the agent's first edit would record a tree that already had it, and
-//!   the turn would show a diff missing its own first change.
-//! - **The ending is recorded before the next prompt is taken.** That is what
-//!   chains the checkpoints: turn two's baseline is turn one's ending, so a
-//!   conversation is a sequence of adjoining ranges with no gap for a hand edit
-//!   to fall into unattributed.
-//!
-//! Both are `await`s on a blocking thread in a loop that is otherwise reading a
-//! child's output, and both cost a `git add -A` on the project. That is the
-//! price of the feature and it is paid twice per conversation plus once per
-//! turn.
+//! An unanswered permission costs a tool call and nothing else: closing the
+//! agent's stdin closes the permission stream with it, the CLI abandons the
+//! request, and the turn finishes.
+//! `fixtures/claude-cli/09-permission-unanswered.ndjson` is a recording of
+//! exactly that, and [`crate::agent`] documents the mechanism.
 //!
 //! ## Continuity is the agent's, and this is where the handle on it is kept
 //!
@@ -204,687 +128,184 @@
 //!
 //! A resume the CLI will not honour is the one failure with no NDJSON to it at
 //! all: the child writes its reason to stderr and exits. [`resume_refused`] is
-//! how that becomes a sentence in the conversation, and the stored id is
-//! deliberately *kept* — starting a fresh session under a thread whose history
-//! the agent has forgotten would leave the developer talking to something that
-//! cannot see the transcript in front of them.
-//!
-//! ## The child is moved rather than replaced when the conversation changes
-//!
-//! `--permission-mode` and `--model` are launch flags, and one child serves a
-//! whole conversation — so for as long as those were the only places the values
-//! reached the agent, a developer who changed either mid-conversation was
-//! answered by a process still running under the old one. The picker moved, the
-//! change survived a restart, the next turn was *requested* under it, and nothing
-//! the agent did was any different.
-//!
-//! [`retune`] closes that, and the shape is worth stating because three
-//! properties fall out of it rather than being enforced anywhere:
-//!
-//! - **The moment is the turn's own dispatch**, not the moment the picker's
-//!   command commits. What a turn wants rides on its [`Prompt`], so it is spent
-//!   when that turn is handed to the agent and not before: a change made while a
-//!   turn is running does not move the rules under it, and a turn queued behind
-//!   another keeps its own. Ticket 02 and the spec's story 29.
-//! - **The comparison is against [`Start`]**, which is this driver's account of
-//!   what the child in front of it is running under rather than of what the
-//!   thread last said. That is what makes "no push when nothing changed" true,
-//!   and it is why a successful push has to move `Start` — every session event
-//!   this file publishes reads it.
-//! - **A refusal is a `control_response`**, arriving later like everything else
-//!   the agent says, so putting `Start` back is a thing [`decide`] asks for and
-//!   the loop spends.
-//!
-//! Ticket 11 of `.scratch/thread-lifecycle/`, and
-//! `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson` is a real
-//! `claude` being moved between two turns.
-
-use std::collections::HashMap;
+//! how that becomes a sentence in the conversation — carried out of
+//! [`Driver::stop`], because the CLI's own words are only final once the child
+//! has gone — and the stored id is deliberately *kept*: starting a fresh session
+//! under a thread whose history the agent has forgotten would leave the developer
+//! talking to something that cannot see the transcript in front of them.
 
 use serde_json::json;
 
 use crate::agent::{permission_mode_for, Agent, Launch};
-use crate::clock::{iso_from_epoch, now_iso};
-use crate::config::ClaudeSettings;
+use crate::clock::iso_from_epoch;
 use crate::process::Search;
 use crate::protocol::{
     Compaction, ContentBlock, Drift, Folded, Permission, RateLimit, SessionState, TokenUsage,
 };
-use crate::settling::SessionStatus;
-use crate::threads::{
-    Activity, Answered, Change, Prompt, Retune, Session, Signal, Thread, Threads,
-    UserInputAnswered,
+use crate::session::{
+    Decided, Driver, Driving, Finished, InFlight, Pushed, Reaped, Reply, Settles, Start,
 };
-use crate::worklog::{Call, Decision, Returned};
+use crate::settling::SessionStatus;
+use crate::threads::{Activity, Change};
+use crate::worklog::{Call, Returned};
 
-/// Everything a session needs to start an agent, gathered while the thread is
-/// known and carried into the task that will need it.
-#[derive(Debug, Clone)]
-pub struct Start {
-    pub thread_id: String,
-    /// The project's folder. The agent's working directory, which is what makes
-    /// a relative path in the transcript mean what the developer thinks.
-    pub workspace_root: String,
-    /// The model the child is running under — the launch flag at first, and then
-    /// whatever a successful push has moved it to. See [`retune`].
-    pub model: Option<String>,
-    /// The runtime mode the child is running under, on the same terms as
-    /// [`Start::model`].
+/// Named by the tests at the bottom of this file and nowhere else in it: they
+/// build an [`InFlight`] and a [`Start`] by hand, where the driver reaches the
+/// first through a field and reads the second's settings without naming their
+/// type.
+#[cfg(test)]
+use {crate::config::ClaudeSettings, std::collections::HashMap};
+
+/// A `claude` CLI behind a session: the child, what it has said so far, and the
+/// conversation it was asked to continue.
+///
+/// The three are one type because the ending needs all three at once — see
+/// [`Driver::stop`], where "the agent never announced itself and it was asked to
+/// resume" is the whole of how a refused resume is recognised.
+#[derive(Debug)]
+pub(crate) struct Claude {
+    agent: Agent,
+    /// Everything the CLI has said, folded. The accumulated state behind
+    /// [`Folded`]'s two index-carrying variants, and per-driver by construction:
+    /// a second driver folds its own protocol into its own.
+    folding: SessionState,
+    /// The conversation this child was asked to continue, kept for the one
+    /// question only the ending can ask of it.
     ///
-    /// **Every session event the driver publishes reads this**, which is why a
-    /// push that succeeds has to move it and a push that is refused has to leave
-    /// it alone: the badge beside the session state is a claim about what the
-    /// agent is doing, not about what was asked of it.
-    pub runtime_mode: String,
-    /// The `claude` session to continue, when the thread already has one. See
-    /// this module's documentation: it is the whole of how a conversation
-    /// survives a restart.
-    pub resume: Option<String>,
-    /// Read once, when the turn is dispatched. A settings change mid-session
-    /// does not move a running agent, which is honest — the process was started
-    /// with the old value and cannot be told otherwise.
-    pub settings: ClaudeSettings,
+    /// Captured when the child was opened rather than read off [`Start`] at the
+    /// end, and the two are the same value: a retune moves the mode and the
+    /// model on that capture and never the conversation, because there is no
+    /// such request and a session that changed which conversation it was in the
+    /// middle of would not be one.
+    resume: Option<String>,
 }
 
-/// Send one turn, starting a session for the thread if it has none.
-///
-/// Synchronous and non-blocking: it is called from the socket's read loop, which
-/// must be free to take the next frame. The failure it can return is the prompt
-/// channel being full or closed, which means a session that is not consuming —
-/// and that is worth telling the client about rather than dropping.
-pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> Result<(), String> {
-    let driving = threads.clone();
-    let starting = start.clone();
-    let prompts = threads.attach(&start.thread_id, move |incoming, signals, epoch| {
-        tokio::spawn(drive(driving, starting, incoming, signals, epoch))
-    });
+impl Driver for Claude {
+    /// Resolve the binary and start the agent, or say why not.
+    async fn open(start: &Start) -> Result<Claude, String> {
+        // Resolved here rather than on the dispatch path: it is a walk of every
+        // `PATH` directory, and the read loop is answering a developer who has
+        // just pressed enter. Resolved per session rather than once at boot
+        // because the setting can change and an install can move, and this is the
+        // moment the answer actually matters.
+        let (path, _) =
+            crate::provider::resolve(&start.settings.binary_path, &Search::from_environment())
+                .startable()?;
 
-    // The whole prompt is built here rather than by the caller, because what a
-    // turn carries is more than what the developer typed: it also carries what
-    // the conversation said the agent should be running under when this turn was
-    // dispatched, and that is read off the same [`Start`] the session was opened
-    // from. A session started a line above is already launched with those values
-    // and the driver's guard makes it the no-op it should be; what this is for is
-    // every turn after the first, where the launch flags were the only place they
-    // had ever reached the child.
-    let prompt = Prompt {
-        turn_id,
-        text,
-        wanted: Retune {
-            runtime_mode: start.runtime_mode.clone(),
+        let agent = Agent::start(&Launch {
+            binary: path.clone(),
+            cwd: start.workspace_root.clone(),
             model: start.model.clone(),
-        },
-    };
+            permission_mode: permission_mode_for(&start.runtime_mode),
+            resume: start.resume.clone(),
+        })
+        .await
+        .map_err(|error| {
+            format!(
+                "The Claude Code binary {} could not be started in {}: {error}",
+                path.display(),
+                start.workspace_root
+            )
+        })?;
 
-    prompts.try_send(prompt).map_err(|error| match error {
-        tokio::sync::mpsc::error::TrySendError::Full(_) => {
-            "The agent has not read the turns already sent to it, so this one was not queued."
-                .to_string()
-        }
-        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-            "The agent session has ended and could not be sent this turn.".to_string()
-        }
-    })
-}
+        Ok(Claude {
+            agent,
+            folding: SessionState::new(),
+            resume: start.resume.clone(),
+        })
+    }
 
-/// The session: start an agent, feed it turns and decisions, publish what it
-/// says, reap it.
-///
-/// `epoch` is which of the conversation's sessions this one is, and is given
-/// back on the way out — a driver may outlive its own slot, so it gives up only
-/// the slot it was in. See [`crate::threads::Threads::detach`].
-async fn drive(
-    threads: Threads,
-    mut start: Start,
-    mut prompts: tokio::sync::mpsc::Receiver<Prompt>,
-    mut signals: tokio::sync::mpsc::Receiver<Signal>,
-    epoch: u64,
-) {
-    let mut agent = match open(&start).await {
-        Ok(agent) => agent,
-        Err(why) => {
-            // The session never existed, so there is no turn to attribute the
-            // failure to beyond the one that asked for it. Reported in the
-            // conversation rather than only to a log, because the developer is
-            // looking at the conversation.
-            threads.apply(
-                &start.thread_id,
-                Change::Activity(Activity::failed("session.failed", &why)),
-            );
-            threads.apply(
-                &start.thread_id,
-                Change::Session(Session {
-                    status: SessionStatus::Error,
-                    runtime_mode: start.runtime_mode.clone(),
-                    active_turn_id: None,
-                    last_error: Some(why),
-                    updated_at: now_iso(),
-                }),
-            );
-            threads.detach(&start.thread_id, epoch);
-            return;
-        }
-    };
+    /// Take the next line and say what it turned out to mean.
+    ///
+    /// **Cancel-safe, and it has to be**: this is one arm of the session's
+    /// `select!`, so it is dropped unfinished whenever a prompt or a signal wins
+    /// the race. The only `await` is the channel receive — [`decide`] is
+    /// synchronous — so a drop can never land between a line being taken off the
+    /// channel and being folded. Every write this driver makes is one of the
+    /// other verbs, which the loop awaits on their own.
+    async fn next(&mut self, driving: &mut Driving) -> Option<Decided> {
+        let line = self.agent.next_line().await?;
+        Some(decide(&mut self.folding, driving, &line))
+    }
 
-    let mut folding = SessionState::new();
-    let mut driving = Driving {
-        turn: None,
-        outstanding: HashMap::new(),
-        interrupts: 0,
-        measurements: 0,
-        retunes: 0,
-        pushed: HashMap::new(),
-        unmeasured: false,
-        drift_reported: Drift::default(),
-        finished: None,
-        reported_usage: None,
-    };
-    // A turn that arrived while another was still running. Held rather than
-    // sent: sending it would orphan the turn in flight — that turn would never
-    // settle, and the finished one's duration and cost would be attributed to
-    // the wrong turn.
-    let mut waiting: Option<Prompt> = None;
-    // False once the prompt channel has closed. The agent is then told there
-    // will be no more turns and the loop keeps draining what it still owes.
-    let mut accepting = true;
-    // False once the signal channel has closed, which is the same moment — both
-    // ends live on the thread's `Live`. Tracked separately anyway, because a
-    // closed channel yields `None` forever and a `select!` arm that kept polling
-    // one would spin.
-    let mut listening = true;
-    // True once the developer has ended the session. Read at the bottom of this
-    // function, where the difference it makes is that a turn cut short by *this*
-    // is not reported as the agent having died: they asked.
-    let mut asked_to_stop = false;
+    async fn send(&mut self, text: &str) -> std::io::Result<()> {
+        self.agent.send(text).await
+    }
 
-    'session: loop {
-        // Anything already owed to the turn that just ended is dealt with before
-        // the next one is started.
-        //
-        // The `select!` below cannot do this, because when a signal and a prompt
-        // are both ready it takes either — and *which* matters here in a way it
-        // does not anywhere else. A developer whose turn finished a moment ago
-        // may have a stop click still in flight; the client sends one with no
-        // `turnId`, meaning "whatever is running". Taken now it is the no-op it
-        // was meant to be. Taken one iteration after the queued prompt, it stops
-        // a turn that had just started, which is the developer's click landing on
-        // the wrong turn.
-        //
-        // The window is real rather than theoretical: this loop `await`s a
-        // `git add -A` at the end of every turn ([`checkpoint`]), and a click
-        // during it is exactly a click after the turn the developer was watching
-        // settled.
-        while let Ok(signal) = signals.try_recv() {
-            match signal {
-                Signal::Answer(answered) => {
-                    answer(&threads, &start, &mut agent, &mut driving, answered).await
-                }
-                Signal::AnswerUserInput(answered) => {
-                    answer_user_input(&threads, &start, &mut agent, &mut driving, answered).await
-                }
-                Signal::Interrupt { turn_id } => {
-                    interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await
-                }
-                // Taken here as well as in the `select!` below, and it belongs
-                // here most: the drain exists so that what was owed to the turn
-                // that just ended is dealt with before the next one starts, and
-                // a stop the developer pressed a moment ago must not be spent on
-                // a turn they never saw begin.
-                Signal::Stop => {
-                    asked_to_stop = true;
-                    break 'session;
-                }
-            }
-        }
+    async fn interrupt(&mut self, request_id: &str) -> std::io::Result<()> {
+        self.agent.interrupt(request_id).await
+    }
 
-        // Whatever is waiting goes next, as soon as the turn before it is done.
-        if accepting && driving.turn.is_none() {
-            if let Some(prompt) = waiting.take() {
-                // Before anything this turn publishes and before the turn itself
-                // reaches the agent, which is what makes the mode this turn is
-                // *requested* under the mode it is *answered* under. It moves
-                // `start`, so the three session events below — `starting` from
-                // the thread, `running` from here, and whatever ends the turn —
-                // all report the same thing.
-                //
-                // **Here rather than when the prompt was taken off the channel**,
-                // and that is what keeps a mode off the turn already in flight:
-                // a turn queued behind a running one waits in `waiting` with its
-                // own mode still attached, and spends it when its own turn comes.
-                // Ticket 02's rule, and the spec's story 29.
-                retune(&threads, &mut start, &mut agent, &mut driving, &prompt.wanted).await;
-
-                // The turn is under way, and *this* is where the session enters
-                // `running` — not the agent's `init` line, which a long-lived
-                // child prints once for the whole conversation. Driving it off
-                // `init` would leave every turn after the first in `starting`,
-                // and a session that is not `running` settles the turn at the
-                // first assistant message, which is the mid-turn settle the
-                // client's reducer exists to avoid.
-                //
-                // **Before the baseline, not after**, and the difference is
-                // seconds on a real repository. The client draws its working
-                // indicator from this status, and the baseline below is a
-                // `git add -A` over the whole project with no stat cache — a
-                // fifth of a second on a scratch repo and over two on this one
-                // (measured with `tools/ui-driver/first-turn.mjs`). Publishing
-                // after it meant the developer pressed send and watched a pane
-                // with nothing in it for as long as their repository is large,
-                // which reads as the message having gone nowhere.
-                //
-                // Honest as well as kinder: the turn *is* running from here. The
-                // developer asked for it, this loop has accepted it and is doing
-                // the work that has to happen before the agent can be given it.
-                // Nothing the client folds needs the prompt to have been written
-                // yet, and a send that then fails settles the session on the way
-                // out like any other failure.
-                running(&threads, &start, &prompt.turn_id);
-
-                // Before the agent is given the turn, which is the whole of what
-                // makes it a *baseline*: everything the agent does from the next
-                // line onwards is what this turn's diff will be against. Awaited
-                // rather than spawned for the same reason — a capture racing the
-                // agent's first edit would record a tree that already had it.
-                baseline(&threads, &start).await;
-                if let Err(error) = agent.send(&prompt.text).await {
-                    eprintln!("laplus: cannot send a turn to the agent: {error}");
-                    break;
-                }
-                driving.turn = Some(InFlight {
-                    turn_id: prompt.turn_id.clone(),
-                    assistant_message_id: None,
-                    tools: HashMap::new(),
-                    stopped: None,
-                });
-                continue;
-            }
-        }
-
-        // The channel is polled whether or not a turn is running, so that a
-        // shutdown mid-turn still closes the agent's input promptly. What it is
-        // not allowed to do is take a second prompt before the first has been
-        // dealt with, which is what `PROMPT_QUEUE` is behind it for.
-        //
-        // A signal is polled under no such condition, and that asymmetry is the
-        // point: both kinds are owed to the turn *in flight*. A decision the
-        // agent has stopped for, deferred behind a queued turn, is the deadlock
-        // ticket 13 was about; an interrupt deferred the same way is a stop
-        // button that works once the thing it was meant to stop has finished.
-        let next = tokio::select! {
-            line = agent.next_line() => Next::Line(line),
-            signal = signals.recv(), if listening => Next::Signal(signal),
-            prompt = prompts.recv(), if accepting && waiting.is_none() => Next::Prompt(prompt),
+    async fn answer(&mut self, asked: &Permission, reply: Reply<'_>) -> std::io::Result<()> {
+        // The contract's vocabulary on the way in, the CLI's on the way out.
+        // Which is the encoder, and it is per-driver for ADR-0001's reason: a
+        // `cancel` is a denial carrying `interrupt: true` *here*, and something
+        // else wherever the second driver is.
+        let answer = match reply {
+            Reply::Decided(decision) => decision.answer(asked),
+            Reply::Answers(answers) => crate::worklog::answers_for(asked, answers),
         };
+        self.agent.answer(&asked.request_id, &answer).await
+    }
 
-        match next {
-            Next::Line(Some(line)) => {
-                // Decided and then applied, rather than applied as it is decided.
-                // What the split is for is [`Decided`]; what it costs here is one
-                // more local.
-                let mut decided = decide(&mut folding, &mut driving, &line);
-                // Taken before the changes are spent and applied after them, so
-                // the developer reads the refusal and *then* the badge corrects
-                // itself, rather than the badge flipping back with nothing
-                // beside it saying why.
-                let reverts = decided.reverts.take();
-                spend(&threads, &start, decided);
-                if let Some(refused) = reverts {
-                    refused.revert(&mut start);
-                    // Republished because the mode this turn was announced under
-                    // is now known to be wrong, and the session is where the
-                    // client reads it. Only while a turn is running: between
-                    // turns there is no session event to correct, and the next
-                    // one will carry the reverted value anyway.
-                    if let Some(active) = driving.turn.as_ref().map(|turn| turn.turn_id.clone()) {
-                        running(&threads, &start, &active);
-                    }
-                }
-                // Asked before the checkpoint below, which is a `git add -A`
-                // over the whole project: the meter is what the developer is
-                // looking at and the question costs one line on stdin, so it
-                // does not queue behind seconds of git.
-                if std::mem::take(&mut driving.unmeasured) {
-                    measure(&mut agent, &mut driving).await;
-                }
-                // The turn is over, so what the agent left behind is what this
-                // turn did. Recorded before the loop takes the next prompt,
-                // which is what makes the next turn's baseline this checkpoint
-                // rather than a tree somebody has since typed into.
-                if let Some(finished) = driving.finished.take() {
-                    checkpoint(&threads, &start, &finished).await;
-                }
+    async fn measure(&mut self, request_id: &str) -> std::io::Result<()> {
+        self.agent.measure_context(request_id).await
+    }
+
+    async fn retune(&mut self, request_id: &str, asked: &Pushed) -> std::io::Result<()> {
+        match asked {
+            Pushed::Mode { asked, .. } => {
+                let mode = crate::agent::pushed_permission_mode_for(asked);
+                self.agent.set_permission_mode(request_id, mode).await
             }
-            // The agent stopped producing: it exited, or its output was
-            // abandoned. Either way there is nothing more to publish.
-            Next::Line(None) => break,
-            Next::Signal(Some(Signal::Answer(answered))) => {
-                answer(&threads, &start, &mut agent, &mut driving, answered).await;
-            }
-            Next::Signal(Some(Signal::AnswerUserInput(answered))) => {
-                answer_user_input(&threads, &start, &mut agent, &mut driving, answered).await;
-            }
-            Next::Signal(Some(Signal::Interrupt { turn_id })) => {
-                interrupt(&threads, &start, &mut agent, &mut driving, turn_id).await;
-            }
-            // The session is over. Left by leaving the loop rather than by
-            // closing the agent's input and draining, which is what the *channel
-            // closing* means below: everything this function does after the loop
-            // is the ending a session is owed, and `Agent::stop` at the end of it
-            // closes stdin, waits, and kills if waiting was not enough. A drain
-            // would be a gentler ending with no bound on it, and the case this
-            // command exists for is an agent that is not answering.
-            Next::Signal(Some(Signal::Stop)) => {
-                asked_to_stop = true;
-                break;
-            }
-            Next::Signal(None) => listening = false,
-            Next::Prompt(Some(prompt)) => waiting = Some(prompt),
-            Next::Prompt(None) => {
-                accepting = false;
-                agent.close_input();
-            }
+            Pushed::Model { asked, .. } => self.agent.set_model(request_id, asked).await,
         }
     }
 
-    // A reply that streamed and will never be buffered, because the agent went
-    // away in the middle of it. Two things are owed to it and neither is
-    // optional:
-    //
-    // - **The client is showing it as still arriving.** A message left
-    //   `streaming` is a reply the UI renders as growing, for the life of the
-    //   thread, and after every restart — the same defect the ordinary
-    //   reconcile is careful to avoid when a turn buffers nothing.
-    // - **A delta owes the database nothing**, by design ([`crate::threads`]'s
-    //   `durable`: a row per token would put the disk in the streaming path), so
-    //   until a message settles there is nothing written down. Without this, the
-    //   partial reply survives in memory and is gone the next time the app opens.
-    //
-    // Sent with **no text**, which is deliberate: the empty case is the one
-    // where the accumulation stands rather than being replaced, so what the
-    // developer saw stream is what is kept — and no reconciliation is recorded,
-    // because none happened. A message forged out of the deltas and compared
-    // against them would report the assumption as checked on a turn where
-    // nothing checked it.
-    if let Some(active) = driving.turn.as_mut() {
-        if let Some(message_id) = active.assistant_message_id.take() {
-            threads.apply(
-                &start.thread_id,
-                Change::AssistantMessage {
-                    message_id,
-                    turn_id: active.turn_id.clone(),
-                    text: String::new(),
-                },
-            );
-        }
+    fn close_input(&mut self) {
+        self.agent.close_input();
     }
 
-    // Whatever the agent was still waiting on is never going to be answered now,
-    // and the client derives its pending-approval panel from these two kinds
-    // alone — so a request left open here is a composer the developer cannot type
-    // into, for the life of the conversation and across every restart after it.
-    // Closing them is what makes "the session remains usable" true of the way a
-    // session actually ends.
-    //
-    // A question is closed with *its* kinds, not these: the two folds are
-    // separate (`derivePendingUserInputs` beside `derivePendingApprovals`), so an
-    // `approval.resolved` over a question closes nothing and leaves exactly the
-    // stuck composer this loop exists to prevent. Said as unanswerable rather
-    // than as answers, because no answers were given and a row claiming some were
-    // would put words in the developer's mouth.
-    for asked in driving.take_outstanding() {
-        let activity = match crate::worklog::questions(&asked).is_some() {
-            true => crate::worklog::unanswerable_user_input(&asked.request_id),
-            false => crate::worklog::resolved(
-                &asked,
-                Decision::Cancel,
-                driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
-            ),
-        };
-        threads.apply(&start.thread_id, Change::Activity(activity));
+    /// Reap the child, then read the two sentences only it can say.
+    ///
+    /// Reaped first, and the complaint comes back from the reaping. A session
+    /// that was asked to continue an old conversation and never announced itself
+    /// did not continue it: the CLI writes its reason to stderr and exits without
+    /// a line of NDJSON, so the agent's own words are the only account of it —
+    /// and they are only final once the child has gone. See [`Agent::stop`].
+    async fn stop(self, driving: &mut Driving, asked_to_stop: bool) -> Reaped {
+        let folding = self.folding;
+        let complaint = self.agent.stop().await;
+
+        let refused = self
+            .resume
+            .as_ref()
+            .filter(|_| folding.session_id.is_none())
+            .map(|session| resume_refused(session, complaint.as_deref()));
+
+        // A turn still in flight when the agent went is a turn that will never
+        // finish, and this is the only moment anybody can say so.
+        //
+        // The drift goes here too, and this is the only place it can: a turn that
+        // never ends emits no `turn.completed`, so a session that died having also
+        // been talking in a dialect this build could not read would otherwise
+        // report the death and nothing about the dialect — which is the more
+        // likely explanation of the two.
+        //
+        // **Unless the developer ended the session**, which is the one way a turn
+        // is cut short that nobody needs telling about: they asked for the process
+        // to go and it went. A stop mid-turn therefore takes that turn's
+        // unreported drift with it, and that is the accepted cost rather than an
+        // oversight — the tally is reported on every turn that ends on its own,
+        // and inventing a row to carry it out of a session the developer ended
+        // would put a diagnostic about this build in front of somebody who had
+        // just pressed stop.
+        let unread = driving.drift_to_report(folding.drift());
+        let death = (driving.turn.is_some() && !asked_to_stop)
+            .then(|| died_mid_turn(complaint.as_deref(), unread));
+
+        Reaped { refused, death }
     }
-
-    // Reaped first, and the complaint comes back from the reaping. A session that
-    // was asked to continue an old conversation and never announced itself did not
-    // continue it: the CLI writes its reason to stderr and exits without a line of
-    // NDJSON, so the agent's own words are the only account of it — and they are
-    // only final once the child has gone. See [`Agent::stop`].
-    let complaint = agent.stop().await;
-    let refused = start
-        .resume
-        .as_ref()
-        .filter(|_| folding.session_id.is_none())
-        .map(|session| resume_refused(session, complaint.as_deref()));
-    if let Some(why) = &refused {
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(Activity::failed("session.resume-failed", why)),
-        );
-    }
-
-    // A turn still in flight when the agent went is a turn that will never
-    // finish, and this is the only moment anybody can say so. The refusal wins
-    // when there is one: "the agent stopped before the turn finished" is true of
-    // a resume that was refused and says nothing about why.
-    //
-    // The drift goes here too, and this is the only place it can: a turn that
-    // never ends emits no `turn.completed`, so a session that died having also
-    // been talking in a dialect this build could not read would otherwise report
-    // the death and nothing about the dialect — which is the more likely
-    // explanation of the two.
-    //
-    // **Unless the developer ended the session**, which is the one way a turn is
-    // cut short that nobody needs telling about: they asked for the process to go
-    // and it went. Reporting it as a death would put an error on a conversation
-    // whose only fault was being stopped, and would settle the turn as `error`
-    // rather than as the `interrupted` a `stopped` session settles it to — which
-    // is the same reading `interrupted` and `stopped` already share (`CONTEXT.md`,
-    // *Settling*): from the turn's point of view it did not finish, and nothing
-    // went wrong.
-    //
-    // A stop mid-turn therefore takes that turn's unreported drift with it, and
-    // that is the accepted cost rather than an oversight: the tally is reported on
-    // every turn that ends on its own, and inventing a row to carry it out of a
-    // session the developer ended would put a diagnostic about this build in front
-    // of somebody who had just pressed stop.
-    let unread = driving.drift_to_report(&folding);
-    let death = (driving.turn.is_some() && !asked_to_stop)
-        .then(|| died_mid_turn(complaint.as_deref(), unread));
-
-    // Said in the conversation and not only on the session, because the session
-    // is a banner and the conversation is what the developer is reading. A
-    // refusal has already put its own row up, so this does not repeat it.
-    if let (Some(why), None) = (&death, &refused) {
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(Activity::failed("session.failed", why)),
-        );
-    }
-
-    // The slot given up before the ending is published, and **whether the
-    // conversation is still this session's to describe decides whether the ending
-    // is published at all.** A driver can outlive its own session: a developer who
-    // stops one and sends a turn straight afterwards — which is exactly what the
-    // branch toolbar does — has a new session describing this conversation while
-    // this one is still being reaped. Its ending would then settle a turn that had
-    // just started and report a session that had just opened as gone.
-    //
-    // The rows above are said either way, because they are about *this* session's
-    // turn rather than about the conversation's current state: a partial reply
-    // left streaming and a permission request left open are defects whoever is
-    // running now.
-    let ours = threads.detach(&start.thread_id, epoch);
-
-    let failure = refused.or(death);
-    if ours {
-        threads.apply(
-            &start.thread_id,
-            Change::Session(Session {
-                // **`error` rather than `stopped` for a turn cut short**, and
-                // ticket 15 settled it deliberately — see ADR-0004. `stopped` is
-                // available and would settle the turn as `interrupted`; it is not
-                // used, because nobody asked for this and because `lastError`
-                // below — the only place the developer is told the agent went away
-                // mid-turn — is the sentence a session that is not in `error` has
-                // nowhere to put.
-                status: match failure.is_some() {
-                    true => SessionStatus::Error,
-                    false => SessionStatus::Stopped,
-                },
-                runtime_mode: start.runtime_mode.clone(),
-                active_turn_id: None,
-                last_error: failure,
-                updated_at: now_iso(),
-            }),
-        );
-    }
-
-    // A turn the agent died in the middle of still changed the working tree, and
-    // the developer's first question about a session that fell over is what it
-    // had already done. So this ending is checkpointed like any other — the only
-    // difference is that nothing published a `turn.completed` for it, which is
-    // why it cannot be caught by the loop above.
-    //
-    // As an `error`, because that is how the session above has just reported it:
-    // ADR-0004 settles a turn cut short by a dead agent as an error rather than
-    // an interruption, and a checkpoint saying anything else would move the turn
-    // back — see [`Ending::checkpoint_status`].
-    //
-    // **A session the developer ended gets no row**, and that is the same rule
-    // rather than an exception to it: there is no checkpoint status that means "the
-    // developer ended the session", so every one this could send would relabel the
-    // turn the moment the client folded it — `error` says the turn failed, and it
-    // did not. What the turn had already done to the tree falls into the diff of
-    // the turn that follows, which is what a model built on photographs does with
-    // an unattributed change (ADR-0008).
-    //
-    // Nor does a session the conversation has already replaced, for the reason the
-    // ending above is conditional: the client reads a checkpoint's status back
-    // into the *latest* turn, so a row for a turn two sessions ago would relabel
-    // the turn running now.
-    if let Some(active) = driving
-        .turn
-        .take()
-        .filter(|_| ours && !asked_to_stop)
-    {
-        checkpoint(
-            &threads,
-            &start,
-            &Finished {
-                turn_id: active.turn_id,
-                status: "error",
-            },
-        )
-        .await;
-    }
-}
-
-/// Record what the working tree looks like before this conversation's next turn
-/// is given to the agent.
-///
-/// Nothing to do in the ordinary case: the checkpoint taken at the end of the
-/// previous turn *is* this turn's baseline, which is what makes a conversation's
-/// checkpoints a chain rather than a set of pairs. The cases where there is
-/// something to do are the first turn of a conversation, and the first turn
-/// after the developer ran `vcs.init` on a project that had no repository — both
-/// of which are "there is no tree recorded for turn zero yet".
-async fn baseline(threads: &Threads, start: &Start) {
-    let turn_count = threads.checkpoint_count(&start.thread_id);
-    let reference = crate::checkpoints::reference(&start.thread_id, turn_count);
-    let root = std::path::PathBuf::from(&start.workspace_root);
-
-    let recorded = tokio::task::spawn_blocking(move || {
-        if crate::checkpoints::present(&root, &reference) {
-            return Ok(());
-        }
-        crate::checkpoints::capture(&root, &reference)
-    })
-    .await;
-
-    // Logged and not said in the conversation, unlike the failure at the end of
-    // a turn. A baseline that could not be written is only visible as the turn
-    // that follows it having no diff, and *that* is the moment the developer is
-    // told — saying it twice would put two rows in the work log for one problem.
-    //
-    // A `JoinError` is the blocking pool having gone, which is the runtime
-    // shutting down. Nothing is owed to a conversation nobody is reading.
-    if let Ok(Err(why)) = recorded {
-        if !crate::git::is_not_a_repository(&why) {
-            eprintln!(
-                "laplus: cannot record the state of {} before a turn: {}",
-                start.workspace_root,
-                why.detail()
-            );
-        }
-    }
-}
-
-/// Record what the working tree looks like now as this conversation's next
-/// checkpoint, and publish the row that offers the turn for review.
-///
-/// **A project that is not a repository is not a failure.** There is nowhere to
-/// keep a checkpoint and nothing the developer did wrong; `vcs.init` is the door
-/// out, and until they walk through it a conversation simply has no turns to
-/// diff. Every other refusal is said in the conversation, because a turn the
-/// developer cannot review is a thing they will otherwise go looking for.
-async fn checkpoint(threads: &Threads, start: &Start, finished: &Finished) {
-    let previous = threads.checkpoint_count(&start.thread_id);
-    let turn_count = previous + 1;
-    let from = crate::checkpoints::reference(&start.thread_id, previous);
-    let reference = crate::checkpoints::reference(&start.thread_id, turn_count);
-    let root = std::path::PathBuf::from(&start.workspace_root);
-
-    // On a blocking thread, like every other git in this server: it is a child
-    // process over a repository whose size is the developer's, and a runtime
-    // worker parked on one is a worker the socket is not using.
-    let taken = tokio::task::spawn_blocking({
-        let reference = reference.clone();
-        move || {
-            crate::checkpoints::capture(&root, &reference)?;
-            // Best effort, and deliberately not fatal: the summary is the line
-            // above the patch, and a turn whose tree was recorded is reviewable
-            // whether or not this could be read.
-            Ok(crate::checkpoints::changed(&root, &from, &reference).unwrap_or_default())
-        }
-    })
-    .await;
-
-    let files = match taken {
-        Ok(Ok(files)) => files,
-        Ok(Err(why)) => {
-            if !crate::git::is_not_a_repository(&why) {
-                threads.apply(
-                    &start.thread_id,
-                    Change::Activity(Activity::failed(
-                        "checkpoint.failed",
-                        &format!(
-                            "The state of the project after this turn could not be recorded, so \
-                             the turn has no diff to review: {}",
-                            why.detail()
-                        ),
-                    )),
-                );
-            }
-            return;
-        }
-        // The blocking pool is gone, which happens when the runtime is shutting
-        // down. There is nothing to say to a conversation nobody is reading.
-        Err(_) => return,
-    };
-
-    threads.apply(
-        &start.thread_id,
-        Change::Checkpointed(Box::new(crate::threads::Checkpoint {
-            turn_id: finished.turn_id.clone(),
-            turn_count,
-            reference,
-            status: finished.status,
-            files,
-            // Resolved by the fold, which is where the transcript is. See
-            // [`crate::threads::Threads::fold`].
-            assistant_message_id: None,
-            completed_at: now_iso(),
-        })),
-    );
 }
 
 /// What the developer is told when the agent went away in the middle of a turn.
@@ -923,174 +344,6 @@ fn resume_refused(session_id: &str, complaint: Option<&str>) -> String {
     why
 }
 
-/// Which of the three sources the loop heard from. A named value rather than
-/// bodies inside `select!`, because writing to the agent needs the same mutable
-/// borrow the line future is holding until the select is over.
-enum Next {
-    Line(Option<String>),
-    Prompt(Option<Prompt>),
-    Signal(Option<Signal>),
-}
-
-/// What the driver knows that the fold does not.
-///
-/// Both fields are things only this side of the pair ever saw: the fold knows a
-/// permission was *asked*, and this knows it has not been answered and which turn
-/// to attribute the answer to.
-struct Driving {
-    /// The turn the agent is currently working on.
-    turn: Option<InFlight>,
-    /// Permission requests published and not yet answered, by the id the client
-    /// answers with.
-    ///
-    /// Per session rather than per turn, unlike the tool calls beside them, and
-    /// for the opposite reason: a tool call that outlived its turn has nothing
-    /// left to answer it, while a permission that outlives its turn is a *panel
-    /// the developer is still looking at*. Settling one is a thing that has to
-    /// happen, so it must not be dropped with the turn.
-    outstanding: HashMap<String, Permission>,
-    /// How many interrupts this session has sent, which is what the next one's
-    /// id is minted from.
-    ///
-    /// Per session and monotonic, so an acknowledgement can be matched to the
-    /// request it answers and a *late* one — for a turn that has already ended —
-    /// is recognised as late rather than mistaken for the current one.
-    interrupts: usize,
-    /// How much of this session's drift the developer has already been shown.
-    ///
-    /// The counters are the session's and monotonic, so what a report has to
-    /// carry is the *difference* — a running total repeated on every turn would
-    /// say the format moved on a turn where nothing did, which is the noise that
-    /// trains a reader to skip the turn where it had.
-    ///
-    /// Kept here rather than on the turn, and that is the difference between
-    /// "what this turn failed to read" and "what has gone unreported": the CLI
-    /// talks *between* turns as well as during them — a rate-limit notice, a
-    /// compaction boundary — and drift there belongs to somebody. Anchoring it
-    /// to the start of a turn would drop it.
-    drift_reported: Drift,
-    /// How many times this session has asked the agent how full its window is,
-    /// so the next request gets an id nothing else has used.
-    measurements: u32,
-    /// How many mode and model pushes this session has sent, on the same terms.
-    retunes: u32,
-    /// Pushes written to the agent and not yet answered, by the id this server
-    /// minted.
-    ///
-    /// The answer is the only thing that says a push landed, and a refusal has to
-    /// put [`Start`] back — so what it was before travels here rather than being
-    /// re-derived from a thread that has since moved on. See [`Pushed`].
-    pushed: HashMap<String, Pushed>,
-    /// A moment has arrived that only the agent can settle, and the loop has not
-    /// asked it yet.
-    ///
-    /// The same one-line handoff from the fold to the loop that `finished` is,
-    /// and for the same reason: asking is a *write* to the agent and so has to
-    /// happen where the loop can `await` it, while noticing that the moment
-    /// arrived happens where the lines are read, which is synchronous.
-    unmeasured: bool,
-    /// A turn that has just ended and whose working tree has not been recorded
-    /// yet.
-    ///
-    /// A one-line handoff from the fold to the loop, and it exists because the
-    /// two halves cannot swap places. Recording a checkpoint is a `git` and
-    /// therefore has to happen where the loop can `await` it; knowing that a
-    /// turn ended happens where the lines are read, which is synchronous.
-    /// Written by exactly one arm of [`decide`] and taken by the loop on the
-    /// next statement, so it is never carried across an iteration.
-    ///
-    /// **Left here rather than moved onto [`Decided`]**, along with `unmeasured`
-    /// above. Both are already what that type is — a thing decided on one line and
-    /// spent on the next — but both are read by the loop itself rather than by
-    /// [`spend`], and neither is a change to a conversation. Moving them would
-    /// have widened `Decided` from "what happened to the thread" to "what the
-    /// driver does next" for no assertion this file could not already make: they
-    /// are `&mut Driving` fields, and a test of `decide` reads them off the
-    /// `Driving` it handed in.
-    finished: Option<Finished>,
-    /// The last context-window reading the client was told about.
-    ///
-    /// Kept so an unchanged reading is not published again. The CLI repeats its
-    /// counts — the `result` at the end of a turn usually agrees with the last
-    /// assistant message of that turn — and a row per repetition would be a row
-    /// per message on the thread, each one saying what the one before it said.
-    /// Per session rather than per turn, because the repetition crosses the
-    /// boundary: a turn that asked the agent nothing new ends where the last one
-    /// did.
-    reported_usage: Option<TokenUsage>,
-}
-
-/// A turn that ended in a way a checkpoint can describe.
-///
-/// See [`Ending::checkpoint_status`] for why the second field is what decides
-/// whether there is anything to hand over at all.
-struct Finished {
-    turn_id: String,
-    status: &'static str,
-}
-
-impl Driving {
-    /// The id for the next interrupt, and the count that makes it unique.
-    fn next_interrupt_id(&mut self) -> String {
-        self.interrupts += 1;
-        format!("interrupt-{}", self.interrupts)
-    }
-
-    /// The id for the next context-window question.
-    ///
-    /// Distinct from an interrupt's for the developer reading a log rather than
-    /// for the code: the answer is told apart by what it carries, not by the id
-    /// it names — see [`crate::protocol::Acknowledgement::reading`].
-    fn next_measurement_id(&mut self) -> String {
-        self.measurements += 1;
-        format!("context-{}", self.measurements)
-    }
-
-    /// The id for the next mode or model push.
-    ///
-    /// One counter for both, because they are one kind of request as far as the
-    /// answer is concerned: the id is what says *which* push a refusal is about,
-    /// and [`Pushed`] carries which kind it was.
-    fn next_retune_id(&mut self) -> String {
-        self.retunes += 1;
-        format!("retune-{}", self.retunes)
-    }
-
-    /// What has gone unread since the last time anybody was told, and a note
-    /// that they have now been told it.
-    fn drift_to_report(&mut self, folding: &SessionState) -> Drift {
-        let unreported = folding.drift().since(self.drift_reported);
-        self.drift_reported = folding.drift();
-        unreported
-    }
-
-    /// The context-window row the client has not been told yet, if the reading
-    /// has moved, and a note that it has now been told.
-    ///
-    /// `None` when nothing has changed, which is most lines: the counts arrive
-    /// on every assistant message and on the `result`, and the last two of those
-    /// usually agree.
-    fn usage_to_report(&mut self, folding: &SessionState) -> Option<TokenUsage> {
-        let reading = folding.token_usage.clone()?;
-        if self.reported_usage.as_ref() == Some(&reading) {
-            return None;
-        }
-        self.reported_usage = Some(reading.clone());
-        Some(reading)
-    }
-
-    /// Take every request still waiting, so the caller can close it.
-    fn take_outstanding(&mut self) -> Vec<Permission> {
-        let mut open: Vec<Permission> = std::mem::take(&mut self.outstanding)
-            .into_values()
-            .collect();
-        // A map has no order and these become rows in a work log. Ordered by the
-        // id the agent minted, which is at least the same every run.
-        open.sort_by(|left, right| left.request_id.cmp(&right.request_id));
-        open
-    }
-}
-
 /// How full the context window is, as the row the composer's meter reads.
 ///
 /// The client never renders this row in the work log — `session-logic.ts` skips
@@ -1122,536 +375,6 @@ fn context_window_row(usage: &TokenUsage, turn_id: Option<String>) -> Activity {
         }),
         turn_id,
     )
-}
-
-/// Tell the agent what the developer decided, and say so in the conversation.
-///
-/// The agent is written to *first*, because that is the half with something
-/// waiting on it: a decision published but not delivered would close the panel
-/// on a conversation that is still stopped. If the write fails the row still goes
-/// up — as a failure — because the alternative is a panel the developer can never
-/// clear.
-async fn answer(
-    threads: &Threads,
-    start: &Start,
-    agent: &mut Agent,
-    driving: &mut Driving,
-    answered: Answered,
-) {
-    // An id this session never asked about, or asked about and has already been
-    // answered on. Said the one way the client recognises as "this request is
-    // gone", so a panel left behind by a session that died without settling is
-    // cleared by the first attempt to answer it rather than being permanent.
-    let Some(asked) = driving.outstanding.remove(&answered.request_id) else {
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(crate::worklog::unanswerable(&answered.request_id)),
-        );
-        return;
-    };
-
-    let sent = agent
-        .answer(&asked.request_id, &answered.decision.answer(&asked))
-        .await;
-
-    // "Cancel" is a denial that also carries `interrupt: true`, so the CLI stops
-    // the turn on it — which makes it an interrupt this server did not send but
-    // did cause, and the turn has to end the same way one it did send would.
-    // Ticket 13 sent the decision correctly and left this half undone by name;
-    // it is the same fact recorded in the same field, and it is recorded only if
-    // the decision actually reached the agent.
-    let mut cancelled = None;
-    if sent.is_ok() && answered.decision == Decision::Cancel {
-        if let Some(active) = driving.turn.as_mut() {
-            if active.stop(&asked.request_id) {
-                cancelled = Some(active.turn_id.clone());
-            }
-        }
-    }
-
-    let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
-
-    // Reported as a *session* failure rather than as an unanswerable request:
-    // the request was real and this server knew it, and what went wrong is that
-    // the agent stopped reading. The resolution below closes the panel either
-    // way, which is why this does not have to.
-    if let Err(error) = sent {
-        eprintln!("laplus: cannot answer a permission request: {error}");
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(Activity::failed(
-                "session.failed",
-                &format!(
-                    "The decision could not be sent to the agent, which is no longer reading: \
-                     {error}"
-                ),
-            )),
-        );
-    }
-
-    // Published either way, and after the write either way. This is what closes
-    // the panel, and a decision that reached the agent and was never recorded
-    // would leave the developer asked a second time about work already under way.
-    threads.apply(
-        &start.thread_id,
-        Change::Activity(crate::worklog::resolved(
-            &asked,
-            answered.decision,
-            turn_id,
-        )),
-    );
-
-    // After the resolution, so the work log reads in the order it happened: the
-    // developer answered the question, and answering it that way stopped the turn.
-    if let Some(turn_id) = cancelled {
-        stopped(threads, start, &turn_id, &asked.request_id);
-    }
-}
-
-/// Tell the agent what the developer answered, and say so in the conversation.
-///
-/// [`answer`]'s twin for `AskUserQuestion`, and the same shape for the same
-/// reasons: the agent is written to first because it is the half that has stopped,
-/// and the row goes up either way because the alternative is a question header the
-/// developer can never clear.
-///
-/// Two things it does *not* have. There is no cancel — the composer offers no way
-/// to refuse a question, so no answer here can end a turn. And there is no
-/// decision to refuse: [`crate::worklog::Decision::parse`] guards the approval
-/// path against a verb this server cannot read, while answers are the developer's
-/// own text and are carried through unread.
-async fn answer_user_input(
-    threads: &Threads,
-    start: &Start,
-    agent: &mut Agent,
-    driving: &mut Driving,
-    answered: UserInputAnswered,
-) {
-    // An id this session never asked about, or has already been answered on.
-    // Closed with the wording the client folds as "that question is gone", which
-    // is what clears a header left behind by a session that died holding one.
-    let Some(asked) = driving.outstanding.remove(&answered.request_id) else {
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(crate::worklog::unanswerable_user_input(
-                &answered.request_id,
-            )),
-        );
-        return;
-    };
-
-    let sent = agent
-        .answer(
-            &asked.request_id,
-            &crate::worklog::answers_for(&asked, &answered.answers),
-        )
-        .await;
-
-    if let Err(error) = sent {
-        eprintln!("laplus: cannot answer a question: {error}");
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(Activity::failed(
-                "session.failed",
-                &format!(
-                    "The answers could not be sent to the agent, which is no longer reading: \
-                     {error}"
-                ),
-            )),
-        );
-    }
-
-    threads.apply(
-        &start.thread_id,
-        Change::Activity(crate::worklog::user_input_resolved(
-            &asked.request_id,
-            &answered.answers,
-            driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
-        )),
-    );
-}
-
-/// Stop the turn the agent is working on, and say so in the conversation.
-///
-/// Three things make this a no-op rather than an error, and each is a race the
-/// developer cannot see and should not have to think about:
-///
-/// - **Nothing is in flight.** The turn ended while the click was travelling, or
-///   there was never one. Either way the agent is not doing the thing they asked
-///   it to stop doing, which is what they wanted.
-/// - **The turn named is not the turn running.** The client names the turn it is
-///   looking at (`buildThreadTurnInterruptInput`), and the same race makes that
-///   the *previous* turn a moment later. Stopping the one after it would be
-///   stopping work the developer never saw start.
-/// - **This turn has already been stopped.** A second click, or a stop after a
-///   permission was cancelled. The agent is already winding down and a second
-///   request would produce a second row saying so.
-///
-/// What is *not* published here is a session change. The turn is not over until
-/// the agent says it is — the CLI still owes whatever it had buffered and then a
-/// `result` — and this server saying "stopped" before that would be describing
-/// an ending it had only asked for. `Folded::Completed` is where the turn
-/// settles, and [`InFlight::stopped`] is what tells it how.
-async fn interrupt(
-    threads: &Threads,
-    start: &Start,
-    agent: &mut Agent,
-    driving: &mut Driving,
-    wanted: Option<String>,
-) {
-    // Every reason to do nothing is settled before an id is minted, so a no-op
-    // costs nothing and the ids in the work log count stops that happened.
-    let Some(active) = driving.turn.as_ref() else {
-        return;
-    };
-    if wanted.is_some_and(|turn_id| turn_id != active.turn_id) || active.stopped.is_some() {
-        return;
-    }
-    let turn_id = active.turn_id.clone();
-    let request_id = driving.next_interrupt_id();
-
-    // The agent is written to before anything else happens, the same way a
-    // decision is and for the same reason: the rows below are what the developer
-    // sees and the write is what actually stops the work. Publishing first would
-    // be a claim about an agent still going — and *recording* first would be
-    // worse, because a turn marked stopped that nobody managed to stop would
-    // report itself as stopped when it finished normally.
-    //
-    // The borrow is taken again afterwards rather than held across the write:
-    // `agent` and `driving` are separate borrows and the second must not outlive
-    // the await, which is the same reason [`Next`] exists.
-    if let Err(error) = agent.interrupt(&request_id).await {
-        eprintln!("laplus: cannot interrupt the agent: {error}");
-        threads.apply(
-            &start.thread_id,
-            Change::Activity(Activity::failed(
-                "turn.interrupt-failed",
-                &format!(
-                    "The agent could not be asked to stop, because it is no longer reading: \
-                     {error}"
-                ),
-            )),
-        );
-        return;
-    }
-
-    // The turn can only have gone away while the write was in flight if the
-    // agent's output ended, and then the loop is about to end too.
-    let Some(active) = driving.turn.as_mut() else {
-        return;
-    };
-    active.stop(&request_id);
-    stopped(threads, start, &turn_id, &request_id);
-}
-
-/// Ask the agent how full its context window is.
-///
-/// **Nothing is published, and a failure is not reported.** That is the whole
-/// difference between this and every other write to the agent, and it is what
-/// makes the request safe to add to a build whose CLI may not implement it: a
-/// stop that did not land is a button that did nothing and has to be said, while
-/// a question that did not land leaves the meter exactly as it was — filled from
-/// the token counts, the way ticket 40 filled it. A row reading "the agent would
-/// not say how full its context window is" would be the first thing a developer
-/// saw on an older CLI, about a number already on screen.
-///
-/// The answer comes back on stdout whenever the agent gets to it, and
-/// [`crate::protocol::SessionState::reduce`] folds it. Nothing here waits, and
-/// no state records that a question is outstanding — a second question asked
-/// before the first was answered is two readings rather than a problem, and the
-/// later of them wins because it arrives later.
-async fn measure(agent: &mut Agent, driving: &mut Driving) {
-    let request_id = driving.next_measurement_id();
-    if let Err(error) = agent.measure_context(&request_id).await {
-        eprintln!("laplus: cannot ask the agent how full its context window is: {error}");
-    }
-}
-
-/// Move the child onto the mode and model this turn asks for, before it is given
-/// the turn.
-///
-/// The whole of ticket 11. `--permission-mode` and `--model` are read once, when
-/// the process is opened, and one process serves a whole conversation — so
-/// before this a developer who tightened `full-access` to `approval-required`
-/// saw the picker move, saw it survive a restart, saw the next turn *requested*
-/// under the new mode, and was answered by an agent still bypassing permissions.
-///
-/// Four rules, and each of them is an acceptance criterion:
-///
-/// - **Nothing is sent for a value that has not moved.** The comparison is
-///   against [`Start`], which is what the child is running under rather than what
-///   the thread last said — so a conversation whose mode never changes never
-///   sends one of these, and upstream's guard-on-change is followed rather than
-///   re-derived.
-/// - **The capture moves only when the write did.** `start` is what every session
-///   event reads, so setting it before the line was written would publish a claim
-///   about a child nobody had managed to tell.
-/// - **The refusal is left to the acknowledgement.** The CLI answers on stdout,
-///   and a mode it will not take comes back as a `control_response` naming this
-///   id — see [`decide`]'s `Acknowledged` arm, which puts `start` back and says
-///   so in the conversation. What is reported *here* is the narrower failure of
-///   the child no longer reading at all.
-/// - **A model is pushed only when there is one to push.** A selection that names
-///   none cannot be expressed as a request — there is nothing that means "go back
-///   to your default" — so the child keeps what it has, and `start` keeps saying
-///   so.
-async fn retune(
-    threads: &Threads,
-    start: &mut Start,
-    agent: &mut Agent,
-    driving: &mut Driving,
-    wanted: &Retune,
-) {
-    // Decided before anything is written, so "has it moved" is asked of the same
-    // capture both questions are asked of — and so the loop below is one shape
-    // rather than two nearly-identical ones.
-    let mode = (wanted.runtime_mode != start.runtime_mode).then(|| Pushed::Mode {
-        previous: start.runtime_mode.clone(),
-        asked: wanted.runtime_mode.clone(),
-    });
-    let model = wanted
-        .model
-        .clone()
-        .filter(|wanted| Some(wanted) != start.model.as_ref())
-        .map(|asked| Pushed::Model {
-            previous: start.model.clone(),
-            asked,
-        });
-
-    for asked in [mode, model].into_iter().flatten() {
-        let request_id = driving.next_retune_id();
-        let written = match &asked {
-            Pushed::Mode { asked, .. } => {
-                let mode = crate::agent::pushed_permission_mode_for(asked);
-                agent.set_permission_mode(&request_id, mode).await
-            }
-            Pushed::Model { asked, .. } => agent.set_model(&request_id, asked).await,
-        };
-
-        match written {
-            Ok(()) => {
-                asked.apply(start);
-                driving.pushed.insert(request_id, asked);
-            }
-            Err(error) => unreachable_agent(threads, start, &asked, &error),
-        }
-    }
-}
-
-/// The agent stopped reading before it could be told what this turn wants.
-///
-/// Reported rather than swallowed, unlike [`measure`]'s failure and for the
-/// reason a failed interrupt is: the developer changed something and was shown
-/// the change, so a change that reached nothing has to be said. The turn goes on
-/// regardless — refusing to send it would leave a conversation with a message in
-/// it and nothing running, which is worse than a turn answered under the old
-/// rules with a row saying so.
-fn unreachable_agent(threads: &Threads, start: &Start, asked: &Pushed, error: &std::io::Error) {
-    let what = asked.what();
-    eprintln!("laplus: cannot tell the agent its {what}: {error}");
-    threads.apply(
-        &start.thread_id,
-        Change::Activity(Activity::failed(
-            "session.retune-failed",
-            &format!(
-                "The agent could not be told which {what} this turn wants, because it is no \
-                 longer reading: {error}"
-            ),
-        )),
-    );
-}
-
-/// One thing this server asked a running child to become, and what it was before.
-///
-/// Held from the moment the line is written until the CLI answers it, because
-/// the answer is the only thing that says whether it landed — and a refusal has
-/// to put [`Start`] back to the value the child is really running under.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Pushed {
-    Mode { previous: String, asked: String },
-    Model { previous: Option<String>, asked: String },
-}
-
-impl Pushed {
-    /// Which of the two this is, in the words the developer's own picker uses.
-    ///
-    /// Read off the variant rather than passed alongside it, so there is one
-    /// place that decides what a mode and a model are called.
-    fn what(&self) -> &'static str {
-        match self {
-            Pushed::Mode { .. } => "runtime mode",
-            Pushed::Model { .. } => "model",
-        }
-    }
-
-    /// Take the driver's capture to what the child was just asked to become.
-    ///
-    /// Called only where the write succeeded, which is the whole of the rule:
-    /// [`Start`] is what every session event reads, so moving it before the line
-    /// was written would publish a claim about a child nobody had told.
-    fn apply(&self, start: &mut Start) {
-        match self {
-            Pushed::Mode { asked, .. } => start.runtime_mode = asked.clone(),
-            Pushed::Model { asked, .. } => start.model = Some(asked.clone()),
-        }
-    }
-
-    /// What the developer is told, when the CLI would not take it.
-    ///
-    /// Names what was refused, in this server's own vocabulary rather than the
-    /// CLI's: the developer picked `approval-required` in a menu and has never
-    /// seen the word `default`.
-    fn sentence(&self, why: &str) -> String {
-        match self {
-            Pushed::Mode { asked, previous } => format!(
-                "The agent would not change to the '{asked}' runtime mode and is still running \
-                 under '{previous}': {why}"
-            ),
-            Pushed::Model { asked, previous } => match previous {
-                Some(previous) => format!(
-                    "The agent would not change to the '{asked}' model and is still running \
-                     '{previous}': {why}"
-                ),
-                None => format!(
-                    "The agent would not change to the '{asked}' model and is still running the \
-                     one it started with: {why}"
-                ),
-            },
-        }
-    }
-
-    /// Put the driver's capture back to what the child is really running under.
-    fn revert(self, start: &mut Start) {
-        match self {
-            Pushed::Mode { previous, .. } => start.runtime_mode = previous,
-            Pushed::Model { previous, .. } => start.model = previous,
-        }
-    }
-}
-
-/// Say in the conversation that the developer stopped this turn.
-///
-/// Two changes rather than one, because they are read by different parts of the
-/// client and neither can be derived from the other:
-///
-/// - **The event settles the turn.** `thread.turn-interrupt-requested` is the
-///   contract's own, and the client's reducer moves the latest turn to
-///   `interrupted` on it *immediately* — so the turn stops being reported as
-///   running when the developer's click lands rather than when the agent gets
-///   round to admitting it. Without it the composer would show work in progress
-///   for as long as the agent took to wind down.
-/// - **The row is the record.** The work log is what a developer reads later,
-///   and "this turn stopped because I stopped it" is not derivable from the
-///   partial reply above it.
-///
-/// Shared by the two things that stop a turn — the stop button, and cancelling a
-/// permission — because they are the same event to a client either way.
-fn stopped(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
-    threads.apply(
-        &start.thread_id,
-        Change::InterruptRequested {
-            turn_id: turn_id.to_string(),
-        },
-    );
-    threads.apply(
-        &start.thread_id,
-        Change::Activity(Activity::info(
-            "turn.interrupted",
-            "The developer stopped the turn.",
-            json!({
-                "requestId": request_id,
-                "turnId": turn_id,
-                // What the client's work log renders as the row's body. Without
-                // it the row is a heading with nothing under it — see
-                // `Activity::failed`, which repeats its summary for the same
-                // reason.
-                "detail": "The developer stopped the turn. Anything the agent had already \
-                           said is kept.",
-            }),
-            Some(turn_id.to_string()),
-        )),
-    );
-}
-
-/// The session is working on this turn.
-fn running(threads: &Threads, start: &Start, turn_id: &str) {
-    threads.apply(
-        &start.thread_id,
-        Change::Session(Session {
-            status: SessionStatus::Running,
-            runtime_mode: start.runtime_mode.clone(),
-            active_turn_id: Some(turn_id.to_string()),
-            last_error: None,
-            updated_at: now_iso(),
-        }),
-    );
-}
-
-/// The turn the agent is currently working on.
-struct InFlight {
-    turn_id: String,
-    /// Minted at the first piece of assistant text and cleared when that message
-    /// completes, so a turn that produces several messages — commentary between
-    /// tool calls — gives each its own id rather than appending them all into one.
-    assistant_message_id: Option<String>,
-    /// Tool calls announced and not yet answered, by the id the agent minted.
-    ///
-    /// The pairing has to be remembered because the two halves arrive in
-    /// different messages and only the first one says what the tool was: a
-    /// `tool_result` carries an id, a payload and nothing else. Per turn rather
-    /// than per session, because a call is always answered within the turn that
-    /// made it — and a turn that ended with one outstanding has nothing left to
-    /// answer it.
-    tools: HashMap<String, Call>,
-    /// The id of the request that stopped this turn, once something has.
-    ///
-    /// Two things can be: an interrupt this server sent, or a permission the
-    /// developer *cancelled*, which is a denial the CLI honours by stopping the
-    /// turn. They are one field because they are one fact — the turn is ending
-    /// because the developer said so — and the turn's ending has to read the
-    /// same way whichever of them it was.
-    ///
-    /// Two things read it. An acknowledgement matches against it, so an answer
-    /// to some other request is not taken for this one. And `Folded::Completed`
-    /// reads it as a fact about *how* the turn ended: the CLI reports an aborted
-    /// turn as an error, and a turn the developer stopped on purpose is not one
-    /// to show them a failure for.
-    stopped: Option<String>,
-}
-
-impl InFlight {
-    /// Record that something has stopped this turn, and say whether it was the
-    /// first thing to.
-    ///
-    /// `false` is a turn already stopping — a second click, or a stop after a
-    /// permission was cancelled — and the caller answers it by saying nothing,
-    /// because the work log already says the turn is being stopped.
-    fn stop(&mut self, request_id: &str) -> bool {
-        if self.stopped.is_some() {
-            return false;
-        }
-        self.stopped = Some(request_id.to_string());
-        true
-    }
-
-    /// Is this the answer to the stop this turn is waiting on?
-    fn awaiting(&self, request_id: &str) -> bool {
-        self.stopped.as_deref() == Some(request_id)
-    }
-
-    /// The agent will not stop, so this turn is going to end the way it was
-    /// going to end.
-    ///
-    /// The flag has to come off rather than merely being ignored: a normal
-    /// ending reported as one the developer asked for would be a work log
-    /// claiming they did something they did not.
-    fn carries_on(&mut self) {
-        self.stopped = None;
-    }
-
-    fn was_stopped(&self) -> bool {
-        self.stopped.is_some()
-    }
 }
 
 /// How a turn ended.
@@ -1758,99 +481,10 @@ impl Ending {
     }
 }
 
-/// Resolve the binary and start the agent, or say why not.
-async fn open(start: &Start) -> Result<Agent, String> {
-    // Resolved here rather than on the dispatch path: it is a walk of every
-    // `PATH` directory, and the read loop is answering a developer who has just
-    // pressed enter. Resolved per session rather than once at boot because the
-    // setting can change and an install can move, and this is the moment the
-    // answer actually matters.
-    let (path, _) = crate::provider::resolve(&start.settings.binary_path, &Search::from_environment())
-        .startable()?;
-
-    Agent::start(&Launch {
-        binary: path.clone(),
-        cwd: start.workspace_root.clone(),
-        model: start.model.clone(),
-        permission_mode: permission_mode_for(&start.runtime_mode),
-        resume: start.resume.clone(),
-    })
-    .await
-    .map_err(|error| {
-        format!(
-            "The Claude Code binary {} could not be started in {}: {error}",
-            path.display(),
-            start.workspace_root
-        )
-    })
-}
-
-/// What one line of the agent's NDJSON turned out to mean for the conversation.
-///
-/// [`decide`] answers with one of these and [`spend`] applies it, which is the
-/// same seam `docs/adr/0025` cut one level down: the fold there reports the
-/// reconciliation verdict rather than spending it, because a function that
-/// applies its own results can only be tested by watching what it did to a live
-/// world. Here the world is a [`Threads`] with a running `claude` behind it, so
-/// there was nothing to watch it with at all.
-///
-/// **Three fields rather than a `Vec<Change>`**, because two of the twelve things
-/// [`decide`] used to do are not changes:
-///
-/// - the agent's own session id is written down and published to nobody
-///   ([`crate::threads::Threads::remember_agent_session`]), so no `Change`
-///   describes it and none could;
-/// - the event that ends a turn is published *only if the session is still
-///   describing that turn*, which is a question about the world asked between two
-///   applies. Returned as a precondition rather than answered here, so the lock it
-///   costs is taken on the lines that end a turn rather than on every line.
-///
-/// See `docs/adr/0027`.
-#[derive(Debug, Default)]
-struct Decided {
-    /// The changes to apply, in the order they were decided — which is the order
-    /// the developer saw the work happen, because the CLI closes one content
-    /// block before announcing the next.
-    changes: Vec<Change>,
-    /// The `claude` session the agent has just announced, if it announced one.
-    agent_session: Option<String>,
-    /// The turn ended, and how. `None` on every line that is not a `result`.
-    settles: Option<Settles>,
-    /// A push the CLI refused, and what the driver's capture of the session has
-    /// to go back to.
-    ///
-    /// A fourth field for the same reason the two above are not changes: putting
-    /// [`Start`] back is not something a conversation can be told, and the
-    /// re-publish that follows it needs a value this function does not hold. So
-    /// the refusal's *row* travels in `changes` and the correction travels here,
-    /// and the loop spends both — see `docs/adr/0027`.
-    reverts: Option<Pushed>,
-}
-
-/// The end of a turn, as the line that ended it reports it.
-///
-/// Two of the five fields of a [`Session`] and not the other three, and the split
-/// is the seam rather than an arbitrary cut: **how the turn went** is what this
-/// line decided, while **which session and when** are facts the driver has held
-/// since it started the child. Leaving the second pair to [`spend`] is what takes
-/// the last clock read out of [`decide`].
-#[derive(Debug)]
-struct Settles {
-    /// The turn that ended — and the turn the session must *still* be describing
-    /// for the ending to be published at all.
-    ///
-    /// `None` is a `result` that arrived with no turn in flight, and it is a
-    /// value rather than a missing one: the session's `activeTurnId` is then also
-    /// `None`, and the two matching is what makes this publishable.
-    turn_id: Option<String>,
-    status: SessionStatus,
-    last_error: Option<String>,
-}
-
 /// Fold one line and say what it turned out to be.
 ///
-/// No [`Threads`], no lock, no clock and no child process: a [`SessionState`], a
-/// [`Driving`] and a line in, a [`Decided`] out. That is the whole of what this
+/// No [`crate::threads::Threads`], no lock, no clock and no child process: a
+/// [`SessionState`], a [`Driving`] and a line in, a [`Decided`] out. That is the whole of what this
 /// commit bought and the whole of why the tests at the bottom of this file can
 /// exist — see [`Decided`] and `docs/adr/0027`.
 ///
@@ -1873,7 +507,7 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
     // of `turn.completed` on the line that ends a turn: the row a developer
     // actually reads stays the last thing in it. The client never renders this
     // one — see [`context_window_row`].
-    let moved = driving.usage_to_report(folding);
+    let moved = driving.usage_to_report(folding.token_usage.clone());
     if let Some(usage) = moved {
         let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
         decided
@@ -2177,7 +811,7 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
             // go in the payload beside it; the sentence gets what is new, so a
             // turn that drifted says so and the one after it does not repeat the
             // claim.
-            let drift = driving.drift_to_report(folding);
+            let drift = driving.drift_to_report(folding.drift());
 
             let completed = Activity {
                 tone: ending.tone(),
@@ -2220,7 +854,8 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
             // the whole point of stopping it — and the dispatch has already moved
             // the session on to that turn. Published unconditionally it would
             // settle a turn that had just started, and the client would show it
-            // finished until the agent got round to it. [`spend`] asks.
+            // finished until the agent got round to it.
+            // [`crate::session::spend`] asks.
             decided.settles = Some(Settles {
                 turn_id: active,
                 status: ending.session_status(),
@@ -2233,48 +868,6 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
 
     decided
 }
-
-/// Apply what [`decide`] decided.
-///
-/// The impure half of the pair, and it is deliberately this short: every line of
-/// it is a call on [`Threads`], so there is nothing here to get wrong that a test
-/// of `decide` would not already have caught.
-///
-/// The order is the order the arms decided in, and the two things that are not
-/// changes go where they went before the split — the id after the row that may
-/// have preceded it on the same line, the ending last of all.
-fn spend(threads: &Threads, start: &Start, decided: Decided) {
-    for change in decided.changes {
-        threads.apply(&start.thread_id, change);
-    }
-
-    if let Some(session_id) = &decided.agent_session {
-        threads.remember_agent_session(&start.thread_id, session_id);
-    }
-
-    let Some(settles) = decided.settles else { return };
-    // The question [`Settles::turn_id`] exists to ask, and the lock it costs is
-    // taken here — on the lines that end a turn — rather than on every line the
-    // agent writes.
-    if threads.active_turn(&start.thread_id) != settles.turn_id {
-        return;
-    }
-
-    threads.apply(
-        &start.thread_id,
-        Change::Session(Session {
-            status: settles.status,
-            // The session's own, not the line's: a turn ends with the latitude
-            // the child was started with, whatever the thread has been moved to
-            // since. See `CONTEXT.md`, *Runtime mode*.
-            runtime_mode: start.runtime_mode.clone(),
-            active_turn_id: None,
-            last_error: settles.last_error,
-            updated_at: now_iso(),
-        }),
-    );
-}
-
 
 /// What the developer is told about the turn that just ended.
 ///
@@ -2439,26 +1032,6 @@ fn human_duration(milliseconds: u64) -> String {
             format!("{:.1}s", under_a_minute as f64 / 1_000.0)
         }
         longer => format!("{}m {}s", longer / 60_000, (longer % 60_000) / 1_000),
-    }
-}
-
-/// The thread and project a turn needs, gathered into what the driver takes.
-///
-/// A free function rather than a method on either, because it is the one place
-/// three things meet: the thread says which model and how much latitude, the
-/// project says where, and the settings say which binary.
-pub fn starting(thread: &Thread, workspace_root: &str, settings: &ClaudeSettings) -> Start {
-    Start {
-        thread_id: thread.id.clone(),
-        workspace_root: workspace_root.to_string(),
-        model: thread.model(),
-        runtime_mode: thread.runtime_mode.clone(),
-        // Read here rather than inside the driver, so what is resumed is the
-        // session the thread held when the turn was dispatched. A session opened
-        // for a thread that has none starts a fresh conversation and reports its
-        // own id back a moment later.
-        resume: thread.agent_session_id.clone(),
-        settings: settings.clone(),
     }
 }
 

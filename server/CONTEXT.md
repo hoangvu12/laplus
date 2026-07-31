@@ -55,6 +55,17 @@ the agent does before it goes quiet. Has an id the client mints.
 **Session** — the agent process behind a thread, as the client sees it. A thread
 with no session is normal — after a restart, every thread has none.
 
+**Driver** — what runs one agent behind a session: it owns the process, speaks
+that agent's protocol, and answers with the changes a conversation is owed. A
+trait, `crate::session::Driver`, and its surface is the I/O verbs only — open a
+session, take the next event, send a prompt, interrupt, answer what the agent
+stopped for, ask how full the window is, retune, say there will be no more
+turns, reap. Everything a session does _around_ those is `crate::session`'s and
+is written once: baselines, checkpoints, epochs, settling, and every session
+event the client reads. Per-agent by construction — ADR-0001 is why an encoder
+belongs to a driver and the decoder does not. `crate::turn` is the one
+implementation there is, and it drives the `claude` CLI.
+
 **Agent session id** — the `claude` CLI's own handle on a conversation, given
 back to it as `--resume`. The one piece of agent-protocol vocabulary that
 reaches the database, because continuity depends on it outliving the process.
@@ -94,8 +105,8 @@ already in flight keeps the rules it started under.
 
 **Retune** — telling a `claude` already serving a conversation to change what it
 _is_: its permission mode, its model, or both. The name for the act and for what
-carries it — `crate::threads::Retune` travels with the prompt, `crate::turn::retune`
-spends it, and `session.retune-refused` and `session.retune-failed` are what the
+carries it — `crate::threads::Retune` travels with the prompt,
+`crate::session::retune` spends it through the driver, and `session.retune-refused` and `session.retune-failed` are what the
 developer is told when it does not land. Distinct from the two other things this
 server says to a running agent: an **interrupt** ends the turn and a **permission
 decision** answers a question, and neither changes what the agent is.
@@ -216,8 +227,8 @@ running child, where the omission cannot stand and `approval-required` becomes
 `default`.
 
 Given to the agent **at launch and again at every turn whose mode has moved** —
-`crate::turn::retune` pushes it on the control channel before the turn is
-written, and the driver's own copy moves with it, so every session event for one
+`crate::session::retune` pushes it through the driver before the turn is
+written, and the session's own copy moves with it, so every session event for one
 turn reports the same mode. Ticket 11 of `.scratch/thread-lifecycle/` is the
 whole of it, and `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson`
 is a real child being moved. The **model** is the same mechanism through
@@ -556,14 +567,17 @@ buffered message. The deltas drive live rendering; the buffered message is
 authoritative and replaces the accumulation. Whether the two agreed is recorded.
 
 **Join** — a place where the agent protocol and the contract meet. `crate::turn`
-is the declared one; `crate::worklog` is a second.
+is the declared one, and it is one **driver**'s: the join is per-agent, while the
+session lifetime around it (`crate::session`) is not. `crate::worklog` is a
+second.
 
 The declared one is crossed in two halves and each is checked on its own.
 `crate::protocol` takes a line and answers with a **`Folded`** — what that line
 was, in this server's words — and `tests/protocol_golden.rs` pins that against 19
 captured sessions. `crate::turn::decide` takes the `Folded` and answers with a
 **`Decided`**: the changes the conversation is owed, the agent session id if one
-was announced, and how the turn ended if it did. `crate::turn::spend` applies it.
+was announced, and how the turn ended if it did — which is also the vocabulary
+every driver answers a session in. `crate::session::spend` applies it.
 Deciding and applying are two functions for the reason the fold and `commit` are
 (ADR-0025): a function that applies its own results can only be tested against a
 live world, and this one's world is a running `claude`. See ADR-0027.

@@ -50,8 +50,14 @@
 //! [`transcripts`] writes one down behind the stream that is producing it,
 //! [`worklog`] says how a tool call and a pause to reason look to the UI, and
 //! [`turn`] is the join: it folds what the agent said with [`protocol`] and
-//! publishes it as what the UI reads. Keeping the join to one file is what makes
+//! answers with what the UI reads. Keeping the join to one file is what makes
 //! "the agent's format moved" and "the UI's contract moved" separate failures.
+//!
+//! [`session`] is the lifetime around that join, and it is deliberately on the
+//! other side of it: a conversation's baselines, checkpoints, epochs, settling
+//! and session events are written once, over the `session::Driver` trait, so a
+//! second agent brings a protocol and an encoder rather than a second copy of
+//! all of that. [`turn`] is the one implementation of that trait there is.
 
 pub mod agent;
 pub mod assets;
@@ -84,6 +90,7 @@ pub mod remote_access;
 pub mod rpc;
 pub mod server;
 pub mod service;
+pub mod session;
 pub mod settings;
 pub mod settling;
 pub mod startup;

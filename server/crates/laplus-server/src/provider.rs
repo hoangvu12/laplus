@@ -4,7 +4,8 @@
 //! **Nothing here starts an agent that takes a turn.** What this establishes is
 //! that the driver *can* be started — the binary is located, it answers
 //! `--version`, and the answer is published as the one provider instance the UI
-//! routes turns through. [`crate::turn`] is what spawns one for real.
+//! routes turns through. [`crate::turn`] is what starts one for real, when a
+//! session opens.
 //!
 //! It does now start one that takes *no* turn: a resolved binary is also asked
 //! what commands and skills it can offer, which is a session opened for one

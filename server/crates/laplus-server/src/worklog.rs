@@ -6,7 +6,9 @@
 //! activities into the work log beside the transcript
 //! (`apps/web/src/session-logic.ts`, `deriveWorkLogEntries`). This module owns
 //! the translation from "the agent called `Read` on `note.txt`" to the payload
-//! that log renders, and [`crate::turn`] owns *when*.
+//! that log renders. A driver owns *when* — [`crate::turn`] for the rows an
+//! agent's own output produces, [`crate::session`] for the ones a session's
+//! lifetime does.
 //!
 //! ## The vocabulary is the client's, not this server's
 //!

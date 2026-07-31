@@ -1287,8 +1287,8 @@ impl Threads {
     /// [`Live::epoch`].
     ///
     /// Answers whether the conversation is **still this session's to describe**,
-    /// which is the question a driver has to ask before publishing its ending and
-    /// the only place it can ask it — see [`crate::turn`].
+    /// which is the question a session has to ask before publishing its ending
+    /// and the only place it can ask it — see [`crate::session`].
     ///
     /// That is not quite "was the slot mine". An *empty* slot is still this
     /// session's to describe: a stop or a shutdown frees it and neither of them
@@ -1832,9 +1832,9 @@ pub(crate) mod tests {
     /// events with its own copy, so a turn left `running` here would be a
     /// conversation this server reports as working and the UI does not.
     ///
-    /// Ticket 15 is what makes this reachable: `crate::turn` currently reports an
-    /// unfinished turn as `error` and keeps `stopped` for the case where none was
-    /// running. This is the ground that choice will stand on.
+    /// Ticket 15 is what makes this reachable: `crate::session` currently reports
+    /// an unfinished turn as `error` and keeps `stopped` for the case where none
+    /// was running. This is the ground that choice will stand on.
     #[test]
     fn a_turn_the_process_died_under_settles_as_interrupted() {
         let (threads, _shell) = threads();

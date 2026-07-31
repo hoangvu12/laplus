@@ -261,7 +261,7 @@ pub struct Reviewing {
 /// this. Two paths then have to agree about which folder that is, because they
 /// are two views of one turn: the turn path, which is both the folder the agent
 /// is started in and the folder [`crate::checkpoints`] photographs at each turn
-/// boundary ([`Shell::start_turn`], through [`crate::turn::Start`]); and the
+/// boundary ([`Shell::start_turn`], through [`crate::session::Start`]); and the
 /// review path, which is the folder the diff and the revert are run in
 /// ([`Shell::reviewing`], read by [`Shell::revert_checkpoint`] and by
 /// [`crate::checkpoints::Diff`]).
@@ -557,7 +557,7 @@ impl Shell {
     /// not move under its feet.
     ///
     /// **What carries it to the child is the next turn's dispatch.**
-    /// [`crate::turn::send`] reads the thread and pushes what has moved on the
+    /// [`crate::session::send`] reads the thread and pushes what has moved on the
     /// agent's control channel before the prompt is written, so a mode changed
     /// here reaches the process already serving the conversation without
     /// replacing it — ticket 11 of `.scratch/thread-lifecycle/`, which also
@@ -1343,12 +1343,12 @@ impl Shell {
         // — so the folder the agent edits is the folder the checkpoint records
         // and the revert puts back. Read off the thread as it stands after the
         // turn request, for the same reason the model and the runtime mode are.
-        let starting = crate::turn::starting(
+        let starting = crate::session::starting(
             &thread,
             &where_the_work_happens(&thread, &project),
             &config.settings.providers.claude_agent,
         );
-        if let Err(why) = crate::turn::send(
+        if let Err(why) = crate::session::send(
             &self.inner.threads,
             &starting,
             turn_id,
@@ -2938,7 +2938,7 @@ mod tests {
             let directory = tempfile::tempdir().expect("a temporary directory");
 
             // **The agent this fixture cannot start.** A turn dispatched here
-            // reaches `turn::send`, which resolves `binaryPath` for real — so
+            // reaches `session::send`, which resolves `binaryPath` for real — so
             // the default `claude` would find the developer's own install and
             // run a real turn against the real API. That is what spec story 61
             // and the ticket forbid, and the default is a bare name precisely
@@ -3043,7 +3043,7 @@ mod tests {
         /// would have to spell absent and blank differently.
         ///
         /// Every caller here expects a refusal. A turn this fixture lets through
-        /// reaches `turn::send`, which wants a runtime and an agent to start —
+        /// reaches `session::send`, which wants a runtime and an agent to start —
         /// see [`Fixture::new`], and `tests/socket_turn.rs` for the turns that
         /// really run.
         fn start_turn(&self, thread_id: &str, fields: Value) -> Result<Value, CommandError> {
