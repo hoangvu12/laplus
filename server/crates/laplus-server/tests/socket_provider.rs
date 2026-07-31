@@ -38,7 +38,7 @@ mod harness;
 
 use harness::agent::FakeAgent;
 use harness::TestServer;
-use laplus_server::config::{ClaudeSettings, ProviderState, ServerConfig};
+use laplus_server::config::{ClaudeSettings, CodexSettings, ProviderState, ServerConfig};
 use laplus_server::process::Search;
 use serde_json::{json, Value};
 
@@ -72,11 +72,122 @@ async fn providers_over_the_socket(server: &TestServer) -> Vec<Value> {
     providers
 }
 
-/// The one provider instance, over the socket.
+/// The Claude provider instance, over the socket.
 async fn provider_over_the_socket(server: &TestServer) -> Value {
     let providers = providers_over_the_socket(server).await;
-    assert_eq!(providers.len(), 1, "v1 ships one provider instance");
-    providers.into_iter().next().expect("a provider")
+    providers
+        .into_iter()
+        .find(|provider| provider["instanceId"] == "claudeAgent")
+        .expect("the Claude provider")
+}
+
+async fn provider_named(server: &TestServer, instance_id: &str) -> Value {
+    providers_over_the_socket(server)
+        .await
+        .into_iter()
+        .find(|provider| provider["instanceId"] == instance_id)
+        .unwrap_or_else(|| panic!("no provider named {instance_id}"))
+}
+
+#[tokio::test]
+async fn codex_probe_reports_its_account_paged_models_reasoning_and_workspace_skills() {
+    let codex = harness::codex::ScriptedCodex::provider_probe();
+    let home = tempfile::tempdir().expect("a CODEX_HOME");
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex = CodexSettings {
+        binary_path: codex.configured(),
+        home_path: home.path().display().to_string(),
+        launch_args: "--config model_reasoning_effort=high".to_string(),
+        ..config.settings.providers.codex
+    };
+    let server = TestServer::start_with(config).await;
+
+    server.refresh_providers(Search::over(&[])).await;
+    codex.assert_reaped();
+    let provider = provider_named(&server, "codex").await;
+
+    assert_eq!(provider["driver"], "codex", "{provider}");
+    assert_eq!(provider["displayName"], "Codex", "{provider}");
+    assert_eq!(provider["status"], "ready", "{provider}");
+    assert_eq!(provider["version"], "0.146.0", "{provider}");
+    assert_eq!(provider["auth"]["status"], "authenticated", "{provider}");
+    assert_eq!(
+        provider["auth"]["email"], "developer@example.com",
+        "{provider}"
+    );
+    assert_eq!(provider["auth"]["type"], "chatgpt", "{provider}");
+    assert_eq!(
+        provider["auth"]["label"], "ChatGPT Pro 5x Subscription",
+        "{provider}"
+    );
+
+    assert_eq!(slugs(&provider), vec!["gpt-5.6-sol", "gpt-5.6-luna"]);
+    assert_eq!(
+        provider["models"][0]["capabilities"]["optionDescriptors"][0],
+        json!({
+            "id": "reasoningEffort",
+            "label": "Reasoning",
+            "type": "select",
+            "options": [
+                {"id": "low", "label": "Low"},
+                {"id": "high", "label": "High", "isDefault": true}
+            ],
+            "currentValue": "high"
+        })
+    );
+    assert_eq!(
+        provider["models"][1]["capabilities"]["optionDescriptors"][0]["options"]
+            .as_array()
+            .map(Vec::len),
+        Some(3),
+        "reasoning efforts belong to each model: {provider}"
+    );
+    assert_eq!(provider["skills"][0]["name"], "tdd", "{provider}");
+    assert_eq!(provider["skills"][0]["scope"], "repo", "{provider}");
+    assert_eq!(
+        provider["skills"][0]["displayName"], "Test Driven Development",
+        "{provider}"
+    );
+
+    assert!(
+        codex.arguments().starts_with("app-server"),
+        "{}",
+        codex.arguments()
+    );
+    assert!(
+        codex.arguments().contains("--config"),
+        "{}",
+        codex.arguments()
+    );
+    assert!(
+        codex.arguments().contains("model_reasoning_effort=high"),
+        "{}",
+        codex.arguments()
+    );
+    assert_eq!(codex.codex_home(), home.path().display().to_string());
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_logged_out_codex_is_named_as_unauthenticated_without_losing_its_models() {
+    // The transport fixture's account response is replaced while all other
+    // responses, including the paged model catalogue, stay the same.
+    let codex = harness::codex::ScriptedCodex::logged_out_provider_probe();
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+
+    server.refresh_providers(Search::over(&[])).await;
+    let provider = provider_named(&server, "codex").await;
+
+    assert_eq!(provider["installed"], true, "{provider}");
+    assert_eq!(provider["status"], "error", "{provider}");
+    assert_eq!(provider["auth"]["status"], "unauthenticated", "{provider}");
+    assert!(message(&provider).contains("codex login"), "{provider}");
+    assert_eq!(slugs(&provider), vec!["gpt-5.6-sol", "gpt-5.6-luna"]);
+
+    server.stop().await;
 }
 
 fn message(provider: &Value) -> String {

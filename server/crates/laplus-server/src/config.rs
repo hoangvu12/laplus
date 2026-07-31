@@ -306,6 +306,12 @@ pub enum ProviderState {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAuth {
     pub status: AuthStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 /// Whether the agent has credentials. `Unknown` is the contract's own literal
@@ -327,11 +333,11 @@ pub struct ProviderModel {
     pub slug: String,
     pub name: String,
     pub is_custom: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
     /// The reasoning-effort, fast-mode and context-window toggles the composer
-    /// shows for this model. `null`, which the contract permits and the client
-    /// reads as "no options", until the ticket that *sends* a turn can honour
-    /// them: advertising a toggle whose value this server would drop on the floor
-    /// is worse than not advertising it.
+    /// shows for this model. Claude has none; Codex carries each live model's
+    /// supported reasoning efforts so a later turn can send the chosen value.
     pub capabilities: Option<serde_json::Value>,
 }
 

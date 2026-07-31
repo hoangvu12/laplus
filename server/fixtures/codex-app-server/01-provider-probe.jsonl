@@ -1,0 +1,16 @@
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.1"},"capabilities":{}}}}
+{"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (Windows 11; x86_64) unknown (laplus/client; 0.1.1)","codexHome":"C:/fixture/codex-home","platformFamily":"windows","platformOs":"windows"}}}
+{"dir":"recv","msg":{"method":"configWarning","params":{"summary":"optional sandbox dependency is unavailable","details":null}}}
+{"dir":"recv","msg":{"method":"remoteControl/status/changed","params":{"status":"disabled"}}}
+{"dir":"recv","msg":{"method":"mcpServer/startupStatus/updated","params":{"name":"codex_apps","status":"starting"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","method":"initialized"}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"account/read","params":{}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":3,"method":"model/list","params":{}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":4,"method":"skills/list","params":{"cwds":["<workspace>"]}}}
+{"dir":"recv","msg":{"method":"fixture/request","id":2,"params":{"note":"server request ids are a separate space"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"laplus does not handle app-server request 'fixture/request' during a provider probe"}}}
+{"dir":"recv","msg":{"id":4,"result":{"data":[{"cwd":"<workspace>","skills":[{"name":"tdd","description":"Build one observable slice at a time.","path":"<workspace>/.agents/skills/tdd/SKILL.md","scope":"repo","enabled":true,"shortDescription":"Red, green, refactor.","interface":{"displayName":"Test Driven Development","shortDescription":"Observable slices."}}],"errors":[]}]}}}
+{"dir":"recv","msg":{"id":2,"result":{"account":{"type":"chatgpt","email":"developer@example.com","planType":"prolite"},"requiresOpenaiAuth":true}}}
+{"dir":"recv","msg":{"id":3,"result":{"data":[{"id":"gpt-5.6-sol","model":"gpt-5.6-sol","displayName":"gpt-5.6-sol","description":"Primary coding model","hidden":false,"isDefault":false,"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Faster"},{"reasoningEffort":"high","description":"Deeper"}]}],"nextCursor":"page-2"}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":5,"method":"model/list","params":{"cursor":"page-2"}}}
+{"dir":"recv","msg":{"id":5,"result":{"data":[{"id":"gpt-5.6-luna","model":"gpt-5.6-luna","displayName":"gpt-5.6-luna","description":"Fast coding model","hidden":false,"isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"minimal","description":"Small"},{"reasoningEffort":"medium","description":"Balanced"},{"reasoningEffort":"high","description":"Deeper"}]}],"nextCursor":null}}}

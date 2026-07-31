@@ -1,11 +1,13 @@
 //! laplus's server: the Rust half of "same UI, tenth of the weight".
 //!
-//! Two wire formats meet here, and keeping them apart is the crate's main
+//! Agent and UI wire formats meet here, and keeping them apart is the crate's main
 //! organising idea:
 //!
 //! - [`protocol`] is what the **agent** speaks — the `claude` CLI's stdio
 //!   NDJSON, lifted out of the STEP 1 spike (`spike-claude-protocol/README.md`)
 //!   once it had answered its question. Pinned by `fixtures/claude-cli/`.
+//! - [`codex`] is the JSON-RPC stdio protocol spoken by `codex app-server`,
+//!   currently for provider probing and pinned by `fixtures/codex-app-server/`.
 //! - [`wire`] is what the **UI** speaks — JSON messages inside WebSocket text
 //!   frames. Pinned by `fixtures/socket-wire/` and described in
 //!   `docs/socket-wire-format.md`.
@@ -42,7 +44,7 @@
 //! The only exception is the copy kept for a client that reconnects, and the
 //! module says why.
 //!
-//! The two formats meet in exactly one place. [`agent`] runs the `claude`
+//! The Claude and UI formats meet in exactly one place. [`agent`] runs the `claude`
 //! subprocess, [`settling`] holds the contract's two lifecycle vocabularies and
 //! the one rule that reads a session's status as how its turn went — the third
 //! copy of a rule upstream keeps in both its server and its client, and the only
@@ -66,6 +68,7 @@ pub mod catalogue;
 pub mod checkpoints;
 pub mod clock;
 pub mod codes;
+pub mod codex;
 pub mod config;
 pub mod config_store;
 pub mod editor;

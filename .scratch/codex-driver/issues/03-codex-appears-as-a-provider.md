@@ -46,29 +46,52 @@ matters. The captures were recorded under it.
 
 **Blocked by:** 02.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Codex appears as a provider instance with a version read from the
+- [x] Codex appears as a provider instance with a version read from the
       handshake's user agent, parsed without assuming the client name is
       slash-free.
-- [ ] The model list is fetched from the agent and paged to exhaustion, and each
+- [x] The model list is fetched from the agent and paged to exhaustion, and each
       model carries its own supported reasoning efforts.
-- [ ] A logged-in account is reported with what it is; a logged-out one is
+- [x] A logged-in account is reported with what it is; a logged-out one is
       reported as **not logged in**, distinct from broken. The model list is
       still offered in that state, because the agent still answers it.
-- [ ] Skills for the workspace populate the composer's `$` menu.
-- [ ] The app-server started for the probe is killed when it has answered.
-- [ ] A configured binary path is used; a configured `CODEX_HOME` is honoured.
-- [ ] `configWarning`, `remoteControl/status/changed` and
+- [x] Skills for the workspace populate the composer's `$` menu.
+- [x] The app-server started for the probe is killed when it has answered.
+- [x] A configured binary path is used; a configured `CODEX_HOME` is honoured.
+- [x] `configWarning`, `remoteControl/status/changed` and
       `mcpServer/startupStatus/updated` arriving before anything is asked do not
       make the provider broken.
-- [ ] `ERROR`-level stderr from a healthy codex does not make the provider
+- [x] `ERROR`-level stderr from a healthy codex does not make the provider
       broken.
-- [ ] Responses are correlated by id, tolerate out-of-order arrival, and decode
+- [x] Responses are correlated by id, tolerate out-of-order arrival, and decode
       without a `jsonrpc` member. The server's own request ids do not collide
       with ours.
-- [ ] An ADR records **one app-server per conversation** and why, because the
+- [x] An ADR records **one app-server per conversation** and why, because the
       protocol permitting the opposite makes the choice surprising to a reader
       who knows it.
-- [ ] `server/CONTEXT.md` gains an **app-server** entry.
-- [ ] The suite runs offline on a machine that has never had `codex` installed.
+- [x] `server/CONTEXT.md` gains an **app-server** entry.
+- [x] The suite runs offline on a machine that has never had `codex` installed.
+
+**Where it landed.** `crate::codex` owns the provider-probe subset of the
+app-server transport. One short-lived child performs the empty-capability
+handshake, then answers `account/read`, paged `model/list` and workspace
+`skills/list`; response ids are correlated independently from app-server request
+ids, notification noise is ignored, and the child is killed and waited for on
+every ending. `crate::provider` publishes the resulting `codex` instance beside
+Claude and re-probes it when Codex settings or registered workspace roots move.
+
+The committed `fixtures/codex-app-server/01-provider-probe.jsonl` drives the
+socket suite without a Codex installation or network access. It covers responses
+without `jsonrpc`, out-of-order answers, overlapping request ids, pagination,
+startup notifications, alarming stderr, account state, per-model reasoning and
+workspace skills. The logged-out variant replaces only the account response, so
+the same live model pages remain available while the provider tells the developer
+to run `codex login`. ADR-0032 records the process topology, and `CONTEXT.md`
+defines app-server.
+
+**Verification.** The focused provider, settings, conformance, provider-unit and
+Codex-unit suites pass; `cargo clippy -p laplus-server --lib --tests` completes
+with its three warnings in unchanged protocol, server and pairing code; and
+`cargo test -p laplus-server --no-fail-fast` completes with no failures. The
+window pass remains ticket 12's end-to-end done bar, after Codex turns exist.

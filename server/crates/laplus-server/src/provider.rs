@@ -3,14 +3,14 @@
 //!
 //! **Nothing here starts an agent that takes a turn.** What this establishes is
 //! that the driver *can* be started — the binary is located, it answers
-//! `--version`, and the answer is published as the one provider instance the UI
-//! routes turns through. [`crate::turn`] is what starts one for real, when a
-//! session opens.
+//! the driver-specific probe, and the answer is published as a provider instance
+//! the UI can select. [`crate::turn`] starts Claude for a real session; Codex
+//! turns begin with the next ticket.
 //!
-//! It does now start one that takes *no* turn: a resolved binary is also asked
-//! what commands and skills it can offer, which is a session opened for one
-//! question and killed on the answer. [`crate::catalogue`] holds the whole of it,
-//! including why that question cannot be answered any other way.
+//! It does now start children that take *no* turn: Claude is asked what commands
+//! it offers, while Codex is asked for its account, models and workspace skills.
+//! Each probe is killed after its answer. [`crate::catalogue`] owns Claude's
+//! command and skill catalogue; [`crate::codex`] owns the Codex probe.
 //!
 //! ## Resolution happens here, not in a child process
 //!
@@ -38,9 +38,9 @@
 //!   through `cmd.exe` on our behalf; on the platform v1 ships the executable is
 //!   a native `claude.exe` in any case. The ticket calls it dead weight, and it
 //!   is.
-//! - **`homePath` and `launchArgs`.** Both describe the environment the *agent*
-//!   runs in. `--version` needs neither, and the process that does belongs to
-//!   the ticket that starts one.
+//! - **Claude's `homePath` and `launchArgs`.** Both describe the environment the
+//!   *agent* runs in. Claude's `--version` probe needs neither. Codex's probe is
+//!   an app-server and therefore does honour both of its corresponding settings.
 //! - **`versionAdvisory`.** Absent, and absent is not a lesser form of what
 //!   upstream sends with update checks off. It would emit the field with
 //!   `status: "unknown"` and four nulls — the `grok` entry in
@@ -48,11 +48,10 @@
 //!   `getProviderVersionAdvisoryPresentation` returns `null` for an `unknown`
 //!   advisory and for a missing one alike. So the two render identically, and
 //!   nothing here has a latest version or an update command to put in one.
-//! - **Authentication.** No credential is read, so `auth.status` is `unknown`,
-//!   which is the contract's own literal for exactly that. The UI renders
-//!   "Installed and ready, but authentication could not be verified" and lets
-//!   the instance be selected, which is the honest state of the world after this
-//!   ticket.
+//! - **Claude authentication.** No Claude credential is read, so its
+//!   `auth.status` is `unknown`, which is the contract's own literal for exactly
+//!   that. Codex answers `account/read`, so its authenticated and unauthenticated
+//!   states are reported explicitly.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -61,7 +60,7 @@ use std::time::{Duration, Instant};
 use crate::catalogue;
 use crate::clock::now_iso;
 use crate::config::{
-    AuthStatus, ClaudeSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
+    AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
 };
 use crate::config_store::{ConfigChange, ConfigStore};
 use crate::process::Search;
@@ -74,10 +73,13 @@ pub const CLAUDE_INSTANCE_ID: &str = "claudeAgent";
 /// field: another instance of this driver would keep this slug and get its own
 /// routing key.
 pub const CLAUDE_DRIVER: &str = "claudeAgent";
+pub const CODEX_INSTANCE_ID: &str = "codex";
+pub const CODEX_DRIVER: &str = "codex";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverKind {
     Claude,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,13 +104,21 @@ impl Registration {
     }
 }
 
-/// The drivers this build can run. Settings may know about a driver before it
-/// joins this registry; registration means turns can actually be dispatched.
-pub const REGISTRY: &[Registration] = &[Registration {
-    instance_id: CLAUDE_INSTANCE_ID,
-    driver: CLAUDE_DRIVER,
-    kind: DriverKind::Claude,
-}];
+/// The drivers this build knows how to route. Settings may know about a driver
+/// before it joins this registry; a registered driver can publish a provider and
+/// be selected by a conversation even when its turn implementation lands later.
+pub const REGISTRY: &[Registration] = &[
+    Registration {
+        instance_id: CLAUDE_INSTANCE_ID,
+        driver: CLAUDE_DRIVER,
+        kind: DriverKind::Claude,
+    },
+    Registration {
+        instance_id: CODEX_INSTANCE_ID,
+        driver: CODEX_DRIVER,
+        kind: DriverKind::Codex,
+    },
+];
 
 pub fn registration(instance_id: &str) -> Option<Registration> {
     REGISTRY
@@ -119,6 +129,10 @@ pub fn registration(instance_id: &str) -> Option<Registration> {
 
 fn claude_registration() -> Registration {
     registration(CLAUDE_INSTANCE_ID).expect("the Claude driver is registered")
+}
+
+fn codex_registration() -> Registration {
+    registration(CODEX_INSTANCE_ID).expect("the Codex driver is registered")
 }
 
 /// What the UI calls this provider. `displayName` is optional in the contract
@@ -188,13 +202,17 @@ impl Located {
     /// found none — and a second wording for the same fact would drift from the
     /// first.
     pub fn startable(self) -> Result<(PathBuf, Source), String> {
+        self.startable_for("Claude Code")
+    }
+
+    fn startable_for(self, product: &str) -> Result<(PathBuf, Source), String> {
         match self {
             Located::Binary { path, source } => Ok((path, source)),
             // `installed: false` although the file exists, because what
             // `installed` claims is that there is an agent here — and a
             // directory or a text file is not one.
             Located::NotExecutable { configured } => Err(format!(
-                "The configured Claude Code binary path {} exists but is not a program this \
+                "The configured {product} binary path {} exists but is not a program this \
                  machine can start. {} PATH was not searched, because a path was configured \
                  and something is there.",
                 configured.display(),
@@ -204,7 +222,7 @@ impl Located {
                 configured,
                 name,
                 directories,
-            } => Err(not_found(configured.as_deref(), &name, &directories)),
+            } => Err(not_found_for(product, configured.as_deref(), &name, &directories)),
         }
     }
 }
@@ -244,6 +262,14 @@ pub enum Source {
 ///   this case to be reported distinctly, and falling back is the one thing that
 ///   would make it indistinguishable.
 pub fn resolve(configured: &str, search: &Search) -> Located {
+    resolve_named(configured, DEFAULT_NAME, search)
+}
+
+fn resolve_codex(configured: &str, search: &Search) -> Located {
+    resolve_named(configured, "codex", search)
+}
+
+fn resolve_named(configured: &str, default_name: &str, search: &Search) -> Located {
     let configured = configured.trim();
     let explicit = names_a_path(configured).then(|| PathBuf::from(configured));
 
@@ -269,7 +295,7 @@ pub fn resolve(configured: &str, search: &Search) -> Located {
         .and_then(|path| path.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| match configured.is_empty() {
-            true => DEFAULT_NAME.to_string(),
+            true => default_name.to_string(),
             false => configured.to_string(),
         });
 
@@ -556,6 +582,7 @@ fn models(version: Option<&str>, custom: &[String]) -> Vec<ProviderModel> {
             slug: model.slug.to_string(),
             name: model.name.to_string(),
             is_custom: false,
+            is_default: None,
             capabilities: None,
         })
         .collect();
@@ -575,6 +602,7 @@ fn models(version: Option<&str>, custom: &[String]) -> Vec<ProviderModel> {
             // write.
             name: slug.trim().to_string(),
             is_custom: true,
+            is_default: None,
             capabilities: None,
         }
     }));
@@ -786,10 +814,20 @@ fn describe_probe(
 /// named one, the command that was looked up, and the directories it was looked
 /// up in. Enough to fix the problem without opening a log file, which is the
 /// criterion.
+#[cfg(test)]
 fn not_found(configured: Option<&Path>, name: &str, directories: &[PathBuf]) -> String {
+    not_found_for("Claude Code", configured, name, directories)
+}
+
+fn not_found_for(
+    product: &str,
+    configured: Option<&Path>,
+    name: &str,
+    directories: &[PathBuf],
+) -> String {
     let mut message = match configured {
         Some(path) => format!(
-            "The configured Claude Code binary path {} does not exist. ",
+            "The configured {product} binary path {} does not exist. ",
             path.display()
         ),
         None => String::new(),
@@ -891,6 +929,9 @@ fn snapshot(
         message,
         auth: ProviderAuth {
             status: AuthStatus::Unknown,
+            r#type: None,
+            label: None,
+            email: None,
         },
         checked_at: now_iso(),
         slash_commands: catalogue.slash_commands,
@@ -904,51 +945,230 @@ fn snapshot(
 /// The store's own ordering guarantee is what makes this safe to call from
 /// anywhere: a change is stored before it is announced, so a subscriber that
 /// opened mid-probe is either told about it or already sees it in its snapshot.
-/// Re-read the skills of the provider already published, and nothing else.
+/// Re-read the skills of every provider already published.
 ///
 /// What a project being registered or removed changes. The `$` menu is built
 /// from a snapshot taken before it, so without this a developer adds a project
 /// and its skills appear on the next restart — which reads as the feature not
 /// working rather than as a stale cache.
 ///
-/// **Not a [`refresh`].** Nothing about which projects exist changes where the
-/// binary is, what version it is, or which commands it knows, so re-probing
-/// would be a `--version` and a handshake — two processes — for a `readdir`. It
-/// also publishes nothing when the answer has not changed, because the config
-/// feed reaches every open window and a project with no skills of its own would
-/// otherwise be a payload saying so.
+/// Claude's skills are files and cost only a scan. Codex exposes them through
+/// `skills/list`, so its existing provider is re-probed with the new roots; one
+/// app-server still answers version, account, models and skills together.
 pub fn rescan_skills(config: &ConfigStore, roots: &[PathBuf]) {
     let current = config.current();
-    let settings = current.settings.providers.claude_agent.clone();
-    if !settings.enabled {
-        return;
+    let settings = current.settings.providers.clone();
+    let mut providers = current.providers.clone();
+    let mut changed = false;
+
+    if settings.claude_agent.enabled {
+        if let Some(provider) = providers
+            .iter_mut()
+            .find(|provider| provider.instance_id == CLAUDE_INSTANCE_ID)
+        {
+            let skills = catalogue::skills(&settings.claude_agent, roots);
+            if provider.skills != skills {
+                provider.skills = skills;
+                changed = true;
+            }
+        }
     }
 
-    let mut providers = current.providers.clone();
-    let Some(provider) = providers
-        .iter_mut()
-        .find(|provider| provider.instance_id == CLAUDE_INSTANCE_ID)
-    else {
-        // Nothing has looked for the agent yet, so there is no snapshot to
-        // amend. The startup probe is still coming and will scan these roots.
-        return;
+    if settings.codex.enabled {
+        if let Some(index) = providers
+            .iter()
+            .position(|provider| provider.instance_id == CODEX_INSTANCE_ID)
+        {
+            providers[index] = describe_codex(
+                &settings.codex,
+                &Search::from_environment(),
+                roots,
+            );
+            changed = true;
+        }
+    }
+
+    if changed {
+        config.apply(ConfigChange::Providers(providers));
+    }
+}
+
+fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) -> Provider {
+    if !settings.enabled {
+        return codex_snapshot(
+            settings,
+            None,
+            Installed::No,
+            ProviderState::Disabled,
+            Some("The Codex provider is switched off in settings.".to_string()),
+            ProviderAuth {
+                status: AuthStatus::Unknown,
+                r#type: None,
+                label: None,
+                email: None,
+            },
+            codex_custom_models(settings),
+            Vec::new(),
+        );
+    }
+
+    let (path, source) = match resolve_codex(&settings.binary_path, search)
+        .startable_for("Codex CLI")
+    {
+        Ok(found) => found,
+        Err(why) => {
+            return codex_snapshot(
+                settings,
+                None,
+                Installed::No,
+                ProviderState::Error,
+                Some(why),
+                ProviderAuth {
+                    status: AuthStatus::Unknown,
+                    r#type: None,
+                    label: None,
+                    email: None,
+                },
+                codex_custom_models(settings),
+                Vec::new(),
+            )
+        }
     };
 
-    let skills = catalogue::skills(&settings, roots);
-    if provider.skills == skills {
-        return;
+    eprintln!("laplus: codex binary {}", path.display());
+    match crate::codex::probe(&path, settings, roots) {
+        Ok(probed) => {
+            let (status, auth_message) = match probed.auth.status {
+                AuthStatus::Unauthenticated => (
+                    ProviderState::Error,
+                    Some("Codex CLI is not authenticated. Run `codex login` and try again.".to_string()),
+                ),
+                AuthStatus::Authenticated | AuthStatus::Unknown => (ProviderState::Ready, None),
+            };
+            let message = match source {
+                Source::OnPath {
+                    instead_of: Some(configured),
+                } => Some(format!(
+                    "The configured Codex CLI binary path {} does not exist, so {} was used \
+                     instead, found on PATH.",
+                    configured.display(),
+                    path.display(),
+                )),
+                _ => auth_message,
+            };
+            codex_snapshot(
+                settings,
+                probed.version,
+                Installed::Yes,
+                status,
+                message,
+                probed.auth,
+                probed.models,
+                probed.skills,
+            )
+        }
+        Err(why) => codex_snapshot(
+            settings,
+            None,
+            Installed::Yes,
+            ProviderState::Error,
+            Some(format!("Codex app-server provider probe failed: {why}.")),
+            ProviderAuth {
+                status: AuthStatus::Unknown,
+                r#type: None,
+                label: None,
+                email: None,
+            },
+            codex_custom_models(settings),
+            Vec::new(),
+        ),
     }
-    provider.skills = skills;
-    config.apply(ConfigChange::Providers(providers));
+}
+
+fn codex_custom_models(settings: &CodexSettings) -> Vec<ProviderModel> {
+    settings
+        .custom_models
+        .iter()
+        .map(|slug| slug.trim())
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| ProviderModel {
+            slug: slug.to_string(),
+            name: slug.to_string(),
+            is_custom: true,
+            is_default: None,
+            capabilities: None,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn codex_snapshot(
+    settings: &CodexSettings,
+    version: Option<String>,
+    installed: Installed,
+    status: ProviderState,
+    message: Option<String>,
+    auth: ProviderAuth,
+    models: Vec<ProviderModel>,
+    skills: Vec<serde_json::Value>,
+) -> Provider {
+    let registered = codex_registration();
+    Provider {
+        instance_id: registered.instance_id.to_string(),
+        driver: registered.driver.to_string(),
+        display_name: "Codex".to_string(),
+        enabled: settings.enabled,
+        installed: installed == Installed::Yes,
+        version,
+        status,
+        message,
+        auth,
+        checked_at: now_iso(),
+        models,
+        slash_commands: Vec::new(),
+        skills,
+    }
 }
 
 pub fn refresh(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
-    let settings = config.current().settings.providers.claude_agent.clone();
-    let provider = describe(&settings, search, roots);
-    if let Some(message) = &provider.message {
+    let settings = config.current().settings.providers.clone();
+    let claude = describe(&settings.claude_agent, search, roots);
+    if let Some(message) = &claude.message {
         eprintln!("laplus: provider claudeAgent: {message}");
     }
-    config.apply(ConfigChange::Providers(vec![provider]));
+    let codex = describe_codex(&settings.codex, search, roots);
+    if let Some(message) = &codex.message {
+        eprintln!("laplus: provider codex: {message}");
+    }
+    config.apply(ConfigChange::Providers(vec![claude, codex]));
+}
+
+pub fn refresh_claude(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
+    let settings = config.current().settings.providers.claude_agent.clone();
+    publish_one(config, describe(&settings, search, roots));
+}
+
+pub fn refresh_codex(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
+    let settings = config.current().settings.providers.codex.clone();
+    publish_one(config, describe_codex(&settings, search, roots));
+}
+
+fn publish_one(config: &ConfigStore, provider: Provider) {
+    let mut providers = config.current().providers.clone();
+    match providers
+        .iter()
+        .position(|held| held.instance_id == provider.instance_id)
+    {
+        Some(index) => providers[index] = provider,
+        None => providers.push(provider),
+    }
+    providers.sort_by_key(|provider| {
+        REGISTRY
+            .iter()
+            .position(|registered| registered.instance_id == provider.instance_id)
+            .unwrap_or(usize::MAX)
+    });
+    config.apply(ConfigChange::Providers(providers));
 }
 
 #[cfg(test)]
@@ -1369,9 +1589,10 @@ mod tests {
         refresh(&store, &fake.on_path(), &[]);
 
         let providers = &store.current().providers;
-        assert_eq!(providers.len(), 1);
+        assert_eq!(providers.len(), REGISTRY.len());
         assert_eq!(providers[0].version.as_deref(), Some("2.1.220"));
         assert_eq!(providers[0].status, ProviderState::Ready);
+        assert_eq!(providers[1].instance_id, CODEX_INSTANCE_ID);
     }
 
     /// Nothing is spawned and nothing is searched for a driver the developer

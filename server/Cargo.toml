@@ -73,6 +73,7 @@ qrcode = { version = "0.14", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+shell-words = "1"
 # The hash `hmac` above is keyed over. Separate crates because RustCrypto keeps
 # the construction and the digest apart; neither is useful here without the
 # other.

@@ -126,6 +126,47 @@ async fn settings_survive_a_restart() {
     restarted.stop().await;
 }
 
+#[tokio::test]
+async fn codex_paths_saved_in_settings_drive_the_next_provider_probe() {
+    let codex = harness::codex::ScriptedCodex::provider_probe();
+    let home = tempfile::tempdir().expect("a CODEX_HOME");
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    update(
+        &mut client,
+        json!({
+            "providers": {
+                "codex": {
+                    "enabled": true,
+                    "binaryPath": codex.configured(),
+                    "homePath": home.path().display().to_string(),
+                    "launchArgs": "--config model_reasoning_effort=high"
+                }
+            }
+        }),
+    )
+    .await
+    .expect_success();
+
+    let config = client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let provider = config["providers"]
+        .as_array()
+        .expect("provider snapshots")
+        .iter()
+        .find(|provider| provider["instanceId"] == "codex")
+        .expect("the Codex provider");
+    assert_eq!(provider["status"], "ready", "{provider}");
+    assert_eq!(codex.codex_home(), home.path().display().to_string());
+    assert!(codex.arguments().contains("model_reasoning_effort=high"));
+    codex.assert_reaped();
+
+    server.stop().await;
+}
+
 /// The Claude instance, configured — and the model list that comes out of it,
 /// which is what "including model selection" means from the composer's side.
 ///

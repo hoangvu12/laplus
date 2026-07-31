@@ -24,6 +24,7 @@
 
 pub mod agent;
 pub mod captures;
+pub mod codex;
 pub mod conversation;
 pub mod shape;
 pub mod terminal;
@@ -123,6 +124,11 @@ struct Session {
 /// A test that means to exercise discovery sets one before starting the server,
 /// and keeps it — which is what the emptiness check below is for.
 fn somewhere_that_is_not_the_developers(config: &mut ServerConfig) {
+    // Never discover or start the developer's real Codex during an offline
+    // suite. Codex tests configure their committed stand-in before this runs.
+    if config.settings.providers.codex.binary_path == "codex" {
+        config.settings.providers.codex.enabled = false;
+    }
     if !config
         .settings
         .providers

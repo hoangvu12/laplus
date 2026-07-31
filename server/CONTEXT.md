@@ -72,6 +72,14 @@ implementation runs it. They happen to both be `claudeAgent` for the first
 entry and are separate fields; `crate::provider::ProviderIdentity` keeps the
 pair durable on the thread.
 
+**App-server** - Codex's JSON-RPC mode, started as `codex app-server` and spoken
+to over newline-delimited JSON on stdio. Responses omit `jsonrpc`, may arrive out
+of order, and are correlated by client request id; requests travelling the other
+way have their own id space. A provider probe owns one short-lived app-server.
+Each Codex conversation will own another for its session, one process per
+conversation by ADR-0032. `crate::codex` is the provider-probe transport and
+decoder.
+
 **Agent session id** — the `claude` CLI's own handle on a conversation, given
 back to it as `--resume`. The one piece of agent-protocol vocabulary that
 reaches the database, because continuity depends on it outliving the process.
@@ -157,12 +165,15 @@ The collision is upstream's word against a VT one and neither is worth renaming.
 snapshot. `crate::catalogue`. Neither is a capability this server implements —
 selecting from either menu only types `/name ` or `$name ` into the prompt, and
 the CLI is what acts on it — so both are read from where the CLI reads them
-rather than written down here.
+rather than written down here. Claude's commands come from its handshake and its
+skills from disk; Codex answers `skills/list` for the registered workspaces in
+the same app-server probe that supplies its account and models.
 
-**Handshake** — the `initialize` control request, and the only way to learn what
-commands a `claude` knows. Its built-ins are compiled in rather than on disk, and
-it writes no `system/init` until it has been given a prompt, so a session is
-opened to ask this one question and killed on the answer.
+**Handshake** — the driver's `initialize` exchange. For Claude it is the only
+way to learn its compiled-in commands, so a session is opened for that question
+and killed on the answer. For Codex it opens the app-server protocol, carries the
+CLI version in `userAgent`, and is followed by the `initialized` notification.
+laplus advertises empty Codex capabilities deliberately.
 
 **Snapshot** — a description of the world that every event after it is a _diff
 against_. Not an optimisation and not merely a first chunk: the client folds an

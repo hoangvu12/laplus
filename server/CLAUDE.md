@@ -3,8 +3,9 @@
 **This file covers `server/`.** The repository root has its own `CLAUDE.md`,
 which is upstream's and is about the TypeScript side.
 
-A Rust server + Tauri shell that drives the `claude` CLI directly, wearing the
-`apps/web` UI from this same repository. See `HANDOFF-rust-server-tauri.md` for
+A Rust server + Tauri shell that drives the `claude` CLI and Codex app-server
+directly, wearing the `apps/web` UI from this same repository. See
+`HANDOFF-rust-server-tauri.md` for
 the plan and `spike-claude-protocol/README.md` for the STEP 1 protocol spike
 that gated it (answered; its code now lives in the workspace).
 

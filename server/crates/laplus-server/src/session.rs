@@ -349,6 +349,7 @@ pub struct Start {
 #[derive(Debug, Clone)]
 pub enum DriverStart {
     Claude(ClaudeSettings),
+    Codex(crate::config::CodexSettings),
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +362,7 @@ impl DriverStart {
     pub(crate) fn claude(&self) -> Result<&ClaudeSettings, String> {
         match self {
             DriverStart::Claude(settings) => Ok(settings),
+            DriverStart::Codex(_) => Err("the Codex turn driver has not landed yet".to_string()),
         }
     }
 }
@@ -386,6 +388,10 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> 
                     driving, starting, incoming, signals, epoch,
                 ))
             })
+        }
+        DriverStart::Codex(_) => {
+            return Err("Codex provider probing is available, but Codex turns are not yet supported."
+                .to_string())
         }
     };
 
@@ -1786,6 +1792,7 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
         crate::provider::DriverKind::Claude => {
             DriverStart::Claude(settings.providers.claude_agent.clone())
         }
+        crate::provider::DriverKind::Codex => DriverStart::Codex(settings.providers.codex.clone()),
     };
 
     Ok(PreparedDriver { registered, driver })

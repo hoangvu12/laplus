@@ -34,8 +34,8 @@
 //!   It streams; ticket 10's second criterion requires it. A switch that turned
 //!   it off would be a switch that did nothing.
 //! - **`providerInstances`** is upstream's driver-agnostic instance map, which
-//!   v1 does not have — it ships one driver, configured through
-//!   `providers.claudeAgent`.
+//!   this server does not write yet; its two built-in instances are configured
+//!   through `providers.claudeAgent` and `providers.codex`.
 //!
 //! A patch that would **change** either is refused rather than ignored, because
 //! a settings panel whose control moves back on its own is worse than one that
@@ -276,8 +276,8 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
             }
             "providerInstances" => {
                 if object(field, value)? != &next.provider_instances {
-                    return Err("This server configures its one provider through \
-                                'providers.claudeAgent' rather than through \
+                    return Err("This server configures its built-in providers through \
+                                'providers.claudeAgent' and 'providers.codex' rather than through \
                                 'providerInstances'."
                         .to_string());
                 }
@@ -493,14 +493,15 @@ impl Update {
         store: &crate::config_store::ConfigStore,
         roots: &[std::path::PathBuf],
     ) -> Result<Value, Value> {
-        let changes_claude = self
+        let changed = self
             .patch
             .get("providers")
-            .and_then(Value::as_object)
-            .is_some_and(|providers| providers.contains_key("claudeAgent"));
+            .and_then(Value::as_object);
+        let changes_claude = changed.is_some_and(|providers| providers.contains_key("claudeAgent"));
+        let changes_codex = changed.is_some_and(|providers| providers.contains_key("codex"));
         let settings = store.reconfigure(|settings| apply(settings, &self.patch))?;
 
-        // **Claude is re-checked when its configuration moved**, and only then.
+        // A provider is re-checked when its configuration moved, and only then.
         // A new `binaryPath` points at a different install with a
         // different version, and a new `customModels` list is a different set of
         // slugs to offer — neither of which the picker would show until
@@ -510,11 +511,13 @@ impl Update {
         //
         // After the write rather than before, so a refused patch cannot start a
         // process; and inline, because this is already off the read loop and the
-        // developer is waiting for the answer that says it worked. Codex
-        // settings are stored but do not launch or probe anything until its
-        // driver lands.
+        // developer is waiting for the answer that says it worked.
+        let search = crate::process::Search::from_environment();
         if changes_claude {
-            crate::provider::refresh(store, &crate::process::Search::from_environment(), roots);
+            crate::provider::refresh_claude(store, &search, roots);
+        }
+        if changes_codex {
+            crate::provider::refresh_codex(store, &search, roots);
         }
         Ok(settings)
     }
