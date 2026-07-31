@@ -5,8 +5,6 @@ use serde_json::{json, Value};
 
 use crate::config::{AuthStatus, ProviderAuth, ProviderModel};
 
-const PREFERRED_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra"];
-
 #[derive(Debug, Clone)]
 pub(crate) enum Request {
     Initialize,
@@ -297,18 +295,6 @@ pub(crate) fn custom_models(custom: &[String]) -> Vec<ProviderModel> {
     models
 }
 
-pub(crate) fn prefer_default(models: &mut [ProviderModel]) {
-    let preferred = PREFERRED_MODELS.iter().find(|slug| {
-        models
-            .iter()
-            .any(|model| !model.is_custom && model.slug == **slug)
-    });
-    let Some(preferred) = preferred else { return };
-    for model in models {
-        model.is_default = (model.slug == *preferred).then_some(true);
-    }
-}
-
 fn reasoning_label(effort: &str) -> String {
     match effort {
         "none" => "None",
@@ -439,6 +425,7 @@ fn version_in(user_agent: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
 
     use serde_json::{json, Value};
@@ -472,6 +459,63 @@ mod tests {
             }
             .message(5),
         ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn the_provider_fixture_received_half_folds_to_the_expected_snapshot() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/codex-app-server");
+        let fixture = std::fs::read_to_string(directory.join("01-provider-probe.jsonl"))
+            .expect("reads the provider fixture");
+        let mut responses = HashMap::new();
+        let mut notifications = 0;
+        let mut server_requests = Vec::new();
+        for record in fixture
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a fixture record"))
+            .filter(|record| record["dir"] == "recv")
+        {
+            match decode_incoming(&record["msg"].to_string()).expect("a received message") {
+                Incoming::Notification => notifications += 1,
+                Incoming::Request { id, method } => {
+                    server_requests.push(json!({"id": id, "method": method}));
+                }
+                Incoming::Response { id, result } => {
+                    responses.insert(id, result.expect("a successful fixture response"));
+                }
+            }
+        }
+
+        let version = decode_initialize(responses.remove(&1).expect("initialize response"))
+            .expect("the version");
+        let auth = decode_account(responses.remove(&2).expect("account response"))
+            .expect("the account");
+        let skills = decode_skills(responses.remove(&4).expect("skills response"))
+            .expect("the skills");
+        let first = decode_models(responses.remove(&3).expect("first model page"))
+            .expect("the first models");
+        assert_eq!(first.next_cursor.as_deref(), Some("page-2"));
+        let last = decode_models(responses.remove(&5).expect("last model page"))
+            .expect("the last models");
+        assert_eq!(last.next_cursor, None);
+        let mut models = first.models;
+        models.extend(last.models);
+
+        let actual = json!({
+            "version": version,
+            "auth": auth,
+            "models": models,
+            "skills": skills,
+            "notificationsIgnored": notifications,
+            "serverRequests": server_requests,
+        });
+        let expected: Value = serde_json::from_str(
+            &std::fs::read_to_string(directory.join("01-provider-probe.expected.json"))
+                .expect("reads the expected provider fold"),
+        )
+        .expect("the expected provider fold is JSON");
 
         assert_eq!(actual, expected);
     }

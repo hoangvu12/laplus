@@ -112,8 +112,9 @@ root, so cargo commands are run from this directory.
   the repository secret of the same name — never in the tree, which `.gitignore`
   enforces. Losing it strands every existing install.
 
-- `fixtures/` — committed test inputs for the two protocols: `socket-wire/` is
-  what the UI speaks, `claude-cli/` is what the agent speaks. Both have READMEs.
+- `fixtures/` — committed test inputs for the three protocols: `socket-wire/`
+  is what the UI speaks, `claude-cli/` is what the Claude driver speaks, and
+  `codex-app-server/` is Codex's bidirectional JSON-RPC. All have READMEs.
 - `tools/wire-capture/` — the recording proxy used to produce `socket-wire/`.
 - `tools/ui-driver/` — a headless browser pointed at a running laplus, over
   the DevTools protocol. The other end of the same wire: `wire-capture` records

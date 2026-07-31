@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use serde_json::Value;
 
@@ -201,10 +202,25 @@ impl ScriptedCodex {
                 "the app-server behind the launcher is still running: {listed}"
             );
         }
+        #[cfg(not(windows))]
+        assert!(!self.running(), "the app-server process is still running");
         let moved = self.directory.path().join("reaped-codex");
         std::fs::rename(self.app_server_path(), &moved)
             .expect("the app-server behind the launcher is still running after refresh returned");
         std::fs::rename(moved, self.app_server_path()).expect("restores the fixture executable");
+    }
+
+    #[cfg(not(windows))]
+    pub fn running(&self) -> bool {
+        let pid = std::fs::read_to_string(self.directory.path().join("app-server-pid"))
+            .expect("the app-server recorded its process id");
+        std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     fn path(&self) -> PathBuf {
@@ -262,6 +278,7 @@ while ($true) { Start-Sleep -Seconds 1 }
             .to_string()
         } else {
             "#!/bin/sh\n\
+             printf '%s\\n' \"$$\" > \"$(dirname \"$0\")/app-server-pid\"\n\
              requests=\"$(dirname \"$0\")/requests\"\n\
              : > \"$requests\"\n\
              read_request() {\n\

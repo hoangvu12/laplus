@@ -18,6 +18,7 @@ function provider(input: {
   availability?: ServerProvider["availability"];
   displayName?: string;
   status?: ServerProvider["status"];
+  authStatus?: ServerProvider["auth"]["status"];
   models?: ServerProvider["models"];
 }): ServerProvider {
   return {
@@ -29,7 +30,7 @@ function provider(input: {
     version: null,
     status: input.status ?? "ready",
     ...(input.availability ? { availability: input.availability } : {}),
-    auth: { status: "authenticated" },
+    auth: { status: input.authStatus ?? "authenticated" },
     checkedAt: "2026-01-01T00:00:00.000Z",
     models: input.models ?? [],
     slashCommands: [],
@@ -62,6 +63,20 @@ describe("isProviderInstancePickerReady", () => {
   it("accepts an enabled, available, ready instance", () => {
     const [entry] = deriveProviderInstanceEntries([
       provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+    ]);
+
+    expect(entry && isProviderInstancePickerReady(entry)).toBe(true);
+  });
+
+  it("accepts models from an installed instance that only needs authentication", () => {
+    const [entry] = deriveProviderInstanceEntries([
+      provider({
+        provider: ProviderDriverKind.make("codex"),
+        instanceId: "codex",
+        status: "error",
+        authStatus: "unauthenticated",
+        models: [model("gpt-5.6-sol")],
+      }),
     ]);
 
     expect(entry && isProviderInstancePickerReady(entry)).toBe(true);

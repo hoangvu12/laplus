@@ -663,6 +663,7 @@ impl Server {
     /// left that can show it to them.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
+        self.state.config().stop_provider_processes().await;
         let _ = self.serving.await;
         self.state.services.shell.threads().shutdown().await;
         self.state.services.terminals.shutdown().await;

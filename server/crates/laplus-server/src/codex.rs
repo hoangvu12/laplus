@@ -16,8 +16,10 @@ use serde_json::Value;
 
 use crate::codex_protocol::{self as protocol, Incoming, Request};
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
+use crate::config_store::ProviderProcessLifetime;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 pub struct Snapshot {
     pub version: Option<String>,
     pub auth: ProviderAuth,
@@ -25,17 +27,19 @@ pub struct Snapshot {
     pub skills: Vec<Value>,
 }
 
-pub fn probe(
+pub(crate) fn probe(
     binary: &Path,
     settings: &CodexSettings,
     roots: &[PathBuf],
+    lifetime: &ProviderProcessLifetime,
 ) -> Result<Snapshot, String> {
+    let _active_process = lifetime.begin()?;
     let cwd = roots
         .first()
         .cloned()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut client = Client::start(binary, settings, &cwd)?;
+    let mut client = Client::start(binary, settings, &cwd, lifetime.clone())?;
 
     let version = protocol::decode_initialize(client.request(Request::Initialize)?)?;
     client.write(&protocol::initialized())?;
@@ -66,7 +70,6 @@ pub fn probe(
         )?;
     }
     protocol::append_custom_models(&mut models, &settings.custom_models);
-    protocol::prefer_default(&mut models);
 
     Ok(Snapshot {
         version: Some(version),
@@ -84,10 +87,16 @@ struct Client {
     responses: HashMap<u64, Result<Value, String>>,
     next_id: u64,
     stderr: Arc<Mutex<Option<String>>>,
+    lifetime: ProviderProcessLifetime,
 }
 
 impl Client {
-    fn start(binary: &Path, settings: &CodexSettings, cwd: &Path) -> Result<Client, String> {
+    fn start(
+        binary: &Path,
+        settings: &CodexSettings,
+        cwd: &Path,
+        lifetime: ProviderProcessLifetime,
+    ) -> Result<Client, String> {
         let launch_args = shell_words::split(&settings.launch_args)
             .map_err(|error| format!("Codex launch arguments could not be read: {error}"))?;
         let mut command = Command::new(binary);
@@ -147,6 +156,7 @@ impl Client {
             responses: HashMap::new(),
             next_id: 1,
             stderr,
+            lifetime,
         })
     }
 
@@ -176,30 +186,21 @@ impl Client {
     fn wait(&mut self, wanted: u64) -> Result<Value, String> {
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
+            if self.lifetime.is_cancelled() {
+                return Err("Codex provider probe was cancelled during server shutdown".to_string());
+            }
             if let Some(response) = self.responses.remove(&wanted) {
                 return response;
             }
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .unwrap_or_default();
-            let line = self.output.recv_timeout(remaining).map_err(|error| {
-                let request = self
-                    .pending
-                    .get(&wanted)
-                    .map(String::as_str)
-                    .unwrap_or("unknown request");
-                let last = self
-                    .stderr
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                match last {
-                    Some(last) => format!(
-                        "Codex stopped answering {request} ({error}); stderr ended with: {last}"
-                    ),
-                    None => format!("Codex stopped answering {request} ({error})"),
-                }
-            })?;
+            let wait = remaining.min(CANCELLATION_POLL);
+            let line = match self.output.recv_timeout(wait) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) if wait < remaining => continue,
+                Err(error) => return Err(self.wait_error(wanted, error)),
+            };
             match protocol::decode_incoming(&line)? {
                 // A method plus an id is app-server asking us something. Its id
                 // is independent from, and never looked up in, `pending`.
@@ -213,6 +214,25 @@ impl Client {
                     }
                 }
             }
+        }
+    }
+
+    fn wait_error(&self, wanted: u64, error: mpsc::RecvTimeoutError) -> String {
+        let request = self
+            .pending
+            .get(&wanted)
+            .map(String::as_str)
+            .unwrap_or("unknown request");
+        let last = self
+            .stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match last {
+            Some(last) => format!(
+                "Codex stopped answering {request} ({error}); stderr ended with: {last}"
+            ),
+            None => format!("Codex stopped answering {request} ({error})"),
         }
     }
 }

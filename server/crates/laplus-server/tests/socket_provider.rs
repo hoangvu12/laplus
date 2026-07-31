@@ -124,6 +124,12 @@ async fn codex_probe_reports_its_account_paged_models_reasoning_and_workspace_sk
 
     assert_eq!(slugs(&provider), vec!["gpt-5.6-sol", "gpt-5.6-luna"]);
     assert_eq!(
+        provider["models"][0].get("isDefault"),
+        None,
+        "laplus must not replace the agent's default: {provider}"
+    );
+    assert_eq!(provider["models"][1]["isDefault"], true, "{provider}");
+    assert_eq!(
         provider["models"][0]["capabilities"]["optionDescriptors"][0],
         json!({
             "id": "reasoningEffort",
@@ -226,7 +232,7 @@ async fn a_logged_out_codex_keeps_login_guidance_when_a_stale_path_falls_back() 
     let missing = tempfile::tempdir()
         .expect("a stale install directory")
         .path()
-        .join("codex.cmd");
+        .join(if cfg!(windows) { "codex.cmd" } else { "codex" });
     let mut config = ServerConfig::detect();
     config.settings.providers.codex.binary_path = missing.display().to_string();
     let server = TestServer::start_with(config).await;
@@ -242,6 +248,43 @@ async fn a_logged_out_codex_keeps_login_guidance_when_a_stale_path_falls_back() 
     assert!(diagnostic.contains("codex login"), "{diagnostic}");
 
     server.stop().await;
+}
+
+#[tokio::test]
+async fn server_shutdown_cancels_and_reaps_an_in_flight_codex_probe() {
+    let codex = harness::codex::ScriptedCodex::blocked_provider_probe_with_email(
+        "blocked@example.com",
+    );
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+
+    server.probe_provider();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !codex.started() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the Codex probe never reached its blocked response"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    server.stop().await;
+
+    #[cfg(not(windows))]
+    {
+        let survived_shutdown = codex.running();
+        if survived_shutdown {
+            codex.release();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while codex.running() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        assert!(!survived_shutdown, "Codex outlived orderly server shutdown");
+    }
+    #[cfg(windows)]
+    codex.assert_reaped();
 }
 
 fn message(provider: &Value) -> String {
@@ -578,9 +621,27 @@ async fn the_resolved_provider_reaches_an_open_subscriber() {
         .refresh_providers(Search::over(&[agent.directory()]))
         .await;
 
-    let event = client.next_event(&subscription).await;
+    let events = client
+        .values_until(&subscription, |event| {
+            event["payload"]["providers"]
+                .as_array()
+                .is_some_and(|providers| {
+                    providers
+                        .iter()
+                        .any(|provider| provider["instanceId"] == "codex")
+                })
+        })
+        .await;
+    let event = events.last().expect("the provider update");
     assert_eq!(event["type"], json!("providerStatuses"));
-    let streamed = &event["payload"]["providers"][0];
+    let streamed = event["payload"]["providers"]
+        .as_array()
+        .and_then(|providers| {
+            providers
+                .iter()
+                .find(|provider| provider["instanceId"] == "claudeAgent")
+        })
+        .expect("the streamed Claude provider");
     assert_eq!(streamed["status"], json!("ready"));
     assert_eq!(streamed["version"], json!("2.1.220"));
 

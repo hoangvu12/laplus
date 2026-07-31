@@ -25,10 +25,11 @@
 //! event vocabulary, closed to the contract's three update members.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::config::{ConfigIssue, Provider, ResolvedKeybinding, ServerConfig, Settings};
 use crate::subscriptions::{EventSource, BACKLOG};
@@ -47,6 +48,7 @@ pub struct ConfigStore {
 struct Inner {
     current: RwLock<Arc<ServerConfig>>,
     provider_probes: Mutex<HashMap<String, u64>>,
+    provider_processes: ProviderProcessLifetime,
     updates: broadcast::Sender<Value>,
 }
 
@@ -55,6 +57,81 @@ struct Inner {
 pub(crate) struct ProviderProbe {
     instance_id: String,
     generation: u64,
+}
+
+/// The shutdown boundary shared by every short-lived provider process.
+///
+/// A guard remains active until the child has been reaped, so server shutdown
+/// can cancel blocked protocol reads and wait for the process rather than only
+/// for the task that happened to start it.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderProcessLifetime {
+    state: Arc<ProviderProcessState>,
+}
+
+#[derive(Debug)]
+struct ProviderProcessState {
+    cancelled: AtomicBool,
+    active: AtomicUsize,
+    finished: Notify,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveProviderProcess {
+    lifetime: ProviderProcessLifetime,
+}
+
+impl ProviderProcessLifetime {
+    fn new() -> ProviderProcessLifetime {
+        ProviderProcessLifetime {
+            state: Arc::new(ProviderProcessState {
+                cancelled: AtomicBool::new(false),
+                active: AtomicUsize::new(0),
+                finished: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn begin(&self) -> Result<ActiveProviderProcess, String> {
+        if self.is_cancelled() {
+            return Err("Codex provider probe was cancelled during server shutdown".to_string());
+        }
+        self.state.active.fetch_add(1, Ordering::AcqRel);
+        if self.is_cancelled() {
+            self.finish_one();
+            return Err("Codex provider probe was cancelled during server shutdown".to_string());
+        }
+        Ok(ActiveProviderProcess {
+            lifetime: self.clone(),
+        })
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancel_and_wait(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        loop {
+            let finished = self.state.finished.notified();
+            if self.state.active.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            finished.await;
+        }
+    }
+
+    fn finish_one(&self) {
+        if self.state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.state.finished.notify_one();
+        }
+    }
+}
+
+impl Drop for ActiveProviderProcess {
+    fn drop(&mut self) {
+        self.lifetime.finish_one();
+    }
 }
 
 /// A change to the server configuration, in the terms the client can project.
@@ -123,6 +200,7 @@ impl ConfigStore {
             inner: Arc::new(Inner {
                 current: RwLock::new(Arc::new(config)),
                 provider_probes: Mutex::new(HashMap::new()),
+                provider_processes: ProviderProcessLifetime::new(),
                 updates: broadcast::channel(BACKLOG).0,
             }),
         }
@@ -157,6 +235,14 @@ impl ConfigStore {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(&current)
+    }
+
+    pub(crate) fn provider_process_lifetime(&self) -> ProviderProcessLifetime {
+        self.inner.provider_processes.clone()
+    }
+
+    pub(crate) async fn stop_provider_processes(&self) {
+        self.inner.provider_processes.cancel_and_wait().await;
     }
 
     /// Apply a change and tell every subscriber about it.

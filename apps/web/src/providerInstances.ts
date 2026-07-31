@@ -69,9 +69,15 @@ export interface ProviderInstanceEntry {
  *
  * Disabling an instance updates `enabled` independently, while its previous
  * `ready` probe status can remain in the streamed snapshot until reconciliation.
+ * An unauthenticated Codex is the one non-ready case with a usable live
+ * catalogue: its error state keeps the login guidance visible while its models
+ * remain available as the server contract promises.
  */
 export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled && entry.isAvailable && entry.status === "ready";
+  const hasUsableCatalogue =
+    entry.status === "ready" ||
+    (entry.status === "error" && entry.snapshot.auth.status === "unauthenticated");
+  return entry.enabled && entry.isAvailable && hasUsableCatalogue;
 }
 
 /** Picker rails contain configured, enabled instances only. */

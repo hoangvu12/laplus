@@ -46,7 +46,7 @@ matters. The captures were recorded under it.
 
 **Blocked by:** 02.
 
-**Status:** done
+**Status:** ready-for-human
 
 - [x] Codex appears as a provider instance with a version read from the
       handshake's user agent, parsed without assuming the client name is
@@ -90,8 +90,18 @@ the same live model pages remain available while the provider tells the develope
 to run `codex login`. ADR-0032 records the process topology, and `CONTEXT.md`
 defines app-server.
 
-**Verification.** The focused provider, settings, conformance, provider-unit and
-Codex-unit suites pass; `cargo clippy -p laplus-server --lib --tests` completes
-with its three warnings in unchanged protocol, server and pairing code; and
-`cargo test -p laplus-server --no-fail-fast` completes with no failures. The
-window pass remains ticket 12's end-to-end done bar, after Codex turns exist.
+**Verification.** The focused provider, settings, provider-unit and Codex-unit
+suites pass. The web package typechecks, its targeted lint is clean, and all
+1,465 unit tests pass. `cargo clippy -p laplus-server --lib --tests` completes
+with its three warnings in unchanged protocol, server and pairing code. The full
+server suite ran with every ticket-focused test green; two unrelated existing
+tests remain red in isolation (`watcher::...a_file_written_outside...` times out
+waiting for inotify, and `a_call_that_names_no_size...` observes only its echoed
+commands before asserting).
+
+The production bundle was also driven through `tools/ui-driver` against the real
+installed Codex 0.146.0. Authenticated, the picker showed the Codex rail and all
+seven live models. With an empty `CODEX_HOME`, the probe reported
+**unauthenticated**, the picker still showed the live Codex catalogue, and
+selecting one displayed the explicit login guidance. The benign bubblewrap
+`ERROR` appeared on stderr in both passes without breaking the provider.

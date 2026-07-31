@@ -927,12 +927,7 @@ fn snapshot(
         version,
         status,
         message,
-        auth: ProviderAuth {
-            status: AuthStatus::Unknown,
-            r#type: None,
-            label: None,
-            email: None,
-        },
+        auth: unknown_auth(),
         checked_at: now_iso(),
         slash_commands: catalogue.slash_commands,
         skills: catalogue.skills,
@@ -979,7 +974,11 @@ pub(crate) fn reserve_skill_rescan(config: &ConfigStore) -> ProbeReservations {
         claude: (current.settings.providers.claude_agent.enabled
             && present(CLAUDE_INSTANCE_ID))
         .then(|| config.begin_provider_probe(CLAUDE_INSTANCE_ID)),
-        codex: (current.settings.providers.codex.enabled && present(CODEX_INSTANCE_ID))
+        codex: current
+            .settings
+            .providers
+            .codex
+            .enabled
             .then(|| config.begin_provider_probe(CODEX_INSTANCE_ID)),
     }
 }
@@ -1016,10 +1015,12 @@ pub(crate) fn rescan_skills_reserved(
     }
 
     if let Some(probe) = probes.codex {
+        let lifetime = config.provider_process_lifetime();
         let provider = describe_codex(
             &settings.codex,
             &Search::from_environment(),
             roots,
+            &lifetime,
         );
         publish_one(
             config,
@@ -1030,7 +1031,12 @@ pub(crate) fn rescan_skills_reserved(
     }
 }
 
-fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) -> Provider {
+fn describe_codex(
+    settings: &CodexSettings,
+    search: &Search,
+    roots: &[PathBuf],
+    lifetime: &crate::config_store::ProviderProcessLifetime,
+) -> Provider {
     if !settings.enabled {
         return codex_snapshot(
             settings,
@@ -1038,12 +1044,7 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
             Installed::No,
             ProviderState::Disabled,
             Some("The Codex provider is switched off in settings.".to_string()),
-            ProviderAuth {
-                status: AuthStatus::Unknown,
-                r#type: None,
-                label: None,
-                email: None,
-            },
+            unknown_auth(),
             crate::codex_protocol::custom_models(&settings.custom_models),
             Vec::new(),
         );
@@ -1060,12 +1061,7 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
                 Installed::No,
                 ProviderState::Error,
                 Some(why),
-                ProviderAuth {
-                    status: AuthStatus::Unknown,
-                    r#type: None,
-                    label: None,
-                    email: None,
-                },
+                unknown_auth(),
                 crate::codex_protocol::custom_models(&settings.custom_models),
                 Vec::new(),
             )
@@ -1073,7 +1069,7 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
     };
 
     eprintln!("laplus: codex binary {}", path.display());
-    match crate::codex::probe(&path, settings, roots) {
+    match crate::codex::probe(&path, settings, roots, lifetime) {
         Ok(probed) => {
             let (status, auth_message) = match probed.auth.status {
                 AuthStatus::Unauthenticated => (
@@ -1119,12 +1115,7 @@ fn describe_codex(settings: &CodexSettings, search: &Search, roots: &[PathBuf]) 
             Installed::Yes,
             ProviderState::Error,
             Some(format!("Codex app-server provider probe failed: {why}.")),
-            ProviderAuth {
-                status: AuthStatus::Unknown,
-                r#type: None,
-                label: None,
-                email: None,
-            },
+            unknown_auth(),
             crate::codex_protocol::custom_models(&settings.custom_models),
             Vec::new(),
         ),
@@ -1160,6 +1151,15 @@ fn codex_snapshot(
     }
 }
 
+fn unknown_auth() -> ProviderAuth {
+    ProviderAuth {
+        status: AuthStatus::Unknown,
+        r#type: None,
+        label: None,
+        email: None,
+    }
+}
+
 pub fn refresh(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
     let probes = reserve_probes(config);
     refresh_reserved(config, search, roots, probes);
@@ -1183,7 +1183,8 @@ pub(crate) fn refresh_reserved(
         claude,
     );
 
-    let codex = describe_codex(&settings.codex, search, roots);
+    let lifetime = config.provider_process_lifetime();
+    let codex = describe_codex(&settings.codex, search, roots, &lifetime);
     if let Some(message) = &codex.message {
         eprintln!("laplus: provider codex: {message}");
     }
@@ -1205,7 +1206,8 @@ pub fn refresh_claude(config: &ConfigStore, search: &Search, roots: &[PathBuf]) 
 pub fn refresh_codex(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
     let probe = config.begin_provider_probe(CODEX_INSTANCE_ID);
     let settings = config.current().settings.providers.codex.clone();
-    let provider = describe_codex(&settings, search, roots);
+    let lifetime = config.provider_process_lifetime();
+    let provider = describe_codex(&settings, search, roots, &lifetime);
     publish_one(config, probe, ExpectedSettings::Codex(settings), provider);
 }
 
@@ -1670,6 +1672,21 @@ mod tests {
         assert_eq!(providers[0].version.as_deref(), Some("2.1.220"));
         assert_eq!(providers[0].status, ProviderState::Ready);
         assert_eq!(providers[1].instance_id, CODEX_INSTANCE_ID);
+    }
+
+    #[test]
+    fn a_workspace_change_supersedes_an_initial_codex_probe_before_it_publishes() {
+        let store = ConfigStore::new(crate::config::ServerConfig::detect());
+        let initial = reserve_probes(&store)
+            .codex
+            .expect("the initial Codex probe is reserved");
+        let rescan = reserve_skill_rescan(&store);
+
+        assert!(
+            rescan.codex.is_some(),
+            "an enabled Codex provider needs a new probe even before its first snapshot lands"
+        );
+        assert!(!store.apply_providers_if_current(initial, |_| true, |_| Vec::new()));
     }
 
     /// Nothing is spawned and nothing is searched for a driver the developer

@@ -158,7 +158,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
 
   /**
    * Lookup table keyed by `instanceId`. Used for display name + driver
-   * kind enrichment and for `ready`/enabled filtering before flattening
+   * kind enrichment and for selectable/enabled filtering before flattening
    * models into the search list.
    */
   const entryByInstanceId = useMemo(
