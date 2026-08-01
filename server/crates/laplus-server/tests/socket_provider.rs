@@ -42,17 +42,18 @@ use laplus_server::config::{ClaudeSettings, CodexSettings, ProviderState, Server
 use laplus_server::process::Search;
 use serde_json::{json, Value};
 
-async fn opencode_peer() -> String {
+async fn opencode_peer(include_connected: bool) -> String {
     use axum::{routing::get, Json, Router};
+    let mut inventory = json!({
+        "providers": [
+            {"id":"anthropic","models":{"claude-sonnet":{"id":"claude-sonnet","name":"Claude Sonnet","variants":{"fast":{},"max":{}}}}},
+            {"id":"offline","models":{"ghost":{"id":"ghost"}}}
+        ]
+    });
+    if include_connected { inventory["connected"] = json!(["anthropic"]); }
     let app = Router::new()
         .route("/global/health", get(|| async { Json(json!({"healthy": true, "version": "1.18.10"})) }))
-        .route("/provider", get(|| async { Json(json!({
-            "connected": ["anthropic"],
-            "providers": [
-                {"id":"anthropic","models":{"claude-sonnet":{"id":"claude-sonnet","name":"Claude Sonnet","variants":{"fast":{},"max":{}}}}},
-                {"id":"offline","models":{"ghost":{"id":"ghost"}}}
-            ]
-        })) }))
+        .route("/provider", get(move || { let inventory = inventory.clone(); async move { Json(inventory) } }))
         .route("/agent", get(|| async { Json(json!([
             {"name":"build","mode":"primary","hidden":false},
             {"name":"secret","mode":"primary","hidden":true},
@@ -280,7 +281,7 @@ async fn a_targeted_refresh_accepts_a_configured_codex_instance() {
 
 #[tokio::test]
 async fn external_opencode_instances_discover_independently_and_keep_custom_fallbacks() {
-    let endpoint = opencode_peer().await;
+    let endpoint = opencode_peer(true).await;
     let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     let server = TestServer::start().await;
     let mut client = server.connect().await;
@@ -304,12 +305,28 @@ async fn external_opencode_instances_discover_independently_and_keep_custom_fall
     server.stop().await;
 }
 
+
+#[tokio::test]
+async fn external_opencode_refuses_inventory_that_does_not_name_connected_providers() {
+    let endpoint = opencode_peer(false).await;
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openIncomplete":{"driver":"opencode","displayName":"OpenCode Incomplete","config":{"serverUrl":endpoint}}
+    }}})).await.expect_success();
+    let provider = provider_named(&server, "openIncomplete").await;
+    assert_eq!(provider["status"], "error", "{provider}");
+    assert!(message(&provider).contains("connected-provider list"), "{provider}");
+    assert!(slugs(&provider).is_empty(), "{provider}");
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions() {
     let current = FakeAgent::saying(if cfg!(windows) {
-        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo {\"connected\":[\"openai\"],\"providers\":[{\"id\":\"openai\",\"models\":{\"gpt-5\":{\"id\":\"gpt-5\"}}}]} & exit /b 0\r\nif \"%1\"==\"agent\" echo [{\"name\":\"build\",\"mode\":\"primary\",\"hidden\":false}] & exit /b 0\r\nexit /b 2"
+        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo helper ^(subagent^)& exit /b 0\r\nexit /b 2"
     } else {
-        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) echo '{\"connected\":[\"openai\"],\"providers\":[{\"id\":\"openai\",\"models\":{\"gpt-5\":{\"id\":\"gpt-5\"}}}]}' ;;\nagent) echo '[{\"name\":\"build\",\"mode\":\"primary\",\"hidden\":false}]' ;;\n*) exit 2;;\nesac"
+        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'helper (subagent)' ;;\n*) exit 2;;\nesac"
     });
     let old = FakeAgent::saying("echo 1.14.18");
     let server = TestServer::start().await;
@@ -322,6 +339,8 @@ async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions(
     let old = provider_named(&server, "openOld").await;
     assert_eq!(local["status"], "ready", "{local}");
     assert_eq!(slugs(&local), vec!["openai/gpt-5"]);
+    assert_eq!(local["models"][0]["name"], "GPT 5");
+    assert_eq!(local["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
     assert_eq!(old["status"], "error", "{old}");
     assert!(message(&old).contains("1.14.19 or newer"), "{old}");
     server.stop().await;

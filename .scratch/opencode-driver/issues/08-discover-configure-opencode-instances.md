@@ -30,8 +30,10 @@ OpenCode HTTP/SSE protocol.
 OpenCode is the third member of the generic provider registry. Its instance
 configuration carries either a local binary or an HTTP(S) endpoint, plus an
 optional password and custom model fallbacks. The existing per-instance probe
-reservation and publication ordering is reused unchanged, so one slow or broken
-instance cannot replace or suppress a sibling's snapshot.
+reservation and publication ordering is reused unchanged. Refreshes run in
+parallel and every local command and remote discovery has a deadlock timeout, so
+one slow or broken instance cannot replace, block or suppress a sibling's
+snapshot.
 
 External discovery uses the narrow client from ticket 07 for health, providers
 and agents. Local discovery runs three short-lived commands (`--version`,
@@ -39,7 +41,9 @@ and agents. Local discovery runs three short-lived commands (`--version`,
 Versions older than 1.14.19 are present but unavailable. Discovered model slugs
 retain `provider/model`; visible primary agents and variants are emitted as the
 existing model option descriptors, and authored fallbacks are appended even
-when upstream inventory is incomplete.
+when upstream inventory is incomplete. An external inventory that omits the
+connected-provider list is refused rather than treating every provider as
+connected.
 
 Starting a turn remains ticket 09. Selecting an OpenCode instance before that
 ticket lands is refused explicitly at the session preparation boundary rather

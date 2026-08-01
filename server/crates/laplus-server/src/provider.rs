@@ -54,7 +54,8 @@
 //!   states are reported explicitly.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::io::Read;
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::catalogue;
@@ -1335,11 +1336,14 @@ fn describe_opencode(instance: &OpenCodeInstance, search: &Search) -> Provider {
     }
     if !settings.server_url.is_empty() {
         return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => match runtime.block_on(discover_external_opencode(settings)) {
-                Ok((version, models)) => opencode_snapshot(instance, Some(version), Installed::Yes,
+            Ok(runtime) => match runtime.block_on(tokio::time::timeout(PROBE_TIMEOUT, discover_external_opencode(settings))) {
+                Ok(Ok((version, models))) => opencode_snapshot(instance, Some(version), Installed::Yes,
                     ProviderState::Ready, None, merge_custom(models, &settings.custom_models)),
-                Err(error) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
+                Ok(Err(error)) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
                     Some(format!("OpenCode server discovery failed: {error}.")), custom_models(&settings.custom_models)),
+                Err(_) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
+                    Some(format!("OpenCode server discovery did not finish within {} seconds.", PROBE_TIMEOUT.as_secs())),
+                    custom_models(&settings.custom_models)),
             },
             Err(error) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
                 Some(format!("OpenCode server discovery could not start: {error}.")), custom_models(&settings.custom_models)),
@@ -1377,42 +1381,31 @@ async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(Stri
     if !health.healthy { return Err("the server reported unhealthy".to_string()); }
     let providers = client.providers().await.map_err(|error| error.to_string())?;
     let agents = client.agents().await.map_err(|error| error.to_string())?;
-    Ok((health.version, opencode_models(&providers, &agents)))
+    Ok((health.version, opencode_models(&providers, &agents)?))
 }
 
 fn discover_local_opencode(path: &Path) -> Result<Vec<ProviderModel>, String> {
-    let model_output = Command::new(path).args(["models", "--verbose"]).output()
-        .map_err(|error| format!("models --verbose could not start: {error}"))?;
-    if !model_output.status.success() { return Err("models --verbose exited unsuccessfully".to_string()); }
-    let agent_output = Command::new(path).args(["agent", "list"]).output()
-        .map_err(|error| format!("agent list could not start: {error}"))?;
-    if !agent_output.status.success() { return Err("agent list exited unsuccessfully".to_string()); }
-    let model_text = String::from_utf8_lossy(&model_output.stdout);
-    let agent_text = String::from_utf8_lossy(&agent_output.stdout);
-    if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&model_text) {
-        let agents = serde_json::from_str::<serde_json::Value>(&agent_text).unwrap_or_else(|_| serde_json::json!([]));
-        return Ok(opencode_models(&providers, &agents));
-    }
-    let agents = agent_text.lines().map(str::trim).filter(|line| !line.is_empty())
-        .map(str::to_string).collect::<Vec<_>>();
-    Ok(model_text.lines().map(str::trim).filter(|line| line.contains('/'))
-        .map(|slug| opencode_model(slug, slug, &[], &agents)).collect())
+    let models = bounded_command(path, &["models", "--verbose"], PROBE_TIMEOUT)?;
+    let agents = bounded_command(path, &["agent", "list"], PROBE_TIMEOUT)?;
+    Ok(local_models(&models, &local_agents(&agents)))
 }
 
-fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) -> Vec<ProviderModel> {
+fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) -> Result<Vec<ProviderModel>, String> {
     let visible_agents = agents.as_array().into_iter().flatten().filter(|agent| {
         !agent.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false)
             && matches!(agent.get("mode").and_then(serde_json::Value::as_str), Some("primary") | Some("all") | None)
     }).filter_map(|agent| agent.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
       .collect::<Vec<_>>();
     let connected = providers.get("connected").and_then(serde_json::Value::as_array)
-        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>());
+        .ok_or_else(|| "provider inventory omitted its connected-provider list".to_string())?
+        .iter().map(|item| item.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>().ok_or_else(|| "provider inventory has a malformed connected-provider list".to_string())?;
     let listed = providers.get("providers").or_else(|| providers.get("all")).and_then(serde_json::Value::as_array)
         .or_else(|| providers.as_array()).into_iter().flatten();
     let mut models = Vec::new();
     for provider in listed {
         let Some(provider_id) = provider.get("id").and_then(serde_json::Value::as_str) else { continue };
-        if connected.as_ref().is_some_and(|ids| !ids.contains(&provider_id)) { continue; }
+        if !connected.iter().any(|id| id == provider_id) { continue; }
         let Some(entries) = provider.get("models").and_then(serde_json::Value::as_object) else { continue };
         for (key, model) in entries {
             let model_id = model.get("id").and_then(serde_json::Value::as_str).unwrap_or(key);
@@ -1422,7 +1415,79 @@ fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) ->
             models.push(opencode_model(&format!("{provider_id}/{model_id}"), name, &variants, &visible_agents));
         }
     }
+    Ok(models)
+}
+
+fn local_agents(output: &str) -> Vec<String> {
+    output.lines().filter(|line| !line.chars().next().is_some_and(char::is_whitespace))
+        .filter_map(|line| line.trim().strip_suffix(" (primary)").or_else(|| line.trim().strip_suffix(" (all)")))
+        .map(str::to_string).collect()
+}
+
+fn local_models(output: &str, agents: &[String]) -> Vec<ProviderModel> {
+    let lines = output.lines().collect::<Vec<_>>();
+    let mut models = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let slug = lines[index].trim();
+        if lines[index].chars().next().is_some_and(char::is_whitespace) || !valid_model_slug(slug) {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let mut json = String::new();
+        let mut depth = 0_i64;
+        while index < lines.len() {
+            let line = lines[index];
+            depth += line.bytes().filter(|byte| *byte == b'{').count() as i64;
+            depth -= line.bytes().filter(|byte| *byte == b'}').count() as i64;
+            json.push_str(line);
+            json.push('\n');
+            index += 1;
+            if depth == 0 && !json.trim().is_empty() { break; }
+        }
+        let detail = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+        let name = detail.get("name").and_then(serde_json::Value::as_str).unwrap_or(slug);
+        let variants = detail.get("variants").and_then(serde_json::Value::as_object)
+            .map(|value| value.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+        models.push(opencode_model(slug, name, &variants, agents));
+    }
     models
+}
+
+fn valid_model_slug(slug: &str) -> bool {
+    let Some((provider, model)) = slug.split_once('/') else { return false };
+    !provider.is_empty() && !model.is_empty() && !model.contains('/')
+        && slug.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+}
+
+fn bounded_command(path: &Path, arguments: &[&str], patience: Duration) -> Result<String, String> {
+    let mut command = Command::new(path);
+    command.args(arguments).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::process::without_a_console(&mut command);
+    let mut child = command.spawn().map_err(|error| format!("{} could not start: {error}", arguments.join(" ")))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let stdout = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout.take(u64::MAX).read_to_end(&mut bytes); bytes });
+    let stderr = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stderr.take(u64::MAX).read_to_end(&mut bytes); bytes });
+    let deadline = Instant::now() + patience;
+    let status: ExitStatus = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                crate::process::terminate_tree_and_wait(&mut child);
+                let _ = stdout.join(); let _ = stderr.join();
+                return Err(format!("{} did not finish within {} seconds", arguments.join(" "), patience.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(PROBE_POLL),
+            Err(error) => return Err(format!("{} could not be waited for: {error}", arguments.join(" "))),
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    let text = format!("{}\n{}", String::from_utf8_lossy(&stdout).trim(), String::from_utf8_lossy(&stderr).trim()).trim().to_string();
+    if !status.success() { return Err(format!("{} exited with {}: {}", arguments.join(" "), status, first_line(&text))); }
+    Ok(text)
 }
 
 fn opencode_model(slug: &str, name: &str, variants: &[String], agents: &[String]) -> ProviderModel {
@@ -1476,11 +1541,14 @@ pub(crate) fn refresh_reserved(
     probes: ProbeReservations,
 ) {
     let current_settings = config.current().settings.clone();
-    for (instance_id, probe) in probes.probes {
-        refresh_instance_reserved(
-            config, &current_settings, &instance_id, search, roots, probe,
-        );
-    }
+    std::thread::scope(|scope| {
+        for (instance_id, probe) in probes.probes {
+            let current_settings = &current_settings;
+            scope.spawn(move || refresh_instance_reserved(
+                config, current_settings, &instance_id, search, roots, probe,
+            ));
+        }
+    });
 }
 
 pub fn refresh_configured(
