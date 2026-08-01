@@ -66,15 +66,7 @@ pub struct Thread {
     /// When the developer last said something. On the shell summary rather than
     /// derived by the client, so the thread list can sort without the messages.
     pub latest_user_message_at: Option<String>,
-    /// The `claude` session this conversation is being held in, as the agent
-    /// itself reported it on its `init` line.
-    ///
-    /// The one field here that is neither in the contract nor derived from it.
-    /// It is what `--resume` is given, and it is therefore the whole of how a
-    /// conversation survives a restart: the context is in the agent's own store,
-    /// not in this server's transcript, and this id is the handle on it. `None`
-    /// until an agent has announced itself for this thread.
-    pub agent_session_id: Option<String>,
+    /// Opaque continuation data for the provider instance that owns the thread.
     pub provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     /// Where this conversation sits in the developer's inbox — see
     /// [`Lifecycle`].
@@ -481,7 +473,6 @@ pub struct ThreadRow {
     pub interaction_mode: String,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
-    pub agent_session_id: Option<String>,
     pub provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     pub latest_turn: Option<LatestTurn>,
     pub latest_user_message_at: Option<String>,
@@ -905,7 +896,6 @@ impl Thread {
             interaction_mode: self.interaction_mode.clone(),
             branch: self.branch.clone(),
             worktree_path: self.worktree_path.clone(),
-            agent_session_id: self.agent_session_id.clone(),
             provider_resume_cursor: self.provider_resume_cursor.clone(),
             latest_turn: self.latest_turn.clone(),
             latest_user_message_at: self.latest_user_message_at.clone(),
@@ -921,7 +911,7 @@ impl Thread {
     ///
     /// - **There is no session.** A session is a running process, and after a
     ///   restart there is none. The first turn on this thread starts one, with
-    ///   the driver's resume request pointed at [`Thread::agent_session_id`].
+    ///   the provider resume cursor handed back to its driver.
     /// - **A turn that was still `running` becomes `interrupted`.** The app
     ///   stopped in the middle of it and nothing is going to finish it, so
     ///   leaving it `running` would show a conversation working forever. The
@@ -961,7 +951,6 @@ impl Thread {
             session: None,
             latest_turn,
             latest_user_message_at: row.latest_user_message_at,
-            agent_session_id: row.agent_session_id,
             provider_resume_cursor: row.provider_resume_cursor,
             // Kept for the same reason the checkpoints are: an archived or
             // snoozed conversation that came back from a restart in the inbox
@@ -2402,7 +2391,6 @@ pub(crate) mod tests {
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
-            agent_session_id: None,
             provider_resume_cursor: None,
             lifecycle: Lifecycle::default(),
         }

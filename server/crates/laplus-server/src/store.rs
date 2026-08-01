@@ -93,10 +93,10 @@ const MIGRATIONS: &[&str] = &[
         interaction_mode       TEXT NOT NULL,
         branch                 TEXT,
         worktree_path          TEXT,
-        -- The driver's own handle on this conversation: a Claude session id or
-        -- a Codex thread id. What the next process resumes, and therefore the
-        -- whole of how continuity survives a restart: the context is in the
-        -- agent's own store and this is the handle on it.
+        -- Retained for rows written before provider resume cursors. Current
+        -- readers expose a value here as the owning driver's v0 string cursor;
+        -- current writes leave it NULL and use the provider-owned columns added
+        -- by the later continuation migration.
         agent_session_id       TEXT,
         latest_turn            TEXT,
         latest_user_message_at TEXT,
@@ -364,6 +364,9 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // Provider-owned continuation data. Binding columns remain outside the
     // opaque JSON so storage can enforce ownership without interpreting it.
+    // The v2 `agent_session_id` column remains only as a read-time v0 source;
+    // current inserts and updates write NULL there and persist continuation in
+    // these columns.
     r#"
     ALTER TABLE threads ADD COLUMN provider_resume_cursor TEXT;
     ALTER TABLE threads ADD COLUMN cursor_provider_instance_id TEXT;
@@ -1046,10 +1049,6 @@ impl Database {
                     ordinal,
                     activity,
                 } => upsert_activity(&transaction, thread_id, *ordinal, activity)?,
-                Write::AgentSession {
-                    thread_id,
-                    session_id,
-                } => remember_agent_session(&transaction, thread_id, session_id)?,
                 Write::ProviderResumeCursor { thread_id, cursor } =>
                     remember_provider_resume_cursor(&transaction, thread_id, cursor)?,
                 Write::Checkpoint {
@@ -1806,7 +1805,7 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 interaction_mode = excluded.interaction_mode, \
                 branch = excluded.branch, \
                 worktree_path = excluded.worktree_path, \
-                agent_session_id = excluded.agent_session_id, \
+                agent_session_id = NULL, \
                 latest_turn = excluded.latest_turn, \
                 latest_user_message_at = excluded.latest_user_message_at, \
                 updated_at = excluded.updated_at, \
@@ -1830,14 +1829,13 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 thread.interaction_mode,
                 thread.branch,
                 thread.worktree_path,
-                thread.agent_session_id,
+                Option::<&str>::None,
                 thread.latest_turn.as_ref().map(|turn| turn.to_value().to_string()),
                 thread.latest_user_message_at,
                 thread.created_at,
                 thread.updated_at,
                 // The six travel with the rest of the row rather than in a
-                // statement of their own, unlike `remember_agent_session` below:
-                // they arrive from `crate::threads` on the same in-memory
+                // statement of their own: they arrive from `crate::threads` on the same in-memory
                 // conversation every other column here comes from, so an update
                 // that left them behind would be the row disagreeing with itself.
                 thread.lifecycle.archived_at,
@@ -1974,44 +1972,13 @@ fn upsert_checkpoint(
     Ok(())
 }
 
-/// Record the `claude` session a conversation is being held in.
-///
-/// Its own statement rather than part of the row upsert, because it arrives from
-/// somewhere else entirely: the agent's `init` line, mid-turn, while the thread
-/// row is being written by every other change beside it. Touching one column
-/// means the two cannot overwrite each other's work.
-/// Refuses to update nothing, rather than succeeding at it. The stored session is
-/// what a restart resumes into, so an update that matched no row is continuity
-/// silently lost — the same reasoning as the checked row counts in
-/// [`Database::remove_project`], and refusing before the commit rolls the
-/// transaction back so the write is retried on its own and named in the log.
-fn remember_agent_session(
-    transaction: &Transaction<'_>,
-    thread_id: &str,
-    session_id: &str,
-) -> Result<(), StorageError> {
-    let updated = transaction
-        .execute(
-            "UPDATE threads SET agent_session_id = ?2 WHERE id = ?1",
-            (thread_id, session_id),
-        )
-        .map_err(StorageError::while_("store the agent session"))?;
-    if updated == 0 {
-        return Err(StorageError::refusing(
-            "store the agent session",
-            format!("there is no thread '{thread_id}' to record session '{session_id}' against"),
-        ));
-    }
-    Ok(())
-}
-
 fn remember_provider_resume_cursor(
     transaction: &Transaction<'_>,
     thread_id: &str,
     cursor: &crate::provider::ResumeCursor,
 ) -> Result<(), StorageError> {
     let updated = transaction.execute(
-        "UPDATE threads SET provider_resume_cursor = ?2, cursor_provider_instance_id = ?3, cursor_provider_driver = ?4 WHERE id = ?1 AND provider_instance_id = ?3 AND provider_driver = ?4",
+        "UPDATE threads SET agent_session_id = NULL, provider_resume_cursor = ?2, cursor_provider_instance_id = ?3, cursor_provider_driver = ?4 WHERE id = ?1 AND provider_instance_id = ?3 AND provider_driver = ?4",
         rusqlite::params![thread_id, cursor.value.to_string(), cursor.provider.instance_id, cursor.provider.driver],
     ).map_err(StorageError::while_("store the provider resume cursor"))?;
     if updated == 0 {
@@ -2033,10 +2000,12 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         instance_id: row.get(19)?,
         driver: row.get(20)?,
     };
+    let legacy_cursor: Option<String> = row.get(8)?;
     let provider_resume_cursor = decode_provider_resume_cursor(
         cursor_json,
         cursor_instance,
         cursor_driver,
+        legacy_cursor,
         &provider,
     )?;
 
@@ -2059,7 +2028,6 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         },
         branch: row.get(6)?,
         worktree_path: row.get(7)?,
-        agent_session_id: row.get(8)?,
         provider_resume_cursor,
         latest_turn: latest_turn.as_deref().and_then(latest_turn_from_json),
         latest_user_message_at: row.get(10)?,
@@ -2082,10 +2050,14 @@ fn decode_provider_resume_cursor(
     encoded: Option<String>,
     instance_id: Option<String>,
     driver: Option<String>,
+    legacy: Option<String>,
     thread_provider: &crate::provider::ProviderIdentity,
 ) -> rusqlite::Result<Option<crate::provider::ResumeCursor>> {
     let (encoded, instance_id, driver) = match (encoded, instance_id, driver) {
-        (None, None, None) => return Ok(None),
+        (None, None, None) => return Ok(legacy.map(|value| crate::provider::ResumeCursor {
+            provider: thread_provider.clone(),
+            value: serde_json::Value::String(value),
+        })),
         (Some(encoded), Some(instance_id), Some(driver)) => (encoded, instance_id, driver),
         _ => return Err(incompatible_cursor("provider resume cursor has incomplete ownership data")),
     };
@@ -2851,7 +2823,6 @@ mod tests {
             interaction_mode: "default".to_string(),
             branch: None,
             worktree_path: None,
-            agent_session_id: None,
             provider_resume_cursor: None,
             latest_turn: None,
             latest_user_message_at: None,
@@ -2880,7 +2851,6 @@ mod tests {
             assistant_message_id: Some("assistant-1".to_string()),
         });
         thread.latest_user_message_at = Some("2026-07-26T00:23:05.000Z".to_string());
-        thread.agent_session_id = Some("session-alpha".to_string());
         thread.provider_resume_cursor = Some(crate::provider::ResumeCursor {
             provider: thread.provider.clone(),
             value: serde_json::json!({"version": 1, "sessionId": "upstream-alpha", "opaque": [1, 2]}),
@@ -3020,44 +2990,6 @@ mod tests {
         assert_eq!(stored, ("bypassPermissions".to_string(), "planning".to_string()));
     }
 
-    /// The one column that arrives from somewhere else. The agent's `init` line
-    /// lands mid-turn, while every other change is rewriting the whole row beside
-    /// it, so it is its own statement — and a later row write must not lose it.
-    #[test]
-    fn the_agents_session_survives_the_row_being_rewritten() {
-        let fixture = Fixture::new();
-        fixture.add("project-1");
-        let thread = a_thread("thread-1", "project-1");
-
-        fixture
-            .database
-            .transcribe(&[
-                Write::Thread(Box::new(thread.clone())),
-                Write::AgentSession {
-                    thread_id: "thread-1".to_string(),
-                    session_id: "session-alpha".to_string(),
-                },
-            ])
-            .expect("stores");
-
-        // The next change to the conversation writes the row it has, which now
-        // carries the session — so the round trip is the live thread's copy of it
-        // rather than the column being overwritten with nothing.
-        let stored = &fixture.database.conversations().expect("reads")[0].thread;
-        assert_eq!(stored.agent_session_id, Some("session-alpha".to_string()));
-
-        fixture
-            .database
-            .transcribe(&[Write::Thread(Box::new(stored.clone()))])
-            .expect("stores");
-        assert_eq!(
-            fixture.database.conversations().expect("reads")[0]
-                .thread
-                .agent_session_id,
-            Some("session-alpha".to_string())
-        );
-    }
-
     #[test]
     fn a_cursor_write_is_bound_to_the_threads_provider_instance() {
         let fixture = Fixture::new();
@@ -3100,6 +3032,49 @@ mod tests {
         assert!(fixture.database.conversations().is_err(), "misowned cursor became absent");
     }
 
+    #[test]
+    fn a_legacy_session_column_is_read_as_the_owning_drivers_v0_cursor() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        fixture.database.transcribe(&[Write::Thread(Box::new(a_thread("thread-1", "project-1")))])
+            .expect("stores thread");
+        fixture.database.lock().execute(
+            "UPDATE threads SET agent_session_id = 'legacy-upstream-id' WHERE id = 'thread-1'",
+            [],
+        ).expect("simulates a historical row");
+
+        let stored = fixture.database.conversations().expect("reads historical row");
+
+        assert_eq!(stored[0].thread.provider_resume_cursor, Some(crate::provider::ResumeCursor {
+            provider: stored[0].thread.provider.clone(),
+            value: serde_json::Value::String("legacy-upstream-id".to_string()),
+        }));
+        let legacy_before_update: Option<String> = fixture.database.lock().query_row(
+            "SELECT agent_session_id FROM threads WHERE id = 'thread-1'",
+            [],
+            |row| row.get(0),
+        ).expect("reads legacy column directly");
+        assert_eq!(legacy_before_update.as_deref(), Some("legacy-upstream-id"));
+
+        fixture.database.transcribe(&[Write::ProviderResumeCursor {
+            thread_id: "thread-1".to_string(),
+            cursor: crate::provider::ResumeCursor {
+                provider: stored[0].thread.provider.clone(),
+                value: serde_json::json!({"version": 1, "threadId": "current-upstream-id"}),
+            },
+        }]).expect("replaces the legacy cursor through the current write path");
+
+        let migrated: (Option<String>, Option<String>) = fixture.database.lock().query_row(
+            "SELECT agent_session_id, provider_resume_cursor FROM threads WHERE id = 'thread-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("reads continuation columns directly");
+        assert_eq!(
+            migrated,
+            (None, Some(r#"{"threadId":"current-upstream-id","version":1}"#.to_string()))
+        );
+    }
+
     /// Deleting a project takes its conversations with it, by the schema's own
     /// cascade. Which conversations there *were* is not this layer's answer —
     /// `crate::threads` holds the live view and the stored rows are a subset of it
@@ -3139,29 +3114,6 @@ mod tests {
             .conversations()
             .expect("reads")
             .is_empty());
-    }
-
-    /// A session recorded against a thread that is not there is refused rather
-    /// than succeeding at updating nothing. The stored session is what a restart
-    /// resumes into, so an update that quietly matched no row is continuity lost
-    /// with nothing said about it.
-    #[test]
-    fn a_session_for_a_thread_that_does_not_exist_is_refused() {
-        let fixture = Fixture::new();
-        fixture.add("project-1");
-
-        let refusal = fixture
-            .database
-            .transcribe(&[Write::AgentSession {
-                thread_id: "never-created".to_string(),
-                session_id: "session-alpha".to_string(),
-            }])
-            .expect_err("there is no such thread");
-        assert!(
-            refusal.to_string().contains("never-created")
-                && refusal.to_string().contains("session-alpha"),
-            "{refusal}"
-        );
     }
 
     /// A conversation cannot be stored against a project that is not there. The

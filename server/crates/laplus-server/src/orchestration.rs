@@ -1216,7 +1216,7 @@ impl Shell {
     ///
     /// **The conversation survives, and so does the agent's own handle on it.**
     /// Nothing here touches the transcript, the work log, or
-    /// [`Thread::agent_session_id`] — which is the whole of how continuity
+    /// [`Thread::provider_resume_cursor`] — which is how continuation
     /// outlives a process, because the next turn is started with `--resume` and
     /// the context is in the agent's store rather than in this server's
     /// transcript. So the next turn is a new session continuing the same
@@ -1900,9 +1900,7 @@ impl CreateThread {
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
-            // Nothing has run yet, so there is no agent session to resume into.
-            // The first turn's `init` line is where this is filled in.
-            agent_session_id: None,
+            // Nothing has run yet, so there is no provider continuation to resume.
             provider_resume_cursor: None,
             // A new conversation is in the inbox, which is what all six being
             // absent means. Nothing creates a thread already archived, settled,

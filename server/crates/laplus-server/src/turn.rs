@@ -124,8 +124,7 @@
 //! to believe.
 //!
 //! So the `init` line's session id is written as the driver's versioned cursor
-//! through the shared continuation boundary (and temporarily mirrored in the
-//! legacy column until ticket 06 removes it), and a session opened for a thread
+//! through the shared continuation boundary, and a session opened for a thread
 //! that has one is opened with `--resume`. The id is the agent's own account of
 //! itself rather than something this server minted, for the same reason the model
 //! and the permission mode are.
@@ -181,13 +180,15 @@ pub(crate) struct Claude {
     /// such request and a session that changed which conversation it was in the
     /// middle of would not be one.
     resume: Option<String>,
-    provider: crate::provider::ProviderIdentity,
 }
 
 fn resume_session(start: &Start) -> Result<Option<String>, String> {
     let Some(cursor) = &start.resume_cursor else {
-        return Ok(start.resume.clone());
+        return Ok(None);
     };
+    if let Some(session_id) = cursor.value.as_str().filter(|id| !id.is_empty()) {
+        return Ok(Some(session_id.to_string()));
+    }
     if cursor.value.as_object().map(serde_json::Map::len) != Some(2) {
         return Err("The stored Claude continuation is incompatible with this build.".to_string());
     }
@@ -244,7 +245,6 @@ impl Driver for Claude {
                 agent,
                 folding: SessionState::new(),
                 resume,
-                provider: start.provider.clone(),
             },
             decided: Decided::default(),
         })
@@ -260,11 +260,7 @@ impl Driver for Claude {
     /// other verbs, which the loop awaits on their own.
     async fn next(&mut self, driving: &mut Driving) -> Option<Decided> {
         let line = self.agent.next_line().await?;
-        let mut decided = decide(&mut self.folding, driving, &line);
-        if let Some(session_id) = decided.agent_session.as_deref() {
-            decided.provider_resume_cursor = Some(resume_cursor(&self.provider, session_id));
-        }
-        Some(decided)
+        Some(decide(&mut self.folding, driving, &line))
     }
 
     async fn send(&mut self, text: &str) -> std::io::Result<()> {
@@ -637,7 +633,10 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
         // differ, and now nothing says so. Ticket 12 asked for that visibility;
         // this is a later decision against it, not an oversight.
         Folded::Initialized => {
-            decided.agent_session = folding.session_id.clone();
+            decided.provider_resume_cursor = folding
+                .session_id
+                .as_deref()
+                .map(|session_id| resume_cursor(&driving.provider, session_id));
             // The first of the two moments worth asking about, and the one
             // upstream does not have: it asks as a turn *completes*, which
             // leaves the opening turn of a session drawing a bare token count
@@ -1106,7 +1105,6 @@ mod tests {
             workspace_root: ".".to_string(),
             model: None,
             runtime_mode: "full-access".to_string(),
-            resume: None,
             resume_cursor: None,
             provider: crate::provider::registration(crate::provider::CLAUDE_DRIVER)
                 .expect("registered")
@@ -1149,6 +1147,9 @@ mod tests {
     /// A driver at the start of a session, with or without a turn under way.
     fn driver(turn: Option<InFlight>) -> Driving {
         Driving {
+            provider: crate::provider::registration(crate::provider::CLAUDE_DRIVER)
+                .expect("registered")
+                .identity(crate::provider::CLAUDE_INSTANCE_ID),
             turn,
             outstanding: HashMap::new(),
             interrupts: 0,
@@ -1204,7 +1205,10 @@ mod tests {
             r#"{"type":"system","subtype":"init","session_id":"s-1","model":"m","cwd":"/tmp","permissionMode":"default"}"#,
         );
 
-        assert_eq!(decided.agent_session.as_deref(), Some("s-1"));
+        assert_eq!(
+            decided.provider_resume_cursor.as_ref().map(|cursor| &cursor.value),
+            Some(&json!({"version": 1, "sessionId": "s-1"}))
+        );
         assert!(decided.changes.is_empty(), "{:?}", kinds(&decided));
         assert!(decided.settles.is_none());
         // And the loop is told to go and ask how full the window is, which is the

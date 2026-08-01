@@ -154,7 +154,7 @@ pub struct Launch {
     /// of the mechanism: the context is in the agent's own store, so continuity
     /// is a flag rather than a replay of the transcript into the prompt. The id
     /// is the agent's own, read off a previous run's `init` line — see
-    /// [`crate::threads::Thread::agent_session_id`].
+    /// the owning driver's provider resume cursor.
     pub resume: Option<String>,
 }
 

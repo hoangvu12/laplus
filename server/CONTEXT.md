@@ -663,8 +663,8 @@ at once, so the next turn starts a _new_ session and the developer's click is
 what stops the conversation being drawn as alive; the driver leaves its loop,
 closes the agent's stdin, waits, and kills if waiting was not enough, and only
 then publishes the session as `stopped`. Nothing else moves: the transcript, the
-work log and above all the **agent session id** survive, which is the whole of
-how the next turn continues the same conversation.
+work log and above all the **provider resume cursor** survive, which is how the
+next turn continues the same conversation.
 
 **Session epoch** — which of a conversation's sessions a driver is. Counted per
 thread, and the reason it exists is that a stop frees the slot while the child is
@@ -710,9 +710,9 @@ The declared one is crossed in two halves and each is checked on its own.
 `crate::protocol` takes a line and answers with a **`Folded`** — what that line
 was, in this server's words — and `tests/protocol_golden.rs` pins that against 19
 captured sessions. `crate::turn::decide` takes the `Folded` and answers with a
-**`Decided`**: the changes the conversation is owed, the agent session id if one
-was announced, and how the turn ended if it did — which is also the vocabulary
-every driver answers a session in. `crate::session::spend` applies it.
+**`Decided`**: the changes the conversation is owed, a provider resume cursor if
+the driver learned one, and how the turn ended if it did — which is also the
+vocabulary every driver answers a session in. `crate::session::spend` applies it.
 Deciding and applying are two functions for the reason the fold and `commit` are
 (ADR-0025): a function that applies its own results can only be tested against a
 live world, and this one's world is a running `claude`. See ADR-0027.

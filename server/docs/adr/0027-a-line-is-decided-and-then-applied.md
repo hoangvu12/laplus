@@ -22,10 +22,9 @@ It was impure for one reason, and the reason was uniform: **twelve call sites on
 `Threads`**, ten of them `apply`. The other two are what decided the shape of
 this ADR rather than of the last one:
 
-- `remember_agent_session`, in `Folded::Initialized`. It writes the `claude`
-  session id and queues a durable write, and publishes nothing. **No `Change`
-  describes it and none could** — the contract has no event for it, which is
-  exactly why the method exists.
+- the provider resume cursor produced in `Folded::Initialized`. It queues a
+  durable write and publishes nothing. **No `Change` describes it and none
+  could** — the contract has no event for continuation.
 - `active_turn`, read _between_ two applies in `Folded::Completed` and gating the
   second on the answer. A developer who stopped the agent can send the next turn
   while this one is winding down, so the ending must go up only while the session
@@ -57,7 +56,7 @@ the twelve things `publish` did are not changes:
 ```rust
 struct Decided {
     changes: Vec<Change>,
-    agent_session: Option<String>,
+    provider_resume_cursor: Option<ResumeCursor>,
     settles: Option<Settles>,
 }
 
@@ -107,7 +106,7 @@ minimal NDJSON lines of the shapes `crate::protocol`'s own tests use.
   is a golden file that silently stops covering the two fields a golden file
   would otherwise be for.
 - **Return `Vec<Change>`.** The tightest interface, and wrong twice: it has
-  nowhere to put the agent session id, and it cannot express a change whose
+  nowhere to put the provider resume cursor, and it cannot express a change whose
   publication is conditional on a read of the world. Either omission puts
   `&Threads` back in the signature, and a `decide` that still holds a `Threads`
   is a rename rather than a cut.

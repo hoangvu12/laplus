@@ -905,34 +905,6 @@ impl Threads {
             .max()
     }
 
-    /// Remember the driver's own continuity handle for this thread.
-    ///
-    /// Nothing is published, and that is not an omission: no event in the
-    /// contract describes this and no client renders it. It is the server's own
-    /// handle on the agent's memory — Claude receives it as `--resume` and Codex
-    /// as the id in `thread/resume` — so what it owes is a durable write and
-    /// nothing else.
-    ///
-    /// An id the thread already holds is dropped rather than rewritten. A
-    /// resumed driver returns one on every open, and a row that says what it
-    /// already said is a disk touch for nothing.
-    pub fn remember_agent_session(&self, thread_id: &str, session_id: &str) {
-        let Some(entry) = self.find(thread_id) else {
-            return;
-        };
-        let mut state = lock(&entry.state);
-        let Some(thread) = state.as_mut() else { return };
-        if thread.agent_session_id.as_deref() == Some(session_id) {
-            return;
-        }
-
-        thread.agent_session_id = Some(session_id.to_string());
-        self.inner.transcripts.queue(Write::AgentSession {
-            thread_id: thread.id.clone(),
-            session_id: session_id.to_string(),
-        });
-    }
-
     pub fn remember_provider_resume_cursor(
         &self,
         thread_id: &str,
@@ -3355,34 +3327,6 @@ pub(crate) mod tests {
                 .latest_turn
                 .map(|turn| turn.state),
             Some(TurnState::Completed)
-        );
-    }
-
-    /// The agent's session id is the server's own bookkeeping: remembered and
-    /// written down, and published to nobody, because no event in the contract
-    /// describes it and no client renders it.
-    #[test]
-    fn the_agents_session_is_remembered_without_being_announced() {
-        let (threads, mut shell) = threads();
-        threads.create(a_thread("thread-1")).expect("created");
-        shell.try_recv().expect("the thread was announced");
-
-        threads.remember_agent_session("thread-1", "session-alpha");
-        assert_eq!(
-            threads.get("thread-1").expect("the thread").agent_session_id,
-            Some("session-alpha".to_string())
-        );
-        assert!(
-            shell.try_recv().is_err(),
-            "remembering the agent's session republished the thread"
-        );
-
-        // A resumed session announces one on every start, and the newest is the
-        // one the next `--resume` has to be given.
-        threads.remember_agent_session("thread-1", "session-beta");
-        assert_eq!(
-            threads.get("thread-1").expect("the thread").agent_session_id,
-            Some("session-beta".to_string())
         );
     }
 

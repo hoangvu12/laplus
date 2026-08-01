@@ -116,8 +116,11 @@ pub(crate) struct Codex {
 
 fn resume_thread(start: &Start) -> Result<Option<String>, String> {
     let Some(cursor) = &start.resume_cursor else {
-        return Ok(start.resume.clone());
+        return Ok(None);
     };
+    if let Some(thread_id) = cursor.value.as_str().filter(|id| !id.is_empty()) {
+        return Ok(Some(thread_id.to_string()));
+    }
     if cursor.value.as_object().map(serde_json::Map::len) != Some(2) {
         return Err("The stored Codex continuation is incompatible with this build.".to_string());
     }
@@ -239,7 +242,6 @@ impl Driver for Codex {
             },
             decided: Decided {
                 changes,
-                agent_session: Some(thread_id.clone()),
                 provider_resume_cursor: Some(resume_cursor(start, &thread_id)),
                 ..Decided::default()
             },

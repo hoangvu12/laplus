@@ -7,15 +7,15 @@ existing driver has migrated, while old database rows remain readable.
 
 **Blocked by:** 05 — Migrate Claude and Codex continuation.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] New and updated threads persist only the provider resume cursor form
-- [ ] Historical rows containing legacy strings remain readable through driver
+- [x] New and updated threads persist only the provider resume cursor form
+- [x] Historical rows containing legacy strings remain readable through driver
       v0 decoding
-- [ ] Shared session and thread vocabulary no longer treats continuation as a
+- [x] Shared session and thread vocabulary no longer treats continuation as a
       provider-neutral string id
-- [ ] The temporary expansion path from ticket 04 is removed without a flag day
+- [x] The temporary expansion path from ticket 04 is removed without a flag day
       database rewrite
-- [ ] Claude and Codex restart and missing-session behavior remains green
-- [ ] The domain glossary and durable schema documentation use provider resume
+- [x] Claude and Codex restart and missing-session behavior remains green
+- [x] The domain glossary and durable schema documentation use provider resume
       cursor consistently

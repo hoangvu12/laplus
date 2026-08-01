@@ -339,10 +339,6 @@ pub struct Start {
     /// it alone: the badge beside the session state is a claim about what the
     /// agent is doing, not about what was asked of it.
     pub runtime_mode: String,
-    /// The agent's own handle on the conversation to continue, when the thread
-    /// already has one. Which agent minted it is the driver's business; that
-    /// there is one is how a conversation survives a restart.
-    pub resume: Option<String>,
     /// Opaque continuation data for this exact provider instance.
     pub resume_cursor: Option<crate::provider::ResumeCursor>,
     pub provider: crate::provider::ProviderIdentity,
@@ -492,6 +488,7 @@ async fn drive<D: Driver>(
     spend(&threads, &start, opened);
 
     let mut driving = Driving {
+        provider: start.provider.clone(),
         turn: None,
         outstanding: HashMap::new(),
         interrupts: 0,
@@ -1030,6 +1027,8 @@ enum Next {
 /// `await` it. Lent to [`Driver::next`] and to [`Driver::stop`] for both
 /// reasons.
 pub(crate) struct Driving {
+    /// The provider instance whose opaque continuation the driver may replace.
+    pub(crate) provider: crate::provider::ProviderIdentity,
     /// The turn the agent is currently working on.
     pub(crate) turn: Option<InFlight>,
     /// Permission requests published and not yet answered, by the id the client
@@ -1721,12 +1720,9 @@ impl InFlight {
 /// only be tested by watching what it did to a live world, and this one's world
 /// is a [`Threads`] with a running agent behind it.
 ///
-/// **Four fields rather than a `Vec<Change>`**, because three of the things a
+/// **Three fields rather than a `Vec<Change>`**, because two of the things a
 /// translation does are not changes:
 ///
-/// - the agent's own session id is written down and published to nobody
-///   ([`crate::threads::Threads::remember_agent_session`]), so no `Change`
-///   describes it and none could;
 /// - the event that ends a turn is published *only if the session is still
 ///   describing that turn*, which is a question about the world asked between two
 ///   applies. Returned as a precondition rather than answered by the driver, so
@@ -1741,8 +1737,7 @@ pub(crate) struct Decided {
     /// The changes to apply, in the order they were decided — which is the order
     /// the developer saw the work happen.
     pub(crate) changes: Vec<Change>,
-    /// The agent's own handle on this conversation, if it has just announced one.
-    pub(crate) agent_session: Option<String>,
+    /// Opaque continuation data minted by the driver and published to nobody.
     pub(crate) provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     /// The turn ended, and how. `None` on everything that did not end one.
     pub(crate) settles: Option<Settles>,
@@ -1785,9 +1780,6 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
         threads.apply(&start.thread_id, change);
     }
 
-    if let Some(session_id) = &decided.agent_session {
-        threads.remember_agent_session(&start.thread_id, session_id);
-    }
     if let Some(cursor) = &decided.provider_resume_cursor {
         if cursor.provider == start.provider {
             threads.remember_provider_resume_cursor(&start.thread_id, cursor);
@@ -1863,11 +1855,6 @@ pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver)
         workspace_root: workspace_root.to_string(),
         model: thread.model(),
         runtime_mode: thread.runtime_mode.clone(),
-        // Read here rather than inside the driver, so what is resumed is the
-        // session the thread held when the turn was dispatched. A session opened
-        // for a thread that has none starts a fresh conversation and reports its
-        // own id back a moment later.
-        resume: thread.agent_session_id.clone(),
         resume_cursor: thread
             .provider_resume_cursor
             .clone()
@@ -1905,7 +1892,6 @@ mod continuation_tests {
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
-            agent_session_id: Some("legacy-session".to_string()),
             provider_resume_cursor: None,
             lifecycle: crate::threads::Lifecycle::default(),
         }
@@ -1932,7 +1918,6 @@ mod continuation_tests {
             workspace_root: "/work".to_string(),
             model: thread.model(),
             runtime_mode: thread.runtime_mode.clone(),
-            resume: thread.agent_session_id.clone(),
             resume_cursor: None,
             provider: thread.provider.clone(),
             driver: DriverStart::Claude(crate::config::ClaudeSettings {
@@ -1948,7 +1933,6 @@ mod continuation_tests {
 
         let after = threads.get("thread-1").expect("thread");
         assert_eq!(after.provider_resume_cursor, Some(cursor));
-        assert_eq!(after.agent_session_id.as_deref(), Some("legacy-session"));
         assert_eq!(after.to_detail_value(), before, "transcript/socket state changed");
         assert!(announcements.try_recv().is_err(), "cursor published an event");
     }
@@ -1973,6 +1957,5 @@ mod continuation_tests {
         };
         let start = starting(&thread, "/work", prepared);
         assert_eq!(start.resume_cursor, Some(cursor));
-        assert_eq!(start.resume.as_deref(), Some("legacy-session"));
     }
 }

@@ -88,12 +88,6 @@ pub enum Write {
         ordinal: usize,
         activity: Box<Activity>,
     },
-    /// The `claude` session this conversation is being held in — the handle
-    /// `--resume` is given after a restart.
-    AgentSession {
-        thread_id: String,
-        session_id: String,
-    },
     ProviderResumeCursor {
         thread_id: String,
         cursor: crate::provider::ResumeCursor,
@@ -117,7 +111,6 @@ impl Write {
             Write::Thread(thread) => &thread.id,
             Write::Message { thread_id, .. }
             | Write::Activity { thread_id, .. }
-            | Write::AgentSession { thread_id, .. }
             | Write::ProviderResumeCursor { thread_id, .. }
             | Write::Checkpoint { thread_id, .. } => thread_id,
         }
@@ -351,7 +344,6 @@ mod tests {
             interaction_mode: "default".to_string(),
             branch: None,
             worktree_path: None,
-            agent_session_id: None,
             provider_resume_cursor: None,
             latest_turn: None,
             latest_user_message_at: None,
