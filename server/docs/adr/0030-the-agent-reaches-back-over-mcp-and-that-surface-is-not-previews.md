@@ -97,3 +97,9 @@ router ships without it.**
 - **The order is fixed by this.** Preview can be built and shipped while MCP does
   not exist. MCP cannot usefully be built before the router it feeds. So preview
   goes first even though the automation half of it will sit quiet.
+
+- **OpenCode consumes the same platform surface rather than growing its own.**
+  Matching T3 Code, an owned OpenCode server receives the per-thread endpoint
+  through `mcp.add`; an external OpenCode server receives none, because laplus
+  does not mutate infrastructure it does not own. Full OpenCode parity therefore
+  depends on the MCP effort rather than absorbing it into the provider driver.

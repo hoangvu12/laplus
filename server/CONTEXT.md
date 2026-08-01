@@ -41,6 +41,10 @@ nobody can pick out of a list. A project registered with no title takes its
 folder's name (`projects::WorkspaceRoot::inferred_title`); a thread with none
 takes its project's.
 
+An OpenCode thread is the exception to developer-only ownership: every non-empty
+title on an upstream `session.updated` event becomes the thread title, matching
+T3 Code even when that overwrites a manual rename.
+
 Moved by `thread.meta.update` and `project.meta.update` — and **the first of those
 is not only the rename control.** The composer sends it before every message whose
 model or branch differs from the thread's, and writes those two fields with it, so
@@ -51,6 +55,15 @@ thread-lifecycle tracker, ticket 03.
 
 **Turn** — one exchange within a thread: the developer's prompt and everything
 the agent does before it goes quiet. Has an id the client mints.
+
+**Steer** — an additional developer prompt incorporated into the OpenCode turn
+already running, retaining that turn's id. _Avoid_: Queued turn, which starts a
+new exchange only after the active one settles.
+
+**Chat attachment** — a file stored by laplus and included with a developer
+prompt. OpenCode receives its resolved local `file://` URL; an external server
+can consume it only when it shares that filesystem. _Avoid_: Attachment alone,
+which already means a terminal output subscription in this context.
 
 **Session** — the agent process behind a thread, as the client sees it. A thread
 with no session is normal — after a restart, every thread has none.
@@ -72,6 +85,11 @@ implementation runs it. They happen to both be `claudeAgent` for the first
 entry and are separate fields; `crate::provider::ProviderIdentity` keeps the
 pair durable on the thread.
 
+**Provider instance** — one configured identity of a driver, with its own
+settings, catalogue and continuation namespace. Several instances may use the
+same driver; a thread routes to the instance id, not merely the driver kind.
+_Avoid_: Provider, when the distinction affects routing or configuration.
+
 **App-server** - Codex's JSON-RPC mode, started as `codex app-server` and spoken
 to over newline-delimited JSON on stdio. Responses omit `jsonrpc`, may arrive out
 of order, and are correlated by client request id; requests travelling the other
@@ -81,11 +99,23 @@ conversation by ADR-0032. `crate::codex_protocol` is the pure wire vocabulary
 and decoder; `crate::codex` owns both app-server lifetimes and implements the
 Codex driver.
 
-**Agent session id** — a driver's own handle on a conversation, given back to
-that driver when a new process continues it: a Claude session id passed as
-`--resume`, or a Codex thread id sent to `thread/resume`. The one piece of
-agent-protocol vocabulary that reaches the database, because continuity depends
-on it outliving the process.
+**Owned OpenCode server** — an `opencode serve` process laplus starts for one
+conversation and stops with that conversation. _Avoid_: Local server, embedded
+server.
+
+**External OpenCode server** — an OpenCode HTTP endpoint configured by the
+developer whose availability, transport security and lifetime laplus does not
+own. _Avoid_: Remote server, because the endpoint may be on loopback.
+
+**Provider resume cursor** — a driver's opaque, versioned description of how to
+continue a conversation after its runtime is gone. _Avoid_: Agent session id,
+because a cursor may contain more than one upstream identifier.
+
+Legacy Claude and Codex rows contain only the upstream id as a string; each
+driver reads that as its v0 cursor. New cursors are JSON owned and validated by
+the driver that wrote them. An established cursor that is malformed or from an
+unsupported future version is surfaced as incompatible rather than silently
+discarded into a fresh conversation.
 
 Writing it down is the whole of what a successful open does. Claude announces
 the handle on its `init` line; Codex returns it from `thread/start` or
@@ -100,6 +130,12 @@ A Codex resume refusal is recoverable rather than a dead session: every error,
 without classifying its wording, falls back to `thread/start`, replaces this id
 with the fresh thread id, and publishes `session.resume-failed` so the developer
 knows the agent no longer has the previous context. `crate::codex`.
+
+OpenCode resumes more narrowly: only a structured missing-session answer starts
+fresh. Transport, authentication and server failures preserve the cursor and
+surface the failure; a session found under another canonical working directory
+is forked into the requested one so its history follows the thread. An adopted
+session has the current runtime permissions re-applied before it is used.
 
 **Runtime mode** — how much latitude the agent is given, as the contract's four
 closed literals: `approval-required`, `auto-accept-edits`, `auto`, `full-access`.
@@ -128,6 +164,13 @@ workspace-write, and `full-access` is `never` and danger-full-access. The
 developer is always named as the reviewer, including on resume. `auto`
 deliberately matches `auto-accept-edits` until the client can render the OpenAI
 reviewer's work; the mapping carries the reason for that divergence.
+
+OpenCode follows T3 Code's more conservative two-way translation:
+`full-access` allows every OpenCode permission, while all three other modes ask
+for every permission except the separate `question` capability. Consequently
+`approval-required`, `auto-accept-edits` and `auto` behave alike for this
+driver; their distinct stored names do not imply distinctions OpenCode has not
+been configured to enforce.
 
 A mode is given to the child at launch and **retuned afterwards**, at the next
 turn's dispatch. Claude uses its control channel: `set_permission_mode`, with
@@ -214,6 +257,17 @@ the CLI is what acts on it — so both are read from where the CLI reads them
 rather than written down here. Claude's commands come from its handshake and its
 skills from disk; Codex answers `skills/list` for the registered workspaces in
 the same app-server probe that supplies its account and models.
+
+OpenCode's catalogue is its connected upstream models plus its visible primary
+agents and model variants. A local instance reads them from `opencode models
+--verbose` and `opencode agent list`; an external instance asks its HTTP API.
+Only connected upstream providers contribute discovered models, while custom
+configured models remain available as fallback entries.
+
+**Text generation** — short, structured provider work used to name commits,
+pull requests, branches and threads outside a conversation. OpenCode runs each
+request in a temporary deny-all session; local instances share a separate
+server that is reaped after thirty idle seconds.
 
 **Handshake** — the driver's `initialize` exchange. For Claude it is the only
 way to learn its compiled-in commands, so a session is opened for that question
