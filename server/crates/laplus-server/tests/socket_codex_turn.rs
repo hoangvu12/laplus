@@ -136,6 +136,14 @@ async fn a_codex_thread_id_survives_a_restart_and_resumes_the_captured_context()
     let workspace = Workspace::with(&["src/main.rs"]);
     complete_first_codex_turn(&codex, &database, &workspace).await;
 
+    rusqlite::Connection::open(&database)
+        .expect("opens the stored conversation")
+        .execute(
+            "UPDATE threads SET agent_session_id = 'obsolete-legacy-thread' WHERE id = 'codex-thread'",
+            [],
+        )
+        .expect("makes the legacy continuation disagree with the migrated cursor");
+
     let mut config = ServerConfig::detect();
     config.settings.providers.codex.binary_path = codex.configured();
     let server = TestServer::start_at_with_config(&database, config).await;
@@ -187,6 +195,56 @@ async fn a_codex_thread_id_survives_a_restart_and_resumes_the_captured_context()
     client.close().await;
     server.stop().await;
     codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn incompatible_codex_cursors_fail_visibly_after_a_restart() {
+    for (cursor, expected) in [
+        (json!({"version": 1}), "incompatible"),
+        (
+            json!({"version": 2, "threadId": "future-thread"}),
+            "newer than this build supports",
+        ),
+    ] {
+        let codex = ScriptedCodex::resumable_conversation();
+        let data = tempfile::tempdir().expect("a temporary data directory");
+        let database = data.path().join("registry.db");
+        let workspace = Workspace::with(&["src/main.rs"]);
+        complete_first_codex_turn(&codex, &database, &workspace).await;
+
+        rusqlite::Connection::open(&database)
+            .expect("opens the stored conversation")
+            .execute(
+                "UPDATE threads SET provider_resume_cursor = ?1 WHERE id = 'codex-thread'",
+                [cursor.to_string()],
+            )
+            .expect("writes the incompatible cursor");
+
+        let mut config = ServerConfig::detect();
+        config.settings.providers.codex.binary_path = codex.configured();
+        let restarted = TestServer::start_at_with_config(&database, config).await;
+        let mut client = restarted.connect().await;
+        let subscription = client.watch_conversation("codex-thread").await;
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                follow_up("codex-thread", "message-2", "after the restart"),
+            )
+            .await
+            .expect_success();
+        let events = client.events_through_the_turn(&subscription).await;
+        let failed = &activity(&events, "session.failed")["payload"]["activity"];
+        assert!(failed["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains(expected)));
+        assert_eq!(
+            codex.thread_requests().len(),
+            1,
+            "an incompatible cursor started Codex"
+        );
+        client.close().await;
+        restarted.stop().await;
+    }
 }
 
 #[tokio::test]

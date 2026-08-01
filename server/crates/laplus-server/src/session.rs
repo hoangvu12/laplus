@@ -835,7 +835,11 @@ async fn drive<D: Driver>(
     // running now.
     let ours = threads.detach(&start.thread_id, epoch);
 
-    let failure = send_failure.or(refused).or(death);
+    // A write can lose the race with a child refusing its resume and report a
+    // broken pipe. The refusal is the cause the developer can act on; the write
+    // failure is only its consequence, so it must not replace the driver's
+    // provider-specific continuation explanation on the session.
+    let failure = refused.or(send_failure).or(death);
     if ours {
         threads.apply(
             &start.thread_id,

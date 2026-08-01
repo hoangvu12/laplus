@@ -114,17 +114,21 @@
 //!
 //! Within one process there is nothing to do: the child is long-lived and the
 //! conversation is its own, so a follow-up is a second line on the same stdin.
-//! Across a restart there is exactly one thing to do, and it is a flag —
-//! `--resume <session-id>` — because the context lives in the agent's own store
-//! rather than in this server's transcript. Replaying the transcript into each
-//! prompt would be the alternative, and it would be a second, worse copy of the
-//! conversation that the agent had no reason to believe.
+//! Across a restart the driver reads its provider resume cursor and turns the
+//! session id inside it into one flag — `--resume <session-id>` — because the
+//! context lives in the agent's own store rather than in this server's
+//! transcript. Legacy rows whose only continuation is the raw session-id column
+//! are the v0 form and are migrated when the resumed CLI announces itself.
+//! Replaying the transcript into each prompt would be the alternative, and it
+//! would be a second, worse copy of the conversation that the agent had no reason
+//! to believe.
 //!
-//! So the `init` line's session id is remembered on the thread and written down
-//! ([`crate::threads::Threads::remember_agent_session`]), and a session opened
-//! for a thread that has one is opened with `--resume`. The id is the agent's own
-//! account of itself rather than something this server minted, for the same
-//! reason the model and the permission mode are.
+//! So the `init` line's session id is written as the driver's versioned cursor
+//! through the shared continuation boundary (and temporarily mirrored in the
+//! legacy column until ticket 06 removes it), and a session opened for a thread
+//! that has one is opened with `--resume`. The id is the agent's own account of
+//! itself rather than something this server minted, for the same reason the model
+//! and the permission mode are.
 //!
 //! A resume the CLI will not honour is the one failure with no NDJSON to it at
 //! all: the child writes its reason to stderr and exits. [`resume_refused`] is
@@ -177,11 +181,38 @@ pub(crate) struct Claude {
     /// such request and a session that changed which conversation it was in the
     /// middle of would not be one.
     resume: Option<String>,
+    provider: crate::provider::ProviderIdentity,
+}
+
+fn resume_session(start: &Start) -> Result<Option<String>, String> {
+    let Some(cursor) = &start.resume_cursor else {
+        return Ok(start.resume.clone());
+    };
+    if cursor.value.as_object().map(serde_json::Map::len) != Some(2) {
+        return Err("The stored Claude continuation is incompatible with this build.".to_string());
+    }
+    let version = cursor.value.get("version").and_then(serde_json::Value::as_u64);
+    let session_id = cursor.value.get("sessionId").and_then(serde_json::Value::as_str);
+    match (version, session_id) {
+        (Some(1), Some(session_id)) if !session_id.is_empty() => Ok(Some(session_id.to_string())),
+        (Some(version), _) if version > 1 => Err(format!(
+            "Claude continuation version {version} is newer than this build supports."
+        )),
+        _ => Err("The stored Claude continuation is incompatible with this build.".to_string()),
+    }
+}
+
+fn resume_cursor(provider: &crate::provider::ProviderIdentity, session_id: &str) -> crate::provider::ResumeCursor {
+    crate::provider::ResumeCursor {
+        provider: provider.clone(),
+        value: json!({"version": 1, "sessionId": session_id}),
+    }
 }
 
 impl Driver for Claude {
     /// Resolve the binary and start the agent, or say why not.
     async fn open(start: &Start) -> Result<Opened<Claude>, String> {
+        let resume = resume_session(start)?;
         // Resolved here rather than on the dispatch path: it is a walk of every
         // `PATH` directory, and the read loop is answering a developer who has
         // just pressed enter. Resolved per session rather than once at boot
@@ -197,7 +228,7 @@ impl Driver for Claude {
             cwd: start.workspace_root.clone(),
             model: start.model.clone(),
             permission_mode: permission_mode_for(&start.runtime_mode),
-            resume: start.resume.clone(),
+            resume: resume.clone(),
         })
         .await
         .map_err(|error| {
@@ -212,7 +243,8 @@ impl Driver for Claude {
             driver: Claude {
                 agent,
                 folding: SessionState::new(),
-                resume: start.resume.clone(),
+                resume,
+                provider: start.provider.clone(),
             },
             decided: Decided::default(),
         })
@@ -228,7 +260,11 @@ impl Driver for Claude {
     /// other verbs, which the loop awaits on their own.
     async fn next(&mut self, driving: &mut Driving) -> Option<Decided> {
         let line = self.agent.next_line().await?;
-        Some(decide(&mut self.folding, driving, &line))
+        let mut decided = decide(&mut self.folding, driving, &line);
+        if let Some(session_id) = decided.agent_session.as_deref() {
+            decided.provider_resume_cursor = Some(resume_cursor(&self.provider, session_id));
+        }
+        Some(decided)
     }
 
     async fn send(&mut self, text: &str) -> std::io::Result<()> {

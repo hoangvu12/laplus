@@ -313,6 +313,14 @@ async fn a_restored_conversation_is_continued_by_resuming_the_agents_own_session
         server.stop().await;
     }
 
+    rusqlite::Connection::open(&database)
+        .expect("opens the stored conversation")
+        .execute(
+            "UPDATE threads SET agent_session_id = 'obsolete-legacy-session' WHERE id = 'thread-1'",
+            [],
+        )
+        .expect("makes the legacy continuation disagree with the migrated cursor");
+
     let restarted = TestServer::start_at_with_agent(&database, &agent.configured()).await;
     let mut client = restarted.connect().await;
     // Not a draft this time: the conversation is on disk, so its subscription
@@ -368,6 +376,65 @@ async fn a_restored_conversation_is_continued_by_resuming_the_agents_own_session
 
     client.close().await;
     restarted.stop().await;
+}
+
+#[tokio::test]
+async fn incompatible_claude_cursors_fail_visibly_after_a_restart() {
+    for (cursor, expected) in [
+        (json!({"version": 1}), "incompatible"),
+        (
+            json!({"version": 2, "sessionId": "future-session"}),
+            "newer than this build supports",
+        ),
+    ] {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database = directory.path().join("state.sqlite");
+        let workspace = Workspace::with(&["src/"]);
+        let agent = ScriptedAgent::per_turn(&lines(&a_conversation(&["before"])));
+
+        {
+            let server = TestServer::start_at_with_agent(&database, &agent.configured()).await;
+            let mut client = server.connect().await;
+            let subscription = client.open_conversation(&workspace, "thread-1").await;
+            client
+                .call(
+                    "orchestration.dispatchCommand",
+                    start_turn("thread-1", "message-1", "before the restart"),
+                )
+                .await
+                .expect_success();
+            client.events_through_the_turn(&subscription).await;
+            client.close().await;
+            server.stop().await;
+        }
+
+        rusqlite::Connection::open(&database)
+            .expect("opens the stored conversation")
+            .execute(
+                "UPDATE threads SET provider_resume_cursor = ?1 WHERE id = 'thread-1'",
+                [cursor.to_string()],
+            )
+            .expect("writes the incompatible cursor");
+
+        let restarted = TestServer::start_at_with_agent(&database, &agent.configured()).await;
+        let mut client = restarted.connect().await;
+        let subscription = client.watch_conversation("thread-1").await;
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                follow_up("thread-1", "message-2", "after the restart"),
+            )
+            .await
+            .expect_success();
+        let events = client.events_through_the_turn(&subscription).await;
+        let failed = &activity(&events, "session.failed")["payload"]["activity"];
+        assert!(failed["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains(expected)));
+        assert_eq!(agent.starts(), 1, "an incompatible cursor started Claude");
+        client.close().await;
+        restarted.stop().await;
+    }
 }
 
 /// A session the agent no longer holds fails with an explanation, and the

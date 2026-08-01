@@ -114,8 +114,34 @@ pub(crate) struct Codex {
     capabilities: Capabilities,
 }
 
+fn resume_thread(start: &Start) -> Result<Option<String>, String> {
+    let Some(cursor) = &start.resume_cursor else {
+        return Ok(start.resume.clone());
+    };
+    if cursor.value.as_object().map(serde_json::Map::len) != Some(2) {
+        return Err("The stored Codex continuation is incompatible with this build.".to_string());
+    }
+    let version = cursor.value.get("version").and_then(serde_json::Value::as_u64);
+    let thread_id = cursor.value.get("threadId").and_then(serde_json::Value::as_str);
+    match (version, thread_id) {
+        (Some(1), Some(thread_id)) if !thread_id.is_empty() => Ok(Some(thread_id.to_string())),
+        (Some(version), _) if version > 1 => Err(format!(
+            "Codex continuation version {version} is newer than this build supports."
+        )),
+        _ => Err("The stored Codex continuation is incompatible with this build.".to_string()),
+    }
+}
+
+fn resume_cursor(start: &Start, thread_id: &str) -> crate::provider::ResumeCursor {
+    crate::provider::ResumeCursor {
+        provider: start.provider.clone(),
+        value: serde_json::json!({"version": 1, "threadId": thread_id}),
+    }
+}
+
 impl Driver for Codex {
     async fn open(start: &Start) -> Result<Opened<Codex>, String> {
+        let resume = resume_thread(start)?;
         let settings = start.driver.codex()?;
         let capabilities = Capabilities::current();
         let (binary, _) = crate::provider::resolve_codex(
@@ -148,7 +174,7 @@ impl Driver for Codex {
             let initialized = app_server.request(Request::Initialize).await?;
             protocol::decode_initialize(initialized)?;
             app_server.write(&protocol::initialized()).await?;
-            match &start.resume {
+            match &resume {
                 Some(resume) => {
                     match app_server
                         .request(Request::ThreadResume {
@@ -208,12 +234,13 @@ impl Driver for Codex {
                 access,
                 // `thread/resume` has no model field. Restate the complete
                 // configuration on its first turn as well as after a retune.
-                explicit_turn_config: start.resume.is_some(),
+                explicit_turn_config: resume.is_some(),
                 capabilities,
             },
             decided: Decided {
                 changes,
-                agent_session: Some(thread_id),
+                agent_session: Some(thread_id.clone()),
+                provider_resume_cursor: Some(resume_cursor(start, &thread_id)),
                 ..Decided::default()
             },
         })
