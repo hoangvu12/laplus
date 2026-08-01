@@ -9,6 +9,9 @@
 //! - `codex_protocol` is the pure JSON-RPC subset spoken by `codex app-server`,
 //!   pinned in both directions by `fixtures/codex-app-server/`; [`codex`] owns
 //!   the child process, pipes and deadlines around it.
+//! - [`opencode_protocol`] is the pure JSON/SSE subset spoken by OpenCode,
+//!   pinned by `fixtures/opencode-http-sse/`; [`opencode`] owns HTTP requests
+//!   and the event-stream lifetime around it.
 //! - [`wire`] is what the **UI** speaks — JSON messages inside WebSocket text
 //!   frames. Pinned by `fixtures/socket-wire/` and described in
 //!   `docs/socket-wire-format.md`.
@@ -82,8 +85,9 @@ pub mod git;
 pub mod http;
 pub mod keybindings;
 pub mod launch;
-pub mod orchestration;
+pub mod opencode;
 pub mod opencode_protocol;
+pub mod orchestration;
 pub mod pairing;
 pub mod process;
 pub mod project_favicon;

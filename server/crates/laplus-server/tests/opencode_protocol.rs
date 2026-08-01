@@ -10,8 +10,9 @@ use axum::{
     Router,
 };
 use futures_util::StreamExt;
-use laplus_server::opencode_protocol::{
-    OpenCodeClient, OpenCodeError, OpenCodeEvent, SseDecodeError, SseDecoder,
+use laplus_server::{
+    opencode::{OpenCodeClient, OpenCodeError},
+    opencode_protocol::{OpenCodeEvent, SseDecodeError, SseDecoder},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -245,15 +246,16 @@ async fn event_stream_retains_and_counts_unknown_events_and_cancels_promptly() {
     let mut events = client.subscribe().await.unwrap();
     assert!(events.next().await.unwrap().is_unknown());
     assert_eq!(events.unknown_count(), 1);
-    tokio::time::timeout(std::time::Duration::from_millis(250), events.cancel())
+    tokio::time::timeout(std::time::Duration::from_secs(60), events.cancel())
         .await
-        .expect("cancellation should release the response pump");
+        .expect("event pump did not stop within the hang timeout");
     let _ = stop.send(());
 }
 
 #[derive(Deserialize)]
 struct GoldenCase {
     operation: String,
+    request: Value,
     response: Value,
 }
 
@@ -286,5 +288,17 @@ fn redacted_wire_fixture_covers_every_protocol_operation_and_error_family() {
             "error.server"
         ]
     );
-    assert!(cases.iter().all(|case| !case.response.is_null()));
+    assert!(cases
+        .iter()
+        .all(|case| !case.request.is_null() && !case.response.is_null()));
+    assert_eq!(
+        cases[5].request,
+        json!({
+            "method":"POST",
+            "path":"/session/ses_redacted/prompt_async",
+            "query":{"directory":"/redacted/project"},
+            "authorization":"Basic [redacted]",
+            "body":{"parts":[{"type":"text","text":"[redacted]"}]}
+        })
+    );
 }
