@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use crate::catalogue;
 use crate::clock::now_iso;
 use crate::config::{
-    AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
+    AuthStatus, ClaudeSettings, CodexSettings, OpenCodeSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
 };
 use crate::config::Settings;
 use crate::config_store::{ConfigStore, ProviderProbe};
@@ -76,12 +76,14 @@ pub const CLAUDE_INSTANCE_ID: &str = "claudeAgent";
 pub const CLAUDE_DRIVER: &str = "claudeAgent";
 pub const CODEX_INSTANCE_ID: &str = "codex";
 pub const CODEX_DRIVER: &str = "codex";
+pub const OPENCODE_DRIVER: &str = "opencode";
 pub const REFRESH: &str = "server.refreshProviders";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverKind {
     Claude,
     Codex,
+    OpenCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +127,10 @@ pub const REGISTRY: &[Registration] = &[
         driver: CODEX_DRIVER,
         kind: DriverKind::Codex,
     },
+    Registration {
+        driver: OPENCODE_DRIVER,
+        kind: DriverKind::OpenCode,
+    },
 ];
 
 pub fn registration(driver: &str) -> Option<Registration> {
@@ -149,9 +155,17 @@ pub struct CodexInstance {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OpenCodeInstance {
+    pub identity: ProviderIdentity,
+    pub display_name: String,
+    pub settings: OpenCodeSettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConfiguredInstance {
     Claude(ClaudeInstance),
     Codex(CodexInstance),
+    OpenCode(OpenCodeInstance),
 }
 
 impl ConfiguredInstance {
@@ -159,6 +173,7 @@ impl ConfiguredInstance {
         match self {
             ConfiguredInstance::Claude(instance) => &instance.identity,
             ConfiguredInstance::Codex(instance) => &instance.identity,
+            ConfiguredInstance::OpenCode(instance) => &instance.identity,
         }
     }
 
@@ -166,6 +181,7 @@ impl ConfiguredInstance {
         match self {
             ConfiguredInstance::Claude(instance) => instance.settings.enabled,
             ConfiguredInstance::Codex(instance) => instance.settings.enabled,
+            ConfiguredInstance::OpenCode(instance) => instance.settings.enabled,
         }
     }
 }
@@ -211,6 +227,8 @@ fn configured_instance(settings: &Settings, instance_id: &str) -> Option<Configu
             .map(ConfiguredInstance::Claude),
         DriverKind::Codex => codex_instance(settings, instance_id)
             .map(ConfiguredInstance::Codex),
+        DriverKind::OpenCode => opencode_instance(settings, instance_id)
+            .map(ConfiguredInstance::OpenCode),
     }
 }
 
@@ -266,6 +284,24 @@ pub fn codex_instance(settings: &Settings, instance_id: &str) -> Option<CodexIns
             binary_path: config.get("binaryPath")?.as_str()?.to_string(),
             home_path: config.get("homePath")?.as_str()?.to_string(),
             launch_args: config.get("launchArgs")?.as_str()?.to_string(),
+            custom_models: config.get("customModels")?.as_array()?.iter()
+                .map(|model| model.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
+pub fn opencode_instance(settings: &Settings, instance_id: &str) -> Option<OpenCodeInstance> {
+    let envelope = settings.provider_instances.get(instance_id)?.as_object()?;
+    if envelope.get("driver")?.as_str()? != OPENCODE_DRIVER { return None; }
+    let config = envelope.get("config")?.as_object()?;
+    Some(OpenCodeInstance {
+        identity: ProviderIdentity { instance_id: instance_id.to_string(), driver: OPENCODE_DRIVER.to_string() },
+        display_name: envelope.get("displayName")?.as_str()?.to_string(),
+        settings: OpenCodeSettings {
+            enabled: envelope.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
+            binary_path: config.get("binaryPath")?.as_str()?.to_string(),
+            server_url: config.get("serverUrl")?.as_str()?.to_string(),
+            server_password: config.get("serverPassword")?.as_str()?.to_string(),
             custom_models: config.get("customModels")?.as_array()?.iter()
                 .map(|model| model.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
         },
@@ -1158,6 +1194,7 @@ pub(crate) fn rescan_skills_reserved(
                 );
                 publish_one(config, probe, instance_id, expected, provider);
             }
+            Some(ConfiguredInstance::OpenCode(_)) => {}
             None => {}
         }
     }
@@ -1288,6 +1325,136 @@ fn codex_snapshot(
     }
 }
 
+const MINIMUM_OPENCODE_VERSION: (u64, u64, u64) = (1, 14, 19);
+
+fn describe_opencode(instance: &OpenCodeInstance, search: &Search) -> Provider {
+    let settings = &instance.settings;
+    if !settings.enabled {
+        return opencode_snapshot(instance, None, Installed::No, ProviderState::Disabled,
+            Some("The OpenCode provider is switched off in settings.".to_string()), custom_models(&settings.custom_models));
+    }
+    if !settings.server_url.is_empty() {
+        return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => match runtime.block_on(discover_external_opencode(settings)) {
+                Ok((version, models)) => opencode_snapshot(instance, Some(version), Installed::Yes,
+                    ProviderState::Ready, None, merge_custom(models, &settings.custom_models)),
+                Err(error) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
+                    Some(format!("OpenCode server discovery failed: {error}.")), custom_models(&settings.custom_models)),
+            },
+            Err(error) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
+                Some(format!("OpenCode server discovery could not start: {error}.")), custom_models(&settings.custom_models)),
+        };
+    }
+    let (path, _) = match resolve_named(&settings.binary_path, "opencode", search)
+        .startable_for("OpenCode CLI") {
+        Ok(found) => found,
+        Err(why) => return opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
+            Some(why), custom_models(&settings.custom_models)),
+    };
+    let version = match probe(&path, PROBE_TIMEOUT) {
+        Probed::Version(version) => version,
+        other => return opencode_snapshot(instance, None, Installed::Yes, ProviderState::Error,
+            Some(format!("OpenCode version probe failed: {other:?}.")), custom_models(&settings.custom_models)),
+    };
+    if parse_version(&version).is_none_or(|found| found < MINIMUM_OPENCODE_VERSION) {
+        return opencode_snapshot(instance, Some(version.clone()), Installed::Yes, ProviderState::Error,
+            Some(format!("OpenCode {version} is unsupported; version 1.14.19 or newer is required.")),
+            custom_models(&settings.custom_models));
+    }
+    match discover_local_opencode(&path) {
+        Ok(models) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Ready,
+            None, merge_custom(models, &settings.custom_models)),
+        Err(error) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Error,
+            Some(format!("OpenCode catalogue discovery failed: {error}.")), custom_models(&settings.custom_models)),
+    }
+}
+
+async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(String, Vec<ProviderModel>), String> {
+    let client = crate::opencode::OpenCodeClient::new(
+        &settings.server_url, ".", (!settings.server_password.is_empty()).then(|| settings.server_password.clone()),
+    ).map_err(|error| error.to_string())?;
+    let health = client.health().await.map_err(|error| error.to_string())?;
+    if !health.healthy { return Err("the server reported unhealthy".to_string()); }
+    let providers = client.providers().await.map_err(|error| error.to_string())?;
+    let agents = client.agents().await.map_err(|error| error.to_string())?;
+    Ok((health.version, opencode_models(&providers, &agents)))
+}
+
+fn discover_local_opencode(path: &Path) -> Result<Vec<ProviderModel>, String> {
+    let model_output = Command::new(path).args(["models", "--verbose"]).output()
+        .map_err(|error| format!("models --verbose could not start: {error}"))?;
+    if !model_output.status.success() { return Err("models --verbose exited unsuccessfully".to_string()); }
+    let agent_output = Command::new(path).args(["agent", "list"]).output()
+        .map_err(|error| format!("agent list could not start: {error}"))?;
+    if !agent_output.status.success() { return Err("agent list exited unsuccessfully".to_string()); }
+    let model_text = String::from_utf8_lossy(&model_output.stdout);
+    let agent_text = String::from_utf8_lossy(&agent_output.stdout);
+    if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&model_text) {
+        let agents = serde_json::from_str::<serde_json::Value>(&agent_text).unwrap_or_else(|_| serde_json::json!([]));
+        return Ok(opencode_models(&providers, &agents));
+    }
+    let agents = agent_text.lines().map(str::trim).filter(|line| !line.is_empty())
+        .map(str::to_string).collect::<Vec<_>>();
+    Ok(model_text.lines().map(str::trim).filter(|line| line.contains('/'))
+        .map(|slug| opencode_model(slug, slug, &[], &agents)).collect())
+}
+
+fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) -> Vec<ProviderModel> {
+    let visible_agents = agents.as_array().into_iter().flatten().filter(|agent| {
+        !agent.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            && matches!(agent.get("mode").and_then(serde_json::Value::as_str), Some("primary") | Some("all") | None)
+    }).filter_map(|agent| agent.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
+      .collect::<Vec<_>>();
+    let connected = providers.get("connected").and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>());
+    let listed = providers.get("providers").or_else(|| providers.get("all")).and_then(serde_json::Value::as_array)
+        .or_else(|| providers.as_array()).into_iter().flatten();
+    let mut models = Vec::new();
+    for provider in listed {
+        let Some(provider_id) = provider.get("id").and_then(serde_json::Value::as_str) else { continue };
+        if connected.as_ref().is_some_and(|ids| !ids.contains(&provider_id)) { continue; }
+        let Some(entries) = provider.get("models").and_then(serde_json::Value::as_object) else { continue };
+        for (key, model) in entries {
+            let model_id = model.get("id").and_then(serde_json::Value::as_str).unwrap_or(key);
+            let name = model.get("name").and_then(serde_json::Value::as_str).unwrap_or(model_id);
+            let variants = model.get("variants").and_then(serde_json::Value::as_object)
+                .map(|value| value.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+            models.push(opencode_model(&format!("{provider_id}/{model_id}"), name, &variants, &visible_agents));
+        }
+    }
+    models
+}
+
+fn opencode_model(slug: &str, name: &str, variants: &[String], agents: &[String]) -> ProviderModel {
+    let mut descriptors = Vec::new();
+    if !agents.is_empty() { descriptors.push(serde_json::json!({"id":"agent","label":"Agent","type":"select",
+        "options": agents.iter().map(|id| serde_json::json!({"id":id,"label":id})).collect::<Vec<_>>() })); }
+    if !variants.is_empty() { descriptors.push(serde_json::json!({"id":"variant","label":"Variant","type":"select",
+        "options": variants.iter().map(|id| serde_json::json!({"id":id,"label":id})).collect::<Vec<_>>() })); }
+    ProviderModel { slug: slug.to_string(), name: name.to_string(), is_custom: false, is_default: None,
+        capabilities: Some(serde_json::json!({"optionDescriptors": descriptors})) }
+}
+
+fn custom_models(models: &[String]) -> Vec<ProviderModel> {
+    models.iter().map(|slug| ProviderModel { slug: slug.clone(), name: slug.clone(), is_custom: true,
+        is_default: None, capabilities: Some(serde_json::json!({"optionDescriptors": []})) }).collect()
+}
+
+fn merge_custom(mut discovered: Vec<ProviderModel>, configured: &[String]) -> Vec<ProviderModel> {
+    for custom in custom_models(configured) {
+        if !discovered.iter().any(|model| model.slug == custom.slug) { discovered.push(custom); }
+    }
+    discovered
+}
+
+fn opencode_snapshot(instance: &OpenCodeInstance, version: Option<String>, installed: Installed,
+    status: ProviderState, message: Option<String>, models: Vec<ProviderModel>) -> Provider {
+    Provider { instance_id: instance.identity.instance_id.clone(), driver: OPENCODE_DRIVER.to_string(),
+        display_name: instance.display_name.clone(), enabled: instance.settings.enabled,
+        installed: installed == Installed::Yes, version, status, message, auth: unknown_auth(),
+        checked_at: now_iso(), models, slash_commands: Vec::new(), skills: Vec::new() }
+}
+
 fn unknown_auth() -> ProviderAuth {
     ProviderAuth {
         status: AuthStatus::Unknown,
@@ -1344,6 +1511,7 @@ fn refresh_instance_reserved(
             let lifetime = config.provider_process_lifetime();
             describe_codex(&instance, search, roots, &lifetime)
         }
+        Some(ConfiguredInstance::OpenCode(instance)) => describe_opencode(&instance, search),
         None => return,
     };
     if let Some(message) = &provider.message {

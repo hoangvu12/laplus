@@ -1841,6 +1841,10 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
         crate::provider::ConfiguredInstance::Codex(instance) => {
             DriverStart::Codex(instance.settings)
         }
+        crate::provider::ConfiguredInstance::OpenCode(_) => return Err(format!(
+            "OpenCode provider instance '{}' can be discovered, but turns require OpenCode ticket 09.",
+            identity.instance_id
+        )),
     };
 
     Ok(PreparedDriver { identity, driver })

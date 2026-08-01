@@ -429,6 +429,16 @@ pub struct CodexSettings {
     pub custom_models: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeSettings {
+    pub enabled: bool,
+    pub binary_path: String,
+    pub server_url: String,
+    pub server_password: String,
+    pub custom_models: Vec<String>,
+}
+
 impl ClaudeSettings {
     pub(crate) fn instance_envelope(&self, display_name: &str) -> serde_json::Value {
         provider_instance_envelope(crate::provider::CLAUDE_DRIVER, display_name, self.enabled,

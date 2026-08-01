@@ -42,6 +42,28 @@ use laplus_server::config::{ClaudeSettings, CodexSettings, ProviderState, Server
 use laplus_server::process::Search;
 use serde_json::{json, Value};
 
+async fn opencode_peer() -> String {
+    use axum::{routing::get, Json, Router};
+    let app = Router::new()
+        .route("/global/health", get(|| async { Json(json!({"healthy": true, "version": "1.18.10"})) }))
+        .route("/provider", get(|| async { Json(json!({
+            "connected": ["anthropic"],
+            "providers": [
+                {"id":"anthropic","models":{"claude-sonnet":{"id":"claude-sonnet","name":"Claude Sonnet","variants":{"fast":{},"max":{}}}}},
+                {"id":"offline","models":{"ghost":{"id":"ghost"}}}
+            ]
+        })) }))
+        .route("/agent", get(|| async { Json(json!([
+            {"name":"build","mode":"primary","hidden":false},
+            {"name":"secret","mode":"primary","hidden":true},
+            {"name":"helper","mode":"subagent","hidden":false}
+        ])) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    format!("http://{address}")
+}
+
 /// A server configuration whose provider settings are the test's.
 ///
 /// The `binaryPath` setting is the seam the spec names for injecting a stand-in
@@ -253,6 +275,55 @@ async fn a_targeted_refresh_accepts_a_configured_codex_instance() {
     assert_eq!(provider["displayName"], "Codex Work");
     assert_eq!(provider["status"], "ready");
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn external_opencode_instances_discover_independently_and_keep_custom_fallbacks() {
+    let endpoint = opencode_peer().await;
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openGood":{"driver":"opencode","displayName":"OpenCode Good","config":{
+            "serverUrl":endpoint,"serverPassword":"secret","customModels":["ollama/qwen3"]}},
+        "openBad":{"driver":"opencode","displayName":"OpenCode Bad","config":{
+            "serverUrl":format!("http://{unavailable}")}}
+    }}})).await.expect_success();
+
+    let good = provider_named(&server, "openGood").await;
+    let bad = provider_named(&server, "openBad").await;
+    assert_eq!(good["status"], "ready", "{good}");
+    assert_eq!(good["version"], "1.18.10", "{good}");
+    assert_eq!(slugs(&good), vec!["anthropic/claude-sonnet", "ollama/qwen3"]);
+    assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][0]["id"], "agent");
+    assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
+    assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][1]["id"], "variant");
+    assert_eq!(bad["status"], "error", "{bad}");
+    assert!(message(&bad).contains("transport failed"), "{bad}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions() {
+    let current = FakeAgent::saying(if cfg!(windows) {
+        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo {\"connected\":[\"openai\"],\"providers\":[{\"id\":\"openai\",\"models\":{\"gpt-5\":{\"id\":\"gpt-5\"}}}]} & exit /b 0\r\nif \"%1\"==\"agent\" echo [{\"name\":\"build\",\"mode\":\"primary\",\"hidden\":false}] & exit /b 0\r\nexit /b 2"
+    } else {
+        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) echo '{\"connected\":[\"openai\"],\"providers\":[{\"id\":\"openai\",\"models\":{\"gpt-5\":{\"id\":\"gpt-5\"}}}]}' ;;\nagent) echo '[{\"name\":\"build\",\"mode\":\"primary\",\"hidden\":false}]' ;;\n*) exit 2;;\nesac"
+    });
+    let old = FakeAgent::saying("echo 1.14.18");
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openLocal":{"driver":"opencode","displayName":"OpenCode Local","config":{"binaryPath":current.configured()}},
+        "openOld":{"driver":"opencode","displayName":"OpenCode Old","config":{"binaryPath":old.configured()}}
+    }}})).await.expect_success();
+    let local = provider_named(&server, "openLocal").await;
+    let old = provider_named(&server, "openOld").await;
+    assert_eq!(local["status"], "ready", "{local}");
+    assert_eq!(slugs(&local), vec!["openai/gpt-5"]);
+    assert_eq!(old["status"], "error", "{old}");
+    assert!(message(&old).contains("1.14.19 or newer"), "{old}");
     server.stop().await;
 }
 

@@ -266,8 +266,8 @@ async fn invalid_provider_instance_envelopes_are_refused_actionably() {
             "provider instance id",
         ),
         (
-            json!({"providerInstances": {"work": {"driver": "opencode", "displayName": "Work"}}}),
-            "unsupported driver kind",
+            json!({"providerInstances": {"work": {"driver": "opencode", "displayName": "Work", "config": {"serverUrl": "ftp://example.test"}}}}),
+            "HTTP or HTTPS",
         ),
         (
             json!({"providerInstances": {"work": {"driver": "claudeAgent", "displayName": "Work", "config": {"customModels": [""]}}}}),
@@ -289,6 +289,37 @@ async fn invalid_provider_instance_envelopes_are_refused_actionably() {
     assert_eq!(instances.len(), 2);
     assert!(instances.contains_key("claudeAgent"));
     assert!(instances.contains_key("codex"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn opencode_provider_instance_settings_round_trip() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    update(&mut client, json!({"providerInstances": {"openWork": {
+        "driver": "opencode",
+        "displayName": "OpenCode Work",
+        "enabled": true,
+        "config": {
+            "binaryPath": "/opt/opencode",
+            "serverUrl": "https://opencode.example.test/api/",
+            "serverPassword": "secret",
+            "customModels": ["ollama/qwen3"]
+        }
+    }}})).await.expect_success();
+
+    let stored = settings(&mut client).await;
+    assert_eq!(stored["providerInstances"]["openWork"], json!({
+        "driver": "opencode",
+        "displayName": "OpenCode Work",
+        "enabled": true,
+        "config": {
+            "binaryPath": "/opt/opencode",
+            "serverUrl": "https://opencode.example.test/api/",
+            "serverPassword": "secret",
+            "customModels": ["ollama/qwen3"]
+        }
+    }));
     server.stop().await;
 }
 

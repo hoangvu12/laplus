@@ -401,6 +401,15 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                 }, &config)?;
                 (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
             }
+            crate::provider::DriverKind::OpenCode => {
+                let settings = opencode(&config)?;
+                normalized.insert(instance_id.clone(), json!({
+                    "driver": driver, "displayName": display_name, "enabled": enabled,
+                    "config": {"binaryPath": settings.binary_path, "serverUrl": settings.server_url,
+                        "serverPassword": settings.server_password, "customModels": settings.custom_models}
+                }));
+                continue;
+            }
         };
         normalized.insert(instance_id.clone(), json!({
             "driver": driver,
@@ -415,6 +424,27 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
         }));
     }
     Ok(normalized)
+}
+
+fn opencode(config: &Map<String, Value>) -> Result<crate::config::OpenCodeSettings, String> {
+    for field in config.keys() {
+        if !matches!(field.as_str(), "binaryPath" | "serverUrl" | "serverPassword" | "customModels") {
+            return Err(unrecognised(&format!("providers.opencode.{field}")));
+        }
+    }
+    let server_url = config.get("serverUrl").map(|v| text("serverUrl", v)).transpose()?.unwrap_or_default();
+    if !server_url.is_empty() {
+        let valid = reqwest::Url::parse(&server_url).ok()
+            .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
+        if !valid { return Err("'serverUrl' has to be an HTTP or HTTPS URL.".to_string()); }
+    }
+    Ok(crate::config::OpenCodeSettings {
+        enabled: true,
+        binary_path: config.get("binaryPath").map(|v| text("binaryPath", v)).transpose()?.unwrap_or_else(|| "opencode".to_string()),
+        server_url,
+        server_password: config.get("serverPassword").map(|v| text("serverPassword", v)).transpose()?.unwrap_or_default(),
+        custom_models: config.get("customModels").map(models).transpose()?.unwrap_or_default(),
+    })
 }
 
 /// The Claude instance's own half of a patch.
