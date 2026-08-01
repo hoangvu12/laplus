@@ -7,13 +7,13 @@ writing their existing representation unchanged.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A thread can persist and restore opaque provider-owned continuation JSON
-- [ ] The cursor survives snapshots, events, restart and session launch without
+- [x] A thread can persist and restore opaque provider-owned continuation JSON
+- [x] The cursor survives snapshots, events, restart and session launch without
       being interpreted by persistence or orchestration
-- [ ] Existing agent session ids continue to round-trip exactly as before
-- [ ] A driver can return a new cursor through the shared session boundary
+- [x] Existing agent session ids continue to round-trip exactly as before
+- [x] A driver can return a new cursor through the shared session boundary
       without changing transcript or activity behavior
-- [ ] Cursor and legacy values cannot be silently assigned to the wrong provider
-- [ ] Storage and socket-level tests cover old rows and new cursor-bearing rows
+- [x] Cursor and legacy values cannot be silently assigned to the wrong provider
+- [x] Storage and socket-level tests cover old rows and new cursor-bearing rows

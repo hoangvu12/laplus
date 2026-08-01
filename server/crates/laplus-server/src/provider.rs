@@ -97,6 +97,14 @@ pub struct ProviderIdentity {
     pub driver: String,
 }
 
+/// Opaque continuation data, bound to the provider instance that minted it.
+/// Only that instance's driver may interpret `value`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeCursor {
+    pub provider: ProviderIdentity,
+    pub value: serde_json::Value,
+}
+
 impl Registration {
     pub fn identity(self) -> ProviderIdentity {
         ProviderIdentity {

@@ -94,6 +94,10 @@ pub enum Write {
         thread_id: String,
         session_id: String,
     },
+    ProviderResumeCursor {
+        thread_id: String,
+        cursor: crate::provider::ResumeCursor,
+    },
     /// What the working tree looked like when a turn finished.
     ///
     /// Stored because the *ref* it names outlives the process: the tree is in
@@ -114,6 +118,7 @@ impl Write {
             Write::Message { thread_id, .. }
             | Write::Activity { thread_id, .. }
             | Write::AgentSession { thread_id, .. }
+            | Write::ProviderResumeCursor { thread_id, .. }
             | Write::Checkpoint { thread_id, .. } => thread_id,
         }
     }
@@ -347,6 +352,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             agent_session_id: None,
+            provider_resume_cursor: None,
             latest_turn: None,
             latest_user_message_at: None,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),

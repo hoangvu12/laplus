@@ -933,6 +933,24 @@ impl Threads {
         });
     }
 
+    pub fn remember_provider_resume_cursor(
+        &self,
+        thread_id: &str,
+        cursor: &crate::provider::ResumeCursor,
+    ) {
+        let Some(entry) = self.find(thread_id) else { return };
+        let mut state = lock(&entry.state);
+        let Some(thread) = state.as_mut() else { return };
+        if thread.provider != cursor.provider || thread.provider_resume_cursor.as_ref() == Some(cursor) {
+            return;
+        }
+        thread.provider_resume_cursor = Some(cursor.clone());
+        self.inner.transcripts.queue(Write::ProviderResumeCursor {
+            thread_id: thread.id.clone(),
+            cursor: cursor.clone(),
+        });
+    }
+
     /// The conversations in a project, oldest first.
     ///
     /// Asked of this registry rather than of the database, and that is the whole
@@ -3366,6 +3384,42 @@ pub(crate) mod tests {
             threads.get("thread-1").expect("the thread").agent_session_id,
             Some("session-beta".to_string())
         );
+    }
+
+    #[test]
+    fn a_provider_cursor_is_remembered_without_changing_the_socket_thread() {
+        let (threads, mut shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        shell.try_recv().expect("thread announcement");
+        let before = threads.get("thread-1").expect("thread").to_detail_value();
+        let cursor = crate::provider::ResumeCursor {
+            provider: threads.get("thread-1").expect("thread").provider,
+            value: json!({"version": 7, "owned": {"anything": true}}),
+        };
+
+        threads.remember_provider_resume_cursor("thread-1", &cursor);
+
+        let restored = threads.get("thread-1").expect("thread");
+        assert_eq!(restored.provider_resume_cursor, Some(cursor));
+        assert_eq!(restored.to_detail_value(), before, "continuation is not socket state");
+        assert!(shell.try_recv().is_err(), "continuation publishes no event");
+    }
+
+    #[test]
+    fn a_cursor_from_another_provider_instance_is_not_assigned() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.remember_provider_resume_cursor(
+            "thread-1",
+            &crate::provider::ResumeCursor {
+                provider: crate::provider::ProviderIdentity {
+                    instance_id: "someone-else".to_string(),
+                    driver: "claudeAgent".to_string(),
+                },
+                value: json!({"version": 1}),
+            },
+        );
+        assert!(threads.get("thread-1").expect("thread").provider_resume_cursor.is_none());
     }
 
     /// A delta owes the database nothing — the buffered message supersedes it —

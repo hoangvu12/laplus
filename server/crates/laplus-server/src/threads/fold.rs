@@ -75,6 +75,7 @@ pub struct Thread {
     /// not in this server's transcript, and this id is the handle on it. `None`
     /// until an agent has announced itself for this thread.
     pub agent_session_id: Option<String>,
+    pub provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     /// Where this conversation sits in the developer's inbox — see
     /// [`Lifecycle`].
     pub lifecycle: Lifecycle,
@@ -481,6 +482,7 @@ pub struct ThreadRow {
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub agent_session_id: Option<String>,
+    pub provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     pub latest_turn: Option<LatestTurn>,
     pub latest_user_message_at: Option<String>,
     pub created_at: String,
@@ -904,6 +906,7 @@ impl Thread {
             branch: self.branch.clone(),
             worktree_path: self.worktree_path.clone(),
             agent_session_id: self.agent_session_id.clone(),
+            provider_resume_cursor: self.provider_resume_cursor.clone(),
             latest_turn: self.latest_turn.clone(),
             latest_user_message_at: self.latest_user_message_at.clone(),
             created_at: self.created_at.clone(),
@@ -959,6 +962,7 @@ impl Thread {
             latest_turn,
             latest_user_message_at: row.latest_user_message_at,
             agent_session_id: row.agent_session_id,
+            provider_resume_cursor: row.provider_resume_cursor,
             // Kept for the same reason the checkpoints are: an archived or
             // snoozed conversation that came back from a restart in the inbox
             // would undo the developer's curation every time the window opened.
@@ -2399,6 +2403,7 @@ pub(crate) mod tests {
             latest_turn: None,
             latest_user_message_at: None,
             agent_session_id: None,
+            provider_resume_cursor: None,
             lifecycle: Lifecycle::default(),
         }
     }

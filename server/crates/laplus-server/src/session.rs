@@ -343,6 +343,9 @@ pub struct Start {
     /// already has one. Which agent minted it is the driver's business; that
     /// there is one is how a conversation survives a restart.
     pub resume: Option<String>,
+    /// Opaque continuation data for this exact provider instance.
+    pub resume_cursor: Option<crate::provider::ResumeCursor>,
+    pub provider: crate::provider::ProviderIdentity,
     /// Read once, when the turn is dispatched. A settings change mid-session
     /// does not move a running agent, which is honest — the process was started
     /// with the old value and cannot be told otherwise.
@@ -1736,6 +1739,7 @@ pub(crate) struct Decided {
     pub(crate) changes: Vec<Change>,
     /// The agent's own handle on this conversation, if it has just announced one.
     pub(crate) agent_session: Option<String>,
+    pub(crate) provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     /// The turn ended, and how. `None` on everything that did not end one.
     pub(crate) settles: Option<Settles>,
     /// A push the agent refused, and what this session's capture of itself has to
@@ -1779,6 +1783,11 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
 
     if let Some(session_id) = &decided.agent_session {
         threads.remember_agent_session(&start.thread_id, session_id);
+    }
+    if let Some(cursor) = &decided.provider_resume_cursor {
+        if cursor.provider == start.provider {
+            threads.remember_provider_resume_cursor(&start.thread_id, cursor);
+        }
     }
 
     let Some(settles) = decided.settles else { return };
@@ -1851,6 +1860,111 @@ pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver)
         // for a thread that has none starts a fresh conversation and reports its
         // own id back a moment later.
         resume: thread.agent_session_id.clone(),
+        resume_cursor: thread
+            .provider_resume_cursor
+            .clone()
+            .filter(|cursor| cursor.provider == thread.provider),
+        provider: thread.provider.clone(),
         driver: prepared.driver,
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::broadcast;
+
+    fn thread() -> Thread {
+        let provider = crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID)
+            .expect("registered")
+            .identity();
+        Thread {
+            id: "thread-1".to_string(),
+            project_id: "project-1".to_string(),
+            title: "Cursor test".to_string(),
+            provider,
+            model_selection: json!({"instanceId": "claudeAgent", "model": "claude-opus-5"}),
+            runtime_mode: "full-access".to_string(),
+            interaction_mode: "default".to_string(),
+            branch: None,
+            worktree_path: None,
+            created_at: "2026-08-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-01T00:00:00.000Z".to_string(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            checkpoints: Vec::new(),
+            session: None,
+            latest_turn: None,
+            latest_user_message_at: None,
+            agent_session_id: Some("legacy-session".to_string()),
+            provider_resume_cursor: None,
+            lifecycle: crate::threads::Lifecycle::default(),
+        }
+    }
+
+    #[test]
+    fn a_driver_cursor_crosses_the_shared_boundary_without_socket_changes() {
+        let (shell, mut announcements) = broadcast::channel(8);
+        let threads = Threads::new(
+            crate::store::Sequences::from(0),
+            shell,
+            crate::transcripts::Transcripts::nowhere(),
+        );
+        let thread = thread();
+        threads.create(thread.clone()).expect("created");
+        announcements.try_recv().expect("creation announcement");
+        let before = threads.get("thread-1").expect("thread").to_detail_value();
+        let cursor = crate::provider::ResumeCursor {
+            provider: thread.provider.clone(),
+            value: json!({"version": 1, "sessionId": "opaque-upstream"}),
+        };
+        let start = Start {
+            thread_id: thread.id.clone(),
+            workspace_root: "/work".to_string(),
+            model: thread.model(),
+            runtime_mode: thread.runtime_mode.clone(),
+            resume: thread.agent_session_id.clone(),
+            resume_cursor: None,
+            provider: thread.provider.clone(),
+            driver: DriverStart::Claude(crate::config::ClaudeSettings {
+                enabled: true,
+                binary_path: "claude".to_string(),
+                home_path: String::new(),
+                launch_args: String::new(),
+                custom_models: Vec::new(),
+            }),
+        };
+
+        spend(&threads, &start, Decided { provider_resume_cursor: Some(cursor.clone()), ..Default::default() });
+
+        let after = threads.get("thread-1").expect("thread");
+        assert_eq!(after.provider_resume_cursor, Some(cursor));
+        assert_eq!(after.agent_session_id.as_deref(), Some("legacy-session"));
+        assert_eq!(after.to_detail_value(), before, "transcript/socket state changed");
+        assert!(announcements.try_recv().is_err(), "cursor published an event");
+    }
+
+    #[test]
+    fn session_launch_carries_only_the_cursor_owned_by_its_provider() {
+        let mut thread = thread();
+        let cursor = crate::provider::ResumeCursor {
+            provider: thread.provider.clone(),
+            value: json!({"version": 3, "opaque": true}),
+        };
+        thread.provider_resume_cursor = Some(cursor.clone());
+        let prepared = PreparedDriver {
+            registered: crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID).expect("registered"),
+            driver: DriverStart::Claude(crate::config::ClaudeSettings {
+                enabled: true,
+                binary_path: "claude".to_string(),
+                home_path: String::new(),
+                launch_args: String::new(),
+                custom_models: Vec::new(),
+            }),
+        };
+        let start = starting(&thread, "/work", prepared);
+        assert_eq!(start.resume_cursor, Some(cursor));
+        assert_eq!(start.resume.as_deref(), Some("legacy-session"));
     }
 }

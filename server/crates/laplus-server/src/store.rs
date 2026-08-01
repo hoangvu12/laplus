@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
+use rusqlite::types::Type;
 
 use crate::orchestration::{
     DEFAULT_PROVIDER_INTERACTION_MODE, DEFAULT_RUNTIME_MODE, INTERACTION_MODES, RUNTIME_MODES,
@@ -361,6 +362,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE threads ADD COLUMN provider_instance_id TEXT NOT NULL DEFAULT 'claudeAgent';
     ALTER TABLE threads ADD COLUMN provider_driver      TEXT NOT NULL DEFAULT 'claudeAgent';
     "#,
+    // Provider-owned continuation data. Binding columns remain outside the
+    // opaque JSON so storage can enforce ownership without interpreting it.
+    r#"
+    ALTER TABLE threads ADD COLUMN provider_resume_cursor TEXT;
+    ALTER TABLE threads ADD COLUMN cursor_provider_instance_id TEXT;
+    ALTER TABLE threads ADD COLUMN cursor_provider_driver TEXT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -453,7 +461,8 @@ const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mo
      interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
      latest_user_message_at, created_at, updated_at, archived_at, settled_override, \
      settled_at, snoozed_until, snoozed_at, deleted_at, provider_instance_id, \
-     provider_driver";
+     provider_driver, provider_resume_cursor, cursor_provider_instance_id, \
+     cursor_provider_driver";
 
 /// The registry's durable half.
 #[derive(Debug)]
@@ -1041,6 +1050,8 @@ impl Database {
                     thread_id,
                     session_id,
                 } => remember_agent_session(&transaction, thread_id, session_id)?,
+                Write::ProviderResumeCursor { thread_id, cursor } =>
+                    remember_provider_resume_cursor(&transaction, thread_id, cursor)?,
                 Write::Checkpoint {
                     thread_id,
                     checkpoint,
@@ -1783,9 +1794,10 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 interaction_mode, branch, worktree_path, agent_session_id, latest_turn, \
                 latest_user_message_at, created_at, updated_at, archived_at, \
                 settled_override, settled_at, snoozed_until, snoozed_at, deleted_at, \
-                provider_instance_id, provider_driver) \
+                provider_instance_id, provider_driver, provider_resume_cursor, \
+                cursor_provider_instance_id, cursor_provider_driver) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                ?16, ?17, ?18, ?19, ?20, ?21) \
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) \
              ON CONFLICT (id) DO UPDATE SET \
                 project_id = excluded.project_id, \
                 title = excluded.title, \
@@ -1805,7 +1817,10 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 snoozed_at = excluded.snoozed_at, \
                 deleted_at = excluded.deleted_at, \
                 provider_instance_id = excluded.provider_instance_id, \
-                provider_driver = excluded.provider_driver",
+                provider_driver = excluded.provider_driver, \
+                provider_resume_cursor = excluded.provider_resume_cursor, \
+                cursor_provider_instance_id = excluded.cursor_provider_instance_id, \
+                cursor_provider_driver = excluded.cursor_provider_driver",
             rusqlite::params![
                 thread.id,
                 thread.project_id,
@@ -1833,6 +1848,9 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 thread.lifecycle.deleted_at,
                 thread.provider.instance_id,
                 thread.provider.driver,
+                thread.provider_resume_cursor.as_ref().map(|cursor| cursor.value.to_string()),
+                thread.provider_resume_cursor.as_ref().map(|cursor| &cursor.provider.instance_id),
+                thread.provider_resume_cursor.as_ref().map(|cursor| &cursor.provider.driver),
             ],
         )
         .map_err(StorageError::while_("store the conversation"))?;
@@ -1987,21 +2005,46 @@ fn remember_agent_session(
     Ok(())
 }
 
+fn remember_provider_resume_cursor(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    cursor: &crate::provider::ResumeCursor,
+) -> Result<(), StorageError> {
+    let updated = transaction.execute(
+        "UPDATE threads SET provider_resume_cursor = ?2, cursor_provider_instance_id = ?3, cursor_provider_driver = ?4 WHERE id = ?1 AND provider_instance_id = ?3 AND provider_driver = ?4",
+        rusqlite::params![thread_id, cursor.value.to_string(), cursor.provider.instance_id, cursor.provider.driver],
+    ).map_err(StorageError::while_("store the provider resume cursor"))?;
+    if updated == 0 {
+        return Err(StorageError::refusing("store the provider resume cursor", format!("thread '{thread_id}' is not owned by provider instance '{}' ({})", cursor.provider.instance_id, cursor.provider.driver)));
+    }
+    Ok(())
+}
+
 fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
     let model_selection: String = row.get(3)?;
     let runtime_mode: String = row.get(4)?;
     let interaction_mode: String = row.get(5)?;
     let latest_turn: Option<String> = row.get(9)?;
     let settled_override: Option<String> = row.get(14)?;
+    let cursor_json: Option<String> = row.get(21)?;
+    let cursor_instance: Option<String> = row.get(22)?;
+    let cursor_driver: Option<String> = row.get(23)?;
+    let provider = crate::provider::ProviderIdentity {
+        instance_id: row.get(19)?,
+        driver: row.get(20)?,
+    };
+    let provider_resume_cursor = decode_provider_resume_cursor(
+        cursor_json,
+        cursor_instance,
+        cursor_driver,
+        &provider,
+    )?;
 
     Ok(ThreadRow {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
-        provider: crate::provider::ProviderIdentity {
-            instance_id: row.get(19)?,
-            driver: row.get(20)?,
-        },
+        provider,
         // A selection that will not parse is a row somebody edited by hand.
         // `null` decodes on the client as "no selection", which is a worse answer
         // than the stored one and a much better one than no conversation.
@@ -2017,6 +2060,7 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         branch: row.get(6)?,
         worktree_path: row.get(7)?,
         agent_session_id: row.get(8)?,
+        provider_resume_cursor,
         latest_turn: latest_turn.as_deref().and_then(latest_turn_from_json),
         latest_user_message_at: row.get(10)?,
         created_at: row.get(11)?,
@@ -2032,6 +2076,35 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
             deleted_at: row.get(18)?,
         },
     })
+}
+
+fn decode_provider_resume_cursor(
+    encoded: Option<String>,
+    instance_id: Option<String>,
+    driver: Option<String>,
+    thread_provider: &crate::provider::ProviderIdentity,
+) -> rusqlite::Result<Option<crate::provider::ResumeCursor>> {
+    let (encoded, instance_id, driver) = match (encoded, instance_id, driver) {
+        (None, None, None) => return Ok(None),
+        (Some(encoded), Some(instance_id), Some(driver)) => (encoded, instance_id, driver),
+        _ => return Err(incompatible_cursor("provider resume cursor has incomplete ownership data")),
+    };
+    let provider = crate::provider::ProviderIdentity { instance_id, driver };
+    if &provider != thread_provider {
+        return Err(incompatible_cursor("provider resume cursor belongs to another provider instance"));
+    }
+    let value = serde_json::from_str(&encoded).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(21, Type::Text, Box::new(error))
+    })?;
+    Ok(Some(crate::provider::ResumeCursor { provider, value }))
+}
+
+fn incompatible_cursor(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        21,
+        Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message)),
+    )
 }
 
 /// A stored `OrchestrationLatestTurn` back as one.
@@ -2779,6 +2852,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             agent_session_id: None,
+            provider_resume_cursor: None,
             latest_turn: None,
             latest_user_message_at: None,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),
@@ -2807,6 +2881,10 @@ mod tests {
         });
         thread.latest_user_message_at = Some("2026-07-26T00:23:05.000Z".to_string());
         thread.agent_session_id = Some("session-alpha".to_string());
+        thread.provider_resume_cursor = Some(crate::provider::ResumeCursor {
+            provider: thread.provider.clone(),
+            value: serde_json::json!({"version": 1, "sessionId": "upstream-alpha", "opaque": [1, 2]}),
+        });
         // All six set, and to six *different* values, so a column wired to the
         // wrong parameter index is a failure here rather than a coincidence.
         thread.lifecycle = crate::threads::Lifecycle {
@@ -2978,6 +3056,48 @@ mod tests {
                 .agent_session_id,
             Some("session-alpha".to_string())
         );
+    }
+
+    #[test]
+    fn a_cursor_write_is_bound_to_the_threads_provider_instance() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        fixture.database.transcribe(&[Write::Thread(Box::new(a_thread("thread-1", "project-1")))])
+            .expect("stores thread");
+        let wrong = crate::provider::ResumeCursor {
+            provider: crate::provider::ProviderIdentity {
+                instance_id: "codex-personal".to_string(),
+                driver: "codex".to_string(),
+            },
+            value: serde_json::json!({"version": 1, "session": "wrong"}),
+        };
+
+        assert!(fixture.database.transcribe(&[Write::ProviderResumeCursor {
+            thread_id: "thread-1".to_string(),
+            cursor: wrong,
+        }]).is_err());
+        assert!(fixture.database.conversations().expect("reads")[0]
+            .thread.provider_resume_cursor.is_none());
+    }
+
+    #[test]
+    fn malformed_or_misowned_stored_cursors_are_incompatible_not_absent() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        fixture.database.transcribe(&[Write::Thread(Box::new(a_thread("thread-1", "project-1")))])
+            .expect("stores thread");
+
+        fixture.database.lock().execute(
+            "UPDATE threads SET provider_resume_cursor = '{', cursor_provider_instance_id = provider_instance_id, cursor_provider_driver = provider_driver WHERE id = 'thread-1'",
+            [],
+        ).expect("corrupts cursor");
+        assert!(fixture.database.conversations().is_err(), "malformed cursor became absent");
+
+        fixture.database.lock().execute(
+            "UPDATE threads SET provider_resume_cursor = '{}', cursor_provider_instance_id = 'other' WHERE id = 'thread-1'",
+            [],
+        ).expect("misowns cursor");
+        assert!(fixture.database.conversations().is_err(), "misowned cursor became absent");
     }
 
     /// Deleting a project takes its conversations with it, by the schema's own
