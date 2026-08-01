@@ -32,6 +32,10 @@ use laplus_server::{endpoints, Server};
 #[tokio::main]
 async fn main() -> ExitCode {
     let requested = match launch::invoked() {
+        Ok(Invoked::Version) => {
+            println!("{}", laplus_server::version::PRODUCT_VERSION);
+            return ExitCode::SUCCESS;
+        }
         Ok(Invoked::Serve(requested)) => requested,
         // `service` does its work and exits; it never gets as far as binding a
         // port. The server it installs is a different process entirely — see
@@ -44,9 +48,10 @@ async fn main() -> ExitCode {
         // Mints against the database rather than against the running server, so
         // this works while a service is up and needs no address to reach it at.
         Ok(Invoked::Pairing(pairing)) => return manage_codes(&pairing),
-        Err(message) => {
-            eprintln!("laplus: {message}");
-            return ExitCode::FAILURE;
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            return ExitCode::from(code as u8);
         }
     };
 

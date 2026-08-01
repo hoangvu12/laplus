@@ -66,12 +66,42 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  version:
+    name: Resolve the product version
+    runs-on: ubuntu-latest
+    outputs:
+      effective: ${{ steps.version.outputs.effective }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: version
+        shell: bash
+        run: |
+          base=$(awk -F '"' '/^version = "/ { print $2; exit }' server/Cargo.toml)
+          web=$(node -p "require('./apps/web/package.json').version")
+          tauri=$(node -p "require('./server/crates/laplus-shell/tauri.conf.json').version")
+          if [[ -z "$base" || "$web" != "$base" || "$tauri" != "$base" ]]; then
+            echo "Product versions disagree: Cargo=$base web=$web Tauri=$tauri" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            effective="${GITHUB_REF_NAME#v}"
+            if [[ "$effective" != "$base" ]]; then
+              echo "Tag $GITHUB_REF_NAME says $effective; the product version is $base." >&2
+              exit 1
+            fi
+          else
+            effective="${base}-rc.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "effective=$effective" >> "$GITHUB_OUTPUT"
+          echo "Building $effective."
+
   release:
     name: Build, measure, publish
     # Forty minutes of Tauri that answers nothing about the npm half. A tag
     # always builds it; a dispatch has to ask, because the usual reason to
     # dispatch this workflow is to exercise the packages rather than the window.
     if: github.event_name != 'workflow_dispatch' || inputs.build_installer
+    needs: version
     runs-on: windows-latest
     timeout-minutes: 60
 
@@ -136,6 +166,8 @@ jobs:
       # without it, so the bundle has to exist before any cargo command that
       # touches the shell — which `cargo xtask release` is.
       - name: Build web bundle
+        env:
+          APP_VERSION: ${{ needs.version.outputs.effective }}
         run: pnpm build:web
 
       - name: Install Rust
@@ -238,6 +270,8 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          APP_VERSION: ${{ needs.version.outputs.effective }}
+          LAPLUS_VERSION: ${{ needs.version.outputs.effective }}
         run: cargo xtask release --measure-install
 
       - name: Find the installer
@@ -267,7 +301,7 @@ jobs:
             exit 1
           fi
           signed="${signature%.sig}"
-          version=$(node -p "require('./server/crates/laplus-shell/tauri.conf.json').version")
+          version='${{ needs.version.outputs.effective }}'
           tag="${GITHUB_REF_NAME}"
           if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
             tag="v${version}"
@@ -332,6 +366,7 @@ jobs:
     name: Server binary (${{ matrix.key }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    needs: version
 
     strategy:
       # Each platform's answer is worth having on its own — and a red matrix
@@ -427,6 +462,7 @@ jobs:
       # here and not the same libc.
       - name: Build
         env:
+          LAPLUS_VERSION: ${{ needs.version.outputs.effective }}
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
@@ -492,7 +528,7 @@ jobs:
   # the credential.
   npm:
     name: Publish the server to npm
-    needs: server
+    needs: [version, server]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -533,24 +569,6 @@ jobs:
       # A published prerelease still answers `npx laplus`, because that resolves
       # the `latest` dist-tag and `latest` is a pointer rather than a judgement
       # about the version it points at.
-      - name: Settle the version
-        id: version
-        shell: bash
-        run: |
-          configured=$(node -p "require('./server/crates/laplus-shell/tauri.conf.json').version")
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            tagged="${GITHUB_REF_NAME#v}"
-            if [[ "$configured" != "$tagged" ]]; then
-              echo "Tag $GITHUB_REF_NAME says $tagged; tauri.conf.json says $configured." >&2
-              exit 1
-            fi
-            version="$configured"
-          else
-            version="${configured}-rc.${GITHUB_RUN_NUMBER}"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Building $version."
-
       - name: Download the server binaries
         uses: actions/download-artifact@v4
         with:
@@ -560,12 +578,14 @@ jobs:
       # What the launcher serves at `/`. The staging step refuses to assemble a
       # package without it rather than publish an `npx laplus` that 404s.
       - name: Build web bundle
+        env:
+          APP_VERSION: ${{ needs.version.outputs.effective }}
         run: pnpm build:web
 
       - name: Stage the packages
         run: >
           node apps/cli/src/release.ts
-          --version ${{ steps.version.outputs.version }}
+          --version ${{ needs.version.outputs.effective }}
           --binaries binaries
           --out staged
 

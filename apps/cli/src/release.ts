@@ -163,29 +163,31 @@ export function stage({
 
   NodeFS.copyFileSync(NodePath.join(repoRoot, NOTICES_SOURCE), NodePath.join(launcher, NOTICES));
 
-  stageBundle({ launcher, repoRoot });
+  stageBundle({ launcher, repoRoot, version });
   staged.push(launcher);
   return staged;
 }
 
 /**
- * Put the built UI where `bin.ts` looks for it, with the version the server
- * reports beside it.
+ * Put the built UI where `bin.ts` looks for it, carrying the product version
+ * shared by every artifact in this release.
  *
  * `ui/package.json` is not decoration: `crate::ui::Assets::from_directory`
  * reads a `package.json` inside the bundle or in the directory above it, and
- * what it finds is the version the window shows — `server/docs/adr/0011`. The
+ * what it finds is the version the window shows. The
  * one directory above `ui/dist` in an installed package is `ui/`, so without a
  * manifest there the server would walk into the *launcher's* package.json and
- * report the npm release's version as the UI's, which is a different number
- * that happens to look plausible.
+ * report whatever manifest it happened to find rather than the effective
+ * version this release was built under.
  */
 function stageBundle({
   launcher,
   repoRoot,
+  version,
 }: {
   readonly launcher: string;
   readonly repoRoot: string;
+  readonly version: string;
 }): void {
   const web = NodePath.join(repoRoot, "apps", "web");
   const built = NodePath.join(web, "dist");
@@ -199,7 +201,7 @@ function stageBundle({
   NodeFS.cpSync(built, NodePath.join(into, "dist"), { recursive: true });
   NodeFS.writeFileSync(
     NodePath.join(into, "package.json"),
-    `${JSON.stringify({ name: "laplus-ui", version: readJson(NodePath.join(web, "package.json")).version, private: true }, null, 2)}\n`,
+    `${JSON.stringify({ name: "laplus-ui", version, private: true }, null, 2)}\n`,
   );
 }
 

@@ -241,24 +241,23 @@ async fn a_server_with_no_ui_still_answers_nothing_at_the_root() {
     server.stop().await;
 }
 
-/// Ticket 26: the version a server reports is the version of the UI it is
-/// serving, so the client — which compares that number against the one compiled
-/// into the page this same server just sent — finds nothing to warn about.
+/// Every transport reports the one product version, whether or not this server
+/// is also carrying the UI.
 ///
 /// Both answers are checked because the UI reads both: `/.well-known/t3/environment`
 /// on boot, and `server.getConfig` once the socket is open. A skew banner raised
 /// by whichever of the two disagreed would be no better than the one this
 /// removes.
 #[tokio::test]
-async fn a_server_serving_a_ui_reports_that_uis_version_as_its_own() {
+async fn a_server_serving_a_ui_reports_the_product_version() {
     let server = TestServer::start_serving(bundle()).await;
 
     let over_http = server.get("/.well-known/t3/environment").await;
-    assert_eq!(over_http.body["serverVersion"], json!(BUNDLE_VERSION));
+    assert_eq!(over_http.body["serverVersion"], json!(laplus_server::version::PRODUCT_VERSION));
 
     let mut client = server.connect().await;
     let config = client.call("server.getConfig", json!({})).await.expect_success();
-    assert_eq!(config["environment"]["serverVersion"], json!(BUNDLE_VERSION));
+    assert_eq!(config["environment"]["serverVersion"], json!(laplus_server::version::PRODUCT_VERSION));
 
     client.close().await;
     server.stop().await;
@@ -275,7 +274,7 @@ async fn a_server_with_no_ui_reports_its_own_version() {
 
     assert_eq!(
         descriptor.body["serverVersion"],
-        json!(env!("CARGO_PKG_VERSION"))
+        json!(laplus_server::version::PRODUCT_VERSION)
     );
 
     server.stop().await;
@@ -317,10 +316,12 @@ async fn a_bundle_read_from_a_directory_is_served_exactly_as_an_embedded_one() {
     assert_eq!(server.get("/settings").await.text, String::from_utf8_lossy(PAGE));
     assert_eq!(server.get("/assets/nope.js").await.status, 404);
 
-    // The server reports the bundle's version as its own, from a `package.json`
-    // beside the files rather than from a build script.
+    // Bundle metadata cannot replace the product's release identity.
     let descriptor = server.get("/.well-known/t3/environment").await;
-    assert_eq!(descriptor.body["serverVersion"], json!(BUNDLE_VERSION));
+    assert_eq!(
+        descriptor.body["serverVersion"],
+        json!(laplus_server::version::PRODUCT_VERSION)
+    );
 
     server.stop().await;
 }

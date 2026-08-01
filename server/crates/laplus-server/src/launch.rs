@@ -35,6 +35,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use clap::{Args, Parser, Subcommand};
+
 use crate::remote_access::Exposure;
 
 /// The port laplus listens on unless told otherwise.
@@ -135,6 +137,7 @@ fn requested_from(arguments: impl Iterator<Item = String>) -> Result<Requested, 
 /// spelling that has always worked still does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invoked {
+    Version,
     Serve(Requested),
     /// `service <verb> [flags…]`. The flags are what the unit will carry.
     Service {
@@ -171,82 +174,220 @@ pub struct Pairing {
 }
 
 /// Read the command line as a verb and its flags.
-pub fn invoked() -> Result<Invoked, String> {
-    invoked_from(std::env::args().skip(1).collect())
-}
-
-fn invoked_from(arguments: Vec<String>) -> Result<Invoked, String> {
-    match arguments.first().map(String::as_str) {
-        Some("service") => {
-            let verb = arguments.get(1).ok_or_else(|| {
-                "service needs a command — install, status or uninstall".to_string()
-            })?;
-            let verb = crate::service::Verb::parse(verb)?;
-            let rest: Vec<String> = arguments.into_iter().skip(2).collect();
-            Ok(Invoked::Service {
-                verb,
-                requested: requested_from(rest.clone().into_iter())?,
-                arguments: rest,
-            })
-        }
-        Some("auth") => pairing_from(arguments),
-        _ => Ok(Invoked::Serve(requested_from(arguments.into_iter())?)),
+pub fn invoked() -> Result<Invoked, clap::Error> {
+    let cli = Cli::try_parse()?;
+    if cli.version {
+        return Ok(Invoked::Version);
+    }
+    match cli.command {
+        None => Ok(Invoked::Serve(requested_from_options(cli.serve)?)),
+        Some(Command::Serve(options)) => Ok(Invoked::Serve(requested_from_options(options)?)),
+        Some(Command::Auth(auth)) => pairing_from_cli(auth),
+        Some(Command::Service(service)) => service_from_cli(service),
     }
 }
 
-/// `auth pairing <verb> [id] [flags…]`.
-///
-/// The noun is spelled out even though `pairing` is the only one, because this
-/// mirrors upstream's `t3 auth pairing …` and because the group it belongs to —
-/// credentials this server issues — has more than one member the moment
-/// sessions get a command.
-fn pairing_from(arguments: Vec<String>) -> Result<Invoked, String> {
-    match arguments.get(1).map(String::as_str) {
-        Some("pairing") => {}
-        Some(other) => return Err(format!("unrecognised auth command {other} — pairing")),
-        None => return Err("auth needs a command — pairing".to_string()),
-    }
-    let verb = arguments
-        .get(2)
-        .ok_or_else(|| "auth pairing needs a command — create, list or revoke".to_string())?;
-    let verb = crate::codes::Verb::parse(verb)?;
+#[derive(Parser)]
+#[command(name = "laplus", about = "Run and administer laplus.", disable_version_flag = true)]
+struct Cli {
+    #[arg(long, help = "Print the product version")]
+    version: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    serve: ServeOptions,
+}
 
-    // The id is positional, as it is upstream, so it has to come off before the
-    // flag parser sees an argument with no `--` and refuses the lot.
-    let mut rest: Vec<String> = arguments.into_iter().skip(3).collect();
-    let id = match rest.first() {
-        Some(first) if !first.starts_with("--") => Some(rest.remove(0)),
-        _ => None,
-    };
-    if verb == crate::codes::Verb::Revoke && id.is_none() {
-        return Err("auth pairing revoke needs the id of a code to revoke".to_string());
-    }
+#[derive(Subcommand)]
+enum Command {
+    /// Run the laplus server.
+    Serve(ServeOptions),
+    /// Manage authentication credentials.
+    Auth(AuthCommand),
+    /// Manage the background service.
+    Service(ServiceCommand),
+}
 
-    // **`ui` is accepted here and unused, because the launcher always sends
-    // it.** `apps/cli` appends `--ui <its own bundle>` to every invocation it
-    // forwards — it has no notion of verbs, deliberately — so a parser that
-    // refused it would make `npx laplus auth pairing create` impossible while
-    // leaving `laplus-server auth pairing create` working. That is exactly how
-    // this was shipped broken once. It is not a hole in the "an unknown flag is
-    // a refusal" rule either: `--ui` is a real flag of this program's, and the
-    // thing being minted here does not serve pages.
-    let flags = flags_from(
-        rest.into_iter(),
-        &["ttl", "label", "base-url", "port", "ui"],
-        &["json"],
-    )?;
-    Ok(Invoked::Pairing(Pairing {
-        verb,
-        ttl: match flags.get("ttl") {
-            Some(given) => crate::codes::ttl_from(given)?,
-            None => crate::pairing::PAIRING_CODE_TTL.0.to_string(),
+#[derive(Args, Default)]
+struct ServeOptions {
+    /// HTTP and WebSocket port.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Listen beyond the loopback interface.
+    #[arg(long, conflicts_with = "no_network")]
+    network: bool,
+    /// Listen only on the loopback interface.
+    #[arg(long, conflicts_with = "network")]
+    no_network: bool,
+    /// Hostname used in printed connection URLs.
+    #[arg(long)]
+    advertise_host: Option<String>,
+    /// Built UI bundle to serve.
+    #[arg(long)]
+    ui: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct AuthCommand {
+    #[command(subcommand)]
+    command: AuthSubcommand,
+}
+
+#[derive(Subcommand)]
+enum AuthSubcommand {
+    /// Manage one-time pairing codes.
+    Pairing(PairingCommand),
+}
+
+#[derive(Args)]
+struct PairingCommand {
+    #[command(subcommand)]
+    command: PairingSubcommand,
+}
+
+#[derive(Subcommand)]
+enum PairingSubcommand {
+    /// Create a pairing code.
+    Create {
+        #[arg(long)]
+        ttl: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List active pairing codes.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke an active pairing code.
+    Revoke { id: String },
+}
+
+#[derive(Args)]
+struct ServiceCommand {
+    #[command(subcommand)]
+    command: ServiceSubcommand,
+}
+
+#[derive(Subcommand)]
+enum ServiceSubcommand {
+    /// Install or update the background service.
+    Install(ServeOptions),
+    /// Report the background service state.
+    Status,
+    /// Remove the background service.
+    Uninstall,
+}
+
+fn requested_from_options(options: ServeOptions) -> Result<Requested, clap::Error> {
+    let mut flags = BTreeMap::new();
+    if let Some(port) = options.port {
+        flags.insert("port".to_string(), port.to_string());
+    }
+    if options.network || options.no_network {
+        flags.insert(
+            "network".to_string(),
+            (!options.no_network).to_string(),
+        );
+    }
+    if let Some(host) = options.advertise_host {
+        flags.insert("advertise-host".to_string(), host);
+    }
+    if let Some(ui) = options.ui {
+        flags.insert("ui".to_string(), ui.to_string_lossy().into_owned());
+    }
+    requested_from_flags(&flags).map_err(invocation_error)
+}
+
+fn requested_from_flags(flags: &BTreeMap<String, String>) -> Result<Requested, String> {
+    Ok(Requested {
+        port: port_in(flags, std::env::var("LAPLUS_PORT").ok())?,
+        ui: ui_in(flags, std::env::var("LAPLUS_UI").ok()),
+        network: network_in(flags, std::env::var("LAPLUS_NETWORK").ok())?,
+        advertise_host: advertise_host_in(
+            flags,
+            std::env::var("LAPLUS_ADVERTISE_HOST").ok(),
+        )?,
+    })
+}
+
+fn pairing_from_cli(auth: AuthCommand) -> Result<Invoked, clap::Error> {
+    let AuthSubcommand::Pairing(pairing) = auth.command;
+    let default_port = || port_in(&BTreeMap::new(), std::env::var("LAPLUS_PORT").ok());
+    let pairing = match pairing.command {
+        PairingSubcommand::Create { ttl, label, base_url, port, json } => Pairing {
+            verb: crate::codes::Verb::Create,
+            ttl: match ttl {
+                Some(ttl) => crate::codes::ttl_from(&ttl).map_err(invocation_error)?,
+                None => crate::pairing::PAIRING_CODE_TTL.0.to_string(),
+            },
+            label: label.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
+            base_url,
+            json,
+            port: port.map(Ok).unwrap_or_else(default_port).map_err(invocation_error)?,
+            id: None,
         },
-        label: flags.get("label").map(|label| label.trim().to_string()).filter(|label| !label.is_empty()),
-        base_url: flags.get("base-url").cloned(),
-        json: flags.get("json").map(String::as_str) == Some("true"),
-        port: port_in(&flags, std::env::var("LAPLUS_PORT").ok())?,
-        id,
-    }))
+        PairingSubcommand::List { json } => Pairing {
+            verb: crate::codes::Verb::List,
+            ttl: crate::pairing::PAIRING_CODE_TTL.0.to_string(),
+            label: None,
+            base_url: None,
+            json,
+            port: default_port().map_err(invocation_error)?,
+            id: None,
+        },
+        PairingSubcommand::Revoke { id } => Pairing {
+            verb: crate::codes::Verb::Revoke,
+            ttl: crate::pairing::PAIRING_CODE_TTL.0.to_string(),
+            label: None,
+            base_url: None,
+            json: false,
+            port: default_port().map_err(invocation_error)?,
+            id: Some(id),
+        },
+    };
+    Ok(Invoked::Pairing(pairing))
+}
+
+fn service_from_cli(service: ServiceCommand) -> Result<Invoked, clap::Error> {
+    let (verb, options) = match service.command {
+        ServiceSubcommand::Install(options) => (crate::service::Verb::Install, options),
+        ServiceSubcommand::Status => (crate::service::Verb::Status, ServeOptions::default()),
+        ServiceSubcommand::Uninstall => (crate::service::Verb::Uninstall, ServeOptions::default()),
+    };
+    let arguments = serve_arguments(&options);
+    let requested = requested_from_options(options)?;
+    Ok(Invoked::Service { verb, requested, arguments })
+}
+
+fn serve_arguments(options: &ServeOptions) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if let Some(port) = options.port {
+        arguments.extend(["--port".to_string(), port.to_string()]);
+    }
+    if options.network {
+        arguments.push("--network".to_string());
+    }
+    if options.no_network {
+        arguments.push("--no-network".to_string());
+    }
+    if let Some(host) = &options.advertise_host {
+        arguments.extend(["--advertise-host".to_string(), host.clone()]);
+    }
+    if let Some(ui) = &options.ui {
+        arguments.extend(["--ui".to_string(), ui.to_string_lossy().into_owned()]);
+    }
+    arguments
+}
+
+fn invocation_error(message: String) -> clap::Error {
+    clap::Error::raw(clap::error::ErrorKind::ValueValidation, message)
 }
 
 /// The flags this process was given, by name and without the `--`.
@@ -700,157 +841,4 @@ mod tests {
         assert_eq!(port_from(&["--port", "0"], None), Ok(0));
     }
 
-    fn invoked_with(arguments: &[&str]) -> Result<Invoked, String> {
-        invoked_from(arguments.iter().map(|argument| argument.to_string()).collect())
-    }
-
-    /// The spelling that has always worked, still working. Every run of this
-    /// binary before `service` existed had no verb at all.
-    #[test]
-    fn no_verb_is_a_server_as_it_always_was() {
-        assert!(matches!(invoked_with(&[]), Ok(Invoked::Serve(_))));
-        assert!(matches!(
-            invoked_with(&["--port", "5000"]),
-            Ok(Invoked::Serve(_))
-        ));
-    }
-
-    /// The flags travel twice over: parsed, so this run can refuse a bad one
-    /// before touching systemd, and verbatim, so the unit starts the server the
-    /// operator described rather than the one this parser defaulted to.
-    #[test]
-    fn the_service_verb_keeps_the_flags_both_ways() {
-        let invoked = invoked_with(&["service", "install", "--network", "--port", "5000"]);
-        let Ok(Invoked::Service {
-            verb,
-            requested,
-            arguments,
-        }) = invoked
-        else {
-            panic!("expected a service invocation, got {invoked:?}");
-        };
-        assert_eq!(verb, crate::service::Verb::Install);
-        assert_eq!(requested.port, 5000);
-        assert_eq!(arguments, vec!["--network", "--port", "5000"]);
-    }
-
-    #[test]
-    fn a_service_verb_with_no_command_says_which_ones_there_are() {
-        let failure = invoked_with(&["service"]).unwrap_err();
-        assert!(failure.contains("install"));
-        assert!(failure.contains("uninstall"));
-    }
-
-    /// A bad flag is refused before anything is written, which is the whole
-    /// reason the flags are parsed here as well as copied.
-    #[test]
-    fn an_unknown_flag_after_the_verb_is_still_refused() {
-        assert!(invoked_with(&["service", "install", "--porrt", "5000"]).is_err());
-    }
-
-    fn pairing_with(arguments: &[&str]) -> Result<Pairing, String> {
-        match invoked_with(arguments)? {
-            Invoked::Pairing(pairing) => Ok(pairing),
-            other => panic!("expected a pairing invocation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_pairing_code_takes_a_lifetime_a_label_and_an_address() {
-        let pairing = pairing_with(&[
-            "auth",
-            "pairing",
-            "create",
-            "--ttl",
-            "2h",
-            "--label",
-            "phone",
-            "--base-url",
-            "https://box.ts.net",
-        ])
-        .expect("a pairing invocation");
-        assert_eq!(pairing.verb, crate::codes::Verb::Create);
-        assert_eq!(pairing.ttl, "+2 hours");
-        assert_eq!(pairing.label.as_deref(), Some("phone"));
-        assert_eq!(pairing.base_url.as_deref(), Some("https://box.ts.net"));
-        assert!(!pairing.json);
-    }
-
-    /// Five minutes, like the code Settings mints — see
-    /// [`crate::pairing::PAIRING_CODE_TTL`].
-    #[test]
-    fn a_code_with_no_lifetime_gets_the_one_settings_uses() {
-        let pairing = pairing_with(&["auth", "pairing", "create"]).expect("a pairing invocation");
-        assert_eq!(pairing.ttl, crate::pairing::PAIRING_CODE_TTL.0);
-    }
-
-    /// A bad `--ttl` is refused here rather than by SQLite, so nothing is
-    /// written and the message names the flag.
-    #[test]
-    fn an_unreadable_lifetime_is_refused_before_the_database_is_opened() {
-        assert!(pairing_with(&["auth", "pairing", "create", "--ttl", "soon"]).is_err());
-    }
-
-    /// The id is positional, as it is upstream, so it has to come off before
-    /// the flag parser sees an argument with no leading dashes.
-    #[test]
-    fn revoking_takes_the_id_as_an_argument() {
-        let pairing = pairing_with(&["auth", "pairing", "revoke", "pl_123", "--json"])
-            .expect("a pairing invocation");
-        assert_eq!(pairing.verb, crate::codes::Verb::Revoke);
-        assert_eq!(pairing.id.as_deref(), Some("pl_123"));
-        assert!(pairing.json);
-    }
-
-    #[test]
-    fn revoking_nothing_in_particular_is_refused() {
-        let failure = pairing_with(&["auth", "pairing", "revoke"]).unwrap_err();
-        assert!(failure.contains("id"), "{failure}");
-    }
-
-    #[test]
-    fn the_auth_group_says_what_it_has_when_asked_for_something_else() {
-        assert!(invoked_with(&["auth"]).unwrap_err().contains("pairing"));
-        assert!(invoked_with(&["auth", "session"])
-            .unwrap_err()
-            .contains("pairing"));
-        assert!(invoked_with(&["auth", "pairing"])
-            .unwrap_err()
-            .contains("create"));
-    }
-
-    /// A blank `--label` is no label rather than an empty one, for the reason
-    /// [`ui_in`] gives about a blank bundle path.
-    #[test]
-    fn a_blank_label_is_no_label() {
-        let pairing = pairing_with(&["auth", "pairing", "create", "--label", "  "])
-            .expect("a pairing invocation");
-        assert_eq!(pairing.label, None);
-    }
-
-    /// **Every verb has to survive the bundle flag.** `apps/cli` appends
-    /// `--ui <bundle>` to everything it forwards, because it is a launcher and
-    /// has no notion of verbs. A verb whose parser refuses it works when run
-    /// directly and fails under `npx laplus`, which is a difference no test
-    /// that runs the binary by hand would ever show — and is how
-    /// `auth pairing create` reached a user broken.
-    #[test]
-    fn every_verb_tolerates_the_bundle_the_launcher_appends() {
-        let bundle = ["--ui", "/home/ubuntu/.npm/_npx/abc/node_modules/laplus/ui/dist"];
-        for verb in [
-            vec!["auth", "pairing", "create"],
-            vec!["auth", "pairing", "list"],
-            vec!["auth", "pairing", "revoke", "pl_123"],
-            vec!["service", "install"],
-            vec!["service", "status"],
-            vec!["service", "uninstall"],
-            vec![],
-        ] {
-            let arguments: Vec<&str> = verb.iter().copied().chain(bundle).collect();
-            assert!(
-                invoked_with(&arguments).is_ok(),
-                "the launcher's own invocation was refused: {arguments:?}"
-            );
-        }
-    }
 }

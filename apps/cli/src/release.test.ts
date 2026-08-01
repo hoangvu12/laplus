@@ -178,16 +178,15 @@ describe("stage", () => {
     ).toThrow(/no binary for/);
   });
 
-  it("puts the UI where the launcher looks, under the version the server reports", () => {
+  it("stages the UI with the product version shared by the release", () => {
     const repoRoot = fakeRepo();
     stage({ version: "1.2.3", binaries: fakeBinaries(), out: scratch(), repoRoot });
 
     const ui = NodePath.join(repoRoot, "apps", "cli", "ui");
     expect(NodeFS.existsSync(NodePath.join(ui, "dist", "index.html"))).toBe(true);
     expect(NodeFS.existsSync(NodePath.join(ui, "dist", "assets", "app.js"))).toBe(true);
-    // The UI's version, not the release's: ADR 0011.
     expect(JSON.parse(NodeFS.readFileSync(NodePath.join(ui, "package.json"), "utf8")).version).toBe(
-      "0.0.28",
+      "1.2.3",
     );
   });
 

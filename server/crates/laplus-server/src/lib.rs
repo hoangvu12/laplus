@@ -107,6 +107,7 @@ pub mod threads;
 pub mod transcripts;
 pub mod turn;
 pub mod ui;
+pub mod version;
 pub mod watcher;
 pub mod wire;
 pub mod worklog;

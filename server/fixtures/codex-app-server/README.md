@@ -87,3 +87,10 @@ wrong shape, a `turn/start` result without its required turn id, an unknown
 notification before the thread response, and one line that is not JSON.
 Recognized output and `turn/completed` follow all of them, so both the fresh fold
 and socket replay prove drift is counted without ending the session.
+
+`08-turn-sandbox-policy-drift.jsonl` records Codex 0.146.0 rejecting the former
+string `turn/start.sandboxPolicy`. The capture was made against an isolated
+app-server with no turn dispatched; host and installation notifications are
+omitted. The generated v2 schema identifies the replacement as an internally
+tagged object whose `type` is `readOnly`, `workspaceWrite`, or
+`dangerFullAccess`.

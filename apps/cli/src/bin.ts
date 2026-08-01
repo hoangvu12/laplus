@@ -25,8 +25,7 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeURL from "node:url";
 
-import packageJson from "../package.json" with { type: "json" };
-import { invocation, HELP } from "./invocation.ts";
+import { invocation } from "./invocation.ts";
 import { missingPackageMessage, targetFor, unsupportedMessage } from "./platform.ts";
 
 /**
@@ -35,9 +34,8 @@ import { missingPackageMessage, targetFor, unsupportedMessage } from "./platform
  * `../ui/dist` resolves to the same place whether this file is running as
  * `src/bin.ts` from a checkout or as the packed `dist/bin.mjs` from npm, which
  * is why the staging directory is a sibling of both rather than inside either.
- * `ui/package.json` beside it carries the *UI's* version, which is what the
- * server reads and reports — `server/docs/adr/0011` is why that is not this
- * package's version.
+ * `ui/package.json` beside it carries the release's product version, shared by
+ * the launcher, UI, server and shell (ADR-0033).
  */
 const BUNDLE = NodeURL.fileURLToPath(new URL("../ui/dist", import.meta.url));
 
@@ -51,16 +49,6 @@ const decided = invocation({
  * the server's own output gets the server's own output and nothing else. */
 function complain(message: string): void {
   process.stderr.write(`${message}\n`);
-}
-
-if (decided.kind === "help") {
-  process.stdout.write(HELP);
-  process.exit(0);
-}
-
-if (decided.kind === "version") {
-  process.stdout.write(`${packageJson.version}\n`);
-  process.exit(0);
 }
 
 const target = targetFor(process.platform, process.arch);
@@ -84,7 +72,10 @@ try {
 
 for (const warning of decided.warnings) complain(`laplus: ${warning}`);
 
-const server = NodeChildProcess.spawn(binary, decided.arguments, { stdio: "inherit" });
+const server = NodeChildProcess.spawn(binary, decided.arguments, {
+  stdio: "inherit",
+  env: decided.environment,
+});
 
 server.on("error", (failure: NodeJS.ErrnoException) => {
   // EACCES is worth its own sentence because it has one cause and it is ours:

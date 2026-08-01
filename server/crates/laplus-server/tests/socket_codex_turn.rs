@@ -180,7 +180,7 @@ async fn a_codex_thread_id_survives_a_restart_and_resumes_the_captured_context()
     assert_eq!(resumed_turn["params"]["approvalPolicy"], "never");
     assert_eq!(
         resumed_turn["params"]["sandboxPolicy"],
-        "danger-full-access"
+        json!({"type": "dangerFullAccess"})
     );
     assert_eq!(resumed_turn["params"]["approvalsReviewer"], "user");
 
@@ -639,7 +639,7 @@ async fn a_model_changed_between_codex_turns_applies_without_replacing_the_conve
     assert_eq!(turns.len(), 2, "unexpected Codex turns: {turns:#?}");
     assert_eq!(turns[1]["params"]["model"], "gpt-5.5");
     assert_eq!(turns[1]["params"]["approvalPolicy"], "never");
-    assert_eq!(turns[1]["params"]["sandboxPolicy"], "danger-full-access");
+    assert_eq!(turns[1]["params"]["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
     assert_eq!(turns[1]["params"]["approvalsReviewer"], "user");
     assert_eq!(codex.conversation_starts(), 1);
     assert_eq!(codex.thread_requests().len(), 1);
@@ -704,7 +704,7 @@ async fn an_access_mode_changed_between_codex_turns_applies_consistently_to_the_
     assert_eq!(turns.len(), 2, "unexpected Codex turns: {turns:#?}");
     assert_eq!(turns[1]["params"]["model"], "gpt-5.4-mini");
     assert_eq!(turns[1]["params"]["approvalPolicy"], "untrusted");
-    assert_eq!(turns[1]["params"]["sandboxPolicy"], "read-only");
+    assert_eq!(turns[1]["params"]["sandboxPolicy"], json!({"type": "readOnly"}));
     assert_eq!(turns[1]["params"]["approvalsReviewer"], "user");
     let sessions: Vec<&Value> = events
         .iter()
@@ -802,11 +802,11 @@ async fn queued_codex_prompts_keep_the_model_and_access_mode_they_were_sent_with
     assert!(turns[0]["params"].get("approvalPolicy").is_none());
     assert_eq!(turns[1]["params"]["model"], "gpt-5.5");
     assert_eq!(turns[1]["params"]["approvalPolicy"], "on-request");
-    assert_eq!(turns[1]["params"]["sandboxPolicy"], "workspace-write");
+    assert_eq!(turns[1]["params"]["sandboxPolicy"], json!({"type": "workspaceWrite"}));
     assert_eq!(turns[1]["params"]["approvalsReviewer"], "user");
     assert_eq!(turns[2]["params"]["model"], "gpt-5.6");
     assert_eq!(turns[2]["params"]["approvalPolicy"], "untrusted");
-    assert_eq!(turns[2]["params"]["sandboxPolicy"], "read-only");
+    assert_eq!(turns[2]["params"]["sandboxPolicy"], json!({"type": "readOnly"}));
     assert_eq!(turns[2]["params"]["approvalsReviewer"], "user");
 
     // Model selection is a thread/turn property in the TypeScript contract;
@@ -934,7 +934,7 @@ async fn a_codex_turn_that_refuses_its_retune_reports_the_failure_to_the_develop
         .expect("the refused retuned request");
     assert_eq!(request["params"]["model"], "gpt-5.5");
     assert_eq!(request["params"]["approvalPolicy"], "untrusted");
-    assert_eq!(request["params"]["sandboxPolicy"], "read-only");
+    assert_eq!(request["params"]["sandboxPolicy"], json!({"type": "readOnly"}));
     assert_eq!(request["params"]["approvalsReviewer"], "user");
 
     client.close().await;

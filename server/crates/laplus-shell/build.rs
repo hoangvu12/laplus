@@ -26,6 +26,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo::rerun-if-env-changed=LAPLUS_VERSION");
+    println!("cargo::rerun-if-env-changed=APP_VERSION");
     let bundle = bundle_directory();
     let manifest = web_directory().join("package.json");
     println!("cargo::rerun-if-changed={}", bundle.display());
@@ -142,6 +144,15 @@ fn web_directory() -> PathBuf {
 /// guess would ship the banner back, silently, and the read is of a file that
 /// is necessarily there — `dist/` was built from it.
 fn bundle_version(manifest: &Path) -> String {
+    for variable in ["LAPLUS_VERSION", "APP_VERSION"] {
+        if let Ok(version) = std::env::var(variable) {
+            let version = version.trim();
+            if !version.is_empty() {
+                return version.to_string();
+            }
+        }
+    }
+
     let source = std::fs::read_to_string(manifest).unwrap_or_else(|error| {
         panic!(
             "cannot read {}: {error}.\n\

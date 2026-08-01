@@ -505,7 +505,7 @@ impl ServerConfig {
                     os: platform_os(),
                     arch: platform_arch(),
                 },
-                server_version: env!("CARGO_PKG_VERSION").to_string(),
+                server_version: crate::version::PRODUCT_VERSION.to_string(),
                 capabilities: Capabilities {
                     repository_identity: false,
                     connection_probe: Some(true),

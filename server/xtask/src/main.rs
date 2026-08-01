@@ -104,7 +104,15 @@ fn release(measure_install: bool) -> Result<String, String> {
         format!("this build would install on top of the developer's data (ticket 30): {astray:?}")
     })?;
 
-    run(Command::new("cargo").arg("tauri").arg("build").current_dir(root.join(SHELL)))?;
+    let mut build = Command::new("cargo");
+    build.arg("tauri").arg("build");
+    if let Ok(version) = std::env::var("LAPLUS_VERSION") {
+        let version = version.trim();
+        if !version.is_empty() {
+            build.arg("--config").arg(format!(r#"{{"version":"{version}"}}"#));
+        }
+    }
+    run(build.current_dir(root.join(SHELL)))?;
 
     let installer = installer_path(&root)?;
     let binary = root.join("target/release/laplus.exe");

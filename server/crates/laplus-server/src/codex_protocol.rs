@@ -553,9 +553,15 @@ impl Access {
     }
 
     fn turn_params(&self) -> Value {
+        let sandbox_type = match self.sandbox {
+            "read-only" => "readOnly",
+            "workspace-write" => "workspaceWrite",
+            "danger-full-access" => "dangerFullAccess",
+            _ => self.sandbox,
+        };
         json!({
             "approvalPolicy": self.approval_policy,
-            "sandboxPolicy": self.sandbox,
+            "sandboxPolicy": { "type": sandbox_type },
             "approvalsReviewer": "user",
         })
     }
@@ -602,7 +608,7 @@ impl Request {
                 "clientInfo": {
                     "name": "laplus/client",
                     "title": "laplus",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": crate::version::PRODUCT_VERSION,
                 },
                 "capabilities": Capabilities::current().message(),
             }),
@@ -1170,6 +1176,26 @@ mod tests {
                 assert_eq!(request["params"]["sandbox"], sandbox);
                 assert_eq!(request["params"]["approvalsReviewer"], "user");
             }
+        }
+    }
+
+    #[test]
+    fn every_runtime_mode_uses_the_tagged_sandbox_policy_on_a_retuned_turn() {
+        for (mode, sandbox_type) in [
+            ("approval-required", "readOnly"),
+            ("auto-accept-edits", "workspaceWrite"),
+            ("auto", "workspaceWrite"),
+            ("full-access", "dangerFullAccess"),
+        ] {
+            let request = Request::TurnStart {
+                thread_id: "codex-thread-1".to_string(),
+                text: "A retuned turn.".to_string(),
+                model: Some("gpt-5.4-mini".to_string()),
+                access: Some(Access::for_runtime_mode(mode).expect("a contract runtime mode")),
+            }
+            .message(3);
+
+            assert_eq!(request["params"]["sandboxPolicy"]["type"], sandbox_type);
         }
     }
 

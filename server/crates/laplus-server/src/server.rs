@@ -303,15 +303,6 @@ impl Server {
         ui: Assets,
     ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
-        // A server that ships a UI answers with that UI's version rather than
-        // this crate's. Here rather than in either caller because both of them
-        // hand over a config and a bundle in the same breath, and the one place
-        // where the two are together is the place that cannot forget.
-        // `ServerConfig::serving_ui_version` is why it is done at all.
-        let config = match ui.version() {
-            Some(version) => config.serving_ui_version(version),
-            None => config,
-        };
         // And the name this data directory answers to, settled here for the
         // reason above and one more: this is the one place the config and the
         // database are together, and the id has to come from the database to

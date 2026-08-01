@@ -904,13 +904,25 @@ of the UI's own **routes** rather than a file. The UI routes in the browser, so
 `/settings` is a path this server has never heard of and must not 404. A missing
 _file_ still must.
 
-**Server version** — `environment.serverVersion`, and in the shell it is the
-**bundle's** version rather than the crate's. Not a claim about the binary: the
-client compares that field against the version compiled into its own page and
-warns about a skew, which between a UI and the executable it ships inside cannot
-happen. Made equal so the comparison finds nothing, and vestigial rather than
-satisfied. The plain server, which ships no bundle, keeps the crate version —
-there a difference is real. See ADR-0011.
+**Product version** — the release identity shared by every shipped part of
+laplus: the Rust server and shell, the web UI, the Tauri application, and the
+npm launcher and platform packages. A prerelease suffix is part of this identity,
+so an RC build reports the same complete value everywhere.
+
+The contract field `environment.serverVersion` carries the product version. It
+is not a separate version owned by the server or by whichever UI bundle happens
+to be served.
+_Avoid_: Server version, UI version, launcher version
+
+**CLI** — the typed command interface owned by the `laplus-server` executable:
+its commands, options, validation, help, version, output, and exit behavior.
+Both direct execution and the npm entry point reach this same interface.
+
+**Launcher** — the thin npm entry point named `laplus`. It selects the platform
+server binary, supplies package metadata such as the bundled UI location, and
+forwards the process streams, signals, and exit status. It defines no commands
+of its own.
+_Avoid_: CLI
 
 **Origin** — scheme, host and port together, and the reason the port is fixed.
 The window is pointed at `http://127.0.0.1:4773/`, so the port is part of what

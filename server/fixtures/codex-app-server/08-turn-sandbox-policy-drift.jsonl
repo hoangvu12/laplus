@@ -1,0 +1,2 @@
+{"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"turn/start","params":{"threadId":"not-used","input":[],"sandboxPolicy":"danger-full-access"}}}
+{"dir":"recv","msg":{"error":{"code":-32600,"message":"Invalid request: invalid type: string \"danger-full-access\", expected internally tagged enum SandboxPolicyDeserialize"},"id":2}}
