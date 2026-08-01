@@ -21,7 +21,7 @@
 
 mod harness;
 
-use harness::agent::ScriptedAgent;
+use harness::agent::{ScriptedAgent, WORKING_DIRECTORY_MARKER};
 use harness::conversation::start_turn;
 use harness::workspace::Workspace;
 use harness::TestServer;
@@ -37,7 +37,9 @@ async fn settings(client: &mut harness::SocketClient) -> Value {
 
 /// One patch, as the panel sends one.
 async fn update(client: &mut harness::SocketClient, patch: Value) -> harness::Outcome {
-    client.call("server.updateSettings", json!({"patch": patch})).await
+    client
+        .call("server.updateSettings", json!({"patch": patch}))
+        .await
 }
 
 /// The keybinding bound to `command`, out of a `getConfig` payload.
@@ -70,8 +72,209 @@ async fn a_setting_can_be_read_and_changed() {
     );
 
     // …and the next reader sees it, rather than the answer being a one-off.
-    assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "/work");
+    assert_eq!(
+        settings(&mut client).await["addProjectBaseDirectory"],
+        "/work"
+    );
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_configured_claude_instance_is_accepted_and_persisted() {
+    let agent = ScriptedAgent::emitting(&["{}"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let after = update(
+        &mut client,
+        json!({"providerInstances": {
+            "claudeWork": {
+                "driver": "claudeAgent",
+                "displayName": "Claude Work",
+                "enabled": true,
+                "config": {
+                    "binaryPath": agent.configured(),
+                    "homePath": "/work/claude",
+                    "launchArgs": "--verbose",
+                    "customModels": ["claude-work-model"]
+                }
+            }
+        }}),
+    )
+    .await
+    .expect_success();
+
+    assert_eq!(
+        after["providerInstances"]["claudeWork"]["driver"],
+        "claudeAgent"
+    );
+    assert_eq!(
+        after["providerInstances"]["claudeWork"]["displayName"],
+        "Claude Work"
+    );
+    assert_eq!(
+        after["providerInstances"]["claudeWork"]["config"]["homePath"],
+        "/work/claude"
+    );
+    assert_eq!(
+        settings(&mut client).await["providerInstances"]["claudeWork"]["config"]["customModels"],
+        json!(["claude-work-model"])
+    );
+    let config = client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let snapshot = config["providers"]
+        .as_array()
+        .expect("provider snapshots")
+        .iter()
+        .find(|provider| provider["instanceId"] == "claudeWork")
+        .expect("configured Claude snapshot");
+    assert_eq!(snapshot["driver"], "claudeAgent");
+    assert_eq!(snapshot["displayName"], "Claude Work");
+    assert_eq!(
+        snapshot["models"]
+            .as_array()
+            .expect("models")
+            .last()
+            .expect("custom model")["slug"],
+        "claude-work-model"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_provider_instance_envelopes_are_refused_actionably() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    for (patch, named) in [
+        (
+            json!({"providerInstances": {"1bad": {"driver": "claudeAgent", "displayName": "Bad"}}}),
+            "provider instance id",
+        ),
+        (
+            json!({"providerInstances": {"work": {"driver": "opencode", "displayName": "Work"}}}),
+            "unsupported driver kind",
+        ),
+        (
+            json!({"providerInstances": {"work": {"driver": "claudeAgent", "displayName": "Work", "config": {"customModels": [""]}}}}),
+            "customModels",
+        ),
+    ] {
+        let error = update(&mut client, patch)
+            .await
+            .expect_declared("ServerSettingsError");
+        assert!(
+            error["cause"].as_str().unwrap_or_default().contains(named),
+            "{error}"
+        );
+    }
+    assert_eq!(settings(&mut client).await["providerInstances"], json!({}));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_turn_routes_through_the_selected_configured_claude_instance() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    update(
+        &mut client,
+        json!({"providerInstances": {"claudeWork": {
+            "driver": "claudeAgent", "displayName": "Claude Work", "enabled": true,
+            "config": {"binaryPath": agent.configured()}
+        }}}),
+    )
+    .await
+    .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            harness::conversation::create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut turn = start_turn("thread-work", "message-1", "say ok");
+    turn["modelSelection"]["instanceId"] = json!("claudeWork");
+    turn["bootstrap"]["createThread"]["modelSelection"]["instanceId"] = json!("claudeWork");
+    client
+        .call("orchestration.dispatchCommand", turn)
+        .await
+        .expect_success();
+    let subscription = client.watch_draft("thread-work").await;
+    let events = client.events_through_the_turn(&subscription).await;
+    assert!(
+        events.iter().any(|event| {
+            event["event"]["type"] == "thread.message-sent"
+                && event["event"]["payload"]["role"] == "assistant"
+                && event["event"]["payload"]["text"] == "ok"
+        }),
+        "{events:?}"
+    );
+    assert!(workspace.path().join(WORKING_DIRECTORY_MARKER).exists());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn disabling_one_claude_instance_does_not_refresh_its_sibling() {
+    let first = ScriptedAgent::emitting(&["{}"]);
+    let second = ScriptedAgent::emitting(&["{}"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    let instance = |binary: String, enabled: bool| {
+        json!({
+            "driver": "claudeAgent", "displayName": "Claude", "enabled": enabled,
+            "config": {"binaryPath": binary}
+        })
+    };
+    update(
+        &mut client,
+        json!({"providerInstances": {
+            "claudeFirst": instance(first.configured(), true),
+            "claudeSecond": instance(second.configured(), true)
+        }}),
+    )
+    .await
+    .expect_success();
+    let sibling_starts = second.starts();
+
+    update(
+        &mut client,
+        json!({"providerInstances": {
+            "claudeFirst": instance(first.configured(), false),
+            "claudeSecond": instance(second.configured(), true)
+        }}),
+    )
+    .await
+    .expect_success();
+
+    assert_eq!(
+        second.starts(),
+        sibling_starts,
+        "the unchanged instance was probed again"
+    );
+    let config = client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let providers = config["providers"].as_array().expect("providers");
+    assert_eq!(
+        providers
+            .iter()
+            .find(|p| p["instanceId"] == "claudeFirst")
+            .expect("first")["status"],
+        "disabled"
+    );
+    assert_eq!(
+        providers
+            .iter()
+            .find(|p| p["instanceId"] == "claudeSecond")
+            .expect("second")["status"],
+        "ready"
+    );
     server.stop().await;
 }
 
@@ -94,6 +297,14 @@ async fn settings_survive_a_restart() {
                     "binaryPath": "/opt/codex",
                     "homePath": "/home/developer/.codex",
                     "launchArgs": "--config model_reasoning_effort=high"
+                }
+            },
+            "providerInstances": {
+                "claudeWork": {
+                    "driver": "claudeAgent",
+                    "displayName": "Claude Work",
+                    "enabled": false,
+                    "config": {"binaryPath": "/opt/claude-work"}
                 }
             },
         }),
@@ -121,6 +332,18 @@ async fn settings_survive_a_restart() {
     assert_eq!(
         after["providers"]["codex"]["launchArgs"],
         "--config model_reasoning_effort=high"
+    );
+    assert_eq!(
+        after["providerInstances"]["claudeWork"]["driver"],
+        "claudeAgent"
+    );
+    assert_eq!(
+        after["providerInstances"]["claudeWork"]["displayName"],
+        "Claude Work"
+    );
+    assert_eq!(
+        after["providerInstances"]["claudeWork"]["config"]["binaryPath"],
+        "/opt/claude-work"
     );
 
     restarted.stop().await;
@@ -175,7 +398,8 @@ async fn a_slow_old_codex_probe_cannot_replace_a_new_settings_probe() {
     config.settings.providers.codex.binary_path = old.configured();
     let server = TestServer::start_with(config).await;
 
-    let old_refresh = server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
+    let old_refresh =
+        server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !old.started() {
         assert!(
@@ -322,7 +546,9 @@ async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
     )
     .await
     .expect_declared("ServerSettingsError");
-    let cause = error["cause"].as_str().expect("a sentence the panel can show");
+    let cause = error["cause"]
+        .as_str()
+        .expect("a sentence the panel can show");
     assert!(cause.contains("account-selection"), "{error}");
     assert!(cause.contains("one Codex account"), "{error}");
     assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "");
@@ -337,9 +563,7 @@ async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
 async fn a_change_reaches_an_open_window_without_a_restart() {
     let server = TestServer::start().await;
     let mut watcher = server.connect().await;
-    let subscription = watcher
-        .subscribe("subscribeServerConfig", json!({}))
-        .await;
+    let subscription = watcher.subscribe("subscribeServerConfig", json!({})).await;
     // The snapshot the subscription opens with, so what follows is the change.
     watcher.next_chunk(&subscription).await;
     watcher.ack(&subscription).await;
@@ -353,7 +577,10 @@ async fn a_change_reaches_an_open_window_without_a_restart() {
 
     let event = watcher.next_event(&subscription).await;
     assert_eq!(event["type"], "settingsUpdated", "{event}");
-    assert_eq!(event["payload"]["settings"]["addProjectBaseDirectory"], "/work");
+    assert_eq!(
+        event["payload"]["settings"]["addProjectBaseDirectory"],
+        "/work"
+    );
 
     server.stop().await;
 }

@@ -359,7 +359,7 @@ pub enum DriverStart {
 
 #[derive(Debug, Clone)]
 pub struct PreparedDriver {
-    registered: crate::provider::Registration,
+    identity: crate::provider::ProviderIdentity,
     driver: DriverStart,
 }
 
@@ -1810,31 +1810,34 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
 /// three things meet: the thread says which model and how much latitude, the
 /// project says where, and the settings say which binary.
 pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, String> {
-    let registered = crate::provider::registration(&thread.provider.instance_id).ok_or_else(|| {
+    let identity = crate::provider::identity(settings, &thread.provider.instance_id).ok_or_else(|| {
         format!(
             "Provider instance '{}' is not registered, so thread '{}' cannot start a turn.",
             thread.provider.instance_id, thread.id
         )
     })?;
-    if registered.driver != thread.provider.driver {
+    if identity.driver != thread.provider.driver {
         return Err(format!(
             "Provider instance '{}' is registered for driver '{}', but thread '{}' records '{}'.",
-            thread.provider.instance_id, registered.driver, thread.id, thread.provider.driver
+            thread.provider.instance_id, identity.driver, thread.id, thread.provider.driver
         ));
     }
-    let driver = match registered.kind {
-        crate::provider::DriverKind::Claude => {
-            DriverStart::Claude(settings.providers.claude_agent.clone())
-        }
-        crate::provider::DriverKind::Codex => DriverStart::Codex(settings.providers.codex.clone()),
+    let driver = if identity.driver == crate::provider::CLAUDE_DRIVER {
+        DriverStart::Claude(
+            crate::provider::claude_instance(settings, &identity.instance_id)
+                .expect("a resolved Claude identity has settings")
+                .settings,
+        )
+    } else {
+        DriverStart::Codex(settings.providers.codex.clone())
     };
 
-    Ok(PreparedDriver { registered, driver })
+    Ok(PreparedDriver { identity, driver })
 }
 
 pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver) -> Start {
-    debug_assert_eq!(prepared.registered.instance_id, thread.provider.instance_id);
-    debug_assert_eq!(prepared.registered.driver, thread.provider.driver);
+    debug_assert_eq!(prepared.identity.instance_id, thread.provider.instance_id);
+    debug_assert_eq!(prepared.identity.driver, thread.provider.driver);
 
     Start {
         thread_id: thread.id.clone(),

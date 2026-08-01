@@ -60,7 +60,8 @@ use std::time::{Duration, Instant};
 use crate::catalogue;
 use crate::clock::now_iso;
 use crate::config::{
-    AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
+    AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel,
+    ProviderState, Settings,
 };
 use crate::config_store::{ConfigStore, ProviderProbe};
 use crate::process::Search;
@@ -125,6 +126,59 @@ pub fn registration(instance_id: &str) -> Option<Registration> {
         .iter()
         .copied()
         .find(|registered| registered.instance_id == instance_id)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaudeInstance {
+    pub identity: ProviderIdentity,
+    pub display_name: String,
+    pub settings: ClaudeSettings,
+}
+
+/// Resolve the settings and durable routing identity for a Claude instance.
+/// The instance id doubles as its continuation namespace, so two configurations
+/// of the same driver cannot accidentally resume each other's conversations.
+pub fn claude_instance(settings: &Settings, instance_id: &str) -> Option<ClaudeInstance> {
+    if instance_id == CLAUDE_INSTANCE_ID {
+        return Some(ClaudeInstance {
+            identity: claude_registration().identity(),
+            display_name: DISPLAY_NAME.to_string(),
+            settings: settings.providers.claude_agent.clone(),
+        });
+    }
+    let envelope = settings.provider_instances.get(instance_id)?.as_object()?;
+    if envelope.get("driver")?.as_str()? != CLAUDE_DRIVER {
+        return None;
+    }
+    let config = envelope.get("config")?.as_object()?;
+    Some(ClaudeInstance {
+        identity: ProviderIdentity {
+            instance_id: instance_id.to_string(),
+            driver: CLAUDE_DRIVER.to_string(),
+        },
+        display_name: envelope.get("displayName")?.as_str()?.to_string(),
+        settings: ClaudeSettings {
+            enabled: envelope
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            binary_path: config.get("binaryPath")?.as_str()?.to_string(),
+            home_path: config.get("homePath")?.as_str()?.to_string(),
+            launch_args: config.get("launchArgs")?.as_str()?.to_string(),
+            custom_models: config
+                .get("customModels")?
+                .as_array()?
+                .iter()
+                .map(|model| model.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
+pub fn identity(settings: &Settings, instance_id: &str) -> Option<ProviderIdentity> {
+    registration(instance_id)
+        .map(Registration::identity)
+        .or_else(|| claude_instance(settings, instance_id).map(|instance| instance.identity))
 }
 
 fn claude_registration() -> Registration {
@@ -226,7 +280,12 @@ impl Located {
                 configured,
                 name,
                 directories,
-            } => Err(not_found_for(product, configured.as_deref(), &name, &directories)),
+            } => Err(not_found_for(
+                product,
+                configured.as_deref(),
+                &name,
+                &directories,
+            )),
         }
     }
 }
@@ -704,6 +763,14 @@ pub fn describe(settings: &ClaudeSettings, search: &Search, roots: &[PathBuf]) -
     }
 }
 
+fn describe_configured(instance: &ClaudeInstance, search: &Search, roots: &[PathBuf]) -> Provider {
+    let mut provider = describe(&instance.settings, search, roots);
+    provider.instance_id = instance.identity.instance_id.clone();
+    provider.driver = instance.identity.driver.clone();
+    provider.display_name = instance.display_name.clone();
+    provider
+}
+
 /// What the snapshot says once the binary has answered — or not.
 fn describe_probe(
     settings: &ClaudeSettings,
@@ -1078,7 +1145,10 @@ fn describe_codex(
             let (status, auth_message) = match probed.auth.status {
                 AuthStatus::Unauthenticated => (
                     ProviderState::Error,
-                    Some("Codex CLI is not authenticated. Run `codex login` and try again.".to_string()),
+                    Some(
+                        "Codex CLI is not authenticated. Run `codex login` and try again."
+                            .to_string(),
+                    ),
                 ),
                 AuthStatus::Authenticated => (ProviderState::Ready, None),
                 AuthStatus::Unknown => (
@@ -1175,7 +1245,8 @@ pub(crate) fn refresh_reserved(
     roots: &[PathBuf],
     probes: ProbeReservations,
 ) {
-    let settings = config.current().settings.providers.clone();
+    let current_settings = config.current().settings.clone();
+    let settings = current_settings.providers.clone();
     let claude = describe(&settings.claude_agent, search, roots);
     if let Some(message) = &claude.message {
         eprintln!("laplus: provider claudeAgent: {message}");
@@ -1198,6 +1269,10 @@ pub(crate) fn refresh_reserved(
         ExpectedSettings::Codex(settings.codex),
         codex,
     );
+
+    for instance_id in current_settings.provider_instances.keys() {
+        refresh_configured(config, instance_id, search, roots);
+    }
 }
 
 pub fn refresh_claude(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
@@ -1215,9 +1290,35 @@ pub fn refresh_codex(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
     publish_one(config, probe, ExpectedSettings::Codex(settings), provider);
 }
 
+pub fn refresh_configured(
+    config: &ConfigStore,
+    instance_id: &str,
+    search: &Search,
+    roots: &[PathBuf],
+) {
+    let probe = config.begin_provider_probe(instance_id);
+    let current = config.current();
+    let Some(instance) = claude_instance(&current.settings, instance_id) else {
+        return;
+    };
+    let expected = current
+        .settings
+        .provider_instances
+        .get(instance_id)
+        .cloned();
+    let provider = describe_configured(&instance, search, roots);
+    publish_one(
+        config,
+        probe,
+        ExpectedSettings::Configured(instance_id.to_string(), expected),
+        provider,
+    );
+}
+
 enum ExpectedSettings {
     Claude(ClaudeSettings),
     Codex(CodexSettings),
+    Configured(String, Option<serde_json::Value>),
 }
 
 fn publish_one(
@@ -1233,6 +1334,9 @@ fn publish_one(
                 current.settings.providers.claude_agent == *expected
             }
             ExpectedSettings::Codex(expected) => current.settings.providers.codex == *expected,
+            ExpectedSettings::Configured(instance_id, expected) => {
+                current.settings.provider_instances.get(instance_id) == expected.as_ref()
+            }
         },
         move |current| {
             let mut providers = current.to_vec();
@@ -1599,7 +1703,10 @@ mod tests {
     #[test]
     fn the_models_offered_are_gated_on_the_version_that_answered() {
         let slugs = |version: Option<&str>| -> Vec<String> {
-            models(version, &[]).into_iter().map(|model| model.slug).collect()
+            models(version, &[])
+                .into_iter()
+                .map(|model| model.slug)
+                .collect()
         };
 
         let old = slugs(Some("2.1.100"));

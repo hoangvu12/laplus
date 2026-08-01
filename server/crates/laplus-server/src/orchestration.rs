@@ -514,7 +514,7 @@ impl Shell {
                 self.rename_project(&project_id, &title)?
             }
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
-            Command::CreateThread(create) => self.create_thread(&create)?,
+            Command::CreateThread(create) => self.create_thread(&create, config)?,
             Command::UpdateThreadMeta(update) => self.update_thread_meta(update)?,
             Command::Archive { thread_id } => self.set_archived(&thread_id, Shelf::Archived)?,
             Command::Unarchive { thread_id } => self.set_archived(&thread_id, Shelf::Working)?,
@@ -1255,11 +1255,11 @@ impl Shell {
     /// The project has to be one this server knows, because the thread's whole
     /// purpose is to run an agent in that project's folder — a thread pointing
     /// at nothing would be a conversation that could never take a turn.
-    fn create_thread(&self, create: &CreateThread) -> Result<i64, CommandError> {
+    fn create_thread(&self, create: &CreateThread, config: &ServerConfig) -> Result<i64, CommandError> {
         let project = self.project(&create.thread.project_id)?;
         self.inner
             .threads
-            .create(create.to_thread(&project)?)
+            .create(create.to_thread(&project, &config.settings)?)
             .map_err(CommandError::new)
     }
 
@@ -1289,7 +1289,7 @@ impl Shell {
                 )));
             };
             let project = self.project(&create.thread.project_id)?;
-            Some(create.to_thread(&project)?)
+            Some(create.to_thread(&project, &config.settings)?)
         } else {
             None
         };
@@ -1853,7 +1853,7 @@ impl CreateThread {
     /// The project supplies the title when the client did not, the same way it
     /// does for a project with a blank name — the composer normally sends one,
     /// and a conversation called "" would be unreachable in the thread list.
-    fn to_thread(&self, project: &Project) -> Result<Thread, CommandError> {
+    fn to_thread(&self, project: &Project, settings: &crate::config::Settings) -> Result<Thread, CommandError> {
         let created_at = self
             .thread
             .created_at
@@ -1866,7 +1866,7 @@ impl CreateThread {
         };
 
         let instance_id = provider_instance(&self.thread.model_selection, &self.thread_id)?;
-        let registered = crate::provider::registration(instance_id).ok_or_else(|| {
+        let identity = crate::provider::identity(settings, instance_id).ok_or_else(|| {
             CommandError::new(format!(
                 "Provider instance '{instance_id}' is not registered, so thread '{}' was not \
                  created.",
@@ -1878,7 +1878,7 @@ impl CreateThread {
             id: self.thread_id.clone(),
             project_id: self.thread.project_id.clone(),
             title,
-            provider: registered.identity(),
+            provider: identity,
             model_selection: self.thread.model_selection.clone(),
             runtime_mode: self.thread.runtime_mode.clone(),
             interaction_mode: self.thread.interaction_mode.clone(),

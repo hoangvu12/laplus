@@ -33,9 +33,9 @@
 //! - **`enableAssistantStreaming`** is a description of what this server does.
 //!   It streams; ticket 10's second criterion requires it. A switch that turned
 //!   it off would be a switch that did nothing.
-//! - **`providerInstances`** is upstream's driver-agnostic instance map, which
-//!   this server does not write yet; its two built-in instances are configured
-//!   through `providers.claudeAgent` and `providers.codex`.
+//! - The two built-in instances remain configured through
+//!   `providers.claudeAgent` and `providers.codex` during the expansion. New
+//!   instances are configured through `providerInstances`.
 //!
 //! A patch that would **change** either is refused rather than ignored, because
 //! a settings panel whose control moves back on its own is worse than one that
@@ -275,12 +275,7 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
                 }
             }
             "providerInstances" => {
-                if object(field, value)? != &next.provider_instances {
-                    return Err("This server configures its built-in providers through \
-                                'providers.claudeAgent' and 'providers.codex' rather than through \
-                                'providerInstances'."
-                        .to_string());
-                }
+                next.provider_instances = provider_instances(object(field, value)?)?;
             }
             // `textGenerationModelSelection` is a stored preference and nothing
             // else — no call reads it yet — so it round-trips rather than being
@@ -295,6 +290,67 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
 
     *settings = next;
     Ok(())
+}
+
+fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+    let mut normalized = Map::new();
+    for (instance_id, value) in instances {
+        if !slug(instance_id) {
+            return Err(format!(
+                "'{instance_id}' is not a provider instance id: it has to start with a letter and \
+                 hold only letters, digits, '-' and '_'."
+            ));
+        }
+        if crate::provider::registration(instance_id).is_some() {
+            return Err(format!(
+                "Provider instance id '{instance_id}' is reserved by a built-in provider."
+            ));
+        }
+        let envelope = object(&format!("providerInstances.{instance_id}"), value)?;
+        for field in envelope.keys() {
+            if !matches!(field.as_str(), "driver" | "displayName" | "enabled" | "config") {
+                return Err(unrecognised(&format!("providerInstances.{instance_id}.{field}")));
+            }
+        }
+        let driver = envelope.get("driver").and_then(Value::as_str).unwrap_or_default().trim();
+        if !slug(driver) {
+            return Err(format!("Provider instance '{instance_id}' needs a valid driver kind."));
+        }
+        if driver != crate::provider::CLAUDE_DRIVER {
+            return Err(format!(
+                "Provider instance '{instance_id}' uses unsupported driver kind '{driver}'."
+            ));
+        }
+        let display_name = envelope.get("displayName").and_then(Value::as_str)
+            .map(str::trim).filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("Provider instance '{instance_id}' needs a non-empty displayName."))?;
+        let enabled = match envelope.get("enabled") {
+            Some(value) => boolean("enabled", value)?,
+            None => true,
+        };
+        let config = envelope.get("config")
+            .map(|value| object(&format!("providerInstances.{instance_id}.config"), value))
+            .transpose()?.cloned().unwrap_or_default();
+        let settings = claude(ClaudeSettings {
+            enabled,
+            binary_path: "claude".to_string(),
+            home_path: String::new(),
+            launch_args: String::new(),
+            custom_models: Vec::new(),
+        }, &config)?;
+        normalized.insert(instance_id.clone(), json!({
+            "driver": driver,
+            "displayName": display_name,
+            "enabled": settings.enabled,
+            "config": {
+                "binaryPath": settings.binary_path,
+                "homePath": settings.home_path,
+                "launchArgs": settings.launch_args,
+                "customModels": settings.custom_models,
+            }
+        }));
+    }
+    Ok(normalized)
 }
 
 /// The Claude instance's own half of a patch.
@@ -499,6 +555,8 @@ impl Update {
             .and_then(Value::as_object);
         let changes_claude = changed.is_some_and(|providers| providers.contains_key("claudeAgent"));
         let changes_codex = changed.is_some_and(|providers| providers.contains_key("codex"));
+        let changes_instances = self.patch.contains_key("providerInstances");
+        let previous_instances = store.current().settings.provider_instances.clone();
         let settings = store.reconfigure(|settings| apply(settings, &self.patch))?;
 
         // A provider is re-checked when its configuration moved, and only then.
@@ -518,6 +576,14 @@ impl Update {
         }
         if changes_codex {
             crate::provider::refresh_codex(store, &search, roots);
+        }
+        if changes_instances {
+            let current = store.current();
+            for (instance_id, instance) in &current.settings.provider_instances {
+                if previous_instances.get(instance_id) != Some(instance) {
+                    crate::provider::refresh_configured(store, instance_id, &search, roots);
+                }
+            }
         }
         Ok(settings)
     }
