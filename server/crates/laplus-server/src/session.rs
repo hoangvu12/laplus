@@ -1954,7 +1954,7 @@ mod continuation_tests {
         };
         thread.provider_resume_cursor = Some(cursor.clone());
         let prepared = PreparedDriver {
-            registered: crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID).expect("registered"),
+            identity: thread.provider.clone(),
             driver: DriverStart::Claude(crate::config::ClaudeSettings {
                 enabled: true,
                 binary_path: "claude".to_string(),
