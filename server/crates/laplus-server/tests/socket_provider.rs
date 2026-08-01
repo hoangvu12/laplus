@@ -324,9 +324,9 @@ async fn external_opencode_refuses_inventory_that_does_not_name_connected_provid
 #[tokio::test]
 async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions() {
     let current = FakeAgent::saying(if cfg!(windows) {
-        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo helper ^(subagent^)& exit /b 0\r\nexit /b 2"
+        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& echo openrouter/anthropic/claude:latest& echo {\"id\":\"anthropic/claude:latest\",\"name\":\"Nested Claude\",\"variants\":{}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo helper ^(subagent^)& exit /b 0\r\nexit /b 2"
     } else {
-        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'helper (subagent)' ;;\n*) exit 2;;\nesac"
+        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' 'openrouter/anthropic/claude:latest' '{' '  \"id\": \"anthropic/claude:latest\",' '  \"name\": \"Nested Claude\",' '  \"variants\": {}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'helper (subagent)' ;;\n*) exit 2;;\nesac"
     });
     let old = FakeAgent::saying("echo 1.14.18");
     let server = TestServer::start().await;
@@ -338,7 +338,7 @@ async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions(
     let local = provider_named(&server, "openLocal").await;
     let old = provider_named(&server, "openOld").await;
     assert_eq!(local["status"], "ready", "{local}");
-    assert_eq!(slugs(&local), vec!["openai/gpt-5"]);
+    assert_eq!(slugs(&local), vec!["openai/gpt-5", "openrouter/anthropic/claude:latest"]);
     assert_eq!(local["models"][0]["name"], "GPT 5");
     assert_eq!(local["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
     assert_eq!(old["status"], "error", "{old}");
@@ -789,9 +789,9 @@ async fn the_resolved_provider_reaches_an_open_subscriber() {
             event["payload"]["providers"]
                 .as_array()
                 .is_some_and(|providers| {
-                    providers
-                        .iter()
-                        .any(|provider| provider["instanceId"] == "codex")
+                    ["claudeAgent", "codex"].iter().all(|instance_id| {
+                        providers.iter().any(|provider| provider["instanceId"] == *instance_id)
+                    })
                 })
         })
         .await;

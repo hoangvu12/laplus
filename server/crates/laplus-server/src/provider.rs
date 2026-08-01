@@ -1457,8 +1457,9 @@ fn local_models(output: &str, agents: &[String]) -> Vec<ProviderModel> {
 
 fn valid_model_slug(slug: &str) -> bool {
     let Some((provider, model)) = slug.split_once('/') else { return false };
-    !provider.is_empty() && !model.is_empty() && !model.contains('/')
-        && slug.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    !provider.is_empty() && !model.is_empty()
+        && provider.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && !model.chars().any(char::is_whitespace)
 }
 
 fn bounded_command(path: &Path, arguments: &[&str], patience: Duration) -> Result<String, String> {
@@ -1480,7 +1481,12 @@ fn bounded_command(path: &Path, arguments: &[&str], patience: Duration) -> Resul
                 return Err(format!("{} did not finish within {} seconds", arguments.join(" "), patience.as_secs()));
             }
             Ok(None) => std::thread::sleep(PROBE_POLL),
-            Err(error) => return Err(format!("{} could not be waited for: {error}", arguments.join(" "))),
+            Err(error) => {
+                crate::process::terminate_tree_and_wait(&mut child);
+                let _ = stdout.join();
+                let _ = stderr.join();
+                return Err(format!("{} could not be waited for: {error}", arguments.join(" ")));
+            }
         }
     };
     let stdout = stdout.join().unwrap_or_default();
@@ -2059,7 +2065,7 @@ mod tests {
         refresh(&store, &fake.on_path(), &[]);
 
         let providers = &store.current().providers;
-        assert_eq!(providers.len(), REGISTRY.len());
+        assert_eq!(providers.len(), store.current().settings.provider_instances.len());
         assert_eq!(providers[0].version.as_deref(), Some("2.1.220"));
         assert_eq!(providers[0].status, ProviderState::Ready);
         assert_eq!(providers[1].instance_id, CODEX_INSTANCE_ID);
