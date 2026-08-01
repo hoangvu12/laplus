@@ -1866,13 +1866,21 @@ impl CreateThread {
         };
 
         let instance_id = provider_instance(&self.thread.model_selection, &self.thread_id)?;
-        let identity = crate::provider::identity(settings, instance_id).ok_or_else(|| {
-            CommandError::new(format!(
-                "Provider instance '{instance_id}' is not registered, so thread '{}' was not \
-                 created.",
-                self.thread_id
-            ))
-        })?;
+        let identity = crate::provider::resolve_instance(settings, instance_id, None)
+            .map(|instance| instance.identity().clone())
+            .map_err(|unavailable| CommandError::new(match unavailable {
+                crate::provider::InstanceUnavailable::Unknown => format!(
+                    "Provider instance '{instance_id}' is not registered, so thread '{}' was not \
+                     created.", self.thread_id
+                ),
+                crate::provider::InstanceUnavailable::Disabled => format!(
+                    "Provider instance '{instance_id}' is disabled, so thread '{}' was not \
+                     created.", self.thread_id
+                ),
+                crate::provider::InstanceUnavailable::Mismatched { .. } => {
+                    unreachable!("thread creation records the configured driver")
+                }
+            }))?;
 
         Ok(Thread {
             id: self.thread_id.clone(),

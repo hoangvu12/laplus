@@ -429,6 +429,42 @@ pub struct CodexSettings {
     pub custom_models: Vec<String>,
 }
 
+impl ClaudeSettings {
+    pub(crate) fn instance_envelope(&self, display_name: &str) -> serde_json::Value {
+        provider_instance_envelope(crate::provider::CLAUDE_DRIVER, display_name, self.enabled,
+            &self.binary_path, &self.home_path, &self.launch_args, &self.custom_models)
+    }
+}
+
+impl CodexSettings {
+    pub(crate) fn instance_envelope(&self, display_name: &str) -> serde_json::Value {
+        provider_instance_envelope(crate::provider::CODEX_DRIVER, display_name, self.enabled,
+            &self.binary_path, &self.home_path, &self.launch_args, &self.custom_models)
+    }
+}
+
+fn provider_instance_envelope(
+    driver: &str,
+    display_name: &str,
+    enabled: bool,
+    binary_path: &str,
+    home_path: &str,
+    launch_args: &str,
+    custom_models: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "driver": driver,
+        "displayName": display_name,
+        "enabled": enabled,
+        "config": {
+            "binaryPath": binary_path,
+            "homePath": home_path,
+            "launchArgs": launch_args,
+            "customModels": custom_models,
+        },
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObservabilitySettings {
@@ -478,6 +514,30 @@ impl ServerConfig {
         // problem: a socket cannot move under a running server, so what is
         // read here at startup is still true for as long as the value lives.
         let policy = policy_for(&remote_access);
+        let claude_settings = ClaudeSettings {
+            enabled: true,
+            binary_path: "claude".to_string(),
+            home_path: String::new(),
+            launch_args: String::new(),
+            custom_models: Vec::new(),
+        };
+        let codex_settings = CodexSettings {
+            enabled: true,
+            binary_path: "codex".to_string(),
+            home_path: String::new(),
+            launch_args: String::new(),
+            custom_models: Vec::new(),
+        };
+        let provider_instances = serde_json::Map::from_iter([
+            (
+                crate::provider::CLAUDE_INSTANCE_ID.to_string(),
+                claude_settings.instance_envelope("Claude"),
+            ),
+            (
+                crate::provider::CODEX_INSTANCE_ID.to_string(),
+                codex_settings.instance_envelope("Codex"),
+            ),
+        ]);
         ServerConfig {
             remote_access,
             preferences: data_dir.clone(),
@@ -553,22 +613,10 @@ impl ServerConfig {
                     "model": "claude-haiku-4-5",
                 }),
                 providers: ProviderSettings {
-                    claude_agent: ClaudeSettings {
-                        enabled: true,
-                        binary_path: "claude".to_string(),
-                        home_path: String::new(),
-                        launch_args: String::new(),
-                        custom_models: Vec::new(),
-                    },
-                    codex: CodexSettings {
-                        enabled: true,
-                        binary_path: "codex".to_string(),
-                        home_path: String::new(),
-                        launch_args: String::new(),
-                        custom_models: Vec::new(),
-                    },
+                    claude_agent: claude_settings,
+                    codex: codex_settings,
                 },
-                provider_instances: serde_json::Map::new(),
+                provider_instances,
                 observability: ObservabilitySettings {
                     otlp_traces_url: String::new(),
                     otlp_metrics_url: String::new(),

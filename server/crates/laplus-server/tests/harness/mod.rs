@@ -124,10 +124,37 @@ struct Session {
 /// A test that means to exercise discovery sets one before starting the server,
 /// and keeps it — which is what the emptiness check below is for.
 fn somewhere_that_is_not_the_developers(config: &mut ServerConfig) {
+    // Tests written before provider instances became the sole routing model
+    // construct `ServerConfig` directly. Keep that test-only builder behavior
+    // compatible by translating its legacy field edits at the boundary.
+    if config.settings.providers.claude_agent.binary_path != "claude" {
+        config.settings.provider_instances["claudeAgent"]["config"]["binaryPath"] =
+            serde_json::json!(config.settings.providers.claude_agent.binary_path);
+    }
+    if !config.settings.providers.claude_agent.enabled {
+        config.settings.provider_instances["claudeAgent"]["enabled"] = serde_json::json!(false);
+    }
+    if !config.settings.providers.claude_agent.home_path.trim().is_empty() {
+        config.settings.provider_instances["claudeAgent"]["config"]["homePath"] =
+            serde_json::json!(config.settings.providers.claude_agent.home_path);
+    }
+    if config.settings.providers.codex.binary_path != "codex" {
+        config.settings.provider_instances["codex"]["config"]["binaryPath"] =
+            serde_json::json!(config.settings.providers.codex.binary_path);
+        config.settings.provider_instances["codex"]["enabled"] =
+            serde_json::json!(config.settings.providers.codex.enabled);
+        config.settings.provider_instances["codex"]["config"]["homePath"] =
+            serde_json::json!(config.settings.providers.codex.home_path);
+        config.settings.provider_instances["codex"]["config"]["launchArgs"] =
+            serde_json::json!(config.settings.providers.codex.launch_args);
+        config.settings.provider_instances["codex"]["config"]["customModels"] =
+            serde_json::json!(config.settings.providers.codex.custom_models);
+    }
     // Never discover or start the developer's real Codex during an offline
     // suite. Codex tests configure their committed stand-in before this runs.
-    if config.settings.providers.codex.binary_path == "codex" {
+    if config.settings.provider_instances["codex"]["config"]["binaryPath"] == "codex" {
         config.settings.providers.codex.enabled = false;
+        config.settings.provider_instances["codex"]["enabled"] = serde_json::json!(false);
     }
     if !config
         .settings
@@ -144,6 +171,8 @@ fn somewhere_that_is_not_the_developers(config: &mut ServerConfig) {
         .join("claude-home")
         .display()
         .to_string();
+    config.settings.provider_instances["claudeAgent"]["config"]["homePath"] =
+        serde_json::json!(config.settings.providers.claude_agent.home_path);
 }
 
 impl TestServer {

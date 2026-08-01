@@ -141,6 +141,68 @@ async fn a_configured_claude_instance_is_accepted_and_persisted() {
 }
 
 #[tokio::test]
+async fn the_built_in_defaults_are_generic_provider_instances() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let current = settings(&mut client).await;
+    assert_eq!(
+        current["providerInstances"]["claudeAgent"]["driver"],
+        "claudeAgent"
+    );
+    assert_eq!(
+        current["providerInstances"]["codex"]["driver"],
+        "codex"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn legacy_provider_settings_are_normalized_into_the_default_instances() {
+    let agent = ScriptedAgent::emitting(&["{}"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let after = update(
+        &mut client,
+        json!({"providers": {"claudeAgent": {
+            "binaryPath": agent.configured(),
+            "customModels": ["legacy-model"]
+        }}}),
+    )
+    .await
+    .expect_success();
+
+    assert_eq!(
+        after["providerInstances"]["claudeAgent"]["config"]["binaryPath"],
+        agent.configured()
+    );
+    assert_eq!(
+        after["providerInstances"]["claudeAgent"]["config"]["customModels"],
+        json!(["legacy-model"])
+    );
+    let refreshed = client
+        .call("server.refreshProviders", json!({"instanceId": "claudeAgent"}))
+        .await
+        .expect_success();
+    let provider = refreshed["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["instanceId"] == "claudeAgent")
+        .expect("the default Claude instance");
+    assert_eq!(provider["status"], "ready");
+    assert!(provider["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .any(|model| model["slug"] == "legacy-model"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn a_default_claude_instance_migrates_to_the_generic_configuration_path() {
     let agent = ScriptedAgent::emitting(&["{}"]);
     let server = TestServer::start().await;
@@ -220,7 +282,13 @@ async fn invalid_provider_instance_envelopes_are_refused_actionably() {
             "{error}"
         );
     }
-    assert_eq!(settings(&mut client).await["providerInstances"], json!({}));
+    let instances = settings(&mut client).await["providerInstances"]
+        .as_object()
+        .expect("provider instances")
+        .clone();
+    assert_eq!(instances.len(), 2);
+    assert!(instances.contains_key("claudeAgent"));
+    assert!(instances.contains_key("codex"));
     server.stop().await;
 }
 
@@ -271,6 +339,47 @@ async fn a_turn_routes_through_the_selected_configured_claude_instance() {
         "the session lost its provider-instance continuation namespace: {events:?}"
     );
     assert!(workspace.path().join(WORKING_DIRECTORY_MARKER).exists());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_disabled_provider_instance_cannot_route_a_new_thread() {
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    update(
+        &mut client,
+        json!({"providerInstances": {
+            "claudeOff": {
+                "driver": "claudeAgent",
+                "displayName": "Claude Off",
+                "enabled": false,
+                "config": {"binaryPath": "claude"}
+            }
+        }}),
+    )
+    .await
+    .expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            harness::conversation::create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut turn = start_turn("thread-off", "message-1", "do not run");
+    turn["modelSelection"]["instanceId"] = json!("claudeOff");
+    turn["bootstrap"]["createThread"]["modelSelection"]["instanceId"] = json!("claudeOff");
+
+    let refusal = client
+        .call("orchestration.dispatchCommand", turn)
+        .await
+        .expect_declared("OrchestrationDispatchCommandError");
+    assert!(
+        refusal["message"].as_str().unwrap_or_default().contains("disabled"),
+        "{refusal}"
+    );
+
     server.stop().await;
 }
 
@@ -476,7 +585,8 @@ async fn a_slow_old_codex_probe_cannot_replace_a_new_settings_probe() {
     let old = harness::codex::ScriptedCodex::blocked_provider_probe_with_email("old@example.com");
     let new = harness::codex::ScriptedCodex::provider_probe_with_email("new@example.com");
     let mut config = laplus_server::config::ServerConfig::detect();
-    config.settings.providers.codex.binary_path = old.configured();
+    config.settings.provider_instances["codex"]["config"]["binaryPath"] =
+        json!(old.configured());
     let server = TestServer::start_with(config).await;
 
     let old_refresh = server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));

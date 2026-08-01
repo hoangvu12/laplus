@@ -2386,9 +2386,9 @@ pub(crate) mod tests {
             id: id.to_string(),
             project_id: "project-1".to_string(),
             title: "A conversation".to_string(),
-            provider: crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID)
+            provider: crate::provider::registration(crate::provider::CLAUDE_DRIVER)
                 .expect("the Claude driver is registered")
-                .identity(),
+                .identity(crate::provider::CLAUDE_INSTANCE_ID),
             model_selection: json!({"instanceId": "claudeAgent", "model": "claude-opus-5"}),
             runtime_mode: "full-access".to_string(),
             interaction_mode: "default".to_string(),

@@ -1819,31 +1819,31 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
 /// three things meet: the thread says which model and how much latitude, the
 /// project says where, and the settings say which binary.
 pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, String> {
-    let identity = crate::provider::identity(settings, &thread.provider.instance_id).ok_or_else(|| {
-        format!(
+    let instance = crate::provider::resolve_instance(
+        settings,
+        &thread.provider.instance_id,
+        Some(&thread.provider.driver),
+    ).map_err(|unavailable| match unavailable {
+        crate::provider::InstanceUnavailable::Unknown => format!(
             "Provider instance '{}' is not registered, so thread '{}' cannot start a turn.",
             thread.provider.instance_id, thread.id
-        )
-    })?;
-    if identity.driver != thread.provider.driver {
-        return Err(format!(
-            "Provider instance '{}' is registered for driver '{}', but thread '{}' records '{}'.",
-            thread.provider.instance_id, identity.driver, thread.id, thread.provider.driver
-        ));
-    }
-    let driver = match crate::provider::driver_kind(settings, &identity.instance_id)
-        .expect("a resolved provider identity has a driver kind") {
-        crate::provider::DriverKind::Claude => DriverStart::Claude(
-            crate::provider::claude_instance(settings, &identity.instance_id)
-                .expect("a resolved Claude identity has settings")
-                .settings,
         ),
-        crate::provider::DriverKind::Codex => {
-            DriverStart::Codex(
-                crate::provider::codex_instance(settings, &identity.instance_id)
-                    .expect("a resolved Codex identity has settings")
-                    .settings,
-            )
+        crate::provider::InstanceUnavailable::Disabled => format!(
+            "Provider instance '{}' is disabled, so thread '{}' cannot start a turn.",
+            thread.provider.instance_id, thread.id
+        ),
+        crate::provider::InstanceUnavailable::Mismatched { configured, recorded } => format!(
+            "Provider instance '{}' is registered for driver '{}', but thread '{}' records '{}'.",
+            thread.provider.instance_id, configured, thread.id, recorded
+        ),
+    })?;
+    let identity = instance.identity().clone();
+    let driver = match instance {
+        crate::provider::ConfiguredInstance::Claude(instance) => {
+            DriverStart::Claude(instance.settings)
+        }
+        crate::provider::ConfiguredInstance::Codex(instance) => {
+            DriverStart::Codex(instance.settings)
         }
     };
 
@@ -1880,9 +1880,9 @@ mod continuation_tests {
     use tokio::sync::broadcast;
 
     fn thread() -> Thread {
-        let provider = crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID)
+        let provider = crate::provider::registration(crate::provider::CLAUDE_DRIVER)
             .expect("registered")
-            .identity();
+            .identity(crate::provider::CLAUDE_INSTANCE_ID);
         Thread {
             id: "thread-1".to_string(),
             project_id: "project-1".to_string(),

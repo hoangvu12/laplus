@@ -88,6 +88,10 @@ the default Claude instance and are separate fields;
 **Provider instance** — one configured identity of a driver, with its own
 settings, catalogue and continuation namespace. Several instances may use the
 same driver; a thread routes to the instance id, not merely the driver kind.
+The durable Claude and Codex defaults are ordinary entries in
+`Settings.provider_instances`; their legacy `providers` buckets are accepted
+only at the settings boundary and normalized there. Snapshots, refreshes and
+sessions never fall back to the legacy shape.
 _Avoid_: Provider, when the distinction affects routing or configuration.
 
 **App-server** - Codex's JSON-RPC mode, started as `codex app-server` and spoken

@@ -1072,9 +1072,9 @@ mod tests {
             runtime_mode: "full-access".to_string(),
             resume: None,
             resume_cursor: None,
-            provider: crate::provider::registration(crate::provider::CLAUDE_INSTANCE_ID)
+            provider: crate::provider::registration(crate::provider::CLAUDE_DRIVER)
                 .expect("registered")
-                .identity(),
+                .identity(crate::provider::CLAUDE_INSTANCE_ID),
             driver: crate::session::DriverStart::Claude(ClaudeSettings {
                 enabled: true,
                 binary_path: "claude".to_string(),

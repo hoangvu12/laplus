@@ -34,8 +34,9 @@
 //!   It streams; ticket 10's second criterion requires it. A switch that turned
 //!   it off would be a switch that did nothing.
 //! - The legacy `providers.claudeAgent` and `providers.codex` buckets remain
-//!   accepted as fallbacks. An explicit envelope under `providerInstances`
-//!   takes precedence, including for the two durable default instance ids.
+//!   accepted as input and are normalized into the durable default envelopes
+//!   under `providerInstances`. Provider operations read only those envelopes.
+//!   An explicit envelope in the same patch takes precedence.
 //!
 //! A patch that would **change** either is refused rather than ignored, because
 //! a settings panel whose control moves back on its own is worse than one that
@@ -148,6 +149,15 @@ pub fn load(directory: &Path, defaults: Settings) -> Settings {
     for (field, value) in stored {
         let mut one = Map::new();
         one.insert(field.clone(), value.clone());
+        if let Err(why) = apply(&mut settings, &one) {
+            complain(&format!("{why} That setting kept its default."));
+        }
+    }
+    // `providers` is the legacy input shape and `providerInstances` is the
+    // routing source of truth. JSON object order must not decide which wins.
+    if let Some(instances) = stored.get("providerInstances") {
+        let mut one = Map::new();
+        one.insert("providerInstances".to_string(), instances.clone());
         if let Err(why) = apply(&mut settings, &one) {
             complain(&format!("{why} That setting kept its default."));
         }
@@ -275,7 +285,18 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
                 }
             }
             "providerInstances" => {
-                next.provider_instances = provider_instances(object(field, value)?)?;
+                let mut instances = provider_instances(object(field, value)?)?;
+                for instance_id in [
+                    crate::provider::CLAUDE_INSTANCE_ID,
+                    crate::provider::CODEX_INSTANCE_ID,
+                ] {
+                    if !instances.contains_key(instance_id) {
+                        if let Some(default) = next.provider_instances.get(instance_id) {
+                            instances.insert(instance_id.to_string(), default.clone());
+                        }
+                    }
+                }
+                next.provider_instances = instances;
             }
             // `textGenerationModelSelection` is a stored preference and nothing
             // else — no call reads it yet — so it round-trips rather than being
@@ -286,6 +307,29 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
             }
             unknown => return Err(unrecognised(unknown)),
         }
+    }
+
+    // The legacy driver buckets remain part of the contract, but provider
+    // operations consume one registry. Normalize old-shaped writes at this
+    // boundary unless the same patch supplied the default instance explicitly.
+    let explicit_instances = patch.get("providerInstances").and_then(Value::as_object);
+    if patch.get("providers").and_then(Value::as_object)
+        .is_some_and(|providers| providers.contains_key("claudeAgent"))
+        && !explicit_instances.is_some_and(|instances| instances.contains_key(crate::provider::CLAUDE_INSTANCE_ID))
+    {
+        next.provider_instances.insert(
+            crate::provider::CLAUDE_INSTANCE_ID.to_string(),
+            next.providers.claude_agent.instance_envelope("Claude"),
+        );
+    }
+    if patch.get("providers").and_then(Value::as_object)
+        .is_some_and(|providers| providers.contains_key("codex"))
+        && !explicit_instances.is_some_and(|instances| instances.contains_key(crate::provider::CODEX_INSTANCE_ID))
+    {
+        next.provider_instances.insert(
+            crate::provider::CODEX_INSTANCE_ID.to_string(),
+            next.providers.codex.instance_envelope("Codex"),
+        );
     }
 
     *settings = next;
@@ -311,18 +355,20 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
         if !slug(driver) {
             return Err(format!("Provider instance '{instance_id}' needs a valid driver kind."));
         }
-        if !matches!(driver, crate::provider::CLAUDE_DRIVER | crate::provider::CODEX_DRIVER) {
+        let Some(registered) = crate::provider::registration(driver) else {
             return Err(format!(
                 "Provider instance '{instance_id}' uses unsupported driver kind '{driver}'."
             ));
-        }
-        if let Some(registered) = crate::provider::registration(instance_id) {
-            if registered.driver != driver {
-                return Err(format!(
-                    "Default provider instance '{instance_id}' belongs to driver '{}', not '{driver}'.",
-                    registered.driver
-                ));
-            }
+        };
+        let default_driver = match instance_id.as_str() {
+            crate::provider::CLAUDE_INSTANCE_ID => Some(crate::provider::CLAUDE_DRIVER),
+            crate::provider::CODEX_INSTANCE_ID => Some(crate::provider::CODEX_DRIVER),
+            _ => None,
+        };
+        if let Some(expected) = default_driver.filter(|expected| *expected != driver) {
+            return Err(format!(
+                "Default provider instance '{instance_id}' belongs to driver '{expected}', not '{driver}'."
+            ));
         }
         let display_name = envelope.get("displayName").and_then(Value::as_str)
             .map(str::trim).filter(|name| !name.is_empty())
@@ -334,8 +380,8 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
         let config = envelope.get("config")
             .map(|value| object(&format!("providerInstances.{instance_id}.config"), value))
             .transpose()?.cloned().unwrap_or_default();
-        let (binary_path, home_path, launch_args, custom_models) = match driver {
-            crate::provider::CLAUDE_DRIVER => {
+        let (binary_path, home_path, launch_args, custom_models) = match registered.kind {
+            crate::provider::DriverKind::Claude => {
                 let settings = claude(ClaudeSettings {
                     enabled,
                     binary_path: "claude".to_string(),
@@ -345,7 +391,7 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                 }, &config)?;
                 (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
             }
-            crate::provider::CODEX_DRIVER => {
+            crate::provider::DriverKind::Codex => {
                 let settings = codex(CodexSettings {
                     enabled,
                     binary_path: "codex".to_string(),
@@ -355,7 +401,6 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                 }, &config)?;
                 (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
             }
-            _ => unreachable!("unsupported drivers were refused above"),
         };
         normalized.insert(instance_id.clone(), json!({
             "driver": driver,
@@ -568,13 +613,6 @@ impl Update {
         store: &crate::config_store::ConfigStore,
         roots: &[std::path::PathBuf],
     ) -> Result<Value, Value> {
-        let changed = self
-            .patch
-            .get("providers")
-            .and_then(Value::as_object);
-        let changes_claude = changed.is_some_and(|providers| providers.contains_key("claudeAgent"));
-        let changes_codex = changed.is_some_and(|providers| providers.contains_key("codex"));
-        let changes_instances = self.patch.contains_key("providerInstances");
         let previous_instances = store.current().settings.provider_instances.clone();
         let settings = store.reconfigure(|settings| apply(settings, &self.patch))?;
 
@@ -590,18 +628,22 @@ impl Update {
         // process; and inline, because this is already off the read loop and the
         // developer is waiting for the answer that says it worked.
         let search = crate::process::Search::from_environment();
-        if changes_claude {
-            crate::provider::refresh_claude(store, &search, roots);
+        let current = store.current();
+        let removed = previous_instances.keys()
+            .filter(|instance_id| !current.settings.provider_instances.contains_key(*instance_id))
+            .cloned().collect::<Vec<_>>();
+        if !removed.is_empty() {
+            for instance_id in &removed {
+                store.begin_provider_probe(instance_id);
+            }
+            let providers = current.providers.iter()
+                .filter(|provider| !removed.contains(&provider.instance_id))
+                .cloned().collect();
+            store.apply(crate::config_store::ConfigChange::Providers(providers));
         }
-        if changes_codex {
-            crate::provider::refresh_codex(store, &search, roots);
-        }
-        if changes_instances {
-            let current = store.current();
-            for (instance_id, instance) in &current.settings.provider_instances {
-                if previous_instances.get(instance_id) != Some(instance) {
-                    crate::provider::refresh_configured(store, instance_id, &search, roots);
-                }
+        for (instance_id, instance) in &current.settings.provider_instances {
+            if previous_instances.get(instance_id) != Some(instance) {
+                crate::provider::refresh_configured(store, instance_id, &search, roots);
             }
         }
         Ok(settings)

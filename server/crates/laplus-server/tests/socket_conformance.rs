@@ -181,7 +181,18 @@ const MISSING: &[Declared] = &[
 /// say, and so does the one compared here. A stand-in reporting an older version
 /// would carry the model-gate advice and this list would stop being empty, which
 /// is why `AGENT_VERSION` is current.
-const ADDED: &[Declared] = &[];
+const ADDED: &[Declared] = &[
+    Declared {
+        path: "/settings/providerInstances/claudeAgent",
+        because: "OpenCode registry ticket 03 makes the durable Claude default an ordinary \
+                  configured provider instance",
+    },
+    Declared {
+        path: "/settings/providerInstances/codex",
+        because: "OpenCode registry ticket 03 makes the durable Codex default an ordinary \
+                  configured provider instance",
+    },
+];
 
 /// Fields present in both but holding a different JSON type. Same reasoning as
 /// added fields — the client decodes this, so a type change is a break.
