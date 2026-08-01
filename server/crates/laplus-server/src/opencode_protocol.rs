@@ -64,6 +64,7 @@ const KNOWN_EVENTS: &[&str] = &[
     "session.error",
     "message.updated",
     "message.part.updated",
+    "message.part.delta",
     "message.part.removed",
     "permission.updated",
     "permission.replied",

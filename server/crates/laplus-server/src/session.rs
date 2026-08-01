@@ -354,6 +354,7 @@ pub struct Start {
 pub enum DriverStart {
     Claude(ClaudeSettings),
     Codex(crate::config::CodexSettings),
+    OpenCode(crate::config::OpenCodeSettings),
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +368,7 @@ impl DriverStart {
         match self {
             DriverStart::Claude(settings) => Ok(settings),
             DriverStart::Codex(_) => Err("the Codex turn driver has not landed yet".to_string()),
+            DriverStart::OpenCode(_) => Err("OpenCode settings were paired with the Claude driver".to_string()),
         }
     }
 
@@ -376,6 +378,14 @@ impl DriverStart {
             DriverStart::Claude(_) => {
                 Err("Codex settings were paired with the Claude driver".to_string())
             }
+            DriverStart::OpenCode(_) => Err("OpenCode settings were paired with the Codex driver".to_string()),
+        }
+    }
+
+    pub(crate) fn opencode(&self) -> Result<&crate::config::OpenCodeSettings, String> {
+        match self {
+            DriverStart::OpenCode(settings) => Ok(settings),
+            _ => Err("OpenCode settings were paired with another driver".to_string()),
         }
     }
 }
@@ -407,6 +417,11 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> 
                 tokio::spawn(drive::<crate::codex::Codex>(
                     driving, starting, incoming, signals, epoch,
                 ))
+            })
+        }
+        DriverStart::OpenCode(_) => {
+            threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+                tokio::spawn(drive::<crate::opencode::OpenCode>(driving, starting, incoming, signals, epoch))
             })
         }
     };
@@ -1841,10 +1856,7 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
         crate::provider::ConfiguredInstance::Codex(instance) => {
             DriverStart::Codex(instance.settings)
         }
-        crate::provider::ConfiguredInstance::OpenCode(_) => return Err(format!(
-            "OpenCode provider instance '{}' can be discovered, but turns require OpenCode ticket 09.",
-            identity.instance_id
-        )),
+        crate::provider::ConfiguredInstance::OpenCode(instance) => DriverStart::OpenCode(instance.settings),
     };
 
     Ok(PreparedDriver { identity, driver })

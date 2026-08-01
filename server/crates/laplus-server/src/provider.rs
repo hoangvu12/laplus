@@ -387,7 +387,7 @@ impl Located {
         self.startable_for("Codex")
     }
 
-    fn startable_for(self, product: &str) -> Result<(PathBuf, Source), String> {
+    pub(crate) fn startable_for(self, product: &str) -> Result<(PathBuf, Source), String> {
         match self {
             Located::Binary { path, source } => Ok((path, source)),
             // `installed: false` although the file exists, because what
@@ -451,7 +451,7 @@ pub(crate) fn resolve_codex(configured: &str, search: &Search) -> Located {
     resolve_named(configured, "codex", search)
 }
 
-fn resolve_named(configured: &str, default_name: &str, search: &Search) -> Located {
+pub(crate) fn resolve_named(configured: &str, default_name: &str, search: &Search) -> Located {
     let configured = configured.trim();
     let explicit = names_a_path(configured).then(|| PathBuf::from(configured));
 

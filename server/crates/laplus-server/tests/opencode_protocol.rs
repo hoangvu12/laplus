@@ -228,6 +228,17 @@ fn sse_decoder_handles_chunks_multiline_heartbeats_unknowns_and_malformed_input(
     ));
 }
 
+#[test]
+fn current_text_delta_event_is_a_known_compatible_event() {
+    let mut decoder = SseDecoder::default();
+    let events = decoder.push(
+        br#"data: {"type":"message.part.delta","properties":{"sessionID":"ses_1","field":"text","delta":"hello"}}
+
+"#,
+    );
+    assert!(matches!(events.as_slice(), [Ok(OpenCodeEvent::Known(_))]));
+}
+
 #[tokio::test]
 async fn event_stream_retains_and_counts_unknown_events_and_cancels_promptly() {
     let (url, _, stop) = peer(move |_| {
