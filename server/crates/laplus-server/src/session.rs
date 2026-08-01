@@ -1839,7 +1839,11 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
                 .settings,
         ),
         crate::provider::DriverKind::Codex => {
-            DriverStart::Codex(settings.providers.codex.clone())
+            DriverStart::Codex(
+                crate::provider::codex_instance(settings, &identity.instance_id)
+                    .expect("a resolved Codex identity has settings")
+                    .settings,
+            )
         }
     };
 

@@ -79,11 +79,11 @@ event the client reads. Per-agent by construction — ADR-0001 is why an encoder
 belongs to a driver and the decoder does not. `crate::turn` drives the `claude`
 CLI and `crate::codex` drives Codex app-server.
 
-Selected through `crate::provider::REGISTRY`: a provider instance id is the
-routing key a conversation records, while the driver slug says which
-implementation runs it. They happen to both be `claudeAgent` for the first
-entry and are separate fields; `crate::provider::ProviderIdentity` keeps the
-pair durable on the thread.
+Selected through `crate::provider`'s configured-instance resolver: a provider
+instance id is the routing key a conversation records, while the driver slug
+says which implementation runs it. They happen to both be `claudeAgent` for
+the default Claude instance and are separate fields;
+`crate::provider::ProviderIdentity` keeps the pair durable on the thread.
 
 **Provider instance** — one configured identity of a driver, with its own
 settings, catalogue and continuation namespace. Several instances may use the

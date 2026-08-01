@@ -141,6 +141,60 @@ async fn a_configured_claude_instance_is_accepted_and_persisted() {
 }
 
 #[tokio::test]
+async fn a_default_claude_instance_migrates_to_the_generic_configuration_path() {
+    let agent = ScriptedAgent::emitting(&["{}"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    let after = update(
+        &mut client,
+        json!({
+            "providers": {"claudeAgent": {
+                "enabled": true,
+                "binaryPath": "legacy-claude",
+                "customModels": ["legacy-model"]
+            }},
+            "providerInstances": {"claudeAgent": {
+                "driver": "claudeAgent",
+                "displayName": "Claude Default",
+                "enabled": true,
+                "config": {
+                    "binaryPath": agent.configured(),
+                    "customModels": ["instance-model"]
+                }
+            }}
+        }),
+    )
+    .await
+    .expect_success();
+
+    assert_eq!(after["providerInstances"]["claudeAgent"]["driver"], "claudeAgent");
+    let config = client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let snapshot = config["providers"]
+        .as_array()
+        .expect("provider snapshots")
+        .iter()
+        .find(|provider| provider["instanceId"] == "claudeAgent")
+        .expect("the default Claude instance");
+    assert_eq!(snapshot["displayName"], "Claude Default");
+    assert!(snapshot["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .any(|model| model["slug"] == "instance-model"));
+    assert!(!snapshot["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .any(|model| model["slug"] == "legacy-model"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn invalid_provider_instance_envelopes_are_refused_actionably() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;

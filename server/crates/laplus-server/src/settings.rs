@@ -33,9 +33,9 @@
 //! - **`enableAssistantStreaming`** is a description of what this server does.
 //!   It streams; ticket 10's second criterion requires it. A switch that turned
 //!   it off would be a switch that did nothing.
-//! - The two built-in instances remain configured through
-//!   `providers.claudeAgent` and `providers.codex` during the expansion. New
-//!   instances are configured through `providerInstances`.
+//! - The legacy `providers.claudeAgent` and `providers.codex` buckets remain
+//!   accepted as fallbacks. An explicit envelope under `providerInstances`
+//!   takes precedence, including for the two durable default instance ids.
 //!
 //! A patch that would **change** either is refused rather than ignored, because
 //! a settings panel whose control moves back on its own is worse than one that
@@ -301,11 +301,6 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                  hold only letters, digits, '-' and '_'."
             ));
         }
-        if crate::provider::registration(instance_id).is_some() {
-            return Err(format!(
-                "Provider instance id '{instance_id}' is reserved by a built-in provider."
-            ));
-        }
         let envelope = object(&format!("providerInstances.{instance_id}"), value)?;
         for field in envelope.keys() {
             if !matches!(field.as_str(), "driver" | "displayName" | "enabled" | "config") {
@@ -316,10 +311,18 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
         if !slug(driver) {
             return Err(format!("Provider instance '{instance_id}' needs a valid driver kind."));
         }
-        if driver != crate::provider::CLAUDE_DRIVER {
+        if !matches!(driver, crate::provider::CLAUDE_DRIVER | crate::provider::CODEX_DRIVER) {
             return Err(format!(
                 "Provider instance '{instance_id}' uses unsupported driver kind '{driver}'."
             ));
+        }
+        if let Some(registered) = crate::provider::registration(instance_id) {
+            if registered.driver != driver {
+                return Err(format!(
+                    "Default provider instance '{instance_id}' belongs to driver '{}', not '{driver}'.",
+                    registered.driver
+                ));
+            }
         }
         let display_name = envelope.get("displayName").and_then(Value::as_str)
             .map(str::trim).filter(|name| !name.is_empty())
@@ -331,22 +334,38 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
         let config = envelope.get("config")
             .map(|value| object(&format!("providerInstances.{instance_id}.config"), value))
             .transpose()?.cloned().unwrap_or_default();
-        let settings = claude(ClaudeSettings {
-            enabled,
-            binary_path: "claude".to_string(),
-            home_path: String::new(),
-            launch_args: String::new(),
-            custom_models: Vec::new(),
-        }, &config)?;
+        let (binary_path, home_path, launch_args, custom_models) = match driver {
+            crate::provider::CLAUDE_DRIVER => {
+                let settings = claude(ClaudeSettings {
+                    enabled,
+                    binary_path: "claude".to_string(),
+                    home_path: String::new(),
+                    launch_args: String::new(),
+                    custom_models: Vec::new(),
+                }, &config)?;
+                (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
+            }
+            crate::provider::CODEX_DRIVER => {
+                let settings = codex(CodexSettings {
+                    enabled,
+                    binary_path: "codex".to_string(),
+                    home_path: String::new(),
+                    launch_args: String::new(),
+                    custom_models: Vec::new(),
+                }, &config)?;
+                (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
+            }
+            _ => unreachable!("unsupported drivers were refused above"),
+        };
         normalized.insert(instance_id.clone(), json!({
             "driver": driver,
             "displayName": display_name,
-            "enabled": settings.enabled,
+            "enabled": enabled,
             "config": {
-                "binaryPath": settings.binary_path,
-                "homePath": settings.home_path,
-                "launchArgs": settings.launch_args,
-                "customModels": settings.custom_models,
+                "binaryPath": binary_path,
+                "homePath": home_path,
+                "launchArgs": launch_args,
+                "customModels": custom_models,
             }
         }));
     }
@@ -736,16 +755,12 @@ mod tests {
         }
     }
 
-    /// The two fields this server reports rather than obeys, refused by name.
+    /// Fields this server reports rather than obeys, refused by name.
     /// Silently ignoring one would be a control that springs back.
     #[test]
     fn a_setting_this_server_does_not_have_says_so_rather_than_ignoring_it() {
         for (patch, expected) in [
             (json!({"enableAssistantStreaming": false}), "always streams"),
-            (
-                json!({"providerInstances": {"codex": {}}}),
-                "providers.claudeAgent",
-            ),
             (json!({"defaultThreadEnvMode": "worktree"}), "own worktree"),
             (
                 json!({"providers": {"codex": {"shadowHomePath": "/accounts/work"}}}),

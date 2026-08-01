@@ -184,6 +184,79 @@ async fn codex_probe_reports_its_account_paged_models_reasoning_and_workspace_sk
 }
 
 #[tokio::test]
+async fn the_default_codex_instance_uses_its_generic_configuration() {
+    let codex = harness::codex::ScriptedCodex::provider_probe();
+    let home = tempfile::tempdir().expect("a CODEX_HOME");
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+
+    client
+        .call(
+            "server.updateSettings",
+            json!({"patch": {"providerInstances": {"codex": {
+                "driver": "codex",
+                "displayName": "Codex Default",
+                "enabled": true,
+                "config": {
+                    "binaryPath": codex.configured(),
+                    "homePath": home.path().display().to_string(),
+                    "launchArgs": "--config model_reasoning_effort=high",
+                    "customModels": ["instance-codex-model"]
+                }
+            }}}}),
+        )
+        .await
+        .expect_success();
+
+    let provider = provider_named(&server, "codex").await;
+    assert_eq!(provider["driver"], "codex", "{provider}");
+    assert_eq!(provider["displayName"], "Codex Default", "{provider}");
+    assert_eq!(provider["status"], "ready", "{provider}");
+    assert!(slugs(&provider).iter().any(|slug| slug == "instance-codex-model"));
+    assert_eq!(codex.codex_home(), home.path().display().to_string());
+    assert!(codex.arguments().contains("model_reasoning_effort=high"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_targeted_refresh_accepts_a_configured_codex_instance() {
+    let codex = harness::codex::ScriptedCodex::provider_probe();
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "server.updateSettings",
+            json!({"patch": {"providerInstances": {"codexWork": {
+                "driver": "codex",
+                "displayName": "Codex Work",
+                "enabled": true,
+                "config": {"binaryPath": codex.configured()}
+            }}}}),
+        )
+        .await
+        .expect_success();
+
+    let refreshed = client
+        .call(
+            "server.refreshProviders",
+            json!({"instanceId": "codexWork"}),
+        )
+        .await
+        .expect_success();
+    let provider = refreshed["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["instanceId"] == "codexWork")
+        .expect("the targeted Codex instance");
+    assert_eq!(provider["displayName"], "Codex Work");
+    assert_eq!(provider["status"], "ready");
+
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn a_logged_out_codex_is_named_as_unauthenticated_without_losing_its_models() {
     // The transport fixture's account response is replaced while all other
     // responses, including the paged model catalogue, stay the same.

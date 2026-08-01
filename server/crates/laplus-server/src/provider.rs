@@ -144,18 +144,26 @@ pub struct ClaudeInstance {
     pub settings: ClaudeSettings,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexInstance {
+    pub identity: ProviderIdentity,
+    pub display_name: String,
+    pub settings: CodexSettings,
+}
+
 /// Resolve the settings and durable routing identity for a Claude instance.
 /// The instance id doubles as its continuation namespace, so two configurations
 /// of the same driver cannot accidentally resume each other's conversations.
 pub fn claude_instance(settings: &Settings, instance_id: &str) -> Option<ClaudeInstance> {
-    if instance_id == CLAUDE_INSTANCE_ID {
+    let explicit = settings.provider_instances.get(instance_id);
+    if instance_id == CLAUDE_INSTANCE_ID && explicit.is_none() {
         return Some(ClaudeInstance {
             identity: claude_registration().identity(),
             display_name: DISPLAY_NAME.to_string(),
             settings: settings.providers.claude_agent.clone(),
         });
     }
-    let envelope = settings.provider_instances.get(instance_id)?.as_object()?;
+    let envelope = explicit?.as_object()?;
     if envelope.get("driver")?.as_str()? != CLAUDE_DRIVER {
         return None;
     }
@@ -184,16 +192,45 @@ pub fn claude_instance(settings: &Settings, instance_id: &str) -> Option<ClaudeI
     })
 }
 
+pub fn codex_instance(settings: &Settings, instance_id: &str) -> Option<CodexInstance> {
+    let explicit = settings.provider_instances.get(instance_id);
+    if instance_id == CODEX_INSTANCE_ID && explicit.is_none() {
+        return Some(CodexInstance {
+            identity: codex_registration().identity(),
+            display_name: "Codex".to_string(),
+            settings: settings.providers.codex.clone(),
+        });
+    }
+    let envelope = explicit?.as_object()?;
+    if envelope.get("driver")?.as_str()? != CODEX_DRIVER {
+        return None;
+    }
+    let config = envelope.get("config")?.as_object()?;
+    Some(CodexInstance {
+        identity: ProviderIdentity {
+            instance_id: instance_id.to_string(),
+            driver: CODEX_DRIVER.to_string(),
+        },
+        display_name: envelope.get("displayName")?.as_str()?.to_string(),
+        settings: CodexSettings {
+            enabled: envelope.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
+            binary_path: config.get("binaryPath")?.as_str()?.to_string(),
+            home_path: config.get("homePath")?.as_str()?.to_string(),
+            launch_args: config.get("launchArgs")?.as_str()?.to_string(),
+            custom_models: config.get("customModels")?.as_array()?.iter()
+                .map(|model| model.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
 pub fn identity(settings: &Settings, instance_id: &str) -> Option<ProviderIdentity> {
-    registration(instance_id)
-        .map(Registration::identity)
-        .or_else(|| claude_instance(settings, instance_id).map(|instance| instance.identity))
+    claude_instance(settings, instance_id).map(|instance| instance.identity)
+        .or_else(|| codex_instance(settings, instance_id).map(|instance| instance.identity))
 }
 
 pub fn driver_kind(settings: &Settings, instance_id: &str) -> Option<DriverKind> {
-    registration(instance_id)
-        .map(|registered| registered.kind)
-        .or_else(|| claude_instance(settings, instance_id).map(|_| DriverKind::Claude))
+    claude_instance(settings, instance_id).map(|_| DriverKind::Claude)
+        .or_else(|| codex_instance(settings, instance_id).map(|_| DriverKind::Codex))
 }
 
 fn claude_registration() -> Registration {
@@ -1052,14 +1089,12 @@ pub(crate) fn reserve_skill_rescan(config: &ConfigStore) -> ProbeReservations {
             .any(|provider| provider.instance_id == instance_id)
     };
     ProbeReservations {
-        claude: (current.settings.providers.claude_agent.enabled
+        claude: (claude_instance(&current.settings, CLAUDE_INSTANCE_ID)
+            .is_some_and(|instance| instance.settings.enabled)
             && present(CLAUDE_INSTANCE_ID))
         .then(|| config.begin_provider_probe(CLAUDE_INSTANCE_ID)),
-        codex: current
-            .settings
-            .providers
-            .codex
-            .enabled
+        codex: codex_instance(&current.settings, CODEX_INSTANCE_ID)
+            .is_some_and(|instance| instance.settings.enabled)
             .then(|| config.begin_provider_probe(CODEX_INSTANCE_ID)),
     }
 }
@@ -1075,30 +1110,32 @@ pub(crate) fn rescan_skills_reserved(
     probes: ProbeReservations,
 ) {
     let current = config.current();
-    let settings = current.settings.providers.clone();
-
     if let Some(probe) = probes.claude {
+        let instance = claude_instance(&current.settings, CLAUDE_INSTANCE_ID)
+            .expect("the default Claude instance");
         if let Some(mut provider) = current
             .providers
             .iter()
             .find(|provider| provider.instance_id == CLAUDE_INSTANCE_ID)
             .cloned()
         {
-            let skills = catalogue::skills(&settings.claude_agent, roots);
+            let skills = catalogue::skills(&instance.settings, roots);
             provider.skills = skills;
             publish_one(
                 config,
                 probe,
-                ExpectedSettings::Claude(settings.claude_agent.clone()),
+                expected_claude(&current.settings, instance.settings),
                 provider,
             );
         }
     }
 
     if let Some(probe) = probes.codex {
+        let instance = codex_instance(&current.settings, CODEX_INSTANCE_ID)
+            .expect("the default Codex instance");
         let lifetime = config.provider_process_lifetime();
         let provider = describe_codex(
-            &settings.codex,
+            &instance,
             &Search::from_environment(),
             roots,
             &lifetime,
@@ -1106,20 +1143,22 @@ pub(crate) fn rescan_skills_reserved(
         publish_one(
             config,
             probe,
-            ExpectedSettings::Codex(settings.codex),
+            expected_codex(&current.settings, instance.settings),
             provider,
         );
     }
 }
 
 fn describe_codex(
-    settings: &CodexSettings,
+    instance: &CodexInstance,
     search: &Search,
     roots: &[PathBuf],
     lifetime: &crate::config_store::ProviderProcessLifetime,
 ) -> Provider {
+    let settings = &instance.settings;
     if !settings.enabled {
         return codex_snapshot(
+            instance,
             settings,
             None,
             Installed::No,
@@ -1137,6 +1176,7 @@ fn describe_codex(
         Ok(found) => found,
         Err(why) => {
             return codex_snapshot(
+                instance,
                 settings,
                 None,
                 Installed::No,
@@ -1180,6 +1220,7 @@ fn describe_codex(
                 (None, None) => None,
             };
             codex_snapshot(
+                instance,
                 settings,
                 probed.version,
                 Installed::Yes,
@@ -1191,6 +1232,7 @@ fn describe_codex(
             )
         }
         Err(why) => codex_snapshot(
+            instance,
             settings,
             None,
             Installed::Yes,
@@ -1205,6 +1247,7 @@ fn describe_codex(
 
 #[allow(clippy::too_many_arguments)]
 fn codex_snapshot(
+    instance: &CodexInstance,
     settings: &CodexSettings,
     version: Option<String>,
     installed: Installed,
@@ -1214,11 +1257,10 @@ fn codex_snapshot(
     models: Vec<ProviderModel>,
     skills: Vec<serde_json::Value>,
 ) -> Provider {
-    let registered = codex_registration();
     Provider {
-        instance_id: registered.instance_id.to_string(),
-        driver: registered.driver.to_string(),
-        display_name: "Codex".to_string(),
+        instance_id: instance.identity.instance_id.clone(),
+        driver: instance.identity.driver.clone(),
+        display_name: instance.display_name.clone(),
         enabled: settings.enabled,
         installed: installed == Installed::Yes,
         version,
@@ -1253,48 +1295,62 @@ pub(crate) fn refresh_reserved(
     probes: ProbeReservations,
 ) {
     let current_settings = config.current().settings.clone();
-    let settings = current_settings.providers.clone();
-    let claude = describe(&settings.claude_agent, search, roots);
+    let claude_instance = claude_instance(&current_settings, CLAUDE_INSTANCE_ID)
+        .expect("the default Claude instance");
+    let claude = describe_configured(&claude_instance, search, roots);
     if let Some(message) = &claude.message {
         eprintln!("laplus: provider claudeAgent: {message}");
     }
     publish_one(
         config,
         probes.claude.expect("a full refresh reserves Claude"),
-        ExpectedSettings::Claude(settings.claude_agent),
+        expected_claude(&current_settings, claude_instance.settings),
         claude,
     );
 
     let lifetime = config.provider_process_lifetime();
-    let codex = describe_codex(&settings.codex, search, roots, &lifetime);
+    let codex_instance = codex_instance(&current_settings, CODEX_INSTANCE_ID)
+        .expect("the default Codex instance");
+    let codex = describe_codex(
+        &codex_instance,
+        search,
+        roots,
+        &lifetime,
+    );
     if let Some(message) = &codex.message {
         eprintln!("laplus: provider codex: {message}");
     }
     publish_one(
         config,
         probes.codex.expect("a full refresh reserves Codex"),
-        ExpectedSettings::Codex(settings.codex),
+        expected_codex(&current_settings, codex_instance.settings),
         codex,
     );
 
-    for instance_id in current_settings.provider_instances.keys() {
+    for instance_id in current_settings.provider_instances.keys()
+        .filter(|id| id.as_str() != CLAUDE_INSTANCE_ID && id.as_str() != CODEX_INSTANCE_ID)
+    {
         refresh_configured(config, instance_id, search, roots);
     }
 }
 
 pub fn refresh_claude(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
     let probe = config.begin_provider_probe(CLAUDE_INSTANCE_ID);
-    let settings = config.current().settings.providers.claude_agent.clone();
-    let provider = describe(&settings, search, roots);
-    publish_one(config, probe, ExpectedSettings::Claude(settings), provider);
+    let current = config.current();
+    let instance = claude_instance(&current.settings, CLAUDE_INSTANCE_ID)
+        .expect("the default Claude instance");
+    let provider = describe_configured(&instance, search, roots);
+    publish_one(config, probe, expected_claude(&current.settings, instance.settings), provider);
 }
 
 pub fn refresh_codex(config: &ConfigStore, search: &Search, roots: &[PathBuf]) {
     let probe = config.begin_provider_probe(CODEX_INSTANCE_ID);
-    let settings = config.current().settings.providers.codex.clone();
+    let current = config.current();
+    let instance = codex_instance(&current.settings, CODEX_INSTANCE_ID)
+        .expect("the default Codex instance");
     let lifetime = config.provider_process_lifetime();
-    let provider = describe_codex(&settings, search, roots, &lifetime);
-    publish_one(config, probe, ExpectedSettings::Codex(settings), provider);
+    let provider = describe_codex(&instance, search, roots, &lifetime);
+    publish_one(config, probe, expected_codex(&current.settings, instance.settings), provider);
 }
 
 pub fn refresh_configured(
@@ -1305,15 +1361,19 @@ pub fn refresh_configured(
 ) {
     let probe = config.begin_provider_probe(instance_id);
     let current = config.current();
-    let Some(instance) = claude_instance(&current.settings, instance_id) else {
-        return;
-    };
     let expected = current
         .settings
         .provider_instances
         .get(instance_id)
         .cloned();
-    let provider = describe_configured(&instance, search, roots);
+    let provider = if let Some(instance) = claude_instance(&current.settings, instance_id) {
+        describe_configured(&instance, search, roots)
+    } else if let Some(instance) = codex_instance(&current.settings, instance_id) {
+        let lifetime = config.provider_process_lifetime();
+        describe_codex(&instance, search, roots, &lifetime)
+    } else {
+        return;
+    };
     publish_one(
         config,
         probe,
@@ -1339,7 +1399,8 @@ pub fn refresh_call(
         None => refresh(config, &search, roots),
         Some(CLAUDE_INSTANCE_ID) => refresh_claude(config, &search, roots),
         Some(CODEX_INSTANCE_ID) => refresh_codex(config, &search, roots),
-        Some(instance_id) if claude_instance(&config.current().settings, instance_id).is_some() => {
+        Some(instance_id) if claude_instance(&config.current().settings, instance_id).is_some()
+            || codex_instance(&config.current().settings, instance_id).is_some() => {
             refresh_configured(config, instance_id, &search, roots)
         }
         Some(instance_id) => {
@@ -1356,6 +1417,20 @@ enum ExpectedSettings {
     Claude(ClaudeSettings),
     Codex(CodexSettings),
     Configured(String, Option<serde_json::Value>),
+}
+
+fn expected_claude(settings: &Settings, legacy: ClaudeSettings) -> ExpectedSettings {
+    match settings.provider_instances.get(CLAUDE_INSTANCE_ID).cloned() {
+        Some(value) => ExpectedSettings::Configured(CLAUDE_INSTANCE_ID.to_string(), Some(value)),
+        None => ExpectedSettings::Claude(legacy),
+    }
+}
+
+fn expected_codex(settings: &Settings, legacy: CodexSettings) -> ExpectedSettings {
+    match settings.provider_instances.get(CODEX_INSTANCE_ID).cloned() {
+        Some(value) => ExpectedSettings::Configured(CODEX_INSTANCE_ID.to_string(), Some(value)),
+        None => ExpectedSettings::Codex(legacy),
+    }
 }
 
 fn publish_one(
