@@ -83,6 +83,7 @@ pub mod http;
 pub mod keybindings;
 pub mod launch;
 pub mod orchestration;
+pub mod opencode_protocol;
 pub mod pairing;
 pub mod process;
 pub mod project_favicon;

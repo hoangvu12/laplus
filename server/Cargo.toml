@@ -67,6 +67,7 @@ portable-pty = "0.9"
 # draws the thing with half-block characters into a terminal. Pure Rust, no
 # build script and no C, so the musl targets of ADR-0026 are unaffected.
 qrcode = { version = "0.14", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 # `bundled` compiles SQLite into the binary. The alternative is linking whatever
 # the machine happens to have, which on Windows is usually nothing — and a
 # desktop app that asks the user to install a database first has given up the

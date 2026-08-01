@@ -1,0 +1,7 @@
+: heartbeat
+
+data: {"type":"session.status",
+data: "properties":{"sessionID":"ses_redacted","status":{"type":"busy"}}}
+
+data: {"type":"future.event","properties":{"sessionID":"ses_redacted","newField":true}}
+

@@ -1,0 +1,16 @@
+[
+  {"operation":"health","response":{"healthy":true,"version":"1.18.10"}},
+  {"operation":"providers","response":{"providers":[{"id":"anthropic","models":{"claude":{"id":"claude"}}}],"default":{}}},
+  {"operation":"agents","response":[{"name":"build","mode":"primary","hidden":false}]},
+  {"operation":"session.create","response":{"id":"ses_redacted","directory":"/redacted/project"}},
+  {"operation":"session.get","response":{"id":"ses_redacted","directory":"/redacted/project"}},
+  {"operation":"session.prompt_async","response":true},
+  {"operation":"session.abort","response":true},
+  {"operation":"session.revert","response":{"id":"ses_redacted","revert":{"messageID":"msg_redacted"}}},
+  {"operation":"permission.reply","response":true},
+  {"operation":"question.reply","response":true},
+  {"operation":"question.reject","response":true},
+  {"operation":"error.missing-session","response":{"name":"NotFoundError","data":{"message":"Session ses_redacted not found"}}},
+  {"operation":"error.authentication","response":{"name":"UnauthorizedError","message":"Unauthorized"}},
+  {"operation":"error.server","response":{"name":"InternalError","message":"redacted server failure"}}
+]
