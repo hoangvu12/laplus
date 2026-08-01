@@ -37,9 +37,7 @@ async fn settings(client: &mut harness::SocketClient) -> Value {
 
 /// One patch, as the panel sends one.
 async fn update(client: &mut harness::SocketClient, patch: Value) -> harness::Outcome {
-    client
-        .call("server.updateSettings", json!({"patch": patch}))
-        .await
+    client.call("server.updateSettings", json!({"patch": patch})).await
 }
 
 /// The keybinding bound to `command`, out of a `getConfig` payload.
@@ -72,10 +70,7 @@ async fn a_setting_can_be_read_and_changed() {
     );
 
     // …and the next reader sees it, rather than the answer being a one-off.
-    assert_eq!(
-        settings(&mut client).await["addProjectBaseDirectory"],
-        "/work"
-    );
+    assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "/work");
 
     server.stop().await;
 }
@@ -214,6 +209,13 @@ async fn a_turn_routes_through_the_selected_configured_claude_instance() {
         }),
         "{events:?}"
     );
+    assert!(
+        events.iter().any(|event| {
+            event["event"]["type"] == "thread.session-set"
+                && event["event"]["payload"]["session"]["providerInstanceId"] == "claudeWork"
+        }),
+        "the session lost its provider-instance continuation namespace: {events:?}"
+    );
     assert!(workspace.path().join(WORKING_DIRECTORY_MARKER).exists());
     server.stop().await;
 }
@@ -275,6 +277,31 @@ async fn disabling_one_claude_instance_does_not_refresh_its_sibling() {
             .expect("second")["status"],
         "ready"
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_targeted_refresh_probes_only_the_named_provider_instance() {
+    let first = ScriptedAgent::emitting(&["{}"]);
+    let second = ScriptedAgent::emitting(&["{}"]);
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    update(&mut client, json!({"providerInstances": {
+        "claudeFirst": {"driver": "claudeAgent", "displayName": "First", "config": {"binaryPath": first.configured()}},
+        "claudeSecond": {"driver": "claudeAgent", "displayName": "Second", "config": {"binaryPath": second.configured()}}
+    }})).await.expect_success();
+    std::fs::remove_file(second.configured()).expect("remove the second temporary agent");
+    std::fs::create_dir(second.configured()).expect("replace it with an unstartable directory");
+
+    let refreshed = client.call("server.refreshProviders", json!({"instanceId": "claudeSecond"}))
+        .await.expect_success();
+
+    let status = |instance_id: &str| refreshed["providers"].as_array().expect("providers")
+        .iter().find(|provider| provider["instanceId"] == instance_id).expect("instance")["status"].clone();
+    assert_eq!(status("claudeFirst"), "ready", "the untargeted sibling changed");
+    assert_eq!(status("claudeSecond"), "error", "the selected instance was not probed");
+    assert!(refreshed["providers"].as_array().expect("providers").iter()
+        .any(|provider| provider["instanceId"] == "claudeSecond"));
     server.stop().await;
 }
 
@@ -398,8 +425,7 @@ async fn a_slow_old_codex_probe_cannot_replace_a_new_settings_probe() {
     config.settings.providers.codex.binary_path = old.configured();
     let server = TestServer::start_with(config).await;
 
-    let old_refresh =
-        server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
+    let old_refresh = server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !old.started() {
         assert!(
@@ -546,9 +572,7 @@ async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
     )
     .await
     .expect_declared("ServerSettingsError");
-    let cause = error["cause"]
-        .as_str()
-        .expect("a sentence the panel can show");
+    let cause = error["cause"].as_str().expect("a sentence the panel can show");
     assert!(cause.contains("account-selection"), "{error}");
     assert!(cause.contains("one Codex account"), "{error}");
     assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "");
@@ -563,7 +587,9 @@ async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
 async fn a_change_reaches_an_open_window_without_a_restart() {
     let server = TestServer::start().await;
     let mut watcher = server.connect().await;
-    let subscription = watcher.subscribe("subscribeServerConfig", json!({})).await;
+    let subscription = watcher
+        .subscribe("subscribeServerConfig", json!({}))
+        .await;
     // The snapshot the subscription opens with, so what follows is the change.
     watcher.next_chunk(&subscription).await;
     watcher.ack(&subscription).await;
@@ -577,10 +603,7 @@ async fn a_change_reaches_an_open_window_without_a_restart() {
 
     let event = watcher.next_event(&subscription).await;
     assert_eq!(event["type"], "settingsUpdated", "{event}");
-    assert_eq!(
-        event["payload"]["settings"]["addProjectBaseDirectory"],
-        "/work"
-    );
+    assert_eq!(event["payload"]["settings"]["addProjectBaseDirectory"], "/work");
 
     server.stop().await;
 }

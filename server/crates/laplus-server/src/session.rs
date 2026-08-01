@@ -1822,14 +1822,16 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
             thread.provider.instance_id, identity.driver, thread.id, thread.provider.driver
         ));
     }
-    let driver = if identity.driver == crate::provider::CLAUDE_DRIVER {
-        DriverStart::Claude(
+    let driver = match crate::provider::driver_kind(settings, &identity.instance_id)
+        .expect("a resolved provider identity has a driver kind") {
+        crate::provider::DriverKind::Claude => DriverStart::Claude(
             crate::provider::claude_instance(settings, &identity.instance_id)
                 .expect("a resolved Claude identity has settings")
                 .settings,
-        )
-    } else {
-        DriverStart::Codex(settings.providers.codex.clone())
+        ),
+        crate::provider::DriverKind::Codex => {
+            DriverStart::Codex(settings.providers.codex.clone())
+        }
     };
 
     Ok(PreparedDriver { identity, driver })

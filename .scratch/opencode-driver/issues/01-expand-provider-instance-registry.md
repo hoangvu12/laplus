@@ -7,16 +7,16 @@ the expand step: old routing remains available until the built-ins migrate.
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] A valid configured provider instance is accepted with its own stable id,
+- [x] A valid configured provider instance is accepted with its own stable id,
       display name, driver kind, settings and continuation namespace
-- [ ] A second Claude instance appears in provider snapshots and can be selected
+- [x] A second Claude instance appears in provider snapshots and can be selected
       for a thread and used for a complete turn
-- [ ] Refreshing or disabling the new instance does not affect another instance
+- [x] Refreshing or disabling the new instance does not affect another instance
       of the same driver
-- [ ] Invalid instance ids, unsupported driver kinds and invalid settings are
+- [x] Invalid instance ids, unsupported driver kinds and invalid settings are
       refused at the settings boundary with actionable errors
-- [ ] Existing built-in Claude and Codex routing remains unchanged during the
+- [x] Existing built-in Claude and Codex routing remains unchanged during the
       expansion
-- [ ] Socket-level tests cover settings, snapshot, selection and turn routing
+- [x] Socket-level tests cover settings, snapshot, selection and turn routing

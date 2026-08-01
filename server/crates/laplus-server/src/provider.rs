@@ -60,9 +60,9 @@ use std::time::{Duration, Instant};
 use crate::catalogue;
 use crate::clock::now_iso;
 use crate::config::{
-    AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel,
-    ProviderState, Settings,
+    AuthStatus, ClaudeSettings, CodexSettings, Provider, ProviderAuth, ProviderModel, ProviderState,
 };
+use crate::config::Settings;
 use crate::config_store::{ConfigStore, ProviderProbe};
 use crate::process::Search;
 
@@ -76,6 +76,7 @@ pub const CLAUDE_INSTANCE_ID: &str = "claudeAgent";
 pub const CLAUDE_DRIVER: &str = "claudeAgent";
 pub const CODEX_INSTANCE_ID: &str = "codex";
 pub const CODEX_DRIVER: &str = "codex";
+pub const REFRESH: &str = "server.refreshProviders";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverKind {
@@ -181,6 +182,12 @@ pub fn identity(settings: &Settings, instance_id: &str) -> Option<ProviderIdenti
         .or_else(|| claude_instance(settings, instance_id).map(|instance| instance.identity))
 }
 
+pub fn driver_kind(settings: &Settings, instance_id: &str) -> Option<DriverKind> {
+    registration(instance_id)
+        .map(|registered| registered.kind)
+        .or_else(|| claude_instance(settings, instance_id).map(|_| DriverKind::Claude))
+}
+
 fn claude_registration() -> Registration {
     registration(CLAUDE_INSTANCE_ID).expect("the Claude driver is registered")
 }
@@ -280,12 +287,7 @@ impl Located {
                 configured,
                 name,
                 directories,
-            } => Err(not_found_for(
-                product,
-                configured.as_deref(),
-                &name,
-                &directories,
-            )),
+            } => Err(not_found_for(product, configured.as_deref(), &name, &directories)),
         }
     }
 }
@@ -1145,10 +1147,7 @@ fn describe_codex(
             let (status, auth_message) = match probed.auth.status {
                 AuthStatus::Unauthenticated => (
                     ProviderState::Error,
-                    Some(
-                        "Codex CLI is not authenticated. Run `codex login` and try again."
-                            .to_string(),
-                    ),
+                    Some("Codex CLI is not authenticated. Run `codex login` and try again.".to_string()),
                 ),
                 AuthStatus::Authenticated => (ProviderState::Ready, None),
                 AuthStatus::Unknown => (
@@ -1313,6 +1312,36 @@ pub fn refresh_configured(
         ExpectedSettings::Configured(instance_id.to_string(), expected),
         provider,
     );
+}
+
+pub fn refresh_call(
+    payload: &serde_json::Value,
+    config: &ConfigStore,
+    roots: &[PathBuf],
+) -> Result<serde_json::Value, serde_json::Value> {
+    let instance_id = payload.get("instanceId").and_then(serde_json::Value::as_str);
+    if payload.get("instanceId").is_some() && instance_id.is_none() {
+        return Err(crate::rpc::declared(
+            "EnvironmentAuthorizationError",
+            "'instanceId' has to be a provider instance id.",
+        ));
+    }
+    let search = Search::from_environment();
+    match instance_id {
+        None => refresh(config, &search, roots),
+        Some(CLAUDE_INSTANCE_ID) => refresh_claude(config, &search, roots),
+        Some(CODEX_INSTANCE_ID) => refresh_codex(config, &search, roots),
+        Some(instance_id) if claude_instance(&config.current().settings, instance_id).is_some() => {
+            refresh_configured(config, instance_id, &search, roots)
+        }
+        Some(instance_id) => {
+            return Err(crate::rpc::declared(
+                "EnvironmentAuthorizationError",
+                format!("Provider instance '{instance_id}' is not configured."),
+            ))
+        }
+    }
+    Ok(serde_json::json!({"providers": config.current().providers}))
 }
 
 enum ExpectedSettings {
@@ -1703,10 +1732,7 @@ mod tests {
     #[test]
     fn the_models_offered_are_gated_on_the_version_that_answered() {
         let slugs = |version: Option<&str>| -> Vec<String> {
-            models(version, &[])
-                .into_iter()
-                .map(|model| model.slug)
-                .collect()
+            models(version, &[]).into_iter().map(|model| model.slug).collect()
         };
 
         let old = slugs(Some("2.1.100"));

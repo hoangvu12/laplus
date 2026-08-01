@@ -465,6 +465,13 @@ pub fn dispatch(
         checkpoints::GET_FULL_THREAD_DIFF => Diff::read_thread(payload)
             .map(|call| deferred_in(&services.shell, |shell| call.run(shell)))
             .map_err(DispatchError::Declared),
+        crate::provider::REFRESH => {
+            let payload = payload.clone();
+            let roots = services.shell.workspace_roots();
+            Ok(deferred_over(&services.config, move |config| {
+                crate::provider::refresh_call(&payload, config, &roots)
+            }))
+        }
         // Reading the settings is reading memory — they were loaded at startup
         // and every change since has gone through the store — so it answers on
         // the read loop. The payload is an empty struct in the contract.
