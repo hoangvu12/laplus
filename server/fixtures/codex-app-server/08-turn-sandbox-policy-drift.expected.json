@@ -1,0 +1,12 @@
+{
+  "threadId": null,
+  "turnId": null,
+  "threadStatus": null,
+  "turnStatus": null,
+  "turnError": null,
+  "assistantMessages": [],
+  "reasoningItems": [],
+  "commandExecutions": [],
+  "unknownEvents": 0,
+  "parseErrors": 0
+}
