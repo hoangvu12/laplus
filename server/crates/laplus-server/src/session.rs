@@ -355,14 +355,19 @@ pub struct Start {
     /// Selected from the conversation's registry entry together, so a driver's
     /// implementation cannot be paired with another driver's settings.
     pub driver: DriverStart,
-    pub mcp: std::sync::Arc<dyn crate::mcp::Platform>,
 }
 
 #[derive(Debug, Clone)]
 pub enum DriverStart {
     Claude(ClaudeSettings),
     Codex(crate::config::CodexSettings),
-    OpenCode(crate::config::OpenCodeSettings),
+    OpenCode(OpenCodeStart),
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenCodeStart {
+    pub settings: crate::config::OpenCodeSettings,
+    pub mcp: std::sync::Arc<dyn crate::mcp::Platform>,
 }
 
 #[derive(Debug, Clone)]
@@ -392,7 +397,14 @@ impl DriverStart {
 
     pub(crate) fn opencode(&self) -> Result<&crate::config::OpenCodeSettings, String> {
         match self {
-            DriverStart::OpenCode(settings) => Ok(settings),
+            DriverStart::OpenCode(start) => Ok(&start.settings),
+            _ => Err("OpenCode settings were paired with another driver".to_string()),
+        }
+    }
+
+    pub(crate) fn opencode_start(&self) -> Result<&OpenCodeStart, String> {
+        match self {
+            DriverStart::OpenCode(start) => Ok(start),
             _ => Err("OpenCode settings were paired with another driver".to_string()),
         }
     }
@@ -1873,7 +1885,7 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
 /// A free function rather than a method on either, because it is the one place
 /// three things meet: the thread says which model and how much latitude, the
 /// project says where, and the settings say which binary.
-pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, String> {
+pub fn prepare(thread: &Thread, settings: &Settings, mcp: std::sync::Arc<dyn crate::mcp::Platform>) -> Result<PreparedDriver, String> {
     let instance = crate::provider::resolve_instance(
         settings,
         &thread.provider.instance_id,
@@ -1900,13 +1912,13 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
         crate::provider::ConfiguredInstance::Codex(instance) => {
             DriverStart::Codex(instance.settings)
         }
-        crate::provider::ConfiguredInstance::OpenCode(instance) => DriverStart::OpenCode(instance.settings),
+        crate::provider::ConfiguredInstance::OpenCode(instance) => DriverStart::OpenCode(OpenCodeStart { settings: instance.settings, mcp }),
     };
 
     Ok(PreparedDriver { identity, driver })
 }
 
-pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver, mcp: std::sync::Arc<dyn crate::mcp::Platform>) -> Start {
+pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver) -> Start {
     debug_assert_eq!(prepared.identity.instance_id, thread.provider.instance_id);
     debug_assert_eq!(prepared.identity.driver, thread.provider.driver);
 
@@ -1921,7 +1933,6 @@ pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver,
             .filter(|cursor| cursor.provider == thread.provider),
         provider: thread.provider.clone(),
         driver: prepared.driver,
-        mcp,
     }
 }
 
@@ -1988,7 +1999,6 @@ mod continuation_tests {
                 launch_args: String::new(),
                 custom_models: Vec::new(),
             }),
-            mcp: std::sync::Arc::new(crate::mcp::Host::new()),
         };
 
         spend(&threads, &start, Decided { provider_resume_cursor: Some(cursor.clone()), ..Default::default() });
@@ -2017,7 +2027,7 @@ mod continuation_tests {
                 custom_models: Vec::new(),
             }),
         };
-        let start = starting(&thread, "/work", prepared, std::sync::Arc::new(crate::mcp::Host::new()));
+        let start = starting(&thread, "/work", prepared);
         assert_eq!(start.resume_cursor, Some(cursor));
     }
 }

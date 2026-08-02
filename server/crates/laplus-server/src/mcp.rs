@@ -5,11 +5,10 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -17,6 +16,14 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// and own its lifetime, but cannot choose or route individual host tools.
 pub trait Platform: fmt::Debug + Send + Sync {
     fn open_session(&self, thread_id: &str) -> Result<Session, OpenError>;
+    fn set_origin(&self, origin: String);
+    fn authorizes(&self, id: &str, authorization: &str) -> bool;
+    fn live_sessions(&self) -> usize;
+    fn dispatch<'a>(
+        &'a self,
+        id: &'a str,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +47,7 @@ struct Inner {
 }
 
 struct SessionRecord {
-    grant: GrantDigest,
+    grant: crate::auth::McpVerifier,
     thread_id: String,
 }
 
@@ -79,7 +86,7 @@ impl Host {
         }))
     }
 
-    pub fn set_origin(&self, origin: impl Into<String>) {
+    fn set_host_origin(&self, origin: impl Into<String>) {
         *self.0.origin.write().expect("MCP origin lock") = Some(origin.into());
     }
 
@@ -93,27 +100,10 @@ impl Host {
             .rsplit('/')
             .next()
             .unwrap_or_default();
-        self.authorizes_id(id, authorization)
+        <Self as Platform>::authorizes(self, id, authorization)
     }
 
-    pub(crate) fn authorizes_id(&self, id: &str, authorization: &str) -> bool {
-        let Some(secret) = authorization.strip_prefix("Bearer ") else {
-            return false;
-        };
-        let wanted = GrantDigest::of(secret.as_bytes());
-        self.0
-            .sessions
-            .lock()
-            .expect("MCP sessions lock")
-            .get(id)
-            .is_some_and(|record| record.grant == wanted)
-    }
-
-    pub fn live_sessions(&self) -> usize {
-        self.0.sessions.lock().expect("MCP sessions lock").len()
-    }
-
-    pub async fn dispatch(&self, id: &str, message: Value) -> Value {
+    async fn dispatch_message(&self, id: &str, message: Value) -> Value {
         let request_id = message.get("id").cloned().unwrap_or(Value::Null);
         if message.get("method").and_then(Value::as_str) != Some("tools/call") {
             return dispatch_with_tools(
@@ -178,37 +168,60 @@ impl Platform for Host {
             .clone()
             .ok_or(OpenError)?;
         let id = random_hex()?;
-        let secret = random_hex()?;
+        let (grant, verifier) = crate::auth::mint_mcp_grant().map_err(|_| OpenError)?;
         self.0.sessions.lock().expect("MCP sessions lock").insert(
             id.clone(),
             SessionRecord {
-                grant: GrantDigest::of(secret.as_bytes()),
+                grant: verifier,
                 thread_id: thread_id.to_string(),
             },
         );
         Ok(Session {
             endpoint: format!("{origin}/mcp/{id}"),
-            authorization: Secret(format!("Bearer {secret}")),
-            id,
-            owner: Arc::downgrade(&self.0),
+            authorization: grant,
+            revoke: Some(Box::new({
+                let owner = Arc::clone(&self.0);
+                move || {
+                    owner
+                        .sessions
+                        .lock()
+                        .expect("MCP sessions lock")
+                        .remove(&id);
+                }
+            })),
         })
     }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct GrantDigest([u8; 32]);
+    fn set_origin(&self, origin: String) {
+        self.set_host_origin(origin);
+    }
 
-impl GrantDigest {
-    fn of(value: &[u8]) -> Self {
-        Self(Sha256::digest(value).into())
+    fn authorizes(&self, id: &str, authorization: &str) -> bool {
+        self.0
+            .sessions
+            .lock()
+            .expect("MCP sessions lock")
+            .get(id)
+            .is_some_and(|record| record.grant.verifies(authorization))
+    }
+
+    fn live_sessions(&self) -> usize {
+        self.0.sessions.lock().expect("MCP sessions lock").len()
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        id: &'a str,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>> {
+        Box::pin(self.dispatch_message(id, message))
     }
 }
 
 pub struct Session {
     endpoint: String,
-    authorization: Secret,
-    id: String,
-    owner: Weak<Inner>,
+    authorization: crate::auth::McpGrant,
+    revoke: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl Session {
@@ -217,6 +230,19 @@ impl Session {
     }
     pub fn authorization(&self) -> &str {
         self.authorization.expose()
+    }
+
+    #[doc(hidden)]
+    pub fn for_adapter(
+        endpoint: String,
+        authorization: String,
+        revoke: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            endpoint,
+            authorization: crate::auth::McpGrant::for_adapter(authorization),
+            revoke: Some(Box::new(revoke)),
+        }
     }
 }
 
@@ -232,27 +258,9 @@ impl fmt::Debug for Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner
-                .sessions
-                .lock()
-                .expect("MCP sessions lock")
-                .remove(&self.id);
+        if let Some(revoke) = self.revoke.take() {
+            revoke();
         }
-    }
-}
-
-struct Secret(String);
-
-impl Secret {
-    fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("[redacted]")
     }
 }
 
@@ -308,7 +316,7 @@ mod tests {
     #[test]
     fn a_session_grant_is_scoped_redacted_and_revoked_with_its_handle() {
         let host = Host::new();
-        host.set_origin("http://127.0.0.1:4773");
+        host.set_origin("http://127.0.0.1:4773".to_string());
         let session = host.open("thread-1").expect("session opens");
         let endpoint = session.endpoint().to_string();
         let authorization = session.authorization().to_string();

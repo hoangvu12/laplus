@@ -178,14 +178,26 @@ struct SocketTurn {
 
 #[derive(Debug)]
 struct FakeMcpPlatform {
-    host: laplus_server::mcp::Host,
     opens: AtomicUsize,
+    origin: Mutex<Option<String>>,
+    sessions: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl laplus_server::mcp::Platform for FakeMcpPlatform {
     fn open_session(&self, thread_id: &str) -> Result<laplus_server::mcp::Session, laplus_server::mcp::OpenError> {
-        self.opens.fetch_add(1, Ordering::SeqCst);
-        self.host.open(thread_id)
+        let ordinal = self.opens.fetch_add(1, Ordering::SeqCst) + 1;
+        let id = format!("fake-{thread_id}-{ordinal}");
+        let authorization = format!("Bearer fake-grant-{ordinal}");
+        self.sessions.lock().unwrap().insert(id.clone(), authorization.clone());
+        let endpoint = format!("{}/mcp/{id}", self.origin.lock().unwrap().as_ref().ok_or(laplus_server::mcp::OpenError)?);
+        let sessions = Arc::clone(&self.sessions);
+        Ok(laplus_server::mcp::Session::for_adapter(endpoint, authorization, move || { sessions.lock().unwrap().remove(&id); }))
+    }
+    fn set_origin(&self, origin: String) { *self.origin.lock().unwrap() = Some(origin); }
+    fn authorizes(&self, id: &str, authorization: &str) -> bool { self.sessions.lock().unwrap().get(id).is_some_and(|grant| grant == authorization) }
+    fn live_sessions(&self) -> usize { self.sessions.lock().unwrap().len() }
+    fn dispatch<'a>(&'a self, _id: &'a str, message: Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send + 'a>> {
+        Box::pin(async move { laplus_server::mcp::dispatch(message) })
     }
 }
 
@@ -242,9 +254,12 @@ async fn wait_until_port_closes(port: u16, because: &str) {
 #[tokio::test]
 async fn owned_opencode_uses_the_injected_generic_mcp_platform() {
     let opencode = FakeOpenCode::new();
-    let host = laplus_server::mcp::Host::new();
-    let platform = Arc::new(FakeMcpPlatform { host: host.clone(), opens: AtomicUsize::new(0) });
-    let server = TestServer::start_with_mcp(opencode_config(&opencode), host, platform.clone()).await;
+    let platform = Arc::new(FakeMcpPlatform {
+        opens: AtomicUsize::new(0),
+        origin: Mutex::new(None),
+        sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+    });
+    let server = TestServer::start_with_mcp(opencode_config(&opencode), platform.clone()).await;
     let workspace = Workspace::with(&["src/"]);
     let mut client = server.connect().await;
     client.call("orchestration.dispatchCommand", create_project("fake-mcp-project", workspace.path())).await.expect_success();

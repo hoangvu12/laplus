@@ -239,7 +239,6 @@ impl TestServer {
 
     pub async fn start_with_mcp(
         mut config: ServerConfig,
-        host: laplus_server::mcp::Host,
         platform: std::sync::Arc<dyn laplus_server::mcp::Platform>,
     ) -> TestServer {
         let preferences = tempfile::tempdir().expect("a temporary directory");
@@ -248,7 +247,7 @@ impl TestServer {
         somewhere_that_is_not_the_developers(&mut config);
         let server = Server::bind_with_platform(
             0, config, Database::in_memory().expect("a database"), Assets::none(),
-            laplus_server::provider_maintenance::ProviderMaintenance::new(), host, platform,
+            laplus_server::provider_maintenance::ProviderMaintenance::new(), platform,
         ).await.expect("server binds with supplied MCP platform");
         TestServer::bootstrapped(server, Some(preferences)).await
     }
@@ -600,6 +599,10 @@ impl TestServer {
 
     pub fn live_mcp_sessions(&self) -> usize {
         self.server.state().live_mcp_sessions()
+    }
+
+    pub fn open_mcp_session(&self, thread_id: &str) -> laplus_server::mcp::Session {
+        self.server.state().open_mcp_session(thread_id).expect("MCP session opens")
     }
 
     /// Wait for the agent gauge to reach `expected`, or fail saying what it was.

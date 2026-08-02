@@ -1,6 +1,6 @@
 # Generic MCP platform
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## Problem Statement
 

@@ -55,6 +55,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// A conversation-scoped MCP bearer. It is deliberately neither serializable
+/// nor printable; the provider adapter must explicitly expose it for one HTTP
+/// header.
+pub struct McpGrant(String);
+
+impl McpGrant {
+    pub(crate) fn expose(&self) -> &str { &self.0 }
+    #[doc(hidden)]
+    pub fn for_adapter(authorization: String) -> Self { Self(authorization) }
+}
+
+impl std::fmt::Debug for McpGrant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct McpVerifier([u8; 32]);
+
+impl McpVerifier {
+    pub(crate) fn verifies(&self, authorization: &str) -> bool {
+        let Some(secret) = authorization.strip_prefix("Bearer ") else { return false };
+        Self::for_secret(secret).0 == self.0
+    }
+
+    fn for_secret(secret: &str) -> Self { Self(Sha256::digest(secret.as_bytes()).into()) }
+}
+
+pub(crate) fn mint_mcp_grant() -> Result<(McpGrant, McpVerifier), getrandom::Error> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)?;
+    let secret = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    Ok((McpGrant(format!("Bearer {secret}")), McpVerifier::for_secret(&secret)))
+}
 
 /// The cookie the browser UI presents. Named in the server config's auth
 /// descriptor, so the two must agree.

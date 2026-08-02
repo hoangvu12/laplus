@@ -1077,7 +1077,8 @@ impl crate::session::Driver for OpenCode {
         // Cursor validation precedes launching an owned process or making any
         // HTTP request, so incompatible durable state cannot mutate upstream.
         let resume_session_id = resume_session_id(start)?;
-        let settings = start.driver.opencode()?;
+        let opencode_start = start.driver.opencode_start()?;
+        let settings = &opencode_start.settings;
         let (mut owned, client) = if settings.server_url.is_empty() {
             let (binary, _) = crate::provider::resolve_named(
                 &settings.binary_path,
@@ -1095,7 +1096,7 @@ impl crate::session::Driver for OpenCode {
             (None, client)
         };
         let mcp_session = if owned.is_some() {
-            let session = match start.mcp.open_session(&start.thread_id) {
+            let session = match opencode_start.mcp.open_session(&start.thread_id) {
                 Ok(session) => session,
                 Err(error) => {
                     if let Some(owned) = owned.as_mut() { owned.stop().await; }

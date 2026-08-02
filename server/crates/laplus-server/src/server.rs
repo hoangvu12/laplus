@@ -91,11 +91,11 @@ pub struct ServerState {
     fiber_ids: AtomicU64,
     unrecognized_messages: AtomicUsize,
     unparseable_frames: AtomicUsize,
-    mcp: crate::mcp::Host,
+    mcp: Arc<dyn crate::mcp::Platform>,
 }
 
 impl ServerState {
-    fn new(services: Services, ui: Assets, shutdown: watch::Receiver<bool>, mcp: crate::mcp::Host) -> Self {
+    fn new(services: Services, ui: Assets, shutdown: watch::Receiver<bool>, mcp: Arc<dyn crate::mcp::Platform>) -> Self {
         ServerState {
             services,
             ui,
@@ -152,6 +152,10 @@ impl ServerState {
 
     pub fn live_mcp_sessions(&self) -> usize {
         self.mcp.live_sessions()
+    }
+
+    pub fn open_mcp_session(&self, thread_id: &str) -> Result<crate::mcp::Session, crate::mcp::OpenError> {
+        self.mcp.open_session(thread_id)
     }
 
     /// Shells still running behind a terminal. The fifth of the family, and the
@@ -325,7 +329,7 @@ impl Server {
         provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
     ) -> std::io::Result<Server> {
         let host = crate::mcp::Host::new();
-        Self::bind_with_platform(port, config, database, ui, provider_maintenance, host.clone(), Arc::new(host)).await
+        Self::bind_with_platform(port, config, database, ui, provider_maintenance, Arc::new(host)).await
     }
 
     /// Assembly seam for tests that observe or refuse MCP session acquisition
@@ -336,7 +340,6 @@ impl Server {
         database: Database,
         ui: Assets,
         provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
-        mcp_host: crate::mcp::Host,
         mcp_platform: Arc<dyn crate::mcp::Platform>,
     ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
@@ -372,13 +375,13 @@ impl Server {
             // time is read in here, and a file that will not read is an issue
             // in the payload rather than a server that will not start.
             config: ConfigStore::opening(config),
-            shell: Shell::new_with_mcp(database, mcp_platform),
+            shell: Shell::new_with_mcp(database, Arc::clone(&mcp_platform)),
             repositories: Repositories::new(&index),
             index,
             terminals: Terminals::new(),
             provider_maintenance,
         };
-        let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe(), mcp_host));
+        let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe(), mcp_platform));
 
         // Minted before the listener exists, so that there is no window in
         // which the server is answering and the credential it will admit its
@@ -1415,19 +1418,22 @@ async fn mcp_post(
     body: Bytes,
 ) -> Response {
     if headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()).is_some_and(|origin| {
-        !origin.starts_with("http://127.0.0.1:") && !origin.starts_with("http://localhost:")
+        reqwest::Url::parse(origin).ok().and_then(|url| url.host_str().map(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback())
+        })) != Some(true)
     }) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let authorization = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()).unwrap_or_default();
-    if !state.mcp.authorizes_id(&session_id, authorization) {
+    if !state.mcp.authorizes(&session_id, authorization) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let message: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(message) => message,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if message.get("method").and_then(serde_json::Value::as_str) == Some("notifications/initialized") {
+    if message.get("method").is_none() || message.get("id").is_none() {
         return StatusCode::ACCEPTED.into_response();
     }
     let response = state.mcp.dispatch(&session_id, message).await;
@@ -1872,7 +1878,7 @@ mod tests {
                 },
                 Assets::none(),
                 watch::channel(false).1,
-                crate::mcp::Host::new(),
+                Arc::new(crate::mcp::Host::new()),
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {

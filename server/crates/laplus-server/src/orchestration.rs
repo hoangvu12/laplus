@@ -732,14 +732,14 @@ impl Shell {
                 return;
             }
 
-            let prepared = match crate::session::prepare(&thread, &settings) {
+            let prepared = match crate::session::prepare(&thread, &settings, mcp) {
                 Ok(prepared) => prepared,
                 Err(why) => {
                     publish_revert_failure(&threads, &thread_id, turn_count, &why, true);
                     return;
                 }
             };
-            let starting = crate::session::starting(&thread, &workspace_root, prepared, mcp);
+            let starting = crate::session::starting(&thread, &workspace_root, prepared);
             if let Err(why) = crate::opencode::rollback(&starting, latest - turn_count).await {
                 publish_revert_failure(&threads, &thread_id, turn_count, &why, true);
                 return;
@@ -1394,8 +1394,11 @@ impl Shell {
         if let Some(selection) = &start.model_selection {
             selection_for(&thread, selection)?;
         }
-        let prepared =
-            crate::session::prepare(&thread, &config.settings).map_err(CommandError::new)?;
+        let prepared = crate::session::prepare(
+            &thread,
+            &config.settings,
+            Arc::clone(&self.inner.mcp),
+        ).map_err(CommandError::new)?;
         let attachments = crate::attachments::resolve_all(&start.message.attachments, &start.message.message_id);
 
         // OpenCode's native busy-session prompt is a steer, not a queued new
@@ -1416,7 +1419,6 @@ impl Shell {
                     &thread,
                     &where_the_work_happens(&thread, &project),
                     prepared,
-                    Arc::clone(&self.inner.mcp),
                 );
                 crate::session::send(
                     &self.inner.threads,
@@ -1473,7 +1475,6 @@ impl Shell {
             &thread,
             &where_the_work_happens(&thread, &project),
             prepared,
-            Arc::clone(&self.inner.mcp),
         );
 
         let sequence = self
