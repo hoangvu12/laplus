@@ -9,7 +9,10 @@ mod harness;
 use std::{
     convert::Infallible,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use axum::{
@@ -22,7 +25,10 @@ use axum::{
 };
 use futures_util::stream;
 use harness::{
-    conversation::{assistant_sends, create_project, create_thread, start_turn},
+    conversation::{
+        assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
+        start_turn,
+    },
     workspace::Workspace,
     SocketClient, TestServer,
 };
@@ -38,6 +44,7 @@ struct FakeOpenCode {
 #[derive(Clone, Copy)]
 enum Startup {
     Healthy,
+    Gated,
     ResistsStop,
     Exit,
     NeverReady,
@@ -54,6 +61,10 @@ impl FakeOpenCode {
 
     fn resisting_stop() -> Self {
         Self::scripted(Startup::ResistsStop)
+    }
+
+    fn busy() -> Self {
+        Self::scripted(Startup::Gated)
     }
 
     fn never_ready() -> Self {
@@ -73,9 +84,11 @@ impl FakeOpenCode {
             (Startup::Exit, true) => "exit /b 23",
             (Startup::Exit, false) => "exit 23",
             (Startup::Healthy, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Healthy, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=false exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
         };
@@ -114,6 +127,10 @@ impl FakeOpenCode {
     }
 
     async fn requests(&self) -> Vec<Value> {
+        self.requests_through(3).await
+    }
+
+    async fn requests_through(&self, count: usize) -> Vec<Value> {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&self.log) {
@@ -121,7 +138,7 @@ impl FakeOpenCode {
                         .lines()
                         .map(|line| serde_json::from_str(line).expect("logged JSON request"))
                         .collect::<Vec<_>>();
-                    if values.len() >= 3 {
+                    if values.len() >= count {
                         return values;
                     }
                 }
@@ -210,6 +227,7 @@ struct PeerState {
     healthy: bool,
     authorization: Option<String>,
     idle_release: Option<Arc<Notify>>,
+    prompts: Arc<AtomicUsize>,
 }
 
 fn assert_authorization(headers: &HeaderMap, state: &PeerState) {
@@ -275,6 +293,13 @@ async fn prompt(
         &state.log,
         json!({"operation":"prompt","sessionId":session_id,"body":body}),
     );
+    let prompt_number = state.prompts.fetch_add(1, Ordering::SeqCst) + 1;
+    if prompt_number > 1 {
+        if let Some(release) = &state.idle_release {
+            release.notify_one();
+        }
+        return StatusCode::NO_CONTENT;
+    }
     let sender = state
         .subscriber
         .lock()
@@ -303,6 +328,7 @@ async fn prompt(
         for event in [
             "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"idle\"}}}\n\n",
             "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
+            "data: {\"type\":\"session.error\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"error\":{\"name\":\"AbortError\",\"message\":\"request aborted\"}}}\n\n",
         ] {
             sender.send(Ok(event)).await.expect("send scripted SSE event");
         }
@@ -313,6 +339,22 @@ async fn prompt(
         finish.await;
     }
     StatusCode::NO_CONTENT
+}
+
+async fn abort(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<PeerState>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_authorization(&headers, &state);
+    append(
+        &state.log,
+        json!({"operation":"abort","sessionId":session_id}),
+    );
+    if let Some(release) = &state.idle_release {
+        release.notify_one();
+    }
+    Json(json!(true))
 }
 
 struct ExternalOpenCode {
@@ -351,6 +393,7 @@ impl ExternalOpenCode {
             .route("/event", get(events))
             .route("/session", post(create_session))
             .route("/session/{id}/prompt_async", post(prompt))
+            .route("/session/{id}/abort", post(abort))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -378,14 +421,18 @@ impl ExternalOpenCode {
     }
 
     async fn requests(&self) -> Vec<Value> {
+        self.requests_through(2).await
+    }
+
+    async fn requests_through(&self, count: usize) -> Vec<Value> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&self.log) {
                     let values = contents
                         .lines()
                         .map(|line| serde_json::from_str(line).unwrap())
-                        .collect::<Vec<_>>();
-                    if values.len() >= 2 {
+                        .collect::<Vec<Value>>();
+                    if values.len() >= count {
                         return values;
                     }
                 }
@@ -393,8 +440,214 @@ impl ExternalOpenCode {
             }
         })
         .await
-        .expect("external peer receives the turn")
+        .expect("external peer receives requests")
     }
+}
+
+#[tokio::test]
+async fn interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate_idle() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("interrupt-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("interrupt-project", "interrupt-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("interrupt-thread").await;
+    let mut command = start_turn("interrupt-thread", "interrupt-message", "begin");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "running OpenCode turn")["payload"]["session"]
+        ["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("interrupt-thread", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+    let after = client.events_through_the_turn(&subscription).await;
+    let requests = peer.requests_through(3).await;
+    assert!(requests
+        .iter()
+        .any(|request| request["operation"] == "abort"));
+    assert_eq!(
+        after
+            .iter()
+            .filter(|item| item["event"]["payload"]["activity"]["kind"] == "turn.completed")
+            .count(),
+        1
+    );
+    // The peer queued a duplicate idle and then a late abort error after the
+    // first idle. Give the session loop a chance to consume both before reading
+    // the durable result; neither may revise the developer-owned interruption.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("interrupt-thread")
+        .await;
+    assert_eq!(snapshot["thread"]["latestTurn"]["state"], "interrupted");
+    assert_eq!(snapshot["thread"]["session"]["status"], "interrupted");
+    assert_eq!(snapshot["thread"]["session"]["lastError"], Value::Null);
+    assert!(snapshot["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "assistant"
+            && message["text"].as_str().unwrap_or("").contains("hello")));
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn a_busy_opencode_prompt_steers_the_active_turn_and_a_later_prompt_starts_another() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("steer-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("steer-project", "steer-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("steer-thread").await;
+    let mut first = start_turn("steer-thread", "message-1", "begin");
+    first["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", first)
+        .await
+        .expect_success();
+    let before = client.events_until_streaming(&subscription).await;
+    let active = last_session(&before, "busy OpenCode turn")["payload"]["session"]["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("steer-thread", "message-2", "change course"),
+        )
+        .await
+        .expect_success();
+    let requests = peer.requests_through(3).await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["operation"] == "prompt")
+            .count(),
+        2
+    );
+    let settled = client.events_through_the_turn(&subscription).await;
+    assert!(!settled
+        .iter()
+        .any(|item| item["event"]["type"] == "thread.turn-start-requested"));
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("steer-thread")
+        .await;
+    let steer = snapshot["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["id"] == "message-2")
+        .unwrap();
+    assert_eq!(steer["turnId"], active);
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("steer-thread", "message-3", "new turn"),
+        )
+        .await
+        .expect_success();
+    let later = client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.turn-start-requested"
+        })
+        .await;
+    let new_turn = later
+        .iter()
+        .find(|item| item["event"]["type"] == "thread.turn-start-requested")
+        .unwrap();
+    assert_ne!(new_turn["event"]["payload"]["turnId"], active);
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn stopping_busy_opencode_aborts_before_releasing_the_external_session() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("stop-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("stop-project", "stop-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("stop-thread").await;
+    let mut command = start_turn("stop-thread", "stop-message", "begin");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    client.events_until_streaming(&subscription).await;
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.session.stop","commandId":"test:stop:busy-opencode","threadId":"stop-thread","createdAt":"2026-08-01T00:00:00.000Z"})).await.expect_success();
+    let requests = peer.requests_through(3).await;
+    assert!(requests
+        .iter()
+        .any(|request| request["operation"] == "abort"));
+    assert!(
+        tokio::net::TcpStream::connect(peer.endpoint.trim_start_matches("http://"))
+            .await
+            .is_ok(),
+        "external endpoint remains operator-owned"
+    );
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
 }
 
 async fn assert_external_turn(password: Option<&str>) {
@@ -556,6 +809,8 @@ async fn opencode_peer_child() {
     let state = PeerState {
         log: Arc::new(log),
         healthy: std::env::var("OPENCODE_TEST_HEALTHY").as_deref() != Ok("false"),
+        idle_release: (std::env::var("OPENCODE_TEST_GATED").as_deref() == Ok("true"))
+            .then(|| Arc::new(Notify::new())),
         ..Default::default()
     };
     let app = Router::new()
@@ -563,6 +818,7 @@ async fn opencode_peer_child() {
         .route("/event", get(events))
         .route("/session", post(create_session))
         .route("/session/{id}/prompt_async", post(prompt))
+        .route("/session/{id}/abort", post(abort))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -646,6 +902,30 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
             .is_err(),
         "stopping Laplus reaps the owned OpenCode server"
     );
+}
+
+#[tokio::test]
+async fn stopping_busy_owned_opencode_aborts_and_reaps_its_server() {
+    let SocketTurn {
+        opencode,
+        server,
+        mut client,
+        subscription,
+        ..
+    } = start_socket_turn(FakeOpenCode::busy(), "project-busy-stop", "thread-busy-stop").await;
+    client.events_until_streaming(&subscription).await;
+    let requests = opencode.requests().await;
+    let port = requests[0]["port"].as_u64().expect("the owned port") as u16;
+
+    client.call("orchestration.dispatchCommand", json!({
+        "type":"thread.session.stop","commandId":"test:stop:busy-owned",
+        "threadId":"thread-busy-stop","createdAt":"2026-08-01T00:00:00.000Z"
+    })).await.expect_success();
+    let requests = opencode.requests_through(4).await;
+    assert!(requests.iter().any(|request| request["operation"] == "abort"));
+    wait_until_port_closes(port, "stopping a busy owned session did not reap its OpenCode server").await;
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]

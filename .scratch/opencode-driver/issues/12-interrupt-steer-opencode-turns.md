@@ -7,16 +7,24 @@ Codex queued-follow-up semantics.
 
 **Blocked by:** 09 — Run the first owned OpenCode text turn.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Interrupt calls the OpenCode abort operation and settles the turn as
+- [x] Interrupt calls the OpenCode abort operation and settles the turn as
       interrupted while retaining partial transcript content
-- [ ] Late abort-related events and duplicate idle signals do not overwrite the
+- [x] Late abort-related events and duplicate idle signals do not overwrite the
       interrupted result or settle twice
-- [ ] Stop aborts active work, closes the OpenCode scope and releases owned
+- [x] Stop aborts active work, closes the OpenCode scope and releases owned
       resources
-- [ ] A prompt sent while OpenCode is busy is delivered immediately to the same
+- [x] A prompt sent while OpenCode is busy is delivered immediately to the same
       upstream session under the active Laplus turn id
-- [ ] A prompt sent after settlement begins a new turn normally
-- [ ] Claude and Codex follow-ups remain queued as before
-- [ ] Socket tests cover timing and correlation using a controllable peer
+- [x] A prompt sent after settlement begins a new turn normally
+- [x] Claude and Codex follow-ups remain queued as before
+- [x] Socket tests cover timing and correlation using a controllable peer
+
+**Where it landed:** OpenCode now aborts through its HTTP session operation,
+settles interrupted turns idempotently while preserving streamed text, and
+aborts active work before session cleanup. Its driver explicitly opts into busy
+turn steering; orchestration retains the active turn id before publishing any
+new-turn events, while the shared default keeps Claude and Codex follow-ups
+queued. The scripted socket peer covers interrupt, duplicate idle, active stop,
+busy steering and post-settlement turn creation.

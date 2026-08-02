@@ -1309,6 +1309,35 @@ impl Shell {
         let prepared =
             crate::session::prepare(&thread, &config.settings).map_err(CommandError::new)?;
 
+        // OpenCode's native busy-session prompt is a steer, not a queued new
+        // turn. Keep the active turn id at both public boundaries: the user
+        // message in the transcript and the prompt handed to the live driver.
+        // Other drivers continue through the ordinary fresh-turn path below.
+        if thread.provider.driver == "opencode" {
+            if let Some(turn_id) = self.inner.threads.active_turn(&start.thread_id) {
+                let sequence = self.inner.threads.apply(
+                    &start.thread_id,
+                    Change::UserMessage {
+                        message_id: start.message.message_id.clone(),
+                        text: start.message.text.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                ).ok_or_else(|| self.not_open(&start.thread_id))?;
+                let starting = crate::session::starting(
+                    &thread,
+                    &where_the_work_happens(&thread, &project),
+                    prepared,
+                );
+                crate::session::send(
+                    &self.inner.threads,
+                    &starting,
+                    turn_id,
+                    start.message.text.clone(),
+                ).map_err(CommandError::new)?;
+                return Ok(sequence);
+            }
+        }
+
         if let Some(thread) = pending {
             self.inner
                 .threads

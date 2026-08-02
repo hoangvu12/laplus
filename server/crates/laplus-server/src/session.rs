@@ -203,6 +203,10 @@ use crate::worklog::{Call, Decision};
 ///   refused, the last thing it said on the way out — and those are sentences
 ///   only the driver can write.
 pub(crate) trait Driver: Send + Sized {
+    /// Whether a prompt received during a running turn belongs to that same
+    /// turn instead of waiting to begin another one.
+    const STEERS_ACTIVE_TURN: bool = false;
+
     /// Start the agent for this session, or say why not in a sentence the
     /// developer will read in the conversation.
     fn open(start: &Start) -> impl Future<Output = Result<Opened<Self>, String>> + Send;
@@ -726,6 +730,21 @@ async fn drive<D: Driver>(
                 break;
             }
             Next::Signal(None) => listening = false,
+            Next::Prompt(Some(prompt)) if D::STEERS_ACTIVE_TURN && driving.turn.is_some() => {
+                // OpenCode accepts another prompt while its session is busy.
+                // It remains part of the active Laplus turn: no baseline,
+                // retune, running event, or replacement InFlight is created.
+                if let Err(error) = driver.send(&prompt.text).await {
+                    eprintln!("laplus: cannot steer the agent: {error}");
+                    threads.apply(
+                        &start.thread_id,
+                        Change::Activity(Activity::failed(
+                            "turn.steer-failed",
+                            &format!("The steer could not be sent to the agent: {error}"),
+                        )),
+                    );
+                }
+            }
             Next::Prompt(Some(prompt)) => waiting = Some(prompt),
             Next::Prompt(None) => {
                 accepting = false;

@@ -577,6 +577,7 @@ impl OpenCode {
         let Some(finished) = driving.turn.take() else {
             return Default::default();
         };
+        let interrupted = finished.was_stopped();
         self.settled = true;
         let mut changes = Vec::new();
         if !self.assistant_text.is_empty() {
@@ -589,27 +590,33 @@ impl OpenCode {
                 text: self.assistant_text.clone(),
             });
         }
-        if let Some(message) = error.as_deref() {
+        if let Some(message) = error.as_deref().filter(|_| !interrupted) {
             changes.push(crate::threads::Change::Activity(
                 crate::threads::Activity::failed("session.failed", message),
             ));
         } else {
             changes.push(crate::threads::Change::Activity(crate::threads::Activity::info(
-                "turn.completed", "Turn completed.",
-                serde_json::json!({"durationMs":Value::Null,"totalCostUsd":Value::Null,"isError":false,"interrupted":false}),
+                "turn.completed", if interrupted { "Turn stopped by the developer." } else { "Turn completed." },
+                serde_json::json!({"durationMs":Value::Null,"totalCostUsd":Value::Null,"isError":false,"interrupted":interrupted}),
                 Some(finished.turn_id.clone()),
             )));
         }
         driving.finished = Some(crate::session::Finished {
             turn_id: finished.turn_id.clone(),
-            status: if error.is_some() { "error" } else { "ready" },
+            status: if interrupted { "interrupted" } else if error.is_some() { "error" } else { "ready" },
         });
+        // A steer shares this turn's normalization state. Clear it only once
+        // the turn settles so the next independent turn starts cleanly.
+        self.pending_parts.clear();
+        self.pending_deltas.clear();
+        self.emitted_parts.clear();
+        self.assistant_text.clear();
         crate::session::Decided {
             changes,
             settles: Some(crate::session::Settles {
                 turn_id: Some(finished.turn_id),
-                status,
-                last_error: error,
+                status: if interrupted { crate::settling::SessionStatus::Interrupted } else { status },
+                last_error: if interrupted { None } else { error },
             }),
             ..Default::default()
         }
@@ -631,6 +638,8 @@ fn structured_event_error(error: &Value) -> String {
 }
 
 impl crate::session::Driver for OpenCode {
+    const STEERS_ACTIVE_TURN: bool = true;
+
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
         if start.resume_cursor.is_some() {
             return Err("OpenCode continuation is not available until ticket 15.".to_string());
@@ -829,10 +838,6 @@ impl crate::session::Driver for OpenCode {
 
     async fn send(&mut self, text: &str) -> std::io::Result<()> {
         self.settled = false;
-        self.pending_parts.clear();
-        self.pending_deltas.clear();
-        self.emitted_parts.clear();
-        self.assistant_text.clear();
         let mut body = serde_json::json!({"parts": [{"type":"text", "text":text}]});
         if let Some(model) = self.model.as_deref() {
             let (provider, model) = model
@@ -847,7 +852,7 @@ impl crate::session::Driver for OpenCode {
     }
 
     async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
-        Ok(())
+        self.client.abort(&self.session_id).await.map(|_| ()).map_err(std::io::Error::other)
     }
     async fn answer(
         &mut self,
@@ -879,14 +884,23 @@ impl crate::session::Driver for OpenCode {
         driving: &mut crate::session::Driving,
         asked_to_stop: bool,
     ) -> crate::session::Reaped {
+        let abort_failure = if asked_to_stop && driving.turn.is_some() {
+            self.client.abort(&self.session_id).await.err().map(|error| {
+                format!("OpenCode could not abort its active work while stopping: {error}")
+            })
+        } else {
+            None
+        };
         self.events.cancel().await;
         if let Some(owned) = self.owned.as_mut() {
             owned.stop().await;
         }
         crate::session::Reaped {
             refused: None,
-            death: (driving.turn.is_some() && !asked_to_stop)
-                .then(|| "OpenCode stopped before the turn finished.".to_string()),
+            death: abort_failure.or_else(|| {
+                (driving.turn.is_some() && !asked_to_stop)
+                    .then(|| "OpenCode stopped before the turn finished.".to_string())
+            }),
         }
     }
 }
