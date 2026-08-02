@@ -519,6 +519,8 @@ mod tests {
             models: Vec::new(),
             slash_commands: Vec::new(),
             skills: Vec::new(),
+            version_advisory: None,
+            update_state: None,
         }
     }
 

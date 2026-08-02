@@ -151,6 +151,10 @@ export const ServerProviderUpdateState = Schema.Struct({
   finishedAt: Schema.NullOr(IsoDateTime),
   message: Schema.NullOr(TrimmedNonEmptyString),
   output: Schema.NullOr(Schema.String.check(Schema.isMaxLength(10_000))),
+  /** Versions observed by probes around the explicit command. Optional keeps
+      older servers and cached snapshots wire-compatible. */
+  beforeVersion: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
+  afterVersion: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
 });
 export type ServerProviderUpdateState = typeof ServerProviderUpdateState.Type;
 

@@ -110,6 +110,7 @@ pub struct Services {
     /// and built from the index, because the watcher that keeps a status honest
     /// is the same one that keeps a listing honest.
     pub repositories: Repositories,
+    pub provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
 }
 
 /// What a method answers with.
@@ -468,6 +469,14 @@ pub fn dispatch(services: &Services, tag: &str, payload: &Value) -> Result<Answe
                 crate::provider::refresh_call(&payload, config, &roots)
             }))
         }
+        crate::provider_maintenance::UPDATE => {
+            let payload = payload.clone();
+            let roots = services.shell.workspace_roots();
+            let maintenance = services.provider_maintenance.clone();
+            Ok(deferred_over(&services.config, move |config| {
+                maintenance.update_call(&payload, config, &roots)
+            }))
+        }
         // Reading the settings is reading memory — they were loaded at startup
         // and every change since has gone through the store — so it answers on
         // the read loop. The payload is an empty struct in the contract.
@@ -577,6 +586,7 @@ mod tests {
             config: ConfigStore::new(ServerConfig::detect()),
             shell: Shell::new(Database::in_memory().expect("an in-memory database")),
             repositories: Repositories::new(&index),
+            provider_maintenance: crate::provider_maintenance::ProviderMaintenance::new(),
             index,
             terminals: Terminals::new(),
         }

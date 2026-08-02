@@ -71,4 +71,30 @@ describe("ServerProvider", () => {
 
     expect(parsed.continuation?.groupKey).toBe("codex:home:/Users/julius/.codex");
   });
+
+  it("keeps observed versions on provider maintenance outcomes", () => {
+    const parsed = decodeServerProvider({
+      instanceId: "openLocal",
+      driver: "opencode",
+      enabled: true,
+      installed: true,
+      version: "1.20.0",
+      status: "ready",
+      auth: { status: "unknown" },
+      checkedAt: "2026-08-02T00:00:00.000Z",
+      models: [],
+      updateState: {
+        status: "unchanged",
+        startedAt: "2026-08-02T00:00:00.000Z",
+        finishedAt: "2026-08-02T00:00:01.000Z",
+        message: "Update command completed; version is unchanged.",
+        output: null,
+        beforeVersion: "1.20.0",
+        afterVersion: "1.20.0",
+      },
+    });
+
+    expect(parsed.updateState?.beforeVersion).toBe("1.20.0");
+    expect(parsed.updateState?.afterVersion).toBe("1.20.0");
+  });
 });

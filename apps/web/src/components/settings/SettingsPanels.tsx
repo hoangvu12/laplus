@@ -884,8 +884,8 @@ export function ProviderSettingsPanel() {
   });
   const [isRefreshingProviders, setIsRefreshingProviders] = useState(false);
   const [isAddInstanceDialogOpen, setIsAddInstanceDialogOpen] = useState(false);
-  const [updatingProviderDrivers, setUpdatingProviderDrivers] = useState<
-    ReadonlySet<ProviderDriverKind>
+  const [updatingProviderInstances, setUpdatingProviderInstances] = useState<
+    ReadonlySet<ProviderInstanceId>
   >(() => new Set());
   const [openInstanceDetails, setOpenInstanceDetails] = useState<Record<string, boolean>>({});
   const refreshingRef = useRef(false);
@@ -946,13 +946,13 @@ export function ProviderSettingsPanel() {
     async (candidate: ProviderUpdateCandidate) => {
       if (!primaryEnvironment) return;
       let started = false;
-      setUpdatingProviderDrivers((previous) => {
-        if (previous.has(candidate.driver)) {
+      setUpdatingProviderInstances((previous) => {
+        if (previous.has(candidate.instanceId)) {
           return previous;
         }
         started = true;
         const next = new Set(previous);
-        next.add(candidate.driver);
+        next.add(candidate.instanceId);
         return next;
       });
       if (!started) {
@@ -979,12 +979,12 @@ export function ProviderSettingsPanel() {
           }),
         );
       }
-      setUpdatingProviderDrivers((previous) => {
-        if (!previous.has(candidate.driver)) {
+      setUpdatingProviderInstances((previous) => {
+        if (!previous.has(candidate.instanceId)) {
           return previous;
         }
         const next = new Set(previous);
-        next.delete(candidate.driver);
+        next.delete(candidate.instanceId);
         return next;
       });
     },
@@ -1217,20 +1217,17 @@ export function ProviderSettingsPanel() {
           const updateCandidate = liveProvider
             ? providerUpdateCandidateByInstanceId.get(liveProvider.instanceId)
             : undefined;
-          const isDriverUpdateRunning =
+          const isInstanceUpdateRunning =
             updateCandidate !== undefined &&
-            (updatingProviderDrivers.has(updateCandidate.driver) ||
-              serverProviders.some(
-                (provider) =>
-                  provider.driver === updateCandidate.driver && isProviderUpdateActive(provider),
-              ));
+            (updatingProviderInstances.has(updateCandidate.instanceId) ||
+              (liveProvider !== undefined && isProviderUpdateActive(liveProvider)));
           const showInlineUpdateButton =
             updateCandidate !== undefined &&
             hasOneClickUpdateProviderCandidate(updateCandidate, serverProviders);
           const canRunInlineUpdate =
             updateCandidate !== undefined &&
             canOneClickUpdateProviderCandidate(updateCandidate, serverProviders) &&
-            !updatingProviderDrivers.has(updateCandidate.driver);
+            !updatingProviderInstances.has(updateCandidate.instanceId);
           const modelPreferences = settings.providerModelPreferences?.[row.instanceId] ?? {
             hiddenModels: [],
             modelOrder: [],
@@ -1303,7 +1300,7 @@ export function ProviderSettingsPanel() {
                     }
                   : undefined
               }
-              isUpdating={showInlineUpdateButton ? isDriverUpdateRunning : undefined}
+              isUpdating={showInlineUpdateButton ? isInstanceUpdateRunning : undefined}
             />
           );
         })}

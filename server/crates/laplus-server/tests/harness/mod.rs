@@ -215,6 +215,28 @@ impl TestServer {
         .await
     }
 
+    /// A configured server whose provider command execution is supplied by a
+    /// hermetic fake while the real socket and maintenance boundaries remain.
+    pub async fn start_with_maintenance(
+        mut config: ServerConfig,
+        maintenance: laplus_server::provider_maintenance::ProviderMaintenance,
+    ) -> TestServer {
+        let preferences = tempfile::tempdir().expect("a temporary directory");
+        config = config.with_remote_access(RemoteAccess::none());
+        config.preferences = preferences.path().to_path_buf();
+        somewhere_that_is_not_the_developers(&mut config);
+        let server = Server::bind_with_maintenance(
+            0,
+            config,
+            Database::in_memory().expect("a database"),
+            Assets::none(),
+            maintenance,
+        )
+        .await
+        .expect("server binds to a free loopback port");
+        TestServer::bootstrapped(server, Some(preferences)).await
+    }
+
     /// A server keeping the developer's configuration in `preferences`.
     ///
     /// Start a second one on the same directory and that is a restart, which is

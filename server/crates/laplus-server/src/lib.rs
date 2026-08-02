@@ -94,6 +94,7 @@ pub mod project_favicon;
 pub mod projects;
 pub mod protocol;
 pub mod provider;
+pub mod provider_maintenance;
 pub mod qr;
 pub mod refs;
 pub mod refusals;

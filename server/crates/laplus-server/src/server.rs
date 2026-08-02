@@ -302,6 +302,21 @@ impl Server {
         database: Database,
         ui: Assets,
     ) -> std::io::Result<Server> {
+        Self::bind_with_maintenance(
+            port, config, database, ui,
+            crate::provider_maintenance::ProviderMaintenance::new(),
+        ).await
+    }
+
+    /// Assembly seam for hosts and hermetic tests that supply command
+    /// execution while keeping the socket and maintenance paths unchanged.
+    pub async fn bind_with_maintenance(
+        port: u16,
+        config: ServerConfig,
+        database: Database,
+        ui: Assets,
+        provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
+    ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         // And the name this data directory answers to, settled here for the
         // reason above and one more: this is the one place the config and the
@@ -339,6 +354,7 @@ impl Server {
             repositories: Repositories::new(&index),
             index,
             terminals: Terminals::new(),
+            provider_maintenance,
         };
         let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe()));
 
@@ -1798,6 +1814,7 @@ mod tests {
                     repositories: Repositories::new(&index),
                     index,
                     terminals: Terminals::new(),
+                    provider_maintenance: crate::provider_maintenance::ProviderMaintenance::new(),
                 },
                 Assets::none(),
                 watch::channel(false).1,

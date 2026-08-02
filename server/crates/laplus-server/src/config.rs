@@ -287,7 +287,45 @@ pub struct Provider {
     pub models: Vec<ProviderModel>,
     pub slash_commands: Vec<serde_json::Value>,
     pub skills: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_advisory: Option<ProviderVersionAdvisory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_state: Option<ProviderUpdateState>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderVersionAdvisory {
+    pub status: ProviderVersionAdvisoryStatus,
+    pub current_version: Option<String>,
+    pub latest_version: Option<String>,
+    pub update_command: Option<String>,
+    pub can_update: bool,
+    pub checked_at: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderVersionAdvisoryStatus { Unknown, Current, BehindLatest }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUpdateState {
+    pub status: ProviderUpdateStatus,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub message: Option<String>,
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUpdateStatus { Idle, Queued, Running, Succeeded, Failed, Unchanged }
 
 /// How the UI should present a provider instance. The contract's
 /// `ServerProviderState`, as a closed set rather than a string, because these

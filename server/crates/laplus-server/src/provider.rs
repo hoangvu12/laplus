@@ -41,13 +41,9 @@
 //! - **Claude's `homePath` and `launchArgs`.** Both describe the environment the
 //!   *agent* runs in. Claude's `--version` probe needs neither. Codex's probe is
 //!   an app-server and therefore does honour both of its corresponding settings.
-//! - **`versionAdvisory`.** Absent, and absent is not a lesser form of what
-//!   upstream sends with update checks off. It would emit the field with
-//!   `status: "unknown"` and four nulls — the `grok` entry in
-//!   `fixtures/socket-wire/02-request-response.ndjson` shows exactly that — and
-//!   `getProviderVersionAdvisoryPresentation` returns `null` for an `unknown`
-//!   advisory and for a missing one alike. So the two render identically, and
-//!   nothing here has a latest version or an update command to put in one.
+//! - **Automatic provider updates.** Probes may advertise a maintenance action,
+//!   but never run it. Commands cross the explicit, instance-addressed
+//!   [`crate::provider_maintenance`] boundary.
 //! - **Claude authentication.** No Claude credential is read, so its
 //!   `auth.status` is `unknown`, which is the contract's own literal for exactly
 //!   that. Codex answers `account/read`, so its authenticated and unauthenticated
@@ -185,6 +181,17 @@ impl ConfiguredInstance {
             ConfiguredInstance::OpenCode(instance) => instance.settings.enabled,
         }
     }
+
+    /// Maintenance capability registered by the concrete driver while the
+    /// command coordinator remains provider-agnostic.
+    pub fn maintenance_action(&self, search: &Search) -> Option<crate::provider_maintenance::Action> {
+        match self {
+            ConfiguredInstance::OpenCode(instance) => {
+                crate::provider_maintenance::opencode_action(&instance.settings.binary_path, search)
+            }
+            ConfiguredInstance::Claude(_) | ConfiguredInstance::Codex(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +227,7 @@ pub fn resolve_instance(
     Ok(instance)
 }
 
-fn configured_instance(settings: &Settings, instance_id: &str) -> Option<ConfiguredInstance> {
+pub(crate) fn configured_instance(settings: &Settings, instance_id: &str) -> Option<ConfiguredInstance> {
     let driver = settings.provider_instances.get(instance_id)?
         .get("driver")?.as_str()?;
     match registration(driver)?.kind {
@@ -1121,6 +1128,8 @@ fn snapshot(
         checked_at: now_iso(),
         slash_commands: catalogue.slash_commands,
         skills: catalogue.skills,
+        version_advisory: None,
+        update_state: None,
     }
 }
 
@@ -1323,6 +1332,8 @@ fn codex_snapshot(
         models,
         slash_commands: Vec::new(),
         skills,
+        version_advisory: None,
+        update_state: None,
     }
 }
 
@@ -1520,10 +1531,20 @@ fn merge_custom(mut discovered: Vec<ProviderModel>, configured: &[String]) -> Ve
 
 fn opencode_snapshot(instance: &OpenCodeInstance, version: Option<String>, installed: Installed,
     status: ProviderState, message: Option<String>, models: Vec<ProviderModel>) -> Provider {
+    let version_advisory = crate::provider_maintenance::opencode_action(
+        &instance.settings.binary_path,
+        &Search::from_environment(),
+    ).map(|action| crate::config::ProviderVersionAdvisory {
+        status: crate::config::ProviderVersionAdvisoryStatus::Unknown,
+        current_version: version.clone(), latest_version: None,
+        update_command: Some(action.display()), can_update: true,
+        checked_at: None, message: None,
+    });
     Provider { instance_id: instance.identity.instance_id.clone(), driver: OPENCODE_DRIVER.to_string(),
         display_name: instance.display_name.clone(), enabled: instance.settings.enabled,
         installed: installed == Installed::Yes, version, status, message, auth: unknown_auth(),
-        checked_at: now_iso(), models, slash_commands: Vec::new(), skills: Vec::new() }
+        checked_at: now_iso(), models, slash_commands: Vec::new(), skills: Vec::new(),
+        version_advisory, update_state: None }
 }
 
 fn unknown_auth() -> ProviderAuth {
