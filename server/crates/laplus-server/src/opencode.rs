@@ -540,6 +540,53 @@ pub(crate) struct OpenCode {
     emitted_parts: HashMap<String, String>,
     assistant_text: String,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
+    pending_questions: HashMap<String, crate::approval::ApprovalRequest>,
+}
+
+fn question_id(index: usize, header: &str) -> String {
+    let slug = header.to_lowercase().chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>().split('-').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-");
+    if slug.is_empty() { format!("question-{index}") } else { format!("question-{index}-{slug}") }
+}
+
+fn question_request(properties: &Value) -> Option<crate::approval::ApprovalRequest> {
+    let id = properties.get("id")?.as_str()?;
+    let questions = properties.get("questions")?.as_array()?.iter().enumerate().map(|(index, question)| {
+        let mut question = question.clone();
+        let header = question.get("header").and_then(Value::as_str).unwrap_or("");
+        question["id"] = Value::String(question_id(index, header));
+        question["multiSelect"] = Value::Bool(question.get("multiple").and_then(Value::as_bool).unwrap_or(false));
+        question
+    }).collect::<Vec<_>>();
+    Some(crate::approval::ApprovalRequest {
+        request_id: id.to_string(),
+        tool_name: crate::worklog::ASK_USER_QUESTION.to_string(),
+        input: serde_json::json!({"questions": questions}),
+        tool_use_id: None,
+        description: Some("OpenCode needs your input".to_string()),
+        suggestions: Vec::new(),
+        available_decisions: None,
+        provider_request_id: Some(serde_json::json!({"kind":"question.asked","id":id})),
+    })
+}
+
+fn ordered_question_answers(request: &crate::approval::ApprovalRequest, answers: &Value) -> Value {
+    Value::Array(request.input["questions"].as_array().into_iter().flatten().map(|question| {
+        let id = question.get("id").and_then(Value::as_str).unwrap_or("");
+        match answers.get(id) {
+            Some(Value::Array(values)) => Value::Array(values.clone()),
+            Some(Value::String(value)) => serde_json::json!([value]),
+            _ => serde_json::json!([]),
+        }
+    }).collect())
+}
+
+fn keyed_question_answers(request: &crate::approval::ApprovalRequest, answers: &Value) -> Value {
+    let ordered = answers.as_array();
+    Value::Object(request.input["questions"].as_array().into_iter().flatten().enumerate().filter_map(|(index, question)| {
+        let id = question.get("id")?.as_str()?.to_string();
+        Some((id, ordered.and_then(|answers| answers.get(index)).cloned().unwrap_or_else(|| serde_json::json!([]))))
+    }).collect())
 }
 
 /// The OpenCode permission rules for a shared runtime mode. Ticket 15 uses the
@@ -1002,6 +1049,7 @@ fn structured_event_error(error: &Value) -> String {
 impl crate::session::Driver for OpenCode {
     const STEERS_ACTIVE_TURN: bool = true;
     const APPROVAL_RESOLVED_BY_EVENT: bool = true;
+    const USER_INPUT_RESOLVED_BY_EVENT: bool = true;
 
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
         // Cursor validation precedes launching an owned process or making any
@@ -1053,6 +1101,7 @@ impl crate::session::Driver for OpenCode {
                 emitted_parts: HashMap::new(),
                 assistant_text: String::new(),
                 pending_permissions: HashMap::new(),
+                pending_questions: HashMap::new(),
             },
             decided: crate::session::Decided {
                 provider_resume_cursor: Some(cursor(start, &session.id)),
@@ -1165,6 +1214,33 @@ impl crate::session::Driver for OpenCode {
                     }
                 }
             }
+            "question.asked" => {
+                if let Some(request) = question_request(&envelope.properties) {
+                    if !self.pending_questions.contains_key(&request.request_id)
+                        && !self.pending_permissions.contains_key(&request.request_id) {
+                        self.pending_questions.insert(request.request_id.clone(), request.clone());
+                        driving.outstanding.insert(request.request_id.clone(), request.clone());
+                        if let Some(questions) = crate::worklog::questions(&request) {
+                            decided.changes.push(crate::threads::Change::Activity(
+                                crate::worklog::user_input_requested(&request, questions, driving.turn.as_ref().map(|turn| turn.turn_id.clone()))
+                            ));
+                        }
+                    }
+                }
+            }
+            "question.replied" | "question.rejected" => {
+                if let Some(id) = envelope.properties.get("requestID").and_then(Value::as_str) {
+                    if let Some(request) = self.pending_questions.remove(id) {
+                        driving.outstanding.remove(id);
+                        let answers = if envelope.kind == "question.replied" {
+                            keyed_question_answers(&request, envelope.properties.get("answers").unwrap_or(&Value::Null))
+                        } else { serde_json::json!({}) };
+                        decided.changes.push(crate::threads::Change::Activity(
+                            crate::worklog::user_input_resolved(id, &answers, driving.turn.as_ref().map(|turn| turn.turn_id.clone()))
+                        ));
+                    }
+                }
+            }
             "session.updated" => {
                 let info = envelope
                     .properties
@@ -1246,9 +1322,19 @@ impl crate::session::Driver for OpenCode {
         Some(decided)
     }
 
-    async fn send(&mut self, text: &str) -> std::io::Result<()> {
+    async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
         self.settled = false;
-        let mut body = serde_json::json!({"parts": [{"type":"text", "text":text}]});
+        let mut parts = Vec::new();
+        if !prompt.text.trim().is_empty() { parts.push(serde_json::json!({"type":"text", "text":prompt.text})); }
+        parts.extend(prompt.attachments.iter().filter_map(|attachment| {
+            // External endpoints receive the same local file URL as owned
+            // servers. This intentionally assumes a shared filesystem/path
+            // mapping; OpenCode has no attachment-upload operation here.
+            let url = reqwest::Url::from_file_path(&attachment.path).ok()?;
+            Some(serde_json::json!({"type":"file","mime":attachment.mime,"filename":attachment.filename,"url":url.to_string()}))
+        }));
+        if parts.is_empty() { return Err(std::io::Error::other("OpenCode prompt has no resolvable text or attachments")); }
+        let mut body = serde_json::json!({"parts": parts});
         if let Some(model) = self.model.as_deref() {
             let (provider, model) = model
                 .split_once('/')
@@ -1273,6 +1359,19 @@ impl crate::session::Driver for OpenCode {
         asked: &crate::approval::ApprovalRequest,
         reply: crate::session::Reply<'_>,
     ) -> std::io::Result<()> {
+        if let Some(pending) = self.pending_questions.get(&asked.request_id) {
+            return match reply {
+                crate::session::Reply::Answers(answers) => self.client.reply_question(
+                    &asked.request_id,
+                    &serde_json::json!({"answers": ordered_question_answers(pending, answers)}),
+                ).await.map(|_| ()).map_err(std::io::Error::other),
+                crate::session::Reply::Rejected => self.client.reject_question(&asked.request_id)
+                    .await.map(|_| ()).map_err(std::io::Error::other),
+                crate::session::Reply::Decided(_) => Err(std::io::Error::other(
+                    "OpenCode questions require answers or rejection",
+                )),
+            };
+        }
         let crate::session::Reply::Decided(decision) = reply else {
             return Err(std::io::Error::other(
                 "OpenCode permission replies require a decision",

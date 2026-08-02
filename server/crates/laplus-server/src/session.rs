@@ -207,6 +207,7 @@ pub(crate) trait Driver: Send + Sized {
     /// turn instead of waiting to begin another one.
     const STEERS_ACTIVE_TURN: bool = false;
     const APPROVAL_RESOLVED_BY_EVENT: bool = false;
+    const USER_INPUT_RESOLVED_BY_EVENT: bool = false;
 
     /// Start the agent for this session, or say why not in a sentence the
     /// developer will read in the conversation.
@@ -225,7 +226,7 @@ pub(crate) trait Driver: Send + Sized {
     fn next(&mut self, driving: &mut Driving) -> impl Future<Output = Option<Decided>> + Send;
 
     /// Give the agent one turn.
-    fn send(&mut self, text: &str) -> impl Future<Output = std::io::Result<()>> + Send;
+    fn send(&mut self, prompt: &Prompt) -> impl Future<Output = std::io::Result<()>> + Send;
 
     /// Stop the turn in flight without ending the session.
     ///
@@ -296,6 +297,7 @@ pub(crate) enum Reply<'a> {
     /// What the developer typed into a question. Carried unread — the answers
     /// are their own words, and nothing here has any business parsing them.
     Answers(&'a Value),
+    Rejected,
 }
 
 /// A driver and everything its successful startup already decided.
@@ -406,7 +408,7 @@ impl DriverStart {
 /// settings with its implementation. Everything after this match is written
 /// against [`Driver`], so a second agent adds an arm here rather than another
 /// session loop.
-pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> Result<(), String> {
+pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, attachments: Vec<crate::threads::PromptAttachment>) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
     let prompts = match &start.driver {
@@ -442,6 +444,7 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String) -> 
     let prompt = Prompt {
         turn_id,
         text,
+        attachments,
         wanted: Retune {
             runtime_mode: start.runtime_mode.clone(),
             model: start.model.clone(),
@@ -631,7 +634,7 @@ async fn drive<D: Driver>(
                 // rather than spawned for the same reason — a capture racing the
                 // agent's first edit would record a tree that already had it.
                 baseline(&threads, &start).await;
-                if let Err(error) = driver.send(&prompt.text).await {
+                if let Err(error) = driver.send(&prompt).await {
                     eprintln!("laplus: cannot send a turn to the agent: {error}");
                     send_failure = Some(format!(
                         "The turn could not be sent to the agent: {error}"
@@ -735,7 +738,7 @@ async fn drive<D: Driver>(
                 // OpenCode accepts another prompt while its session is busy.
                 // It remains part of the active Laplus turn: no baseline,
                 // retune, running event, or replacement InFlight is created.
-                if let Err(error) = driver.send(&prompt.text).await {
+                if let Err(error) = driver.send(&prompt).await {
                     eprintln!("laplus: cannot steer the agent: {error}");
                     threads.apply(
                         &start.thread_id,
@@ -1280,7 +1283,7 @@ async fn answer<D: Driver>(
     // the request was real and this server knew it, and what went wrong is that
     // the agent stopped reading. The resolution below closes the panel either
     // way, which is why this does not have to.
-    if let Err(error) = sent {
+    if let Err(ref error) = sent {
         eprintln!("laplus: cannot answer a permission request: {error}");
         threads.apply(
             &start.thread_id,
@@ -1338,7 +1341,12 @@ async fn answer_user_input<D: Driver>(
     // An id this session never asked about, or has already been answered on.
     // Closed with the wording the client folds as "that question is gone", which
     // is what clears a header left behind by a session that died holding one.
-    let Some(asked) = driving.outstanding.remove(&answered.request_id) else {
+    let asked = if D::USER_INPUT_RESOLVED_BY_EVENT {
+        driving.outstanding.get(&answered.request_id).cloned()
+    } else {
+        driving.outstanding.remove(&answered.request_id)
+    };
+    let Some(asked) = asked else {
         threads.apply(
             &start.thread_id,
             Change::Activity(crate::worklog::unanswerable_user_input(
@@ -1348,11 +1356,14 @@ async fn answer_user_input<D: Driver>(
         return;
     };
 
-    let sent = driver
-        .answer(&asked, Reply::Answers(&answered.answers))
-        .await;
+    let reply = if answered.rejected {
+        Reply::Rejected
+    } else {
+        Reply::Answers(&answered.answers)
+    };
+    let sent = driver.answer(&asked, reply).await;
 
-    if let Err(error) = sent {
+    if let Err(ref error) = sent {
         eprintln!("laplus: cannot answer a question: {error}");
         threads.apply(
             &start.thread_id,
@@ -1366,14 +1377,17 @@ async fn answer_user_input<D: Driver>(
         );
     }
 
-    threads.apply(
-        &start.thread_id,
-        Change::Activity(crate::worklog::user_input_resolved(
-            &asked.request_id,
-            &answered.answers,
-            driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
-        )),
-    );
+    if !D::USER_INPUT_RESOLVED_BY_EVENT || sent.is_err() {
+        driving.outstanding.remove(&answered.request_id);
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(crate::worklog::user_input_resolved(
+                &asked.request_id,
+                &answered.answers,
+                driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+            )),
+        );
+    }
 }
 
 /// Stop the turn the agent is working on, and say so in the conversation.

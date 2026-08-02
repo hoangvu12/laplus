@@ -28,7 +28,7 @@ use harness::{
     conversation::{
         activity, assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
         revert_checkpoint,
-        respond_to_approval, start_turn, start_turn_in,
+        respond_to_approval, respond_to_user_input, start_turn, start_turn_in,
     },
     workspace::Workspace,
     SocketClient, TestServer,
@@ -473,6 +473,7 @@ struct PeerState {
     idle_release: Option<Arc<Notify>>,
     prompts: Arc<AtomicUsize>,
     permissions: bool,
+    questions: bool,
     resume: ResumeBehavior,
     gets: Arc<AtomicUsize>,
     creates: Arc<AtomicUsize>,
@@ -684,6 +685,10 @@ async fn prompt(
         ] { sender.send(Ok(event.to_string())).await.unwrap(); }
         return StatusCode::NO_CONTENT;
     }
+    if state.questions {
+        sender.send(Ok("data: {\"type\":\"question.asked\",\"properties\":{\"id\":\"que-1\",\"sessionID\":\"ses_owned_1\",\"questions\":[{\"header\":\"Database Choice\",\"question\":\"Which database?\",\"options\":[{\"label\":\"SQLite\",\"description\":\"Local\"},{\"label\":\"Postgres\",\"description\":\"Shared\"}],\"multiple\":false},{\"header\":\"Features\",\"question\":\"Which features?\",\"options\":[{\"label\":\"Search\",\"description\":\"Search\"},{\"label\":\"Sync\",\"description\":\"Sync\"}],\"multiple\":true}]}}\n\n".to_string())).await.unwrap();
+        return StatusCode::NO_CONTENT;
+    }
     for event in [
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"reason-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"check the stream\"}}}\n\n",
         "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\"}}}\n\n",
@@ -765,6 +770,22 @@ async fn reply_legacy_permission(
     Json(json!(true))
 }
 
+async fn reply_question(AxumPath(request_id): AxumPath<String>, State(state): State<PeerState>, Json(body): Json<Value>) -> Json<Value> {
+    append(&state.log, json!({"operation":"question.reply","requestId":request_id,"body":body}));
+    let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    sender.send(Ok(format!("data: {{\"type\":\"question.replied\",\"properties\":{{\"sessionID\":\"ses_owned_1\",\"requestID\":\"{request_id}\",\"answers\":{}}}}}\n\n", body["answers"]))).await.unwrap();
+    sender.send(Ok("data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n".to_string())).await.unwrap();
+    Json(json!(true))
+}
+
+async fn reject_question(AxumPath(request_id): AxumPath<String>, State(state): State<PeerState>) -> Json<Value> {
+    append(&state.log, json!({"operation":"question.reject","requestId":request_id}));
+    let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    sender.send(Ok(format!("data: {{\"type\":\"question.rejected\",\"properties\":{{\"sessionID\":\"ses_owned_1\",\"requestID\":\"{request_id}\"}}}}\n\n"))).await.unwrap();
+    sender.send(Ok("data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n".to_string())).await.unwrap();
+    Json(json!(true))
+}
+
 struct ExternalOpenCode {
     _directory: tempfile::TempDir,
     endpoint: String,
@@ -782,6 +803,10 @@ impl ExternalOpenCode {
         Self::start_configured(None, None, true).await
     }
 
+    async fn with_questions() -> Self {
+        Self::start_configured_with_rollback(None, None, false, ResumeBehavior::Normal, None, false, true).await
+    }
+
     async fn for_resume(resume: ResumeBehavior) -> Self {
         Self::start_configured_with_resume(None, None, false, resume).await
     }
@@ -794,6 +819,7 @@ impl ExternalOpenCode {
             ResumeBehavior::Normal,
             Some(probe),
             fails,
+            false,
         )
         .await
     }
@@ -832,6 +858,7 @@ impl ExternalOpenCode {
             resume,
             None,
             false,
+            false,
         )
         .await
     }
@@ -843,6 +870,7 @@ impl ExternalOpenCode {
         resume: ResumeBehavior,
         rollback_probe: Option<PathBuf>,
         rollback_fails: bool,
+        questions: bool,
     ) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
@@ -858,6 +886,7 @@ impl ExternalOpenCode {
             }),
             idle_release,
             permissions,
+            questions,
             resume,
             rollback_probe,
             rollback_fails,
@@ -877,6 +906,8 @@ impl ExternalOpenCode {
             .route("/session/{id}/abort", post(abort))
             .route("/permission/{id}/reply", post(reply_permission))
             .route("/session/{id}/permissions/{permission_id}", post(reply_legacy_permission))
+            .route("/question/{id}/reply", post(reply_question))
+            .route("/question/{id}/reject", post(reject_question))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -933,6 +964,85 @@ impl ExternalOpenCode {
         .await
         .expect("external peer receives requests")
     }
+}
+
+async fn start_question_turn(peer: &ExternalOpenCode, suffix: &str) -> (Workspace, TestServer, SocketClient, String) {
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    let project = format!("question-project-{suffix}");
+    let thread = format!("question-thread-{suffix}");
+    client.call("orchestration.dispatchCommand", create_project(&project, workspace.path())).await.expect_success();
+    let mut create = create_thread(&project, &thread);
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation(&thread).await;
+    let mut command = start_turn(&thread, &format!("message-{suffix}"), "ask me");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", command).await.expect_success();
+    (workspace, server, client, subscription)
+}
+
+#[tokio::test]
+async fn opencode_questions_preserve_order_ids_and_resolve_only_after_the_reply_event() {
+    let peer = ExternalOpenCode::with_questions().await;
+    let (_workspace, server, mut client, subscription) = start_question_turn(&peer, "answer").await;
+    let (asked, request_id) = client.events_until_user_input(&subscription).await;
+    let questions = &activity(&asked, "user-input.requested")["payload"]["activity"]["payload"]["questions"];
+    assert_eq!(questions[0]["id"], "question-0-database-choice");
+    assert_eq!(questions[1]["id"], "question-1-features");
+    assert_eq!(questions[1]["multiSelect"], true);
+    assert_eq!(questions[0]["options"][0]["label"], "SQLite");
+    client.call("orchestration.dispatchCommand", respond_to_user_input("question-thread-answer", &request_id, json!({"question-1-features":["Sync","Search"],"question-0-database-choice":["Postgres"]}))).await.expect_success();
+    let settled = client.events_through_the_turn(&subscription).await;
+    assert!(settled.iter().any(|item| item["event"]["payload"]["activity"]["kind"] == "user-input.resolved"));
+    let requests = peer.requests_through(3).await;
+    let reply = requests.iter().find(|request| request["operation"] == "question.reply").unwrap();
+    assert_eq!(reply["body"]["answers"], json!([["Postgres"],["Sync","Search"]]));
+    server.stop().await; peer.task.abort();
+}
+
+#[tokio::test]
+async fn rejecting_an_opencode_question_uses_the_distinct_route_and_event() {
+    let peer = ExternalOpenCode::with_questions().await;
+    let (_workspace, server, mut client, subscription) = start_question_turn(&peer, "reject").await;
+    let (_, request_id) = client.events_until_user_input(&subscription).await;
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.user-input.reject","commandId":"test:reject-question","threadId":"question-thread-reject","requestId":request_id,"createdAt":"2026-08-02T00:00:00.000Z"})).await.expect_success();
+    let settled = client.events_through_the_turn(&subscription).await;
+    assert!(settled.iter().any(|item| item["event"]["payload"]["activity"]["kind"] == "user-input.resolved"));
+    let requests = peer.requests_through(3).await;
+    assert!(requests.iter().any(|request| request["operation"] == "question.reject"));
+    server.stop().await; peer.task.abort();
+}
+
+#[tokio::test]
+async fn opencode_prompt_resolves_stored_attachments_and_omits_missing_references() {
+    let peer = ExternalOpenCode::start(None).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("attachment-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("attachment-project", "attachment-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("attachment-thread").await;
+    let mut command = start_turn("attachment-thread", "attachment-message", "inspect");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    command["message"]["attachments"] = json!([
+        {"type":"image","name":"screen.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="},
+        {"type":"image","id":"image-missing","name":"missing.png","mimeType":"image/png","sizeBytes":2}
+    ]);
+    client.call("orchestration.dispatchCommand", command).await.expect_success();
+    client.events_through_the_turn(&subscription).await;
+    let requests = peer.requests_through(2).await;
+    let prompt = requests.iter().find(|request| request["operation"] == "prompt").unwrap();
+    assert_eq!(prompt["body"]["parts"][0], json!({"type":"text","text":"inspect"}));
+    assert_eq!(prompt["body"]["parts"][1]["type"], "file");
+    assert_eq!(prompt["body"]["parts"][1]["mime"], "image/png");
+    assert_eq!(prompt["body"]["parts"][1]["filename"], "screen.png");
+    assert!(prompt["body"]["parts"][1]["url"].as_str().unwrap().starts_with("file://"));
+    assert_eq!(prompt["body"]["parts"].as_array().unwrap().len(), 2, "missing references are omitted independently");
+    server.stop().await; peer.task.abort();
 }
 
 #[tokio::test]

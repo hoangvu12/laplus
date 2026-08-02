@@ -1,5 +1,6 @@
 import {
   CommandId,
+  ApprovalRequestId,
   EnvironmentId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
@@ -24,6 +25,7 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   archiveThread,
   createProject,
+  rejectThreadUserInput,
   settleThread,
   stopThreadSession,
   unsettleThread,
@@ -73,6 +75,22 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect("dispatches user-input rejection as its own command", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      yield* rejectThreadUserInput({
+        threadId: ThreadId.make("thread-1"),
+        requestId: ApprovalRequestId.make("question-1"),
+        createdAt: "2026-08-02T00:00:00.000Z",
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+      expect(dispatched[0]).toMatchObject({
+        type: "thread.user-input.reject",
+        threadId: "thread-1",
+        requestId: "question-1",
+      });
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
   it.effect("adds generated command metadata", () =>
     Effect.gen(function* () {
       const dispatched: ClientOrchestrationCommand[] = [];

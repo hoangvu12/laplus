@@ -605,6 +605,7 @@ export interface ChatComposerProps {
   ) => Promise<unknown>;
   onSelectActivePendingUserInputOption: (questionId: string, optionLabel: string) => void;
   onAdvanceActivePendingUserInput: () => void;
+  onRejectActivePendingUserInput: (requestId: ApprovalRequestId) => void;
   onPreviousActivePendingUserInputQuestion: () => void;
   onChangeActivePendingUserInputCustomAnswer: (
     questionId: string,
@@ -688,6 +689,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onRespondToApproval,
     onSelectActivePendingUserInputOption,
     onAdvanceActivePendingUserInput,
+    onRejectActivePendingUserInput,
     onPreviousActivePendingUserInputQuestion,
     onChangeActivePendingUserInputCustomAnswer,
     onProviderModelSelect,
@@ -2691,11 +2693,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               <div className="rounded-t-[19px] border-b border-border/65 bg-muted/20">
                 <ComposerPendingUserInputPanel
                   pendingUserInputs={pendingUserInputs}
-                  respondingRequestIds={respondingRequestIds}
+                  respondingRequestIds={
+                    activePendingIsResponding && activePendingUserInput
+                      ? [activePendingUserInput.requestId]
+                      : []
+                  }
                   answers={activePendingDraftAnswers}
                   questionIndex={activePendingQuestionIndex}
                   onToggleOption={onSelectActivePendingUserInputOption}
                   onAdvance={onAdvanceActivePendingUserInput}
+                  onReject={onRejectActivePendingUserInput}
                 />
               </div>
             ) : showPlanFollowUpPrompt && activeProposedPlan ? (
@@ -2727,11 +2734,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             >
               <ComposerPendingUserInputPanel
                 pendingUserInputs={pendingUserInputs}
-                respondingRequestIds={respondingRequestIds}
+                respondingRequestIds={
+                  activePendingIsResponding && activePendingUserInput
+                    ? [activePendingUserInput.requestId]
+                    : []
+                }
                 answers={activePendingDraftAnswers}
                 questionIndex={activePendingQuestionIndex}
                 onToggleOption={onSelectActivePendingUserInputOption}
                 onAdvance={onAdvanceActivePendingUserInput}
+                onReject={onRejectActivePendingUserInput}
               />
               <div className="px-3 pb-3 sm:px-4">
                 <div

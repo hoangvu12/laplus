@@ -765,7 +765,7 @@ fn question(asked: &Value) -> Option<Value> {
     }
 
     Some(json!({
-        "id": text,
+        "id": asked.get("id").and_then(Value::as_str).unwrap_or(text),
         // The header is a chip beside the question, and the question itself is
         // the honest fallback — an empty one renders as a blank chip, and the
         // contract trims it to non-empty anyway.

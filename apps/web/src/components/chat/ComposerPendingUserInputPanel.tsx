@@ -15,6 +15,7 @@ interface PendingUserInputPanelProps {
   questionIndex: number;
   onToggleOption: (questionId: string, optionLabel: string) => void;
   onAdvance: () => void;
+  onReject: (requestId: ApprovalRequestId) => void;
 }
 
 export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserInputPanel({
@@ -24,6 +25,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
   questionIndex,
   onToggleOption,
   onAdvance,
+  onReject,
 }: PendingUserInputPanelProps) {
   if (pendingUserInputs.length === 0) return null;
   const activePrompt = pendingUserInputs[0];
@@ -38,6 +40,7 @@ export const ComposerPendingUserInputPanel = memo(function ComposerPendingUserIn
       questionIndex={questionIndex}
       onToggleOption={onToggleOption}
       onAdvance={onAdvance}
+      onReject={onReject}
     />
   );
 });
@@ -49,6 +52,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   questionIndex,
   onToggleOption,
   onAdvance,
+  onReject,
 }: {
   prompt: PendingUserInput;
   isResponding: boolean;
@@ -56,6 +60,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
   questionIndex: number;
   onToggleOption: (questionId: string, optionLabel: string) => void;
   onAdvance: () => void;
+  onReject: (requestId: ApprovalRequestId) => void;
 }) {
   const progress = derivePendingUserInputProgress(prompt.questions, answers, questionIndex);
   const activeQuestion = progress.activeQuestion;
@@ -163,6 +168,14 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
             {questionIndex + 1}/{prompt.questions.length}
           </span>
         ) : null}
+        <button
+          type="button"
+          disabled={isResponding}
+          className="ml-auto text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+          onClick={() => onReject(prompt.requestId)}
+        >
+          Reject
+        </button>
       </div>
       <p className="text-sm text-foreground/90">{activeQuestion.question}</p>
       {activeQuestion.multiSelect ? (

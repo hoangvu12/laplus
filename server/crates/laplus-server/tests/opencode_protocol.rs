@@ -284,6 +284,14 @@ fn sse_decoder_handles_chunks_multiline_heartbeats_unknowns_and_malformed_input(
 }
 
 #[test]
+fn question_v2_remains_an_observable_unknown_family() {
+    let mut decoder = SseDecoder::default();
+    let decoded = decoder.push(b"data: {\"type\":\"question.v2.asked\",\"properties\":{\"id\":\"q2\"}}\n\n");
+    assert_eq!(decoded.len(), 1);
+    assert!(decoded[0].as_ref().unwrap().is_unknown());
+}
+
+#[test]
 fn current_text_delta_event_is_a_known_compatible_event() {
     let mut decoder = SseDecoder::default();
     let events = decoder.push(

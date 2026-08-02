@@ -1245,6 +1245,7 @@ impl Shell {
             threads::UserInputAnswered {
                 request_id: respond.request_id.clone(),
                 answers: respond.answers.clone(),
+                rejected: respond.rejected,
             },
         ) {
             self.inner.threads.apply(
@@ -1388,6 +1389,7 @@ impl Shell {
         }
         let prepared =
             crate::session::prepare(&thread, &config.settings).map_err(CommandError::new)?;
+        let attachments = crate::attachments::resolve_all(&start.message.attachments, &start.message.message_id);
 
         // OpenCode's native busy-session prompt is a steer, not a queued new
         // turn. Keep the active turn id at both public boundaries: the user
@@ -1413,6 +1415,7 @@ impl Shell {
                     &starting,
                     turn_id,
                     start.message.text.clone(),
+                    attachments,
                 ).map_err(CommandError::new)?;
                 return Ok(sequence);
             }
@@ -1484,6 +1487,7 @@ impl Shell {
             &starting,
             turn_id,
             start.message.text.clone(),
+            attachments,
         ) {
             // The prompt is already in the transcript and the turn is already
             // marked running, so the refusal has to end them as well as being
@@ -2147,6 +2151,8 @@ struct RespondToUserInput {
     request_id: String,
     #[serde(default)]
     answers: Value,
+    #[serde(default)]
+    rejected: bool,
 }
 
 /// `project.meta.update` — the sidebar's rename dialog.
@@ -2722,7 +2728,17 @@ impl Command {
                 Ok(Command::RespondToUserInput(RespondToUserInput {
                     thread_id: non_blank(respond.thread_id, "threadId", kind)?,
                     request_id: non_blank(respond.request_id, "requestId", kind)?,
-                    ..respond
+                    answers: respond.answers,
+                    rejected: false,
+                }))
+            }
+            "thread.user-input.reject" => {
+                let reject: RespondToUserInput = read(payload, kind)?;
+                Ok(Command::RespondToUserInput(RespondToUserInput {
+                    thread_id: non_blank(reject.thread_id, "threadId", kind)?,
+                    request_id: non_blank(reject.request_id, "requestId", kind)?,
+                    answers: serde_json::json!({}),
+                    rejected: true,
                 }))
             }
             "thread.runtime-mode.set" => {

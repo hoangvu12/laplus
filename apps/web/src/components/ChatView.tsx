@@ -1158,6 +1158,9 @@ function ChatViewContent(props: ChatViewProps) {
   const respondToThreadUserInput = useAtomCommand(threadEnvironment.respondToUserInput, {
     reportFailure: false,
   });
+  const rejectThreadUserInput = useAtomCommand(threadEnvironment.rejectUserInput, {
+    reportFailure: false,
+  });
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
@@ -4786,6 +4789,28 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThreadId, environmentId, respondToThreadUserInput, setThreadError],
   );
 
+  const onRejectActivePendingUserInput = useCallback(
+    async (requestId: ApprovalRequestId) => {
+      if (!activeThreadId) return;
+      setRespondingUserInputRequestIds((existing) =>
+        existing.includes(requestId) ? existing : [...existing, requestId],
+      );
+      const result = await rejectThreadUserInput({
+        environmentId,
+        input: { threadId: activeThreadId, requestId },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          activeThreadId,
+          error instanceof Error ? error.message : "Failed to reject user input.",
+        );
+      }
+      setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
+    },
+    [activeThreadId, environmentId, rejectThreadUserInput, setThreadError],
+  );
+
   const setActivePendingUserInputQuestionIndex = useCallback(
     (nextQuestionIndex: number) => {
       if (!activePendingUserInput) {
@@ -5729,6 +5754,7 @@ function ChatViewContent(props: ChatViewProps) {
                               onSelectActivePendingUserInputOption
                             }
                             onAdvanceActivePendingUserInput={onAdvanceActivePendingUserInput}
+                            onRejectActivePendingUserInput={onRejectActivePendingUserInput}
                             onPreviousActivePendingUserInputQuestion={
                               onPreviousActivePendingUserInputQuestion
                             }

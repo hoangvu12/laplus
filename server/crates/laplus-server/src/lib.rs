@@ -67,6 +67,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod attachments;
 pub mod assets;
 pub mod auth;
 pub mod catalogue;

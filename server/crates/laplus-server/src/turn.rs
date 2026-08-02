@@ -263,8 +263,8 @@ impl Driver for Claude {
         Some(decide(&mut self.folding, driving, &line))
     }
 
-    async fn send(&mut self, text: &str) -> std::io::Result<()> {
-        self.agent.send(text).await
+    async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
+        self.agent.send(&prompt.text).await
     }
 
     async fn interrupt(&mut self, request_id: &str) -> std::io::Result<()> {
@@ -279,6 +279,7 @@ impl Driver for Claude {
         let answer = match reply {
             Reply::Decided(decision) => decision.answer(asked),
             Reply::Answers(answers) => crate::worklog::answers_for(asked, answers),
+            Reply::Rejected => crate::worklog::Decision::Decline.answer(asked),
         };
         self.agent.answer(&asked.request_id, &answer).await
     }

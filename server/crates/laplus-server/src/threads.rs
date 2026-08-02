@@ -86,6 +86,7 @@
 //!   [`crate::orchestration`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -320,9 +321,17 @@ pub struct Reconciliation {
 pub struct Prompt {
     pub turn_id: String,
     pub text: String,
+    pub attachments: Vec<PromptAttachment>,
     /// What the conversation said the agent should be running under when *this*
     /// turn was dispatched. See [`Retune`].
     pub wanted: Retune,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptAttachment {
+    pub mime: String,
+    pub filename: String,
+    pub path: PathBuf,
 }
 
 /// What the conversation says the agent should be running under, as of the turn
@@ -415,6 +424,7 @@ pub struct Answered {
 pub struct UserInputAnswered {
     pub request_id: String,
     pub answers: Value,
+    pub rejected: bool,
 }
 
 impl Threads {

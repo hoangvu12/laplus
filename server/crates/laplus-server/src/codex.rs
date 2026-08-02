@@ -356,7 +356,8 @@ impl Driver for Codex {
         Some(decided)
     }
 
-    async fn send(&mut self, text: &str) -> std::io::Result<()> {
+    async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
+        let text = &prompt.text;
         self.turn_id_unavailable = false;
         let (model, access) = match self.explicit_turn_config {
             true => (self.model.clone(), Some(self.access)),
