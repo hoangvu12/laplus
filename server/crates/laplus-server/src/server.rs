@@ -373,7 +373,7 @@ impl Server {
             ui,
             provider_maintenance,
             mcp_platform,
-            Arc::new(public_exposure::NetworkEndpointVerifier),
+            Arc::new(public_exposure::NetworkEndpointVerifier::default()),
         )
         .await
     }
@@ -2109,7 +2109,7 @@ mod tests {
                 Assets::none(),
                 watch::channel(false).1,
                 Arc::new(crate::mcp::Host::new()),
-                Arc::new(public_exposure::NetworkEndpointVerifier),
+                Arc::new(public_exposure::NetworkEndpointVerifier::default()),
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {

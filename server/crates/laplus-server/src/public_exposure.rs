@@ -1,7 +1,7 @@
 //! Operator-owned public endpoint registration and layered verification.
 
-use std::net::IpAddr;
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -41,13 +41,21 @@ pub fn normalize_hostname(input: &str) -> Result<String, &'static str> {
         reqwest::Url::parse(&format!("https://{candidate}"))
             .map_err(|_| "Enter a valid HTTPS hostname.")?
     };
-    if url.scheme() != "https" || url.host_str().is_none() || url.port().is_some()
-        || url.username() != "" || url.password().is_some() || url.path() != "/"
-        || url.query().is_some() || url.fragment().is_some()
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.port().is_some()
+        || url.username() != ""
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
         return Err("Enter a hostname only; HTTPS and the default port are required.");
     }
-    let host = url.host_str().ok_or("Enter a valid HTTPS hostname.")?.trim_end_matches('.');
+    let host = url
+        .host_str()
+        .ok_or("Enter a valid HTTPS hostname.")?
+        .trim_end_matches('.');
     if host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok() {
         return Err("A public DNS hostname is required.");
     }
@@ -80,9 +88,9 @@ pub fn public_address(address: IpAddr) -> bool {
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)
                 || (segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0])
                 || (segments[..3] == [0x0064, 0xff9b, 1])
-                || ip.to_ipv4_mapped().is_some_and(|mapped| {
-                    !public_address(IpAddr::V4(mapped))
-                }))
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| !public_address(IpAddr::V4(mapped))))
         }
     }
 }
@@ -105,10 +113,11 @@ fn verify_descriptor(
             message: "Cloudflare Access intercepted the environment descriptor.",
         });
     }
-    let body: serde_json::Value = serde_json::from_slice(body).map_err(|_| VerificationFailure {
-        kind: "identity",
-        message: "The endpoint did not return a laplus environment descriptor.",
-    })?;
+    let body: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| VerificationFailure {
+            kind: "identity",
+            message: "The endpoint did not return a laplus environment descriptor.",
+        })?;
     if body.get("environmentId").and_then(|value| value.as_str()) != Some(environment_id) {
         return Err(VerificationFailure {
             kind: "wrong-environment",
@@ -118,9 +127,7 @@ fn verify_descriptor(
     Ok(())
 }
 
-async fn read_descriptor_body(
-    response: reqwest::Response,
-) -> Result<Vec<u8>, VerificationFailure> {
+async fn read_descriptor_body(response: reqwest::Response) -> Result<Vec<u8>, VerificationFailure> {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -139,9 +146,8 @@ async fn read_descriptor_body(
     Ok(body)
 }
 
-pub type VerificationFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<(), VerificationFailure>> + Send + 'a>,
->;
+pub type VerificationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), VerificationFailure>> + Send + 'a>>;
 
 pub trait EndpointVerifier: std::fmt::Debug + Send + Sync {
     fn verify<'a>(
@@ -154,7 +160,28 @@ pub trait EndpointVerifier: std::fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug, Default)]
-pub struct NetworkEndpointVerifier;
+pub struct NetworkEndpointVerifier {
+    resolved_addresses: Option<Vec<std::net::SocketAddr>>,
+    trusted_root_der: Option<Vec<u8>>,
+    permit_non_public_test_addresses: bool,
+}
+
+impl NetworkEndpointVerifier {
+    /// A hermetic network boundary for integration tests. Production always
+    /// uses [`Default`], system DNS and platform roots; this keeps the real
+    /// HTTPS/WSS implementation under test without making a local peer public.
+    #[doc(hidden)]
+    pub fn with_hermetic_network(
+        resolved_addresses: Vec<std::net::SocketAddr>,
+        trusted_root_der: Vec<u8>,
+    ) -> Self {
+        Self {
+            resolved_addresses: Some(resolved_addresses),
+            trusted_root_der: Some(trusted_root_der),
+            permit_non_public_test_addresses: true,
+        }
+    }
+}
 
 pub fn next_background_delay(current: Duration, succeeded: bool) -> Duration {
     if succeeded {
@@ -172,81 +199,238 @@ impl EndpointVerifier for NetworkEndpointVerifier {
         http_token: &'a str,
         ws_token: &'a str,
     ) -> VerificationFuture<'a> {
-        Box::pin(verify(origin, environment_id, http_token, ws_token))
+        Box::pin(verify_with_network(
+            origin,
+            environment_id,
+            http_token,
+            ws_token,
+            self,
+        ))
     }
 }
 
-pub async fn verify(origin: &str, environment_id: &str, http_token: &str, ws_token: &str)
-    -> Result<(), VerificationFailure>
-{
-    let url = reqwest::Url::parse(origin).map_err(|_| VerificationFailure { kind: "dns", message: "The configured hostname is invalid." })?;
-    let host = url.host_str().ok_or(VerificationFailure { kind: "dns", message: "The configured hostname has no DNS name." })?;
-    let resolved = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::lookup_host((host, 443)),
+pub async fn verify(
+    origin: &str,
+    environment_id: &str,
+    http_token: &str,
+    ws_token: &str,
+) -> Result<(), VerificationFailure> {
+    verify_with_network(
+        origin,
+        environment_id,
+        http_token,
+        ws_token,
+        &NetworkEndpointVerifier::default(),
     )
+    .await
+}
+
+async fn verify_with_network(
+    origin: &str,
+    environment_id: &str,
+    http_token: &str,
+    ws_token: &str,
+    network: &NetworkEndpointVerifier,
+) -> Result<(), VerificationFailure> {
+    let url = reqwest::Url::parse(origin).map_err(|_| VerificationFailure {
+        kind: "dns",
+        message: "The configured hostname is invalid.",
+    })?;
+    let host = url.host_str().ok_or(VerificationFailure {
+        kind: "dns",
+        message: "The configured hostname has no DNS name.",
+    })?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let resolved = match &network.resolved_addresses {
+        Some(addresses) => addresses.clone(),
+        None => tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host((host, port)),
+        )
         .await
-        .map_err(|_| VerificationFailure { kind: "dns", message: "DNS lookup timed out." })?
-        .map_err(|_| VerificationFailure { kind: "dns", message: "DNS lookup failed." })?;
-    let resolved: Vec<_> = resolved.collect();
-    if resolved.is_empty() || !resolved.iter().all(|address| public_address(address.ip())) {
-        return Err(VerificationFailure { kind: "destination", message: "The hostname resolves to a disallowed address." });
+        .map_err(|_| VerificationFailure {
+            kind: "dns",
+            message: "DNS lookup timed out.",
+        })?
+        .map_err(|_| VerificationFailure {
+            kind: "dns",
+            message: "DNS lookup failed.",
+        })?
+        .collect(),
+    };
+    if resolved.is_empty()
+        || (!network.permit_non_public_test_addresses
+            && !resolved.iter().all(|address| public_address(address.ip())))
+    {
+        return Err(VerificationFailure {
+            kind: "destination",
+            message: "The hostname resolves to a disallowed address.",
+        });
     }
     // Pin every outbound protocol to the address that passed policy. Resolving
     // again in either client would leave a DNS-rebinding gap between the check
     // above and the authenticated request.
     let destination = resolved[0];
-    let client = reqwest::Client::builder().redirect(Policy::none()).timeout(Duration::from_secs(10))
-        .resolve(host, destination)
-        .build().map_err(|_| VerificationFailure { kind: "tls", message: "Could not prepare HTTPS verification." })?;
-    let descriptor = client.get(format!("{origin}/.well-known/t3/environment")).send().await
-        .map_err(|error| VerificationFailure { kind: if error.is_connect() { "tls" } else { "http" }, message: "The public HTTPS endpoint could not be reached." })?;
+    let mut client_builder = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(10))
+        .resolve(host, destination);
+    let ws_connector = if let Some(root_der) = &network.trusted_root_der {
+        let certificate =
+            reqwest::Certificate::from_der(root_der).map_err(|_| VerificationFailure {
+                kind: "tls",
+                message: "Could not read the trusted verification root.",
+            })?;
+        client_builder = client_builder.add_root_certificate(certificate);
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(root_der.clone()))
+            .map_err(|_| VerificationFailure {
+                kind: "tls",
+                message: "Could not read the trusted verification root.",
+            })?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+            config,
+        )))
+    } else {
+        None
+    };
+    let client = client_builder.build().map_err(|_| VerificationFailure {
+        kind: "tls",
+        message: "Could not prepare HTTPS verification.",
+    })?;
+    let descriptor = client
+        .get(format!("{origin}/.well-known/t3/environment"))
+        .send()
+        .await
+        .map_err(|error| VerificationFailure {
+            kind: if error.is_connect() { "tls" } else { "http" },
+            message: "The public HTTPS endpoint could not be reached.",
+        })?;
     let status = descriptor.status();
-    let content_type = descriptor.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let content_type = descriptor
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let body = read_descriptor_body(descriptor).await?;
     verify_descriptor(status, &content_type, &body, environment_id)?;
-    let challenge = client.get(format!("{origin}/api/access/cloudflare/challenge"))
-        .bearer_auth(http_token).send().await.map_err(|_| VerificationFailure { kind: "authentication", message: "The authenticated HTTP challenge failed." })?;
+    let challenge = client
+        .get(format!("{origin}/api/access/cloudflare/challenge"))
+        .bearer_auth(http_token)
+        .send()
+        .await
+        .map_err(|_| VerificationFailure {
+            kind: "authentication",
+            message: "The authenticated HTTP challenge failed.",
+        })?;
     if challenge.status().is_redirection()
-        || challenge.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).is_some_and(|value| value.contains("text/html"))
+        || challenge
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/html"))
     {
-        return Err(VerificationFailure { kind: "cloudflare-access", message: "An access page intercepted the authenticated HTTP challenge." });
+        return Err(VerificationFailure {
+            kind: "cloudflare-access",
+            message: "An access page intercepted the authenticated HTTP challenge.",
+        });
     }
     if !challenge.status().is_success() {
-        return Err(VerificationFailure { kind: "authentication", message: "The authenticated HTTP challenge was refused." });
+        return Err(VerificationFailure {
+            kind: "authentication",
+            message: "The authenticated HTTP challenge was refused.",
+        });
     }
-    let ws_url = format!("wss://{host}/api/access/cloudflare/challenge/ws");
-    let mut request = ws_url.into_client_request()
-        .map_err(|_| VerificationFailure { kind: "websocket", message: "The WebSocket challenge could not be prepared." })?;
+    let mut ws_url = url.clone();
+    ws_url.set_scheme("wss").map_err(|_| VerificationFailure {
+        kind: "websocket",
+        message: "The WebSocket challenge could not be prepared.",
+    })?;
+    ws_url.set_path("/api/access/cloudflare/challenge/ws");
+    ws_url.set_query(None);
+    ws_url.set_fragment(None);
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| VerificationFailure {
+            kind: "websocket",
+            message: "The WebSocket challenge could not be prepared.",
+        })?;
     request.headers_mut().insert(
         "Authorization",
-        format!("Bearer {ws_token}").parse()
-            .map_err(|_| VerificationFailure { kind: "websocket", message: "The WebSocket challenge could not be prepared." })?,
+        format!("Bearer {ws_token}")
+            .parse()
+            .map_err(|_| VerificationFailure {
+                kind: "websocket",
+                message: "The WebSocket challenge could not be prepared.",
+            })?,
     );
-    let stream = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(destination)).await
-        .map_err(|_| VerificationFailure { kind: "websocket", message: "The authenticated WebSocket upgrade timed out." })?
-        .map_err(|_| VerificationFailure { kind: "websocket", message: "The authenticated WebSocket connection failed." })?;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(destination),
+    )
+    .await
+    .map_err(|_| VerificationFailure {
+        kind: "websocket",
+        message: "The authenticated WebSocket upgrade timed out.",
+    })?
+    .map_err(|_| VerificationFailure {
+        kind: "websocket",
+        message: "The authenticated WebSocket connection failed.",
+    })?;
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_tungstenite::client_async_tls_with_config(request, stream, None, None),
-    ).await
-        .map_err(|_| VerificationFailure { kind: "websocket", message: "The authenticated WebSocket upgrade timed out." })?
-        .map_err(|error| {
-            if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
-                let intercepted = response.status().is_redirection()
-                    || response.headers().get("content-type").and_then(|value| value.to_str().ok()).is_some_and(|value| value.contains("text/html"));
-                if intercepted {
-                    return VerificationFailure { kind: "cloudflare-access-websocket", message: "An access page intercepted the WebSocket upgrade." };
-                }
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, ws_connector),
+    )
+    .await
+    .map_err(|_| VerificationFailure {
+        kind: "websocket",
+        message: "The authenticated WebSocket upgrade timed out.",
+    })?
+    .map_err(|error| {
+        if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
+            let intercepted = response.status().is_redirection()
+                || response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("text/html"));
+            if intercepted {
+                return VerificationFailure {
+                    kind: "cloudflare-access-websocket",
+                    message: "An access page intercepted the WebSocket upgrade.",
+                };
             }
-            VerificationFailure { kind: "websocket", message: "The authenticated WebSocket upgrade failed." }
+        }
+        VerificationFailure {
+            kind: "websocket",
+            message: "The authenticated WebSocket upgrade failed.",
+        }
+    })?;
+    let answer = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .map_err(|_| VerificationFailure {
+            kind: "websocket",
+            message: "The authenticated WebSocket challenge timed out.",
+        })?
+        .ok_or(VerificationFailure {
+            kind: "websocket",
+            message: "The authenticated WebSocket closed before answering.",
+        })?
+        .map_err(|_| VerificationFailure {
+            kind: "websocket",
+            message: "The authenticated WebSocket challenge failed.",
         })?;
-    let answer = tokio::time::timeout(Duration::from_secs(10), socket.next()).await
-        .map_err(|_| VerificationFailure { kind: "websocket", message: "The authenticated WebSocket challenge timed out." })?
-        .ok_or(VerificationFailure { kind: "websocket", message: "The authenticated WebSocket closed before answering." })?
-        .map_err(|_| VerificationFailure { kind: "websocket", message: "The authenticated WebSocket challenge failed." })?;
     if answer.into_text().ok().as_deref() != Some("ok") {
-        return Err(VerificationFailure { kind: "websocket", message: "The authenticated WebSocket challenge returned an unexpected answer." });
+        return Err(VerificationFailure {
+            kind: "websocket",
+            message: "The authenticated WebSocket challenge returned an unexpected answer.",
+        });
     }
     Ok(())
 }
@@ -257,7 +441,10 @@ mod tests {
 
     #[test]
     fn registration_normalizes_only_https_hostnames() {
-        assert_eq!(normalize_hostname(" Example.COM. "), Ok("https://example.com".into()));
+        assert_eq!(
+            normalize_hostname(" Example.COM. "),
+            Ok("https://example.com".into())
+        );
         assert!(normalize_hostname("http://example.com").is_err());
         assert!(normalize_hostname("https://example.com/path").is_err());
         assert!(normalize_hostname("127.0.0.1").is_err());
