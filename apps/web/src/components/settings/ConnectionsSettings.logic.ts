@@ -1,3 +1,5 @@
+import type { AdvertisedEndpoint, ExternalTunnelEndpointSnapshot } from "@t3tools/contracts";
+
 /**
  * The parts of `ConnectionsSettings` that are decisions rather than markup,
  * split out so they can be tested — the shape `KeybindingsSettings.logic.ts` and
@@ -47,3 +49,26 @@ export const formatRemoteBackendHost = (httpBaseUrl: string): string | null => {
     return trimmed;
   }
 };
+
+export const mergeVerifiedExternalEndpoint = (
+  endpoints: ReadonlyArray<AdvertisedEndpoint>,
+  snapshot: ExternalTunnelEndpointSnapshot | null,
+): ReadonlyArray<AdvertisedEndpoint> => {
+  const external = snapshot?.advertisedEndpoint;
+  if (!external || endpoints.some((endpoint) => endpoint.id === external.id)) return endpoints;
+  return [...endpoints, external];
+};
+
+export const visibleNetworkAdvertisedEndpoints = (
+  endpoints: ReadonlyArray<AdvertisedEndpoint>,
+  networkAccessible: boolean,
+): ReadonlyArray<AdvertisedEndpoint> =>
+  endpoints.filter(
+    (endpoint) =>
+      endpoint.provider.id !== "tailscale" &&
+      (networkAccessible || endpoint.provider.id === "cloudflare"),
+  );
+
+export const registeredExternalTunnelHostname = (
+  snapshot: ExternalTunnelEndpointSnapshot,
+): string => snapshot.httpsOrigin ?? "";

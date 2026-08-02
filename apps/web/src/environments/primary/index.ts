@@ -15,11 +15,14 @@ export {
 
 export {
   createServerPairingCredential,
+  forgetExternalTunnelEndpoint,
   fetchSessionState,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,
   listServerClientSessions,
   listServerPairingLinks,
+  readExternalTunnelEndpoint,
+  registerExternalTunnelEndpoint,
   peekPairingTokenFromUrl,
   PrimaryEnvironmentPairingCredentialRejectedError,
   PrimaryEnvironmentRequestError,
@@ -28,6 +31,7 @@ export {
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
+  testExternalTunnelEndpoint,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,
   takePairingTokenFromUrl,

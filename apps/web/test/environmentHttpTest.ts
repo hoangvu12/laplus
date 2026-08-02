@@ -12,6 +12,8 @@ import {
   type AuthSessionState,
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
+  type ExternalTunnelEndpointSnapshot,
+  type RegisterExternalTunnelEndpointInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Context from "effect/Context";
@@ -35,6 +37,12 @@ interface EnvironmentHttpTestScenario {
   readonly pairingCredential?: (
     payload: AuthCreatePairingCredentialInput,
   ) => Effect.Effect<AuthPairingCredentialResult>;
+  readonly externalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
+  readonly registerExternalTunnel?: (
+    payload: RegisterExternalTunnelEndpointInput,
+  ) => Effect.Effect<ExternalTunnelEndpointSnapshot>;
+  readonly testExternalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
+  readonly forgetExternalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -42,6 +50,10 @@ export interface EnvironmentHttpTestCalls {
   session: number;
   browserSession: Array<AuthBrowserSessionRequest>;
   pairingCredential: Array<AuthCreatePairingCredentialInput>;
+  externalTunnel: number;
+  registerExternalTunnel: Array<RegisterExternalTunnelEndpointInput>;
+  testExternalTunnel: number;
+  forgetExternalTunnel: number;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -66,10 +78,14 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     session: 0,
     browserSession: [],
     pairingCredential: [],
+    externalTunnel: 0,
+    registerExternalTunnel: [],
+    testExternalTunnel: 0,
+    forgetExternalTunnel: 0,
   };
 
   const client = await Effect.runPromise(
-    HttpApiTest.groups(EnvironmentHttpApi, ["metadata", "auth"]).pipe(
+    HttpApiTest.groups(EnvironmentHttpApi, ["metadata", "auth", "access"]).pipe(
       Effect.provide([
         NodeHttpServer.layerHttpServices,
         HttpApiBuilder.group(EnvironmentHttpApi, "metadata", (handlers) =>
@@ -116,6 +132,33 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
             .handle("clients", () => unexpectedEndpoint("auth.clients"))
             .handle("revokeClient", () => unexpectedEndpoint("auth.revokeClient"))
             .handle("revokeOtherClients", () => unexpectedEndpoint("auth.revokeOtherClients")),
+        ),
+        HttpApiBuilder.group(EnvironmentHttpApi, "access", (handlers) =>
+          handlers
+            .handle("externalTunnel", () => {
+              calls.externalTunnel += 1;
+              return scenario.externalTunnel?.() ?? unexpectedEndpoint("access.externalTunnel");
+            })
+            .handle("registerExternalTunnel", ({ payload }) => {
+              calls.registerExternalTunnel.push(payload);
+              return (
+                scenario.registerExternalTunnel?.(payload) ??
+                unexpectedEndpoint("access.registerExternalTunnel")
+              );
+            })
+            .handle("testExternalTunnel", () => {
+              calls.testExternalTunnel += 1;
+              return (
+                scenario.testExternalTunnel?.() ?? unexpectedEndpoint("access.testExternalTunnel")
+              );
+            })
+            .handle("forgetExternalTunnel", () => {
+              calls.forgetExternalTunnel += 1;
+              return (
+                scenario.forgetExternalTunnel?.() ??
+                unexpectedEndpoint("access.forgetExternalTunnel")
+              );
+            }),
         ),
       ]),
       Effect.provideService(EnvironmentAuthenticatedAuth, authenticatedAuth),

@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, RawQuery, State, WebSocketUpgrade};
@@ -94,14 +94,27 @@ pub struct ServerState {
     unrecognized_messages: AtomicUsize,
     unparseable_frames: AtomicUsize,
     mcp: Arc<dyn crate::mcp::Platform>,
-    diagnostic_challenges: Mutex<HashSet<String>>,
+    diagnostic_challenges: Mutex<HashMap<String, DiagnosticChallenge>>,
     external_verification_running: AtomicBool,
     external_verification_finished: Notify,
     external_verification_generation: AtomicU64,
+    endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticChallenge {
+    Http,
+    WebSocket,
 }
 
 impl ServerState {
-    fn new(services: Services, ui: Assets, shutdown: watch::Receiver<bool>, mcp: Arc<dyn crate::mcp::Platform>) -> Self {
+    fn new(
+        services: Services,
+        ui: Assets,
+        shutdown: watch::Receiver<bool>,
+        mcp: Arc<dyn crate::mcp::Platform>,
+        endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
+    ) -> Self {
         ServerState {
             services,
             ui,
@@ -112,10 +125,11 @@ impl ServerState {
             unrecognized_messages: AtomicUsize::new(0),
             unparseable_frames: AtomicUsize::new(0),
             mcp,
-            diagnostic_challenges: Mutex::new(HashSet::new()),
+            diagnostic_challenges: Mutex::new(HashMap::new()),
             external_verification_running: AtomicBool::new(false),
             external_verification_finished: Notify::new(),
             external_verification_generation: AtomicU64::new(0),
+            endpoint_verifier,
         }
     }
 
@@ -352,6 +366,27 @@ impl Server {
         provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
         mcp_platform: Arc<dyn crate::mcp::Platform>,
     ) -> std::io::Result<Server> {
+        Self::bind_with_platform_and_verifier(
+            port,
+            config,
+            database,
+            ui,
+            provider_maintenance,
+            mcp_platform,
+            Arc::new(public_exposure::NetworkEndpointVerifier),
+        )
+        .await
+    }
+
+    pub async fn bind_with_platform_and_verifier(
+        port: u16,
+        config: ServerConfig,
+        database: Database,
+        ui: Assets,
+        provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
+        mcp_platform: Arc<dyn crate::mcp::Platform>,
+        endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
+    ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         // And the name this data directory answers to, settled here for the
         // reason above and one more: this is the one place the config and the
@@ -391,7 +426,13 @@ impl Server {
             terminals: Terminals::new(),
             provider_maintenance,
         };
-        let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe(), mcp_platform));
+        let state = Arc::new(ServerState::new(
+            services,
+            ui,
+            shutdown.subscribe(),
+            mcp_platform,
+            endpoint_verifier,
+        ));
 
         // Public checks are intentionally much less frequent than connector
         // readiness checks. Failure doubles the bounded delay; a small process-
@@ -416,8 +457,7 @@ impl Server {
                     continue;
                 }
                 let succeeded = run_external_verification(&verifier_state).await;
-                delay = if succeeded { std::time::Duration::from_secs(300) }
-                    else { std::cmp::min(delay.saturating_mul(2), std::time::Duration::from_secs(1800)) };
+                delay = public_exposure::next_background_delay(delay, succeeded);
             }
         });
 
@@ -1444,9 +1484,23 @@ async fn run_external_verification(state: &Arc<ServerState>) -> bool {
     };
     let http_token = pairing::opaque_token().expect("operating system randomness");
     let ws_token = pairing::opaque_token().expect("operating system randomness");
-    state.diagnostic_challenges.lock().expect("diagnostic challenges").extend([http_token.clone(), ws_token.clone()]);
+    state.diagnostic_challenges.lock().expect("diagnostic challenges").extend([
+        (http_token.clone(), DiagnosticChallenge::Http),
+        (ws_token.clone(), DiagnosticChallenge::WebSocket),
+    ]);
     let environment_id = state.config().current().environment.environment_id.clone();
-    let result = public_exposure::verify(&endpoint.https_origin, &environment_id, &http_token, &ws_token).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        state.endpoint_verifier
+            .verify(&endpoint.https_origin, &environment_id, &http_token, &ws_token),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(public_exposure::VerificationFailure {
+            kind: "http",
+            message: "Public endpoint verification timed out.",
+        })
+    });
     state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(&http_token);
     state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(&ws_token);
     let succeeded = result.is_ok();
@@ -1463,14 +1517,27 @@ fn diagnostic_token(headers: &HeaderMap) -> Option<&str> {
 
 async fn diagnostic_http_challenge(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     let Some(token) = diagnostic_token(&headers) else { return StatusCode::UNAUTHORIZED.into_response() };
-    if !state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(token) { return StatusCode::UNAUTHORIZED.into_response(); }
+    if !consume_diagnostic_challenge(&state, token, DiagnosticChallenge::Http) { return StatusCode::UNAUTHORIZED.into_response(); }
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
 async fn diagnostic_ws_challenge(State(state): State<Arc<ServerState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     let Some(token) = diagnostic_token(&headers) else { return StatusCode::UNAUTHORIZED.into_response() };
-    if !state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(token) { return StatusCode::UNAUTHORIZED.into_response(); }
+    if !consume_diagnostic_challenge(&state, token, DiagnosticChallenge::WebSocket) { return StatusCode::UNAUTHORIZED.into_response(); }
     ws.on_upgrade(|mut socket| async move { let _ = socket.send(Message::Text("ok".into())).await; })
+}
+
+fn consume_diagnostic_challenge(
+    state: &ServerState,
+    token: &str,
+    expected: DiagnosticChallenge,
+) -> bool {
+    let mut challenges = state.diagnostic_challenges.lock().expect("diagnostic challenges");
+    if challenges.get(token) != Some(&expected) {
+        return false;
+    }
+    challenges.remove(token);
+    true
 }
 
 /// Write a 401 to the log and answer with the body the client decodes.
@@ -2042,6 +2109,7 @@ mod tests {
                 Assets::none(),
                 watch::channel(false).1,
                 Arc::new(crate::mcp::Host::new()),
+                Arc::new(public_exposure::NetworkEndpointVerifier),
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {

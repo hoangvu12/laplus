@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { formatRemoteBackendHost } from "./ConnectionsSettings.logic";
+import {
+  formatRemoteBackendHost,
+  mergeVerifiedExternalEndpoint,
+  registeredExternalTunnelHostname,
+  visibleNetworkAdvertisedEndpoints,
+} from "./ConnectionsSettings.logic";
 
 describe("the host a remote environment was paired with", () => {
   /**
@@ -43,5 +48,48 @@ describe("the host a remote environment was paired with", () => {
   it("has no answer for an empty value", () => {
     expect(formatRemoteBackendHost("")).toBe(null);
     expect(formatRemoteBackendHost("   ")).toBe(null);
+  });
+});
+
+describe("verified external tunnel advertisement", () => {
+  const endpoint = {
+    id: "cloudflare-external:https://laplus.example.com",
+    label: "Cloudflare Tunnel",
+    provider: { id: "cloudflare", label: "Cloudflare Tunnel", kind: "tunnel", isAddon: true },
+    httpBaseUrl: "https://laplus.example.com",
+    wsBaseUrl: "wss://laplus.example.com",
+    reachability: "public",
+    compatibility: { hostedHttpsApp: "compatible", desktopApp: "compatible" },
+    source: "user",
+    status: "available",
+  } as const;
+
+  it("joins the established endpoint rail only after verification", () => {
+    const pending = {
+      configured: true,
+      httpsOrigin: endpoint.httpBaseUrl,
+      wssOrigin: endpoint.wsBaseUrl,
+      ownership: "external",
+      health: { connector: "external", https: "unknown", webSocket: "unknown" },
+      verificationState: "pending",
+      failureKind: null,
+      failureMessage: null,
+      lastAttemptAt: null,
+      lastVerifiedAt: null,
+      advertisedEndpoint: null,
+    } as const;
+    expect(mergeVerifiedExternalEndpoint([], pending)).toEqual([]);
+    expect(registeredExternalTunnelHostname(pending)).toBe("https://laplus.example.com");
+    expect(
+      mergeVerifiedExternalEndpoint([], {
+        ...pending,
+        verificationState: "verified",
+        advertisedEndpoint: endpoint,
+      }),
+    ).toEqual([endpoint]);
+  });
+
+  it("stays visible while the listener remains loopback-only", () => {
+    expect(visibleNetworkAdvertisedEndpoints([endpoint], false)).toEqual([endpoint]);
   });
 });

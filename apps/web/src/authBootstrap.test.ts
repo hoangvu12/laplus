@@ -519,4 +519,50 @@ describe("resolveInitialServerAuthGateState", () => {
       { label: "Julius iPhone", scopes: ["orchestration:read"] },
     ]);
   });
+
+  it("routes external tunnel administration through the selected primary environment client", async () => {
+    const snapshot = {
+      configured: false,
+      httpsOrigin: null,
+      wssOrigin: null,
+      ownership: "external",
+      health: { connector: "external", https: "unknown", webSocket: "unknown" },
+      verificationState: "unconfigured",
+      failureKind: null,
+      failureMessage: null,
+      lastAttemptAt: null,
+      lastVerifiedAt: null,
+      advertisedEndpoint: null,
+    } as const;
+    const testApi = await installEnvironmentHttpTest({
+      externalTunnel: () => Effect.succeed(snapshot),
+      registerExternalTunnel: () =>
+        Effect.succeed({
+          ...snapshot,
+          configured: true,
+          httpsOrigin: "https://laplus.example.com",
+          wssOrigin: "wss://laplus.example.com",
+          verificationState: "pending",
+        }),
+      testExternalTunnel: () => Effect.succeed(snapshot),
+      forgetExternalTunnel: () => Effect.succeed(snapshot),
+    });
+    disposeHttpTest = testApi.dispose;
+    const {
+      forgetExternalTunnelEndpoint,
+      readExternalTunnelEndpoint,
+      registerExternalTunnelEndpoint,
+      testExternalTunnelEndpoint,
+    } = await import("./environments/primary");
+
+    await readExternalTunnelEndpoint();
+    await registerExternalTunnelEndpoint("laplus.example.com");
+    await testExternalTunnelEndpoint();
+    await forgetExternalTunnelEndpoint();
+
+    expect(testApi.calls.externalTunnel).toBe(1);
+    expect(testApi.calls.registerExternalTunnel).toEqual([{ hostname: "laplus.example.com" }]);
+    expect(testApi.calls.testExternalTunnel).toBe(1);
+    expect(testApi.calls.forgetExternalTunnel).toBe(1);
+  });
 });

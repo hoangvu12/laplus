@@ -40,7 +40,12 @@ import * as Option from "effect/Option";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
-import { formatRemoteBackendHost } from "./ConnectionsSettings.logic";
+import {
+  formatRemoteBackendHost,
+  mergeVerifiedExternalEndpoint,
+  registeredExternalTunnelHostname,
+  visibleNetworkAdvertisedEndpoints,
+} from "./ConnectionsSettings.logic";
 import { resolveDesktopPairingUrl } from "./pairingUrls";
 import {
   SettingsPageContainer,
@@ -94,9 +99,13 @@ import { Textarea } from "../ui/textarea";
 import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "../../pairingUrl";
 import {
   createServerPairingCredential,
+  forgetExternalTunnelEndpoint,
+  readExternalTunnelEndpoint,
+  registerExternalTunnelEndpoint,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
+  testExternalTunnelEndpoint,
   isLoopbackHostname,
   usePrimarySessionState,
   type ServerClientSessionRecord,
@@ -139,32 +148,13 @@ const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 const EMPTY_ADVERTISED_ENDPOINTS: ReadonlyArray<AdvertisedEndpoint> = [];
 const EMPTY_DISCOVERED_SSH_HOSTS: ReadonlyArray<DesktopDiscoveredSshHost> = [];
 
-async function externalTunnelRequest(
-  path: string,
-  init?: RequestInit,
-): Promise<ExternalTunnelEndpointSnapshot> {
-  const response = await fetch(path, {
-    ...init,
-    credentials: "same-origin",
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  const body = (await response.json().catch(() => null)) as
-    | ExternalTunnelEndpointSnapshot
-    | { message?: string; requiredScope?: string }
-    | null;
-  if (!response.ok) {
-    const detail =
-      body && "requiredScope" in body
-        ? `Requires ${body.requiredScope}.`
-        : body && "message" in body
-          ? body.message
-          : "The request failed.";
-    throw new Error(detail);
-  }
-  return body as ExternalTunnelEndpointSnapshot;
-}
-
-export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: boolean }) {
+export function CloudflareTunnelSettingsRow({
+  canWrite,
+  onSnapshot,
+}: {
+  readonly canWrite: boolean;
+  readonly onSnapshot?: (snapshot: ExternalTunnelEndpointSnapshot) => void;
+}) {
   const [snapshot, setSnapshot] = useState<ExternalTunnelEndpointSnapshot | null>(null);
   const [open, setOpen] = useState(false);
   const [hostname, setHostname] = useState("");
@@ -174,31 +164,40 @@ export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: b
 
   const refresh = useCallback(async () => {
     try {
-      setSnapshot(await externalTunnelRequest("/api/access/cloudflare"));
+      const next = await readExternalTunnelEndpoint();
+      setSnapshot(next);
+      setHostname(registeredExternalTunnelHostname(next));
+      onSnapshot?.(next);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load Cloudflare Tunnel state.");
     }
-  }, []);
+  }, [onSnapshot]);
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
-  const mutate = useCallback(async (path: string, body?: unknown) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const next = await externalTunnelRequest(path, {
-        method: "POST",
-        body: body === undefined ? "{}" : JSON.stringify(body),
-      });
-      setSnapshot(next);
-      if (next.httpsOrigin) setHostname(next.httpsOrigin);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "The request failed.");
-    } finally {
-      setBusy(false);
-    }
-  }, []);
+  const mutate = useCallback(
+    async (operation: "register" | "test" | "forget") => {
+      setBusy(true);
+      setError(null);
+      try {
+        const next =
+          operation === "register"
+            ? await registerExternalTunnelEndpoint(hostname)
+            : operation === "test"
+              ? await testExternalTunnelEndpoint()
+              : await forgetExternalTunnelEndpoint();
+        setSnapshot(next);
+        onSnapshot?.(next);
+        if (next.httpsOrigin) setHostname(next.httpsOrigin);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "The request failed.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [hostname, onSnapshot],
+  );
 
   const createPairing = useCallback(async () => {
     if (!snapshot?.httpsOrigin) return;
@@ -270,6 +269,7 @@ export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: b
               {snapshot.verificationState !== "verified" ? " · stale" : ""}
             </p>
           ) : null}
+          {snapshot?.configured ? <CloudflareLayeredHealth snapshot={snapshot} /> : null}
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
           {pairingUrl ? (
             <div className="flex flex-col items-center gap-3 rounded-md border p-3">
@@ -280,20 +280,12 @@ export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: b
         </DialogPanel>
         <DialogFooter>
           {snapshot?.configured && canWrite ? (
-            <Button
-              variant="destructive"
-              disabled={busy}
-              onClick={() => void mutate("/api/access/cloudflare/forget")}
-            >
+            <Button variant="destructive" disabled={busy} onClick={() => void mutate("forget")}>
               Forget
             </Button>
           ) : null}
           {snapshot?.configured && canWrite ? (
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => void mutate("/api/access/cloudflare/test")}
-            >
+            <Button variant="outline" disabled={busy} onClick={() => void mutate("test")}>
               Test now
             </Button>
           ) : null}
@@ -305,7 +297,7 @@ export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: b
           {canWrite ? (
             <Button
               disabled={busy || hostname.trim() === ""}
-              onClick={() => void mutate("/api/access/cloudflare", { hostname })}
+              onClick={() => void mutate("register")}
             >
               {busy ? "Working…" : snapshot?.configured ? "Update" : "Register"}
             </Button>
@@ -313,6 +305,19 @@ export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: b
         </DialogFooter>
       </DialogPopup>
     </Dialog>
+  );
+}
+
+export function CloudflareLayeredHealth({
+  snapshot,
+}: {
+  readonly snapshot: ExternalTunnelEndpointSnapshot;
+}) {
+  return (
+    <p className="text-xs text-muted-foreground">
+      Connector {snapshot.health.connector} · HTTPS {snapshot.health.https} · WebSocket{" "}
+      {snapshot.health.webSocket}
+    </p>
   );
 }
 
@@ -1744,6 +1749,12 @@ export function ConnectionsSettings() {
   const primaryServerConfig = primaryEnvironment?.serverConfig ?? null;
   const primaryVersionMismatch = resolveServerConfigVersionMismatch(primaryServerConfig);
   const [isAdvertisedEndpointListExpanded, setIsAdvertisedEndpointListExpanded] = useState(false);
+  const [externalTunnelSnapshot, setExternalTunnelSnapshot] =
+    useState<ExternalTunnelEndpointSnapshot | null>(null);
+  const acceptExternalTunnelSnapshot = useCallback(
+    (snapshot: ExternalTunnelEndpointSnapshot) => setExternalTunnelSnapshot(snapshot),
+    [],
+  );
   const defaultAdvertisedEndpointKey = useUiStateStore(
     (state) => state.defaultAdvertisedEndpointKey,
   );
@@ -1805,8 +1816,10 @@ export function ConnectionsSettings() {
   const isLoadingDiscoveredSshHosts = desktopSshHosts.isPending;
   const discoveredSshHostsError = sshConnectionError ?? desktopSshHosts.error;
   const desktopServerExposureState = desktopNetworkAccess.data?.serverExposureState ?? null;
-  const desktopAdvertisedEndpoints =
-    desktopNetworkAccess.data?.advertisedEndpoints ?? EMPTY_ADVERTISED_ENDPOINTS;
+  const desktopAdvertisedEndpoints = useMemo(() => {
+    const endpoints = desktopNetworkAccess.data?.advertisedEndpoints ?? EMPTY_ADVERTISED_ENDPOINTS;
+    return mergeVerifiedExternalEndpoint(endpoints, externalTunnelSnapshot);
+  }, [desktopNetworkAccess.data?.advertisedEndpoints, externalTunnelSnapshot]);
   const desktopServerExposureError =
     desktopServerExposureMutationError ?? desktopNetworkAccess.error;
   const desktopAccessManagementError =
@@ -2230,9 +2243,10 @@ export function ConnectionsSettings() {
   );
   const visibleDesktopNetworkAdvertisedEndpoints = useMemo(
     () =>
-      isLocalBackendNetworkAccessible
-        ? desktopAdvertisedEndpoints.filter((endpoint) => !isTailscaleHttpsEndpoint(endpoint))
-        : [],
+      visibleNetworkAdvertisedEndpoints(
+        desktopAdvertisedEndpoints,
+        isLocalBackendNetworkAccessible,
+      ),
     [desktopAdvertisedEndpoints, isLocalBackendNetworkAccessible],
   );
   const visibleDesktopAdvertisedEndpoints = useMemo(
@@ -2243,7 +2257,9 @@ export function ConnectionsSettings() {
     [tailscaleHttpsEndpoint, visibleDesktopNetworkAdvertisedEndpoints],
   );
   const isLocalBackendRemotelyReachable =
-    isLocalBackendNetworkAccessible || tailscaleHttpsEndpoint?.status === "available";
+    isLocalBackendNetworkAccessible ||
+    tailscaleHttpsEndpoint?.status === "available" ||
+    externalTunnelSnapshot?.advertisedEndpoint?.status === "available";
   const defaultDesktopNetworkAdvertisedEndpoint = useMemo(
     () =>
       selectPairingEndpoint(visibleDesktopNetworkAdvertisedEndpoints, defaultAdvertisedEndpointKey),
@@ -2638,7 +2654,7 @@ export function ConnectionsSettings() {
                     only where something can act on it — a tailnet name still
                     works here, through the tunnel list below. */}
                 {desktopBridge ? renderTailscaleRow() : null}
-                <CloudflareTunnelSettingsRow canWrite />
+                <CloudflareTunnelSettingsRow canWrite onSnapshot={acceptExternalTunnelSnapshot} />
               </>
             ) : (
               <>{renderDisabledNetworkAccessRow()}</>
@@ -2829,7 +2845,12 @@ export function ConnectionsSettings() {
             title="Administrative access"
             description="Pairing links and client-session management require the access:write scope for this backend."
           />
-          {canReadLocalBackendAccess ? <CloudflareTunnelSettingsRow canWrite={false} /> : null}
+          {canReadLocalBackendAccess ? (
+            <CloudflareTunnelSettingsRow
+              canWrite={canManageLocalBackend}
+              onSnapshot={acceptExternalTunnelSnapshot}
+            />
+          ) : null}
         </SettingsSection>
       )}
 

@@ -7,7 +7,11 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
-import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
+import {
+  EnvironmentHttpCommonError,
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type ExternalTunnelEndpointSnapshot,
+} from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -32,6 +36,10 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "list-client-sessions",
   "revoke-client-session",
   "revoke-other-client-sessions",
+  "read-external-tunnel-endpoint",
+  "register-external-tunnel-endpoint",
+  "test-external-tunnel-endpoint",
+  "forget-external-tunnel-endpoint",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -408,6 +416,70 @@ export async function createServerPairingCredential(input?: {
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "create-pairing-credential",
+      cause: error,
+    });
+  }
+}
+
+export async function readExternalTunnelEndpoint(): Promise<ExternalTunnelEndpointSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.externalTunnel({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "read-external-tunnel-endpoint",
+      cause: error,
+    });
+  }
+}
+
+export async function registerExternalTunnelEndpoint(
+  hostname: string,
+): Promise<ExternalTunnelEndpointSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.registerExternalTunnel({ headers: {}, payload: { hostname } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "register-external-tunnel-endpoint",
+      cause: error,
+    });
+  }
+}
+
+export async function testExternalTunnelEndpoint(): Promise<ExternalTunnelEndpointSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.testExternalTunnel({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "test-external-tunnel-endpoint",
+      cause: error,
+    });
+  }
+}
+
+export async function forgetExternalTunnelEndpoint(): Promise<ExternalTunnelEndpointSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.forgetExternalTunnel({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "forget-external-tunnel-endpoint",
       cause: error,
     });
   }

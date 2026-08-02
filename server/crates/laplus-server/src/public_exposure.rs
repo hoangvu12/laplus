@@ -1,12 +1,16 @@
 //! Operator-owned public endpoint registration and layered verification.
 
 use std::net::IpAddr;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+const DESCRIPTOR_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -89,6 +93,89 @@ pub struct VerificationFailure {
     pub message: &'static str,
 }
 
+fn verify_descriptor(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    body: &[u8],
+    environment_id: &str,
+) -> Result<(), VerificationFailure> {
+    if status.is_redirection() || content_type.contains("text/html") {
+        return Err(VerificationFailure {
+            kind: "cloudflare-access",
+            message: "Cloudflare Access intercepted the environment descriptor.",
+        });
+    }
+    let body: serde_json::Value = serde_json::from_slice(body).map_err(|_| VerificationFailure {
+        kind: "identity",
+        message: "The endpoint did not return a laplus environment descriptor.",
+    })?;
+    if body.get("environmentId").and_then(|value| value.as_str()) != Some(environment_id) {
+        return Err(VerificationFailure {
+            kind: "wrong-environment",
+            message: "The hostname reaches a different laplus environment.",
+        });
+    }
+    Ok(())
+}
+
+async fn read_descriptor_body(
+    response: reqwest::Response,
+) -> Result<Vec<u8>, VerificationFailure> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| VerificationFailure {
+            kind: "identity",
+            message: "The endpoint descriptor could not be read.",
+        })?;
+        if body.len().saturating_add(chunk.len()) > DESCRIPTOR_BODY_LIMIT {
+            return Err(VerificationFailure {
+                kind: "identity",
+                message: "The endpoint descriptor was too large.",
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+pub type VerificationFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<(), VerificationFailure>> + Send + 'a>,
+>;
+
+pub trait EndpointVerifier: std::fmt::Debug + Send + Sync {
+    fn verify<'a>(
+        &'a self,
+        origin: &'a str,
+        environment_id: &'a str,
+        http_token: &'a str,
+        ws_token: &'a str,
+    ) -> VerificationFuture<'a>;
+}
+
+#[derive(Debug, Default)]
+pub struct NetworkEndpointVerifier;
+
+pub fn next_background_delay(current: Duration, succeeded: bool) -> Duration {
+    if succeeded {
+        Duration::from_secs(300)
+    } else {
+        std::cmp::min(current.saturating_mul(2), Duration::from_secs(1800))
+    }
+}
+
+impl EndpointVerifier for NetworkEndpointVerifier {
+    fn verify<'a>(
+        &'a self,
+        origin: &'a str,
+        environment_id: &'a str,
+        http_token: &'a str,
+        ws_token: &'a str,
+    ) -> VerificationFuture<'a> {
+        Box::pin(verify(origin, environment_id, http_token, ws_token))
+    }
+}
+
 pub async fn verify(origin: &str, environment_id: &str, http_token: &str, ws_token: &str)
     -> Result<(), VerificationFailure>
 {
@@ -114,17 +201,10 @@ pub async fn verify(origin: &str, environment_id: &str, http_token: &str, ws_tok
         .build().map_err(|_| VerificationFailure { kind: "tls", message: "Could not prepare HTTPS verification." })?;
     let descriptor = client.get(format!("{origin}/.well-known/t3/environment")).send().await
         .map_err(|error| VerificationFailure { kind: if error.is_connect() { "tls" } else { "http" }, message: "The public HTTPS endpoint could not be reached." })?;
-    if descriptor.status().is_redirection() {
-        return Err(VerificationFailure { kind: "cloudflare-access", message: "Cloudflare Access intercepted the environment descriptor." });
-    }
-    let content_type = descriptor.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if content_type.contains("text/html") {
-        return Err(VerificationFailure { kind: "cloudflare-access", message: "An HTML access page intercepted the environment descriptor." });
-    }
-    let body: serde_json::Value = descriptor.json().await.map_err(|_| VerificationFailure { kind: "identity", message: "The endpoint did not return a laplus environment descriptor." })?;
-    if body.get("environmentId").and_then(|v| v.as_str()) != Some(environment_id) {
-        return Err(VerificationFailure { kind: "wrong-environment", message: "The hostname reaches a different laplus environment." });
-    }
+    let status = descriptor.status();
+    let content_type = descriptor.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let body = read_descriptor_body(descriptor).await?;
+    verify_descriptor(status, &content_type, &body, environment_id)?;
     let challenge = client.get(format!("{origin}/api/access/cloudflare/challenge"))
         .bearer_auth(http_token).send().await.map_err(|_| VerificationFailure { kind: "authentication", message: "The authenticated HTTP challenge failed." })?;
     if challenge.status().is_redirection()
@@ -198,5 +278,78 @@ mod tests {
         assert!(!public_address("64:ff9b:1::a00:1".parse().unwrap()));
         assert!(public_address("1.1.1.1".parse().unwrap()));
         assert!(public_address("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn background_verification_backoff_is_bounded_and_success_resets_it() {
+        let mut delay = Duration::from_secs(30);
+        for expected in [60, 120, 240, 480, 960, 1800, 1800] {
+            delay = next_background_delay(delay, false);
+            assert_eq!(delay, Duration::from_secs(expected));
+        }
+        assert_eq!(next_background_delay(delay, true), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn redirects_html_and_wrong_environment_descriptors_stay_distinct() {
+        let redirected = verify_descriptor(
+            reqwest::StatusCode::FOUND,
+            "text/plain",
+            b"",
+            "environment-a",
+        )
+        .unwrap_err();
+        assert_eq!(redirected.kind, "cloudflare-access");
+
+        let access_page = verify_descriptor(
+            reqwest::StatusCode::OK,
+            "text/html",
+            b"<html>sign in</html>",
+            "environment-a",
+        )
+        .unwrap_err();
+        assert_eq!(access_page.kind, "cloudflare-access");
+
+        let wrong = verify_descriptor(
+            reqwest::StatusCode::OK,
+            "application/json",
+            br#"{"environmentId":"environment-b"}"#,
+            "environment-a",
+        )
+        .unwrap_err();
+        assert_eq!(wrong.kind, "wrong-environment");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_descriptor_is_refused_without_buffering_the_whole_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = vec![b'x'; DESCRIPTOR_BODY_LIMIT + 1];
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/descriptor"))
+            .await
+            .unwrap();
+
+        let failure = read_descriptor_body(response).await.unwrap_err();
+        assert_eq!(failure.kind, "identity");
+        assert_eq!(failure.message, "The endpoint descriptor was too large.");
+        peer.await.unwrap();
     }
 }

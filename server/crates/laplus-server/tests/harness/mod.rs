@@ -252,6 +252,28 @@ impl TestServer {
         TestServer::bootstrapped(server, Some(preferences)).await
     }
 
+    pub async fn start_at_with_endpoint_verifier(
+        database: &Path,
+        verifier: std::sync::Arc<dyn laplus_server::public_exposure::EndpointVerifier>,
+    ) -> TestServer {
+        let preferences = tempfile::tempdir().expect("a temporary directory");
+        let mut config = ServerConfig::detect().with_remote_access(RemoteAccess::none());
+        config.preferences = preferences.path().to_path_buf();
+        somewhere_that_is_not_the_developers(&mut config);
+        let server = Server::bind_with_platform_and_verifier(
+            0,
+            config,
+            Database::open(database).expect("the database opens"),
+            Assets::none(),
+            laplus_server::provider_maintenance::ProviderMaintenance::new(),
+            std::sync::Arc::new(laplus_server::mcp::Host::new()),
+            verifier,
+        )
+        .await
+        .expect("server binds with supplied endpoint verifier");
+        TestServer::bootstrapped(server, Some(preferences)).await
+    }
+
     /// A server keeping the developer's configuration in `preferences`.
     ///
     /// Start a second one on the same directory and that is a restart, which is

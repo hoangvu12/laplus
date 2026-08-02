@@ -2,6 +2,134 @@ mod harness;
 
 use harness::{ClientIdentity, TestServer};
 use serde_json::json;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
+use futures_util::StreamExt;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+#[derive(Debug)]
+struct ScriptedVerifier {
+    results: Mutex<VecDeque<Result<(), (&'static str, &'static str)>>>,
+    credentials: Mutex<Vec<(String, String)>>,
+}
+
+impl ScriptedVerifier {
+    fn new(results: impl IntoIterator<Item = Result<(), (&'static str, &'static str)>>) -> Self {
+        Self {
+            results: Mutex::new(results.into_iter().collect()),
+            credentials: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl laplus_server::public_exposure::EndpointVerifier for ScriptedVerifier {
+    fn verify<'a>(
+        &'a self,
+        _origin: &'a str,
+        _environment_id: &'a str,
+        http_token: &'a str,
+        ws_token: &'a str,
+    ) -> laplus_server::public_exposure::VerificationFuture<'a> {
+        self.credentials
+            .lock()
+            .unwrap()
+            .push((http_token.to_string(), ws_token.to_string()));
+        let result = self.results.lock().unwrap().pop_front().expect("a scripted result");
+        Box::pin(async move {
+            result.map_err(|(kind, message)| {
+                laplus_server::public_exposure::VerificationFailure { kind, message }
+            })
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct BlockingVerifier {
+    calls: AtomicUsize,
+    release: Notify,
+}
+
+#[derive(Debug, Default)]
+struct LoopbackChallengeVerifier {
+    base_url: Mutex<Option<String>>,
+}
+
+impl laplus_server::public_exposure::EndpointVerifier for LoopbackChallengeVerifier {
+    fn verify<'a>(
+        &'a self,
+        _origin: &'a str,
+        _environment_id: &'a str,
+        http_token: &'a str,
+        ws_token: &'a str,
+    ) -> laplus_server::public_exposure::VerificationFuture<'a> {
+        let base_url = self.base_url.lock().unwrap().clone().expect("server URL installed");
+        Box::pin(async move {
+            let client = reqwest::Client::new();
+            let http_url = format!("{base_url}/api/access/cloudflare/challenge");
+            let wrong_protocol = client.get(&http_url).bearer_auth(ws_token).send().await.unwrap();
+            assert_eq!(wrong_protocol.status(), reqwest::StatusCode::UNAUTHORIZED);
+            let first = client.get(&http_url).bearer_auth(http_token).send().await.unwrap();
+            assert_eq!(first.status(), reqwest::StatusCode::OK);
+            let repeated = client.get(&http_url).bearer_auth(http_token).send().await.unwrap();
+            assert_eq!(repeated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            let ws_url = format!(
+                "{}/api/access/cloudflare/challenge/ws",
+                base_url.replacen("http://", "ws://", 1)
+            );
+            let mut wrong_protocol_request = ws_url.clone().into_client_request().unwrap();
+            wrong_protocol_request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {http_token}").parse().unwrap(),
+            );
+            let wrong_protocol =
+                tokio_tungstenite::connect_async(wrong_protocol_request).await.unwrap_err();
+            assert!(matches!(
+                wrong_protocol,
+                tokio_tungstenite::tungstenite::Error::Http(ref response)
+                    if response.status() == 401
+            ));
+            let mut request = ws_url.clone().into_client_request().unwrap();
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {ws_token}").parse().unwrap(),
+            );
+            let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            assert_eq!(socket.next().await.unwrap().unwrap().into_text().unwrap(), "ok");
+
+            let mut repeated_request = ws_url.into_client_request().unwrap();
+            repeated_request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {ws_token}").parse().unwrap(),
+            );
+            let repeated = tokio_tungstenite::connect_async(repeated_request).await.unwrap_err();
+            assert!(matches!(
+                repeated,
+                tokio_tungstenite::tungstenite::Error::Http(ref response)
+                    if response.status() == 401
+            ));
+            Ok(())
+        })
+    }
+}
+
+impl laplus_server::public_exposure::EndpointVerifier for BlockingVerifier {
+    fn verify<'a>(
+        &'a self,
+        _origin: &'a str,
+        _environment_id: &'a str,
+        _http_token: &'a str,
+        _ws_token: &'a str,
+    ) -> laplus_server::public_exposure::VerificationFuture<'a> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.release.notified().await;
+            Ok(())
+        })
+    }
+}
 
 const GRANT_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
 const BOOTSTRAP_TOKEN_TYPE: &str = "urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap";
@@ -33,6 +161,12 @@ async fn setup_state_requires_read_and_mutations_require_write_without_disclosin
     assert_eq!(refused.status, 403);
     assert_eq!(refused.body["requiredScope"], "access:write");
     assert!(refused.body.get("verificationState").is_none());
+    for path in ["/api/access/cloudflare/test", "/api/access/cloudflare/forget"] {
+        let refused = server.post_json_as(path, &reader, &json!({})).await;
+        assert_eq!(refused.status, 403);
+        assert_eq!(refused.body["requiredScope"], "access:write");
+        assert!(refused.body.get("verificationState").is_none());
+    }
     server.stop().await;
 }
 
@@ -97,5 +231,112 @@ async fn registration_rejects_probe_shaped_and_private_destinations() {
         let response = server.post_json("/api/access/cloudflare", &json!({"hostname": hostname})).await;
         assert_eq!(response.status, 400, "{hostname}: {}", response.text);
     }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn layered_verification_keeps_stale_success_and_never_exposes_diagnostic_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let verifier = Arc::new(ScriptedVerifier::new([
+        Ok(()),
+        Err(("dns", "DNS lookup failed.")),
+        Err(("tls", "TLS negotiation failed.")),
+        Err(("identity", "The endpoint was not a laplus environment.")),
+        Err(("cloudflare-access", "Cloudflare Access intercepted the descriptor.")),
+        Err(("wrong-environment", "The hostname reaches another environment.")),
+        Err(("authentication", "The one-time HTTP challenge was refused.")),
+        Err(("websocket", "The authenticated WebSocket upgrade failed.")),
+    ]));
+    let server = TestServer::start_at_with_endpoint_verifier(&path, verifier.clone()).await;
+    server
+        .post_json(
+            "/api/access/cloudflare",
+            &json!({"hostname": "laplus.example.com"}),
+        )
+        .await;
+
+    let verified = server.post_json("/api/access/cloudflare/test", &json!({})).await;
+    assert_eq!(verified.body["verificationState"], "verified");
+    assert_eq!(verified.body["health"]["https"], "healthy");
+    assert_eq!(verified.body["health"]["webSocket"], "healthy");
+    assert_eq!(verified.body["advertisedEndpoint"]["status"], "available");
+    let last_success = verified.body["lastVerifiedAt"].clone();
+
+    for (kind, https, websocket) in [
+        ("dns", "failed", "unknown"),
+        ("tls", "failed", "unknown"),
+        ("identity", "failed", "unknown"),
+        ("cloudflare-access", "failed", "unknown"),
+        ("wrong-environment", "failed", "unknown"),
+        ("authentication", "failed", "unknown"),
+        ("websocket", "healthy", "failed"),
+    ] {
+        let failed = server.post_json("/api/access/cloudflare/test", &json!({})).await;
+        assert_eq!(failed.body["failureKind"], kind);
+        assert_eq!(failed.body["health"]["https"], https);
+        assert_eq!(failed.body["health"]["webSocket"], websocket);
+        assert_eq!(failed.body["lastVerifiedAt"], last_success);
+        assert!(failed.body["advertisedEndpoint"].is_null());
+    }
+
+    let snapshot = server.get("/api/access/cloudflare").await;
+    let persisted = std::fs::read(&path).unwrap();
+    for (http_token, ws_token) in verifier.credentials.lock().unwrap().iter() {
+        assert_ne!(http_token, ws_token);
+        assert!(!snapshot.text.contains(http_token));
+        assert!(!snapshot.text.contains(ws_token));
+        assert!(!persisted.windows(http_token.len()).any(|window| window == http_token.as_bytes()));
+        assert!(!persisted.windows(ws_token.len()).any(|window| window == ws_token.as_bytes()));
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn concurrent_test_now_requests_share_one_bounded_verification() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let verifier = Arc::new(BlockingVerifier::default());
+    let server = TestServer::start_at_with_endpoint_verifier(&path, verifier.clone()).await;
+    server
+        .post_json(
+            "/api/access/cloudflare",
+            &json!({"hostname": "laplus.example.com"}),
+        )
+        .await;
+
+    let body = json!({});
+    let first = server.post_json("/api/access/cloudflare/test", &body);
+    let second = server.post_json("/api/access/cloudflare/test", &body);
+    let release = async {
+        while verifier.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        verifier.release.notify_waiters();
+    };
+    let (first, second, ()) = tokio::join!(first, second, release);
+
+    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.body["verificationState"], "verified");
+    assert_eq!(second.body["verificationState"], "verified");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn diagnostic_http_and_websocket_credentials_are_distinct_and_single_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let verifier = Arc::new(LoopbackChallengeVerifier::default());
+    let server = TestServer::start_at_with_endpoint_verifier(&path, verifier.clone()).await;
+    *verifier.base_url.lock().unwrap() = Some(format!("http://{}", server.addr()));
+    server
+        .post_json(
+            "/api/access/cloudflare",
+            &json!({"hostname": "laplus.example.com"}),
+        )
+        .await;
+
+    let verified = server.post_json("/api/access/cloudflare/test", &json!({})).await;
+    assert_eq!(verified.body["verificationState"], "verified");
     server.stop().await;
 }
