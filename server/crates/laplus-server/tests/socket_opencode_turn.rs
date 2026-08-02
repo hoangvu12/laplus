@@ -27,6 +27,7 @@ use futures_util::stream;
 use harness::{
     conversation::{
         activity, assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
+        revert_checkpoint,
         respond_to_approval, start_turn, start_turn_in,
     },
     workspace::Workspace,
@@ -475,6 +476,8 @@ struct PeerState {
     resume: ResumeBehavior,
     gets: Arc<AtomicUsize>,
     creates: Arc<AtomicUsize>,
+    rollback_probe: Option<PathBuf>,
+    rollback_fails: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -604,6 +607,37 @@ async fn move_session(
 ) -> Result<Json<Value>, StatusCode> {
     append(&state.log, json!({"operation":"move","body":body}));
     if matches!(state.resume, ResumeBehavior::MoveFailure) {
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    } else {
+        Ok(Json(json!(true)))
+    }
+}
+
+async fn session_messages(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<PeerState>,
+) -> Json<Value> {
+    append(&state.log, json!({"operation":"messages","sessionId":session_id}));
+    Json(json!([
+        {"info":{"id":"assistant-1","role":"assistant"},"parts":[]},
+        {"info":{"id":"assistant-2","role":"assistant"},"parts":[]}
+    ]))
+}
+
+async fn revert_session(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<PeerState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    if let Some(probe) = &state.rollback_probe {
+        assert_eq!(
+            std::fs::read_to_string(probe).expect("restored file exists before provider rollback"),
+            "before\n",
+            "the working tree must be restored before OpenCode history is touched"
+        );
+    }
+    append(&state.log, json!({"operation":"revert","sessionId":session_id,"body":body}));
+    if state.rollback_fails {
         Err(StatusCode::INTERNAL_SERVER_ERROR)
     } else {
         Ok(Json(json!(true)))
@@ -752,6 +786,18 @@ impl ExternalOpenCode {
         Self::start_configured_with_resume(None, None, false, resume).await
     }
 
+    async fn for_rollback(probe: PathBuf, fails: bool) -> Self {
+        Self::start_configured_with_rollback(
+            None,
+            None,
+            false,
+            ResumeBehavior::Normal,
+            Some(probe),
+            fails,
+        )
+        .await
+    }
+
     async fn start_with_idle_release(
         password: Option<&str>,
         idle_release: Option<Arc<Notify>>,
@@ -779,6 +825,25 @@ impl ExternalOpenCode {
         permissions: bool,
         resume: ResumeBehavior,
     ) -> Self {
+        Self::start_configured_with_rollback(
+            password,
+            idle_release,
+            permissions,
+            resume,
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn start_configured_with_rollback(
+        password: Option<&str>,
+        idle_release: Option<Arc<Notify>>,
+        permissions: bool,
+        resume: ResumeBehavior,
+        rollback_probe: Option<PathBuf>,
+        rollback_fails: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
         let state = PeerState {
@@ -794,6 +859,8 @@ impl ExternalOpenCode {
             idle_release,
             permissions,
             resume,
+            rollback_probe,
+            rollback_fails,
             ..Default::default()
         };
         let prompts = state.prompts.clone();
@@ -803,6 +870,8 @@ impl ExternalOpenCode {
             .route("/session", post(create_session))
             .route("/session/{id}", get(get_session).patch(update_session))
             .route("/session/{id}/fork", post(fork_session))
+            .route("/session/{id}/message", get(session_messages))
+            .route("/session/{id}/revert", post(revert_session))
             .route("/experimental/control-plane/move-session", post(move_session))
             .route("/session/{id}/prompt_async", post(prompt))
             .route("/session/{id}/abort", post(abort))
@@ -1251,6 +1320,110 @@ fn stored_opencode_cursor(database: &Path) -> String {
         [],
         |row| row.get(0),
     ).unwrap()
+}
+
+async fn checkpointed_external_thread(
+    peer: &ExternalOpenCode,
+    database: &Path,
+    workspace: &Workspace,
+) {
+    let first = TestServer::start_at_with_config(database, peer.config(None)).await;
+    let mut client = first.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("rollback-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("rollback-project", "rollback-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let watch = client.watch_conversation("rollback-thread").await;
+    let mut turn = start_turn("rollback-thread", "rollback-message-1", "first");
+    turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    client.events_through_the_checkpoint(&watch, 1).await;
+    client.close().await;
+    first.stop().await;
+
+    workspace.put("tracked.txt", "after\n");
+    workspace.put("later.txt", "only in the removed turn\n");
+    peer.reset_prompts();
+    let second = TestServer::start_at_with_config(database, peer.config(None)).await;
+    let mut client = second.connect().await;
+    let watch = client.watch_conversation("rollback-thread").await;
+    let mut turn = follow_up("rollback-thread", "rollback-message-2", "second");
+    turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    client.events_through_the_checkpoint(&watch, 2).await;
+    client.close().await;
+    second.stop().await;
+    peer.reset_prompts();
+}
+
+async fn rollback_outcome(fails: bool) {
+    let data = tempfile::tempdir().unwrap();
+    let database = data.path().join("registry.sqlite");
+    let workspace = Workspace::with(&["tracked.txt"]);
+    workspace.put("tracked.txt", "before\n");
+    workspace.init_repository().commit("initial");
+    let probe = workspace.path().join("tracked.txt");
+    let peer = ExternalOpenCode::for_rollback(probe, fails).await;
+    checkpointed_external_thread(&peer, &database, &workspace).await;
+    let cursor_before = rusqlite::Connection::open(&database).unwrap().query_row::<String, _, _>(
+        "SELECT provider_resume_cursor FROM threads WHERE id = 'rollback-thread'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+
+    let restarted = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let mut client = restarted.connect().await;
+    let watch = client.watch_conversation("rollback-thread").await;
+    client.call("projects.listEntries", json!({"cwd": workspace.cwd()})).await.expect_success();
+    client.call("orchestration.dispatchCommand", revert_checkpoint("rollback-thread", 1)).await.expect_success();
+    let seen = client.values_until(&watch, |item| {
+        if fails {
+            item["event"]["payload"]["activity"]["kind"] == "revert.failed"
+        } else {
+            item["event"]["type"] == "thread.reverted"
+        }
+    }).await;
+    assert_eq!(workspace.read("tracked.txt"), "before\n");
+    let search = client.call(
+        "projects.searchEntries",
+        json!({"cwd":workspace.cwd(),"query":"later.txt","limit":10}),
+    ).await.expect_success();
+    assert_eq!(search["entries"], json!([]), "workspace search must use the refreshed restored index");
+    let reference = laplus_server::checkpoints::reference("rollback-thread", 2);
+    let later_ref_exists = workspace.try_git(&["rev-parse", "--verify", "--quiet", &reference]).status.success();
+    assert_eq!(later_ref_exists, fails, "later refs are pruned only after provider success");
+    assert_eq!(
+        rusqlite::Connection::open(&database).unwrap().query_row::<String, _, _>(
+            "SELECT provider_resume_cursor FROM threads WHERE id = 'rollback-thread'",
+            [],
+            |row| row.get(0),
+        ).unwrap(),
+        cursor_before,
+        "rollback must not replace the adopted continuation cursor"
+    );
+    assert_eq!(
+        seen.iter().any(|item| item["event"]["type"] == "thread.reverted"),
+        !fails,
+        "failure must not publish false completion"
+    );
+
+    let requests = peer.requests_through(9).await;
+    let tail = requests.iter().rev().take(4).rev().map(|entry| entry["operation"].as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(tail, vec!["get", "update", "messages", "revert"]);
+    assert_eq!(requests.last().unwrap()["body"], json!({"messageID":"assistant-1"}));
+    client.close().await;
+    restarted.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn opencode_checkpoint_rollback_orders_tree_history_refs_and_completion() {
+    rollback_outcome(false).await;
+}
+
+#[tokio::test]
+async fn opencode_checkpoint_rollback_keeps_the_recoverable_partial_state_on_provider_failure() {
+    rollback_outcome(true).await;
 }
 
 async fn resume_external_turn(peer: &ExternalOpenCode, database: &Path) -> Vec<Value> {

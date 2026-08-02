@@ -308,6 +308,18 @@ pub fn restore(root: &Path, reference: &str) -> Result<(), Unavailable> {
     run(root, &environment, &["read-tree", "-m", "-u", &photograph])
 }
 
+/// Delete checkpoint refs strictly later than `turn_count`.
+///
+/// Kept separate from [`restore`] because the provider rollback sits between
+/// them. If that remote operation fails, retaining these refs is the recovery
+/// evidence that makes the partial state explicit rather than destructive.
+pub fn prune_after(root: &Path, thread_id: &str, turn_count: u64, latest: u64) -> Result<(), Unavailable> {
+    for count in turn_count.saturating_add(1)..=latest {
+        run(root, &[], &["update-ref", "-d", &reference(thread_id, count)])?;
+    }
+    Ok(())
+}
+
 /// One git in the scratch index, refusing on anything but success.
 fn run(
     root: &Path,

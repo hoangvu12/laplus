@@ -7,18 +7,31 @@ remains visible and recoverable.
 
 **Blocked by:** 15 — Resume safely across restarts and CWD changes.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Checkpoint revert restores the filesystem and refreshes the workspace
+- [x] Checkpoint revert restores the filesystem and refreshes the workspace
       index before asking OpenCode to revert history
-- [ ] Provider history is rolled back by the exact number of removed turns
-- [ ] Later checkpoint references are pruned only after provider rollback
+- [x] Provider history is rolled back by the exact number of removed turns
+- [x] Later checkpoint references are pruned only after provider rollback
       succeeds
-- [ ] Successful completion is published only after tree, provider and ref work
+- [x] Successful completion is published only after tree, provider and ref work
       has finished
-- [ ] If provider rollback fails, the restored tree remains, later refs remain,
+- [x] If provider rollback fails, the restored tree remains, later refs remain,
       failure is reported and false completion is not published
-- [ ] The adopted resume cursor remains usable after successful rollback and is
+- [x] The adopted resume cursor remains usable after successful rollback and is
       not silently replaced after failure
-- [ ] Socket tests use a real temporary repository and scripted OpenCode peer to
+- [x] Socket tests use a real temporary repository and scripted OpenCode peer to
       assert operation order and both outcomes
+
+## Where landed
+
+- `server/crates/laplus-server/src/orchestration.rs` coordinates restore,
+  workspace refresh, OpenCode rollback, ref pruning and final publication.
+- `server/crates/laplus-server/src/opencode.rs` translates removed turn counts
+  into OpenCode's retained assistant-message boundary without replacing the
+  durable cursor.
+- `server/crates/laplus-server/src/checkpoints.rs` removes only checkpoint refs
+  later than the retained turn, after provider success.
+- `server/crates/laplus-server/tests/socket_opencode_turn.rs` covers successful
+  and failed rollback across a Laplus restart with a real Git repository and a
+  scripted external OpenCode peer.

@@ -112,10 +112,15 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         )
         .await
         .unwrap();
+    client.messages("ses_1").await.unwrap();
     client.fork_session("ses_1").await.unwrap();
     client.move_session("ses_1", "/work tree").await.unwrap();
     client
         .prompt("ses_1", &json!({"parts":[{"type":"text","text":"hi"}]}))
+        .await
+        .unwrap();
+    client
+        .prompt_sync("ses_1", &json!({"parts":[{"type":"text","text":"short"}]}))
         .await
         .unwrap();
     client.abort("ses_1").await.unwrap();
@@ -133,6 +138,7 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         .await
         .unwrap();
     client.reject_question("que_2").await.unwrap();
+    client.delete_session("ses_1").await.unwrap();
 
     let requests = requests.lock().unwrap();
     assert!(requests
@@ -147,15 +153,18 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
             "/api/agent",
             "/api/session",
             "/api/session/ses_1",
+            "/api/session/ses_1/message",
             "/api/session/ses_1/fork",
             "/api/experimental/control-plane/move-session",
             "/api/session/ses_1/prompt_async",
+            "/api/session/ses_1/message",
             "/api/session/ses_1/abort",
             "/api/session/ses_1/revert",
             "/api/permission/per_1/reply",
             "/api/session/ses_1/permissions/legacy_1",
             "/api/question/que_1/reply",
             "/api/question/que_2/reject",
+            "/api/session/ses_1",
         ]
     );
     assert_eq!(
@@ -166,9 +175,9 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         serde_json::from_slice::<Value>(&requests[4].3).unwrap()["permission"][0]["action"],
         "allow"
     );
-    assert_eq!(serde_json::from_slice::<Value>(&requests[5].3).unwrap(), json!({}));
+    assert_eq!(serde_json::from_slice::<Value>(&requests[6].3).unwrap(), json!({}));
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[6].3).unwrap(),
+        serde_json::from_slice::<Value>(&requests[7].3).unwrap(),
         json!({"sessionID":"ses_1","destination":{"directory":"/work tree"},"moveChanges":false})
     );
     let _ = stop.send(());

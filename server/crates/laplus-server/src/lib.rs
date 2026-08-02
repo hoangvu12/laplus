@@ -109,6 +109,7 @@ pub mod startup;
 pub mod store;
 pub mod subscriptions;
 pub mod terminal;
+pub mod text_generation;
 pub mod threads;
 pub mod transcripts;
 pub mod turn;

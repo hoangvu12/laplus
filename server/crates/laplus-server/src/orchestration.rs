@@ -539,7 +539,7 @@ impl Shell {
                     interaction_mode: set.interaction_mode,
                 },
             )?,
-            Command::RevertCheckpoint(revert) => self.revert_checkpoint(revert)?,
+            Command::RevertCheckpoint(revert) => self.revert_checkpoint(revert, index, config)?,
             Command::StopSession { thread_id } => self.stop_session(&thread_id)?,
         };
 
@@ -629,12 +629,18 @@ impl Shell {
     /// disk, this is the read loop, and a folder that has been moved is reported
     /// the same way a `git` that refused is: as a failure on the conversation
     /// rather than as a refusal of a command that had already been accepted.
-    fn revert_checkpoint(&self, revert: RevertCheckpointPayload) -> Result<i64, CommandError> {
+    fn revert_checkpoint(
+        &self,
+        revert: RevertCheckpointPayload,
+        index: &Index,
+        config: &ServerConfig,
+    ) -> Result<i64, CommandError> {
         let RevertCheckpointPayload {
             thread_id,
             turn_count,
         } = revert;
         let reviewing = self.reviewing(&thread_id)?;
+        let thread = self.open_thread(&thread_id)?;
         if reviewing.checkpoints == 0 || turn_count > reviewing.checkpoints {
             return Err(CommandError::new(format!(
                 "The state of this project at turn {turn_count} was not recorded, so there is \
@@ -660,13 +666,86 @@ impl Shell {
         // owed the answer either way.
         let threads = self.inner.threads.clone();
         let workspace_root = reviewing.workspace_root;
-        tokio::task::spawn_blocking(move || {
-            let restored = WorkspaceRoot::check(&workspace_root)
-                .map_err(|rejection| rejection.message())
-                .and_then(|root| {
-                    crate::checkpoints::restore(root.path(), &reference)
-                        .map_err(|why| why.detail())
-                });
+        let latest = reviewing.checkpoints;
+        let index = index.clone();
+        let settings = config.settings.clone();
+        tokio::spawn(async move {
+            let checked = WorkspaceRoot::check(&workspace_root)
+                .map_err(|rejection| rejection.message());
+            let root = match checked {
+                Ok(root) => root,
+                Err(why) => {
+                    publish_revert_failure(&threads, &thread_id, turn_count, &why, false);
+                    return;
+                }
+            };
+            let root_path = root.path().to_path_buf();
+            let restored = tokio::task::spawn_blocking({
+                let root_path = root_path.clone();
+                move || crate::checkpoints::restore(&root_path, &reference).map_err(|why| why.detail())
+            })
+            .await
+            .map_err(|why| format!("the filesystem restore task stopped: {why}"))
+            .and_then(|restored| restored);
+
+            if let Err(why) = restored {
+                publish_revert_failure(&threads, &thread_id, turn_count, &why, false);
+                return;
+            }
+
+            // The restore bypasses the watcher on some platforms. Refresh now,
+            // before the provider is touched, so the file picker already
+            // describes the restored tree even when rollback fails afterwards.
+            let refreshed = tokio::task::spawn_blocking({
+                let index = index.clone();
+                let workspace_root = workspace_root.clone();
+                move || {
+                    crate::filesystem::ListEntries::read(&json!({"cwd": workspace_root}))
+                        .and_then(|call| call.run(&index))
+                        .map(|_| ())
+                        .map_err(|error| {
+                            error.get("message").and_then(Value::as_str)
+                                .unwrap_or("the workspace index could not be refreshed")
+                                .to_string()
+                        })
+                }
+            })
+            .await
+            .map_err(|why| format!("the workspace refresh task stopped: {why}"))
+            .and_then(|refreshed| refreshed);
+            if let Err(why) = refreshed {
+                publish_revert_failure(&threads, &thread_id, turn_count, &why, true);
+                return;
+            }
+
+            // Provider history is an OpenCode capability. Preserve the shared
+            // filesystem-only behavior for the other drivers.
+            if thread.provider.driver != crate::provider::OPENCODE_DRIVER {
+                threads.apply(&thread_id, Change::Reverted { turn_count });
+                return;
+            }
+
+            let prepared = match crate::session::prepare(&thread, &settings) {
+                Ok(prepared) => prepared,
+                Err(why) => {
+                    publish_revert_failure(&threads, &thread_id, turn_count, &why, true);
+                    return;
+                }
+            };
+            let starting = crate::session::starting(&thread, &workspace_root, prepared);
+            if let Err(why) = crate::opencode::rollback(&starting, latest - turn_count).await {
+                publish_revert_failure(&threads, &thread_id, turn_count, &why, true);
+                return;
+            }
+
+            let pruning_thread_id = thread_id.clone();
+            let pruned = tokio::task::spawn_blocking(move || {
+                crate::checkpoints::prune_after(&root_path, &pruning_thread_id, turn_count, latest)
+                    .map_err(|why| why.detail())
+            })
+            .await
+            .map_err(|why| format!("the checkpoint cleanup task stopped: {why}"))
+            .and_then(|pruned| pruned);
 
             // **A failure is never published as a completion**, which is the
             // criterion this arm exists for: a client that folded
@@ -675,7 +754,7 @@ impl Shell {
             // Said in the conversation rather than only to a log, the way a
             // checkpoint that could not be taken is — the developer is looking at
             // the conversation, and this is the only place left to tell them.
-            match restored {
+            match pruned {
                 Ok(()) => {
                     threads.apply(&thread_id, Change::Reverted { turn_count });
                 }
@@ -685,8 +764,9 @@ impl Shell {
                         Change::Activity(crate::threads::Activity::failed(
                             "revert.failed",
                             &format!(
-                                "The project could not be put back to how it looked at turn \
-                                 {turn_count}, so it is still as this conversation left it: {why}"
+                                "The project and OpenCode history were put back to turn \
+                                 {turn_count}, but later checkpoint references could not all be \
+                                 removed, so completion was not published: {why}"
                             ),
                         )),
                     );
@@ -2188,6 +2268,31 @@ struct SetInteractionModePayload {
 struct RevertCheckpointPayload {
     thread_id: String,
     turn_count: u64,
+}
+
+fn publish_revert_failure(
+    threads: &Threads,
+    thread_id: &str,
+    turn_count: u64,
+    why: &str,
+    tree_restored: bool,
+) {
+    let message = if tree_restored {
+        format!(
+            "The project was put back to how it looked at turn {turn_count}, but OpenCode history \
+             could not be rolled back. The restored files and later \
+             checkpoint references were kept so this partial state can be recovered: {why}"
+        )
+    } else {
+        format!(
+            "The project could not be put back to how it looked at turn {turn_count}, so it is \
+             still as this conversation left it: {why}"
+        )
+    };
+    threads.apply(
+        thread_id,
+        Change::Activity(crate::threads::Activity::failed("revert.failed", &message)),
+    );
 }
 
 /// A command whose whole payload is the conversation it is about.

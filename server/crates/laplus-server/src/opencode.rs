@@ -147,6 +147,14 @@ impl OpenCodeClient {
         self.request_json(Method::GET, &format!("session/{id}"), Option::<&()>::None)
             .await
     }
+    pub async fn messages(&self, id: &str) -> Result<Value, OpenCodeError> {
+        self.request_json(
+            Method::GET,
+            &format!("session/{id}/message"),
+            Option::<&()>::None,
+        )
+        .await
+    }
     pub async fn fork_session(&self, id: &str) -> Result<Session, OpenCodeError> {
         self.request_json(Method::POST, &format!("session/{id}/fork"), Some(&serde_json::json!({})))
             .await
@@ -176,6 +184,14 @@ impl OpenCodeClient {
         classify_response(response, self.password.as_deref())
             .await
             .map(|_| ())
+    }
+    pub async fn prompt_sync(&self, id: &str, body: &Value) -> Result<Value, OpenCodeError> {
+        self.request_json(Method::POST, &format!("session/{id}/message"), Some(body))
+            .await
+    }
+    pub async fn delete_session(&self, id: &str) -> Result<Value, OpenCodeError> {
+        self.request_json(Method::DELETE, &format!("session/{id}"), Option::<&()>::None)
+            .await
     }
     pub async fn abort(&self, id: &str) -> Result<Value, OpenCodeError> {
         self.request_json(
@@ -298,19 +314,96 @@ impl OpenCodeClient {
     }
 }
 
+/// Roll an OpenCode conversation back by completed assistant turns.
+///
+/// OpenCode names the retained boundary with an assistant message id rather
+/// than accepting a count. Read the full history and translate the checkpoint
+/// count exactly as the upstream adapter does: keep the assistant message just
+/// before the removed suffix, or omit `messageID` when the whole history goes.
+/// The durable cursor is only read here; a failed rollback therefore cannot
+/// replace the continuation identity remembered by the thread.
+pub async fn rollback(
+    start: &crate::session::Start,
+    removed_turns: u64,
+) -> Result<(), String> {
+    if removed_turns == 0 {
+        return Ok(());
+    }
+
+    let resume_session_id = resume_session_id(start)?;
+    let settings = start.driver.opencode()?;
+    let (mut owned, client) = if settings.server_url.is_empty() {
+        let (binary, _) = crate::provider::resolve_named(
+            &settings.binary_path,
+            "opencode",
+            &crate::process::Search::from_environment(),
+        )
+        .startable_for("OpenCode CLI")?;
+        let (owned, client) = OwnedServer::start(&binary, &start.workspace_root).await?;
+        (Some(owned), client)
+    } else {
+        let password =
+            (!settings.server_password.is_empty()).then(|| settings.server_password.clone());
+        (
+            None,
+            OpenCodeClient::new(&settings.server_url, &start.workspace_root, password)
+                .map_err(|error| error.to_string())?,
+        )
+    };
+
+    let result = async {
+        let session = recover_session(&client, start, resume_session_id.as_deref(), false).await?;
+        let messages = client
+            .messages(&session.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let entries = messages
+            .as_array()
+            .ok_or_else(|| "OpenCode returned a malformed session message list".to_string())?;
+        let assistant_ids = entries
+            .iter()
+            .filter_map(|entry| {
+                let info = entry.get("info")?;
+                (info.get("role").and_then(Value::as_str) == Some("assistant"))
+                    .then(|| info.get("id").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        let removed = usize::try_from(removed_turns).unwrap_or(usize::MAX);
+        let target = assistant_ids
+            .len()
+            .checked_sub(removed.saturating_add(1))
+            .and_then(|index| assistant_ids.get(index).copied());
+        let body = target
+            .map(|message_id| serde_json::json!({ "messageID": message_id }))
+            .unwrap_or_else(|| serde_json::json!({}));
+        client
+            .revert(&session.id, &body)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Some(owned) = owned.as_mut() {
+        owned.stop().await;
+    }
+    result
+}
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL: Duration = Duration::from_millis(50);
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// One loopback OpenCode server owned by a conversation.
-struct OwnedServer {
+pub(crate) struct OwnedServer {
     child: Child,
     process_group_id: u32,
 }
 
 impl OwnedServer {
-    async fn start(binary: &Path, directory: &str) -> Result<(Self, OpenCodeClient), String> {
+    pub(crate) async fn start(binary: &Path, directory: &str) -> Result<(Self, OpenCodeClient), String> {
         let listener = StdTcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("OpenCode could not reserve a loopback port: {error}"))?;
         let port = listener
@@ -374,7 +467,7 @@ impl OwnedServer {
         }
     }
 
-    async fn stop(&mut self) {
+    pub(crate) async fn stop(&mut self) {
         if self.child.try_wait().ok().flatten().is_some() {
             terminate_owned_group(self.process_group_id, true).await;
             return;
@@ -627,14 +720,19 @@ async fn recover_session(
     client: &OpenCodeClient,
     start: &crate::session::Start,
     session_id: Option<&str>,
+    missing_starts_fresh: bool,
 ) -> Result<Session, String> {
     let Some(session_id) = session_id else {
-        return create_session(client, start).await;
+        return if missing_starts_fresh {
+            create_session(client, start).await
+        } else {
+            Err("OpenCode rollback requires an adopted provider resume cursor.".to_string())
+        };
     };
 
     let recovered = match client.session(session_id).await {
         Ok(session) => session,
-        Err(OpenCodeError::MissingSession { .. }) => {
+        Err(OpenCodeError::MissingSession { .. }) if missing_starts_fresh => {
             return create_session(client, start).await;
         }
         Err(error) => return Err(error.to_string()),
@@ -927,7 +1025,7 @@ impl crate::session::Driver for OpenCode {
             (None, client)
         };
         let opened = async {
-            let session = recover_session(&client, start, resume_session_id.as_deref()).await?;
+            let session = recover_session(&client, start, resume_session_id.as_deref(), true).await?;
             let events = client.subscribe().await.map_err(|error| error.to_string())?;
             Ok::<_, String>((events, session))
         }
