@@ -100,6 +100,7 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
 
     assert_eq!(client.health().await.unwrap().version, "1.18.10");
     client.providers().await.unwrap();
+    client.config().await.unwrap();
     client.agents().await.unwrap();
     client
         .create_session(&json!({"title":"hello"}))
@@ -150,6 +151,7 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         vec![
             "/api/global/health",
             "/api/provider",
+            "/api/config",
             "/api/agent",
             "/api/session",
             "/api/session/ses_1",
@@ -168,16 +170,16 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         ]
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[3].3).unwrap(),
+        serde_json::from_slice::<Value>(&requests[4].3).unwrap(),
         json!({"title":"hello"})
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[4].3).unwrap()["permission"][0]["action"],
+        serde_json::from_slice::<Value>(&requests[5].3).unwrap()["permission"][0]["action"],
         "allow"
     );
-    assert_eq!(serde_json::from_slice::<Value>(&requests[6].3).unwrap(), json!({}));
+    assert_eq!(serde_json::from_slice::<Value>(&requests[7].3).unwrap(), json!({}));
     assert_eq!(
-        serde_json::from_slice::<Value>(&requests[7].3).unwrap(),
+        serde_json::from_slice::<Value>(&requests[8].3).unwrap(),
         json!({"sessionID":"ses_1","destination":{"directory":"/work tree"},"moveChanges":false})
     );
     let _ = stop.send(());
@@ -377,6 +379,7 @@ fn redacted_wire_fixture_covers_every_protocol_operation_and_error_family() {
         vec![
             "health",
             "providers",
+            "config",
             "agents",
             "session.create",
             "session.get",
@@ -397,7 +400,7 @@ fn redacted_wire_fixture_covers_every_protocol_operation_and_error_family() {
         .iter()
         .all(|case| !case.request.is_null() && !case.response.is_null()));
     assert_eq!(
-        cases[7].request,
+        cases[8].request,
         json!({
             "method":"POST",
             "path":"/session/ses_redacted/prompt_async",

@@ -619,6 +619,24 @@ async fn events(State(state): State<PeerState>, headers: HeaderMap) -> Response 
         .unwrap()
 }
 
+async fn providers() -> Json<Value> {
+    Json(json!({
+        "providers": [{
+            "id": "openai",
+            "models": {"gpt-5": {
+                "id": "gpt-5",
+                "name": "GPT 5",
+                "limit": {"context": 200_000}
+            }}
+        }],
+        "connected": ["openai"]
+    }))
+}
+
+async fn opencode_config_snapshot() -> Json<Value> {
+    Json(json!({"compaction": {"auto": false}}))
+}
+
 async fn create_session(
     State(state): State<PeerState>,
     headers: HeaderMap,
@@ -777,7 +795,7 @@ async fn prompt(
     }
     for event in [
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"reason-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"check the stream\"}}}\n\n",
-        "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\"}}}\n\n",
+        "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5\"},\"tokens\":{\"input\":12000,\"output\":500,\"reasoning\":300,\"cache\":{\"read\":9000,\"write\":100}}}}}\n\n",
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
         "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"busy\"}}}\n\n",
         "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"text-1\",\"field\":\"text\",\"delta\":\"hello \"}}\n\n",
@@ -981,6 +999,8 @@ impl ExternalOpenCode {
         let prompts = state.prompts.clone();
         let app = Router::new()
             .route("/global/health", get(health))
+            .route("/provider", get(providers))
+            .route("/config", get(opencode_config_snapshot))
             .route("/event", get(events))
             .route("/session", post(create_session))
             .route("/session/{id}", get(get_session).patch(update_session))
@@ -1859,6 +1879,8 @@ async fn opencode_peer_child() {
     };
     let app = Router::new()
         .route("/global/health", get(health))
+        .route("/provider", get(providers))
+        .route("/config", get(opencode_config_snapshot))
         .route("/mcp", post(add_mcp))
         .route("/event", get(events))
         .route("/session", post(create_session))
@@ -1903,6 +1925,23 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
     assert!(events.iter().any(
         |item| item["event"]["payload"]["activity"]["payload"]["thinking"] == "check the stream"
     ));
+    let usage = activity(&events, "context-window.updated");
+    assert_eq!(usage["payload"]["activity"]["payload"], json!({
+        "usedTokens": 21_600,
+        "lastUsedTokens": 21_600,
+        "totalProcessedTokens": null,
+        "maxTokens": 200_000,
+        "inputTokens": 21_100,
+        "outputTokens": 500,
+        "compactsAutomatically": false
+    }));
+    let snapshot = server.connect().await.into_thread_snapshot("thread-open").await;
+    assert!(snapshot["thread"]["activities"].as_array().unwrap().iter().any(|row| {
+        row["kind"] == "context-window.updated"
+            && row["payload"]["usedTokens"] == 21_600
+            && row["payload"]["maxTokens"] == 200_000
+            && row["payload"]["compactsAutomatically"] == false
+    }));
     assert_eq!(
         events
             .iter()

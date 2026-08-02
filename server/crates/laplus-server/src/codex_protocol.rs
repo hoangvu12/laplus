@@ -140,6 +140,7 @@ pub enum ConversationFold {
     CommandStarted(CommandExecution),
     CommandCompleted(CommandExecution),
     ApprovalRequested(ApprovalRequest),
+    TokenUsage(crate::protocol::TokenUsage),
     TurnCompleted(Completion),
 }
 
@@ -390,12 +391,30 @@ impl ConversationState {
                     duration_ms: turn["durationMs"].as_u64(),
                 })
             }
+            "thread/tokenUsage/updated" => {
+                let usage = &params["tokenUsage"];
+                let last = &usage["last"];
+                let Some(used_tokens) = last["totalTokens"].as_u64().filter(|value| *value > 0)
+                else {
+                    return ConversationFold::Nothing;
+                };
+                let total_processed_tokens = usage["total"]["totalTokens"]
+                    .as_u64()
+                    .filter(|total| *total > used_tokens);
+                ConversationFold::TokenUsage(crate::protocol::TokenUsage {
+                    used_tokens,
+                    total_processed_tokens,
+                    max_tokens: usage["modelContextWindow"].as_u64(),
+                    input_tokens: last["inputTokens"].as_u64(),
+                    output_tokens: last["outputTokens"].as_u64(),
+                    compacts_automatically: Some(true),
+                })
+            }
             "thread/started"
             | "serverRequest/resolved"
             | "configWarning"
             | "remoteControl/status/changed"
             | "mcpServer/startupStatus/updated"
-            | "thread/tokenUsage/updated"
             | "account/rateLimits/updated" => ConversationFold::Nothing,
             _ => {
                 self.unknown_event()

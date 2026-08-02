@@ -132,6 +132,10 @@ impl OpenCodeClient {
         self.request_json(Method::GET, "provider", Option::<&()>::None)
             .await
     }
+    pub async fn config(&self) -> Result<Value, OpenCodeError> {
+        self.request_json(Method::GET, "config", Option::<&()>::None)
+            .await
+    }
     pub async fn agents(&self) -> Result<Value, OpenCodeError> {
         self.request_json(Method::GET, "agent", Option::<&()>::None)
             .await
@@ -555,6 +559,8 @@ pub(crate) struct OpenCode {
     owned: Option<OwnedServer>,
     mcp_session: Option<crate::mcp::Session>,
     model: Option<String>,
+    context_windows: HashMap<String, u64>,
+    compacts_automatically: Option<bool>,
     settled: bool,
     roles: HashMap<String, String>,
     pending_parts: HashMap<String, Value>,
@@ -563,6 +569,49 @@ pub(crate) struct OpenCode {
     assistant_text: String,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
     pending_questions: HashMap<String, crate::approval::ApprovalRequest>,
+}
+
+fn context_windows(providers: &Value) -> HashMap<String, u64> {
+    crate::provider::opencode_catalogue_models(providers)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|model| model.context_window.map(|window| (model.slug, window)))
+        .collect()
+}
+
+fn message_token_usage(
+    info: &Value,
+    context_windows: &HashMap<String, u64>,
+    compacts_automatically: Option<bool>,
+) -> Option<crate::protocol::TokenUsage> {
+    let tokens = info.get("tokens")?;
+    let input = tokens.get("input").and_then(Value::as_u64)?;
+    let cache_read = tokens.pointer("/cache/read").and_then(Value::as_u64).unwrap_or(0);
+    let cache_write = tokens.pointer("/cache/write").and_then(Value::as_u64).unwrap_or(0);
+    let output = tokens.get("output").and_then(Value::as_u64)?;
+    let input_tokens = input.saturating_add(cache_read).saturating_add(cache_write);
+    let used_tokens = tokens
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| input_tokens.saturating_add(output));
+    if used_tokens == 0 {
+        return None;
+    }
+    let model = info.get("model");
+    let slug = model
+        .and_then(|model| Some(format!(
+            "{}/{}",
+            model.get("providerID")?.as_str()?,
+            model.get("modelID")?.as_str()?
+        )));
+    Some(crate::protocol::TokenUsage {
+        used_tokens,
+        total_processed_tokens: None,
+        max_tokens: slug.as_ref().and_then(|slug| context_windows.get(slug)).copied(),
+        input_tokens: Some(input_tokens),
+        output_tokens: Some(output),
+        compacts_automatically,
+    })
 }
 
 fn question_id(index: usize, header: &str) -> String {
@@ -1112,6 +1161,17 @@ impl crate::session::Driver for OpenCode {
         } else {
             None
         };
+        let context_windows = client
+            .providers()
+            .await
+            .ok()
+            .map(|providers| context_windows(&providers))
+            .unwrap_or_default();
+        let compacts_automatically = client
+            .config()
+            .await
+            .ok()
+            .map(|config| config.pointer("/compaction/auto").and_then(Value::as_bool).unwrap_or(true));
         let opened = async {
             let session = recover_session(&client, start, resume_session_id.as_deref(), true).await?;
             let events = client.subscribe().await.map_err(|error| error.to_string())?;
@@ -1135,6 +1195,8 @@ impl crate::session::Driver for OpenCode {
                 owned,
                 mcp_session,
                 model: start.model.clone(),
+                context_windows,
+                compacts_automatically,
                 settled: false,
                 roles: HashMap::new(),
                 pending_parts: HashMap::new(),
@@ -1189,6 +1251,18 @@ impl crate::session::Driver for OpenCode {
                             self.normalize_part(&part, driving, &mut decided);
                         }
                     }
+                }
+                if let Some(usage) = driving
+                    .usage_to_report(message_token_usage(
+                        info,
+                        &self.context_windows,
+                        self.compacts_automatically,
+                    ))
+                {
+                    let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+                    decided.changes.push(crate::threads::Change::Activity(
+                        crate::turn::context_window_row(&usage, turn_id),
+                    ));
                 }
             }
             "message.part.delta" => {

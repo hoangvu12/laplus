@@ -388,7 +388,7 @@ fn resume_refused(session_id: &str, complaint: Option<&str>) -> String {
 /// (`apps/web/src/lib/contextWindow.ts`, `deriveLatestContextWindowSnapshot`).
 /// So the row is a carrier rather than something a developer reads, and its
 /// summary exists only because the contract requires a non-empty one.
-fn context_window_row(usage: &TokenUsage, turn_id: Option<String>) -> Activity {
+pub(crate) fn context_window_row(usage: &TokenUsage, turn_id: Option<String>) -> Activity {
     Activity::info(
         "context-window.updated",
         "Context window updated",

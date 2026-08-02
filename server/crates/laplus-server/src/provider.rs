@@ -1401,12 +1401,16 @@ fn discover_local_opencode(path: &Path) -> Result<Vec<ProviderModel>, String> {
     Ok(local_models(&models, &local_agents(&agents)))
 }
 
-fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) -> Result<Vec<ProviderModel>, String> {
-    let visible_agents = agents.as_array().into_iter().flatten().filter(|agent| {
-        !agent.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false)
-            && matches!(agent.get("mode").and_then(serde_json::Value::as_str), Some("primary") | Some("all") | None)
-    }).filter_map(|agent| agent.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
-      .collect::<Vec<_>>();
+pub(crate) struct OpenCodeCatalogueModel {
+    pub(crate) slug: String,
+    name: String,
+    variants: Vec<String>,
+    pub(crate) context_window: Option<u64>,
+}
+
+pub(crate) fn opencode_catalogue_models(
+    providers: &serde_json::Value,
+) -> Result<Vec<OpenCodeCatalogueModel>, String> {
     let connected = providers.get("connected").and_then(serde_json::Value::as_array)
         .ok_or_else(|| "provider inventory omitted its connected-provider list".to_string())?
         .iter().map(|item| item.as_str().map(str::to_string))
@@ -1423,10 +1427,26 @@ fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) ->
             let name = model.get("name").and_then(serde_json::Value::as_str).unwrap_or(model_id);
             let variants = model.get("variants").and_then(serde_json::Value::as_object)
                 .map(|value| value.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-            models.push(opencode_model(&format!("{provider_id}/{model_id}"), name, &variants, &visible_agents));
+            models.push(OpenCodeCatalogueModel {
+                slug: format!("{provider_id}/{model_id}"),
+                name: name.to_string(),
+                variants,
+                context_window: model.pointer("/limit/context").and_then(serde_json::Value::as_u64),
+            });
         }
     }
     Ok(models)
+}
+
+fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) -> Result<Vec<ProviderModel>, String> {
+    let visible_agents = agents.as_array().into_iter().flatten().filter(|agent| {
+        !agent.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            && matches!(agent.get("mode").and_then(serde_json::Value::as_str), Some("primary") | Some("all") | None)
+    }).filter_map(|agent| agent.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
+      .collect::<Vec<_>>();
+    Ok(opencode_catalogue_models(providers)?.into_iter().map(|model| {
+        opencode_model(&model.slug, &model.name, &model.variants, &visible_agents)
+    }).collect())
 }
 
 fn local_agents(output: &str) -> Vec<String> {

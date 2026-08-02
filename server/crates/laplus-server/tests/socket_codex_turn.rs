@@ -711,6 +711,55 @@ async fn a_model_changed_between_codex_turns_applies_without_replacing_the_conve
 }
 
 #[tokio::test]
+async fn codex_token_usage_fills_the_context_window_meter() {
+    let codex = ScriptedCodex::context_usage_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Say hello."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let usage = activity(&events, "context-window.updated");
+    assert_eq!(usage["payload"]["activity"]["payload"], json!({
+        "usedTokens": 12_500,
+        "totalProcessedTokens": 42_000,
+        "maxTokens": 200_000,
+        "inputTokens": 12_000,
+        "outputTokens": 500,
+        "lastUsedTokens": 12_500,
+        "compactsAutomatically": true
+    }));
+
+    let snapshot = server.connect().await.into_thread_snapshot("codex-thread").await;
+    assert!(snapshot["thread"]["activities"].as_array().unwrap().iter().any(|row| {
+        row["kind"] == "context-window.updated" && row["payload"]["usedTokens"] == 12_500
+    }));
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
 async fn an_access_mode_changed_between_codex_turns_applies_consistently_to_the_next_turn() {
     let codex = ScriptedCodex::command_conversation();
     let workspace = Workspace::with(&["src/main.rs"]);

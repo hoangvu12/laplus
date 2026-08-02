@@ -543,6 +543,14 @@ fn decide(folded: ConversationFold, driving: &mut Driving, drift: Drift) -> Deci
                 .push(Change::Activity(crate::worklog::requested(&asked, turn_id)));
             driving.outstanding.insert(asked.request_id.clone(), asked);
         }
+        ConversationFold::TokenUsage(reading) => {
+            if let Some(usage) = driving.usage_to_report(Some(reading)) {
+                let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+                decided
+                    .changes
+                    .push(Change::Activity(crate::turn::context_window_row(&usage, turn_id)));
+            }
+        }
         ConversationFold::TurnCompleted(completion) => {
             let ending = match (
                 driving.turn.as_ref().is_some_and(|turn| turn.was_stopped()),

@@ -23,6 +23,16 @@
     }
   },
   {
+    "operation": "config",
+    "request": {
+      "method": "GET",
+      "path": "/config",
+      "query": { "directory": "/redacted/project" },
+      "authorization": "Basic [redacted]"
+    },
+    "response": { "compaction": { "auto": false } }
+  },
+  {
     "operation": "agents",
     "request": {
       "method": "GET",

@@ -41,6 +41,44 @@ impl ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("02-command-execution", None)
     }
 
+    pub fn context_usage_conversation() -> ScriptedCodex {
+        let codex = ScriptedCodex::plain_conversation();
+        let events = codex.directory.path().join("turn-events-before-pause");
+        let existing = std::fs::read_to_string(&events).expect("reads the turn events");
+        std::fs::write(
+            events,
+            format!(
+                "{}\n{existing}",
+                serde_json::json!({
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "codex-thread-1",
+                        "turnId": "codex-turn-1",
+                        "tokenUsage": {
+                            "total": {
+                                "totalTokens": 42_000,
+                                "inputTokens": 40_000,
+                                "cachedInputTokens": 30_000,
+                                "outputTokens": 2_000,
+                                "reasoningOutputTokens": 1_200
+                            },
+                            "last": {
+                                "totalTokens": 12_500,
+                                "inputTokens": 12_000,
+                                "cachedInputTokens": 9_000,
+                                "outputTokens": 500,
+                                "reasoningOutputTokens": 300
+                            },
+                            "modelContextWindow": 200_000
+                        }
+                    }
+                })
+            ),
+        )
+        .expect("writes the token usage notification");
+        codex
+    }
+
     pub fn initialization_drift_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
         std::fs::write(

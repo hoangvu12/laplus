@@ -922,10 +922,10 @@ pub struct TokenUsage {
     /// Whether the agent summarises the conversation by itself when the window
     /// fills. The client turns it into a sentence in the meter's tooltip.
     ///
-    /// **The one field no amount of inference can fill.** It is only ever the
-    /// CLI's own answer to [`context_usage_line`], carried onto later readings by
-    /// [`SessionState::remembering`] so that the sentence does not blink out
-    /// every time a token count moves the meter.
+    /// **The one field no amount of inference can fill.** Claude learns it from
+    /// the CLI's answer to [`context_usage_line`] and carries it onto later
+    /// readings with [`SessionState::remembering`]; Codex and OpenCode state the
+    /// same policy at their adapter boundary.
     pub compacts_automatically: Option<bool>,
 }
 
