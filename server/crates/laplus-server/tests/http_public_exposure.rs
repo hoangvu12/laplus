@@ -58,6 +58,39 @@ async fn normalized_external_registration_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn repeating_registration_keeps_the_verified_endpoint_available() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let database = laplus_server::store::Database::open(&path).unwrap();
+    database
+        .register_external_tunnel_endpoint("https://laplus.example.com")
+        .unwrap();
+    database
+        .record_external_tunnel_verification(
+            "https://laplus.example.com",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+    drop(database);
+
+    let server = TestServer::start_at(&path).await;
+    let repeated = server
+        .post_json(
+            "/api/access/cloudflare",
+            &json!({"hostname": " LAPLUS.EXAMPLE.COM. "}),
+        )
+        .await;
+
+    assert_eq!(repeated.status, 200, "{}", repeated.text);
+    assert_eq!(repeated.body["verificationState"], "verified");
+    assert!(repeated.body["lastVerifiedAt"].is_string());
+    assert_eq!(repeated.body["advertisedEndpoint"]["status"], "available");
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn registration_rejects_probe_shaped_and_private_destinations() {
     let server = TestServer::start().await;
     for hostname in ["http://example.com", "https://example.com/a", "https://127.0.0.1"] {

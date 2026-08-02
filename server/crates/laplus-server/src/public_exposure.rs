@@ -52,10 +52,34 @@ pub fn normalize_hostname(input: &str) -> Result<String, &'static str> {
 
 pub fn public_address(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(ip) => !(ip.is_private() || ip.is_loopback() || ip.is_link_local()
-            || ip.is_broadcast() || ip.is_documentation() || ip.is_unspecified()),
-        IpAddr::V6(ip) => !(ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local()
-            || ip.is_unicast_link_local()),
+        IpAddr::V4(ip) => {
+            let [first, second, ..] = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || first == 0
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 192 && second == 0)
+                || (first == 198 && (second == 18 || second == 19))
+                || first >= 224)
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0])
+                || (segments[..3] == [0x0064, 0xff9b, 1])
+                || ip.to_ipv4_mapped().is_some_and(|mapped| {
+                    !public_address(IpAddr::V4(mapped))
+                }))
+        }
     }
 }
 
@@ -70,7 +94,12 @@ pub async fn verify(origin: &str, environment_id: &str, http_token: &str, ws_tok
 {
     let url = reqwest::Url::parse(origin).map_err(|_| VerificationFailure { kind: "dns", message: "The configured hostname is invalid." })?;
     let host = url.host_str().ok_or(VerificationFailure { kind: "dns", message: "The configured hostname has no DNS name." })?;
-    let resolved = tokio::net::lookup_host((host, 443)).await
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::lookup_host((host, 443)),
+    )
+        .await
+        .map_err(|_| VerificationFailure { kind: "dns", message: "DNS lookup timed out." })?
         .map_err(|_| VerificationFailure { kind: "dns", message: "DNS lookup failed." })?;
     let resolved: Vec<_> = resolved.collect();
     if resolved.is_empty() || !resolved.iter().all(|address| public_address(address.ip())) {
@@ -155,9 +184,19 @@ mod tests {
     }
 
     #[test]
-    fn private_destinations_are_disallowed() {
+    fn non_public_destinations_are_disallowed() {
         assert!(!public_address("10.0.0.1".parse().unwrap()));
+        assert!(!public_address("100.64.0.1".parse().unwrap()));
+        assert!(!public_address("198.18.0.1".parse().unwrap()));
+        assert!(!public_address("224.0.0.1".parse().unwrap()));
+        assert!(!public_address("240.0.0.1".parse().unwrap()));
         assert!(!public_address("::1".parse().unwrap()));
+        assert!(!public_address("2001:db8::1".parse().unwrap()));
+        assert!(!public_address("ff02::1".parse().unwrap()));
+        assert!(!public_address("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!public_address("64:ff9b::a00:1".parse().unwrap()));
+        assert!(!public_address("64:ff9b:1::a00:1".parse().unwrap()));
         assert!(public_address("1.1.1.1".parse().unwrap()));
+        assert!(public_address("2606:4700:4700::1111".parse().unwrap()));
     }
 }

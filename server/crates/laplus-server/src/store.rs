@@ -782,8 +782,16 @@ impl Database {
                  (id, https_origin, verification_state, created_at, updated_at) \
                  VALUES (0, ?1, 'pending', {NOW}, {NOW}) \
                  ON CONFLICT(id) DO UPDATE SET https_origin = excluded.https_origin, \
-                 verification_state = 'pending', failure_kind = NULL, failure_message = NULL, \
-                 last_attempt_at = NULL, last_verified_at = NULL, updated_at = {NOW}"
+                 verification_state = CASE WHEN https_origin = excluded.https_origin \
+                     THEN verification_state ELSE 'pending' END, \
+                 failure_kind = CASE WHEN https_origin = excluded.https_origin \
+                     THEN failure_kind ELSE NULL END, \
+                 failure_message = CASE WHEN https_origin = excluded.https_origin \
+                     THEN failure_message ELSE NULL END, \
+                 last_attempt_at = CASE WHEN https_origin = excluded.https_origin \
+                     THEN last_attempt_at ELSE NULL END, \
+                 last_verified_at = CASE WHEN https_origin = excluded.https_origin \
+                     THEN last_verified_at ELSE NULL END, updated_at = {NOW}"
             ),
             [origin],
         ).map(|_| ()).map_err(StorageError::while_("register the external tunnel endpoint"))
