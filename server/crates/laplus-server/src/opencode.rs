@@ -1,6 +1,9 @@
 //! HTTP ownership and event-stream lifetime for OpenCode.
 
-use std::{fmt, net::TcpListener as StdTcpListener, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap, fmt, net::TcpListener as StdTcpListener, path::Path, process::Stdio,
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use reqwest::{Method, StatusCode, Url};
@@ -69,7 +72,13 @@ impl fmt::Display for OpenCodeError {
                 write!(formatter, "OpenCode authentication failed ({status})")
             }
             Self::MissingSession { .. } => formatter.write_str("OpenCode session does not exist"),
-            Self::Server { status, .. } => write!(formatter, "OpenCode request failed ({status})"),
+            Self::Server { status, error, .. } => {
+                write!(formatter, "OpenCode request failed ({status})")?;
+                if let Some(detail) = structured_detail(error.as_ref()) {
+                    write!(formatter, ": {detail}")?;
+                }
+                Ok(())
+            }
             Self::MalformedJson { source, .. } => {
                 write!(formatter, "OpenCode returned malformed JSON: {source}")
             }
@@ -78,6 +87,16 @@ impl fmt::Display for OpenCodeError {
             }
             Self::StreamClosed => formatter.write_str("OpenCode event stream closed"),
         }
+    }
+}
+
+fn structured_detail(error: Option<&StructuredError>) -> Option<String> {
+    let error = error?;
+    match (error.name.as_deref(), error.message.as_deref()) {
+        (Some(name), Some(message)) => Some(format!("{name}: {message}")),
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(message)) => Some(message.to_string()),
+        (None, None) => None,
     }
 }
 
@@ -134,7 +153,9 @@ impl OpenCodeClient {
             .send()
             .await
             .map_err(OpenCodeError::Transport)?;
-        classify_response(response).await.map(|_| ())
+        classify_response(response, self.password.as_deref())
+            .await
+            .map(|_| ())
     }
     pub async fn abort(&self, id: &str) -> Result<Value, OpenCodeError> {
         self.request_json(
@@ -171,9 +192,10 @@ impl OpenCodeClient {
             .send()
             .await
             .map_err(OpenCodeError::Transport)?;
-        let response = classify_response(response).await?;
+        let response = classify_response(response, self.password.as_deref()).await?;
         let (events_tx, events_rx) = mpsc::channel(32);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let password = self.password.clone();
         let task = tokio::spawn(async move {
             let mut chunks = response.bytes_stream();
             let mut decoder = SseDecoder::default();
@@ -182,10 +204,10 @@ impl OpenCodeClient {
                     changed = cancel_rx.changed() => if changed.is_ok() && *cancel_rx.borrow() { break },
                     chunk = chunks.next() => match chunk {
                         Some(Ok(bytes)) => for decoded in decoder.push(&bytes) {
-                            if events_tx.send(decoded.map_err(OpenCodeError::MalformedSse)).await.is_err() { return; }
+                            if events_tx.send(decoded.map_err(|error| OpenCodeError::MalformedSse(redact_sse(error, password.as_deref())))).await.is_err() { return; }
                         },
                         Some(Err(error)) => { let _ = events_tx.send(Err(OpenCodeError::Transport(error))).await; return; }
-                        None => { if let Some(error) = decoder.finish() { let _ = events_tx.send(Err(OpenCodeError::MalformedSse(error))).await; } return; }
+                        None => { if let Some(error) = decoder.finish() { let _ = events_tx.send(Err(OpenCodeError::MalformedSse(redact_sse(error, password.as_deref())))).await; } return; }
                     }
                 }
             }
@@ -228,14 +250,17 @@ impl OpenCodeClient {
             .send()
             .await
             .map_err(OpenCodeError::Transport)?;
-        let bytes = classify_response(response)
+        let bytes = classify_response(response, self.password.as_deref())
             .await?
             .bytes()
             .await
             .map_err(OpenCodeError::Transport)?;
         serde_json::from_slice(&bytes).map_err(|source| OpenCodeError::MalformedJson {
             source,
-            body: String::from_utf8_lossy(&bytes).into_owned(),
+            body: redact(
+                String::from_utf8_lossy(&bytes).into_owned(),
+                self.password.as_deref(),
+            ),
         })
     }
 }
@@ -279,8 +304,13 @@ impl OwnedServer {
                 binary.display()
             )
         })?;
-        let process_group_id = child.id().ok_or_else(|| "OpenCode started without a process id.".to_string())?;
-        let mut owned = Self { child, process_group_id };
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| "OpenCode started without a process id.".to_string())?;
+        let mut owned = Self {
+            child,
+            process_group_id,
+        };
         let client = OpenCodeClient::new(&format!("http://127.0.0.1:{port}"), directory, None)
             .map_err(|error| error.to_string())?;
         let ready = tokio::time::timeout(STARTUP_TIMEOUT, async {
@@ -346,8 +376,13 @@ async fn terminate_owned_group(pid: u32, force: bool) {
     {
         let mut command = Command::new("taskkill.exe");
         command.args(["/PID", &pid.to_string(), "/T"]);
-        if force { command.arg("/F"); }
-        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        if force {
+            command.arg("/F");
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         crate::process::without_a_console(command.as_std_mut());
         let _ = command.status().await;
     }
@@ -368,9 +403,17 @@ pub(crate) struct OpenCode {
     client: OpenCodeClient,
     events: EventStream,
     session_id: String,
-    owned: OwnedServer,
+    /// Present only when Laplus launched the endpoint. An operator-owned
+    /// endpoint shares all session behavior, but its lifetime is never ours.
+    owned: Option<OwnedServer>,
     model: Option<String>,
     settled: bool,
+    roles: HashMap<String, String>,
+    pending_parts: HashMap<String, Value>,
+    pending_deltas: HashMap<String, String>,
+    emitted_parts: HashMap<String, String>,
+    reasoning: HashMap<String, String>,
+    assistant_text: String,
 }
 
 fn cursor(start: &crate::session::Start, session_id: &str) -> crate::provider::ResumeCursor {
@@ -398,19 +441,221 @@ fn event_session(properties: &Value) -> Option<&str> {
         })
 }
 
+impl OpenCode {
+    fn assistant_role(&self, properties: &Value) -> Option<bool> {
+        let message_id = properties.get("messageID").and_then(Value::as_str)?;
+        self.roles.get(message_id).map(|role| role == "assistant")
+    }
+
+    fn emit_text(
+        &mut self,
+        part_id: &str,
+        kind: &str,
+        text: &str,
+        driving: &mut crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) {
+        let emitted = self.emitted_parts.entry(part_id.to_string()).or_default();
+        // Cumulative updates reconcile true deltas. A stale snapshot is ignored;
+        // a divergent snapshot cannot safely retract text already on screen.
+        let suffix = if text.starts_with(emitted.as_str()) {
+            &text[emitted.len()..]
+        } else if emitted.starts_with(text) {
+            ""
+        } else {
+            ""
+        };
+        if suffix.is_empty() {
+            return;
+        }
+        emitted.push_str(suffix);
+        if kind == "reasoning" {
+            self.reasoning
+                .entry(part_id.to_string())
+                .or_default()
+                .push_str(suffix);
+            return;
+        }
+        let Some(active) = driving.turn.as_mut() else {
+            return;
+        };
+        self.assistant_text.push_str(suffix);
+        let message_id = active
+            .assistant_message_id
+            .get_or_insert_with(crate::threads::fresh_message_id)
+            .clone();
+        decided
+            .changes
+            .push(crate::threads::Change::AssistantDelta {
+                message_id,
+                turn_id: active.turn_id.clone(),
+                text: suffix.to_string(),
+            });
+    }
+
+    fn normalize_part(
+        &mut self,
+        part: &Value,
+        driving: &mut crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) {
+        let part_id = part
+            .get("id")
+            .or_else(|| part.get("partID"))
+            .and_then(Value::as_str)
+            .unwrap_or("__legacy_text");
+        self.pending_parts.insert(part_id.to_string(), part.clone());
+        if self.assistant_role(part) == Some(false) {
+            return;
+        }
+        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(kind, "text" | "reasoning") {
+            return;
+        }
+        if let Some(delta) = self.pending_deltas.remove(part_id) {
+            let previous = self.emitted_parts.get(part_id).cloned().unwrap_or_default();
+            self.emit_text(part_id, kind, &(previous + &delta), driving, decided);
+        }
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            self.emit_text(part_id, kind, text, driving, decided);
+        }
+    }
+
+    fn normalize_delta(
+        &mut self,
+        properties: &Value,
+        driving: &mut crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) {
+        let part_id = properties
+            .get("partID")
+            .or_else(|| properties.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("__legacy_text");
+        let Some(delta) = properties.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        let part = self.pending_parts.get(part_id).cloned();
+        let Some(part) = part else {
+            self.pending_deltas
+                .entry(part_id.to_string())
+                .or_default()
+                .push_str(delta);
+            return;
+        };
+        if self
+            .assistant_role(properties)
+            .or_else(|| self.assistant_role(&part))
+            == Some(false)
+        {
+            self.pending_deltas
+                .entry(part_id.to_string())
+                .or_default()
+                .push_str(delta);
+            return;
+        }
+        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(kind, "text" | "reasoning") {
+            return;
+        }
+        let cumulative = self.emitted_parts.get(part_id).cloned().unwrap_or_default() + delta;
+        self.emit_text(part_id, kind, &cumulative, driving, decided);
+    }
+
+    fn settle(
+        &mut self,
+        driving: &mut crate::session::Driving,
+        status: crate::settling::SessionStatus,
+        error: Option<String>,
+    ) -> crate::session::Decided {
+        if self.settled {
+            return Default::default();
+        }
+        let Some(finished) = driving.turn.take() else {
+            return Default::default();
+        };
+        self.settled = true;
+        let mut changes = Vec::new();
+        for reasoning in self.reasoning.values() {
+            if let Some(activity) =
+                crate::worklog::thinking(reasoning, Some(finished.turn_id.clone()))
+            {
+                changes.push(crate::threads::Change::Activity(activity));
+            }
+        }
+        if !self.assistant_text.is_empty() {
+            let message_id = finished
+                .assistant_message_id
+                .unwrap_or_else(crate::threads::fresh_message_id);
+            changes.push(crate::threads::Change::AssistantMessage {
+                message_id,
+                turn_id: finished.turn_id.clone(),
+                text: self.assistant_text.clone(),
+            });
+        }
+        if let Some(message) = error.as_deref() {
+            changes.push(crate::threads::Change::Activity(
+                crate::threads::Activity::failed("session.failed", message),
+            ));
+        } else {
+            changes.push(crate::threads::Change::Activity(crate::threads::Activity::info(
+                "turn.completed", "Turn completed.",
+                serde_json::json!({"durationMs":Value::Null,"totalCostUsd":Value::Null,"isError":false,"interrupted":false}),
+                Some(finished.turn_id.clone()),
+            )));
+        }
+        driving.finished = Some(crate::session::Finished {
+            turn_id: finished.turn_id.clone(),
+            status: if error.is_some() { "error" } else { "ready" },
+        });
+        crate::session::Decided {
+            changes,
+            settles: Some(crate::session::Settles {
+                turn_id: Some(finished.turn_id),
+                status,
+                last_error: error,
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+fn structured_event_error(error: &Value) -> String {
+    let name = error.get("name").and_then(Value::as_str);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.pointer("/data/message").and_then(Value::as_str));
+    match (name, message) {
+        (Some(name), Some(message)) => format!("{name}: {message}"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(message)) => message.to_string(),
+        _ => "OpenCode reported a session error.".to_string(),
+    }
+}
+
 impl crate::session::Driver for OpenCode {
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
         if start.resume_cursor.is_some() {
             return Err("OpenCode continuation is not available until ticket 15.".to_string());
         }
         let settings = start.driver.opencode()?;
+        let (mut owned, client) = if settings.server_url.is_empty() {
         let (binary, _) = crate::provider::resolve_named(
             &settings.binary_path,
             "opencode",
             &crate::process::Search::from_environment(),
         )
         .startable_for("OpenCode CLI")?;
-        let (mut owned, client) = OwnedServer::start(&binary, &start.workspace_root).await?;
+            let (owned, client) = OwnedServer::start(&binary, &start.workspace_root).await?;
+            (Some(owned), client)
+        } else {
+            let password =
+                (!settings.server_password.is_empty()).then(|| settings.server_password.clone());
+            let client = OpenCodeClient::new(&settings.server_url, &start.workspace_root, password)
+                .map_err(|error| error.to_string())?;
+            (None, client)
+        };
         let opened = async {
             let events = client
                 .subscribe()
@@ -426,7 +671,9 @@ impl crate::session::Driver for OpenCode {
         let (events, session) = match opened {
             Ok(value) => value,
             Err(error) => {
+                if let Some(owned) = owned.as_mut() {
                 owned.stop().await;
+                }
                 return Err(error);
             }
         };
@@ -438,6 +685,12 @@ impl crate::session::Driver for OpenCode {
                 owned,
                 model: start.model.clone(),
                 settled: false,
+                roles: HashMap::new(),
+                pending_parts: HashMap::new(),
+                pending_deltas: HashMap::new(),
+                emitted_parts: HashMap::new(),
+                reasoning: HashMap::new(),
+                assistant_text: String::new(),
             },
             decided: crate::session::Decided {
                 provider_resume_cursor: Some(cursor(start, &session.id)),
@@ -454,30 +707,41 @@ impl crate::session::Driver for OpenCode {
             Ok(event) => event,
             Err(_) => return None,
         };
+        let unknown = event.is_unknown();
         let envelope = event.envelope();
         if event_session(&envelope.properties).is_some_and(|id| id != self.session_id) {
             return Some(Default::default());
         }
         let mut decided = crate::session::Decided::default();
         match envelope.kind.as_str() {
+            "message.updated" => {
+                let info = envelope
+                    .properties
+                    .get("info")
+                    .unwrap_or(&envelope.properties);
+                if let (Some(id), Some(role)) = (
+                    info.get("id").and_then(Value::as_str),
+                    info.get("role").and_then(Value::as_str),
+                    ) {
+                    self.roles.insert(id.to_string(), role.to_string());
+                    if role == "assistant" {
+                        let parts = self
+                            .pending_parts
+                            .values()
+                            .filter(|part| {
+                                part.get("messageID").and_then(Value::as_str) == Some(id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for part in parts {
+                            self.normalize_part(&part, driving, &mut decided);
+                        }
+                    }
+                }
+            }
             "message.part.delta" => {
                 if envelope.properties.get("field").and_then(Value::as_str) == Some("text") {
-                    if let (Some(active), Some(text)) = (
-                        driving.turn.as_mut(),
-                        envelope.properties.get("delta").and_then(Value::as_str),
-                    ) {
-                        let message_id = active
-                            .assistant_message_id
-                            .get_or_insert_with(crate::threads::fresh_message_id)
-                            .clone();
-                        decided
-                            .changes
-                            .push(crate::threads::Change::AssistantDelta {
-                                message_id,
-                                turn_id: active.turn_id.clone(),
-                                text: text.to_string(),
-                            });
-                    }
+                    self.normalize_delta(&envelope.properties, driving, &mut decided);
                 }
             }
             "message.part.updated" => {
@@ -485,26 +749,31 @@ impl crate::session::Driver for OpenCode {
                     .properties
                     .get("part")
                     .unwrap_or(&envelope.properties);
-                if part.get("type").and_then(Value::as_str) == Some("text") {
-                    if let (Some(active), Some(text)) = (
-                        driving.turn.as_mut(),
-                        part.get("text").and_then(Value::as_str),
-                    ) {
-                        let message_id = active
-                            .assistant_message_id
-                            .take()
-                            .unwrap_or_else(crate::threads::fresh_message_id);
-                        decided
-                            .changes
-                            .push(crate::threads::Change::AssistantMessage {
-                                message_id,
-                                turn_id: active.turn_id.clone(),
-                                text: text.to_string(),
-                            });
+                self.normalize_part(part, driving, &mut decided);
                     }
+            "session.updated" => {
+                let info = envelope
+                    .properties
+                    .get("info")
+                    .unwrap_or(&envelope.properties);
+                if let Some(title) = info
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                {
+                    decided.changes.push(crate::threads::Change::MetaUpdated(
+                        crate::threads::MetaUpdate {
+                            title: Some(title.to_string()),
+                            model_selection: None,
+                            branch: None,
+                            worktree_path: None,
+                        },
+                    ));
                 }
             }
-            "session.idle" => return Some(opencode_settle(driving, &mut self.settled)),
+            "session.idle" => {
+                return Some(self.settle(driving, crate::settling::SessionStatus::Ready, None))
+            }
             "session.status"
                 if envelope
                     .properties
@@ -512,8 +781,52 @@ impl crate::session::Driver for OpenCode {
                     .and_then(Value::as_str)
                     == Some("idle") =>
             {
-                return Some(opencode_settle(driving, &mut self.settled));
+                return Some(self.settle(driving, crate::settling::SessionStatus::Ready, None));
             }
+            "session.status" => match envelope
+                .properties
+                .pointer("/status/type")
+                .and_then(Value::as_str)
+            {
+                // Dispatching the prompt already published the shared running
+                // session. Re-publishing it here through the settlement seam
+                // would clear activeTurnId, so busy is an idempotent confirmation.
+                Some("busy") => {}
+                Some("retry") => {
+                    let status = &envelope.properties["status"];
+                    let message = status
+                        .pointer("/message")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            status
+                                .pointer("/error/data/message")
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("OpenCode is retrying the request.");
+                    decided.changes.push(crate::threads::Change::Activity(
+                        crate::threads::Activity::info(
+                            "runtime.warning",
+                            message,
+                            status.clone(),
+                            driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+                        ),
+                    ));
+            }
+            _ => {}
+            },
+            "session.error" => {
+                let error = envelope
+                    .properties
+                    .get("error")
+                    .unwrap_or(&envelope.properties);
+                let message = structured_event_error(error);
+                return Some(self.settle(
+                    driving,
+                    crate::settling::SessionStatus::Error,
+                    Some(message),
+                ));
+            }
+            _ if unknown => eprintln!("OpenCode event not understood: {}", envelope.kind),
             _ => {}
         }
         Some(decided)
@@ -521,6 +834,11 @@ impl crate::session::Driver for OpenCode {
 
     async fn send(&mut self, text: &str) -> std::io::Result<()> {
         self.settled = false;
+        self.pending_parts.clear();
+        self.pending_deltas.clear();
+        self.emitted_parts.clear();
+        self.reasoning.clear();
+        self.assistant_text.clear();
         let mut body = serde_json::json!({"parts": [{"type":"text", "text":text}]});
         if let Some(model) = self.model.as_deref() {
             let (provider, model) = model
@@ -568,7 +886,9 @@ impl crate::session::Driver for OpenCode {
         asked_to_stop: bool,
     ) -> crate::session::Reaped {
         self.events.cancel().await;
-        self.owned.stop().await;
+        if let Some(owned) = self.owned.as_mut() {
+            owned.stop().await;
+        }
         crate::session::Reaped {
             refused: None,
             death: (driving.turn.is_some() && !asked_to_stop)
@@ -577,49 +897,19 @@ impl crate::session::Driver for OpenCode {
     }
 }
 
-fn opencode_settle(
-    driving: &mut crate::session::Driving,
-    settled: &mut bool,
-) -> crate::session::Decided {
-    if *settled {
-        return Default::default();
-    }
-    let Some(finished) = driving.turn.take() else {
-        return Default::default();
-    };
-    *settled = true;
-    driving.finished = Some(crate::session::Finished {
-        turn_id: finished.turn_id.clone(),
-        status: "ready",
-    });
-    crate::session::Decided {
-        changes: vec![crate::threads::Change::Activity(
-            crate::threads::Activity::info(
-                "turn.completed",
-                "Turn completed.",
-                serde_json::json!({"durationMs":Value::Null,"totalCostUsd":Value::Null,"isError":false,"interrupted":false}),
-                Some(finished.turn_id.clone()),
-            ),
-        )],
-        settles: Some(crate::session::Settles {
-            turn_id: Some(finished.turn_id),
-            status: crate::settling::SessionStatus::Ready,
-            last_error: None,
-        }),
-        ..Default::default()
-    }
-}
-
 async fn classify_response(
     response: reqwest::Response,
+    password: Option<&str>,
 ) -> Result<reqwest::Response, OpenCodeError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let bytes = response.bytes().await.map_err(OpenCodeError::Transport)?;
-    let body = String::from_utf8_lossy(&bytes).into_owned();
-    let error = serde_json::from_slice::<StructuredError>(&bytes).ok();
+    let body = redact(String::from_utf8_lossy(&bytes).into_owned(), password);
+    let error = serde_json::from_slice::<StructuredError>(&bytes)
+        .ok()
+        .map(|error| redact_structured(error, password));
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return Err(OpenCodeError::Authentication { status, error });
     }
@@ -634,6 +924,48 @@ async fn classify_response(
         error,
         body,
     })
+}
+
+fn redact(value: String, password: Option<&str>) -> String {
+    password
+        .filter(|password| !password.is_empty())
+        .map_or(value.clone(), |password| {
+            value.replace(password, "[redacted]")
+        })
+}
+
+fn redact_structured(mut error: StructuredError, password: Option<&str>) -> StructuredError {
+    error.name = error.name.map(|value| redact(value, password));
+    error.message = error.message.map(|value| redact(value, password));
+    if let Some(data) = error.data.as_mut() {
+        redact_value(data, password);
+    }
+    error
+}
+
+fn redact_value(value: &mut Value, password: Option<&str>) {
+    match value {
+        Value::String(text) => *text = redact(std::mem::take(text), password),
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| redact_value(value, password)),
+        Value::Object(values) => values
+            .values_mut()
+            .for_each(|value| redact_value(value, password)),
+        _ => {}
+    }
+}
+
+fn redact_sse(error: SseDecodeError, password: Option<&str>) -> SseDecodeError {
+    match error {
+        SseDecodeError::MalformedField(value) => {
+            SseDecodeError::MalformedField(redact(value, password))
+        }
+        SseDecodeError::MalformedJson(value) => {
+            SseDecodeError::MalformedJson(redact(value, password))
+        }
+        other => other,
+    }
 }
 
 fn is_missing_session(error: &StructuredError) -> bool {

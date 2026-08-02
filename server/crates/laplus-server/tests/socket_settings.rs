@@ -37,7 +37,9 @@ async fn settings(client: &mut harness::SocketClient) -> Value {
 
 /// One patch, as the panel sends one.
 async fn update(client: &mut harness::SocketClient, patch: Value) -> harness::Outcome {
-    client.call("server.updateSettings", json!({"patch": patch})).await
+    client
+        .call("server.updateSettings", json!({"patch": patch}))
+        .await
 }
 
 /// The keybinding bound to `command`, out of a `getConfig` payload.
@@ -70,7 +72,10 @@ async fn a_setting_can_be_read_and_changed() {
     );
 
     // …and the next reader sees it, rather than the answer being a one-off.
-    assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "/work");
+    assert_eq!(
+        settings(&mut client).await["addProjectBaseDirectory"],
+        "/work"
+    );
 
     server.stop().await;
 }
@@ -150,10 +155,7 @@ async fn the_built_in_defaults_are_generic_provider_instances() {
         current["providerInstances"]["claudeAgent"]["driver"],
         "claudeAgent"
     );
-    assert_eq!(
-        current["providerInstances"]["codex"]["driver"],
-        "codex"
-    );
+    assert_eq!(current["providerInstances"]["codex"]["driver"], "codex");
 
     server.stop().await;
 }
@@ -183,7 +185,10 @@ async fn legacy_provider_settings_are_normalized_into_the_default_instances() {
         json!(["legacy-model"])
     );
     let refreshed = client
-        .call("server.refreshProviders", json!({"instanceId": "claudeAgent"}))
+        .call(
+            "server.refreshProviders",
+            json!({"instanceId": "claudeAgent"}),
+        )
         .await
         .expect_success();
     let provider = refreshed["providers"]
@@ -230,7 +235,10 @@ async fn a_default_claude_instance_migrates_to_the_generic_configuration_path() 
     .await
     .expect_success();
 
-    assert_eq!(after["providerInstances"]["claudeAgent"]["driver"], "claudeAgent");
+    assert_eq!(
+        after["providerInstances"]["claudeAgent"]["driver"],
+        "claudeAgent"
+    );
     let config = client
         .call("server.getConfig", json!({}))
         .await
@@ -293,10 +301,33 @@ async fn invalid_provider_instance_envelopes_are_refused_actionably() {
 }
 
 #[tokio::test]
-async fn opencode_provider_instance_settings_round_trip() {
+async fn an_invalid_opencode_password_is_never_echoed_in_the_error() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;
-    update(&mut client, json!({"providerInstances": {"openWork": {
+    let error = update(
+        &mut client,
+        json!({"providerInstances": {"work": {
+            "driver": "opencode", "displayName": "Work",
+            "config": {"serverPassword": {"value": "secret-that-must-not-escape"}}
+        }}}),
+    )
+    .await
+    .expect_declared("ServerSettingsError");
+    assert!(error["cause"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("serverPassword"));
+    assert!(!error.to_string().contains("secret-that-must-not-escape"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn opencode_provider_instance_settings_hide_the_password_from_the_client() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    update(
+        &mut client,
+        json!({"providerInstances": {"openWork": {
         "driver": "opencode",
         "displayName": "OpenCode Work",
         "enabled": true,
@@ -306,20 +337,29 @@ async fn opencode_provider_instance_settings_round_trip() {
             "serverPassword": "secret",
             "customModels": ["ollama/qwen3"]
         }
-    }}})).await.expect_success();
+        }}}),
+    )
+    .await
+    .expect_success();
 
     let stored = settings(&mut client).await;
-    assert_eq!(stored["providerInstances"]["openWork"], json!({
+    assert!(
+        !stored.to_string().contains("secret"),
+        "settings snapshots must not expose provider credentials"
+    );
+    assert_eq!(
+        stored["providerInstances"]["openWork"],
+        json!({
         "driver": "opencode",
         "displayName": "OpenCode Work",
         "enabled": true,
         "config": {
             "binaryPath": "/opt/opencode",
             "serverUrl": "https://opencode.example.test/api/",
-            "serverPassword": "secret",
             "customModels": ["ollama/qwen3"]
         }
-    }));
+        })
+    );
     server.stop().await;
 }
 
@@ -407,7 +447,10 @@ async fn a_disabled_provider_instance_cannot_route_a_new_thread() {
         .await
         .expect_declared("OrchestrationDispatchCommandError");
     assert!(
-        refusal["message"].as_str().unwrap_or_default().contains("disabled"),
+        refusal["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("disabled"),
         "{refusal}"
     );
 
@@ -487,14 +530,37 @@ async fn a_targeted_refresh_probes_only_the_named_provider_instance() {
     std::fs::remove_file(second.configured()).expect("remove the second temporary agent");
     std::fs::create_dir(second.configured()).expect("replace it with an unstartable directory");
 
-    let refreshed = client.call("server.refreshProviders", json!({"instanceId": "claudeSecond"}))
-        .await.expect_success();
+    let refreshed = client
+        .call(
+            "server.refreshProviders",
+            json!({"instanceId": "claudeSecond"}),
+        )
+        .await
+        .expect_success();
 
-    let status = |instance_id: &str| refreshed["providers"].as_array().expect("providers")
-        .iter().find(|provider| provider["instanceId"] == instance_id).expect("instance")["status"].clone();
-    assert_eq!(status("claudeFirst"), "ready", "the untargeted sibling changed");
-    assert_eq!(status("claudeSecond"), "error", "the selected instance was not probed");
-    assert!(refreshed["providers"].as_array().expect("providers").iter()
+    let status = |instance_id: &str| {
+        refreshed["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == instance_id)
+            .expect("instance")["status"]
+            .clone()
+    };
+    assert_eq!(
+        status("claudeFirst"),
+        "ready",
+        "the untargeted sibling changed"
+    );
+    assert_eq!(
+        status("claudeSecond"),
+        "error",
+        "the selected instance was not probed"
+    );
+    assert!(refreshed["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
         .any(|provider| provider["instanceId"] == "claudeSecond"));
     server.stop().await;
 }
@@ -616,11 +682,11 @@ async fn a_slow_old_codex_probe_cannot_replace_a_new_settings_probe() {
     let old = harness::codex::ScriptedCodex::blocked_provider_probe_with_email("old@example.com");
     let new = harness::codex::ScriptedCodex::provider_probe_with_email("new@example.com");
     let mut config = laplus_server::config::ServerConfig::detect();
-    config.settings.provider_instances["codex"]["config"]["binaryPath"] =
-        json!(old.configured());
+    config.settings.provider_instances["codex"]["config"]["binaryPath"] = json!(old.configured());
     let server = TestServer::start_with(config).await;
 
-    let old_refresh = server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
+    let old_refresh =
+        server.refresh_providers_in_background(laplus_server::process::Search::over(&[]));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !old.started() {
         assert!(
@@ -767,7 +833,9 @@ async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
     )
     .await
     .expect_declared("ServerSettingsError");
-    let cause = error["cause"].as_str().expect("a sentence the panel can show");
+    let cause = error["cause"]
+        .as_str()
+        .expect("a sentence the panel can show");
     assert!(cause.contains("account-selection"), "{error}");
     assert!(cause.contains("one Codex account"), "{error}");
     assert_eq!(settings(&mut client).await["addProjectBaseDirectory"], "");
@@ -782,9 +850,7 @@ async fn a_codex_shadow_home_is_refused_as_unsupported_account_selection() {
 async fn a_change_reaches_an_open_window_without_a_restart() {
     let server = TestServer::start().await;
     let mut watcher = server.connect().await;
-    let subscription = watcher
-        .subscribe("subscribeServerConfig", json!({}))
-        .await;
+    let subscription = watcher.subscribe("subscribeServerConfig", json!({})).await;
     // The snapshot the subscription opens with, so what follows is the change.
     watcher.next_chunk(&subscription).await;
     watcher.ack(&subscription).await;
@@ -798,7 +864,10 @@ async fn a_change_reaches_an_open_window_without_a_restart() {
 
     let event = watcher.next_event(&subscription).await;
     assert_eq!(event["type"], "settingsUpdated", "{event}");
-    assert_eq!(event["payload"]["settings"]["addProjectBaseDirectory"], "/work");
+    assert_eq!(
+        event["payload"]["settings"]["addProjectBaseDirectory"],
+        "/work"
+    );
 
     server.stop().await;
 }
@@ -925,7 +994,10 @@ async fn keybindings_survive_a_restart_and_reach_an_open_window() {
 async fn a_corrupt_store_falls_back_to_defaults_with_a_warning_rather_than_failing_to_start() {
     let preferences = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(preferences.path().join("settings.json"), "{ not json").expect("writes");
-    std::fs::write(preferences.path().join("keybindings.json"), "not json either")
+    std::fs::write(
+        preferences.path().join("keybindings.json"),
+        "not json either",
+    )
         .expect("writes");
 
     let server = TestServer::start_configured_in(preferences.path()).await;

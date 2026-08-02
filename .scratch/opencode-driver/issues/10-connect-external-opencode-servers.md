@@ -7,16 +7,16 @@ authentication and no attempt to start, stop or secure that endpoint.
 **Blocked by:** 08 — Discover and configure OpenCode instances; 09 — Run the
 first owned OpenCode text turn.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] An external instance opens a directory-bound session and completes a text
+- [x] An external instance opens a directory-bound session and completes a text
       turn through the same driver behavior as an owned instance
-- [ ] An optional password is sent using OpenCode Basic authentication and is
+- [x] An optional password is sent using OpenCode Basic authentication and is
       never exposed in snapshots, logs or errors
-- [ ] HTTP and HTTPS URLs are accepted without a Laplus loopback restriction
-- [ ] Authentication, reachability and structured server failures remain
+- [x] HTTP and HTTPS URLs are accepted without a Laplus loopback restriction
+- [x] Authentication, reachability and structured server failures remain
       distinct and actionable
-- [ ] Stopping the Laplus session cancels its subscription but never performs an
+- [x] Stopping the Laplus session cancels its subscription but never performs an
       endpoint-lifetime action
-- [ ] Socket tests prove authenticated and unauthenticated flows and the absence
+- [x] Socket tests prove authenticated and unauthenticated flows and the absence
       of ownership actions

@@ -67,6 +67,26 @@ const ERROR: &str = "ServerSettingsError";
 /// The file, inside the app's data directory.
 pub const FILE: &str = "settings.json";
 
+/// Settings as they may cross a client boundary. Provider credentials remain
+/// in the runtime value and settings file, but are never reflected to a UI,
+/// subscription, snapshot or RPC response.
+pub(crate) fn public_value(settings: &Settings) -> Value {
+    let mut value = serde_json::to_value(settings).unwrap_or(Value::Null);
+    if let Some(instances) = value
+        .get_mut("providerInstances")
+        .and_then(Value::as_object_mut)
+    {
+        for instance in instances.values_mut() {
+            if instance.get("driver").and_then(Value::as_str) == Some("opencode") {
+                if let Some(config) = instance.get_mut("config").and_then(Value::as_object_mut) {
+                    config.remove("serverPassword");
+                }
+            }
+        }
+    }
+    value
+}
+
 /// The longest an interval may be — a little over a day.
 ///
 /// Not a rule of the contract's, which types it only as a duration. What this
@@ -200,11 +220,17 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
 
     for (field, value) in patch {
         match field.as_str() {
-            "enableProviderUpdateChecks" => next.enable_provider_update_checks = boolean(field, value)?,
-            "newWorktreesStartFromOrigin" => next.new_worktrees_start_from_origin = boolean(field, value)?,
+            "enableProviderUpdateChecks" => {
+                next.enable_provider_update_checks = boolean(field, value)?
+            }
+            "newWorktreesStartFromOrigin" => {
+                next.new_worktrees_start_from_origin = boolean(field, value)?
+            }
             "addProjectBaseDirectory" => next.add_project_base_directory = text(field, value)?,
             "automaticGitFetchInterval" => {
-                let interval = value.as_u64().filter(|interval| *interval <= LONGEST_INTERVAL);
+                let interval = value
+                    .as_u64()
+                    .filter(|interval| *interval <= LONGEST_INTERVAL);
                 next.automatic_git_fetch_interval = interval.ok_or_else(|| {
                     format!(
                         "'automaticGitFetchInterval' has to be a whole number of milliseconds \
@@ -285,7 +311,31 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
                 }
             }
             "providerInstances" => {
-                let mut instances = provider_instances(object(field, value)?)?;
+                let provided = object(field, value)?;
+                let mut instances = provider_instances(provided)?;
+                for (instance_id, instance) in &mut instances {
+                    let Some(previous) = next.provider_instances.get(instance_id) else {
+                        continue;
+                    };
+                    if instance.get("driver").and_then(Value::as_str) != Some("opencode")
+                        || previous.get("driver").and_then(Value::as_str) != Some("opencode")
+                    {
+                        continue;
+                    }
+                    let previous_password = previous.pointer("/config/serverPassword").cloned();
+                    if let (Some(password), Some(config)) = (
+                        previous_password,
+                        instance.get_mut("config").and_then(Value::as_object_mut),
+                    ) {
+                        let password_was_omitted = provided
+                            .get(instance_id)
+                            .and_then(|instance| instance.pointer("/config/serverPassword"))
+                            .is_none();
+                        if password_was_omitted {
+                            config.insert("serverPassword".to_string(), password);
+                        }
+                    }
+                }
                 for instance_id in [
                     crate::provider::CLAUDE_INSTANCE_ID,
                     crate::provider::CODEX_INSTANCE_ID,
@@ -313,18 +363,24 @@ fn apply(settings: &mut Settings, patch: &Map<String, Value>) -> Result<(), Stri
     // operations consume one registry. Normalize old-shaped writes at this
     // boundary unless the same patch supplied the default instance explicitly.
     let explicit_instances = patch.get("providerInstances").and_then(Value::as_object);
-    if patch.get("providers").and_then(Value::as_object)
+    if patch
+        .get("providers")
+        .and_then(Value::as_object)
         .is_some_and(|providers| providers.contains_key("claudeAgent"))
-        && !explicit_instances.is_some_and(|instances| instances.contains_key(crate::provider::CLAUDE_INSTANCE_ID))
+        && !explicit_instances
+            .is_some_and(|instances| instances.contains_key(crate::provider::CLAUDE_INSTANCE_ID))
     {
         next.provider_instances.insert(
             crate::provider::CLAUDE_INSTANCE_ID.to_string(),
             next.providers.claude_agent.instance_envelope("Claude"),
         );
     }
-    if patch.get("providers").and_then(Value::as_object)
+    if patch
+        .get("providers")
+        .and_then(Value::as_object)
         .is_some_and(|providers| providers.contains_key("codex"))
-        && !explicit_instances.is_some_and(|instances| instances.contains_key(crate::provider::CODEX_INSTANCE_ID))
+        && !explicit_instances
+            .is_some_and(|instances| instances.contains_key(crate::provider::CODEX_INSTANCE_ID))
     {
         next.provider_instances.insert(
             crate::provider::CODEX_INSTANCE_ID.to_string(),
@@ -347,13 +403,24 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
         }
         let envelope = object(&format!("providerInstances.{instance_id}"), value)?;
         for field in envelope.keys() {
-            if !matches!(field.as_str(), "driver" | "displayName" | "enabled" | "config") {
-                return Err(unrecognised(&format!("providerInstances.{instance_id}.{field}")));
+            if !matches!(
+                field.as_str(),
+                "driver" | "displayName" | "enabled" | "config"
+            ) {
+                return Err(unrecognised(&format!(
+                    "providerInstances.{instance_id}.{field}"
+                )));
             }
         }
-        let driver = envelope.get("driver").and_then(Value::as_str).unwrap_or_default().trim();
+        let driver = envelope
+            .get("driver")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
         if !slug(driver) {
-            return Err(format!("Provider instance '{instance_id}' needs a valid driver kind."));
+            return Err(format!(
+                "Provider instance '{instance_id}' needs a valid driver kind."
+            ));
         }
         let Some(registered) = crate::provider::registration(driver) else {
             return Err(format!(
@@ -370,36 +437,60 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                 "Default provider instance '{instance_id}' belongs to driver '{expected}', not '{driver}'."
             ));
         }
-        let display_name = envelope.get("displayName").and_then(Value::as_str)
-            .map(str::trim).filter(|name| !name.is_empty())
-            .ok_or_else(|| format!("Provider instance '{instance_id}' needs a non-empty displayName."))?;
+        let display_name = envelope
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                format!("Provider instance '{instance_id}' needs a non-empty displayName.")
+            })?;
         let enabled = match envelope.get("enabled") {
             Some(value) => boolean("enabled", value)?,
             None => true,
         };
-        let config = envelope.get("config")
+        let config = envelope
+            .get("config")
             .map(|value| object(&format!("providerInstances.{instance_id}.config"), value))
-            .transpose()?.cloned().unwrap_or_default();
+            .transpose()?
+            .cloned()
+            .unwrap_or_default();
         let (binary_path, home_path, launch_args, custom_models) = match registered.kind {
             crate::provider::DriverKind::Claude => {
-                let settings = claude(ClaudeSettings {
+                let settings = claude(
+                    ClaudeSettings {
                     enabled,
                     binary_path: "claude".to_string(),
                     home_path: String::new(),
                     launch_args: String::new(),
                     custom_models: Vec::new(),
-                }, &config)?;
-                (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
+                    },
+                    &config,
+                )?;
+                (
+                    settings.binary_path,
+                    settings.home_path,
+                    settings.launch_args,
+                    settings.custom_models,
+                )
             }
             crate::provider::DriverKind::Codex => {
-                let settings = codex(CodexSettings {
+                let settings = codex(
+                    CodexSettings {
                     enabled,
                     binary_path: "codex".to_string(),
                     home_path: String::new(),
                     launch_args: String::new(),
                     custom_models: Vec::new(),
-                }, &config)?;
-                (settings.binary_path, settings.home_path, settings.launch_args, settings.custom_models)
+                    },
+                    &config,
+                )?;
+                (
+                    settings.binary_path,
+                    settings.home_path,
+                    settings.launch_args,
+                    settings.custom_models,
+                )
             }
             crate::provider::DriverKind::OpenCode => {
                 let settings = opencode(&config)?;
@@ -411,7 +502,9 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                 continue;
             }
         };
-        normalized.insert(instance_id.clone(), json!({
+        normalized.insert(
+            instance_id.clone(),
+            json!({
             "driver": driver,
             "displayName": display_name,
             "enabled": enabled,
@@ -421,29 +514,52 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                 "launchArgs": launch_args,
                 "customModels": custom_models,
             }
-        }));
+            }),
+        );
     }
     Ok(normalized)
 }
 
 fn opencode(config: &Map<String, Value>) -> Result<crate::config::OpenCodeSettings, String> {
     for field in config.keys() {
-        if !matches!(field.as_str(), "binaryPath" | "serverUrl" | "serverPassword" | "customModels") {
+        if !matches!(
+            field.as_str(),
+            "binaryPath" | "serverUrl" | "serverPassword" | "customModels"
+        ) {
             return Err(unrecognised(&format!("providers.opencode.{field}")));
         }
     }
-    let server_url = config.get("serverUrl").map(|v| text("serverUrl", v)).transpose()?.unwrap_or_default();
+    let server_url = config
+        .get("serverUrl")
+        .map(|v| text("serverUrl", v))
+        .transpose()?
+        .unwrap_or_default();
     if !server_url.is_empty() {
-        let valid = reqwest::Url::parse(&server_url).ok()
+        let valid = reqwest::Url::parse(&server_url)
+            .ok()
             .is_some_and(|url| matches!(url.scheme(), "http" | "https"));
-        if !valid { return Err("'serverUrl' has to be an HTTP or HTTPS URL.".to_string()); }
+        if !valid {
+            return Err("'serverUrl' has to be an HTTP or HTTPS URL.".to_string());
+        }
     }
     Ok(crate::config::OpenCodeSettings {
         enabled: true,
-        binary_path: config.get("binaryPath").map(|v| text("binaryPath", v)).transpose()?.unwrap_or_else(|| "opencode".to_string()),
+        binary_path: config
+            .get("binaryPath")
+            .map(|v| text("binaryPath", v))
+            .transpose()?
+            .unwrap_or_else(|| "opencode".to_string()),
         server_url,
-        server_password: config.get("serverPassword").map(|v| text("serverPassword", v)).transpose()?.unwrap_or_default(),
-        custom_models: config.get("customModels").map(models).transpose()?.unwrap_or_default(),
+        server_password: config
+            .get("serverPassword")
+            .map(|v| secret_text("serverPassword", v))
+            .transpose()?
+            .unwrap_or_default(),
+        custom_models: config
+            .get("customModels")
+            .map(models)
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -453,7 +569,10 @@ fn opencode(config: &Map<String, Value>) -> Result<crate::config::OpenCodeSettin
 /// it. This is the criterion "the Claude Code provider instance can be
 /// configured, including model selection": `customModels` is what the composer's
 /// model picker offers, and `binaryPath` is what the next session starts.
-fn claude(mut claude: ClaudeSettings, patch: &Map<String, Value>) -> Result<ClaudeSettings, String> {
+fn claude(
+    mut claude: ClaudeSettings,
+    patch: &Map<String, Value>,
+) -> Result<ClaudeSettings, String> {
     for (field, value) in patch {
         match field.as_str() {
             "enabled" => claude.enabled = boolean(field, value)?,
@@ -519,9 +638,7 @@ fn models(value: &Value) -> Result<Vec<String>, String> {
                 .map(str::trim)
                 .filter(|named| !named.is_empty())
                 .map(str::to_string)
-                .ok_or_else(|| {
-                    format!("'customModels' has to hold model names, and held {model}.")
-                })
+                .ok_or_else(|| format!("'customModels' has to hold model names, and held {model}."))
         })
         .collect()
 }
@@ -535,10 +652,15 @@ fn models(value: &Value) -> Result<Vec<String>, String> {
 /// a stored value the client cannot decode would fail its whole settings read.
 fn selection(value: &Value) -> Result<Value, String> {
     let object = value.as_object().ok_or_else(|| {
-        format!("'textGenerationModelSelection' has to name an instance and a model, and was {value}.")
+        format!(
+            "'textGenerationModelSelection' has to name an instance and a model, and was {value}."
+        )
     })?;
     for field in ["instanceId", "model"] {
-        let named = object.get(field).and_then(Value::as_str).unwrap_or_default();
+        let named = object
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if named.trim().is_empty() {
             return Err(format!(
                 "'textGenerationModelSelection' has to name a non-empty '{field}'."
@@ -570,10 +692,13 @@ fn slug(value: &str) -> bool {
 
     !value.is_empty()
         && value.chars().count() <= LONGEST
-        && value.chars().next().is_some_and(|first| first.is_ascii_alphabetic())
         && value
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
 }
 
 fn boolean(field: &str, value: &Value) -> Result<bool, String> {
@@ -587,6 +712,13 @@ fn text(field: &str, value: &Value) -> Result<String, String> {
         .as_str()
         .map(|text| text.trim().to_string())
         .ok_or_else(|| format!("'{field}' has to be text, and was {value}."))
+}
+
+fn secret_text(field: &str, value: &Value) -> Result<String, String> {
+    value
+        .as_str()
+        .map(|text| text.trim().to_string())
+        .ok_or_else(|| format!("'{field}' has to be text."))
 }
 
 fn object<'a>(field: &str, value: &'a Value) -> Result<&'a Map<String, Value>, String> {
@@ -622,9 +754,9 @@ impl Update {
     /// [`crate::keybindings::Upsert::read`], whose reasoning this shares.
     pub fn read(payload: &Value, directory: &Path) -> Result<Update, Value> {
         let refuse = |detail: &str| refused(directory, Operation::Normalize, detail);
-        let patch = payload
-            .get("patch")
-            .ok_or_else(|| refuse("This call needs a patch of the settings to change; none was given."))?;
+        let patch = payload.get("patch").ok_or_else(|| {
+            refuse("This call needs a patch of the settings to change; none was given.")
+        })?;
         let patch = patch
             .as_object()
             .ok_or_else(|| refuse("The patch has to be a group of settings."))?;
@@ -659,16 +791,26 @@ impl Update {
         // developer is waiting for the answer that says it worked.
         let search = crate::process::Search::from_environment();
         let current = store.current();
-        let removed = previous_instances.keys()
-            .filter(|instance_id| !current.settings.provider_instances.contains_key(*instance_id))
-            .cloned().collect::<Vec<_>>();
+        let removed = previous_instances
+            .keys()
+            .filter(|instance_id| {
+                !current
+                    .settings
+                    .provider_instances
+                    .contains_key(*instance_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if !removed.is_empty() {
             for instance_id in &removed {
                 store.begin_provider_probe(instance_id);
             }
-            let providers = current.providers.iter()
+            let providers = current
+                .providers
+                .iter()
                 .filter(|provider| !removed.contains(&provider.instance_id))
-                .cloned().collect();
+                .cloned()
+                .collect();
             store.apply(crate::config_store::ConfigChange::Providers(providers));
         }
         for (instance_id, instance) in &current.settings.provider_instances {
@@ -728,8 +870,13 @@ pub(crate) fn reconfigure(
     // `normalize` rather than a `write-file` — the file is fine and the request
     // was not.
     change(&mut next).map_err(|why| refused(directory, Operation::Normalize, &why))?;
-    save(directory, &next)
-        .map_err(|why| refused(directory, Operation::Write, &format!("they were not saved: {why}")))?;
+    save(directory, &next).map_err(|why| {
+        refused(
+            directory,
+            Operation::Write,
+            &format!("they were not saved: {why}"),
+        )
+    })?;
     *settings = next;
     Ok(())
 }
@@ -764,7 +911,10 @@ mod tests {
             after.enable_provider_update_checks,
             before.enable_provider_update_checks
         );
-        assert_eq!(after.automatic_git_fetch_interval, before.automatic_git_fetch_interval);
+        assert_eq!(
+            after.automatic_git_fetch_interval,
+            before.automatic_git_fetch_interval
+        );
         assert_eq!(after.providers.claude_agent, before.providers.claude_agent);
     }
 
@@ -780,7 +930,10 @@ mod tests {
 
         assert_eq!(after.providers.claude_agent.binary_path, "/opt/claude");
         assert!(after.providers.claude_agent.enabled, "the neighbour moved");
-        assert_eq!(after.providers.claude_agent.custom_models, Vec::<String>::new());
+        assert_eq!(
+            after.providers.claude_agent.custom_models,
+            Vec::<String>::new()
+        );
     }
 
     /// The criterion: an invalid patch is refused *and changes nothing*. Driven
@@ -812,14 +965,38 @@ mod tests {
     #[test]
     fn an_invalid_value_is_refused_with_a_sentence_naming_the_field() {
         for (patch, named) in [
-            (json!({"enableProviderUpdateChecks": "yes"}), "enableProviderUpdateChecks"),
-            (json!({"automaticGitFetchInterval": 999_999_999_999u64}), "automaticGitFetchInterval"),
-            (json!({"defaultThreadEnvMode": "elsewhere"}), "defaultThreadEnvMode"),
-            (json!({"addProjectBaseDirectory": 7}), "addProjectBaseDirectory"),
-            (json!({"observability": {"otlpTracesUrl": 7}}), "otlpTracesUrl"),
-            (json!({"providers": {"claudeAgent": {"customModels": "opus"}}}), "customModels"),
-            (json!({"providers": {"claudeAgent": {"customModels": [""]}}}), "customModels"),
-            (json!({"textGenerationModelSelection": {"model": "x"}}), "instanceId"),
+            (
+                json!({"enableProviderUpdateChecks": "yes"}),
+                "enableProviderUpdateChecks",
+            ),
+            (
+                json!({"automaticGitFetchInterval": 999_999_999_999u64}),
+                "automaticGitFetchInterval",
+            ),
+            (
+                json!({"defaultThreadEnvMode": "elsewhere"}),
+                "defaultThreadEnvMode",
+            ),
+            (
+                json!({"addProjectBaseDirectory": 7}),
+                "addProjectBaseDirectory",
+            ),
+            (
+                json!({"observability": {"otlpTracesUrl": 7}}),
+                "otlpTracesUrl",
+            ),
+            (
+                json!({"providers": {"claudeAgent": {"customModels": "opus"}}}),
+                "customModels",
+            ),
+            (
+                json!({"providers": {"claudeAgent": {"customModels": [""]}}}),
+                "customModels",
+            ),
+            (
+                json!({"textGenerationModelSelection": {"model": "x"}}),
+                "instanceId",
+            ),
             (json!({"nonsense": true}), "nonsense"),
         ] {
             let why = patched(patch.clone()).expect_err("a refusal");
@@ -951,7 +1128,10 @@ mod tests {
             // one — see [`Operation`].
             assert_eq!(error["operation"], "normalize", "{payload}");
             assert!(
-                error["settingsPath"].as_str().unwrap_or_default().ends_with(FILE),
+                error["settingsPath"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(FILE),
                 "{error}"
             );
         }

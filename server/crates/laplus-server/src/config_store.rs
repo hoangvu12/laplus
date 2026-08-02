@@ -159,7 +159,10 @@ impl ConfigChange {
     /// How this change describes itself to a subscriber.
     fn to_event(&self) -> Value {
         match self {
-            ConfigChange::Keybindings { keybindings, issues } => json!({
+            ConfigChange::Keybindings {
+                keybindings,
+                issues,
+            } => json!({
                 "version": 1,
                 "type": "keybindingsUpdated",
                 "payload": {"keybindings": keybindings, "issues": issues},
@@ -172,14 +175,17 @@ impl ConfigChange {
             ConfigChange::Settings(settings) => json!({
                 "version": 1,
                 "type": "settingsUpdated",
-                "payload": {"settings": settings},
+                "payload": {"settings": crate::settings::public_value(settings)},
             }),
         }
     }
 
     fn apply_to(self, config: &mut ServerConfig) {
         match self {
-            ConfigChange::Keybindings { keybindings, issues } => {
+            ConfigChange::Keybindings {
+                keybindings,
+                issues,
+            } => {
                 config.keybindings = keybindings;
                 config.issues = issues;
             }
@@ -354,7 +360,7 @@ impl ConfigStore {
         next.settings = settings.clone();
         *current = Arc::new(next);
 
-        let answer = serde_json::to_value(&settings).unwrap_or(Value::Null);
+        let answer = crate::settings::public_value(&settings);
         let _ = self
             .inner
             .updates
@@ -522,16 +528,24 @@ mod tests {
         let older = store.begin_provider_probe("codex");
         let newer = store.begin_provider_probe("codex");
 
-        assert!(store.apply_providers_if_current(newer, |_| true, |_| {
+        assert!(store.apply_providers_if_current(
+            newer,
+            |_| true,
+            |_| {
             let mut provider = provider("new");
             provider.skills = vec![json!({"name": "new-workspace"})];
             vec![provider]
-        }));
-        assert!(!store.apply_providers_if_current(older, |_| true, |_| {
+            }
+        ));
+        assert!(!store.apply_providers_if_current(
+            older,
+            |_| true,
+            |_| {
             let mut provider = provider("old");
             provider.skills = vec![json!({"name": "old-workspace"})];
             vec![provider]
-        }));
+            }
+        ));
 
         assert_eq!(store.current().providers[0].version.as_deref(), Some("new"));
         assert_eq!(

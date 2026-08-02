@@ -429,7 +429,7 @@ pub struct CodexSettings {
     pub custom_models: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenCodeSettings {
     pub enabled: bool,
@@ -439,17 +439,44 @@ pub struct OpenCodeSettings {
     pub custom_models: Vec<String>,
 }
 
+impl std::fmt::Debug for OpenCodeSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenCodeSettings")
+            .field("enabled", &self.enabled)
+            .field("binary_path", &self.binary_path)
+            .field("server_url", &self.server_url)
+            .field("server_password", &"[redacted]")
+            .field("custom_models", &self.custom_models)
+            .finish()
+    }
+}
+
 impl ClaudeSettings {
     pub(crate) fn instance_envelope(&self, display_name: &str) -> serde_json::Value {
-        provider_instance_envelope(crate::provider::CLAUDE_DRIVER, display_name, self.enabled,
-            &self.binary_path, &self.home_path, &self.launch_args, &self.custom_models)
+        provider_instance_envelope(
+            crate::provider::CLAUDE_DRIVER,
+            display_name,
+            self.enabled,
+            &self.binary_path,
+            &self.home_path,
+            &self.launch_args,
+            &self.custom_models,
+        )
     }
 }
 
 impl CodexSettings {
     pub(crate) fn instance_envelope(&self, display_name: &str) -> serde_json::Value {
-        provider_instance_envelope(crate::provider::CODEX_DRIVER, display_name, self.enabled,
-            &self.binary_path, &self.home_path, &self.launch_args, &self.custom_models)
+        provider_instance_envelope(
+            crate::provider::CODEX_DRIVER,
+            display_name,
+            self.enabled,
+            &self.binary_path,
+            &self.home_path,
+            &self.launch_args,
+            &self.custom_models,
+        )
     }
 }
 
@@ -597,7 +624,10 @@ impl ServerConfig {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 ".",
             ),
-            keybindings_config_path: display_path(data_dir.join("keybindings.json"), "keybindings.json"),
+            keybindings_config_path: display_path(
+                data_dir.join("keybindings.json"),
+                "keybindings.json",
+            ),
             keybindings: Vec::new(),
             issues: Vec::new(),
             // Empty until something has looked. See the module docs.
@@ -706,7 +736,9 @@ impl ServerConfig {
     }
 
     pub fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("server config serializes")
+        let mut value = serde_json::to_value(self).expect("server config serializes");
+        value["settings"] = crate::settings::public_value(&self.settings);
+        value
     }
 }
 
@@ -799,7 +831,11 @@ const MACHINE_SLUG_LIMIT: usize = 28;
 /// Ticket 06 of the headless-Linux effort is where `<machine>-<suffix>` and the
 /// argument for a legible id over an opaque one are written down.
 pub(crate) fn fresh_environment_id() -> Result<String, crate::pairing::RandomError> {
-    Ok(format!("{}-{}", machine_slug(), crate::pairing::identifier_suffix()?))
+    Ok(format!(
+        "{}-{}",
+        machine_slug(),
+        crate::pairing::identifier_suffix()?
+    ))
 }
 
 /// The prefix half of this laplus's environment id: what
@@ -955,7 +991,13 @@ mod tests {
             directory.display()
         );
 
-        let base = ["LOCALAPPDATA", "APPDATA", "XDG_DATA_HOME", "USERPROFILE", "HOME"]
+        let base = [
+            "LOCALAPPDATA",
+            "APPDATA",
+            "XDG_DATA_HOME",
+            "USERPROFILE",
+            "HOME",
+        ]
             .iter()
             .find_map(|name| non_empty_env(name));
         let Some(base) = base else {
@@ -978,10 +1020,7 @@ mod tests {
             crate::store::default_path().starts_with(&directory),
             "the registry should live with the rest of the developer's files"
         );
-        assert!(
-            logs_dir().starts_with(&directory),
-            "so should the logs"
-        );
+        assert!(logs_dir().starts_with(&directory), "so should the logs");
     }
 
     /// The shell writes a startup failure into this directory before any server
@@ -1014,7 +1053,9 @@ mod tests {
             "/keybindingsConfigPath",
             "/observability/logsDirectoryPath",
         ] {
-            let found = value.pointer(path).unwrap_or_else(|| panic!("{path} is present"));
+            let found = value
+                .pointer(path)
+                .unwrap_or_else(|| panic!("{path} is present"));
             let text = found
                 .as_str()
                 .unwrap_or_else(|| panic!("{path} is a string, got {found}"));
@@ -1054,7 +1095,9 @@ mod tests {
         assert_eq!(detected.auth.policy, "loopback-browser");
 
         let opened = {
-            let exposed = detected.remote_access.with_exposure(Exposure::NetworkAccessible);
+            let exposed = detected
+                .remote_access
+                .with_exposure(Exposure::NetworkAccessible);
             detected.with_remote_access(exposed)
         };
         assert_eq!(
@@ -1183,7 +1226,10 @@ mod tests {
     /// usefully say, and the caller has a fallback for that.
     #[test]
     fn a_machine_name_slugs_into_a_url_safe_prefix() {
-        assert_eq!(slug_of("DESKTOP-19EUMEB").as_deref(), Some("desktop-19eumeb"));
+        assert_eq!(
+            slug_of("DESKTOP-19EUMEB").as_deref(),
+            Some("desktop-19eumeb")
+        );
         assert_eq!(slug_of("orpheus").as_deref(), Some("orpheus"));
         assert_eq!(
             slug_of("ip-10-0-1-42.eu-west-1.compute.internal").as_deref(),
@@ -1231,7 +1277,9 @@ mod tests {
         let slug = machine_slug();
         assert!(!slug.is_empty());
         assert!(
-            slug.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            slug.bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
             "{slug} should begin with a character and not a dash"
         );
         assert!(

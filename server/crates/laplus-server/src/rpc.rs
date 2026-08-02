@@ -278,11 +278,7 @@ pub fn resume_cursor(payload: &Value) -> Option<i64> {
 }
 
 /// Answer one call.
-pub fn dispatch(
-    services: &Services,
-    tag: &str,
-    payload: &Value,
-) -> Result<Answer, DispatchError> {
+pub fn dispatch(services: &Services, tag: &str, payload: &Value) -> Result<Answer, DispatchError> {
     match tag {
         SERVER_GET_CONFIG => Ok(Answer::Value(services.config.current().to_value())),
         SERVER_PROBE => Ok(Answer::Value(serde_json::json!({}))),
@@ -475,9 +471,9 @@ pub fn dispatch(
         // Reading the settings is reading memory — they were loaded at startup
         // and every change since has gone through the store — so it answers on
         // the read loop. The payload is an empty struct in the contract.
-        settings::GET => Ok(Answer::Value(
-            serde_json::to_value(&services.config.current().settings).unwrap_or(Value::Null),
-        )),
+        settings::GET => Ok(Answer::Value(settings::public_value(
+            &services.config.current().settings,
+        ))),
         // The three that write a file do not. Small work, but a disk that is
         // busy is bounded by nothing this server controls, and the read loop
         // owes the next frame.
@@ -612,11 +608,27 @@ mod tests {
             "a client that has read an empty registry holds a real position"
         );
 
-        assert_eq!(resume_cursor(&json!({"afterSequence": -1})), None, "negative");
+        assert_eq!(
+            resume_cursor(&json!({"afterSequence": -1})),
+            None,
+            "negative"
+        );
         assert_eq!(resume_cursor(&json!({"afterSequence": null})), None, "null");
-        assert_eq!(resume_cursor(&json!({"afterSequence": "3"})), None, "a string");
-        assert_eq!(resume_cursor(&json!({"afterSequence": 1.5})), None, "not whole");
-        assert_eq!(resume_cursor(&json!({})), None, "a client that holds nothing");
+        assert_eq!(
+            resume_cursor(&json!({"afterSequence": "3"})),
+            None,
+            "a string"
+        );
+        assert_eq!(
+            resume_cursor(&json!({"afterSequence": 1.5})),
+            None,
+            "not whole"
+        );
+        assert_eq!(
+            resume_cursor(&json!({})),
+            None,
+            "a client that holds nothing"
+        );
     }
 
     #[test]
@@ -789,7 +801,10 @@ mod tests {
 
         for tag in [terminal::CLOSE, terminal::RESTART] {
             let answer = dispatch(&services, tag, &named).expect("dispatches");
-            assert!(matches!(answer, Answer::Deferred(_)), "{tag} answered inline");
+            assert!(
+                matches!(answer, Answer::Deferred(_)),
+                "{tag} answered inline"
+            );
         }
 
         // …and clearing does not, because it is arithmetic on a string the
@@ -889,9 +904,15 @@ mod tests {
             "toTurnCount": 1,
         });
 
-        for tag in [checkpoints::GET_TURN_DIFF, checkpoints::GET_FULL_THREAD_DIFF] {
+        for tag in [
+            checkpoints::GET_TURN_DIFF,
+            checkpoints::GET_FULL_THREAD_DIFF,
+        ] {
             let answer = dispatch(&services, tag, &asked).expect("dispatches");
-            assert!(matches!(answer, Answer::Deferred(_)), "{tag} answered inline");
+            assert!(
+                matches!(answer, Answer::Deferred(_)),
+                "{tag} answered inline"
+            );
         }
     }
 
@@ -909,10 +930,7 @@ mod tests {
         });
 
         for (tag, expected) in [
-            (
-                checkpoints::GET_TURN_DIFF,
-                "OrchestrationGetTurnDiffError",
-            ),
+            (checkpoints::GET_TURN_DIFF, "OrchestrationGetTurnDiffError"),
             (
                 checkpoints::GET_FULL_THREAD_DIFF,
                 "OrchestrationGetFullThreadDiffError",

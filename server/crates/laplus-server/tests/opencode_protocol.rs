@@ -164,9 +164,13 @@ async fn missing_session_auth_transport_server_and_bad_json_are_distinct() {
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"name":"InternalError","message":"boom"}),
         ),
+        "/api/session/leaky" => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"name":"InternalError","message":"rejected wire-secret"}),
+        ),
         "/api/global/health" => Response::builder()
             .status(200)
-            .body(Body::from("not-json"))
+            .body(Body::from("not-json wire-secret"))
             .unwrap(),
         _ => unreachable!(),
     })
@@ -180,10 +184,27 @@ async fn missing_session_auth_transport_server_and_bad_json_are_distinct() {
         client.session("auth").await,
         Err(OpenCodeError::Authentication { .. })
     ));
-    assert!(matches!(
-        client.session("broken").await,
-        Err(OpenCodeError::Server { .. })
-    ));
+    let broken = client
+        .session("broken")
+        .await
+        .expect_err("structured server failure");
+    assert!(matches!(broken, OpenCodeError::Server { .. }));
+    assert!(
+        broken.to_string().contains("InternalError: boom"),
+        "{broken}"
+    );
+    let authenticated =
+        OpenCodeClient::new(&url, "/workspace", Some("wire-secret".into())).unwrap();
+    let leaky = authenticated
+        .session("leaky")
+        .await
+        .expect_err("server failure");
+    assert!(!leaky.to_string().contains("wire-secret"), "{leaky}");
+    let malformed = authenticated.health().await.expect_err("malformed JSON");
+    assert!(
+        !format!("{malformed:?}").contains("wire-secret"),
+        "{malformed:?}"
+    );
     assert!(matches!(
         client.health().await,
         Err(OpenCodeError::MalformedJson { .. })
@@ -261,6 +282,35 @@ async fn event_stream_retains_and_counts_unknown_events_and_cancels_promptly() {
         .await
         .expect("event pump did not stop within the hang timeout");
     let _ = stop.send(());
+}
+
+#[tokio::test]
+async fn event_stream_errors_never_echo_the_configured_password() {
+    let (url, _, stop) = peer(move |_| {
+        Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(Body::from("malformed: wire-secret\n\n"))
+            .unwrap()
+    })
+    .await;
+    let client = OpenCodeClient::new(&url, "/workspace", Some("wire-secret".into())).unwrap();
+    let mut events = client.subscribe().await.unwrap();
+    let error = events.next().await.expect_err("malformed SSE");
+    assert!(!error.to_string().contains("wire-secret"), "{error}");
+    let _ = stop.send(());
+}
+
+#[test]
+fn opencode_settings_debug_never_echoes_the_password() {
+    let settings = laplus_server::config::OpenCodeSettings {
+        enabled: true,
+        binary_path: "opencode".into(),
+        server_url: "https://opencode.example.test".into(),
+        server_password: "debug-secret".into(),
+        custom_models: Vec::new(),
+    };
+    assert!(!format!("{settings:?}").contains("debug-secret"));
 }
 
 #[derive(Deserialize)]

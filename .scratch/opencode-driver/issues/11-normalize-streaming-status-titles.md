@@ -8,17 +8,17 @@ surfaces.
 
 **Blocked by:** 09 — Run the first owned OpenCode text turn.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Assistant and reasoning parts render correctly when role metadata arrives
+- [x] Assistant and reasoning parts render correctly when role metadata arrives
       before or after the part
-- [ ] True deltas stream immediately and the final cumulative update emits only
+- [x] True deltas stream immediately and the final cumulative update emits only
       unseen text
-- [ ] An older cumulative update never shortens or duplicates rendered content
-- [ ] Status-idle and standalone idle settle the same active turn idempotently
-- [ ] Busy, retry and structured error events publish the expected session,
+- [x] An older cumulative update never shortens or duplicates rendered content
+- [x] Status-idle and standalone idle settle the same active turn idempotently
+- [x] Busy, retry and structured error events publish the expected session,
       warning and failed-turn behavior
-- [ ] Every non-empty upstream title update becomes the thread title
-- [ ] Unknown new events remain observable and non-fatal
-- [ ] Scripted-peer tests exercise the captured 1.18.10 ordering and pinned T3
+- [x] Every non-empty upstream title update becomes the thread title
+- [x] Unknown new events remain observable and non-fatal
+- [x] Scripted-peer tests exercise the captured 1.18.10 ordering and pinned T3
       variants through the socket boundary

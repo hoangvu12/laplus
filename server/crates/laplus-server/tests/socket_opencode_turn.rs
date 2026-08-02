@@ -14,8 +14,8 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, State},
-    http::{header, StatusCode},
+    extract::{Path as AxumPath, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::{get, post},
     Json, Router,
@@ -208,6 +208,17 @@ struct PeerState {
     subscriber: Arc<Mutex<Option<mpsc::Sender<Result<&'static str, Infallible>>>>>,
     log: Arc<PathBuf>,
     healthy: bool,
+    authorization: Option<String>,
+}
+
+fn assert_authorization(headers: &HeaderMap, state: &PeerState) {
+    assert_eq!(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        state.authorization.as_deref(),
+        "the external endpoint receives exactly the configured authentication"
+    );
 }
 
 fn append(path: &Path, value: Value) {
@@ -224,7 +235,8 @@ async fn health(State(state): State<PeerState>) -> Json<Value> {
     Json(json!({"healthy":state.healthy,"version":"1.18.10"}))
 }
 
-async fn events(State(state): State<PeerState>) -> Response {
+async fn events(State(state): State<PeerState>, headers: HeaderMap) -> Response {
+    assert_authorization(&headers, &state);
     let (tx, rx) = mpsc::channel(8);
     *state.subscriber.lock().expect("subscriber lock") = Some(tx);
     let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
@@ -237,16 +249,27 @@ async fn events(State(state): State<PeerState>) -> Response {
         .unwrap()
 }
 
-async fn create_session(State(state): State<PeerState>, Json(body): Json<Value>) -> Json<Value> {
-    append(&state.log, json!({"operation":"create","body":body}));
+async fn create_session(
+    State(state): State<PeerState>,
+    headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_authorization(&headers, &state);
+    append(
+        &state.log,
+        json!({"operation":"create","directory":query.get("directory"),"body":body}),
+    );
     Json(json!({"id":"ses_owned_1"}))
 }
 
 async fn prompt(
     AxumPath(session_id): AxumPath<String>,
     State(state): State<PeerState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> StatusCode {
+    assert_authorization(&headers, &state);
     append(
         &state.log,
         json!({"operation":"prompt","sessionId":session_id,"body":body}),
@@ -258,13 +281,183 @@ async fn prompt(
         .clone()
         .expect("event subscription precedes prompt");
     for event in [
-        "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"field\":\"text\",\"delta\":\"hello \"}}\n\n",
-        "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"hello from OpenCode\"}}}\n\n",
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"reason-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"check the stream\"}}}\n\n",
+        "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\"}}}\n\n",
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
+        "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"busy\"}}}\n\n",
+        "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"text-1\",\"field\":\"text\",\"delta\":\"hello \"}}\n\n",
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"hello from OpenCode\"}}}\n\n",
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"hello\"}}}\n\n",
+        "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"retry\",\"message\":\"Retrying upstream\"}}}\n\n",
+        "data: {\"type\":\"session.updated\",\"properties\":{\"info\":{\"id\":\"ses_owned_1\",\"title\":\"Upstream title\"}}}\n\n",
+        "data: {\"type\":\"future.event\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
+        "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"idle\"}}}\n\n",
         "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
     ] {
         sender.send(Ok(event)).await.expect("send scripted SSE event");
     }
     StatusCode::NO_CONTENT
+}
+
+struct ExternalOpenCode {
+    _directory: tempfile::TempDir,
+    endpoint: String,
+    log: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ExternalOpenCode {
+    async fn start(password: Option<&str>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            authorization: password.map(|password| match password {
+                "external-secret-that-must-stay-private" => {
+                    "Basic b3BlbmNvZGU6ZXh0ZXJuYWwtc2VjcmV0LXRoYXQtbXVzdC1zdGF5LXByaXZhdGU="
+                        .to_string()
+                }
+                _ => panic!("test password needs an explicit wire expectation"),
+            }),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/global/health", get(health))
+            .route("/event", get(events))
+            .route("/session", post(create_session))
+            .route("/session/{id}/prompt_async", post(prompt))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            _directory: directory,
+            endpoint,
+            log,
+            task,
+        }
+    }
+
+    fn config(&self, password: Option<&str>) -> ServerConfig {
+        let mut config = ServerConfig::detect();
+        config.settings.provider_instances.insert(
+            "openExternal".into(),
+            json!({"driver":"opencode","displayName":"OpenCode External","config":{
+                "binaryPath":"this-binary-must-never-be-started","serverUrl":self.endpoint,
+                "serverPassword":password.unwrap_or_default(),"customModels":["openai/gpt-5"]
+            }}),
+        );
+        config
+    }
+
+    async fn requests(&self) -> Vec<Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&self.log) {
+                    let values = contents
+                        .lines()
+                        .map(|line| serde_json::from_str(line).unwrap())
+                        .collect::<Vec<_>>();
+                    if values.len() >= 2 {
+                        return values;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("external peer receives the turn")
+    }
+}
+
+async fn assert_external_turn(password: Option<&str>) {
+    let peer = ExternalOpenCode::start(password).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(password)).await;
+    let mut client = server.connect().await;
+    if password.is_some() {
+        let mut instances = client
+            .call("server.getSettings", json!({}))
+            .await
+            .expect_success()["providerInstances"]
+            .clone();
+        assert!(instances["openExternal"]["config"]
+            .get("serverPassword")
+            .is_none());
+        instances["openExternal"]["config"]["customModels"] =
+            json!(["openai/gpt-5", "openai/gpt-5-mini"]);
+        let updated = client
+            .call(
+                "server.updateSettings",
+                json!({"patch":{"providerInstances":instances}}),
+            )
+            .await
+            .expect_success();
+        assert!(!updated
+            .to_string()
+            .contains("external-secret-that-must-stay-private"));
+    }
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("external-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("external-project", "external-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("external-thread").await;
+    let mut command = start_turn("external-thread", "external-message", "say hello");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        assistant_sends(&events).last().unwrap().0,
+        "hello from OpenCode"
+    );
+    let requests = peer.requests().await;
+    assert_eq!(
+        requests[0]["directory"],
+        workspace.path().to_string_lossy().as_ref()
+    );
+    client.call("orchestration.dispatchCommand", json!({
+        "type":"thread.session.stop","commandId":"test:stop:external","threadId":"external-thread",
+        "createdAt":"2026-08-01T00:00:00.000Z"
+    })).await.expect_success();
+    assert!(
+        tokio::net::TcpStream::connect(peer.endpoint.trim_start_matches("http://"))
+            .await
+            .is_ok(),
+        "stopping a session must leave an operator-owned endpoint running"
+    );
+    client.close().await;
+    server.stop().await;
+    assert!(
+        !peer.task.is_finished(),
+        "server shutdown must not stop an operator-owned endpoint"
+    );
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn an_unauthenticated_external_opencode_turn_crosses_the_socket_without_ownership() {
+    assert_external_turn(None).await;
+}
+
+#[tokio::test]
+async fn an_authenticated_external_opencode_turn_crosses_the_socket_without_exposing_its_password()
+{
+    assert_external_turn(Some("external-secret-that-must-stay-private")).await;
 }
 
 #[tokio::test]
@@ -311,8 +504,26 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
         assistant_sends(&events),
         vec![
             ("hello ".to_string(), true),
+            ("from OpenCode".to_string(), true),
             ("hello from OpenCode".to_string(), false),
         ]
+    );
+    assert!(events
+        .iter()
+        .any(|item| item["event"]["type"] == "thread.meta-updated"
+            && item["event"]["payload"]["title"] == "Upstream title"));
+    assert!(events
+        .iter()
+        .any(|item| item["event"]["payload"]["activity"]["kind"] == "runtime.warning"));
+    assert!(events.iter().any(
+        |item| item["event"]["payload"]["activity"]["payload"]["thinking"] == "check the stream"
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|item| item["event"]["payload"]["activity"]["kind"] == "turn.completed")
+            .count(),
+        1
     );
     let settled = events
         .iter()
