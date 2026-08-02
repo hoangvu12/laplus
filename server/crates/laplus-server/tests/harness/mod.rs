@@ -237,6 +237,22 @@ impl TestServer {
         TestServer::bootstrapped(server, Some(preferences)).await
     }
 
+    pub async fn start_with_mcp(
+        mut config: ServerConfig,
+        host: laplus_server::mcp::Host,
+        platform: std::sync::Arc<dyn laplus_server::mcp::Platform>,
+    ) -> TestServer {
+        let preferences = tempfile::tempdir().expect("a temporary directory");
+        config = config.with_remote_access(RemoteAccess::none());
+        config.preferences = preferences.path().to_path_buf();
+        somewhere_that_is_not_the_developers(&mut config);
+        let server = Server::bind_with_platform(
+            0, config, Database::in_memory().expect("a database"), Assets::none(),
+            laplus_server::provider_maintenance::ProviderMaintenance::new(), host, platform,
+        ).await.expect("server binds with supplied MCP platform");
+        TestServer::bootstrapped(server, Some(preferences)).await
+    }
+
     /// A server keeping the developer's configuration in `preferences`.
     ///
     /// Start a second one on the same directory and that is a restart, which is
@@ -580,6 +596,10 @@ impl TestServer {
     /// is terminated and reaped when the session ends" is observed from outside.
     pub fn live_agents(&self) -> usize {
         self.server.state().live_agents()
+    }
+
+    pub fn live_mcp_sessions(&self) -> usize {
+        self.server.state().live_mcp_sessions()
     }
 
     /// Wait for the agent gauge to reach `expected`, or fail saying what it was.

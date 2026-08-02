@@ -136,6 +136,27 @@ impl OpenCodeClient {
         self.request_json(Method::GET, "agent", Option::<&()>::None)
             .await
     }
+    pub async fn register_mcp(&self, session: &crate::mcp::Session) -> Result<(), String> {
+        let body = serde_json::json!({
+            "name":"laplus",
+            "config":{
+                "type":"remote",
+                "url":session.endpoint(),
+                "headers":{"Authorization":session.authorization()},
+                "oauth":false
+            }
+        });
+        let statuses: Value = self.request_json(Method::POST, "mcp", Some(&body)).await
+            .map_err(|error| redact(error.to_string(), Some(session.authorization())))?;
+        let status = statuses.pointer("/laplus/status").and_then(Value::as_str);
+        if status == Some("connected") { return Ok(()); }
+        let detail = statuses.pointer("/laplus/error").and_then(Value::as_str)
+            .or_else(|| statuses.pointer("/laplus/message").and_then(Value::as_str));
+        Err(match detail {
+            Some(detail) => format!("OpenCode could not connect to Laplus MCP: {}", redact(detail.to_string(), Some(session.authorization()))),
+            None => format!("OpenCode did not connect to Laplus MCP (status: {}).", status.unwrap_or("missing")),
+        })
+    }
     pub async fn create_session(&self, body: &Value) -> Result<Session, OpenCodeError> {
         self.request_json(Method::POST, "session", Some(body)).await
     }
@@ -532,6 +553,7 @@ pub(crate) struct OpenCode {
     /// Present only when Laplus launched the endpoint. An operator-owned
     /// endpoint shares all session behavior, but its lifetime is never ours.
     owned: Option<OwnedServer>,
+    mcp_session: Option<crate::mcp::Session>,
     model: Option<String>,
     settled: bool,
     roles: HashMap<String, String>,
@@ -1072,6 +1094,23 @@ impl crate::session::Driver for OpenCode {
                 .map_err(|error| error.to_string())?;
             (None, client)
         };
+        let mcp_session = if owned.is_some() {
+            let session = match start.mcp.open_session(&start.thread_id) {
+                Ok(session) => session,
+                Err(error) => {
+                    if let Some(owned) = owned.as_mut() { owned.stop().await; }
+                    return Err(error.to_string());
+                }
+            };
+            if let Err(error) = client.register_mcp(&session).await {
+                drop(session);
+                if let Some(owned) = owned.as_mut() { owned.stop().await; }
+                return Err(format!("OpenCode MCP registration failed: {error}"));
+            }
+            Some(session)
+        } else {
+            None
+        };
         let opened = async {
             let session = recover_session(&client, start, resume_session_id.as_deref(), true).await?;
             let events = client.subscribe().await.map_err(|error| error.to_string())?;
@@ -1093,6 +1132,7 @@ impl crate::session::Driver for OpenCode {
                 events,
                 session_id: session.id.clone(),
                 owned,
+                mcp_session,
                 model: start.model.clone(),
                 settled: false,
                 roles: HashMap::new(),
@@ -1447,6 +1487,7 @@ impl crate::session::Driver for OpenCode {
         if let Some(owned) = self.owned.as_mut() {
             owned.stop().await;
         }
+        drop(self.mcp_session.take());
         crate::session::Reaped {
             refused: None,
             death: abort_failure.or_else(|| {

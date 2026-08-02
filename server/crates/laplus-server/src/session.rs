@@ -355,6 +355,7 @@ pub struct Start {
     /// Selected from the conversation's registry entry together, so a driver's
     /// implementation cannot be paired with another driver's settings.
     pub driver: DriverStart,
+    pub mcp: std::sync::Arc<dyn crate::mcp::Platform>,
 }
 
 #[derive(Debug, Clone)]
@@ -1905,7 +1906,7 @@ pub fn prepare(thread: &Thread, settings: &Settings) -> Result<PreparedDriver, S
     Ok(PreparedDriver { identity, driver })
 }
 
-pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver) -> Start {
+pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver, mcp: std::sync::Arc<dyn crate::mcp::Platform>) -> Start {
     debug_assert_eq!(prepared.identity.instance_id, thread.provider.instance_id);
     debug_assert_eq!(prepared.identity.driver, thread.provider.driver);
 
@@ -1920,6 +1921,7 @@ pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver)
             .filter(|cursor| cursor.provider == thread.provider),
         provider: thread.provider.clone(),
         driver: prepared.driver,
+        mcp,
     }
 }
 
@@ -1986,6 +1988,7 @@ mod continuation_tests {
                 launch_args: String::new(),
                 custom_models: Vec::new(),
             }),
+            mcp: std::sync::Arc::new(crate::mcp::Host::new()),
         };
 
         spend(&threads, &start, Decided { provider_resume_cursor: Some(cursor.clone()), ..Default::default() });
@@ -2014,7 +2017,7 @@ mod continuation_tests {
                 custom_models: Vec::new(),
             }),
         };
-        let start = starting(&thread, "/work", prepared);
+        let start = starting(&thread, "/work", prepared, std::sync::Arc::new(crate::mcp::Host::new()));
         assert_eq!(start.resume_cursor, Some(cursor));
     }
 }

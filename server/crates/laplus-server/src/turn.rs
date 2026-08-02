@@ -1117,6 +1117,7 @@ mod tests {
                 launch_args: String::new(),
                 custom_models: Vec::new(),
             }),
+            mcp: std::sync::Arc::new(crate::mcp::Host::new()),
         }
     }
 

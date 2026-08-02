@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, RawQuery, State, WebSocketUpgrade};
+use axum::body::Bytes;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, MethodRouter};
@@ -90,10 +91,11 @@ pub struct ServerState {
     fiber_ids: AtomicU64,
     unrecognized_messages: AtomicUsize,
     unparseable_frames: AtomicUsize,
+    mcp: crate::mcp::Host,
 }
 
 impl ServerState {
-    fn new(services: Services, ui: Assets, shutdown: watch::Receiver<bool>) -> Self {
+    fn new(services: Services, ui: Assets, shutdown: watch::Receiver<bool>, mcp: crate::mcp::Host) -> Self {
         ServerState {
             services,
             ui,
@@ -103,6 +105,7 @@ impl ServerState {
             fiber_ids: AtomicU64::new(1),
             unrecognized_messages: AtomicUsize::new(0),
             unparseable_frames: AtomicUsize::new(0),
+            mcp,
         }
     }
 
@@ -145,6 +148,10 @@ impl ServerState {
     /// ends" something a test can observe rather than assert about internals.
     pub fn live_agents(&self) -> usize {
         self.services.shell.threads().live_agents()
+    }
+
+    pub fn live_mcp_sessions(&self) -> usize {
+        self.mcp.live_sessions()
     }
 
     /// Shells still running behind a terminal. The fifth of the family, and the
@@ -317,6 +324,21 @@ impl Server {
         ui: Assets,
         provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
     ) -> std::io::Result<Server> {
+        let host = crate::mcp::Host::new();
+        Self::bind_with_platform(port, config, database, ui, provider_maintenance, host.clone(), Arc::new(host)).await
+    }
+
+    /// Assembly seam for tests that observe or refuse MCP session acquisition
+    /// while retaining the production HTTP host and conversation lifecycle.
+    pub async fn bind_with_platform(
+        port: u16,
+        config: ServerConfig,
+        database: Database,
+        ui: Assets,
+        provider_maintenance: crate::provider_maintenance::ProviderMaintenance,
+        mcp_host: crate::mcp::Host,
+        mcp_platform: Arc<dyn crate::mcp::Platform>,
+    ) -> std::io::Result<Server> {
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         // And the name this data directory answers to, settled here for the
         // reason above and one more: this is the one place the config and the
@@ -350,13 +372,13 @@ impl Server {
             // time is read in here, and a file that will not read is an issue
             // in the payload rather than a server that will not start.
             config: ConfigStore::opening(config),
-            shell: Shell::new(database),
+            shell: Shell::new_with_mcp(database, mcp_platform),
             repositories: Repositories::new(&index),
             index,
             terminals: Terminals::new(),
             provider_maintenance,
         };
-        let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe()));
+        let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe(), mcp_host));
 
         // Minted before the listener exists, so that there is no window in
         // which the server is answering and the credential it will admit its
@@ -436,6 +458,7 @@ impl Server {
             // basename and [`crate::assets`] percent-encodes the separator out
             // of it. See that module for why nothing here checks a credential.
             .route("/api/assets/{token}/{name}", get(project_asset))
+            .route("/mcp/{sessionId}", get(mcp_get).post(mcp_post))
             // Last, and only for paths nothing above matched: the UI itself.
             // A route wins over a fallback, so attaching a bundle cannot move
             // an answer the client already decodes — which is the property
@@ -462,6 +485,7 @@ impl Server {
         let bind = state.config().current().remote_access.bind_address();
         let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port))).await?;
         let local_addr = listener.local_addr()?;
+        state.mcp.set_origin(format!("http://127.0.0.1:{}", local_addr.port()));
 
         let serving = tokio::spawn(async move {
             let served = axum::serve(listener, app)
@@ -1380,6 +1404,36 @@ fn refuse(refusal: http::Refusal) -> Response {
         .into_response()
 }
 
+async fn mcp_get() -> Response {
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+async fn mcp_post(
+    State(state): State<Arc<ServerState>>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if headers.get(header::ORIGIN).and_then(|value| value.to_str().ok()).is_some_and(|origin| {
+        !origin.starts_with("http://127.0.0.1:") && !origin.starts_with("http://localhost:")
+    }) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let authorization = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()).unwrap_or_default();
+    if !state.mcp.authorizes_id(&session_id, authorization) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let message: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(message) => message,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if message.get("method").and_then(serde_json::Value::as_str) == Some("notifications/initialized") {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    let response = state.mcp.dispatch(&session_id, message).await;
+    ([(header::CONTENT_TYPE, "application/json")], Json(response)).into_response()
+}
+
 /// Everything the routes above did not answer: a file of the UI, the page
 /// standing in for one of its own routes, or a 404.
 ///
@@ -1818,6 +1872,7 @@ mod tests {
                 },
                 Assets::none(),
                 watch::channel(false).1,
+                crate::mcp::Host::new(),
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {

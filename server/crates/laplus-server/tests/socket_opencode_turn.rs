@@ -49,6 +49,7 @@ enum Startup {
     ResistsStop,
     Exit,
     NeverReady,
+    McpFailure,
 }
 
 impl FakeOpenCode {
@@ -72,6 +73,8 @@ impl FakeOpenCode {
         Self::scripted(Startup::NeverReady)
     }
 
+    fn mcp_failure() -> Self { Self::scripted(Startup::McpFailure) }
+
     fn scripted(startup: Startup) -> Self {
         let directory = tempfile::tempdir().expect("temporary OpenCode directory");
         let log = directory.path().join("requests.jsonl");
@@ -88,10 +91,12 @@ impl FakeOpenCode {
             (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::McpFailure, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_MCP_FAIL=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Healthy, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=false exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
+            (Startup::McpFailure, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_MCP_FAIL=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
         };
         let serve = serve
             .replace("{log}", &log.display().to_string())
@@ -128,7 +133,7 @@ impl FakeOpenCode {
     }
 
     async fn requests(&self) -> Vec<Value> {
-        self.requests_through(3).await
+        self.requests_through(4).await
     }
 
     async fn requests_through(&self, count: usize) -> Vec<Value> {
@@ -169,6 +174,19 @@ struct SocketTurn {
     server: TestServer,
     client: SocketClient,
     subscription: String,
+}
+
+#[derive(Debug)]
+struct FakeMcpPlatform {
+    host: laplus_server::mcp::Host,
+    opens: AtomicUsize,
+}
+
+impl laplus_server::mcp::Platform for FakeMcpPlatform {
+    fn open_session(&self, thread_id: &str) -> Result<laplus_server::mcp::Session, laplus_server::mcp::OpenError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.host.open(thread_id)
+    }
 }
 
 async fn start_socket_turn(
@@ -219,6 +237,33 @@ async fn wait_until_port_closes(port: u16, because: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("{because}"));
+}
+
+#[tokio::test]
+async fn owned_opencode_uses_the_injected_generic_mcp_platform() {
+    let opencode = FakeOpenCode::new();
+    let host = laplus_server::mcp::Host::new();
+    let platform = Arc::new(FakeMcpPlatform { host: host.clone(), opens: AtomicUsize::new(0) });
+    let server = TestServer::start_with_mcp(opencode_config(&opencode), host, platform.clone()).await;
+    let workspace = Workspace::with(&["src/"]);
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("fake-mcp-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("fake-mcp-project", "fake-mcp-thread");
+    create["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("fake-mcp-thread").await;
+    let mut turn = start_turn("fake-mcp-thread", "fake-mcp-message", "hello");
+    turn["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    client.events_through_the_turn(&subscription).await;
+    assert_eq!(platform.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(server.live_mcp_sessions(), 1);
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.session.stop","commandId":"fake:stop","threadId":"fake-mcp-thread","createdAt":"2026-08-01T00:00:00.000Z"})).await.expect_success();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while server.live_mcp_sessions() != 0 { tokio::task::yield_now().await; }
+    }).await.expect("fake platform session is released");
+    client.close().await;
+    server.stop().await;
 }
 
 fn set_runtime_mode(thread_id: &str, mode: &str) -> Value {
@@ -468,6 +513,7 @@ async fn retuning_opencode_reapplies_the_same_permission_rules_with_patch() {
 struct PeerState {
     subscriber: Arc<Mutex<Option<mpsc::Sender<Result<String, Infallible>>>>>,
     log: Arc<PathBuf>,
+    mcp_failed: bool,
     healthy: bool,
     authorization: Option<String>,
     idle_release: Option<Arc<Notify>>,
@@ -517,6 +563,31 @@ fn append(path: &Path, value: Value) {
 
 async fn health(State(state): State<PeerState>) -> Json<Value> {
     Json(json!({"healthy":state.healthy,"version":"1.18.10"}))
+}
+
+async fn add_mcp(State(state): State<PeerState>, Json(body): Json<Value>) -> Json<Value> {
+    let endpoint = body.pointer("/config/url").and_then(Value::as_str).expect("MCP endpoint");
+    let authorization = body.pointer("/config/headers/Authorization").and_then(Value::as_str).expect("MCP authorization");
+    append(&state.log, json!({
+        "operation":"mcp.add",
+        "authorizationPresent":authorization.starts_with("Bearer "),
+        "oauth":body.pointer("/config/oauth"),
+        "url":endpoint
+    }));
+    let response = reqwest::Client::new().post(endpoint)
+        .header(header::AUTHORIZATION.as_str(), authorization)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"opencode-test","version":"1.18.10"}
+        }}))
+        .send().await.expect("connect to Laplus MCP");
+    assert_eq!(response.status(), StatusCode::OK);
+    let initialized: Value = response.json().await.expect("MCP initialize response");
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+    Json(if state.mcp_failed {
+        json!({"laplus":{"status":"failed","error":"scripted connection refusal"}})
+    } else {
+        json!({"laplus":{"status":"connected"}})
+    })
 }
 
 async fn events(State(state): State<PeerState>, headers: HeaderMap) -> Response {
@@ -1675,7 +1746,7 @@ async fn an_owned_opencode_session_is_re_adopted_after_a_server_restart() {
     turn["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", turn).await.expect_success();
     client.events_through_the_turn(&watch).await;
-    let first_requests = first_opencode.requests_through(3).await;
+    let first_requests = first_opencode.requests_through(4).await;
     let first_port = first_requests[0]["port"].as_u64().expect("the first owned port") as u16;
     client.close().await;
     first.stop().await;
@@ -1688,8 +1759,8 @@ async fn an_owned_opencode_session_is_re_adopted_after_a_server_restart() {
     turn["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", turn).await.expect_success();
     client.events_through_the_turn(&watch).await;
-    let requests = first_opencode.requests_through(7).await;
-    assert_eq!(requests[3..].iter().map(|row| row["operation"].as_str().unwrap()).collect::<Vec<_>>(), vec!["launch", "get", "update", "prompt"]);
+    let requests = first_opencode.requests_through(9).await;
+    assert_eq!(requests[4..].iter().map(|row| row["operation"].as_str().unwrap()).collect::<Vec<_>>(), vec!["launch", "mcp.add", "get", "update", "prompt"]);
     client.close().await;
     second.stop().await;
 }
@@ -1766,12 +1837,14 @@ async fn opencode_peer_child() {
     let state = PeerState {
         log: Arc::new(log),
         healthy: std::env::var("OPENCODE_TEST_HEALTHY").as_deref() != Ok("false"),
+        mcp_failed: std::env::var("OPENCODE_TEST_MCP_FAIL").as_deref() == Ok("true"),
         idle_release: (std::env::var("OPENCODE_TEST_GATED").as_deref() == Ok("true"))
             .then(|| Arc::new(Notify::new())),
         ..Default::default()
     };
     let app = Router::new()
         .route("/global/health", get(health))
+        .route("/mcp", post(add_mcp))
         .route("/event", get(events))
         .route("/session", post(create_session))
         .route("/session/{id}", get(get_session).patch(update_session))
@@ -1828,9 +1901,18 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
         .expect("ready session event");
     assert_eq!(settled["event"]["payload"]["session"]["status"], "ready");
     let requests = opencode.requests().await;
-    assert_eq!(requests[2]["body"]["parts"][0]["text"], "say hello");
     assert_eq!(
-        requests[2]["body"]["model"],
+        requests.iter().map(|request| request["operation"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec!["launch", "mcp.add", "create", "prompt"],
+        "owned OpenCode connects Laplus MCP before its session and first prompt"
+    );
+    assert_eq!(requests[1]["authorizationPresent"], true);
+    assert_eq!(requests[1]["oauth"], false);
+    assert!(!serde_json::to_string(&requests).unwrap().contains("Bearer "));
+    assert_eq!(server.live_mcp_sessions(), 1);
+    assert_eq!(requests[3]["body"]["parts"][0]["text"], "say hello");
+    assert_eq!(
+        requests[3]["body"]["model"],
         json!({"providerID":"openai","modelID":"gpt-5"})
     );
     let port = requests[0]["port"].as_u64().expect("the owned port") as u16;
@@ -1852,6 +1934,7 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
         "the stop command did not reap the owned OpenCode server",
     )
     .await;
+    assert_eq!(server.live_mcp_sessions(), 0);
     client.close().await;
     server.stop().await;
     assert!(
@@ -1890,7 +1973,7 @@ async fn stopping_busy_owned_opencode_aborts_and_reaps_its_server() {
         )
         .await
         .expect_success();
-    let requests = opencode.requests_through(4).await;
+    let requests = opencode.requests_through(5).await;
     assert!(requests
         .iter()
         .any(|request| request["operation"] == "abort"));
@@ -1921,6 +2004,23 @@ async fn an_owned_server_that_exits_during_startup_becomes_a_visible_session_fai
         .as_str()
         .expect("visible startup failure")
         .contains("exited before becoming ready"));
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn owned_mcp_registration_failure_is_visible_and_releases_the_grant() {
+    let SocketTurn { opencode, server, mut client, subscription, .. } =
+        start_socket_turn(FakeOpenCode::mcp_failure(), "project-mcp-failed", "thread-mcp-failed").await;
+    let events = client.events_through_the_turn(&subscription).await;
+    let failed = events.iter().rfind(|item| item["event"]["type"] == "thread.session-set")
+        .expect("failed session event");
+    assert_eq!(failed["event"]["payload"]["session"]["status"], "error");
+    assert!(failed["event"]["payload"]["session"]["lastError"].as_str().unwrap()
+        .contains("OpenCode MCP registration failed"));
+    let requests = opencode.requests_through(2).await;
+    assert_eq!(requests.iter().map(|row| row["operation"].as_str().unwrap()).collect::<Vec<_>>(), vec!["launch", "mcp.add"]);
+    assert_eq!(server.live_mcp_sessions(), 0);
     client.close().await;
     server.stop().await;
 }

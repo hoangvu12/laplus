@@ -206,6 +206,7 @@ struct Inner {
     sequences: Sequences,
     threads: Threads,
     transcripts: Transcripts,
+    mcp: Arc<dyn crate::mcp::Platform>,
 }
 
 /// A command this server understands, once its payload has been read.
@@ -337,6 +338,10 @@ impl Shell {
     /// over three tables is the cost, and it is the size of the history rather
     /// than a query per conversation — see [`Database::conversations`].
     pub fn new(database: Database) -> Shell {
+        Self::new_with_mcp(database, Arc::new(crate::mcp::Host::new()))
+    }
+
+    pub fn new_with_mcp(database: Database, mcp: Arc<dyn crate::mcp::Platform>) -> Shell {
         let sequences = Sequences::resuming(&database).unwrap_or_else(|error| {
             // Unreachable in practice: everything else this server does with the
             // registry would already have failed. Loud rather than silent,
@@ -368,6 +373,7 @@ impl Shell {
                 updates,
                 access_updates: broadcast::channel(BACKLOG).0,
                 transcripts,
+                mcp,
             }),
         }
     }
@@ -669,6 +675,7 @@ impl Shell {
         let latest = reviewing.checkpoints;
         let index = index.clone();
         let settings = config.settings.clone();
+        let mcp = Arc::clone(&self.inner.mcp);
         tokio::spawn(async move {
             let checked = WorkspaceRoot::check(&workspace_root)
                 .map_err(|rejection| rejection.message());
@@ -732,7 +739,7 @@ impl Shell {
                     return;
                 }
             };
-            let starting = crate::session::starting(&thread, &workspace_root, prepared);
+            let starting = crate::session::starting(&thread, &workspace_root, prepared, mcp);
             if let Err(why) = crate::opencode::rollback(&starting, latest - turn_count).await {
                 publish_revert_failure(&threads, &thread_id, turn_count, &why, true);
                 return;
@@ -1409,6 +1416,7 @@ impl Shell {
                     &thread,
                     &where_the_work_happens(&thread, &project),
                     prepared,
+                    Arc::clone(&self.inner.mcp),
                 );
                 crate::session::send(
                     &self.inner.threads,
@@ -1465,6 +1473,7 @@ impl Shell {
             &thread,
             &where_the_work_happens(&thread, &project),
             prepared,
+            Arc::clone(&self.inner.mcp),
         );
 
         let sequence = self

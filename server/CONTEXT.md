@@ -222,6 +222,19 @@ calls, thinking, permission requests and their resolutions. `crate::worklog`.
 
 **Activity** — one row in the work log.
 
+**MCP session** — a conversation-scoped capability through which its agent can
+call Laplus host tools. It ends with the owned agent lifetime and is distinct
+from an agent provider's own conversation session.
+_Avoid_: MCP server, provider MCP
+
+**MCP grant** — the secret authority to use one MCP session. Possession grants
+access only to that conversation's registered host tools.
+_Avoid_: token, API key
+
+**Toolkit** — a named collection of host tools offered through MCP, independent
+of the agent provider that calls them.
+_Avoid_: provider tools, MCP server
+
 Codex's **commentary** phase is not one. `agentMessage` labels prose before tool
 use `commentary` and prose after it `final_answer`; both are messages addressed
 to the developer and are published in the transcript as separate messages. The

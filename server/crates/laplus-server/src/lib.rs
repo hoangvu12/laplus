@@ -88,6 +88,7 @@ pub mod keybindings;
 pub mod launch;
 pub mod opencode;
 pub mod opencode_protocol;
+pub mod mcp;
 pub mod orchestration;
 pub mod pairing;
 pub mod process;
