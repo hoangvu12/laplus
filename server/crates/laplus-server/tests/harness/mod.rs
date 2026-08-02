@@ -295,6 +295,27 @@ impl TestServer {
         TestServer::bootstrapped(server, None).await
     }
 
+    pub async fn start_configured_in_with_endpoint_verifier(
+        preferences: &Path,
+        verifier: std::sync::Arc<dyn laplus_server::public_exposure::EndpointVerifier>,
+    ) -> TestServer {
+        let mut config = ServerConfig::detect_in(preferences.to_path_buf())
+            .with_remote_access(RemoteAccess::none());
+        somewhere_that_is_not_the_developers(&mut config);
+        let server = Server::bind_with_platform_and_verifier(
+            0,
+            config,
+            Database::in_memory().expect("a database"),
+            Assets::none(),
+            laplus_server::provider_maintenance::ProviderMaintenance::new(),
+            std::sync::Arc::new(laplus_server::mcp::Host::new()),
+            verifier,
+        )
+        .await
+        .expect("server binds to a free loopback port");
+        TestServer::bootstrapped(server, None).await
+    }
+
     /// A server that will start `binary` when a turn is dispatched.
     ///
     /// The injection the spec asks for, and the whole of it: the agent-executable

@@ -565,4 +565,65 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(testApi.calls.testExternalTunnel).toBe(1);
     expect(testApi.calls.forgetExternalTunnel).toBe(1);
   });
+
+  it("routes managed connector discovery and lifecycle commands through the access client", async () => {
+    const snapshot = {
+      configured: false,
+      ownership: "laplus",
+      desiredState: "stopped",
+      connectorState: "stopped",
+      readiness: null,
+      httpsOrigin: null,
+      executablePath: null,
+      detectedVersion: null,
+      metricsOrigin: null,
+      failureMessage: null,
+      restartCount: 0,
+      logs: [],
+      verificationState: "unconfigured",
+      failureKind: null,
+      publicFailureMessage: null,
+      lastVerifiedAt: null,
+    } as const;
+    const testApi = await installEnvironmentHttpTest({
+      cloudflaredExecutables: () => Effect.succeed({ executables: [] }),
+      managedCloudflareConnector: () => Effect.succeed(snapshot),
+      configureManagedCloudflareConnector: () => Effect.succeed(snapshot),
+      startManagedCloudflareConnector: () => Effect.succeed(snapshot),
+      stopManagedCloudflareConnector: () => Effect.succeed(snapshot),
+      retryManagedCloudflareConnector: () => Effect.succeed(snapshot),
+    });
+    disposeHttpTest = testApi.dispose;
+    const {
+      configureManagedCloudflareConnector,
+      discoverCloudflaredExecutables,
+      readManagedCloudflareConnector,
+      retryManagedCloudflareConnector,
+      startManagedCloudflareConnector,
+      stopManagedCloudflareConnector,
+    } = await import("./environments/primary");
+
+    await discoverCloudflaredExecutables();
+    await readManagedCloudflareConnector();
+    await configureManagedCloudflareConnector({
+      hostname: "laplus.example.com",
+      executablePath: "/usr/bin/cloudflared",
+      connectorToken: "private-token",
+    });
+    await startManagedCloudflareConnector();
+    await stopManagedCloudflareConnector();
+    await retryManagedCloudflareConnector();
+
+    expect(testApi.calls.cloudflaredExecutables).toBe(1);
+    expect(testApi.calls.configureManagedCloudflareConnector).toEqual([
+      {
+        hostname: "laplus.example.com",
+        executablePath: "/usr/bin/cloudflared",
+        connectorToken: "private-token",
+      },
+    ]);
+    expect(testApi.calls.startManagedCloudflareConnector).toBe(1);
+    expect(testApi.calls.stopManagedCloudflareConnector).toBe(1);
+    expect(testApi.calls.retryManagedCloudflareConnector).toBe(1);
+  });
 });

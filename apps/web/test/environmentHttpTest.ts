@@ -13,6 +13,9 @@ import {
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
   type ExternalTunnelEndpointSnapshot,
+  type CloudflaredExecutableDiscovery,
+  type ConfigureManagedCloudflareConnectorInput,
+  type ManagedCloudflareConnectorSnapshot,
   type RegisterExternalTunnelEndpointInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -43,6 +46,14 @@ interface EnvironmentHttpTestScenario {
   ) => Effect.Effect<ExternalTunnelEndpointSnapshot>;
   readonly testExternalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
   readonly forgetExternalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
+  readonly cloudflaredExecutables?: () => Effect.Effect<CloudflaredExecutableDiscovery>;
+  readonly managedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
+  readonly configureManagedCloudflareConnector?: (
+    payload: ConfigureManagedCloudflareConnectorInput,
+  ) => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
+  readonly startManagedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
+  readonly stopManagedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
+  readonly retryManagedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -54,6 +65,12 @@ export interface EnvironmentHttpTestCalls {
   registerExternalTunnel: Array<RegisterExternalTunnelEndpointInput>;
   testExternalTunnel: number;
   forgetExternalTunnel: number;
+  cloudflaredExecutables: number;
+  managedCloudflareConnector: number;
+  configureManagedCloudflareConnector: Array<ConfigureManagedCloudflareConnectorInput>;
+  startManagedCloudflareConnector: number;
+  stopManagedCloudflareConnector: number;
+  retryManagedCloudflareConnector: number;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -82,6 +99,12 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     registerExternalTunnel: [],
     testExternalTunnel: 0,
     forgetExternalTunnel: 0,
+    cloudflaredExecutables: 0,
+    managedCloudflareConnector: 0,
+    configureManagedCloudflareConnector: [],
+    startManagedCloudflareConnector: 0,
+    stopManagedCloudflareConnector: 0,
+    retryManagedCloudflareConnector: 0,
   };
 
   const client = await Effect.runPromise(
@@ -157,6 +180,48 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
               return (
                 scenario.forgetExternalTunnel?.() ??
                 unexpectedEndpoint("access.forgetExternalTunnel")
+              );
+            })
+            .handle("cloudflaredExecutables", () => {
+              calls.cloudflaredExecutables += 1;
+              return (
+                scenario.cloudflaredExecutables?.() ??
+                unexpectedEndpoint("access.cloudflaredExecutables")
+              );
+            })
+            .handle("managedCloudflareConnector", () => {
+              calls.managedCloudflareConnector += 1;
+              return (
+                scenario.managedCloudflareConnector?.() ??
+                unexpectedEndpoint("access.managedCloudflareConnector")
+              );
+            })
+            .handle("configureManagedCloudflareConnector", ({ payload }) => {
+              calls.configureManagedCloudflareConnector.push(payload);
+              return (
+                scenario.configureManagedCloudflareConnector?.(payload) ??
+                unexpectedEndpoint("access.configureManagedCloudflareConnector")
+              );
+            })
+            .handle("startManagedCloudflareConnector", () => {
+              calls.startManagedCloudflareConnector += 1;
+              return (
+                scenario.startManagedCloudflareConnector?.() ??
+                unexpectedEndpoint("access.startManagedCloudflareConnector")
+              );
+            })
+            .handle("stopManagedCloudflareConnector", () => {
+              calls.stopManagedCloudflareConnector += 1;
+              return (
+                scenario.stopManagedCloudflareConnector?.() ??
+                unexpectedEndpoint("access.stopManagedCloudflareConnector")
+              );
+            })
+            .handle("retryManagedCloudflareConnector", () => {
+              calls.retryManagedCloudflareConnector += 1;
+              return (
+                scenario.retryManagedCloudflareConnector?.() ??
+                unexpectedEndpoint("access.retryManagedCloudflareConnector")
               );
             }),
         ),

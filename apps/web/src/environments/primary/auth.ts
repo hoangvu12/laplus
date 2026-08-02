@@ -10,7 +10,10 @@ import type {
 import {
   EnvironmentHttpCommonError,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type CloudflaredExecutableDiscovery,
+  type ConfigureManagedCloudflareConnectorInput,
   type ExternalTunnelEndpointSnapshot,
+  type ManagedCloudflareConnectorSnapshot,
 } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -40,6 +43,12 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "register-external-tunnel-endpoint",
   "test-external-tunnel-endpoint",
   "forget-external-tunnel-endpoint",
+  "discover-cloudflared-executables",
+  "read-managed-cloudflare-connector",
+  "configure-managed-cloudflare-connector",
+  "start-managed-cloudflare-connector",
+  "stop-managed-cloudflare-connector",
+  "retry-managed-cloudflare-connector",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -484,6 +493,82 @@ export async function forgetExternalTunnelEndpoint(): Promise<ExternalTunnelEndp
     });
   }
 }
+
+export async function discoverCloudflaredExecutables(): Promise<CloudflaredExecutableDiscovery> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.cloudflaredExecutables({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "discover-cloudflared-executables",
+      cause: error,
+    });
+  }
+}
+
+export async function readManagedCloudflareConnector(): Promise<ManagedCloudflareConnectorSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.managedCloudflareConnector({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "read-managed-cloudflare-connector",
+      cause: error,
+    });
+  }
+}
+
+export async function configureManagedCloudflareConnector(
+  payload: ConfigureManagedCloudflareConnectorInput,
+): Promise<ManagedCloudflareConnectorSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.configureManagedCloudflareConnector({ headers: {}, payload }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "configure-managed-cloudflare-connector",
+      cause: error,
+    });
+  }
+}
+
+async function mutateManagedCloudflareConnector(
+  operation: "start" | "stop" | "retry",
+): Promise<ManagedCloudflareConnectorSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          operation === "start"
+            ? client.access.startManagedCloudflareConnector({ headers: {} })
+            : operation === "stop"
+              ? client.access.stopManagedCloudflareConnector({ headers: {} })
+              : client.access.retryManagedCloudflareConnector({ headers: {} }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: `${operation}-managed-cloudflare-connector`,
+      cause: error,
+    });
+  }
+}
+
+export const startManagedCloudflareConnector = () => mutateManagedCloudflareConnector("start");
+export const stopManagedCloudflareConnector = () => mutateManagedCloudflareConnector("stop");
+export const retryManagedCloudflareConnector = () => mutateManagedCloudflareConnector("retry");
 
 export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPairingLinkRecord>> {
   try {

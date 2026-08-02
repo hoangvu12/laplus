@@ -112,3 +112,63 @@ export const RegisterExternalTunnelEndpointInput = Schema.Struct({
   hostname: TrimmedNonEmptyString,
 });
 export type RegisterExternalTunnelEndpointInput = typeof RegisterExternalTunnelEndpointInput.Type;
+
+export const CloudflaredExecutableCompatibility = Schema.Literals(["compatible", "incompatible"]);
+export type CloudflaredExecutableCompatibility = typeof CloudflaredExecutableCompatibility.Type;
+
+export const CloudflaredExecutable = Schema.Struct({
+  path: TrimmedNonEmptyString,
+  source: Schema.optional(Schema.Literals(["system", "user-selected", "app-managed"])),
+  version: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  compatibility: Schema.optional(CloudflaredExecutableCompatibility),
+  selected: Schema.Boolean,
+  failureMessage: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+});
+export type CloudflaredExecutable = typeof CloudflaredExecutable.Type;
+
+export const CloudflaredExecutableDiscovery = Schema.Struct({
+  executables: Schema.Array(CloudflaredExecutable),
+});
+export type CloudflaredExecutableDiscovery = typeof CloudflaredExecutableDiscovery.Type;
+
+export const ManagedCloudflareConnectorState = Schema.Literals([
+  "unconfigured",
+  "starting",
+  "ready",
+  "degraded",
+  "restart-exhausted",
+  "stopping",
+  "stopped",
+  "failed",
+]);
+export type ManagedCloudflareConnectorState = typeof ManagedCloudflareConnectorState.Type;
+
+export const ManagedCloudflareConnectorSnapshot = Schema.Struct({
+  configured: Schema.Boolean,
+  ownership: Schema.Literal("laplus"),
+  remoteOwnership: Schema.optional(Schema.Literal("cloudflare")),
+  desiredState: Schema.Literals(["running", "stopped"]),
+  connectorState: ManagedCloudflareConnectorState,
+  readiness: Schema.NullOr(Schema.Boolean),
+  httpsOrigin: Schema.NullOr(TrimmedNonEmptyString),
+  loopbackOrigin: Schema.optional(TrimmedNonEmptyString),
+  executablePath: Schema.NullOr(TrimmedNonEmptyString),
+  detectedVersion: Schema.NullOr(TrimmedNonEmptyString),
+  metricsOrigin: Schema.NullOr(TrimmedNonEmptyString),
+  failureMessage: Schema.NullOr(TrimmedNonEmptyString),
+  restartCount: Schema.Number,
+  logs: Schema.Array(TrimmedNonEmptyString),
+  verificationState: ExternalTunnelVerificationState,
+  failureKind: Schema.NullOr(ExternalTunnelFailureKind),
+  publicFailureMessage: Schema.NullOr(TrimmedNonEmptyString),
+  lastVerifiedAt: Schema.NullOr(Schema.String),
+});
+export type ManagedCloudflareConnectorSnapshot = typeof ManagedCloudflareConnectorSnapshot.Type;
+
+export const ConfigureManagedCloudflareConnectorInput = Schema.Struct({
+  hostname: TrimmedNonEmptyString,
+  executablePath: TrimmedNonEmptyString,
+  connectorToken: TrimmedNonEmptyString,
+});
+export type ConfigureManagedCloudflareConnectorInput =
+  typeof ConfigureManagedCloudflareConnectorInput.Type;

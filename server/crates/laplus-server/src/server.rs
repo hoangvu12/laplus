@@ -99,6 +99,7 @@ pub struct ServerState {
     external_verification_finished: Notify,
     external_verification_generation: AtomicU64,
     endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
+    cloudflare_connector: Arc<crate::cloudflare_connector::Manager>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +115,7 @@ impl ServerState {
         shutdown: watch::Receiver<bool>,
         mcp: Arc<dyn crate::mcp::Platform>,
         endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
+        cloudflare_connector: Arc<crate::cloudflare_connector::Manager>,
     ) -> Self {
         ServerState {
             services,
@@ -130,6 +132,7 @@ impl ServerState {
             external_verification_finished: Notify::new(),
             external_verification_generation: AtomicU64::new(0),
             endpoint_verifier,
+            cloudflare_connector,
         }
     }
 
@@ -415,6 +418,12 @@ impl Server {
         // watcher: there is one watcher in the process and both the file tree
         // and the status are kept fresh by it.
         let index = Index::new();
+        let cloudflare_connector = crate::cloudflare_connector::Manager::open(&config.preferences);
+        if let Some(origin) = cloudflare_connector.snapshot()["httpsOrigin"].as_str() {
+            if let Err(error) = database.register_external_tunnel_endpoint(origin) {
+                eprintln!("laplus: cannot restore managed public endpoint: {error}");
+            }
+        }
         let services = Services {
             // `opening` rather than `new`: what the developer configured last
             // time is read in here, and a file that will not read is an issue
@@ -432,6 +441,7 @@ impl Server {
             shutdown.subscribe(),
             mcp_platform,
             endpoint_verifier,
+            Arc::clone(&cloudflare_connector),
         ));
 
         // Public checks are intentionally much less frequent than connector
@@ -535,6 +545,12 @@ impl Server {
             .route("/api/access/cloudflare/forget", post(forget_external_tunnel))
             .route("/api/access/cloudflare/challenge", get(diagnostic_http_challenge))
             .route("/api/access/cloudflare/challenge/ws", get(diagnostic_ws_challenge))
+            .route("/api/access/cloudflare/executables", get(cloudflare_executables))
+            .route("/api/access/cloudflare/connector", get(cloudflare_connector_status))
+            .route("/api/access/cloudflare/connector/configure", post(configure_cloudflare_connector))
+            .route("/api/access/cloudflare/connector/start", post(start_cloudflare_connector))
+            .route("/api/access/cloudflare/connector/stop", post(stop_cloudflare_connector))
+            .route("/api/access/cloudflare/connector/retry", post(retry_cloudflare_connector))
             // A file out of a project, for an `<img>` the browser fetches
             // itself. A real route and not the fallback for the same reason as
             // the two above it: a token has no extension, so the asset fallback
@@ -572,6 +588,8 @@ impl Server {
         let listener = tokio::net::TcpListener::bind(SocketAddr::from((bind, port))).await?;
         let local_addr = listener.local_addr()?;
         state.mcp.set_origin(format!("http://127.0.0.1:{}", local_addr.port()));
+        cloudflare_connector.set_loopback_origin(format!("http://127.0.0.1:{}", local_addr.port()));
+        cloudflare_connector.begin();
 
         let serving = tokio::spawn(async move {
             let served = axum::serve(listener, app)
@@ -586,6 +604,11 @@ impl Server {
                 eprintln!("laplus: socket endpoint stopped: {error}");
             }
         });
+
+        if cloudflare_connector.snapshot()["desiredState"] == "running" {
+            let verification_state = Arc::clone(&state);
+            tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
+        }
 
         Ok(Server {
             local_addr,
@@ -780,6 +803,7 @@ impl Server {
     /// left that can show it to them.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
+        self.state.cloudflare_connector.shutdown().await;
         self.state.config().stop_provider_processes().await;
         let _ = self.serving.await;
         self.state.services.shell.threads().shutdown().await;
@@ -1414,12 +1438,16 @@ fn external_tunnel_snapshot(state: &ServerState) -> Result<public_exposure::Snap
             failure_message: None, last_attempt_at: None, last_verified_at: None, advertised_endpoint: None },
         Some(endpoint) => {
             let wss = endpoint.https_origin.replacen("https://", "wss://", 1);
+            let connector = state.cloudflare_connector.snapshot();
+            let managed = connector["configured"] == true
+                && connector["httpsOrigin"].as_str() == Some(endpoint.https_origin.as_str());
             let advertised_endpoint = (endpoint.verification_state == "verified").then(|| serde_json::json!({
-                "id": format!("cloudflare-external:{}", endpoint.https_origin),
+                "id": format!("cloudflare-{}:{}", if managed { "managed" } else { "external" }, endpoint.https_origin),
                 "label": "Cloudflare Tunnel", "provider": { "id": "cloudflare", "label": "Cloudflare Tunnel", "kind": "tunnel", "isAddon": true },
                 "httpBaseUrl": endpoint.https_origin, "wsBaseUrl": wss, "reachability": "public",
                 "compatibility": { "hostedHttpsApp": "compatible", "desktopApp": "compatible" },
-                "source": "user", "status": "available", "description": "Externally managed by your operator"
+                "source": if managed { "server" } else { "user" }, "status": "available",
+                "description": if managed { "Connector supervised by laplus" } else { "Externally managed by your operator" }
             }));
             public_exposure::Snapshot { configured: true, https_origin: Some(endpoint.https_origin),
                 wss_origin: Some(wss), ownership: "external", health: serde_json::json!({
@@ -1465,6 +1493,106 @@ async fn test_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(qu
         return (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"message": "Verification is still running."}))).into_response();
     }
     Json(external_tunnel_snapshot(&state).unwrap()).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigureCloudflareConnector {
+    hostname: String,
+    executable_path: std::path::PathBuf,
+    connector_token: String,
+}
+
+fn managed_connector_snapshot(state: &ServerState) -> serde_json::Value {
+    let mut snapshot = state.cloudflare_connector.snapshot();
+    let verification = state.services.shell.database().external_tunnel_endpoint().ok().flatten();
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("verificationState".into(), serde_json::json!(verification.as_ref()
+            .map(|endpoint| endpoint.verification_state.as_str()).unwrap_or("unconfigured")));
+        object.insert("failureKind".into(), serde_json::json!(verification.as_ref().and_then(|endpoint| endpoint.failure_kind.as_deref())));
+        object.insert("publicFailureMessage".into(), serde_json::json!(verification.as_ref().and_then(|endpoint| endpoint.failure_message.as_deref())));
+        object.insert("lastVerifiedAt".into(), serde_json::json!(verification.as_ref().and_then(|endpoint| endpoint.last_verified_at.as_deref())));
+    }
+    snapshot
+}
+
+fn connector_authorized(
+    state: &ServerState,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    scope: &str,
+) -> Result<(), Response> {
+    let (_, grant) = authorized(state, query, headers)?;
+    require_scope(&grant, scope)
+}
+
+async fn cloudflare_executables(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:read") { return response; }
+    Json(state.cloudflare_connector.discover().await).into_response()
+}
+
+async fn cloudflare_connector_status(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:read") { return response; }
+    Json(managed_connector_snapshot(&state)).into_response()
+}
+
+async fn configure_cloudflare_connector(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<ConfigureCloudflareConnector>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    if let Err(message) = state.cloudflare_connector.configure(
+        &body.hostname, &body.executable_path, &body.connector_token,
+    ).await {
+        let redacted = message.replace(&body.connector_token, "[REDACTED]");
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": redacted}))).into_response();
+    }
+    if let Some(origin) = state.cloudflare_connector.snapshot()["httpsOrigin"].as_str() {
+        if let Err(error) = state.services.shell.database().register_external_tunnel_endpoint(origin) {
+            eprintln!("laplus: cannot persist managed public endpoint: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    let verification_state = Arc::clone(&state);
+    tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
+    Json(managed_connector_snapshot(&state)).into_response()
+}
+
+async fn mutate_cloudflare_connector(
+    state: Arc<ServerState>, query: Option<&str>, headers: HeaderMap,
+    running: bool, retry: bool,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query, &headers, "access:write") { return response; }
+    match state.cloudflare_connector.set_desired(running, retry) {
+        Ok(()) => {
+            if running {
+                let verification_state = Arc::clone(&state);
+                tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
+            }
+            Json(managed_connector_snapshot(&state)).into_response()
+        }
+        Err(message) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response(),
+    }
+}
+
+async fn start_cloudflare_connector(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
+    mutate_cloudflare_connector(state, query.as_deref(), headers, true, false).await
+}
+async fn stop_cloudflare_connector(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
+    mutate_cloudflare_connector(state, query.as_deref(), headers, false, false).await
+}
+async fn retry_cloudflare_connector(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
+    mutate_cloudflare_connector(state, query.as_deref(), headers, true, true).await
 }
 
 async fn run_external_verification(state: &Arc<ServerState>) -> bool {
@@ -2095,9 +2223,12 @@ mod tests {
     impl Loopback {
         fn new() -> Loopback {
             let index = Index::new();
+            let config = ServerConfig::detect();
+            let connector_preferences = tempfile::tempdir().expect("connector preferences");
+            let cloudflare_connector = crate::cloudflare_connector::Manager::open(connector_preferences.path());
             let state = Arc::new(ServerState::new(
                 Services {
-                    config: ConfigStore::new(ServerConfig::detect()),
+                    config: ConfigStore::new(config),
                     shell: Shell::new(
                         Database::in_memory().expect("an in-memory database"),
                     ),
@@ -2110,6 +2241,7 @@ mod tests {
                 watch::channel(false).1,
                 Arc::new(crate::mcp::Host::new()),
                 Arc::new(public_exposure::NetworkEndpointVerifier::default()),
+                cloudflare_connector,
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {

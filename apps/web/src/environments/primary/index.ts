@@ -15,6 +15,8 @@ export {
 
 export {
   createServerPairingCredential,
+  configureManagedCloudflareConnector,
+  discoverCloudflaredExecutables,
   forgetExternalTunnelEndpoint,
   fetchSessionState,
   isPrimaryEnvironmentPairingCredentialRejectedError,
@@ -22,6 +24,7 @@ export {
   listServerClientSessions,
   listServerPairingLinks,
   readExternalTunnelEndpoint,
+  readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
   peekPairingTokenFromUrl,
   PrimaryEnvironmentPairingCredentialRejectedError,
@@ -31,6 +34,9 @@ export {
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
+  retryManagedCloudflareConnector,
+  startManagedCloudflareConnector,
+  stopManagedCloudflareConnector,
   testExternalTunnelEndpoint,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,

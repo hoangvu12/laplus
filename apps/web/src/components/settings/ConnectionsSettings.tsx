@@ -28,6 +28,8 @@ import {
   type DesktopServerExposureState,
   type EnvironmentId,
   type ExternalTunnelEndpointSnapshot,
+  type ManagedCloudflareConnectorSnapshot,
+  type CloudflaredExecutable,
 } from "@t3tools/contracts";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import {
@@ -99,12 +101,18 @@ import { Textarea } from "../ui/textarea";
 import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "../../pairingUrl";
 import {
   createServerPairingCredential,
+  configureManagedCloudflareConnector,
+  discoverCloudflaredExecutables,
   forgetExternalTunnelEndpoint,
   readExternalTunnelEndpoint,
+  readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
+  retryManagedCloudflareConnector,
+  startManagedCloudflareConnector,
+  stopManagedCloudflareConnector,
   testExternalTunnelEndpoint,
   isLoopbackHostname,
   usePrimarySessionState,
@@ -161,6 +169,12 @@ export function CloudflareTunnelSettingsRow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pairingUrl, setPairingUrl] = useState<string | null>(null);
+  const [managed, setManaged] = useState<ManagedCloudflareConnectorSnapshot | null>(null);
+  const [executablePath, setExecutablePath] = useState("");
+  const [connectorToken, setConnectorToken] = useState("");
+  const [cloudflaredExecutables, setCloudflaredExecutables] = useState<
+    ReadonlyArray<CloudflaredExecutable>
+  >([]);
 
   const refresh = useCallback(async () => {
     try {
@@ -175,6 +189,63 @@ export function CloudflareTunnelSettingsRow({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    void Promise.all([readManagedCloudflareConnector(), discoverCloudflaredExecutables()])
+      .then(([next, discovery]) => {
+        const candidates = discovery.executables;
+        setManaged(next);
+        setCloudflaredExecutables(candidates);
+        setExecutablePath(
+          next.executablePath ??
+            candidates.find((item) => item.compatibility === "compatible")?.path ??
+            candidates[0]?.path ??
+            "",
+        );
+        if (next.httpsOrigin) setHostname(new URL(next.httpsOrigin).hostname);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!open || !managed?.configured) return;
+    const refreshManaged = () => {
+      void readManagedCloudflareConnector()
+        .then(setManaged)
+        .catch(() => undefined);
+    };
+    refreshManaged();
+    const interval = window.setInterval(refreshManaged, 1_000);
+    return () => window.clearInterval(interval);
+  }, [managed?.configured, open]);
+
+  const mutateManaged = useCallback(
+    async (operation: "configure" | "start" | "stop" | "retry") => {
+      setBusy(true);
+      setError(null);
+      try {
+        const next =
+          operation === "configure"
+            ? await configureManagedCloudflareConnector({
+                hostname,
+                executablePath,
+                connectorToken,
+              })
+            : operation === "start"
+              ? await startManagedCloudflareConnector()
+              : operation === "stop"
+                ? await stopManagedCloudflareConnector()
+                : await retryManagedCloudflareConnector();
+        setManaged(next);
+        if (operation === "configure") setConnectorToken("");
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "The connector request failed.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [connectorToken, executablePath, hostname],
+  );
 
   const mutate = useCallback(
     async (operation: "register" | "test" | "forget") => {
@@ -224,12 +295,16 @@ export function CloudflareTunnelSettingsRow({
       <SettingsRow
         title="Cloudflare Tunnel"
         description={
-          snapshot?.httpsOrigin
-            ? `${snapshot.httpsOrigin} · ${stateLabel}`
-            : "Register an externally managed HTTPS hostname."
+          managed?.configured
+            ? `${managed.httpsOrigin} · ${managedCloudflareCompactState(managed)}`
+            : snapshot?.httpsOrigin
+              ? `${snapshot.httpsOrigin} · ${stateLabel}`
+              : "Register an externally managed HTTPS hostname."
         }
         status={
-          snapshot?.verificationState === "failed" ? (
+          managed?.failureMessage ? (
+            <span className="text-destructive">{managed.failureMessage}</span>
+          ) : snapshot?.verificationState === "failed" ? (
             <span className="text-destructive">{snapshot.failureMessage}</span>
           ) : undefined
         }
@@ -247,34 +322,55 @@ export function CloudflareTunnelSettingsRow({
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
-          <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
-            laplus will verify and advertise this endpoint, but will never start, stop, reconfigure,
-            or delete its connector. The hostname is public unless you independently protect it;
-            laplus authentication remains required. Cloudflare Access may intercept pairing or
-            WebSocket traffic.
-          </div>
-          <label className="block">
-            <span className="text-sm font-medium">HTTPS hostname</span>
-            <Input
-              className="mt-2"
-              placeholder="laplus.example.com"
-              value={hostname}
-              disabled={busy || !canWrite}
-              onChange={(event) => setHostname(event.target.value)}
-            />
-          </label>
-          {snapshot?.lastVerifiedAt ? (
-            <p className="text-xs text-muted-foreground">
-              Last verified {formatAccessTimestamp(snapshot.lastVerifiedAt)}
-              {snapshot.verificationState !== "verified" ? " · stale" : ""}
-            </p>
-          ) : null}
-          {snapshot?.configured ? <CloudflareLayeredHealth snapshot={snapshot} /> : null}
-          {error ? <p className="text-xs text-destructive">{error}</p> : null}
-          {pairingUrl ? (
-            <div className="flex flex-col items-center gap-3 rounded-md border p-3">
-              <QRCodeSvg value={pairingUrl} className="size-40" />
-              <Textarea readOnly value={pairingUrl} aria-label="Cloudflare pairing URL" />
+          <ManagedCloudflareConnectorPanel
+            snapshot={managed}
+            executables={cloudflaredExecutables}
+            canWrite={canWrite}
+            busy={busy}
+            hostname={hostname}
+            executablePath={executablePath}
+            connectorToken={connectorToken}
+            onHostnameChange={setHostname}
+            onExecutablePathChange={setExecutablePath}
+            onConnectorTokenChange={setConnectorToken}
+            onConfigure={() => void mutateManaged("configure")}
+            onStart={() => void mutateManaged("start")}
+            onStop={() => void mutateManaged("stop")}
+            onRetry={() => void mutateManaged("retry")}
+          />
+          {!managed?.configured ? (
+            <div className="border-t border-border/70 pt-4">
+              <p className="mb-2 text-sm font-medium">Externally managed hostname</p>
+              <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+                laplus will verify and advertise this endpoint, but will never start, stop,
+                reconfigure, or delete its connector. The hostname is public unless you
+                independently protect it; laplus authentication remains required. Cloudflare Access
+                may intercept pairing or WebSocket traffic.
+              </div>
+              <label className="block">
+                <span className="text-sm font-medium">HTTPS hostname</span>
+                <Input
+                  className="mt-2"
+                  placeholder="laplus.example.com"
+                  value={hostname}
+                  disabled={busy || !canWrite}
+                  onChange={(event) => setHostname(event.target.value)}
+                />
+              </label>
+              {snapshot?.lastVerifiedAt ? (
+                <p className="text-xs text-muted-foreground">
+                  Last verified {formatAccessTimestamp(snapshot.lastVerifiedAt)}
+                  {snapshot.verificationState !== "verified" ? " · stale" : ""}
+                </p>
+              ) : null}
+              {snapshot?.configured ? <CloudflareLayeredHealth snapshot={snapshot} /> : null}
+              {error ? <p className="text-xs text-destructive">{error}</p> : null}
+              {pairingUrl ? (
+                <div className="flex flex-col items-center gap-3 rounded-md border p-3">
+                  <QRCodeSvg value={pairingUrl} className="size-40" />
+                  <Textarea readOnly value={pairingUrl} aria-label="Cloudflare pairing URL" />
+                </div>
+              ) : null}
             </div>
           ) : null}
         </DialogPanel>
@@ -305,6 +401,173 @@ export function CloudflareTunnelSettingsRow({
         </DialogFooter>
       </DialogPopup>
     </Dialog>
+  );
+}
+
+export function managedCloudflareCompactState(
+  snapshot: ManagedCloudflareConnectorSnapshot,
+): string {
+  switch (snapshot.connectorState) {
+    case "unconfigured":
+      return "Not configured";
+    case "starting":
+      return "Starting";
+    case "ready":
+      return snapshot.verificationState === "verified" ? "Publicly verified" : "Locally ready";
+    case "degraded":
+      return "Degraded";
+    case "restart-exhausted":
+      return "Restart exhausted";
+    case "stopping":
+      return "Stopping";
+    case "stopped":
+      return "Stopped";
+    case "failed":
+      return "Setup failed";
+  }
+}
+
+export function ManagedCloudflareConnectorPanel({
+  snapshot,
+  executables,
+  canWrite,
+  busy,
+  hostname,
+  executablePath,
+  connectorToken,
+  onHostnameChange,
+  onExecutablePathChange,
+  onConnectorTokenChange,
+  onConfigure,
+  onStart,
+  onStop,
+  onRetry,
+}: {
+  readonly snapshot: ManagedCloudflareConnectorSnapshot | null;
+  readonly executables: ReadonlyArray<CloudflaredExecutable>;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly hostname: string;
+  readonly executablePath: string;
+  readonly connectorToken: string;
+  readonly onHostnameChange: (value: string) => void;
+  readonly onExecutablePathChange: (value: string) => void;
+  readonly onConnectorTokenChange: (value: string) => void;
+  readonly onConfigure: () => void;
+  readonly onStart: () => void;
+  readonly onStop: () => void;
+  readonly onRetry: () => void;
+}) {
+  const incompatible = executables.find(
+    (item) => item.path === executablePath && item.compatibility === "incompatible",
+  );
+  return (
+    <section className="space-y-3" aria-label="Laplus-managed Cloudflare connector">
+      <div>
+        <p className="text-sm font-medium">Run a connector with laplus</p>
+        <p className="text-xs text-muted-foreground">
+          Use an existing compatible cloudflared executable and a tunnel connector token. Cloudflare
+          retains control-plane ownership.
+        </p>
+      </div>
+      <label className="block">
+        <span className="text-xs font-medium">Hostname</span>
+        <Input
+          className="mt-1"
+          value={hostname}
+          disabled={busy || !canWrite}
+          onChange={(event) => onHostnameChange(event.target.value)}
+        />
+      </label>
+      <label className="block">
+        <span className="text-xs font-medium">cloudflared executable</span>
+        <Input
+          className="mt-1"
+          value={executablePath}
+          disabled={busy || !canWrite}
+          onChange={(event) => onExecutablePathChange(event.target.value)}
+        />
+      </label>
+      {incompatible ? (
+        <p className="text-xs text-destructive">
+          {incompatible.failureMessage ?? "This cloudflared executable is incompatible."}
+        </p>
+      ) : null}
+      <label className="block">
+        <span className="text-xs font-medium">Connector token</span>
+        <Input
+          className="mt-1"
+          type="password"
+          autoComplete="off"
+          value={connectorToken}
+          placeholder={
+            snapshot?.configured
+              ? "Stored privately; enter only to replace"
+              : "Paste tunnel connector token"
+          }
+          disabled={busy || !canWrite}
+          onChange={(event) => onConnectorTokenChange(event.target.value)}
+        />
+      </label>
+      {snapshot ? (
+        <div className="rounded-md border border-border/70 p-3 text-xs">
+          <p>
+            Connector{" "}
+            {snapshot.readiness === true
+              ? "ready"
+              : snapshot.readiness === false
+                ? "not ready"
+                : "readiness unknown"}
+          </p>
+          <p>Public endpoint {snapshot.verificationState}</p>
+          {snapshot.failureMessage ? (
+            <p className="text-destructive">{snapshot.failureMessage}</p>
+          ) : null}
+          {snapshot.publicFailureMessage ? (
+            <p className="text-destructive">{snapshot.publicFailureMessage}</p>
+          ) : null}
+          {snapshot.logs.length > 0 ? (
+            <pre className="mt-2 whitespace-pre-wrap text-muted-foreground">
+              {snapshot.logs.join("\n")}
+            </pre>
+          ) : null}
+        </div>
+      ) : null}
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={
+              busy ||
+              hostname.trim() === "" ||
+              executablePath.trim() === "" ||
+              (!snapshot?.configured && connectorToken.trim() === "") ||
+              incompatible !== undefined
+            }
+            onClick={onConfigure}
+          >
+            Save connector
+          </Button>
+          {snapshot?.configured && snapshot.desiredState === "stopped" ? (
+            <Button size="sm" disabled={busy} onClick={onStart}>
+              Start connector
+            </Button>
+          ) : null}
+          {snapshot?.configured && snapshot.desiredState === "running" ? (
+            <Button size="sm" variant="outline" disabled={busy} onClick={onStop}>
+              Stop connector
+            </Button>
+          ) : null}
+          {snapshot?.connectorState === "restart-exhausted" ||
+          snapshot?.connectorState === "failed" ? (
+            <Button size="sm" disabled={busy} onClick={onRetry}>
+              Retry connector
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
   );
 }
 

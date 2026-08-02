@@ -28,6 +28,9 @@ import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ExternalTunnelEndpointSnapshot,
+  CloudflaredExecutableDiscovery,
+  ConfigureManagedCloudflareConnectorInput,
+  ManagedCloudflareConnectorSnapshot,
   RegisterExternalTunnelEndpointInput,
 } from "./remoteAccess.ts";
 import {
@@ -443,6 +446,65 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       success: ExternalTunnelEndpointSnapshot,
       error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("cloudflaredExecutables", "/api/access/cloudflare/executables", {
+      headers: OptionalBearerHeaders,
+      success: CloudflaredExecutableDiscovery,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("managedCloudflareConnector", "/api/access/cloudflare/connector", {
+      headers: OptionalBearerHeaders,
+      success: ManagedCloudflareConnectorSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "configureManagedCloudflareConnector",
+      "/api/access/cloudflare/connector/configure",
+      {
+        headers: OptionalBearerHeaders,
+        payload: ConfigureManagedCloudflareConnectorInput,
+        success: ManagedCloudflareConnectorSnapshot,
+        error: EnvironmentScopedOperationErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "startManagedCloudflareConnector",
+      "/api/access/cloudflare/connector/start",
+      {
+        headers: OptionalBearerHeaders,
+        success: ManagedCloudflareConnectorSnapshot,
+        error: EnvironmentScopedOperationErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "stopManagedCloudflareConnector",
+      "/api/access/cloudflare/connector/stop",
+      {
+        headers: OptionalBearerHeaders,
+        success: ManagedCloudflareConnectorSnapshot,
+        error: EnvironmentScopedOperationErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "retryManagedCloudflareConnector",
+      "/api/access/cloudflare/connector/retry",
+      {
+        headers: OptionalBearerHeaders,
+        success: ManagedCloudflareConnectorSnapshot,
+        error: EnvironmentScopedOperationErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
 const EnvironmentOrchestrationThreadSnapshotParams = Schema.Struct({

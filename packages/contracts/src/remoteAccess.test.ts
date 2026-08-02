@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
-import { ExternalTunnelEndpointSnapshot } from "./remoteAccess.ts";
+import {
+  ExternalTunnelEndpointSnapshot,
+  ManagedCloudflareConnectorSnapshot,
+} from "./remoteAccess.ts";
 
 const decode = Schema.decodeUnknownSync(ExternalTunnelEndpointSnapshot);
 
@@ -120,5 +123,59 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       https: "healthy",
       webSocket: "failed",
     });
+  });
+});
+
+describe("ManagedCloudflareConnectorSnapshot", () => {
+  it("keeps local connector readiness independent from public verification", () => {
+    const decodeManaged = Schema.decodeUnknownSync(ManagedCloudflareConnectorSnapshot);
+    const snapshot = decodeManaged({
+      configured: true,
+      ownership: "laplus",
+      remoteOwnership: "cloudflare",
+      desiredState: "running",
+      connectorState: "ready",
+      readiness: true,
+      httpsOrigin: "https://laplus.example.com",
+      loopbackOrigin: "http://127.0.0.1:4773",
+      executablePath: "/usr/bin/cloudflared",
+      detectedVersion: "2026.7.0",
+      metricsOrigin: "http://127.0.0.1:12345",
+      failureMessage: null,
+      restartCount: 0,
+      logs: ["connector established"],
+      verificationState: "failed",
+      failureKind: "websocket",
+      publicFailureMessage: "The WebSocket upgrade failed.",
+      lastVerifiedAt: null,
+    });
+
+    expect(snapshot.readiness).toBe(true);
+    expect(snapshot.verificationState).toBe("failed");
+    expect(snapshot).not.toHaveProperty("connectorToken");
+  });
+
+  it("represents an unconfigured connector without exposing a secret", () => {
+    const decodeManaged = Schema.decodeUnknownSync(ManagedCloudflareConnectorSnapshot);
+    const snapshot = decodeManaged({
+      configured: false,
+      ownership: "laplus",
+      desiredState: "stopped",
+      connectorState: "stopped",
+      readiness: null,
+      httpsOrigin: null,
+      executablePath: null,
+      detectedVersion: null,
+      metricsOrigin: null,
+      failureMessage: null,
+      restartCount: 0,
+      logs: [],
+      verificationState: "unconfigured",
+      failureKind: null,
+      publicFailureMessage: null,
+      lastVerifiedAt: null,
+    });
+
+    expect(snapshot.configured).toBe(false);
   });
 });
