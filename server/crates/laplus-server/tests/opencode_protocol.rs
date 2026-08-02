@@ -90,7 +90,9 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         "/api/global/health" => {
             json_response(StatusCode::OK, json!({"healthy":true,"version":"1.18.10"}))
         }
-        "/api/session" => json_response(StatusCode::OK, json!({"id":"ses_1"})),
+        "/api/session" | "/api/session/ses_1" => {
+            json_response(StatusCode::OK, json!({"id":"ses_1"}))
+        }
         _ => json_response(StatusCode::OK, json!({"ok":true})),
     })
     .await;
@@ -101,6 +103,13 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
     client.agents().await.unwrap();
     client
         .create_session(&json!({"title":"hello"}))
+        .await
+        .unwrap();
+    client
+        .update_session(
+            "ses_1",
+            &json!({"permission":[{"permission":"*","pattern":"*","action":"allow"}]}),
+        )
         .await
         .unwrap();
     client
@@ -116,6 +125,7 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         .reply_permission("per_1", &json!({"reply":"once"}))
         .await
         .unwrap();
+    client.reply_legacy_permission("ses_1", "legacy_1", &json!({"response":"always"})).await.unwrap();
     client
         .reply_question("que_1", &json!({"answers":[["yes"]]}))
         .await
@@ -134,10 +144,12 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
             "/api/provider",
             "/api/agent",
             "/api/session",
+            "/api/session/ses_1",
             "/api/session/ses_1/prompt_async",
             "/api/session/ses_1/abort",
             "/api/session/ses_1/revert",
             "/api/permission/per_1/reply",
+            "/api/session/ses_1/permissions/legacy_1",
             "/api/question/que_1/reply",
             "/api/question/que_2/reject",
         ]
@@ -145,6 +157,10 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
     assert_eq!(
         serde_json::from_slice::<Value>(&requests[3].3).unwrap(),
         json!({"title":"hello"})
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[4].3).unwrap()["permission"][0]["action"],
+        "allow"
     );
     let _ = stop.send(());
 }

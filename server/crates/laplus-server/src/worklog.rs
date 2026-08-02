@@ -320,6 +320,34 @@ impl Kind {
     }
 }
 
+/// OpenCode's tool-family mapping into the shared work-log item vocabulary.
+/// Its first-party rules intentionally differ from Claude's broader classifier,
+/// so the provider selects the mapping here while the work-log owns the names.
+pub(crate) fn opencode_item_type(tool_name: &str) -> &'static str {
+    let name = tool_name.to_ascii_lowercase();
+    if name.contains("bash") || name.contains("command") {
+        "command_execution"
+    } else if ["edit", "write", "patch", "multiedit"]
+        .iter()
+        .any(|needle| name.contains(needle))
+    {
+        "file_change"
+    } else if name.contains("web") {
+        "web_search"
+    } else if name.contains("mcp") {
+        "mcp_tool_call"
+    } else if name.contains("image") {
+        "image_view"
+    } else if ["task", "agent", "subtask"]
+        .iter()
+        .any(|needle| name.contains(needle))
+    {
+        "collab_agent_tool_call"
+    } else {
+        "dynamic_tool_call"
+    }
+}
+
 /// The agent reasoning, as a row of its own.
 ///
 /// `task.progress` because that is the one kind this UI renders with its

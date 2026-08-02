@@ -206,6 +206,7 @@ pub(crate) trait Driver: Send + Sized {
     /// Whether a prompt received during a running turn belongs to that same
     /// turn instead of waiting to begin another one.
     const STEERS_ACTIVE_TURN: bool = false;
+    const APPROVAL_RESOLVED_BY_EVENT: bool = false;
 
     /// Start the agent for this session, or say why not in a sentence the
     /// developer will read in the conversation.
@@ -1242,7 +1243,12 @@ async fn answer<D: Driver>(
     // answered on. Said the one way the client recognises as "this request is
     // gone", so a panel left behind by a session that died without settling is
     // cleared by the first attempt to answer it rather than being permanent.
-    let Some(asked) = driving.outstanding.remove(&answered.request_id) else {
+    let asked = if D::APPROVAL_RESOLVED_BY_EVENT {
+        driving.outstanding.get(&answered.request_id).cloned()
+    } else {
+        driving.outstanding.remove(&answered.request_id)
+    };
+    let Some(asked) = asked else {
         threads.apply(
             &start.thread_id,
             Change::Activity(crate::worklog::unanswerable(&answered.request_id)),
@@ -1251,6 +1257,7 @@ async fn answer<D: Driver>(
     };
 
     let sent = driver.answer(&asked, Reply::Decided(answered.decision)).await;
+    let send_failed = sent.is_err();
 
     // "Cancel" is a denial that also stops the turn, wherever the driver puts
     // that — which makes it an interrupt this server did not send but did cause,
@@ -1290,14 +1297,17 @@ async fn answer<D: Driver>(
     // Published either way, and after the write either way. This is what closes
     // the panel, and a decision that reached the agent and was never recorded
     // would leave the developer asked a second time about work already under way.
-    threads.apply(
-        &start.thread_id,
-        Change::Activity(crate::worklog::resolved(
-            &asked,
-            answered.decision,
-            turn_id,
-        )),
-    );
+    if !D::APPROVAL_RESOLVED_BY_EVENT || send_failed {
+        driving.outstanding.remove(&answered.request_id);
+        threads.apply(
+            &start.thread_id,
+            Change::Activity(crate::worklog::resolved(
+                &asked,
+                answered.decision,
+                turn_id,
+            )),
+        );
+    }
 
     // After the resolution, so the work log reads in the order it happened: the
     // developer answered the question, and answering it that way stopped the turn.

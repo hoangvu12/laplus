@@ -30,10 +30,14 @@ pub struct Session {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EventEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
     pub properties: Value,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +70,7 @@ const KNOWN_EVENTS: &[&str] = &[
     "message.part.updated",
     "message.part.delta",
     "message.part.removed",
+    "permission.asked",
     "permission.updated",
     "permission.replied",
     "question.asked",

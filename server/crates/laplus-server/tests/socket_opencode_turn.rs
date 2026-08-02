@@ -20,14 +20,14 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use futures_util::stream;
 use harness::{
     conversation::{
         assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
-        start_turn,
+        respond_to_approval, start_turn, start_turn_in,
     },
     workspace::Workspace,
     SocketClient, TestServer,
@@ -220,6 +220,249 @@ async fn wait_until_port_closes(port: u16, because: &str) {
     .unwrap_or_else(|_| panic!("{because}"));
 }
 
+fn set_runtime_mode(thread_id: &str, mode: &str) -> Value {
+    json!({"type":"thread.runtime-mode.set","commandId":"test:mode","threadId":thread_id,"runtimeMode":mode})
+}
+
+#[tokio::test]
+async fn opencode_tools_and_permissions_cross_the_socket_and_reply_on_the_v2_route() {
+    let peer = ExternalOpenCode::with_permissions().await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("permission-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("permission-project", "permission-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    create["runtimeMode"] = json!("approval-required");
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("permission-thread").await;
+    let mut command = start_turn_in(
+        "permission-thread",
+        "permission-message",
+        "use a tool",
+        "approval-required",
+    );
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    let asked = client
+        .values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["requestId"] == "per-1"
+        })
+        .await;
+    let requested = asked
+        .iter()
+        .find(|item| item["event"]["payload"]["activity"]["payload"]["requestId"] == "per-1")
+        .unwrap();
+    assert_eq!(
+        requested["event"]["payload"]["activity"]["payload"]["requestKind"],
+        "command"
+    );
+    assert_eq!(
+        requested["event"]["payload"]["activity"]["payload"]["data"]["toolCallId"],
+        "call-1"
+    );
+    let started = asked
+        .iter()
+        .find(|item| {
+            item["event"]["payload"]["activity"]["kind"] == "tool.updated"
+                && item["event"]["payload"]["activity"]["payload"]["data"]["toolName"]
+                    == "mystery"
+        })
+        .unwrap();
+    assert_eq!(
+        started["event"]["payload"]["activity"]["payload"]["itemType"],
+        "dynamic_tool_call"
+    );
+    assert_eq!(
+        started["event"]["payload"]["activity"]["payload"]["data"]["state"]["input"]["secret"],
+        42
+    );
+    assert_eq!(
+        started["event"]["payload"]["activity"]["payload"]["data"]["raw"]["id"],
+        "evt-tool-1"
+    );
+    let item_types = asked
+        .iter()
+        .filter(|item| matches!(item["event"]["payload"]["activity"]["kind"].as_str(), Some("tool.started" | "tool.updated")))
+        .map(|item| {
+            item["event"]["payload"]["activity"]["payload"]["itemType"]
+                .as_str()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        item_types,
+        vec!["dynamic_tool_call"]
+    );
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval("permission-thread", "per-1", "accept"),
+        )
+        .await
+        .expect_success();
+    let requests = peer.requests_through(3).await;
+    let create = requests
+        .iter()
+        .find(|request| request["operation"] == "create")
+        .unwrap();
+    assert_eq!(
+        create["body"]["permission"][0],
+        json!({"permission":"*","pattern":"*","action":"ask"})
+    );
+    assert_eq!(
+        create["body"]["permission"][8],
+        json!({"permission":"question","pattern":"*","action":"allow"})
+    );
+    let reply = requests
+        .iter()
+        .find(|request| request["operation"] == "permission.reply")
+        .unwrap();
+    assert_eq!(reply["requestId"], "per-1");
+    assert_eq!(reply["body"], json!({"reply":"once"}));
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn every_shared_permission_decision_has_an_opencode_v2_reply() {
+    for (index, decision, expected) in [
+        (1, "accept", "once"),
+        (2, "acceptForSession", "always"),
+        (3, "decline", "reject"),
+        (4, "cancel", "reject"),
+    ] {
+        let peer = ExternalOpenCode::with_permissions().await;
+        let workspace = Workspace::with(&["src/"]);
+        let server = TestServer::start_with(peer.config(None)).await;
+        let mut client = server.connect().await;
+        let project = format!("decision-project-{index}");
+        let thread = format!("decision-thread-{index}");
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                create_project(&project, workspace.path()),
+            )
+            .await
+            .expect_success();
+        let mut create = create_thread(&project, &thread);
+        create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+        client
+            .call("orchestration.dispatchCommand", create)
+            .await
+            .expect_success();
+        let subscription = client.watch_conversation(&thread).await;
+        let mut command = start_turn(&thread, &format!("message-{index}"), "ask");
+        command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+        client
+            .call("orchestration.dispatchCommand", command)
+            .await
+            .expect_success();
+        client
+            .values_until(&subscription, |item| {
+                item["event"]["payload"]["activity"]["kind"] == "approval.requested"
+            })
+            .await;
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                respond_to_approval(&thread, "per-1", decision),
+            )
+            .await
+            .expect_success();
+        let requests = peer.requests_through(3).await;
+        let reply = requests
+            .iter()
+            .find(|request| request["operation"] == "permission.reply")
+            .unwrap();
+        assert_eq!(
+            reply["body"],
+            json!({"reply":expected}),
+            "decision {decision}"
+        );
+        client.close().await;
+        server.stop().await;
+        peer.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn retuning_opencode_reapplies_the_same_permission_rules_with_patch() {
+    let peer = ExternalOpenCode::start(None).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("retune-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("retune-project", "retune-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("retune-thread").await;
+    let mut first = start_turn("retune-thread", "retune-message-1", "first");
+    first["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", first)
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            set_runtime_mode("retune-thread", "approval-required"),
+        )
+        .await
+        .expect_success();
+    let mut second = start_turn_in(
+        "retune-thread",
+        "retune-message-2",
+        "second",
+        "approval-required",
+    );
+    second["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", second)
+        .await
+        .expect_success();
+    let requests = peer.requests_through(4).await;
+    let update = requests
+        .iter()
+        .find(|request| request["operation"] == "update")
+        .unwrap();
+    assert_eq!(update["sessionId"], "ses_owned_1");
+    assert_eq!(
+        update["body"]["permission"][0],
+        json!({"permission":"*","pattern":"*","action":"ask"})
+    );
+    assert_eq!(
+        update["body"]["permission"][8],
+        json!({"permission":"question","pattern":"*","action":"allow"})
+    );
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
 #[derive(Clone, Default)]
 struct PeerState {
     subscriber: Arc<Mutex<Option<mpsc::Sender<Result<&'static str, Infallible>>>>>,
@@ -228,6 +471,7 @@ struct PeerState {
     authorization: Option<String>,
     idle_release: Option<Arc<Notify>>,
     prompts: Arc<AtomicUsize>,
+    permissions: bool,
 }
 
 fn assert_authorization(headers: &HeaderMap, state: &PeerState) {
@@ -256,7 +500,7 @@ async fn health(State(state): State<PeerState>) -> Json<Value> {
 
 async fn events(State(state): State<PeerState>, headers: HeaderMap) -> Response {
     assert_authorization(&headers, &state);
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = mpsc::channel(32);
     *state.subscriber.lock().expect("subscriber lock") = Some(tx);
     let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -280,6 +524,18 @@ async fn create_session(
         json!({"operation":"create","directory":query.get("directory"),"body":body}),
     );
     Json(json!({"id":"ses_owned_1"}))
+}
+
+async fn update_session(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<PeerState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    append(
+        &state.log,
+        json!({"operation":"update","sessionId":session_id,"body":body}),
+    );
+    Json(json!({"id":session_id}))
 }
 
 async fn prompt(
@@ -306,6 +562,13 @@ async fn prompt(
         .expect("subscriber lock")
         .clone()
         .expect("event subscription precedes prompt");
+    if state.permissions {
+        for event in [
+            "data: {\"id\":\"evt-tool-1\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"part-tool-1\",\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"type\":\"tool\",\"callID\":\"call-1\",\"tool\":\"mystery\",\"state\":{\"status\":\"running\",\"input\":{\"secret\":42},\"time\":{\"start\":1}}}}}\n\n",
+            "data: {\"id\":\"evt-per-1\",\"type\":\"permission.asked\",\"properties\":{\"id\":\"per-1\",\"sessionID\":\"ses_owned_1\",\"permission\":\"bash\",\"patterns\":[\"cargo test\"],\"metadata\":{\"command\":\"cargo test\"},\"always\":[],\"tool\":{\"messageID\":\"message-1\",\"callID\":\"call-1\"}}}\n\n",
+        ] { sender.send(Ok(event)).await.unwrap(); }
+        return StatusCode::NO_CONTENT;
+    }
     for event in [
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"reason-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"check the stream\"}}}\n\n",
         "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\"}}}\n\n",
@@ -357,6 +620,36 @@ async fn abort(
     Json(json!(true))
 }
 
+async fn reply_permission(
+    AxumPath(request_id): AxumPath<String>,
+    State(state): State<PeerState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    append(
+        &state.log,
+        json!({"operation":"permission.reply","requestId":request_id,"body":body}),
+    );
+    let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    for event in [
+        "data: {\"id\":\"evt-reply-1\",\"type\":\"permission.replied\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"requestID\":\"per-1\",\"reply\":\"once\"}}\n\n",
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"type\":\"tool\",\"callID\":\"call-bash\",\"tool\":\"Bash\",\"state\":{\"status\":\"error\",\"input\":{},\"error\":\"denied\",\"time\":{\"start\":1,\"end\":2}}}}\n\n",
+        "data: {\"id\":\"evt-tool-2\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"part-tool-1\",\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"type\":\"tool\",\"callID\":\"call-1\",\"tool\":\"mystery\",\"state\":{\"status\":\"completed\",\"input\":{\"secret\":42},\"output\":\"done\",\"title\":\"Mystery\",\"metadata\":{},\"time\":{\"start\":1,\"end\":2}}}}}\n\n",
+        "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
+    ] { sender.send(Ok(event)).await.unwrap(); }
+    Json(json!(true))
+}
+
+async fn reply_legacy_permission(
+    AxumPath((session_id, request_id)): AxumPath<(String, String)>,
+    State(state): State<PeerState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    append(&state.log, json!({"operation":"permission.reply.legacy","sessionId":session_id,"requestId":request_id,"body":body}));
+    let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    sender.send(Ok("data: {\"type\":\"permission.replied\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"permissionID\":\"legacy-1\",\"response\":\"once\"}}\n\n")).await.unwrap();
+    Json(json!(true))
+}
+
 struct ExternalOpenCode {
     _directory: tempfile::TempDir,
     endpoint: String,
@@ -369,9 +662,21 @@ impl ExternalOpenCode {
         Self::start_with_idle_release(password, None).await
     }
 
+    async fn with_permissions() -> Self {
+        Self::start_configured(None, None, true).await
+    }
+
     async fn start_with_idle_release(
         password: Option<&str>,
         idle_release: Option<Arc<Notify>>,
+    ) -> Self {
+        Self::start_configured(password, idle_release, false).await
+    }
+
+    async fn start_configured(
+        password: Option<&str>,
+        idle_release: Option<Arc<Notify>>,
+        permissions: bool,
     ) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
@@ -386,14 +691,18 @@ impl ExternalOpenCode {
                 _ => panic!("test password needs an explicit wire expectation"),
             }),
             idle_release,
+            permissions,
             ..Default::default()
         };
         let app = Router::new()
             .route("/global/health", get(health))
             .route("/event", get(events))
             .route("/session", post(create_session))
+            .route("/session/{id}", patch(update_session))
             .route("/session/{id}/prompt_async", post(prompt))
             .route("/session/{id}/abort", post(abort))
+            .route("/permission/{id}/reply", post(reply_permission))
+            .route("/session/{id}/permissions/{permission_id}", post(reply_legacy_permission))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -912,18 +1221,35 @@ async fn stopping_busy_owned_opencode_aborts_and_reaps_its_server() {
         mut client,
         subscription,
         ..
-    } = start_socket_turn(FakeOpenCode::busy(), "project-busy-stop", "thread-busy-stop").await;
+    } = start_socket_turn(
+        FakeOpenCode::busy(),
+        "project-busy-stop",
+        "thread-busy-stop",
+    )
+    .await;
     client.events_until_streaming(&subscription).await;
     let requests = opencode.requests().await;
     let port = requests[0]["port"].as_u64().expect("the owned port") as u16;
 
-    client.call("orchestration.dispatchCommand", json!({
-        "type":"thread.session.stop","commandId":"test:stop:busy-owned",
-        "threadId":"thread-busy-stop","createdAt":"2026-08-01T00:00:00.000Z"
-    })).await.expect_success();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.session.stop","commandId":"test:stop:busy-owned",
+                "threadId":"thread-busy-stop","createdAt":"2026-08-01T00:00:00.000Z"
+            }),
+        )
+        .await
+        .expect_success();
     let requests = opencode.requests_through(4).await;
-    assert!(requests.iter().any(|request| request["operation"] == "abort"));
-    wait_until_port_closes(port, "stopping a busy owned session did not reap its OpenCode server").await;
+    assert!(requests
+        .iter()
+        .any(|request| request["operation"] == "abort"));
+    wait_until_port_closes(
+        port,
+        "stopping a busy owned session did not reap its OpenCode server",
+    )
+    .await;
     client.close().await;
     server.stop().await;
 }

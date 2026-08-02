@@ -139,6 +139,10 @@ impl OpenCodeClient {
     pub async fn create_session(&self, body: &Value) -> Result<Session, OpenCodeError> {
         self.request_json(Method::POST, "session", Some(body)).await
     }
+    pub async fn update_session(&self, id: &str, body: &Value) -> Result<Session, OpenCodeError> {
+        self.request_json(Method::PATCH, &format!("session/{id}"), Some(body))
+            .await
+    }
     pub async fn session(&self, id: &str) -> Result<Session, OpenCodeError> {
         self.request_json(Method::GET, &format!("session/{id}"), Option::<&()>::None)
             .await
@@ -172,6 +176,19 @@ impl OpenCodeClient {
     pub async fn reply_permission(&self, id: &str, body: &Value) -> Result<Value, OpenCodeError> {
         self.request_json(Method::POST, &format!("permission/{id}/reply"), Some(body))
             .await
+    }
+    pub async fn reply_legacy_permission(
+        &self,
+        session_id: &str,
+        id: &str,
+        body: &Value,
+    ) -> Result<Value, OpenCodeError> {
+        self.request_json(
+            Method::POST,
+            &format!("session/{session_id}/permissions/{id}"),
+            Some(body),
+        )
+        .await
     }
     pub async fn reply_question(&self, id: &str, body: &Value) -> Result<Value, OpenCodeError> {
         self.request_json(Method::POST, &format!("question/{id}/reply"), Some(body))
@@ -413,6 +430,114 @@ pub(crate) struct OpenCode {
     pending_deltas: HashMap<String, String>,
     emitted_parts: HashMap<String, String>,
     assistant_text: String,
+    pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
+}
+
+/// The OpenCode permission rules for a shared runtime mode. Ticket 15 uses the
+/// same value when adopting or forking a session; keeping it here prevents
+/// resume from growing a second, subtly different access translation.
+pub(crate) fn permission_rules(runtime_mode: &str) -> Value {
+    if runtime_mode == "full-access" {
+        return serde_json::json!([{"permission":"*","pattern":"*","action":"allow"}]);
+    }
+    serde_json::json!([
+        {"permission":"*","pattern":"*","action":"ask"},
+        {"permission":"bash","pattern":"*","action":"ask"},
+        {"permission":"edit","pattern":"*","action":"ask"},
+        {"permission":"webfetch","pattern":"*","action":"ask"},
+        {"permission":"websearch","pattern":"*","action":"ask"},
+        {"permission":"codesearch","pattern":"*","action":"ask"},
+        {"permission":"external_directory","pattern":"*","action":"ask"},
+        {"permission":"doom_loop","pattern":"*","action":"ask"},
+        {"permission":"question","pattern":"*","action":"allow"}
+    ])
+}
+
+fn tool_activity(
+    part: &Value,
+    raw: &Value,
+    turn_id: Option<String>,
+) -> Option<crate::threads::Activity> {
+    if part.get("type").and_then(Value::as_str) != Some("tool") {
+        return None;
+    }
+    let id = part.get("callID").and_then(Value::as_str)?;
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("Tool");
+    let state = part.get("state")?;
+    let status = state
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("pending");
+    let (kind, shared_status) = match status {
+        "pending" => ("tool.started", "inProgress"),
+        "completed" => ("tool.completed", "completed"),
+        "error" => ("tool.completed", "failed"),
+        _ => ("tool.updated", "inProgress"),
+    };
+    let detail = match status {
+        "completed" => state.get("output").cloned(),
+        "error" => state.get("error").cloned(),
+        _ => state
+            .get("title")
+            .cloned()
+            .or_else(|| state.get("input").cloned()),
+    };
+    let mut payload = serde_json::json!({
+        "itemType": crate::worklog::opencode_item_type(tool), "status": shared_status, "title": tool,
+        "data": {"toolCallId": id, "toolName": tool, "tool": tool, "state": state, "raw": raw}
+    });
+    if let Some(detail) = detail {
+        payload["detail"] = detail;
+    }
+    Some(crate::threads::Activity::tool(kind, tool, payload, turn_id))
+}
+
+fn permission_request(
+    properties: &Value,
+    legacy: bool,
+) -> Option<crate::approval::ApprovalRequest> {
+    let id = properties.get("id")?.as_str()?;
+    let permission = properties
+        .get(if legacy { "type" } else { "permission" })?
+        .as_str()?;
+    let patterns = properties
+        .get("patterns")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+    let description = patterns
+        .filter(|v| !v.is_empty())
+        .or_else(|| Some(permission.to_string()));
+    Some(crate::approval::ApprovalRequest {
+        request_id: id.to_string(),
+        tool_name: permission.to_string(),
+        input: properties
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        tool_use_id: properties
+            .pointer("/tool/callID")
+            .or_else(|| properties.get("callID"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description,
+        suggestions: Vec::new(),
+        available_decisions: Some(vec![
+            crate::worklog::Decision::Accept,
+            crate::worklog::Decision::AcceptForSession,
+            crate::worklog::Decision::Decline,
+            crate::worklog::Decision::Cancel,
+        ]),
+        provider_request_id: Some(
+            serde_json::json!({"kind":if legacy {"permission.updated"} else {"permission.asked"},"id":id}),
+        ),
+    })
 }
 
 fn cursor(start: &crate::session::Start, session_id: &str) -> crate::provider::ResumeCursor {
@@ -603,7 +728,13 @@ impl OpenCode {
         }
         driving.finished = Some(crate::session::Finished {
             turn_id: finished.turn_id.clone(),
-            status: if interrupted { "interrupted" } else if error.is_some() { "error" } else { "ready" },
+            status: if interrupted {
+                "interrupted"
+            } else if error.is_some() {
+                "error"
+            } else {
+                "ready"
+            },
         });
         // A steer shares this turn's normalization state. Clear it only once
         // the turn settles so the next independent turn starts cleanly.
@@ -615,7 +746,11 @@ impl OpenCode {
             changes,
             settles: Some(crate::session::Settles {
                 turn_id: Some(finished.turn_id),
-                status: if interrupted { crate::settling::SessionStatus::Interrupted } else { status },
+                status: if interrupted {
+                    crate::settling::SessionStatus::Interrupted
+                } else {
+                    status
+                },
                 last_error: if interrupted { None } else { error },
             }),
             ..Default::default()
@@ -639,6 +774,7 @@ fn structured_event_error(error: &Value) -> String {
 
 impl crate::session::Driver for OpenCode {
     const STEERS_ACTIVE_TURN: bool = true;
+    const APPROVAL_RESOLVED_BY_EVENT: bool = true;
 
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
         if start.resume_cursor.is_some() {
@@ -646,12 +782,12 @@ impl crate::session::Driver for OpenCode {
         }
         let settings = start.driver.opencode()?;
         let (mut owned, client) = if settings.server_url.is_empty() {
-        let (binary, _) = crate::provider::resolve_named(
-            &settings.binary_path,
-            "opencode",
-            &crate::process::Search::from_environment(),
-        )
-        .startable_for("OpenCode CLI")?;
+            let (binary, _) = crate::provider::resolve_named(
+                &settings.binary_path,
+                "opencode",
+                &crate::process::Search::from_environment(),
+            )
+            .startable_for("OpenCode CLI")?;
             let (owned, client) = OwnedServer::start(&binary, &start.workspace_root).await?;
             (Some(owned), client)
         } else {
@@ -667,7 +803,10 @@ impl crate::session::Driver for OpenCode {
                 .await
                 .map_err(|error| error.to_string())?;
             let session = client
-                .create_session(&serde_json::json!({"title": "Laplus conversation"}))
+                .create_session(&serde_json::json!({
+                    "title": "Laplus conversation",
+                    "permission": permission_rules(&start.runtime_mode)
+                }))
                 .await
                 .map_err(|error| error.to_string())?;
             Ok::<_, String>((events, session))
@@ -677,7 +816,7 @@ impl crate::session::Driver for OpenCode {
             Ok(value) => value,
             Err(error) => {
                 if let Some(owned) = owned.as_mut() {
-                owned.stop().await;
+                    owned.stop().await;
                 }
                 return Err(error);
             }
@@ -695,6 +834,7 @@ impl crate::session::Driver for OpenCode {
                 pending_deltas: HashMap::new(),
                 emitted_parts: HashMap::new(),
                 assistant_text: String::new(),
+                pending_permissions: HashMap::new(),
             },
             decided: crate::session::Decided {
                 provider_resume_cursor: Some(cursor(start, &session.id)),
@@ -726,7 +866,7 @@ impl crate::session::Driver for OpenCode {
                 if let (Some(id), Some(role)) = (
                     info.get("id").and_then(Value::as_str),
                     info.get("role").and_then(Value::as_str),
-                    ) {
+                ) {
                     self.roles.insert(id.to_string(), role.to_string());
                     if role == "assistant" {
                         let parts = self
@@ -753,8 +893,60 @@ impl crate::session::Driver for OpenCode {
                     .properties
                     .get("part")
                     .unwrap_or(&envelope.properties);
+                if let Some(activity) = tool_activity(
+                    part,
+                    &serde_json::to_value(envelope).unwrap_or(Value::Null),
+                    driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+                ) {
+                    decided
+                        .changes
+                        .push(crate::threads::Change::Activity(activity));
+                }
                 self.normalize_part(part, driving, &mut decided);
+            }
+            "permission.asked" | "permission.updated" => {
+                let legacy = envelope.kind == "permission.updated";
+                if let Some(request) = permission_request(&envelope.properties, legacy) {
+                    if !self.pending_permissions.contains_key(&request.request_id) {
+                        self.pending_permissions
+                            .insert(request.request_id.clone(), request.clone());
+                        driving
+                            .outstanding
+                            .insert(request.request_id.clone(), request.clone());
+                        decided.changes.push(crate::threads::Change::Activity(
+                            crate::worklog::requested(
+                                &request,
+                                driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+                            ),
+                        ));
                     }
+                }
+            }
+            "permission.replied" => {
+                let id = envelope
+                    .properties
+                    .get("requestID")
+                    .or_else(|| envelope.properties.get("permissionID"))
+                    .and_then(Value::as_str);
+                if let Some(id) = id {
+                    let request = self.pending_permissions.remove(id)
+                        .or_else(|| driving.outstanding.get(id).cloned());
+                    driving.outstanding.remove(id);
+                    let decision = match envelope.properties.get("reply")
+                        .or_else(|| envelope.properties.get("response"))
+                        .and_then(Value::as_str) {
+                        Some("once") => Some(crate::worklog::Decision::Accept),
+                        Some("always") => Some(crate::worklog::Decision::AcceptForSession),
+                        Some("reject") => Some(crate::worklog::Decision::Decline),
+                        _ => None,
+                    };
+                    if let (Some(request), Some(decision)) = (request, decision) {
+                        decided.changes.push(crate::threads::Change::Activity(
+                            crate::worklog::resolved(&request, decision, driving.turn.as_ref().map(|turn| turn.turn_id.clone()))
+                        ));
+                    }
+                }
+            }
             "session.updated" => {
                 let info = envelope
                     .properties
@@ -815,8 +1007,8 @@ impl crate::session::Driver for OpenCode {
                             driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
                         ),
                     ));
-            }
-            _ => {}
+                }
+                _ => {}
             },
             "session.error" => {
                 let error = envelope
@@ -852,16 +1044,46 @@ impl crate::session::Driver for OpenCode {
     }
 
     async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
-        self.client.abort(&self.session_id).await.map(|_| ()).map_err(std::io::Error::other)
+        self.client
+            .abort(&self.session_id)
+            .await
+            .map(|_| ())
+            .map_err(std::io::Error::other)
     }
     async fn answer(
         &mut self,
-        _asked: &crate::approval::ApprovalRequest,
-        _reply: crate::session::Reply<'_>,
+        asked: &crate::approval::ApprovalRequest,
+        reply: crate::session::Reply<'_>,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::other(
-            "OpenCode approvals require ticket 13",
-        ))
+        let crate::session::Reply::Decided(decision) = reply else {
+            return Err(std::io::Error::other(
+                "OpenCode permission replies require a decision",
+            ));
+        };
+        let Some(pending) = self.pending_permissions.get(&asked.request_id) else {
+            return Err(std::io::Error::other(
+                "unknown pending OpenCode permission request",
+            ));
+        };
+        if pending.provider_request_id != asked.provider_request_id {
+            return Err(std::io::Error::other(
+                "OpenCode permission identity does not match",
+            ));
+        }
+        let reply = match decision {
+            crate::worklog::Decision::Accept => "once",
+            crate::worklog::Decision::AcceptForSession => "always",
+            crate::worklog::Decision::Decline | crate::worklog::Decision::Cancel => "reject",
+        };
+        let legacy = asked.provider_request_id.as_ref()
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str) == Some("permission.updated");
+        let result = if legacy {
+            self.client.reply_legacy_permission(&self.session_id, &asked.request_id, &serde_json::json!({"response":reply})).await
+        } else {
+            self.client.reply_permission(&asked.request_id, &serde_json::json!({"reply":reply})).await
+        };
+        result.map(|_| ()).map_err(std::io::Error::other)
     }
     async fn measure(&mut self, _request_id: &str) -> std::io::Result<()> {
         Ok(())
@@ -871,8 +1093,17 @@ impl crate::session::Driver for OpenCode {
         _request_id: &str,
         asked: &crate::session::Pushed,
     ) -> std::io::Result<()> {
-        if let crate::session::Pushed::Model { asked, .. } = asked {
-            self.model = Some(asked.clone());
+        match asked {
+            crate::session::Pushed::Model { asked, .. } => self.model = Some(asked.clone()),
+            crate::session::Pushed::Mode { asked, .. } => {
+                self.client
+                    .update_session(
+                        &self.session_id,
+                        &serde_json::json!({"permission":permission_rules(asked)}),
+                    )
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
         }
         Ok(())
     }
@@ -885,9 +1116,13 @@ impl crate::session::Driver for OpenCode {
         asked_to_stop: bool,
     ) -> crate::session::Reaped {
         let abort_failure = if asked_to_stop && driving.turn.is_some() {
-            self.client.abort(&self.session_id).await.err().map(|error| {
-                format!("OpenCode could not abort its active work while stopping: {error}")
-            })
+            self.client
+                .abort(&self.session_id)
+                .await
+                .err()
+                .map(|error| {
+                    format!("OpenCode could not abort its active work while stopping: {error}")
+                })
         } else {
             None
         };
