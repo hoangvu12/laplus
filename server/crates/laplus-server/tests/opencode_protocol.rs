@@ -90,7 +90,7 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         "/api/global/health" => {
             json_response(StatusCode::OK, json!({"healthy":true,"version":"1.18.10"}))
         }
-        "/api/session" | "/api/session/ses_1" => {
+        "/api/session" | "/api/session/ses_1" | "/api/session/ses_1/fork" => {
             json_response(StatusCode::OK, json!({"id":"ses_1"}))
         }
         _ => json_response(StatusCode::OK, json!({"ok":true})),
@@ -112,6 +112,8 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
         )
         .await
         .unwrap();
+    client.fork_session("ses_1").await.unwrap();
+    client.move_session("ses_1", "/work tree").await.unwrap();
     client
         .prompt("ses_1", &json!({"parts":[{"type":"text","text":"hi"}]}))
         .await
@@ -145,6 +147,8 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
             "/api/agent",
             "/api/session",
             "/api/session/ses_1",
+            "/api/session/ses_1/fork",
+            "/api/experimental/control-plane/move-session",
             "/api/session/ses_1/prompt_async",
             "/api/session/ses_1/abort",
             "/api/session/ses_1/revert",
@@ -161,6 +165,11 @@ async fn client_centralizes_prefix_directory_auth_json_and_operation_routes() {
     assert_eq!(
         serde_json::from_slice::<Value>(&requests[4].3).unwrap()["permission"][0]["action"],
         "allow"
+    );
+    assert_eq!(serde_json::from_slice::<Value>(&requests[5].3).unwrap(), json!({}));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[6].3).unwrap(),
+        json!({"sessionID":"ses_1","destination":{"directory":"/work tree"},"moveChanges":false})
     );
     let _ = stop.send(());
 }
@@ -354,6 +363,8 @@ fn redacted_wire_fixture_covers_every_protocol_operation_and_error_family() {
             "agents",
             "session.create",
             "session.get",
+            "session.fork",
+            "session.move",
             "session.prompt_async",
             "session.abort",
             "session.revert",
@@ -369,7 +380,7 @@ fn redacted_wire_fixture_covers_every_protocol_operation_and_error_family() {
         .iter()
         .all(|case| !case.request.is_null() && !case.response.is_null()));
     assert_eq!(
-        cases[5].request,
+        cases[7].request,
         json!({
             "method":"POST",
             "path":"/session/ses_redacted/prompt_async",

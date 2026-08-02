@@ -20,13 +20,13 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::Response,
-    routing::{get, patch, post},
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::stream;
 use harness::{
     conversation::{
-        assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
+        activity, assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
         respond_to_approval, start_turn, start_turn_in,
     },
     workspace::Workspace,
@@ -465,13 +465,30 @@ async fn retuning_opencode_reapplies_the_same_permission_rules_with_patch() {
 
 #[derive(Clone, Default)]
 struct PeerState {
-    subscriber: Arc<Mutex<Option<mpsc::Sender<Result<&'static str, Infallible>>>>>,
+    subscriber: Arc<Mutex<Option<mpsc::Sender<Result<String, Infallible>>>>>,
     log: Arc<PathBuf>,
     healthy: bool,
     authorization: Option<String>,
     idle_release: Option<Arc<Notify>>,
     prompts: Arc<AtomicUsize>,
     permissions: bool,
+    resume: ResumeBehavior,
+    gets: Arc<AtomicUsize>,
+    creates: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ResumeBehavior {
+    #[default]
+    Normal,
+    Missing,
+    GetFailure,
+    UpdateFailure,
+    ForkTarget,
+    ForkThenMove,
+    ForkFailure,
+    MoveFailure,
+    VerificationFailure,
 }
 
 fn assert_authorization(headers: &HeaderMap, state: &PeerState) {
@@ -523,19 +540,74 @@ async fn create_session(
         &state.log,
         json!({"operation":"create","directory":query.get("directory"),"body":body}),
     );
-    Json(json!({"id":"ses_owned_1"}))
+    let create = state.creates.fetch_add(1, Ordering::SeqCst);
+    Json(json!({"id":if matches!(state.resume, ResumeBehavior::Missing) && create > 0 { "ses_fresh_2" } else { "ses_owned_1" }}))
 }
 
 async fn update_session(
     AxumPath(session_id): AxumPath<String>,
     State(state): State<PeerState>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
     append(
         &state.log,
         json!({"operation":"update","sessionId":session_id,"body":body}),
     );
-    Json(json!({"id":session_id}))
+    if matches!(state.resume, ResumeBehavior::UpdateFailure) {
+        Err(StatusCode::UNAUTHORIZED)
+    } else {
+        Ok(Json(json!({"id":session_id})))
+    }
+}
+
+async fn get_session(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<PeerState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    append(
+        &state.log,
+        json!({"operation":"get","sessionId":session_id,"directory":query.get("directory")}),
+    );
+    let get = state.gets.fetch_add(1, Ordering::SeqCst);
+    match state.resume {
+        ResumeBehavior::Missing => Err((StatusCode::NOT_FOUND, Json(json!({"name":"NotFoundError","message":"session not found"})))),
+        ResumeBehavior::GetFailure => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"name":"InternalError","message":"failed to load session"})))),
+        ResumeBehavior::VerificationFailure if get > 0 => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"name":"InternalError","message":"verification failed"})))),
+        ResumeBehavior::ForkThenMove if get > 0 => Ok(Json(json!({"id":session_id,"directory":query.get("directory")}))),
+        ResumeBehavior::ForkTarget | ResumeBehavior::ForkThenMove | ResumeBehavior::ForkFailure | ResumeBehavior::MoveFailure | ResumeBehavior::VerificationFailure => Ok(Json(json!({"id":session_id,"directory":"/old/opencode/worktree"}))),
+        _ => Ok(Json(json!({"id":session_id,"directory":query.get("directory")}))),
+    }
+}
+
+async fn fork_session(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<PeerState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    append(&state.log, json!({"operation":"fork","sessionId":session_id,"directory":query.get("directory"),"body":body}));
+    if matches!(state.resume, ResumeBehavior::ForkFailure) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let directory = if matches!(state.resume, ResumeBehavior::ForkTarget) {
+        query.get("directory").cloned().unwrap_or_default()
+    } else {
+        "/old/opencode/worktree".to_string()
+    };
+    Ok(Json(json!({"id":"ses_forked_1","directory":directory})))
+}
+
+async fn move_session(
+    State(state): State<PeerState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    append(&state.log, json!({"operation":"move","body":body}));
+    if matches!(state.resume, ResumeBehavior::MoveFailure) {
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    } else {
+        Ok(Json(json!(true)))
+    }
 }
 
 async fn prompt(
@@ -562,11 +634,20 @@ async fn prompt(
         .expect("subscriber lock")
         .clone()
         .expect("event subscription precedes prompt");
+    if session_id != "ses_owned_1" {
+        for event in [
+            format!("data: {{\"type\":\"message.part.updated\",\"properties\":{{\"part\":{{\"id\":\"text-fresh\",\"messageID\":\"message-fresh\",\"sessionID\":\"{session_id}\",\"type\":\"text\",\"text\":\"continued OpenCode session\"}}}}}}\n\n"),
+            format!("data: {{\"type\":\"session.idle\",\"properties\":{{\"sessionID\":\"{session_id}\"}}}}\n\n"),
+        ] {
+            sender.send(Ok(event)).await.unwrap();
+        }
+        return StatusCode::NO_CONTENT;
+    }
     if state.permissions {
         for event in [
             "data: {\"id\":\"evt-tool-1\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"part-tool-1\",\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"type\":\"tool\",\"callID\":\"call-1\",\"tool\":\"mystery\",\"state\":{\"status\":\"running\",\"input\":{\"secret\":42},\"time\":{\"start\":1}}}}}\n\n",
             "data: {\"id\":\"evt-per-1\",\"type\":\"permission.asked\",\"properties\":{\"id\":\"per-1\",\"sessionID\":\"ses_owned_1\",\"permission\":\"bash\",\"patterns\":[\"cargo test\"],\"metadata\":{\"command\":\"cargo test\"},\"always\":[],\"tool\":{\"messageID\":\"message-1\",\"callID\":\"call-1\"}}}\n\n",
-        ] { sender.send(Ok(event)).await.unwrap(); }
+        ] { sender.send(Ok(event.to_string())).await.unwrap(); }
         return StatusCode::NO_CONTENT;
     }
     for event in [
@@ -581,7 +662,7 @@ async fn prompt(
         "data: {\"type\":\"session.updated\",\"properties\":{\"info\":{\"id\":\"ses_owned_1\",\"title\":\"Upstream title\"}}}\n\n",
         "data: {\"type\":\"future.event\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
     ] {
-        sender.send(Ok(event)).await.expect("send scripted SSE event");
+        sender.send(Ok(event.to_string())).await.expect("send scripted SSE event");
     }
     let gated = state.idle_release.is_some();
     let finish = async move {
@@ -593,7 +674,7 @@ async fn prompt(
             "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
             "data: {\"type\":\"session.error\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"error\":{\"name\":\"AbortError\",\"message\":\"request aborted\"}}}\n\n",
         ] {
-            sender.send(Ok(event)).await.expect("send scripted SSE event");
+            sender.send(Ok(event.to_string())).await.expect("send scripted SSE event");
         }
     };
     if gated {
@@ -635,7 +716,7 @@ async fn reply_permission(
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"type\":\"tool\",\"callID\":\"call-bash\",\"tool\":\"Bash\",\"state\":{\"status\":\"error\",\"input\":{},\"error\":\"denied\",\"time\":{\"start\":1,\"end\":2}}}}\n\n",
         "data: {\"id\":\"evt-tool-2\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"part-tool-1\",\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"type\":\"tool\",\"callID\":\"call-1\",\"tool\":\"mystery\",\"state\":{\"status\":\"completed\",\"input\":{\"secret\":42},\"output\":\"done\",\"title\":\"Mystery\",\"metadata\":{},\"time\":{\"start\":1,\"end\":2}}}}}\n\n",
         "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
-    ] { sender.send(Ok(event)).await.unwrap(); }
+    ] { sender.send(Ok(event.to_string())).await.unwrap(); }
     Json(json!(true))
 }
 
@@ -646,7 +727,7 @@ async fn reply_legacy_permission(
 ) -> Json<Value> {
     append(&state.log, json!({"operation":"permission.reply.legacy","sessionId":session_id,"requestId":request_id,"body":body}));
     let sender = state.subscriber.lock().unwrap().clone().unwrap();
-    sender.send(Ok("data: {\"type\":\"permission.replied\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"permissionID\":\"legacy-1\",\"response\":\"once\"}}\n\n")).await.unwrap();
+    sender.send(Ok("data: {\"type\":\"permission.replied\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"permissionID\":\"legacy-1\",\"response\":\"once\"}}\n\n".to_string())).await.unwrap();
     Json(json!(true))
 }
 
@@ -655,6 +736,7 @@ struct ExternalOpenCode {
     endpoint: String,
     log: PathBuf,
     task: tokio::task::JoinHandle<()>,
+    prompts: Arc<AtomicUsize>,
 }
 
 impl ExternalOpenCode {
@@ -664,6 +746,10 @@ impl ExternalOpenCode {
 
     async fn with_permissions() -> Self {
         Self::start_configured(None, None, true).await
+    }
+
+    async fn for_resume(resume: ResumeBehavior) -> Self {
+        Self::start_configured_with_resume(None, None, false, resume).await
     }
 
     async fn start_with_idle_release(
@@ -677,6 +763,21 @@ impl ExternalOpenCode {
         password: Option<&str>,
         idle_release: Option<Arc<Notify>>,
         permissions: bool,
+    ) -> Self {
+        Self::start_configured_with_resume(
+            password,
+            idle_release,
+            permissions,
+            ResumeBehavior::Normal,
+        )
+        .await
+    }
+
+    async fn start_configured_with_resume(
+        password: Option<&str>,
+        idle_release: Option<Arc<Notify>>,
+        permissions: bool,
+        resume: ResumeBehavior,
     ) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
@@ -692,13 +793,17 @@ impl ExternalOpenCode {
             }),
             idle_release,
             permissions,
+            resume,
             ..Default::default()
         };
+        let prompts = state.prompts.clone();
         let app = Router::new()
             .route("/global/health", get(health))
             .route("/event", get(events))
             .route("/session", post(create_session))
-            .route("/session/{id}", patch(update_session))
+            .route("/session/{id}", get(get_session).patch(update_session))
+            .route("/session/{id}/fork", post(fork_session))
+            .route("/experimental/control-plane/move-session", post(move_session))
             .route("/session/{id}/prompt_async", post(prompt))
             .route("/session/{id}/abort", post(abort))
             .route("/permission/{id}/reply", post(reply_permission))
@@ -714,6 +819,7 @@ impl ExternalOpenCode {
             endpoint,
             log,
             task,
+            prompts,
         }
     }
 
@@ -731,6 +837,13 @@ impl ExternalOpenCode {
 
     async fn requests(&self) -> Vec<Value> {
         self.requests_through(2).await
+    }
+
+    fn reset_prompts(&self) {
+        // A restarted Laplus process is a fresh driver even though this
+        // operator-owned scripted peer deliberately remains alive.
+        // The peer's first-prompt script should therefore run again.
+        self.prompts.store(0, Ordering::SeqCst);
     }
 
     async fn requests_through(&self, count: usize) -> Vec<Value> {
@@ -1047,6 +1160,258 @@ async fn an_authenticated_external_opencode_turn_crosses_the_socket_without_expo
 }
 
 #[tokio::test]
+async fn an_external_opencode_session_is_re_adopted_exactly_after_a_restart() {
+    let peer = ExternalOpenCode::start(None).await;
+    let workspace = Workspace::with(&["src/"]);
+    let registry = tempfile::tempdir().unwrap();
+    let database = registry.path().join("registry.sqlite");
+    let config = peer.config(None);
+
+    let first = TestServer::start_at_with_config(&database, config.clone()).await;
+    let mut client = first.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("restart-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("restart-project", "restart-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let watch = client.watch_conversation("restart-thread").await;
+    let mut first_turn = start_turn("restart-thread", "restart-message-1", "remember this");
+    first_turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", first_turn)
+        .await
+        .expect_success();
+    client.events_through_the_turn(&watch).await;
+    client.close().await;
+    first.stop().await;
+
+    peer.reset_prompts();
+    let second = TestServer::start_at_with_config(&database, config).await;
+    let mut client = second.connect().await;
+    let watch = client.watch_conversation("restart-thread").await;
+    let mut second_turn = start_turn("restart-thread", "restart-message-2", "what did I say?");
+    second_turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", second_turn)
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&watch).await;
+    assert_eq!(assistant_sends(&events).last().unwrap().0, "hello from OpenCode");
+
+    let requests = peer.requests_through(5).await;
+    let operations = requests
+        .iter()
+        .map(|request| request["operation"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(operations, vec!["create", "prompt", "get", "update", "prompt"]);
+    assert_eq!(requests[2]["sessionId"], "ses_owned_1");
+    assert_eq!(requests[3]["body"]["permission"][0]["action"], "allow");
+
+    client.close().await;
+    second.stop().await;
+    assert!(
+        !peer.task.is_finished(),
+        "restart must not take ownership of the external peer"
+    );
+    peer.task.abort();
+}
+
+async fn seed_external_opencode_thread(
+    peer: &ExternalOpenCode,
+    database: &Path,
+    workspace: &Workspace,
+) {
+    let first = TestServer::start_at_with_config(database, peer.config(None)).await;
+    let mut client = first.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("resume-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("resume-project", "resume-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let watch = client.watch_conversation("resume-thread").await;
+    let mut turn = start_turn("resume-thread", "resume-message-1", "remember this");
+    turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    client.events_through_the_turn(&watch).await;
+    client.close().await;
+    first.stop().await;
+    peer.reset_prompts();
+}
+
+fn stored_opencode_cursor(database: &Path) -> String {
+    rusqlite::Connection::open(database).unwrap().query_row(
+        "SELECT provider_resume_cursor FROM threads WHERE id = 'resume-thread'",
+        [],
+        |row| row.get(0),
+    ).unwrap()
+}
+
+async fn resume_external_turn(peer: &ExternalOpenCode, database: &Path) -> Vec<Value> {
+    let restarted = TestServer::start_at_with_config(database, peer.config(None)).await;
+    let mut client = restarted.connect().await;
+    let watch = client.watch_conversation("resume-thread").await;
+    let mut turn = follow_up("resume-thread", "resume-message-2", "continue");
+    turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    let events = client.events_through_the_turn(&watch).await;
+    client.close().await;
+    restarted.stop().await;
+    events
+}
+
+#[tokio::test]
+async fn a_structured_missing_opencode_session_starts_fresh_and_replaces_the_cursor() {
+    let peer = ExternalOpenCode::for_resume(ResumeBehavior::Missing).await;
+    let data = tempfile::tempdir().unwrap();
+    let database = data.path().join("registry.sqlite");
+    let workspace = Workspace::with(&["src/"]);
+    seed_external_opencode_thread(&peer, &database, &workspace).await;
+    let before = stored_opencode_cursor(&database);
+
+    let events = resume_external_turn(&peer, &database).await;
+    assert_eq!(assistant_sends(&events).last().unwrap().0, "continued OpenCode session");
+    assert_ne!(stored_opencode_cursor(&database), before);
+    assert!(stored_opencode_cursor(&database).contains("ses_fresh_2"));
+    let operations = peer.requests_through(5).await;
+    assert_eq!(operations[2]["operation"], "get");
+    assert_eq!(operations[3]["operation"], "create");
+    assert_eq!(operations[4]["operation"], "prompt");
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn incompatible_opencode_cursors_fail_closed_without_contacting_or_replacing_the_peer() {
+    for cursor in [json!({"version":1}), json!({"version":2,"sessionId":"future"})] {
+        let peer = ExternalOpenCode::start(None).await;
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("registry.sqlite");
+        let workspace = Workspace::with(&["src/"]);
+        seed_external_opencode_thread(&peer, &database, &workspace).await;
+        rusqlite::Connection::open(&database).unwrap().execute(
+            "UPDATE threads SET provider_resume_cursor = ?1 WHERE id = 'resume-thread'",
+            [cursor.to_string()],
+        ).unwrap();
+
+        let events = resume_external_turn(&peer, &database).await;
+        let failed = &activity(&events, "session.failed")["payload"]["activity"];
+        assert!(failed["summary"].as_str().unwrap().contains("cursor"));
+        assert_eq!(stored_opencode_cursor(&database), cursor.to_string());
+        assert_eq!(peer.requests_through(2).await.len(), 2, "invalid cursor contacted OpenCode");
+        peer.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn opencode_resume_failures_preserve_the_verified_cursor() {
+    for behavior in [
+        ResumeBehavior::GetFailure,
+        ResumeBehavior::UpdateFailure,
+        ResumeBehavior::ForkFailure,
+        ResumeBehavior::MoveFailure,
+        ResumeBehavior::VerificationFailure,
+    ] {
+        let peer = ExternalOpenCode::for_resume(behavior).await;
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("registry.sqlite");
+        let original = Workspace::with(&["old/"]);
+        seed_external_opencode_thread(&peer, &database, &original).await;
+        let before = stored_opencode_cursor(&database);
+        if !matches!(behavior, ResumeBehavior::GetFailure | ResumeBehavior::UpdateFailure) {
+            let moved = Workspace::with(&["new/"]);
+            rusqlite::Connection::open(&database).unwrap().execute(
+                "UPDATE projects SET workspace_root = ?1, canonical_root = ?1 WHERE id = 'resume-project'",
+                [moved.path().display().to_string()],
+            ).unwrap();
+            // Keep the replacement workspace alive through recovery.
+            let events = resume_external_turn(&peer, &database).await;
+            assert!(activity(&events, "session.failed")["payload"]["activity"]["summary"].is_string());
+            assert_eq!(stored_opencode_cursor(&database), before);
+            drop(moved);
+        } else {
+            let events = resume_external_turn(&peer, &database).await;
+            assert!(activity(&events, "session.failed")["payload"]["activity"]["summary"].is_string());
+            assert_eq!(stored_opencode_cursor(&database), before);
+        }
+        peer.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn cwd_migration_adopts_only_verified_forks_with_and_without_move() {
+    for behavior in [ResumeBehavior::ForkTarget, ResumeBehavior::ForkThenMove] {
+        let peer = ExternalOpenCode::for_resume(behavior).await;
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("registry.sqlite");
+        let original = Workspace::with(&["old/"]);
+        seed_external_opencode_thread(&peer, &database, &original).await;
+        let moved = Workspace::with(&["new/"]);
+        rusqlite::Connection::open(&database).unwrap().execute(
+            "UPDATE projects SET workspace_root = ?1, canonical_root = ?1 WHERE id = 'resume-project'",
+            [moved.path().display().to_string()],
+        ).unwrap();
+
+        let events = resume_external_turn(&peer, &database).await;
+        assert_eq!(assistant_sends(&events).last().unwrap().0, "continued OpenCode session");
+        assert!(stored_opencode_cursor(&database).contains("ses_forked_1"));
+        let requests = peer.requests_through(if matches!(behavior, ResumeBehavior::ForkTarget) { 6 } else { 8 }).await;
+        let operations = requests.iter().map(|row| row["operation"].as_str().unwrap()).collect::<Vec<_>>();
+        assert!(operations.windows(2).any(|ops| ops == ["get", "fork"]));
+        if matches!(behavior, ResumeBehavior::ForkTarget) {
+            assert!(!operations.contains(&"move"));
+        } else {
+            assert!(operations.windows(2).any(|ops| ops == ["move", "get"]));
+            let movement = requests.iter().find(|row| row["operation"] == "move").unwrap();
+            assert_eq!(movement["body"]["sessionID"], "ses_forked_1");
+            assert_eq!(movement["body"]["moveChanges"], false);
+        }
+        peer.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn an_owned_opencode_session_is_re_adopted_after_a_server_restart() {
+    let first_opencode = FakeOpenCode::new();
+    let data = tempfile::tempdir().unwrap();
+    let database = data.path().join("registry.sqlite");
+    let workspace = Workspace::with(&["src/"]);
+    let first = TestServer::start_at_with_config(&database, opencode_config(&first_opencode)).await;
+    let mut client = first.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("owned-resume-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("owned-resume-project", "owned-resume-thread");
+    create["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let watch = client.watch_conversation("owned-resume-thread").await;
+    let mut turn = start_turn("owned-resume-thread", "owned-message-1", "remember");
+    turn["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    client.events_through_the_turn(&watch).await;
+    let first_requests = first_opencode.requests_through(3).await;
+    let first_port = first_requests[0]["port"].as_u64().expect("the first owned port") as u16;
+    client.close().await;
+    first.stop().await;
+    wait_until_port_closes(first_port, "the first owned OpenCode child stops before restart").await;
+
+    let second = TestServer::start_at_with_config(&database, opencode_config(&first_opencode)).await;
+    let mut client = second.connect().await;
+    let watch = client.watch_conversation("owned-resume-thread").await;
+    let mut turn = follow_up("owned-resume-thread", "owned-message-2", "continue");
+    turn["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    client.events_through_the_turn(&watch).await;
+    let requests = first_opencode.requests_through(7).await;
+    assert_eq!(requests[3..].iter().map(|row| row["operation"].as_str().unwrap()).collect::<Vec<_>>(), vec!["launch", "get", "update", "prompt"]);
+    client.close().await;
+    second.stop().await;
+}
+
+#[tokio::test]
 async fn opencode_reasoning_reaches_the_socket_before_the_turn_settles() {
     let idle_release = Arc::new(Notify::new());
     let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release.clone())).await;
@@ -1126,6 +1491,7 @@ async fn opencode_peer_child() {
         .route("/global/health", get(health))
         .route("/event", get(events))
         .route("/session", post(create_session))
+        .route("/session/{id}", get(get_session).patch(update_session))
         .route("/session/{id}/prompt_async", post(prompt))
         .route("/session/{id}/abort", post(abort))
         .with_state(state);

@@ -7,7 +7,7 @@ use std::{
 
 use futures_util::StreamExt;
 use reqwest::{Method, StatusCode, Url};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     process::{Child, Command},
@@ -146,6 +146,22 @@ impl OpenCodeClient {
     pub async fn session(&self, id: &str) -> Result<Session, OpenCodeError> {
         self.request_json(Method::GET, &format!("session/{id}"), Option::<&()>::None)
             .await
+    }
+    pub async fn fork_session(&self, id: &str) -> Result<Session, OpenCodeError> {
+        self.request_json(Method::POST, &format!("session/{id}/fork"), Some(&serde_json::json!({})))
+            .await
+    }
+    pub async fn move_session(&self, id: &str, directory: &str) -> Result<Value, OpenCodeError> {
+        self.request_json(
+            Method::POST,
+            "experimental/control-plane/move-session",
+            Some(&serde_json::json!({
+                "sessionID": id,
+                "destination": {"directory": directory},
+                "moveChanges": false
+            })),
+        )
+        .await
     }
     pub async fn prompt(&self, id: &str, body: &Value) -> Result<(), OpenCodeError> {
         let response = self
@@ -547,6 +563,119 @@ fn cursor(start: &crate::session::Start, session_id: &str) -> crate::provider::R
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1Cursor {
+    version: u64,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+fn resume_session_id(start: &crate::session::Start) -> Result<Option<String>, String> {
+    let Some(cursor) = &start.resume_cursor else {
+        return Ok(None);
+    };
+    let parsed: V1Cursor = serde_json::from_value(cursor.value.clone())
+        .map_err(|_| "OpenCode provider resume cursor is malformed or incompatible.".to_string())?;
+    if parsed.version != 1 || parsed.session_id.is_empty() {
+        return Err("OpenCode provider resume cursor is malformed or incompatible.".to_string());
+    }
+    Ok(Some(parsed.session_id))
+}
+
+fn session_directory(session: &Session) -> Result<&str, String> {
+    session
+        .extra
+        .get("directory")
+        .and_then(Value::as_str)
+        .filter(|directory| !directory.is_empty())
+        .ok_or_else(|| "OpenCode session did not report its working directory.".to_string())
+}
+
+fn canonical_directory(path: &str) -> Result<std::path::PathBuf, String> {
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("OpenCode session directory {path} could not be verified: {error}"))
+}
+
+fn session_is_in(session: &Session, directory: &str) -> Result<bool, String> {
+    let requested = canonical_directory(directory)?;
+    match std::fs::canonicalize(session_directory(session)?) {
+        Ok(recovered) => Ok(recovered == requested),
+        // A removed worktree is necessarily not the requested, existing one.
+        // Recovery must still be allowed to fork its durable history.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "OpenCode session directory could not be verified: {error}"
+        )),
+    }
+}
+
+async fn create_session(
+    client: &OpenCodeClient,
+    start: &crate::session::Start,
+) -> Result<Session, String> {
+    client
+        .create_session(&serde_json::json!({
+            "title": "Laplus conversation",
+            "permission": permission_rules(&start.runtime_mode)
+        }))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn recover_session(
+    client: &OpenCodeClient,
+    start: &crate::session::Start,
+    session_id: Option<&str>,
+) -> Result<Session, String> {
+    let Some(session_id) = session_id else {
+        return create_session(client, start).await;
+    };
+
+    let recovered = match client.session(session_id).await {
+        Ok(session) => session,
+        Err(OpenCodeError::MissingSession { .. }) => {
+            return create_session(client, start).await;
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
+    let adopted = if session_is_in(&recovered, &start.workspace_root)? {
+        recovered
+    } else {
+        let forked = client
+            .fork_session(&recovered.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if session_is_in(&forked, &start.workspace_root)? {
+            forked
+        } else {
+            client
+                .move_session(&forked.id, &start.workspace_root)
+                .await
+                .map_err(|error| error.to_string())?;
+            let moved = client
+                .session(&forked.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !session_is_in(&moved, &start.workspace_root)? {
+                return Err("OpenCode session move did not reach the requested working directory."
+                    .to_string());
+            }
+            moved
+        }
+    };
+
+    client
+        .update_session(
+            &adopted.id,
+            &serde_json::json!({"permission": permission_rules(&start.runtime_mode)}),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(adopted)
+}
+
 fn event_session(properties: &Value) -> Option<&str> {
     properties
         .get("sessionID")
@@ -777,9 +906,9 @@ impl crate::session::Driver for OpenCode {
     const APPROVAL_RESOLVED_BY_EVENT: bool = true;
 
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
-        if start.resume_cursor.is_some() {
-            return Err("OpenCode continuation is not available until ticket 15.".to_string());
-        }
+        // Cursor validation precedes launching an owned process or making any
+        // HTTP request, so incompatible durable state cannot mutate upstream.
+        let resume_session_id = resume_session_id(start)?;
         let settings = start.driver.opencode()?;
         let (mut owned, client) = if settings.server_url.is_empty() {
             let (binary, _) = crate::provider::resolve_named(
@@ -798,17 +927,8 @@ impl crate::session::Driver for OpenCode {
             (None, client)
         };
         let opened = async {
-            let events = client
-                .subscribe()
-                .await
-                .map_err(|error| error.to_string())?;
-            let session = client
-                .create_session(&serde_json::json!({
-                    "title": "Laplus conversation",
-                    "permission": permission_rules(&start.runtime_mode)
-                }))
-                .await
-                .map_err(|error| error.to_string())?;
+            let session = recover_session(&client, start, resume_session_id.as_deref()).await?;
+            let events = client.subscribe().await.map_err(|error| error.to_string())?;
             Ok::<_, String>((events, session))
         }
         .await;

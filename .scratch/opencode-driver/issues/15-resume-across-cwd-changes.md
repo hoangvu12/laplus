@@ -9,20 +9,26 @@ history when the working directory changes by verified fork and move behavior.
 operator-owned OpenCode servers; 11 — Normalize streaming, status and titles;
 13 — Render tools and answer permissions.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] Restart re-adopts the exact OpenCode session named by a valid v1 cursor
+- [x] Restart re-adopts the exact OpenCode session named by a valid v1 cursor
       and continues its history
-- [ ] A structured missing-session response creates a fresh session and replaces
+- [x] A structured missing-session response creates a fresh session and replaces
       the cursor honestly
-- [ ] Transport, authentication, decoding and other server failures preserve the
+- [x] Transport, authentication, decoding and other server failures preserve the
       cursor and fail visibly
-- [ ] An in-place recovery reapplies the thread's current permission rules
-- [ ] A canonical CWD mismatch forks history and adopts the result only after
+- [x] An in-place recovery reapplies the thread's current permission rules
+- [x] A canonical CWD mismatch forks history and adopts the result only after
       its returned directory is verified
-- [ ] A fork that remains in the source directory is followed by move-session
+- [x] A fork that remains in the source directory is followed by move-session
       and a second verification, matching captured 1.18.10 behavior
-- [ ] A failed fork or move never replaces the durable cursor with an unverified
+- [x] A failed fork or move never replaces the durable cursor with an unverified
       session
-- [ ] Socket restart tests cover owned and external peers, missing sessions and
+- [x] Socket restart tests cover owned and external peers, missing sessions and
       both CWD migration variants
+
+## Where it landed
+
+- Strict cursor recovery and verified adoption: `server/crates/laplus-server/src/opencode.rs`
+- HTTP operation fixtures and protocol coverage: `server/crates/laplus-server/tests/opencode_protocol.rs`, `server/fixtures/opencode-http-sse/operations.json`
+- Owned/external restart, failure, missing-session, and migration coverage: `server/crates/laplus-server/tests/socket_opencode_turn.rs`
