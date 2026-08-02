@@ -7,7 +7,7 @@ import {
   TerminalIcon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { type ReactNode, memo, useCallback, useMemo, useState } from "react";
+import { type ReactNode, memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
@@ -27,6 +27,7 @@ import {
   type DesktopSshEnvironmentTarget,
   type DesktopServerExposureState,
   type EnvironmentId,
+  type ExternalTunnelEndpointSnapshot,
 } from "@t3tools/contracts";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import {
@@ -137,6 +138,183 @@ import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
 const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 const EMPTY_ADVERTISED_ENDPOINTS: ReadonlyArray<AdvertisedEndpoint> = [];
 const EMPTY_DISCOVERED_SSH_HOSTS: ReadonlyArray<DesktopDiscoveredSshHost> = [];
+
+async function externalTunnelRequest(
+  path: string,
+  init?: RequestInit,
+): Promise<ExternalTunnelEndpointSnapshot> {
+  const response = await fetch(path, {
+    ...init,
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", ...init?.headers },
+  });
+  const body = (await response.json().catch(() => null)) as
+    | ExternalTunnelEndpointSnapshot
+    | { message?: string; requiredScope?: string }
+    | null;
+  if (!response.ok) {
+    const detail =
+      body && "requiredScope" in body
+        ? `Requires ${body.requiredScope}.`
+        : body && "message" in body
+          ? body.message
+          : "The request failed.";
+    throw new Error(detail);
+  }
+  return body as ExternalTunnelEndpointSnapshot;
+}
+
+export function CloudflareTunnelSettingsRow({ canWrite }: { readonly canWrite: boolean }) {
+  const [snapshot, setSnapshot] = useState<ExternalTunnelEndpointSnapshot | null>(null);
+  const [open, setOpen] = useState(false);
+  const [hostname, setHostname] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pairingUrl, setPairingUrl] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setSnapshot(await externalTunnelRequest("/api/access/cloudflare"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load Cloudflare Tunnel state.");
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const mutate = useCallback(async (path: string, body?: unknown) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await externalTunnelRequest(path, {
+        method: "POST",
+        body: body === undefined ? "{}" : JSON.stringify(body),
+      });
+      setSnapshot(next);
+      if (next.httpsOrigin) setHostname(next.httpsOrigin);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The request failed.");
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const createPairing = useCallback(async () => {
+    if (!snapshot?.httpsOrigin) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await createServerPairingCredential({ label: "Cloudflare Tunnel" });
+      setPairingUrl(resolveDesktopPairingUrl(snapshot.httpsOrigin, result.credential));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create a pairing link.");
+    } finally {
+      setBusy(false);
+    }
+  }, [snapshot?.httpsOrigin]);
+
+  const stateLabel =
+    snapshot?.verificationState === "verified"
+      ? "Verified"
+      : snapshot?.configured
+        ? "Needs verification"
+        : "Not configured";
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <SettingsRow
+        title="Cloudflare Tunnel"
+        description={
+          snapshot?.httpsOrigin
+            ? `${snapshot.httpsOrigin} · ${stateLabel}`
+            : "Register an externally managed HTTPS hostname."
+        }
+        status={
+          snapshot?.verificationState === "failed" ? (
+            <span className="text-destructive">{snapshot.failureMessage}</span>
+          ) : undefined
+        }
+        control={
+          <DialogTrigger render={<Button size="xs" variant="outline" />}>
+            {snapshot?.configured ? "Manage" : "Set up"}
+          </DialogTrigger>
+        }
+      />
+      <DialogPopup className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Cloudflare Tunnel</DialogTitle>
+          <DialogDescription>
+            Register a hostname whose connector remains owned and operated outside laplus.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogPanel className="space-y-4">
+          <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+            laplus will verify and advertise this endpoint, but will never start, stop, reconfigure,
+            or delete its connector. The hostname is public unless you independently protect it;
+            laplus authentication remains required. Cloudflare Access may intercept pairing or
+            WebSocket traffic.
+          </div>
+          <label className="block">
+            <span className="text-sm font-medium">HTTPS hostname</span>
+            <Input
+              className="mt-2"
+              placeholder="laplus.example.com"
+              value={hostname}
+              disabled={busy || !canWrite}
+              onChange={(event) => setHostname(event.target.value)}
+            />
+          </label>
+          {snapshot?.lastVerifiedAt ? (
+            <p className="text-xs text-muted-foreground">
+              Last verified {formatAccessTimestamp(snapshot.lastVerifiedAt)}
+              {snapshot.verificationState !== "verified" ? " · stale" : ""}
+            </p>
+          ) : null}
+          {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          {pairingUrl ? (
+            <div className="flex flex-col items-center gap-3 rounded-md border p-3">
+              <QRCodeSvg value={pairingUrl} className="size-40" />
+              <Textarea readOnly value={pairingUrl} aria-label="Cloudflare pairing URL" />
+            </div>
+          ) : null}
+        </DialogPanel>
+        <DialogFooter>
+          {snapshot?.configured && canWrite ? (
+            <Button
+              variant="destructive"
+              disabled={busy}
+              onClick={() => void mutate("/api/access/cloudflare/forget")}
+            >
+              Forget
+            </Button>
+          ) : null}
+          {snapshot?.configured && canWrite ? (
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => void mutate("/api/access/cloudflare/test")}
+            >
+              Test now
+            </Button>
+          ) : null}
+          {snapshot?.verificationState === "verified" && canWrite ? (
+            <Button variant="outline" disabled={busy} onClick={() => void createPairing()}>
+              Pair device
+            </Button>
+          ) : null}
+          {canWrite ? (
+            <Button
+              disabled={busy || hostname.trim() === ""}
+              onClick={() => void mutate("/api/access/cloudflare", { hostname })}
+            >
+              {busy ? "Working…" : snapshot?.configured ? "Update" : "Register"}
+            </Button>
+          ) : null}
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
+  );
+}
 
 const accessTimestampFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -1573,6 +1751,7 @@ export function ConnectionsSettings() {
     (state) => state.setDefaultAdvertisedEndpointKey,
   );
   const canManageLocalBackend = currentSessionScopes?.includes(AuthAccessWriteScope) ?? false;
+  const canReadLocalBackendAccess = currentSessionScopes?.includes(AuthAccessReadScope) ?? false;
   const authAccessChanges = useEnvironmentQuery(
     canManageLocalBackend && primaryEnvironmentId !== null
       ? authEnvironment.accessChanges({
@@ -2459,6 +2638,7 @@ export function ConnectionsSettings() {
                     only where something can act on it — a tailnet name still
                     works here, through the tunnel list below. */}
                 {desktopBridge ? renderTailscaleRow() : null}
+                <CloudflareTunnelSettingsRow canWrite />
               </>
             ) : (
               <>{renderDisabledNetworkAccessRow()}</>
@@ -2649,6 +2829,7 @@ export function ConnectionsSettings() {
             title="Administrative access"
             description="Pairing links and client-session management require the access:write scope for this backend."
           />
+          {canReadLocalBackendAccess ? <CloudflareTunnelSettingsRow canWrite={false} /> : null}
         </SettingsSection>
       )}
 

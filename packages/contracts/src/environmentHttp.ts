@@ -27,6 +27,10 @@ import {
 import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
+  ExternalTunnelEndpointSnapshot,
+  RegisterExternalTunnelEndpointInput,
+} from "./remoteAccess.ts";
+import {
   ClientOrchestrationCommand,
   DispatchResult,
   OrchestrationReadModel,
@@ -410,6 +414,37 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
+export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
+  .add(
+    HttpApiEndpoint.get("externalTunnel", "/api/access/cloudflare", {
+      headers: OptionalBearerHeaders,
+      success: ExternalTunnelEndpointSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("registerExternalTunnel", "/api/access/cloudflare", {
+      headers: OptionalBearerHeaders,
+      payload: RegisterExternalTunnelEndpointInput,
+      success: ExternalTunnelEndpointSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("testExternalTunnel", "/api/access/cloudflare/test", {
+      headers: OptionalBearerHeaders,
+      success: ExternalTunnelEndpointSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("forgetExternalTunnel", "/api/access/cloudflare/forget", {
+      headers: OptionalBearerHeaders,
+      success: ExternalTunnelEndpointSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  ) {}
+
 const EnvironmentOrchestrationThreadSnapshotParams = Schema.Struct({
   threadId: ThreadId,
 });
@@ -449,4 +484,5 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)
   .add(EnvironmentAuthHttpApi)
+  .add(EnvironmentAccessHttpApi)
   .add(EnvironmentOrchestrationHttpApi) {}

@@ -66,3 +66,49 @@ export const AdvertisedEndpoint = Schema.Struct({
   description: Schema.optional(TrimmedNonEmptyString),
 });
 export type AdvertisedEndpoint = typeof AdvertisedEndpoint.Type;
+
+export const ExternalTunnelVerificationState = Schema.Literals([
+  "unconfigured",
+  "pending",
+  "verified",
+  "failed",
+]);
+export type ExternalTunnelVerificationState = typeof ExternalTunnelVerificationState.Type;
+
+export const ExternalTunnelFailureKind = Schema.Literals([
+  "dns",
+  "tls",
+  "destination",
+  "http",
+  "identity",
+  "wrong-environment",
+  "authentication",
+  "websocket",
+  "cloudflare-access",
+  "cloudflare-access-websocket",
+]);
+export type ExternalTunnelFailureKind = typeof ExternalTunnelFailureKind.Type;
+
+export const ExternalTunnelEndpointSnapshot = Schema.Struct({
+  configured: Schema.Boolean,
+  httpsOrigin: Schema.NullOr(TrimmedNonEmptyString),
+  wssOrigin: Schema.NullOr(TrimmedNonEmptyString),
+  ownership: Schema.Literal("external"),
+  health: Schema.Struct({
+    connector: Schema.Literal("external"),
+    https: Schema.Literals(["unknown", "healthy", "failed"]),
+    webSocket: Schema.Literals(["unknown", "healthy", "failed"]),
+  }),
+  verificationState: ExternalTunnelVerificationState,
+  failureKind: Schema.NullOr(ExternalTunnelFailureKind),
+  failureMessage: Schema.NullOr(TrimmedNonEmptyString),
+  lastAttemptAt: Schema.NullOr(Schema.String),
+  lastVerifiedAt: Schema.NullOr(Schema.String),
+  advertisedEndpoint: Schema.NullOr(AdvertisedEndpoint),
+});
+export type ExternalTunnelEndpointSnapshot = typeof ExternalTunnelEndpointSnapshot.Type;
+
+export const RegisterExternalTunnelEndpointInput = Schema.Struct({
+  hostname: TrimmedNonEmptyString,
+});
+export type RegisterExternalTunnelEndpointInput = typeof RegisterExternalTunnelEndpointInput.Type;

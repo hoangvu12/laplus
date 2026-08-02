@@ -32,8 +32,9 @@
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, RawQuery, State, WebSocketUpgrade};
@@ -43,7 +44,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post, MethodRouter};
 use axum::{middleware, Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 
 use crate::auth::{self, AuthInvalidBody, Credential, Rejection, UpgradeRequest};
 use crate::config::ServerConfig;
@@ -53,6 +54,7 @@ use crate::git::Repositories;
 use crate::orchestration::Shell;
 use crate::pairing;
 use crate::process::Search;
+use crate::public_exposure;
 use crate::rpc::{Answer, Deferred, Services};
 use crate::store::{Database, NewPairingLink, NewSession, StorageError};
 use crate::subscriptions::Subscriptions;
@@ -92,6 +94,10 @@ pub struct ServerState {
     unrecognized_messages: AtomicUsize,
     unparseable_frames: AtomicUsize,
     mcp: Arc<dyn crate::mcp::Platform>,
+    diagnostic_challenges: Mutex<HashSet<String>>,
+    external_verification_running: AtomicBool,
+    external_verification_finished: Notify,
+    external_verification_generation: AtomicU64,
 }
 
 impl ServerState {
@@ -106,6 +112,10 @@ impl ServerState {
             unrecognized_messages: AtomicUsize::new(0),
             unparseable_frames: AtomicUsize::new(0),
             mcp,
+            diagnostic_challenges: Mutex::new(HashSet::new()),
+            external_verification_running: AtomicBool::new(false),
+            external_verification_finished: Notify::new(),
+            external_verification_generation: AtomicU64::new(0),
         }
     }
 
@@ -383,6 +393,34 @@ impl Server {
         };
         let state = Arc::new(ServerState::new(services, ui, shutdown.subscribe(), mcp_platform));
 
+        // Public checks are intentionally much less frequent than connector
+        // readiness checks. Failure doubles the bounded delay; a small process-
+        // local jitter prevents several environments restarting together from
+        // repeatedly probing Cloudflare in lockstep.
+        let verifier_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(30);
+            let mut verifier_shutdown = verifier_state.shutdown.clone();
+            loop {
+                let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.subsec_millis() as u64 % 5).unwrap_or(0);
+                tokio::select! {
+                    _ = tokio::time::sleep(delay + std::time::Duration::from_secs(jitter)) => {},
+                    changed = verifier_shutdown.changed() => {
+                        if changed.is_err() || *verifier_shutdown.borrow() { break; }
+                        continue;
+                    }
+                }
+                if verifier_state.services.shell.database().external_tunnel_endpoint().ok().flatten().is_none() {
+                    delay = std::time::Duration::from_secs(30);
+                    continue;
+                }
+                let succeeded = run_external_verification(&verifier_state).await;
+                delay = if succeeded { std::time::Duration::from_secs(300) }
+                    else { std::cmp::min(delay.saturating_mul(2), std::time::Duration::from_secs(1800)) };
+            }
+        });
+
         // Minted before the listener exists, so that there is no window in
         // which the server is answering and the credential it will admit its
         // own window with does not yet exist.
@@ -452,6 +490,11 @@ impl Server {
             .route("/api/auth/pairing-token", post(pairing_credential))
             .route("/api/auth/pairing-links", get(pairing_links))
             .route("/api/auth/pairing-links/revoke", post(revoke_pairing_link))
+            .route("/api/access/cloudflare", get(external_tunnel_status).post(register_external_tunnel))
+            .route("/api/access/cloudflare/test", post(test_external_tunnel))
+            .route("/api/access/cloudflare/forget", post(forget_external_tunnel))
+            .route("/api/access/cloudflare/challenge", get(diagnostic_http_challenge))
+            .route("/api/access/cloudflare/challenge/ws", get(diagnostic_ws_challenge))
             // A file out of a project, for an `<img>` the browser fetches
             // itself. A real route and not the fallback for the same reason as
             // the two above it: a token has no extension, so the asset fallback
@@ -1308,6 +1351,126 @@ async fn revoke_pairing_link(
             refuse(http::pairing_link_revoke_failed())
         }
     }
+}
+
+fn require_scope(grant: &pairing::Grant, scope: &str) -> Result<(), Response> {
+    if grant.scopes.iter().any(|granted| granted == scope) { return Ok(()); }
+    Err((StatusCode::FORBIDDEN, Json(serde_json::json!({
+        "_tag": "EnvironmentScopeRequiredError",
+        "code": "insufficient_scope",
+        "requiredScope": scope,
+        "traceId": auth::trace_id(),
+    }))).into_response())
+}
+
+fn external_tunnel_snapshot(state: &ServerState) -> Result<public_exposure::Snapshot, Response> {
+    let endpoint = state.services.shell.database().external_tunnel_endpoint().map_err(|error| {
+        eprintln!("laplus: cannot read public endpoint state: {error}");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+    Ok(match endpoint {
+        None => public_exposure::Snapshot { configured: false, https_origin: None, wss_origin: None,
+            ownership: "external", health: serde_json::json!({"connector":"external","https":"unknown","webSocket":"unknown"}), verification_state: "unconfigured".into(), failure_kind: None,
+            failure_message: None, last_attempt_at: None, last_verified_at: None, advertised_endpoint: None },
+        Some(endpoint) => {
+            let wss = endpoint.https_origin.replacen("https://", "wss://", 1);
+            let advertised_endpoint = (endpoint.verification_state == "verified").then(|| serde_json::json!({
+                "id": format!("cloudflare-external:{}", endpoint.https_origin),
+                "label": "Cloudflare Tunnel", "provider": { "id": "cloudflare", "label": "Cloudflare Tunnel", "kind": "tunnel", "isAddon": true },
+                "httpBaseUrl": endpoint.https_origin, "wsBaseUrl": wss, "reachability": "public",
+                "compatibility": { "hostedHttpsApp": "compatible", "desktopApp": "compatible" },
+                "source": "user", "status": "available", "description": "Externally managed by your operator"
+            }));
+            public_exposure::Snapshot { configured: true, https_origin: Some(endpoint.https_origin),
+                wss_origin: Some(wss), ownership: "external", health: serde_json::json!({
+                    "connector": "external",
+                    "https": if endpoint.verification_state == "verified" || matches!(endpoint.failure_kind.as_deref(), Some("websocket" | "cloudflare-access-websocket")) { "healthy" } else if endpoint.verification_state == "failed" { "failed" } else { "unknown" },
+                    "webSocket": if endpoint.verification_state == "verified" { "healthy" } else if matches!(endpoint.failure_kind.as_deref(), Some("websocket" | "cloudflare-access-websocket")) { "failed" } else { "unknown" }
+                }), verification_state: endpoint.verification_state,
+                failure_kind: endpoint.failure_kind, failure_message: endpoint.failure_message,
+                last_attempt_at: endpoint.last_attempt_at, last_verified_at: endpoint.last_verified_at,
+                advertised_endpoint }
+        }
+    })
+}
+
+async fn external_tunnel_status(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
+    let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
+    if let Err(response) = require_scope(&grant, "access:read") { return response; }
+    match external_tunnel_snapshot(&state) { Ok(snapshot) => Json(snapshot).into_response(), Err(response) => response }
+}
+
+async fn register_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap, Json(body): Json<public_exposure::RegisterRequest>) -> Response {
+    let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
+    if let Err(response) = require_scope(&grant, "access:write") { return response; }
+    let origin = match public_exposure::normalize_hostname(&body.hostname) { Ok(origin) => origin, Err(message) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response() };
+    match state.services.shell.database().register_external_tunnel_endpoint(&origin) {
+        Ok(()) => Json(external_tunnel_snapshot(&state).unwrap()).into_response(),
+        Err(error) => { eprintln!("laplus: cannot register public endpoint: {error}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    }
+}
+
+async fn forget_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
+    let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
+    if let Err(response) = require_scope(&grant, "access:write") { return response; }
+    match state.services.shell.database().forget_external_tunnel_endpoint() { Ok(()) => Json(external_tunnel_snapshot(&state).unwrap()).into_response(), Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+}
+
+async fn test_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
+    let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
+    if let Err(response) = require_scope(&grant, "access:write") { return response; }
+    if state.services.shell.database().external_tunnel_endpoint().ok().flatten().is_none() { return StatusCode::NOT_FOUND.into_response() };
+    run_external_verification(&state).await;
+    if state.external_verification_running.load(Ordering::Acquire) {
+        return (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"message": "Verification is still running."}))).into_response();
+    }
+    Json(external_tunnel_snapshot(&state).unwrap()).into_response()
+}
+
+async fn run_external_verification(state: &Arc<ServerState>) -> bool {
+    let generation = state.external_verification_generation.load(Ordering::Acquire);
+    let finished = state.external_verification_finished.notified();
+    if state.external_verification_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if state.external_verification_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        return tokio::time::timeout(std::time::Duration::from_secs(55), finished).await.is_ok();
+    }
+    let Some(endpoint) = state.services.shell.database().external_tunnel_endpoint().ok().flatten() else {
+        state.external_verification_running.store(false, Ordering::Release);
+        state.external_verification_generation.fetch_add(1, Ordering::AcqRel);
+        state.external_verification_finished.notify_waiters();
+        return false;
+    };
+    let http_token = pairing::opaque_token().expect("operating system randomness");
+    let ws_token = pairing::opaque_token().expect("operating system randomness");
+    state.diagnostic_challenges.lock().expect("diagnostic challenges").extend([http_token.clone(), ws_token.clone()]);
+    let environment_id = state.config().current().environment.environment_id.clone();
+    let result = public_exposure::verify(&endpoint.https_origin, &environment_id, &http_token, &ws_token).await;
+    state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(&http_token);
+    state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(&ws_token);
+    let succeeded = result.is_ok();
+    let recorded = match result { Ok(()) => state.services.shell.database().record_external_tunnel_verification(&endpoint.https_origin, true, None, None), Err(failure) => state.services.shell.database().record_external_tunnel_verification(&endpoint.https_origin, false, Some(failure.kind), Some(failure.message)) };
+    state.external_verification_running.store(false, Ordering::Release);
+    state.external_verification_generation.fetch_add(1, Ordering::AcqRel);
+    state.external_verification_finished.notify_waiters();
+    succeeded && matches!(recorded, Ok(true))
+}
+
+fn diagnostic_token(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
+}
+
+async fn diagnostic_http_challenge(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
+    let Some(token) = diagnostic_token(&headers) else { return StatusCode::UNAUTHORIZED.into_response() };
+    if !state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(token) { return StatusCode::UNAUTHORIZED.into_response(); }
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+async fn diagnostic_ws_challenge(State(state): State<Arc<ServerState>>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let Some(token) = diagnostic_token(&headers) else { return StatusCode::UNAUTHORIZED.into_response() };
+    if !state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(token) { return StatusCode::UNAUTHORIZED.into_response(); }
+    ws.on_upgrade(|mut socket| async move { let _ = socket.send(Message::Text("ok".into())).await; })
 }
 
 /// Write a 401 to the log and answer with the body the client decodes.

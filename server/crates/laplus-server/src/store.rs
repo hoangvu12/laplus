@@ -372,6 +372,22 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE threads ADD COLUMN cursor_provider_instance_id TEXT;
     ALTER TABLE threads ADD COLUMN cursor_provider_driver TEXT;
     "#,
+    // External public endpoints are configuration, not discovered network
+    // state. One environment can expose one operator-owned Cloudflare hostname
+    // in this first slice, so the singleton row makes replacement atomic.
+    r#"
+    CREATE TABLE external_tunnel_endpoint (
+        id                       INTEGER PRIMARY KEY CHECK (id = 0),
+        https_origin             TEXT NOT NULL,
+        verification_state       TEXT NOT NULL,
+        failure_kind             TEXT,
+        failure_message          TEXT,
+        last_attempt_at          TEXT,
+        last_verified_at         TEXT,
+        created_at               TEXT NOT NULL,
+        updated_at               TEXT NOT NULL
+    ) STRICT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -428,6 +444,16 @@ pub struct NewSession<'a> {
     pub scopes: &'a [String],
     pub method: &'a str,
     pub label: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalTunnelEndpoint {
+    pub https_origin: String,
+    pub verification_state: String,
+    pub failure_kind: Option<String>,
+    pub failure_message: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub last_verified_at: Option<String>,
 }
 
 /// Scopes go into their column as a JSON array. See the migration's note on
@@ -730,6 +756,62 @@ pub fn default_path() -> PathBuf {
 }
 
 impl Database {
+    pub fn external_tunnel_endpoint(&self) -> Result<Option<ExternalTunnelEndpoint>, StorageError> {
+        self.lock()
+            .query_row(
+                "SELECT https_origin, verification_state, failure_kind, failure_message, \
+                 last_attempt_at, last_verified_at FROM external_tunnel_endpoint WHERE id = 0",
+                [],
+                |row| Ok(ExternalTunnelEndpoint {
+                    https_origin: row.get(0)?,
+                    verification_state: row.get(1)?,
+                    failure_kind: row.get(2)?,
+                    failure_message: row.get(3)?,
+                    last_attempt_at: row.get(4)?,
+                    last_verified_at: row.get(5)?,
+                }),
+            )
+            .optional()
+            .map_err(StorageError::while_("read the external tunnel endpoint"))
+    }
+
+    pub fn register_external_tunnel_endpoint(&self, origin: &str) -> Result<(), StorageError> {
+        self.lock().execute(
+            &format!(
+                "INSERT INTO external_tunnel_endpoint \
+                 (id, https_origin, verification_state, created_at, updated_at) \
+                 VALUES (0, ?1, 'pending', {NOW}, {NOW}) \
+                 ON CONFLICT(id) DO UPDATE SET https_origin = excluded.https_origin, \
+                 verification_state = 'pending', failure_kind = NULL, failure_message = NULL, \
+                 last_attempt_at = NULL, last_verified_at = NULL, updated_at = {NOW}"
+            ),
+            [origin],
+        ).map(|_| ()).map_err(StorageError::while_("register the external tunnel endpoint"))
+    }
+
+    pub fn forget_external_tunnel_endpoint(&self) -> Result<(), StorageError> {
+        self.lock().execute("DELETE FROM external_tunnel_endpoint WHERE id = 0", [])
+            .map(|_| ()).map_err(StorageError::while_("forget the external tunnel endpoint"))
+    }
+
+    pub fn record_external_tunnel_verification(
+        &self,
+        origin: &str,
+        verified: bool,
+        failure_kind: Option<&str>,
+        failure_message: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        self.lock().execute(
+            &format!(
+                "UPDATE external_tunnel_endpoint SET verification_state = ?1, failure_kind = ?2, \
+                 failure_message = ?3, last_attempt_at = {NOW}, \
+                 last_verified_at = CASE WHEN ?1 = 'verified' THEN {NOW} ELSE last_verified_at END, \
+                 updated_at = {NOW} WHERE id = 0 AND https_origin = ?4"
+            ),
+            rusqlite::params![if verified { "verified" } else { "failed" }, failure_kind, failure_message, origin],
+        ).map(|changed| changed == 1).map_err(StorageError::while_("record external tunnel verification"))
+    }
+
     /// Open the database at `path`, creating the file, its parent directories
     /// and its schema if they are not there.
     ///
@@ -3618,5 +3700,19 @@ mod tests {
         });
 
         assert_eq!(upgraded.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_verification_result_cannot_be_applied_after_the_hostname_changes() {
+        let database = Database::in_memory().expect("a database");
+        database.register_external_tunnel_endpoint("https://a.example.com").unwrap();
+        database.register_external_tunnel_endpoint("https://b.example.com").unwrap();
+
+        assert!(!database
+            .record_external_tunnel_verification("https://a.example.com", true, None, None)
+            .unwrap());
+        let endpoint = database.external_tunnel_endpoint().unwrap().unwrap();
+        assert_eq!(endpoint.https_origin, "https://b.example.com");
+        assert_eq!(endpoint.verification_state, "pending");
     }
 }

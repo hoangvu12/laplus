@@ -23,6 +23,7 @@ serde_json.workspace = true
 shell-words.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 # A throwaway directory per test, removed on drop. The registry's tests need a
@@ -32,4 +33,3 @@ tempfile.workspace = true
 # The test harness's socket client. Deliberately a different implementation
 # from the server's, so a passing test means two stacks agree on the framing
 # rather than one stack agreeing with itself.
-tokio-tungstenite.workspace = true
