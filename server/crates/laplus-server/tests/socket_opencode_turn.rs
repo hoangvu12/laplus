@@ -28,7 +28,7 @@ use harness::{
 };
 use laplus_server::config::ServerConfig;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 struct FakeOpenCode {
     directory: tempfile::TempDir,
@@ -209,6 +209,7 @@ struct PeerState {
     log: Arc<PathBuf>,
     healthy: bool,
     authorization: Option<String>,
+    idle_release: Option<Arc<Notify>>,
 }
 
 fn assert_authorization(headers: &HeaderMap, state: &PeerState) {
@@ -291,10 +292,25 @@ async fn prompt(
         "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"retry\",\"message\":\"Retrying upstream\"}}}\n\n",
         "data: {\"type\":\"session.updated\",\"properties\":{\"info\":{\"id\":\"ses_owned_1\",\"title\":\"Upstream title\"}}}\n\n",
         "data: {\"type\":\"future.event\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
-        "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"idle\"}}}\n\n",
-        "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
     ] {
         sender.send(Ok(event)).await.expect("send scripted SSE event");
+    }
+    let gated = state.idle_release.is_some();
+    let finish = async move {
+        if let Some(release) = &state.idle_release {
+            release.notified().await;
+        }
+        for event in [
+            "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"idle\"}}}\n\n",
+            "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
+        ] {
+            sender.send(Ok(event)).await.expect("send scripted SSE event");
+        }
+    };
+    if gated {
+        tokio::spawn(finish);
+    } else {
+        finish.await;
     }
     StatusCode::NO_CONTENT
 }
@@ -308,6 +324,13 @@ struct ExternalOpenCode {
 
 impl ExternalOpenCode {
     async fn start(password: Option<&str>) -> Self {
+        Self::start_with_idle_release(password, None).await
+    }
+
+    async fn start_with_idle_release(
+        password: Option<&str>,
+        idle_release: Option<Arc<Notify>>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
         let state = PeerState {
@@ -320,6 +343,7 @@ impl ExternalOpenCode {
                 }
                 _ => panic!("test password needs an explicit wire expectation"),
             }),
+            idle_release,
             ..Default::default()
         };
         let app = Router::new()
@@ -458,6 +482,65 @@ async fn an_unauthenticated_external_opencode_turn_crosses_the_socket_without_ow
 async fn an_authenticated_external_opencode_turn_crosses_the_socket_without_exposing_its_password()
 {
     assert_external_turn(Some("external-secret-that-must-stay-private")).await;
+}
+
+#[tokio::test]
+async fn opencode_reasoning_reaches_the_socket_before_the_turn_settles() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release.clone())).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("reasoning-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("reasoning-project", "reasoning-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("reasoning-thread").await;
+    let mut command = start_turn("reasoning-thread", "reasoning-message", "say hello");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+
+    let before_idle = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["thinking"] == "check the stream"
+        }),
+    )
+    .await
+    .expect("reasoning reaches the socket before OpenCode reports idle");
+    assert!(!before_idle.iter().any(|item| {
+        item["event"]["type"] == "thread.session-set"
+            && item["event"]["payload"]["session"]["status"] == "ready"
+    }));
+
+    idle_release.notify_one();
+    let after_idle = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        before_idle
+            .iter()
+            .chain(&after_idle)
+            .filter(|item| {
+                item["event"]["payload"]["activity"]["payload"]["thinking"] == "check the stream"
+            })
+            .count(),
+        1,
+        "settlement must not publish the streamed reasoning again"
+    );
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
 }
 
 #[tokio::test]

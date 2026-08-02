@@ -412,7 +412,6 @@ pub(crate) struct OpenCode {
     pending_parts: HashMap<String, Value>,
     pending_deltas: HashMap<String, String>,
     emitted_parts: HashMap<String, String>,
-    reasoning: HashMap<String, String>,
     assistant_text: String,
 }
 
@@ -470,10 +469,14 @@ impl OpenCode {
         }
         emitted.push_str(suffix);
         if kind == "reasoning" {
-            self.reasoning
-                .entry(part_id.to_string())
-                .or_default()
-                .push_str(suffix);
+            if let Some(activity) = crate::worklog::thinking(
+                suffix,
+                driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+            ) {
+                decided
+                    .changes
+                    .push(crate::threads::Change::Activity(activity));
+            }
             return;
         }
         let Some(active) = driving.turn.as_mut() else {
@@ -576,13 +579,6 @@ impl OpenCode {
         };
         self.settled = true;
         let mut changes = Vec::new();
-        for reasoning in self.reasoning.values() {
-            if let Some(activity) =
-                crate::worklog::thinking(reasoning, Some(finished.turn_id.clone()))
-            {
-                changes.push(crate::threads::Change::Activity(activity));
-            }
-        }
         if !self.assistant_text.is_empty() {
             let message_id = finished
                 .assistant_message_id
@@ -689,7 +685,6 @@ impl crate::session::Driver for OpenCode {
                 pending_parts: HashMap::new(),
                 pending_deltas: HashMap::new(),
                 emitted_parts: HashMap::new(),
-                reasoning: HashMap::new(),
                 assistant_text: String::new(),
             },
             decided: crate::session::Decided {
@@ -837,7 +832,6 @@ impl crate::session::Driver for OpenCode {
         self.pending_parts.clear();
         self.pending_deltas.clear();
         self.emitted_parts.clear();
-        self.reasoning.clear();
         self.assistant_text.clear();
         let mut body = serde_json::json!({"parts": [{"type":"text", "text":text}]});
         if let Some(model) = self.model.as_deref() {
