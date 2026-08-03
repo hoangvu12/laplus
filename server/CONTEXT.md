@@ -1078,8 +1078,10 @@ _Avoid_: Connected, which claims the layer this cannot see.
 **Settled connector** — one with no child of laplus's running, which four words
 mean rather than one: `stopped`, `restart-exhausted`, `failed` and
 `unconfigured`. What a stop, forget or delete waits for before it removes
-anything, because the last three already carry `desiredState: stopped` and never
-move again. `ConnectorState::settled`.
+anything: `restart-exhausted` and `failed` already carry `desiredState: stopped`
+and never move again, and `unconfigured` has no configuration to carry a desired
+state at all — so waiting for `stopped` alone waits for a word that will not
+arrive. `crate::cloudflare_connector::ConnectorState::settled`.
 
 **Redaction boundary** — where a run credential is taken out of what laplus
 reports, which is the server and never the client: at capture as the connector's
@@ -1087,7 +1089,9 @@ output is read, and again as the snapshot is built. Substitution rather than
 removal, so the sentence a developer needs survives with `[REDACTED]` where the
 secret was. The secrets are learned while the credential file is certainly
 readable and remembered thereafter — a redaction that re-read the file at log
-time redacted nothing exactly when a cleanup had removed it. ADR-0053.
+time redacted nothing exactly when a cleanup had removed it.
+`crate::cloudflare_connector` (its `Runtime::secrets` carries the reasoning),
+`public_exposure::Refusal::redacting`, ADR-0053.
 _Avoid_: Masking, which is a client-side affordance and not a boundary — a secret
 that reached the browser has already leaked.
 

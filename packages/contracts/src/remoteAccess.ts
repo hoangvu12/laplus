@@ -496,7 +496,6 @@ export type CloudflareAccountSetupStep = typeof CloudflareAccountSetupStep.Type;
  * asked for. `hostname` is absent until the DNS route ran, because until then
  * nothing at Cloudflare has one.
  */
-
 export const CloudflareUnfinishedCreation = Schema.Struct({
   name: Schema.NullOr(TrimmedNonEmptyString),
   tunnelId: Schema.NullOr(TrimmedNonEmptyString),

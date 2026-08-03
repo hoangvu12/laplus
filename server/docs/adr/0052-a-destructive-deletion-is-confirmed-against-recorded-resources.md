@@ -34,10 +34,23 @@ exactly the copying that ADR rules out. The developer therefore supplies a
 Cloudflare API token with DNS edit permission for the one request that needs it.
 It is never persisted, never logged, never put in a snapshot and never passed as
 a process argument, and it is redacted out of every refusal the route can answer
-with. Missing or insufficient DNS authority is refused _before_ the first step is
-journaled: the tempting alternative is to delete the tunnel anyway and report
-success, which leaves a hostname answering with a Cloudflare error page and is a
-weaker operation rather than a recoverable state.
+with. The tempting alternative is to delete the tunnel anyway and report success,
+which leaves a hostname answering with a Cloudflare error page and is a weaker
+operation rather than a recoverable state.
+
+**So the deletion does everything that only reads before it does anything that
+spends.** Ownership, the journal and DNS authority — having a token, and being
+able to see the zone the recorded record sits in — are all reads; spending the
+confirmation, stopping the connector and the four removals are not. A missing or
+insufficient DNS authority is therefore refused while the confirmation is still
+spendable and the connector is still serving, so "nothing happened" is the plain
+description of that refusal rather than a sentence that has to except the two
+irreversible things that happened first. Ordering it the other way — authority
+checked after the confirmation was spent and the connector stopped — was true of
+the first implementation and false of everything written about it. Reads before
+spends costs nothing and weakens nothing: the confirmation records that a person
+was shown these exact resources, and anything holding `access:write` can mint one
+from the offer route whenever it likes.
 
 **Forget removes laplus's own setup and no executable, including the one laplus
 installed.** Ticket 02 says laplus never removes a system or user-selected

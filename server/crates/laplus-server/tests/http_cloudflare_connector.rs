@@ -7,24 +7,49 @@ use harness::TestServer;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 
+/// How many times a supervised connector is asked before it is called wedged,
+/// and how long between the asks.
+///
+/// **A hang detector, not a budget** — see `READ_TIMEOUT` in the harness. Wide
+/// enough that a supervisor waiting out an unanswered probe still converges
+/// here, and a genuine wedge is still a failure rather than a hung suite. No
+/// assertion in this file is about how long anything took; they are all about
+/// what the connector settled on.
+const ATTEMPTS: usize = 500;
+const BETWEEN: std::time::Duration = std::time::Duration::from_millis(20);
+
 async fn wait_for_json(
     server: &TestServer,
     predicate: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     let mut last = serde_json::Value::Null;
-    // A hang detector, not a budget — see `READ_TIMEOUT` in the harness. Wide
-    // enough that a supervisor waiting out an unanswered probe still converges
-    // here, and a genuine wedge is still a failure rather than a hung suite.
-    for _ in 0..500 {
+    for _ in 0..ATTEMPTS {
         let response = server.get("/api/access/cloudflare/connector").await;
         last = response.body.clone();
         if response.status == 200 && predicate(&response.body) {
             return response.body;
         }
         tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(BETWEEN).await;
     }
     panic!("connector state did not converge: {last}")
+}
+
+/// Wait for something this test can see for itself, on the same terms.
+///
+/// The twin of [`wait_for_json`] for a fact that is not on the wire — a
+/// verifier's call count, say. Same attempts and same pause, because a second
+/// hand-rolled loop beside the first is a second place for a wait to quietly
+/// become a budget.
+async fn wait_until(mut settled: impl FnMut() -> bool) -> bool {
+    for _ in 0..ATTEMPTS {
+        if settled() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(BETWEEN).await;
+    }
+    false
 }
 
 #[tokio::test]
@@ -248,14 +273,8 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
             .count(),
         launches + 1
     );
-    for _ in 0..500 {
-        if verifier.count() > after_stop {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
     assert!(
-        verifier.count() > after_stop,
+        wait_until(|| verifier.count() > after_stop).await,
         "starting re-verified the endpoint: {after_stop} then {}",
         verifier.count()
     );

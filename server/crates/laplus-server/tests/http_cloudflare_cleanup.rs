@@ -659,6 +659,14 @@ async fn a_deletion_needs_a_confirmation_this_server_minted_and_spends_it_once()
 /// So a missing token, and a token that can see no zone containing the recorded
 /// name, both refuse before anything is attempted — which is the most
 /// recoverable state there is, because nothing happened.
+///
+/// **"Nothing" is asserted rather than asserted about.** One confirmation is
+/// minted and spent by none of the three refusals, which is what proves the
+/// authority check runs before it — a spent one would answer the second attempt
+/// with `confirmation-required` instead. The connector is still the running one
+/// it was for the same reason. Both were false when this test was written: the
+/// deletion spent the confirmation and stopped the connector first, and the
+/// prose here and in ADR-0052 described a recoverability the code did not have.
 #[tokio::test]
 async fn missing_dns_authority_refuses_before_anything_is_deleted() {
     let _serial = serially();
@@ -680,12 +688,14 @@ async fn missing_dns_authority_refuses_before_anything_is_deleted() {
     wait_for_connector(&server, |body| body["connectorState"] == "ready").await;
     let owned = owned_files(directory.path());
 
+    // One offer for all three, because a refusal that spends it is a refusal
+    // something has to be undone after.
+    let offer = offered_confirmation(&server).await;
     for (why, token) in [
         ("no token at all", ""),
         ("a token Cloudflare rejects", "not-the-right-token"),
         ("a token that can see no zone for this name", DNS_API_TOKEN),
     ] {
-        let offer = offered_confirmation(&server).await;
         let refused = server
             .post_json(
                 "/api/access/cloudflare/account/delete",
@@ -712,8 +722,10 @@ async fn missing_dns_authority_refuses_before_anything_is_deleted() {
     }
 
     // **Nothing was weakened.** The tunnel is still there, the record is still
-    // there, laplus's own setup is still there, and the endpoint is still the
-    // one it was.
+    // there, laplus's own setup is still there, the connector is still serving
+    // the hostname, and the endpoint is still the one it was.
+    let connector = server.get("/api/access/cloudflare/connector").await;
+    assert_eq!(connector.body["desiredState"], "running", "a refusal stopped the connector");
     assert_eq!(fake.invocations("delete"), 0);
     assert_eq!(api.calls("DELETE"), 0);
     assert_eq!(api.records().len(), 1);
@@ -721,8 +733,9 @@ async fn missing_dns_authority_refuses_before_anything_is_deleted() {
     let held = server.get("/api/access/cloudflare").await;
     assert_eq!(held.body["ownership"], "laplus-created");
     assert_eq!(held.body["httpsOrigin"], format!("https://{CREATED_HOSTNAME}"));
-    // No residue, because no step was ever begun.
-    assert_eq!(held.body["cleanup"]["state"], "stopped");
+    // No residue, because no step was ever begun — and `intact` rather than
+    // `stopped`, because the refusal did not stop the connector either.
+    assert_eq!(held.body["cleanup"]["state"], "intact");
     assert_eq!(held.body["cleanup"]["remaining"], json!([]));
     server.stop().await;
     api.stop();

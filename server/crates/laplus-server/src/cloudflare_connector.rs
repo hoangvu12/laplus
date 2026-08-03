@@ -45,10 +45,8 @@ crate::public_exposure::closed_vocabulary! {
     /// What the connector is *actually* doing, as the compact row and the wizard
     /// report it.
     ///
-    /// **The exact shape this macro was written to abolish** — though not the
-    /// last of it: `action` in the supervision loop below is still a bare `&str`
-    /// vocabulary (`"replace"` / `"shutdown"`) compared at four sites, and wants
-    /// the same treatment. Every word below was a literal written at
+    /// **The exact shape this macro was written to abolish.** Every word below
+    /// was a literal written at
     /// a dozen sites in this file and compared against at three more, while the
     /// contract pinned the same eight words in
     /// `packages/contracts/src/remoteAccess.ts` and nothing made the two agree.
@@ -89,6 +87,29 @@ crate::public_exposure::closed_vocabulary! {
         /// spawn. Recoverable, and distinct from [`Self::RestartExhausted`]
         /// because nothing was ever running to exhaust a budget for.
         Failed => "failed",
+    }
+}
+
+crate::public_exposure::closed_vocabulary! {
+    /// What the supervision loop should do about the child it is watching.
+    ///
+    /// **Never on the wire, and a vocabulary all the same.** This was four
+    /// string literals produced at two places and compared at four more, in the
+    /// one loop in this crate where getting a word wrong means a `cloudflared`
+    /// that outlives the manager that spawned it — `"stop"` misspelt reads as
+    /// [`Self::Continue`] and supervises a connector nobody asked for. The words
+    /// it answers with are the ones it always used, so the two decision sites
+    /// still read as they did.
+    SupervisionAction as "supervision action" {
+        /// Keep watching this child.
+        Continue => "continue",
+        /// The desired state is no longer running: terminate and park.
+        Stop => "stop",
+        /// A newer configuration exists, so this child is superseded rather than
+        /// unwanted — the loop terminates it and starts again from the top.
+        Replace => "replace",
+        /// The process is going away. Terminate and leave the loop entirely.
+        Shutdown => "shutdown",
     }
 }
 
@@ -350,6 +371,23 @@ impl Manager {
     /// Whether a connector is configured at all, whatever it serves.
     pub fn configured(&self) -> bool {
         self.runtime.lock().unwrap().configuration.is_some()
+    }
+
+    /// Whether this connector is off because it was asked to be.
+    ///
+    /// **Configured *and* desired stopped**, which is not the same as either
+    /// half: an unconfigured manager has no connector to have stopped, and a
+    /// configured one whose child has merely died is degraded rather than
+    /// stopped. Asked of the manager for the reason [`Self::serves`] gives — the
+    /// cleanup report reached this by comparing two keys of the JSON snapshot,
+    /// and a rename on either side of that would have been silent.
+    pub fn is_stopped(&self) -> bool {
+        self.runtime
+            .lock()
+            .unwrap()
+            .configuration
+            .as_ref()
+            .is_some_and(|configuration| configuration.desired_state == DesiredState::Stopped)
     }
 
     /// The dedicated tunnel this connector is already configured to run, if it
@@ -855,35 +893,14 @@ impl Manager {
             }
             let client = reqwest::Client::new();
             loop {
-                let action = {
-                    let runtime = self.runtime.lock().unwrap();
-                    if runtime.shutdown {
-                        "shutdown"
-                    } else if runtime
-                        .configuration
-                        .as_ref()
-                        .is_none_or(|value| value.desired_state != DesiredState::Running)
-                    {
-                        "stop"
-                    } else if runtime.generation != generation {
-                        "replace"
-                    } else {
-                        "continue"
-                    }
-                };
-                if action != "continue" {
+                let action = self.supervision_action(generation);
+                if action != SupervisionAction::Continue {
                     terminate(&mut child).await;
                     if let Some(task) = log_task.take() {
                         let _ = task.await;
                     }
-                    let mut runtime = self.runtime.lock().unwrap();
-                    runtime.connector_state = if action == "replace" {
-                        ConnectorState::Starting
-                    } else {
-                        ConnectorState::Stopped
-                    };
-                    runtime.readiness = None;
-                    if action == "shutdown" {
+                    self.park(action);
+                    if action == SupervisionAction::Shutdown {
                         return;
                     }
                     break;
@@ -905,32 +922,11 @@ impl Manager {
                                 runtime.failure_message = None;
                             }
                             loop {
-                                let action = {
-                                    let runtime = self.runtime.lock().unwrap();
-                                    if runtime.shutdown {
-                                        "shutdown"
-                                    } else if runtime
-                                        .configuration
-                                        .as_ref()
-                                        .is_none_or(|value| value.desired_state != DesiredState::Running)
-                                    {
-                                        "stop"
-                                    } else if runtime.generation != generation {
-                                        "replace"
-                                    } else {
-                                        "continue"
-                                    }
-                                };
-                                if action != "continue" {
+                                let action = self.supervision_action(generation);
+                                if action != SupervisionAction::Continue {
                                     terminate_group(process_group).await;
-                                    let mut runtime = self.runtime.lock().unwrap();
-                                    runtime.connector_state = if action == "replace" {
-                                        ConnectorState::Starting
-                                    } else {
-                                        ConnectorState::Stopped
-                                    };
-                                    runtime.readiness = None;
-                                    if action == "shutdown" {
+                                    self.park(action);
+                                    if action == SupervisionAction::Shutdown {
                                         return;
                                     }
                                     break;
@@ -1007,6 +1003,49 @@ impl Manager {
         }
     }
 
+    /// What the loop watching `generation`'s child should do next.
+    ///
+    /// **One reading of three fields, asked at two places.** The loop watches a
+    /// child twice — once before the first `/ready`, and once more when the
+    /// process it launched has handed over to a replacement it must keep
+    /// supervising — and the question is the same both times. Asked twice by
+    /// hand it was two copies of the same `if` ladder under two separate locks,
+    /// which is one edit away from the two disagreeing about what `shutdown`
+    /// outranks.
+    fn supervision_action(&self, generation: u64) -> SupervisionAction {
+        let runtime = self.runtime.lock().unwrap();
+        if runtime.shutdown {
+            SupervisionAction::Shutdown
+        } else if runtime
+            .configuration
+            .as_ref()
+            .is_none_or(|value| value.desired_state != DesiredState::Running)
+        {
+            SupervisionAction::Stop
+        } else if runtime.generation != generation {
+            SupervisionAction::Replace
+        } else {
+            SupervisionAction::Continue
+        }
+    }
+
+    /// Record that the child this loop was watching has been terminated.
+    ///
+    /// A replacement is on its way for [`SupervisionAction::Replace`] and for
+    /// nothing else, so that is the one word that parks at
+    /// [`ConnectorState::Starting`] rather than [`ConnectorState::Stopped`] —
+    /// reporting `stopped` for a connector about to come back is how a wizard
+    /// offers a Start button for something already starting.
+    fn park(&self, action: SupervisionAction) {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.connector_state = if action == SupervisionAction::Replace {
+            ConnectorState::Starting
+        } else {
+            ConnectorState::Stopped
+        };
+        runtime.readiness = None;
+    }
+
     fn fail(&self, message: String, exhausted: bool) {
         let mut runtime = self.runtime.lock().unwrap();
         runtime.failure_message = Some(message);
@@ -1043,9 +1082,7 @@ impl Manager {
                 runtime.secrets.push(secret);
             }
         }
-        // Longest first, so a value that contains another is replaced before its
-        // substring is and the shorter one cannot half-redact the longer.
-        runtime.secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        longest_first(&mut runtime.secrets);
     }
 
     /// Keep the connector's own output, with its run credential taken out of it.
@@ -1095,8 +1132,8 @@ fn redacted_against(secrets: &[String], text: &str) -> String {
 /// turn "the connector for tunnel 2222 failed" into a sentence nobody can act
 /// on. Matched by what the key is called rather than by its exact spelling, so
 /// a credential shape laplus has not seen still has its secret taken out.
-/// Longest first, so a value that contains another is replaced before its
-/// substring is.
+/// Ordered by [`longest_first`], because a caller redacts with the list as it
+/// comes.
 fn secrets_within(held: &str) -> Vec<String> {
     let mut secrets = vec![held.trim().to_string()];
     if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(held) {
@@ -1112,8 +1149,19 @@ fn secrets_within(held: &str) -> Vec<String> {
         );
     }
     secrets.retain(|secret| !secret.trim().is_empty());
-    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    longest_first(&mut secrets);
     secrets
+}
+
+/// Order secrets so that redacting them in turn cannot half-redact one.
+///
+/// A tunnel credential's `TunnelSecret` is a substring of the document that
+/// holds it, so replacing the shorter value first leaves the longer one as a
+/// mixture of `[REDACTED]` and the rest of the secret — which reads as redacted
+/// and is not. Written once because both the reading of a credential file and
+/// the merge into what this process already remembers have to hold it.
+fn longest_first(secrets: &mut [String]) {
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
 }
 
 /// Whether the connector answers `/ready`, within a bounded wait.

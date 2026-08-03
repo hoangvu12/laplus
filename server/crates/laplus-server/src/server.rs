@@ -136,12 +136,31 @@ struct DeletionConfirmation {
     minted_at: std::time::Instant,
 }
 
+impl DeletionConfirmation {
+    /// Whether this offer may still be spent, asked *at* an instant rather than
+    /// asked of the clock.
+    ///
+    /// **The instant is a parameter so that expiring is a decision a test can
+    /// reach.** Read from `Instant::now()` inside the check, a five-minute TTL
+    /// could only be exercised by waiting five minutes — so a claim that an
+    /// expired confirmation is refused would have been prose nothing re-checks,
+    /// and wrong from the first commit that reordered the check. Nothing here
+    /// measures elapsed time either: the caller says what "now" is, and
+    /// `a_deletion_confirmation_stops_being_spendable_at_its_deadline` says an
+    /// instant past the deadline. The refusal that decision produces is covered
+    /// where it is answered, in `tests/http_cloudflare_cleanup.rs`.
+    fn spendable_at(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.minted_at) < DELETION_CONFIRMATION_TTL
+    }
+}
+
 /// How long a destructive confirmation stays spendable.
 ///
 /// Long enough to read what it names, paste a Cloudflare API token and press the
 /// button; short enough that a tab left open is not standing authority over a
-/// tunnel. It is not a performance budget, so nothing asserts on elapsed time —
-/// what the tests assert is that an expired confirmation is refused.
+/// tunnel. It is not a performance budget, and nothing asserts on elapsed time —
+/// see [`DeletionConfirmation::spendable_at`] for how expiry is checked without
+/// one.
 const DELETION_CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl ServerState {
@@ -1733,44 +1752,15 @@ async fn forget_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(
     // What an earlier attempt already removed — the same answer the snapshot
     // reports, and the reason a refusal below never claims a rollback that did
     // not occur.
-    let mut completed = cleanup_completed(
+    let mut cleanup = Cleanup::resumed(
         &state,
         &database.mutation_journal().unwrap_or_default(),
         public_exposure::MutationIntent::Forget,
         &FORGET_STEPS,
     );
-    if let Err(refusal) = remove_local_setup(
-        &state,
-        public_exposure::MutationIntent::Forget,
-        &FORGET_STEPS,
-        &mut completed,
-    )
-    .await
-    {
-        return refusal.into_response();
-    }
-    if let Err(error) = database.forget_public_exposure_endpoint() {
-        eprintln!("laplus: cannot forget the public endpoint: {error}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    // The wizard resumes from the account's selection, so a forget that left one
-    // behind would reopen on `adopting` or `creating` for a setup that no longer
-    // exists. Consent and the listing survive: neither is what was removed.
-    if let Err(refusal) = state.cloudflare_account.forget_selection() {
-        return refusal.into_response();
-    }
-    // The setup those journals described is gone, so they are no longer the
-    // unfinished work `unfinishedCreation` reports — this one's own entries are
-    // what a later `cleanup-required` is read from and stay.
-    for intent in [
-        public_exposure::MutationIntent::Adopt,
-        public_exposure::MutationIntent::Create,
-    ] {
-        if let Err(error) = database.clear_mutation_journal(intent) {
-            eprintln!("laplus: cannot clear a Cloudflare setup journal: {error}");
-        }
-    }
-    Json(external_tunnel_snapshot(&state).unwrap()).into_response()
+    // A forget is its own tail and nothing else: there is nothing at Cloudflare
+    // to do first, and no secret in the request to keep out of a refusal.
+    finish_cleanup(&state, &mut cleanup, "").await
 }
 
 async fn test_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
@@ -2196,12 +2186,12 @@ const DELETION_STEPS: [public_exposure::MutationStep; 4] = [
 
 /// Whether any step of this intent settled as completed, whatever it targeted.
 ///
-/// The looser twin of [`journaled_completion`], and looser on purpose: a
+/// The looser twin of [`completed_step_targeting`], and looser on purpose: a
 /// creation's DNS route is journaled with the hostname it routed, so a later
 /// creation for a *different* hostname must not read it as done. A deletion has
 /// already been confirmed against the exact resources on the endpoint row, so
 /// the entry can only be about them.
-fn journaled_step(
+fn any_completed_step(
     journal: &[crate::store::MutationJournalEntry],
     intent: public_exposure::MutationIntent,
     step: public_exposure::MutationStep,
@@ -2213,41 +2203,83 @@ fn journaled_step(
     })
 }
 
-/// Which steps of a cleanup are done, and how each one is known.
+/// One cleanup in progress: which steps it is made of, and how far it has got.
 ///
-/// **Each step is answered by whichever source can actually see it, and never
-/// by both.** laplus's own configuration and run credential are files, so those
-/// two steps are decided by looking — which is exact, survives a restart, and
-/// catches a cleanup killed between removing a file and settling its entry. The
-/// DNS record and the tunnel are at Cloudflare and leave nothing on this machine
-/// at all, so for those the journal *is* the observation, which is the same
-/// argument ADR-0051 makes for a DNS route.
-///
-/// Reading the journal for the local steps as well was a real defect and not a
-/// belt-and-braces: a `Completed` entry stays completed however the world moves
-/// on, so a forget, a fresh setup and a second forget found both steps already
-/// done and removed nothing — while answering `200` and reporting `forgotten`.
-/// What made that possible was a residue describing a setup that no longer
-/// existed, and [`crate::store::Database::register_public_exposure_endpoint`]
-/// now clears it: recording an exposure is the moment a previous removal becomes
-/// history.
-fn cleanup_completed(
-    state: &ServerState,
-    journal: &[crate::store::MutationJournalEntry],
+/// **The three values travelled together anyway.** A cleanup's intent, the list
+/// of steps it is made of and what it has already completed are read together,
+/// journaled together and reported together — every refusal names all three,
+/// and the two routes and the snapshot each had to carry them by hand. As one
+/// value they cannot come apart, so nothing can journal under one intent while
+/// reporting what is outstanding from another list.
+struct Cleanup {
     intent: public_exposure::MutationIntent,
-    steps: &[public_exposure::MutationStep],
-) -> Vec<public_exposure::MutationStep> {
-    use public_exposure::MutationStep;
+    steps: &'static [public_exposure::MutationStep],
+    completed: Vec<public_exposure::MutationStep>,
+}
 
-    steps
-        .iter()
-        .copied()
-        .filter(|step| match step {
-            MutationStep::ConfigurationRemove => !state.cloudflare_connector.holds_configuration(),
-            MutationStep::CredentialRemove => !state.cloudflare_connector.holds_credentials(),
-            remote => journaled_step(journal, intent, *remote),
-        })
-        .collect()
+impl Cleanup {
+    /// Which steps of this cleanup are done, and how each one is known.
+    ///
+    /// **Each step is answered by whichever source can actually see it, and
+    /// never by both.** laplus's own configuration and run credential are files,
+    /// so those two steps are decided by looking — which is exact, survives a
+    /// restart, and catches a cleanup killed between removing a file and
+    /// settling its entry. The DNS record and the tunnel are at Cloudflare and
+    /// leave nothing on this machine at all, so for those the journal *is* the
+    /// observation, which is the same argument ADR-0051 makes for a DNS route.
+    ///
+    /// Reading the journal for the local steps as well was a real defect and not
+    /// a belt-and-braces: a `Completed` entry stays completed however the world
+    /// moves on, so a forget, a fresh setup and a second forget found both steps
+    /// already done and removed nothing — while answering `200` and reporting
+    /// `forgotten`. What made that possible was a residue describing a setup
+    /// that no longer existed, and
+    /// [`crate::store::Database::register_public_exposure_endpoint`] now clears
+    /// it: recording an exposure is the moment a previous removal becomes
+    /// history.
+    fn resumed(
+        state: &ServerState,
+        journal: &[crate::store::MutationJournalEntry],
+        intent: public_exposure::MutationIntent,
+        steps: &'static [public_exposure::MutationStep],
+    ) -> Self {
+        use public_exposure::MutationStep;
+
+        let completed = steps
+            .iter()
+            .copied()
+            .filter(|step| match step {
+                MutationStep::ConfigurationRemove => {
+                    !state.cloudflare_connector.holds_configuration()
+                }
+                MutationStep::CredentialRemove => !state.cloudflare_connector.holds_credentials(),
+                remote => any_completed_step(journal, intent, *remote),
+            })
+            .collect();
+        Cleanup { intent, steps, completed }
+    }
+
+    /// Whether a step has already happened, and so must not happen again.
+    fn holds(&self, step: public_exposure::MutationStep) -> bool {
+        self.completed.contains(&step)
+    }
+
+    fn did(&mut self, step: public_exposure::MutationStep) {
+        self.completed.push(step);
+    }
+
+    fn remaining(&self) -> Vec<public_exposure::MutationStep> {
+        remaining_steps(self.steps, &self.completed)
+    }
+
+    /// A refusal that names exactly what this cleanup did and did not do.
+    ///
+    /// Never a rollback: both lists come from what has actually been journaled
+    /// and observed, so a half-finished deletion says what is gone rather than
+    /// implying that anything came back.
+    fn refusing(&self, refusal: public_exposure::Refusal) -> public_exposure::Refusal {
+        refusal.after(&self.completed, &self.remaining())
+    }
 }
 
 /// What a stop, forget or delete has done and has left to do.
@@ -2265,11 +2297,16 @@ fn cleanup_report(state: &ServerState) -> public_exposure::CleanupReport {
 
     let database = state.services.shell.database();
     // Nothing was removed, so the only thing left to say is whether the
-    // connector is off because it was asked to be.
+    // connector is off because it was asked to be. Asked of the manager rather
+    // than read out of its JSON: two snapshot keys indexed by hand is a typed
+    // question answered through an untyped keyhole, and the rule
+    // [`crate::cloudflare_connector::Manager::serves`] already carries.
     let nothing_removed = || {
-        let connector = state.cloudflare_connector.snapshot();
-        let stopped = connector["configured"] == true && connector["desiredState"] == "stopped";
-        CleanupReport::intact(if stopped { CleanupState::Stopped } else { CleanupState::Intact })
+        CleanupReport::intact(if state.cloudflare_connector.is_stopped() {
+            CleanupState::Stopped
+        } else {
+            CleanupState::Intact
+        })
     };
     let Ok(journal) = database.mutation_journal() else {
         return nothing_removed();
@@ -2290,13 +2327,13 @@ fn cleanup_report(state: &ServerState) -> public_exposure::CleanupReport {
         (Some(_), _) => MutationIntent::DeleteEverywhere,
         (None, Some(_)) => MutationIntent::Forget,
     };
-    let steps: &[MutationStep] = if intent == MutationIntent::DeleteEverywhere {
+    let steps: &'static [MutationStep] = if intent == MutationIntent::DeleteEverywhere {
         &DELETION_STEPS
     } else {
         &FORGET_STEPS
     };
-    let completed = cleanup_completed(state, &journal, intent, steps);
-    let remaining = remaining_steps(steps, &completed);
+    let cleanup = Cleanup::resumed(state, &journal, intent, steps);
+    let remaining = cleanup.remaining();
     let recorded = database.public_exposure_endpoint().ok().flatten();
     // What is outstanding *at Cloudflare*, named so a retry can target it and a
     // person can remove it by hand. Read from the journal first, because the
@@ -2323,7 +2360,7 @@ fn cleanup_report(state: &ServerState) -> public_exposure::CleanupReport {
                 .and_then(|endpoint| endpoint.dns_record.as_ref())
                 .map(|record| record.name.clone())
         }),
-        completed,
+        completed: cleanup.completed,
         remaining,
     }
 }
@@ -2368,36 +2405,93 @@ async fn stop_the_connector(state: &ServerState) -> Result<(), public_exposure::
 /// optional.
 async fn remove_local_setup(
     state: &Arc<ServerState>,
-    intent: public_exposure::MutationIntent,
-    steps: &[public_exposure::MutationStep],
-    completed: &mut Vec<public_exposure::MutationStep>,
+    cleanup: &mut Cleanup,
 ) -> Result<(), public_exposure::Refusal> {
     use public_exposure::MutationStep;
 
+    type Removal = fn(&crate::cloudflare_connector::Manager) -> Result<(), public_exposure::Refusal>;
+
     let database = state.services.shell.database();
+    let connector = &state.cloudflare_connector;
     stop_the_connector(state).await?;
-    for step in [MutationStep::ConfigurationRemove, MutationStep::CredentialRemove] {
-        if completed.contains(&step) {
+    // Paired here rather than matched on inside the loop. The two `match`es this
+    // replaces both ended in `_ =>`, which silently meant "the credential one" —
+    // so a ninth [`MutationStep`] added to the vocabulary would have compiled
+    // into a loop that journaled it and removed a run credential for it.
+    for (step, target, remove) in [
+        (
+            MutationStep::ConfigurationRemove,
+            connector.configuration_path(),
+            crate::cloudflare_connector::Manager::remove_configuration as Removal,
+        ),
+        (
+            MutationStep::CredentialRemove,
+            connector.credential_path(),
+            crate::cloudflare_connector::Manager::remove_credentials as Removal,
+        ),
+    ] {
+        if cleanup.holds(step) {
             continue;
         }
-        let target = match step {
-            MutationStep::ConfigurationRemove => state.cloudflare_connector.configuration_path(),
-            _ => state.cloudflare_connector.credential_path(),
-        };
         let sequence = database
-            .begin_mutation_step(intent, step, Some(&target.to_string_lossy()))
+            .begin_mutation_step(cleanup.intent, step, Some(&target.to_string_lossy()))
             .ok();
-        let removed = match step {
-            MutationStep::ConfigurationRemove => state.cloudflare_connector.remove_configuration(),
-            _ => state.cloudflare_connector.remove_credentials(),
-        };
+        let removed = remove(connector);
         settle_journaled_step(state, sequence, removed.is_ok(), None);
         if let Err(refusal) = removed {
-            return Err(refusal.after(completed, &remaining_steps(steps, completed)));
+            return Err(cleanup.refusing(refusal));
         }
-        completed.push(step);
+        cleanup.did(step);
     }
     Ok(())
+}
+
+/// Remove laplus's own setup, forget the record, and leave no residue that
+/// describes it.
+///
+/// **The whole of a forget, and the last thing a delete-everywhere does.** The
+/// two routes differ in what precedes this — a deletion removes two Cloudflare
+/// resources first, a forget touches Cloudflare at no point — and in nothing
+/// after it. Written once because the two drifting apart here is how a forget
+/// would leave behind a selection the wizard reopens on, or a journal that
+/// reports finished work as unfinished; each of those was a real defect in one
+/// route while the other was right.
+///
+/// `secret` is taken out of every refusal this can answer with: a deletion
+/// carries a Cloudflare API token through the request, a forget carries nothing,
+/// and an empty secret redacts nothing.
+async fn finish_cleanup(
+    state: &Arc<ServerState>,
+    cleanup: &mut Cleanup,
+    secret: &str,
+) -> Response {
+    if let Err(refusal) = remove_local_setup(state, cleanup).await {
+        return refusal.redacting(secret).into_response();
+    }
+    let database = state.services.shell.database();
+    if let Err(error) = database.forget_public_exposure_endpoint() {
+        eprintln!("laplus: cannot forget the public endpoint: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    // The wizard resumes from the account's selection, so a cleanup that left one
+    // behind would reopen on `adopting` or `creating` for a setup that no longer
+    // exists. Consent and the listing survive: neither is what was removed.
+    if let Err(refusal) = state.cloudflare_account.forget_selection() {
+        return refusal.redacting(secret).into_response();
+    }
+    // The setup those journals described is gone, so they are no longer the
+    // unfinished work `unfinishedCreation` reports — this cleanup's own entries
+    // are what a later `cleanup-required` or `fully-removed` is read from, and
+    // they stay.
+    for intent in [
+        public_exposure::MutationIntent::Adopt,
+        public_exposure::MutationIntent::Create,
+    ] {
+        if let Err(error) = database.clear_mutation_journal(intent) {
+            eprintln!("laplus: cannot clear a Cloudflare setup journal: {error}");
+        }
+    }
+    Json(external_tunnel_snapshot(state).unwrap()).into_response()
 }
 
 /// Dedicate an inactive existing tunnel to this environment.
@@ -2638,8 +2732,9 @@ struct CreateCloudflareTunnel {
 /// no identifier for it — so for that one step the log *is* the observation, and
 /// reading it is not the "hopeful in-memory list" the other two steps are read
 /// off disk to avoid. The detail is compared as well as the step, so a route
-/// completed for some other hostname is not read as this one's.
-fn journaled_completion(
+/// completed for some other hostname is not read as this one's — which is the
+/// whole difference between this and [`any_completed_step`].
+fn completed_step_targeting(
     database: &crate::store::Database,
     intent: public_exposure::MutationIntent,
     step: public_exposure::MutationStep,
@@ -2833,7 +2928,7 @@ async fn create_cloudflare_tunnel(
     let routed = recorded.as_ref().is_some_and(|endpoint| {
         endpoint.ownership == public_exposure::TunnelOwnership::LaplusCreated
             && endpoint.dns_record.as_ref().is_some_and(|record| record.name == dns_name)
-    }) || journaled_completion(
+    }) || completed_step_targeting(
         &database,
         public_exposure::MutationIntent::Create,
         public_exposure::MutationStep::DnsRoute,
@@ -2976,7 +3071,8 @@ async fn offer_cloudflare_deletion(
     {
         let mut offers = state.deletion_confirmations.lock().expect("deletion confirmations");
         // An offer nobody took is not authority anybody keeps.
-        offers.retain(|_, held| held.minted_at.elapsed() < DELETION_CONFIRMATION_TTL);
+        let now = std::time::Instant::now();
+        offers.retain(|_, held| held.spendable_at(now));
         offers.insert(
             confirmation.clone(),
             DeletionConfirmation {
@@ -3060,7 +3156,7 @@ fn spend_deletion_confirmation(
         && held.https_origin == endpoint.https_origin
         && held.dns_record_name
             == endpoint.dns_record.as_ref().map(|record| record.name.clone());
-    if held.minted_at.elapsed() >= DELETION_CONFIRMATION_TTL || !names_what_is_recorded {
+    if !held.spendable_at(std::time::Instant::now()) || !names_what_is_recorded {
         return Err(refused());
     }
     Ok(())
@@ -3089,6 +3185,18 @@ fn spend_deletion_confirmation(
 /// Revoking a Cloudflare token would invalidate every other copy of that account
 /// certificate, on every other machine — which the spec puts out of scope and
 /// ADR-0045 forbids reaching for at all.
+///
+/// **Everything that only reads happens before anything that spends.** Ownership,
+/// what is already done, and DNS authority are all reads; spending the
+/// confirmation, stopping the connector and the four removals are not. So the
+/// reads go first and a missing-authority refusal is answered while the
+/// confirmation is still spendable and the connector is still serving — which is
+/// what makes "missing authority leaves a recoverable state" the plain sentence
+/// ADR-0052 and ticket 07 say it is, rather than one that has to explain which
+/// unrecoverable things happened first. It costs nothing and it is not a
+/// weakening: the confirmation is a record that a person was shown these exact
+/// resources, and a caller holding `access:write` can mint one from the offer
+/// route whenever it likes.
 async fn delete_cloudflare_tunnel(
     State(state): State<Arc<ServerState>>,
     RawQuery(query): RawQuery,
@@ -3107,15 +3215,10 @@ async fn delete_cloudflare_tunnel(
         Ok(offered) => offered,
         Err(refusal) => return refusal.into_response(),
     };
-    if let Err(refusal) =
-        spend_deletion_confirmation(&state, &body.confirmation, &endpoint, &tunnel_id)
-    {
-        return refusal.into_response();
-    }
 
     let database = state.services.shell.database();
     let journal = database.mutation_journal().unwrap_or_default();
-    let mut completed = cleanup_completed(
+    let mut cleanup = Cleanup::resumed(
         &state,
         &journal,
         MutationIntent::DeleteEverywhere,
@@ -3125,79 +3228,78 @@ async fn delete_cloudflare_tunnel(
     // at the boundary — the rule `configure` already follows for a connector
     // token, and for the same reason: several of the refusals below quote
     // Cloudflare's own words back.
-    let refuse = |refusal: public_exposure::Refusal, completed: &[MutationStep]| {
-        refusal
-            .after(completed, &remaining_steps(&DELETION_STEPS, completed))
-            .redacting(&body.dns_api_token)
-            .into_response()
+    let refuse = |refusal: public_exposure::Refusal, cleanup: &Cleanup| {
+        cleanup.refusing(refusal).redacting(&body.dns_api_token).into_response()
     };
 
+    // --- DNS authority, which is read before anything at all is spent ---
+    //
+    // A tunnel laplus made and never routed has no record to remove, and neither
+    // has a deletion resuming past a DNS step it already finished; both need no
+    // token, and demanding one would refuse a retry that has nothing left to use
+    // it for.
+    let outstanding_record = (!cleanup.holds(MutationStep::DnsRecordDelete))
+        .then(|| endpoint.dns_record.clone())
+        .flatten();
+    let addressed = match &outstanding_record {
+        None => None,
+        Some(record) => {
+            // Having a token, and being able to see the zone the record sits in,
+            // are both reads. Establishing them here means a missing-authority
+            // refusal is answered before the confirmation is spent, before the
+            // connector is stopped and before the first step is journaled — so
+            // it reports a deletion that has not started, which is what it is.
+            let dns = match crate::cloudflare_dns::Dns::with_token(&body.dns_api_token) {
+                Ok(dns) => dns,
+                Err(refusal) => return refuse(refusal, &cleanup),
+            };
+            match locate_dns_record(&state, &dns, record).await {
+                // A name nothing answers to is a record already gone, which the
+                // step below reads as having happened rather than as a failure —
+                // the same reading Cloudflare's own `81044` gets.
+                Ok(located) => Some((dns, located)),
+                Err(refusal) => return refuse(refusal, &cleanup),
+            }
+        }
+    };
+
+    if let Err(refusal) =
+        spend_deletion_confirmation(&state, &body.confirmation, &endpoint, &tunnel_id)
+    {
+        return refusal.into_response();
+    }
     // Stopped before anything is deleted: `cloudflared tunnel delete` refuses
     // while the tunnel still has connections, and laplus's own connector is one.
     if let Err(refusal) = stop_the_connector(&state).await {
-        return refuse(refusal, &completed);
+        return refuse(refusal, &cleanup);
     }
 
     // --- the DNS record, which no cloudflared command can remove ---
-    if !completed.contains(&MutationStep::DnsRecordDelete) {
-        match endpoint.dns_record.clone() {
-            // A tunnel laplus made and never routed has no record to remove, and
-            // that is this step being done rather than skipped — journaled, so
-            // the report reads it the same way the command did. Left unwritten,
-            // a deletion that then failed at the tunnel would report a DNS
-            // removal as outstanding forever, because that step has no local
-            // observation to fall back on.
-            None => {
-                let sequence = database
-                    .begin_mutation_step(
-                        MutationIntent::DeleteEverywhere,
-                        MutationStep::DnsRecordDelete,
-                        None,
-                    )
-                    .ok();
-                settle_journaled_step(&state, sequence, true, None);
-                completed.push(MutationStep::DnsRecordDelete);
-            }
-            Some(record) => {
-                // **Authority is established before the step is begun.** Having
-                // a token and being able to see the zone the record is in are
-                // reads, not mutations, and a missing-authority refusal that
-                // left a journal entry behind would report a deletion as
-                // partially done when nothing at all had happened — the opposite
-                // of the recoverable state the acceptance box asks for.
-                let dns = match crate::cloudflare_dns::Dns::with_token(&body.dns_api_token) {
-                    Ok(dns) => dns,
-                    Err(refusal) => return refuse(refusal, &completed),
-                };
-                let located = match locate_dns_record(&state, &dns, &record).await {
-                    Ok(located) => located,
-                    Err(refusal) => return refuse(refusal, &completed),
-                };
-                let sequence = database
-                    .begin_mutation_step(
-                        MutationIntent::DeleteEverywhere,
-                        MutationStep::DnsRecordDelete,
-                        Some(&record.name),
-                    )
-                    .ok();
-                // A record that resolved to nothing is one that is already gone,
-                // which is this step having happened rather than a failure —
-                // the same reading Cloudflare's own `81044` gets.
-                let removed = match located {
-                    Some(located) => dns.delete(&located).await.map(|_| ()),
-                    None => Ok(()),
-                };
-                settle_journaled_step(&state, sequence, removed.is_ok(), None);
-                match removed {
-                    Ok(()) => completed.push(MutationStep::DnsRecordDelete),
-                    Err(refusal) => return refuse(refusal, &completed),
-                }
-            }
+    if !cleanup.holds(MutationStep::DnsRecordDelete) {
+        // Journaled even when there was no record, so the report reads that step
+        // the way the command did. Left unwritten, a deletion that then failed at
+        // the tunnel would report a DNS removal as outstanding forever, because
+        // that step has no local observation to fall back on.
+        let sequence = database
+            .begin_mutation_step(
+                MutationIntent::DeleteEverywhere,
+                MutationStep::DnsRecordDelete,
+                outstanding_record.as_ref().map(|record| record.name.as_str()),
+            )
+            .ok();
+        let removed = match &addressed {
+            Some((dns, Some(located))) => dns.delete(located).await.map(|_| ()),
+            _ => Ok(()),
+        };
+        settle_journaled_step(&state, sequence, removed.is_ok(), None);
+        match removed {
+            Ok(()) => cleanup.did(MutationStep::DnsRecordDelete),
+            Err(refusal) => return refuse(refusal, &cleanup),
         }
     }
 
     // --- the tunnel, which only the account certificate can remove ---
-    if !completed.contains(&MutationStep::TunnelDelete) {
+    if !cleanup.holds(MutationStep::TunnelDelete) {
         let sequence = database
             .begin_mutation_step(
                 MutationIntent::DeleteEverywhere,
@@ -3211,38 +3313,13 @@ async fn delete_cloudflare_tunnel(
             .await;
         settle_journaled_step(&state, sequence, deleted.is_ok(), None);
         if let Err(refusal) = deleted {
-            return refuse(refusal, &completed);
+            return refuse(refusal, &cleanup);
         }
-        completed.push(MutationStep::TunnelDelete);
+        cleanup.did(MutationStep::TunnelDelete);
     }
 
     // --- and then laplus's own setup, which is exactly what forget removes ---
-    if let Err(refusal) = remove_local_setup(
-        &state,
-        MutationIntent::DeleteEverywhere,
-        &DELETION_STEPS,
-        &mut completed,
-    )
-    .await
-    {
-        return refusal.redacting(&body.dns_api_token).into_response();
-    }
-    if let Err(error) = database.forget_public_exposure_endpoint() {
-        eprintln!("laplus: cannot forget the deleted public endpoint: {error}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    if let Err(refusal) = state.cloudflare_account.forget_selection() {
-        return refusal.into_response();
-    }
-    // The creation this deletion undid is no longer unfinished work; this
-    // intent's own entries stay, because they are what `fully-removed` is read
-    // from and the only durable record that the two Cloudflare resources went.
-    for intent in [MutationIntent::Adopt, MutationIntent::Create] {
-        if let Err(error) = database.clear_mutation_journal(intent) {
-            eprintln!("laplus: cannot clear a Cloudflare setup journal: {error}");
-        }
-    }
-    Json(external_tunnel_snapshot(&state).unwrap()).into_response()
+    finish_cleanup(&state, &mut cleanup, &body.dns_api_token).await
 }
 
 /// Address the recorded record, resolving it if laplus never has.
@@ -3950,6 +4027,39 @@ mod tests {
 
         let overridden = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 4774));
         assert_eq!(Server::reachable_from(overridden).port(), 4774);
+    }
+
+    /// An offer stops being authority at its deadline, and the deadline is a
+    /// comparison rather than a wait.
+    ///
+    /// **This is the test the constant's doc comment promises.** A tab left open
+    /// must not be standing authority over a tunnel, which is only true if the
+    /// age check actually refuses — and the whole reason
+    /// [`DeletionConfirmation::spendable_at`] takes the instant is that a test
+    /// asserting this by sleeping for five minutes is a test nobody would run
+    /// and nothing would re-check. No elapsed time is measured here: both
+    /// instants are named.
+    #[test]
+    fn a_deletion_confirmation_stops_being_spendable_at_its_deadline() {
+        let minted_at = std::time::Instant::now();
+        let held = DeletionConfirmation {
+            tunnel_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            dns_record_name: Some("laplus.example.com".to_string()),
+            https_origin: "https://laplus.example.com".to_string(),
+            minted_at,
+        };
+        assert!(held.spendable_at(minted_at), "minted and already expired");
+        assert!(
+            held.spendable_at(
+                minted_at + DELETION_CONFIRMATION_TTL - std::time::Duration::from_secs(1)
+            ),
+            "a confirmation expired a second before its deadline"
+        );
+        // At the deadline rather than after it: an offer whose whole window has
+        // passed is expired, and a boundary read the other way is five minutes
+        // plus one tick of standing authority.
+        assert!(!held.spendable_at(minted_at + DELETION_CONFIRMATION_TTL));
+        assert!(!held.spendable_at(minted_at + DELETION_CONFIRMATION_TTL * 2));
     }
 
     /// And a real address is left alone, or a server told to bind one interface

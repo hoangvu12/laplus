@@ -79,8 +79,14 @@ struct ApiError {
     code: i64,
 }
 
+/// A Cloudflare object as narrowly as a lookup needs it: what it is called, and
+/// what to address it by.
+///
+/// One shape for zones and for DNS records, because laplus asks the same
+/// question of both — find the thing with this name, and tell me its id — and
+/// the two answers differ only in the fields this deliberately ignores.
 #[derive(Debug, Deserialize)]
-struct Named {
+struct NamedResource {
     id: String,
     name: String,
 }
@@ -106,20 +112,42 @@ impl Dns {
         Ok(Self { origin: api_origin(), token: token.trim().to_string() })
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, Refusal> {
+    /// One request to Cloudflare, answered as the status and the envelope every
+    /// reply comes wrapped in.
+    ///
+    /// **Written once because each rung of it is a decision.** Carrying the
+    /// token, reading `401` and `403` as *laplus was never given authority*
+    /// rather than as Cloudflare saying no, and reading a body that will not
+    /// parse as unreadable rather than as an empty result are three answers this
+    /// module has to give the same way every time — and they were given twice,
+    /// in a `get` and a `delete` that had already drifted to reading the status
+    /// at different points. The status comes back out because deleting needs it:
+    /// `404` plus Cloudflare's own `81044` is a record already gone.
+    async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<(reqwest::StatusCode, Envelope<T>), Refusal> {
         let response = self
             .client()?
-            .get(format!("{}{path}", self.origin))
+            .request(method, format!("{}{path}", self.origin))
             .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|_| unreachable_api())?;
-        if response.status() == reqwest::StatusCode::FORBIDDEN
-            || response.status() == reqwest::StatusCode::UNAUTHORIZED
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::UNAUTHORIZED
         {
             return Err(missing_authority());
         }
-        let envelope: Envelope<Vec<T>> = response.json().await.map_err(|_| unreadable_api())?;
+        let envelope = response.json().await.map_err(|_| unreadable_api())?;
+        Ok((status, envelope))
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, Refusal> {
+        let (_, envelope): (_, Envelope<Vec<T>>) =
+            self.call(reqwest::Method::GET, path).await?;
         if !envelope.success {
             // **Not every refusal is a missing token.** Cloudflare answers a
             // rate limit, a suspended zone and a malformed query with the same
@@ -153,7 +181,7 @@ impl Dns {
     pub async fn locate(&self, record_name: &str) -> Result<Option<Located>, Refusal> {
         let mut zone = None;
         for candidate in zone_candidates(record_name) {
-            let found: Vec<Named> = self
+            let found: Vec<NamedResource> = self
                 .get(&format!("/client/v4/zones?name={candidate}"))
                 .await?;
             if let Some(named) = found.into_iter().find(|held| held.name == candidate) {
@@ -162,7 +190,7 @@ impl Dns {
             }
         }
         let zone = zone.ok_or_else(missing_authority)?;
-        let records: Vec<Named> = self
+        let records: Vec<NamedResource> = self
             .get(&format!(
                 "/client/v4/zones/{}/dns_records?name={record_name}",
                 zone.id
@@ -184,24 +212,15 @@ impl Dns {
     /// A deletion that re-derived its target from a name each time is one that
     /// can be pointed somewhere else by a zone that changed underneath it.
     pub async fn delete(&self, located: &Located) -> Result<Removal, Refusal> {
-        let response = self
-            .client()?
-            .delete(format!(
-                "{}/client/v4/zones/{}/dns_records/{}",
-                self.origin, located.zone_id, located.record_id
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|_| unreachable_api())?;
-        if response.status() == reqwest::StatusCode::FORBIDDEN
-            || response.status() == reqwest::StatusCode::UNAUTHORIZED
-        {
-            return Err(missing_authority());
-        }
-        let status = response.status();
-        let envelope: Envelope<serde_json::Value> =
-            response.json().await.map_err(|_| unreadable_api())?;
+        let (status, envelope): (_, Envelope<serde_json::Value>) = self
+            .call(
+                reqwest::Method::DELETE,
+                &format!(
+                    "/client/v4/zones/{}/dns_records/{}",
+                    located.zone_id, located.record_id
+                ),
+            )
+            .await?;
         if envelope.success {
             return Ok(Removal::Removed);
         }
