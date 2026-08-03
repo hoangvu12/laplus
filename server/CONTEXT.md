@@ -981,6 +981,29 @@ two. `POST /api/access/cloudflare/account/adopt`, ADR-0050.
 _Avoid_: Adoption for the screen that merely offers it — that is a choice, and
 `adoptionConfirmed` is still false.
 
+**Creation** — the explicit confirmation that makes a new stable tunnel for this
+environment, and the three mutations behind it: allocating the tunnel with its
+own private credential, routing a DNS name to it, and writing laplus's own
+connector configuration. The only path that ends in a laplus-created tunnel, and
+therefore the only one that ends in an ownership authorizing a Cloudflare
+deletion. Journaled step by step because any of the three can be the last.
+`POST /api/access/cloudflare/account/create`, ADR-0051.
+_Avoid_: Provisioning, which says nothing about who ends up owning the result.
+
+**Locally managed tunnel** — a tunnel whose ingress configuration lives on this
+computer rather than at Cloudflare, which is what `cloudflared tunnel create`
+produces and what laplus creates. Named on the screen that offers it because
+Cloudflare recommends the remotely managed kind, and a developer choosing the
+convenience of an in-app wizard should know which one they are getting.
+_Avoid_: Managed tunnel, which reads as the opposite.
+
+**Recorded DNS record** — the DNS resource laplus created, held on the endpoint
+row as a name and, where laplus has them, a zone and record id. `cloudflared
+tunnel route dns` reports no identifiers and the account certificate's contents
+are never read, so creation records the name alone; whatever later acquires DNS
+authority resolves and fills in the rest. A record with a name and no ids is one
+laplus made and cannot yet address. `store::DnsRecord`, ADR-0051.
+
 **Activation race** — a connector starting between the listing a dedication
 offer was drawn from and the confirmation of it. Answered by re-reading the
 tunnel's activity immediately before the first mutation and falling back to an

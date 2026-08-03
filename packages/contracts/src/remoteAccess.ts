@@ -203,6 +203,18 @@ export const ManagedCloudflareConnectorSnapshot = Schema.Struct({
   readiness: Schema.NullOr(Schema.Boolean),
   httpsOrigin: Schema.NullOr(TrimmedNonEmptyString),
   loopbackOrigin: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Where this connector's run credential is, or would be.
+   *
+   * **A path and never contents**, the rule {@link CloudflareAccountSnapshot}'s
+   * `certificatePath` already follows. It is here because ticket 06's creation
+   * preview has to name the file laplus is about to write the tunnel's only
+   * run authority into — a confirmation that says "somewhere private" is a
+   * confirmation of an abstraction — so it is present before anything is
+   * configured as well as after. Reading this snapshot requires `access:read`,
+   * which ADR-0047 reserves for administrative sessions.
+   */
+  credentialPath: Schema.optional(TrimmedNonEmptyString),
   executablePath: Schema.NullOr(TrimmedNonEmptyString),
   detectedVersion: Schema.NullOr(TrimmedNonEmptyString),
   metricsOrigin: Schema.NullOr(TrimmedNonEmptyString),
@@ -326,11 +338,17 @@ export const CloudflareAccountTunnel = Schema.Struct({
 export type CloudflareAccountTunnel = typeof CloudflareAccountTunnel.Type;
 
 /**
- * The tunnel the developer chose and the hostname they said reaches it.
+ * Which tunnel this environment's setup is about, and how far laplus has gone.
  *
  * `adoptionConfirmed` is the whole of ADR-0045's inactive-tunnel rule: a chosen
  * adoptable tunnel is a candidate, and stays one until dedication is separately
- * confirmed. Nothing here makes laplus the tunnel's lifecycle owner.
+ * confirmed. Choosing one makes laplus nothing's lifecycle owner.
+ *
+ * `created` is the other way in, and the two are never both true: a tunnel is
+ * either picked out of the account's listing or made by laplus. Two booleans
+ * rather than one word because `adoptionConfirmed` was on the wire before
+ * creation existed and must go on meaning exactly what it meant — a created
+ * tunnel was never adopted.
  */
 export const CloudflareTunnelSelection = Schema.Struct({
   tunnelId: TrimmedNonEmptyString,
@@ -338,6 +356,11 @@ export const CloudflareTunnelSelection = Schema.Struct({
   classification: CloudflareTunnelClassification,
   httpsOrigin: TrimmedNonEmptyString,
   adoptionConfirmed: Schema.Boolean,
+  /**
+   * laplus allocated this tunnel and routed its DNS name. The only ownership
+   * that authorizes deleting either — see `deletableAtCloudflare`.
+   */
+  created: Schema.Boolean,
 });
 export type CloudflareTunnelSelection = typeof CloudflareTunnelSelection.Type;
 
@@ -361,8 +384,65 @@ export const CloudflareAccountSetupStep = Schema.Literals([
    * is left to ask, which is why this is where an adopted setup resumes.
    */
   "adopting",
+  /**
+   * laplus allocated the tunnel, routed the DNS name to it, wrote its own
+   * isolated configuration and is supervising the connector. The creation twin
+   * of `adopting`, separate because the two differ in the one thing the screen
+   * after them must say: only this one's Cloudflare resources are laplus's to
+   * delete.
+   *
+   * **Not the screen that asks.** The name and hostname a creation is confirmed
+   * against are answers nothing has recorded yet, so the offer is the client's
+   * own step; this is what is true once the mutations have happened.
+   */
+  "creating",
 ]);
 export type CloudflareAccountSetupStep = typeof CloudflareAccountSetupStep.Type;
+
+/**
+ * One step of a multi-step Cloudflare mutation, as a refusal reports it.
+ *
+ * These are the words tickets 06 and 07 need in order to "identify completed
+ * and pending work" and "preserve exact remaining work for idempotent retry"
+ * without ever claiming a rollback that did not occur. `dns-record-delete` is
+ * deliberately not the mirror of `dns-route`: `cloudflared` has no
+ * `route dns delete`, so removing a record is a Cloudflare DNS API call needing
+ * its own authority.
+ */
+export const PublicExposureMutationStep = Schema.Literals([
+  "credential",
+  "tunnel-create",
+  "dns-route",
+  "configuration",
+  "dns-record-delete",
+  "tunnel-delete",
+  "configuration-remove",
+  "credential-remove",
+]);
+export type PublicExposureMutationStep = typeof PublicExposureMutationStep.Type;
+
+/**
+ * A creation that started and never finished, as it survives a restart.
+ *
+ * **The refusal body is not enough.** `completed`/`remaining` reach the client
+ * in the 400 that failed, which is exactly as long as the developer stays on
+ * that screen — and a partial creation has left a real Cloudflare tunnel behind.
+ * So the server also answers this from the residual journal, whose entries a
+ * finished creation clears; its presence *is* the unfinished state.
+ *
+ * `name` is absent once the allocation succeeded, because the journal entry is
+ * settled with the UUID a cleanup has to target rather than the label it was
+ * asked for. `hostname` is absent until the DNS route ran, because until then
+ * nothing at Cloudflare has one.
+ */
+export const CloudflareUnfinishedCreation = Schema.Struct({
+  name: Schema.NullOr(TrimmedNonEmptyString),
+  tunnelId: Schema.NullOr(TrimmedNonEmptyString),
+  hostname: Schema.NullOr(TrimmedNonEmptyString),
+  completed: Schema.Array(PublicExposureMutationStep),
+  remaining: Schema.Array(PublicExposureMutationStep),
+});
+export type CloudflareUnfinishedCreation = typeof CloudflareUnfinishedCreation.Type;
 
 /**
  * Everything the wizard knows about Cloudflare account authorization.
@@ -391,6 +471,7 @@ export const CloudflareAccountSnapshot = Schema.Struct({
   listedAt: Schema.NullOr(Schema.String),
   selection: Schema.NullOr(CloudflareTunnelSelection),
   step: CloudflareAccountSetupStep,
+  unfinishedCreation: Schema.NullOr(CloudflareUnfinishedCreation),
 });
 export type CloudflareAccountSnapshot = typeof CloudflareAccountSnapshot.Type;
 
@@ -421,6 +502,26 @@ export const SelectCloudflareTunnelInput = Schema.Struct({
   hostname: TrimmedNonEmptyString,
 });
 export type SelectCloudflareTunnelInput = typeof SelectCloudflareTunnelInput.Type;
+
+/**
+ * What to call a tunnel laplus is about to create, and where it will answer.
+ *
+ * **Two different things, which is why they are two fields.** A tunnel's name is
+ * an account-local label Cloudflare shows in its listing; the hostname is a DNS
+ * record routed to it. Creation is the only place a developer supplies both, and
+ * each is refused with its own reason — `tunnel-name-invalid` or
+ * `hostname-invalid` — so a rejection says which box to fix.
+ *
+ * No tunnel id: there is nothing to identify yet. The UUID Cloudflare allocates
+ * comes back in the answer's selection, because that is the resource a later
+ * deletion has to target.
+ */
+export const CreateCloudflareTunnelInput = Schema.Struct({
+  executablePath: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  hostname: TrimmedNonEmptyString,
+});
+export type CreateCloudflareTunnelInput = typeof CreateCloudflareTunnelInput.Type;
 
 /**
  * The body of the one-time HTTP challenge laplus answers to itself through the

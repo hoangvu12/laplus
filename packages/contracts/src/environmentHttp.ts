@@ -26,6 +26,8 @@ import {
 } from "./auth.ts";
 import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+export { PublicExposureMutationStep } from "./remoteAccess.ts";
+
 import {
   ApproveCloudflaredReleaseInput,
   CloudflareAccountCommandInput,
@@ -35,7 +37,9 @@ import {
   ExternalTunnelChallengeResult,
   ExternalTunnelEndpointSnapshot,
   CloudflaredExecutableDiscovery,
+  PublicExposureMutationStep,
   ConfigureManagedCloudflareConnectorInput,
+  CreateCloudflareTunnelInput,
   ManagedCloudflareConnectorSnapshot,
   RegisterExternalTunnelEndpointInput,
   SelectCloudflareTunnelInput,
@@ -238,30 +242,15 @@ export const PublicExposureRefusalReason = Schema.Literals([
    * has to be resolved before this command can run. Ticket 07.
    */
   "cleanup-required",
+  /**
+   * The name for a tunnel laplus would create is not one Cloudflare accepts.
+   * Distinct from `hostname-invalid` because creation asks for two different
+   * things — what to call the tunnel and where it answers — and a developer
+   * given one message for both cannot tell which field to fix. Ticket 06.
+   */
+  "tunnel-name-invalid",
 ]);
 export type PublicExposureRefusalReason = typeof PublicExposureRefusalReason.Type;
-
-/**
- * One step of a multi-step Cloudflare mutation, as a refusal reports it.
- *
- * These are the words tickets 06 and 07 need in order to "identify completed
- * and pending work" and "preserve exact remaining work for idempotent retry"
- * without ever claiming a rollback that did not occur. `dns-record-delete` is
- * deliberately not the mirror of `dns-route`: `cloudflared` has no
- * `route dns delete`, so removing a record is a Cloudflare DNS API call needing
- * its own authority.
- */
-export const PublicExposureMutationStep = Schema.Literals([
-  "credential",
-  "tunnel-create",
-  "dns-route",
-  "configuration",
-  "dns-record-delete",
-  "tunnel-delete",
-  "configuration-remove",
-  "credential-remove",
-]);
-export type PublicExposureMutationStep = typeof PublicExposureMutationStep.Type;
 
 const PublicExposureRefusalFields = {
   code: Schema.Literal("public_exposure_refused"),
@@ -744,6 +733,25 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
     HttpApiEndpoint.post("adoptCloudflareTunnel", "/api/access/cloudflare/account/adopt", {
       headers: OptionalBearerHeaders,
       payload: CloudflareAccountCommandInput,
+      success: CloudflareAccountSnapshot,
+      error: EnvironmentPublicExposureErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    // Creating a stable tunnel for this environment: allocate it, route a DNS
+    // name to it, write laplus's own isolated configuration, and supervise a
+    // connector. The one path that ends in `laplus-created` — the only tunnel
+    // ownership that authorizes deleting anything at Cloudflare (ADR-0049).
+    //
+    // **Three mutations, and every one of them can be the last.** A partial
+    // creation is refused with the exact steps completed and outstanding, and
+    // never claims a rollback: there is no `tunnel delete` in this call.
+    // Repeating it reconciles against the credential that is on disk, the DNS
+    // record the endpoint row names, and the connector's own configuration, so a
+    // resume after a timeout, disconnect or restart duplicates no resource.
+    HttpApiEndpoint.post("createCloudflareTunnel", "/api/access/cloudflare/account/create", {
+      headers: OptionalBearerHeaders,
+      payload: CreateCloudflareTunnelInput,
       success: CloudflareAccountSnapshot,
       error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),

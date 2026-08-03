@@ -531,15 +531,40 @@ pub struct NewSession<'a> {
 
 /// The exact DNS record laplus created, so cleanup can name it and target it.
 ///
-/// A struct because ticket 07 requires "Delete everywhere" to name the record
-/// in its confirmation and then delete *that* record — and because the CLI has
-/// no `route dns delete`, so the delete is a Cloudflare API call that needs the
+/// A struct because ticket 07 requires "Delete everywhere" to name the record in
+/// its confirmation and then delete *that* record — and because the CLI has no
+/// `route dns delete`, so the delete is a Cloudflare API call that needs the
 /// zone as well as the record id. See `.scratch/cloudflare-tunnel/research.md`.
+///
+/// **Only the name is required, and that is a fact about `cloudflared` rather
+/// than a relaxation.** `cloudflared tunnel route dns` prints `Added CNAME
+/// <hostname> which will route to this tunnel` and returns no identifiers at
+/// all, and the zone and record ids live inside the account certificate, whose
+/// *contents* ADR-0045 forbids laplus to read. So the only thing creation can
+/// truthfully write down is the name it asked Cloudflare to create — which is
+/// also the one a destructive confirmation has to show a human. The ids are
+/// filled in by whatever later acquires DNS authority of its own, and until then
+/// their absence is the record saying so. `docs/adr/0051`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsRecord {
-    pub zone_id: String,
-    pub record_id: String,
+    pub zone_id: Option<String>,
+    pub record_id: Option<String>,
     pub name: String,
+}
+
+impl DnsRecord {
+    /// A record laplus created and can name but cannot yet address.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self { zone_id: None, record_id: None, name: name.into() }
+    }
+
+    /// The zone and record this could be deleted through Cloudflare's DNS API
+    /// with, if laplus has both — and `None` for a record it can name and has
+    /// not yet resolved. Both or neither: a record laplus can name but not
+    /// address is not one a deletion could target.
+    pub fn address(&self) -> Option<(&str, &str)> {
+        Some((self.zone_id.as_deref()?, self.record_id.as_deref()?))
+    }
 }
 
 /// The one public endpoint this environment exposes, and who owns it.
@@ -962,15 +987,12 @@ fn public_exposure_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicE
         https_origin: row.get(0)?,
         ownership: closed_word(row, 1)?,
         tunnel_id: row.get(2)?,
-        // All three or none: a record laplus cannot both name and address is
-        // not a record cleanup could target, and a partial one would let a
-        // confirmation display a hostname it could never actually delete.
-        dns_record: match (zone_id, record_id, name) {
-            (Some(zone_id), Some(record_id), Some(name)) => {
-                Some(DnsRecord { zone_id, record_id, name })
-            }
-            _ => None,
-        },
+        // **The name is what makes a record**, because it is the only thing
+        // `cloudflared tunnel route dns` reports back — see [`DnsRecord`]. Zone
+        // and record ids are what a later command with DNS authority learns, so
+        // a row that has the name and neither id is a record laplus made and
+        // has not yet addressed, rather than a half-written one.
+        dns_record: name.map(|name| DnsRecord { zone_id, record_id, name }),
         credential_path: row.get(6)?,
         configuration_path: row.get(7)?,
         verification_state: row.get(8)?,
@@ -1029,8 +1051,8 @@ impl Database {
                 exposure.https_origin,
                 exposure.ownership.as_str(),
                 exposure.tunnel_id,
-                exposure.dns_record.map(|record| record.zone_id.as_str()),
-                exposure.dns_record.map(|record| record.record_id.as_str()),
+                exposure.dns_record.and_then(|record| record.zone_id.as_deref()),
+                exposure.dns_record.and_then(|record| record.record_id.as_deref()),
                 exposure.dns_record.map(|record| record.name.as_str()),
                 exposure.credential_path,
                 exposure.configuration_path,
@@ -4113,8 +4135,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("state.sqlite");
         let record = DnsRecord {
-            zone_id: "zone-1".into(),
-            record_id: "record-1".into(),
+            zone_id: Some("zone-1".into()),
+            record_id: Some("record-1".into()),
             name: "laplus.example.com".into(),
         };
         {
@@ -4155,6 +4177,53 @@ mod tests {
         assert_eq!(adopted.ownership, TunnelOwnership::Adopted);
         assert!(!adopted.ownership.deletable_at_cloudflare());
         assert_eq!(adopted.dns_record, None);
+    }
+
+    /// What `cloudflared tunnel route dns` actually leaves laplus knowing.
+    ///
+    /// The CLI prints a sentence and no identifiers, and the zone and record ids
+    /// are inside an account certificate ADR-0045 forbids reading — so a
+    /// creation records the name it asked for and nothing it would have to
+    /// invent. A row in that shape still *is* a record laplus made, which is
+    /// what makes it survive to whatever later acquires DNS authority.
+    #[test]
+    fn a_dns_record_laplus_can_name_but_not_yet_address_survives_as_a_record() {
+        use crate::public_exposure::TunnelOwnership;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+        {
+            let database = Database::open(&path).expect("creates the database");
+            database
+                .register_public_exposure_endpoint(NewPublicExposure {
+                    ownership: TunnelOwnership::LaplusCreated,
+                    tunnel_id: Some("44444444-4444-4444-4444-444444444444"),
+                    dns_record: Some(&DnsRecord::named("created.example.com")),
+                    ..NewPublicExposure::external("https://created.example.com")
+                })
+                .expect("records a laplus-created tunnel");
+        }
+
+        let database = Database::open(&path).expect("reopens the database");
+        let record = database
+            .public_exposure_endpoint()
+            .unwrap()
+            .unwrap()
+            .dns_record
+            .expect("a record laplus made");
+        assert_eq!(record.name, "created.example.com");
+        // Named, and not yet addressable — which a later deletion has to read as
+        // "find this record" rather than as "there is no record".
+        assert_eq!(record.address(), None);
+        assert_eq!(
+            DnsRecord {
+                zone_id: Some("zone-1".into()),
+                record_id: Some("record-1".into()),
+                name: "created.example.com".into(),
+            }
+            .address(),
+            Some(("zone-1", "record-1"))
+        );
     }
 
     /// What a boot is allowed to do to ownership: nothing.

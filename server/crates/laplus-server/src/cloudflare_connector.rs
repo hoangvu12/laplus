@@ -241,6 +241,26 @@ impl Manager {
         self.directory.join(INGRESS)
     }
 
+    /// Whether this connector is already configured for `https_origin`.
+    ///
+    /// Asked of the manager rather than fished out of its JSON snapshot: three
+    /// call sites were poking `snapshot()["configured"]` and
+    /// `snapshot()["httpsOrigin"]` by hand, which is a typed question answered
+    /// through an untyped keyhole.
+    pub fn serves(&self, https_origin: &str) -> bool {
+        self.runtime
+            .lock()
+            .unwrap()
+            .configuration
+            .as_ref()
+            .is_some_and(|configuration| configuration.https_origin == https_origin)
+    }
+
+    /// Whether a connector is configured at all, whatever it serves.
+    pub fn configured(&self) -> bool {
+        self.runtime.lock().unwrap().configuration.is_some()
+    }
+
     /// The dedicated tunnel this connector is already configured to run, if it
     /// runs one.
     ///
@@ -372,6 +392,13 @@ impl Manager {
             if let Some(origin) = self.owner_origin.lock().unwrap().clone() {
                 unconfigured["loopbackOrigin"] = json!(origin);
             }
+            // Present before anything is configured for the same reason the
+            // loopback target is: ticket 06's creation preview has to name where
+            // the tunnel's run credential will be kept, and a confirmation that
+            // says "somewhere private" is a confirmation of an abstraction. A
+            // path and never contents — the rule `certificatePath` already
+            // follows.
+            unconfigured["credentialPath"] = json!(self.credential_path());
             return unconfigured;
         };
         json!({
@@ -382,6 +409,7 @@ impl Manager {
             "readiness": runtime.readiness,
             "httpsOrigin": configuration.https_origin,
             "loopbackOrigin": configuration.loopback_origin,
+            "credentialPath": configuration.credential.file(),
             "executablePath": configuration.executable_path,
             "detectedVersion": runtime.detected_version,
             "metricsOrigin": runtime.metrics_origin,
@@ -1082,7 +1110,7 @@ fn write_ingress(directory: &Path, configuration: &Configuration) -> Result<(), 
     }
     contents.push_str(&format!(
         "ingress:\n  - hostname: {}\n    service: {}\n  - service: http_status:404\n",
-        configuration.https_origin.trim_start_matches("https://"),
+        crate::public_exposure::hostname_of(&configuration.https_origin),
         configuration.loopback_origin
     ));
     // Idempotent, so that the two callers do not fight: a dedication writes

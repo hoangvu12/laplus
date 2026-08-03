@@ -76,9 +76,11 @@ const unconfiguredConnector: ManagedCloudflareConnectorSnapshot = {
   connectorState: "stopped",
   readiness: null,
   httpsOrigin: null,
-  // The server answers this before anything is configured, because the
-  // dedication confirmation has to show where the public hostname would go.
+  // The server answers both of these before anything is configured, because a
+  // dedication confirmation has to show where the public hostname would go and
+  // a creation confirmation has to show where the run credential will be kept.
   loopbackOrigin: "http://127.0.0.1:4773",
+  credentialPath: "/data/laplus/cloudflare/tunnel.json",
   executablePath: null,
   detectedVersion: null,
   metricsOrigin: null,
@@ -139,6 +141,7 @@ const signedOut: CloudflareAccountSnapshot = {
   listedAt: null,
   selection: null,
   step: "sign-in",
+  unfinishedCreation: null,
 };
 
 const activeTunnel = {
@@ -167,6 +170,7 @@ const listed: CloudflareAccountSnapshot = {
   tunnels: [activeTunnel, inactiveTunnel],
   listedAt: "2026-08-03T09:00:01.000Z",
   step: "choose-tunnel",
+  unfinishedCreation: null,
 };
 
 type Scenario = Parameters<typeof installEnvironmentHttpTest>[0];
@@ -350,6 +354,7 @@ describe("the Cloudflare account path", () => {
       certificateDetected: true,
       loginState: "complete",
       step: "consent",
+      unfinishedCreation: null,
     };
     const testApi = await mount({
       account: detected,
@@ -358,6 +363,7 @@ describe("the Cloudflare account path", () => {
           ...detected,
           certificateConsentedAt: "2026-08-03T09:00:00.000Z",
           step: "choose-tunnel",
+          unfinishedCreation: null,
         }),
     });
     try {
@@ -385,6 +391,7 @@ describe("the Cloudflare account path", () => {
       certificateDetected: true,
       loginState: "complete",
       step: "consent",
+      unfinishedCreation: null,
     };
     const testApi = await mount({
       account: detected,
@@ -431,12 +438,14 @@ describe("the Cloudflare account path", () => {
     const chosen: CloudflareAccountSnapshot = {
       ...listed,
       step: "verify-hostname",
+      unfinishedCreation: null,
       selection: {
         tunnelId: activeTunnel.id,
         name: activeTunnel.name,
         classification: "external",
         httpsOrigin: "https://laplus.example.com",
         adoptionConfirmed: false,
+        created: false,
       },
     };
     const testApi = await mount({
@@ -470,12 +479,14 @@ describe("the Cloudflare account path", () => {
     const chosen: CloudflareAccountSnapshot = {
       ...listed,
       step: "confirm-adoption",
+      unfinishedCreation: null,
       selection: {
         tunnelId: inactiveTunnel.id,
         name: inactiveTunnel.name,
         classification: "adoptable",
         httpsOrigin: "https://spare.example.com",
         adoptionConfirmed: false,
+        created: false,
       },
     };
     const testApi = await mount({ account: chosen });
@@ -635,18 +646,21 @@ describe("dedicating an inactive tunnel", () => {
   const offered: CloudflareAccountSnapshot = {
     ...listed,
     step: "confirm-adoption",
+    unfinishedCreation: null,
     selection: {
       tunnelId: inactiveTunnel.id,
       name: inactiveTunnel.name,
       classification: "adoptable",
       httpsOrigin: "https://spare.example.com",
       adoptionConfirmed: false,
+      created: false,
     },
   };
 
   const dedicated: CloudflareAccountSnapshot = {
     ...offered,
     step: "adopting",
+    unfinishedCreation: null,
     selection: { ...offered.selection!, adoptionConfirmed: true },
   };
 
@@ -776,6 +790,177 @@ describe("dedicating an inactive tunnel", () => {
       const pairing = await screen.findByLabelText("Cloudflare pairing URL");
       expect((pairing as HTMLTextAreaElement).value).toContain("https://spare.example.com");
       expect(testApi.calls.pairingCredential).toHaveLength(1);
+    } finally {
+      await testApi.dispose();
+    }
+  });
+});
+
+describe("creating a stable tunnel", () => {
+  const created: CloudflareAccountSnapshot = {
+    ...listed,
+    step: "creating",
+    unfinishedCreation: null,
+    selection: {
+      tunnelId: "44444444-4444-4444-4444-444444444444",
+      name: "laplus-workstation",
+      classification: "adoptable",
+      httpsOrigin: "https://stable.example.com",
+      adoptionConfirmed: false,
+      created: true,
+    },
+  };
+
+  const createdConnector: ManagedCloudflareConnectorSnapshot = {
+    ...readyConnector,
+    tunnelOwnership: "laplus-created",
+    deletableAtCloudflare: true,
+    httpsOrigin: "https://stable.example.com",
+  };
+
+  /**
+   * Ticket 06, checkbox 1, driven rather than rendered.
+   *
+   * Every line of the preview is something the developer is agreeing to, and
+   * nothing may be confirmed until all of them are there — so this types both
+   * answers and checks the offer before and after.
+   */
+  it("previews the tunnel, address, DNS change, target, credential and warning first", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: listed,
+      createCloudflareTunnel: () => Effect.succeed(created),
+      managedCloudflareConnector: () => Effect.succeed(unconfiguredConnector),
+    });
+    try {
+      await openWizard(user);
+      await user.click(await screen.findByRole("button", { name: "Create a new tunnel" }));
+
+      const offer = await screen.findByLabelText("Create a tunnel");
+      // Locally managed on this computer, said in as many words: Cloudflare's
+      // own recommendation is the other kind of tunnel.
+      expect(offer.textContent).toContain("locally managed on this computer");
+      // Nothing may be confirmed before both answers exist. The control is
+      // shown and refuses rather than hidden, so a developer can see what the
+      // screen is for before they have finished filling it in.
+      const before = await screen.findByRole("button", { name: "Create this tunnel" });
+      expect((before as HTMLButtonElement).disabled).toBe(true);
+
+      await user.type(screen.getByLabelText("New tunnel name"), "laplus-workstation");
+      await user.type(screen.getByLabelText("New tunnel HTTPS hostname"), "Stable.Example.com");
+
+      const previewed = await screen.findByLabelText("Create a tunnel");
+      expect(previewed.textContent).toContain("laplus-workstation");
+      // The address that will exist, not the text that was typed.
+      expect(previewed.textContent).toContain("https://stable.example.com");
+      expect(previewed.textContent).toContain("A new CNAME record for stable.example.com");
+      expect(previewed.textContent).toContain("http://127.0.0.1:4773");
+      expect(previewed.textContent).toContain("/data/laplus/cloudflare/tunnel.json");
+      expect(previewed.textContent).toContain("reachable from the public Internet");
+      expect(previewed.textContent).toContain("laplus authentication remains required");
+
+      await user.click(screen.getByRole("button", { name: "Create this tunnel" }));
+
+      await waitFor(() =>
+        expect(testApi.calls.createCloudflareTunnel).toEqual([
+          {
+            executablePath: "/usr/bin/cloudflared",
+            name: "laplus-workstation",
+            hostname: "Stable.Example.com",
+          },
+        ]),
+      );
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * Ticket 06, checkbox 7, as the developer sees it.
+   *
+   * A creation that allocated a tunnel and could not route it has to say both
+   * halves. The screen must not imply the tunnel was cleaned up: nothing here
+   * deletes anything, and claiming otherwise is precisely what the acceptance
+   * criterion forbids.
+   */
+  it("reports a half-finished creation as what happened and what is left", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: listed,
+      createCloudflareTunnel: () =>
+        Effect.fail(
+          new EnvironmentPublicExposurePreconditionError({
+            code: "public_exposure_refused",
+            reason: "command-failed",
+            message: "cloudflared could not route that hostname to the tunnel.",
+            completed: ["tunnel-create"],
+            remaining: ["dns-route", "configuration"],
+            traceId: "trace",
+          }),
+        ),
+    });
+    try {
+      await openWizard(user);
+      await user.click(await screen.findByRole("button", { name: "Create a new tunnel" }));
+      await user.type(screen.getByLabelText("New tunnel name"), "laplus-workstation");
+      await user.type(screen.getByLabelText("New tunnel HTTPS hostname"), "stable.example.com");
+      await user.click(screen.getByRole("button", { name: "Create this tunnel" }));
+
+      const refusal = await screen.findByText(/could not route that hostname/);
+      expect(refusal.textContent).toContain("Already done: creating the tunnel.");
+      expect(refusal.textContent).toContain(
+        "Still outstanding: creating the DNS route, writing the connector configuration.",
+      );
+      // Never a rollback that did not occur.
+      expect(refusal.textContent).not.toContain("undone");
+      expect(refusal.textContent).not.toContain("rolled back");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * Ticket 06, checkbox 9: the endpoint is identified as laplus-created, and
+   * *only* this ownership is told it may delete anything at Cloudflare.
+   *
+   * The sentence is `deletableAtCloudflare` — the server's own verdict and the
+   * same value ticket 07's deletion command will refuse on — so the offer and
+   * the refusal cannot come apart.
+   */
+  it("identifies a laplus-created tunnel and is the one ownership offered a deletion", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: created,
+      connector: createdConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "laplus-created",
+        deletableAtCloudflare: true,
+        httpsOrigin: "https://stable.example.com",
+      },
+      pairingCredential: () =>
+        Effect.succeed({
+          id: "pairing-link",
+          credential: "pairing-credential",
+          expiresAt: DateTime.makeUnsafe("2026-08-03T09:05:00.000Z"),
+        }),
+    });
+    try {
+      await openWizard(user);
+
+      const panel = await screen.findByLabelText("Dedicated Cloudflare tunnel");
+      expect(panel.textContent).toContain("laplus-created");
+      expect(panel.textContent).toContain("so it can also delete them");
+      // The supervision, stop and pairing behaviour every connector has.
+      expect(screen.getByRole("button", { name: "Stop connector" })).toBeTruthy();
+      expect(screen.queryByLabelText("Connector token")).toBe(null);
+      // Ticket 07 owns the command itself; nothing here draws one.
+      expect(screen.queryByRole("button", { name: /Delete/ })).toBe(null);
+      expect(screen.queryByRole("button", { name: "Forget" })).toBe(null);
+
+      await user.click(screen.getByRole("button", { name: "Pair device" }));
+      const pairing = await screen.findByLabelText("Cloudflare pairing URL");
+      expect((pairing as HTMLTextAreaElement).value).toContain("https://stable.example.com");
     } finally {
       await testApi.dispose();
     }

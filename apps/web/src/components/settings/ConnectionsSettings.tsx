@@ -31,6 +31,7 @@ import {
   type ManagedCloudflareConnectorSnapshot,
   type CloudflareAccountSnapshot,
   type CloudflareAccountTunnel,
+  type CloudflareUnfinishedCreation,
   type CloudflaredExecutable,
   type CloudflaredInstallationSnapshot,
   type CloudflaredRelease,
@@ -47,9 +48,11 @@ import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import {
+  cloudflareCreationPreview,
   cloudflareFailureMessage,
   cloudflareOwnershipLabel,
   cloudflareRowSummary,
+  cloudflareUnfinishedCreationSummary,
   cloudflareWizardState,
   formatRemoteBackendHost,
   mergeVerifiedExternalEndpoint,
@@ -125,6 +128,7 @@ import {
   readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
   adoptCloudflareTunnel,
+  createCloudflareTunnel,
   selectCloudflareTunnel,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
@@ -214,6 +218,11 @@ export function CloudflareTunnelSettingsRow({
   // hostname as somebody else's, and every step derived from that selection
   // then leads back to the same screen. See `cloudflareWizardState`.
   const [revisitingTunnelChoice, setRevisitingTunnelChoice] = useState(false);
+  // The developer asked to make a tunnel rather than pick one. Client-held
+  // because a name and a hostname that have only been typed are not durable
+  // state — see `cloudflareWizardState`.
+  const [creatingTunnel, setCreatingTunnel] = useState(false);
+  const [newTunnelName, setNewTunnelName] = useState("");
   // **Two hostnames, deliberately.** A laplus-managed connector's hostname and
   // an externally managed one are different claims about who owns a lifecycle,
   // and sharing one field made "Register" hand the managed hostname to the
@@ -437,6 +446,33 @@ export function CloudflareTunnelSettingsRow({
     ]);
   }, [executablePath, mutateAccount, refresh, refreshAccount]);
 
+  /**
+   * Create the tunnel, then re-read everything the answer could have moved.
+   *
+   * Three reads for the reason dedication takes three: the account says which
+   * step the wizard is on, the connector says what laplus is now supervising,
+   * and the endpoint says who owns the tunnel behind it — and a refusal moves
+   * the server too, so this refreshes either way. A partial creation leaves a
+   * real tunnel and possibly a real DNS record, and a client still holding the
+   * snapshot from before would offer to create them again.
+   */
+  const createTunnel = useCallback(async () => {
+    await mutateAccount(() =>
+      createCloudflareTunnel({
+        executablePath,
+        name: newTunnelName,
+        hostname: tunnelHostname,
+      }),
+    );
+    await Promise.all([
+      refreshAccount(),
+      readManagedCloudflareConnector()
+        .then(setManaged)
+        .catch(() => undefined),
+      refresh(),
+    ]);
+  }, [executablePath, mutateAccount, newTunnelName, refresh, refreshAccount, tunnelHostname]);
+
   const createPairing = useCallback(async () => {
     const origin = managed?.configured ? managed.httpsOrigin : snapshot?.httpsOrigin;
     if (!origin) return;
@@ -459,6 +495,7 @@ export function CloudflareTunnelSettingsRow({
     chosenPath,
     revisitingPathChoice,
     revisitingTunnelChoice,
+    creatingTunnel,
   });
   const verified =
     managed?.configured === true
@@ -472,15 +509,19 @@ export function CloudflareTunnelSettingsRow({
     wizard.step === "choose-tunnel" ||
     wizard.step === "confirm-adoption" ||
     wizard.step === "adopting" ||
+    wizard.step === "create-tunnel" ||
+    wizard.step === "creating" ||
     wizard.step === "connector-token" ||
     wizard.step === "managed-connector";
   // Dedication runs cloudflared twice — once to re-read the tunnel's activity
-  // and once to retrieve its credential — so the screen that asks for it is
-  // also a screen that has to say which executable will do it.
+  // and once to retrieve its credential — and creation runs it twice as well,
+  // to allocate the tunnel and to route the DNS name. So each screen that asks
+  // for one is also a screen that has to say which executable will do it.
   const picksExecutable =
     wizard.step === "sign-in" ||
     wizard.step === "choose-tunnel" ||
-    wizard.step === "confirm-adoption";
+    wizard.step === "confirm-adoption" ||
+    wizard.step === "create-tunnel";
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -578,6 +619,38 @@ export function CloudflareTunnelSettingsRow({
               onHostnameChange={setTunnelHostname}
               onRefresh={() => void mutateAccount(() => listCloudflareTunnels(executablePath))}
               onChoose={() => void chooseTunnel()}
+              onCreateInstead={() => setCreatingTunnel(true)}
+            />
+          ) : null}
+
+          {wizard.step === "create-tunnel" ? (
+            <CloudflareCreationOffer
+              name={newTunnelName}
+              hostname={tunnelHostname}
+              loopbackOrigin={managed?.loopbackOrigin ?? null}
+              credentialPath={managed?.credentialPath ?? null}
+              unfinished={account?.unfinishedCreation ?? null}
+              canWrite={canWrite}
+              busy={busy}
+              onNameChange={setNewTunnelName}
+              onHostnameChange={setTunnelHostname}
+              onBack={() => setCreatingTunnel(false)}
+              onConfirm={() => void createTunnel()}
+            />
+          ) : null}
+
+          {/* One panel for both dedicated tunnels. What differs between an
+              adopted one and a laplus-created one is a single sentence about
+              deletion, and that sentence is `deletableAtCloudflare` — the
+              server's verdict — rather than a branch here. */}
+          {(wizard.step === "adopting" || wizard.step === "creating") && managed?.configured ? (
+            <CloudflareDedicatedConnectorPanel
+              snapshot={managed}
+              canWrite={canWrite}
+              busy={busy}
+              onStart={() => void mutateManaged("start")}
+              onStop={() => void mutateManaged("stop")}
+              onRetry={() => void mutateManaged("retry")}
             />
           ) : null}
 
@@ -588,17 +661,6 @@ export function CloudflareTunnelSettingsRow({
               canWrite={canWrite}
               busy={busy}
               onConfirm={() => void dedicateTunnel()}
-            />
-          ) : null}
-
-          {wizard.step === "adopting" && managed?.configured ? (
-            <CloudflareDedicatedConnectorPanel
-              snapshot={managed}
-              canWrite={canWrite}
-              busy={busy}
-              onStart={() => void mutateManaged("start")}
-              onStop={() => void mutateManaged("stop")}
-              onRetry={() => void mutateManaged("retry")}
             />
           ) : null}
 
@@ -695,6 +757,7 @@ export function CloudflareTunnelSettingsRow({
               onClick={() => {
                 setChosenPath(null);
                 setRevisitingPathChoice(true);
+                setCreatingTunnel(false);
                 setPairingUrl(null);
               }}
             >
@@ -903,6 +966,7 @@ export function CloudflareTunnelChoiceStep({
   onHostnameChange,
   onRefresh,
   onChoose,
+  onCreateInstead,
 }: {
   readonly account: CloudflareAccountSnapshot;
   readonly canWrite: boolean;
@@ -913,6 +977,7 @@ export function CloudflareTunnelChoiceStep({
   readonly onHostnameChange: (hostname: string) => void;
   readonly onRefresh: () => void;
   readonly onChoose: () => void;
+  readonly onCreateInstead: () => void;
 }) {
   const chosen = account.tunnels.find((tunnel) => tunnel.id === selectedTunnelId);
   return (
@@ -985,6 +1050,144 @@ export function CloudflareTunnelChoiceStep({
             onClick={onChoose}
           >
             Use this tunnel
+          </Button>
+          {/* The way into the third fork. Offered here rather than on the path
+              choice because it needs the account authorization the two screens
+              above establish — creating a tunnel is an account-management
+              action, and the wizard's first screen is about which authority to
+              hand over rather than what to do with it. */}
+          <Button size="sm" variant="outline" disabled={busy} onClick={onCreateInstead}>
+            Create a new tunnel
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * A tunnel laplus would make, and everything the confirmation is a confirmation
+ * of.
+ *
+ * **Locally managed on this computer, said in as many words.** Cloudflare's own
+ * recommendation is a remotely managed tunnel whose configuration lives at
+ * Cloudflare; `cloudflared tunnel create` makes the other kind, and a developer
+ * choosing it should know which one they are getting — the research behind
+ * ADR-0045 is explicit that the CLI-login route is the convenience option rather
+ * than the least-privilege default.
+ *
+ * The preview is {@link cloudflareCreationPreview}, so what may be confirmed and
+ * what is shown are one decision: the button refuses until every line of the
+ * preview is there. Shown-and-disabled rather than hidden, because the screen
+ * has to say what it is for before it has been filled in.
+ */
+export function CloudflareCreationOffer({
+  name,
+  hostname,
+  loopbackOrigin,
+  credentialPath,
+  unfinished,
+  canWrite,
+  busy,
+  onNameChange,
+  onHostnameChange,
+  onBack,
+  onConfirm,
+}: {
+  readonly name: string;
+  readonly hostname: string;
+  readonly loopbackOrigin: string | null;
+  readonly credentialPath: string | null;
+  readonly unfinished: CloudflareUnfinishedCreation | null;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onNameChange: (name: string) => void;
+  readonly onHostnameChange: (hostname: string) => void;
+  readonly onBack: () => void;
+  readonly onConfirm: () => void;
+}) {
+  const preview = cloudflareCreationPreview({ name, hostname, loopbackOrigin, credentialPath });
+  return (
+    <section className="space-y-3" aria-label="Create a tunnel">
+      <div>
+        <p className="text-sm font-medium">Create a tunnel, locally managed on this computer</p>
+        <p className="text-xs text-muted-foreground">
+          laplus creates the tunnel and its DNS route, keeps its own configuration and run
+          credential, and supervises the connector. Cloudflare does not hold this tunnel&rsquo;s
+          configuration — this computer does.
+        </p>
+      </div>
+      {/* An earlier attempt that stopped part way. It says what exists rather
+          than what was attempted, and never implies a rollback: laplus removes
+          nothing here, so a tunnel it allocated is still allocated. */}
+      {unfinished ? (
+        <div className="space-y-1 rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">An earlier attempt did not finish</p>
+          <p>{cloudflareUnfinishedCreationSummary(unfinished)}</p>
+          {unfinished.tunnelId ? (
+            <p className="break-all">
+              Tunnel {unfinished.tunnelId} already exists in your Cloudflare account. Creating again
+              finishes it rather than making a second one.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+      <label className="block">
+        <span className="text-sm font-medium">Tunnel name</span>
+        <Input
+          className="mt-1"
+          aria-label="New tunnel name"
+          placeholder="laplus-workstation"
+          value={name}
+          disabled={busy || !canWrite}
+          onChange={(event) => onNameChange(event.target.value)}
+        />
+        <span className="mt-1 block text-xs text-muted-foreground">
+          A label for this tunnel in your Cloudflare account. Cloudflare allocates its identifier.
+        </span>
+      </label>
+      <label className="block">
+        <span className="text-sm font-medium">HTTPS hostname</span>
+        <Input
+          className="mt-1"
+          aria-label="New tunnel HTTPS hostname"
+          placeholder="laplus.example.com"
+          value={hostname}
+          disabled={busy || !canWrite}
+          onChange={(event) => onHostnameChange(event.target.value)}
+        />
+        <span className="mt-1 block text-xs text-muted-foreground">
+          It must be in a zone this Cloudflare account controls, so that laplus can create the DNS
+          record for it.
+        </span>
+      </label>
+      {preview ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 text-xs text-muted-foreground">
+          <dt>Tunnel</dt>
+          <dd className="break-all">{preview.name}</dd>
+          <dt>Public address</dt>
+          <dd className="break-all">{preview.httpsOrigin}</dd>
+          <dt>DNS change</dt>
+          <dd className="break-all">{preview.dnsChange}</dd>
+          <dt>Routes to</dt>
+          <dd className="break-all">{preview.routesTo}</dd>
+          <dt>Credential</dt>
+          <dd className="break-all">{preview.credentialPath}</dd>
+        </dl>
+      ) : null}
+      <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+        This hostname will be reachable from the public Internet unless you independently protect
+        it; laplus authentication remains required. Cloudflare Access may intercept pairing or
+        WebSocket traffic. Nothing is created until you confirm, and laplus never edits your own
+        cloudflared configuration or installs a system service.
+      </div>
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" disabled={busy || preview === null} onClick={onConfirm}>
+            {busy ? "Working…" : "Create this tunnel"}
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={onBack}>
+            Choose an existing tunnel
           </Button>
         </div>
       ) : null}
@@ -1060,8 +1263,8 @@ export function CloudflareAdoptionOffer({
 }
 
 /**
- * A dedicated tunnel laplus is supervising: an adopted one today, a
- * laplus-created one when ticket 06 lands.
+ * A dedicated tunnel laplus is supervising, however it came by it: one it
+ * adopted, or one it created.
  *
  * **Deliberately not {@link ManagedCloudflareConnectorPanel}.** That panel's
  * controls are a hostname and a connector token, and a dedicated tunnel has

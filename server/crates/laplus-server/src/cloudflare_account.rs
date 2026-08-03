@@ -94,9 +94,8 @@ crate::public_exposure::closed_vocabulary! {
     /// browser, which is what lets a reopened dialog, a reloaded page and a
     /// restarted server agree about how far setup got.
     ///
-    /// **Ticket 06 adds `creating` here.** Adding one is a compile error in
-    /// `step` and a type error in the UI's `WIZARD_STEP_LABELS`, which is the
-    /// point of the enum.
+    /// Adding one is a compile error in `step` and a type error in the UI's
+    /// `WIZARD_STEP_LABELS`, which is the point of the enum.
     SetupStep as "setup step" {
         SignIn => "sign-in",
         Consent => "consent",
@@ -108,6 +107,17 @@ crate::public_exposure::closed_vocabulary! {
         /// step an adopted setup resumes at from here on, because there is
         /// nothing left to ask and everything left to watch.
         Adopting => "adopting",
+        /// laplus allocated the tunnel, routed the DNS name to it and wrote its
+        /// own configuration, and is bringing the connector up. The creation
+        /// twin of `adopting`, and separate from it because the two differ in
+        /// the one thing the screen after them has to say: only this one's
+        /// Cloudflare resources are laplus's to delete.
+        ///
+        /// **Not the screen that asks.** The name and hostname a creation is
+        /// confirmed against are answers nothing has recorded yet, so the offer
+        /// is the client's own step; this is what is true once the mutations
+        /// have happened.
+        Creating => "creating",
     }
 }
 
@@ -123,6 +133,15 @@ pub struct Tunnel {
     pub classification: Classification,
 }
 
+/// Which tunnel this environment's setup is about, and how far laplus has gone.
+///
+/// **Two ways in, and never both.** A tunnel is either chosen out of the account
+/// listing — in which case `select` writes this and dedication may later confirm
+/// it — or made by laplus, in which case creation writes it and `created` is the
+/// only flag that is ever true. They are two booleans rather than one word
+/// because `adoptionConfirmed` was already on the wire before creation existed
+/// and a client that reads it must go on getting the answer it has always got:
+/// a created tunnel was never adopted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Selection {
@@ -130,9 +149,16 @@ pub struct Selection {
     pub name: String,
     pub classification: Classification,
     pub https_origin: String,
-    /// Always false here. Adoption is a later, separate confirmation; until it
-    /// succeeds an inactive tunnel is a choice and not a laplus-managed tunnel.
+    /// Set only by [`Account::confirm_adoption`]. False when a tunnel is merely
+    /// chosen: adoption is a later, separate confirmation, and until it succeeds
+    /// an inactive tunnel is a choice and not a laplus-managed tunnel.
     pub adoption_confirmed: bool,
+    /// Set only by [`Account::confirm_creation`], which is the only thing that
+    /// can be true of a tunnel this environment allocated. Defaulted on read so
+    /// that an `account.json` written before creation existed still parses —
+    /// the reason ticket 05 gave for the same care over `RunCredential`.
+    #[serde(default)]
+    pub created: bool,
 }
 
 #[derive(Debug)]
@@ -163,6 +189,29 @@ pub struct Account {
 /// carrying only a sentence, which left `server.rs` recovering the contract's
 /// reason by matching the prose — see [`RefusalReason`]'s own note.
 pub use crate::public_exposure::{Refusal, RefusalReason};
+
+/// A `tunnel create` that did not finish, and the resource it may have left.
+///
+/// **The identifier outlives the credential.** cloudflared can allocate a tunnel
+/// and still leave laplus without a usable `<UUID>.json` — it can exit non-zero
+/// after writing a truncated one, or exit zero having written one for a
+/// different tunnel — and in both cases laplus removes the file, because a
+/// resume that trusted it would configure a connector against garbage. What must
+/// *not* go with the file is the UUID cloudflared reported: it is the only name
+/// anyone has for a tunnel that may exist at Cloudflare and cannot be run from
+/// here, so it is journaled rather than discarded. `docs/adr/0051`.
+#[derive(Debug)]
+pub struct FailedAllocation {
+    pub refusal: Refusal,
+    pub tunnel_id: Option<String>,
+}
+
+impl FailedAllocation {
+    /// A refusal from before the command ran, so nothing was allocated.
+    fn without_a_tunnel(refusal: Refusal) -> Self {
+        Self { refusal, tunnel_id: None }
+    }
+}
 
 /// The two sentences about a missing certificate, which three callers share.
 fn sign_in_first() -> Refusal {
@@ -512,6 +561,7 @@ impl Account {
                 classification: tunnel.classification,
                 https_origin,
                 adoption_confirmed: false,
+                created: false,
             });
             settings.clone()
         };
@@ -642,6 +692,202 @@ impl Account {
         Ok(())
     }
 
+    /// Allocate a new tunnel, writing its narrow run credential into laplus's
+    /// own private directory.
+    ///
+    /// **`create --credentials-file`, not `token --cred-file`.** A created
+    /// tunnel does not exist until this runs, so the same command that allocates
+    /// it is the one that writes the `<UUID>.json` that will run it — which is
+    /// why creation never asks Cloudflare for a credential separately, and why
+    /// there is no `Credential` step in a creation's journal. `--credentials-file`
+    /// is what keeps that file out of cloudflared's default directory and inside
+    /// laplus's, and `--output json` is what makes the allocated UUID readable
+    /// rather than scraped from a sentence.
+    ///
+    /// **The name is asked for and the UUID is allocated.** They are different
+    /// things and cleanup targets the second, so the id is returned rather than
+    /// the caller being left to assume the two are related.
+    ///
+    /// **Not idempotent on its own.** A credential already on disk is an
+    /// allocation that already happened — but only the *caller* can say whether
+    /// it happened as part of this creation, because an adopted tunnel's
+    /// credential lives at the same path and reusing one would turn a tunnel
+    /// laplus merely borrowed into a tunnel laplus claims to have made. The
+    /// route answers that from the endpoint row and the journal before calling
+    /// this; see `create_cloudflare_tunnel`.
+    pub async fn create_tunnel(
+        &self,
+        executable: &Path,
+        name: &str,
+        credential_file: &Path,
+    ) -> Result<String, FailedAllocation> {
+        let name = match normalize_tunnel_name(name) {
+            Ok(name) => name,
+            Err(refusal) => return Err(FailedAllocation::without_a_tunnel(refusal)),
+        };
+        let (executable, certificate) = self
+            .consented_command(executable)
+            .await
+            .map_err(FailedAllocation::without_a_tunnel)?;
+        if let Some(parent) = credential_file.parent() {
+            crate::cloudflare_connector::private_directory(parent)
+                .map_err(FailedAllocation::without_a_tunnel)?;
+        }
+        let output = tokio::process::Command::new(&executable)
+            .args([
+                "tunnel",
+                "--origincert",
+                &certificate.to_string_lossy(),
+                "create",
+                "--credentials-file",
+                &credential_file.to_string_lossy(),
+                "--output",
+                "json",
+                &name,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|_| {
+                FailedAllocation::without_a_tunnel(Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared could not create the tunnel.",
+                ))
+            })?;
+        let allocated = created_tunnel_id(&String::from_utf8_lossy(&output.stdout));
+        if !output.status.success() {
+            // **Take the wreckage with it**, for the reason retrieval does: the
+            // resume decides by looking, and a truncated `<UUID>.json` left here
+            // would make the next attempt skip an allocation it still needs and
+            // then configure a connector against garbage.
+            let _ = std::fs::remove_file(credential_file);
+            return Err(FailedAllocation {
+                tunnel_id: allocated,
+                refusal: Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared could not create the tunnel. A tunnel with that name may already \
+                     exist in this Cloudflare account.",
+                ),
+            });
+        }
+        let Some(held) = credential_tunnel_id(credential_file).filter(|held| {
+            // What the command *said* and what it *wrote* have to be the same
+            // tunnel, because the connector runs on the file and cleanup targets
+            // the id. A disagreement is a credential laplus cannot vouch for.
+            allocated.as_ref().is_none_or(|allocated| allocated == held)
+        }) else {
+            // The credential goes, and the *identifier does not*: cloudflared
+            // exited successfully, so a tunnel may well exist at Cloudflare with
+            // nothing here able to run it. That id is the only name a cleanup
+            // would have for it, so it is carried out to the journal rather than
+            // thrown away with the file.
+            let _ = std::fs::remove_file(credential_file);
+            return Err(FailedAllocation {
+                tunnel_id: allocated,
+                refusal: Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared created a tunnel but did not write a run credential laplus can \
+                     use. A tunnel of that name may now exist in your Cloudflare account.",
+                ),
+            });
+        };
+        // cloudflared's own umask decides the mode it wrote with, and this file
+        // is the whole of the authority to run the tunnel.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(credential_file, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| FailedAllocation {
+                    tunnel_id: Some(held.clone()),
+                    refusal: Refusal::rejected(
+                        RefusalReason::LocalSetupFailed,
+                        "The tunnel credential could not be protected.",
+                    ),
+                })?;
+        }
+        Ok(held)
+    }
+
+    /// Route a DNS name to a tunnel laplus created.
+    ///
+    /// **No `--overwrite-dns`.** The flag would let laplus take a hostname that
+    /// already answers for something else, which is somebody's DNS zone rather
+    /// than laplus's to reassign — and creation is the one path that is supposed
+    /// to leave everything it did not make alone. A name already in use is
+    /// refused by Cloudflare and reported as such.
+    ///
+    /// **The CLI reports no identifiers.** It prints `Added CNAME <hostname>
+    /// which will route to this tunnel` and stops, so the name is the whole of
+    /// what laplus may write down about the record it made — see
+    /// [`crate::store::DnsRecord`] and `docs/adr/0051`.
+    pub async fn route_dns(
+        &self,
+        executable: &Path,
+        tunnel_id: &str,
+        hostname: &str,
+    ) -> Result<(), Refusal> {
+        let (executable, certificate) = self.consented_command(executable).await?;
+        let output = tokio::process::Command::new(&executable)
+            .args([
+                "tunnel",
+                "--origincert",
+                &certificate.to_string_lossy(),
+                "route",
+                "dns",
+                tunnel_id,
+                hostname,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|_| {
+                Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared could not create the DNS route.",
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Refusal::rejected(
+                RefusalReason::CommandFailed,
+                "cloudflared could not route that hostname to the tunnel. A DNS record for it may \
+                 already exist, or the hostname may be outside this Cloudflare account's zones.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record the tunnel laplus created, and that it created it.
+    ///
+    /// Written last, after the tunnel, the route and the configuration exist,
+    /// for the reason [`Account::confirm_adoption`] is: it is what [`step`]
+    /// reads to say the wizard has moved past the offer, and a setup claiming to
+    /// have moved on from work it had not done is what the journal exists to
+    /// prevent.
+    pub fn confirm_creation(
+        &self,
+        tunnel_id: &str,
+        name: &str,
+        https_origin: &str,
+    ) -> Result<(), Refusal> {
+        let settings = {
+            let mut settings = self.settings.lock().unwrap();
+            settings.selection = Some(Selection {
+                tunnel_id: tunnel_id.to_string(),
+                name: name.to_string(),
+                // Inactive at Cloudflare until laplus's own connector reaches
+                // it, which is the only honest reading of a listing this tunnel
+                // was never in. Nothing branches on it for a created tunnel:
+                // `created` is answered first by `step`.
+                classification: Classification::Adoptable,
+                https_origin: https_origin.to_string(),
+                adoption_confirmed: false,
+                created: true,
+            });
+            settings.clone()
+        };
+        self.persist(&settings)
+    }
+
     /// Record that dedication was confirmed and completed.
     ///
     /// Written last, after the credential and the configuration exist, because
@@ -681,20 +927,71 @@ impl Account {
     }
 }
 
-/// Whether the file at `path` is a usable run credential for `tunnel_id`.
+/// Which tunnel the run credential at `path` is for, if it is one at all.
 ///
 /// **Existence is not the question a resume should ask.** An interrupted
-/// adoption decides whether to spend the account certificate again by looking at
-/// what is on disk, and a file that exists but is truncated, empty, or left over
-/// from a different tunnel would make it skip a retrieval it still needs — and
-/// then configure a connector that can never authenticate. `TunnelID` is
-/// cloudflared's own field name in the `<UUID>.json` credential it writes.
-pub fn credential_for(path: &Path, tunnel_id: &str) -> bool {
+/// adoption or creation decides whether to spend the account certificate again
+/// by looking at what is on disk, and a file that exists but is truncated,
+/// empty, or left over from a different tunnel would make it skip a mutation it
+/// still needs — and then configure a connector that can never authenticate.
+/// `TunnelID` is cloudflared's own field name in the `<UUID>.json` credential it
+/// writes, and it is the only thing in there laplus reads.
+///
+/// The id rather than a yes/no because creation does not know one to compare
+/// against: `tunnel create` is asked for a name and answers with a UUID, so what
+/// a resumed creation needs from the file is *which* tunnel it already made.
+pub fn credential_tunnel_id(path: &Path) -> Option<String> {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|held| held.get("TunnelID")?.as_str().map(str::to_string))
-        .is_some_and(|held| held == tunnel_id)
+}
+
+/// Whether the file at `path` is a usable run credential for `tunnel_id`.
+pub fn credential_for(path: &Path, tunnel_id: &str) -> bool {
+    credential_tunnel_id(path).is_some_and(|held| held == tunnel_id)
+}
+
+/// The UUID `tunnel create --output json` says it allocated.
+///
+/// Read from the structured output rather than from the sentence the plain form
+/// prints, and treated as advisory: the credential file is what the connector
+/// actually runs on, so a disagreement between the two is a refusal rather than
+/// a preference. See [`Account::create_tunnel`].
+fn created_tunnel_id(output: &str) -> Option<String> {
+    serde_json::from_str::<Value>(output.trim())
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// A name Cloudflare will accept for a tunnel, or the refusal saying why not.
+///
+/// Checked here rather than left to `cloudflared`, because this is one of the
+/// two questions a creation asks the developer and a rejection that arrives as
+/// "cloudflared said no" does not say which field to fix. Deliberately narrow:
+/// letters, digits, dash, dot and underscore are what Cloudflare's own tunnel
+/// names use, and anything else — a slash above all — would go into a URL path
+/// laplus builds no request from but a person reads as a resource it is not.
+pub fn normalize_tunnel_name(name: &str) -> Result<String, Refusal> {
+    let candidate = name.trim();
+    let refused = |why: &str| {
+        Refusal::rejected(RefusalReason::TunnelNameInvalid, format!("Enter a tunnel name {why}."))
+    };
+    if candidate.is_empty() {
+        return Err(refused("for laplus to create"));
+    }
+    if candidate.chars().count() > 64 {
+        return Err(refused("of 64 characters or fewer"));
+    }
+    if !candidate
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-._".contains(character))
+    {
+        return Err(refused("using letters, digits, dashes, dots and underscores only"));
+    }
+    Ok(candidate.to_string())
 }
 
 /// Where the account certificate is, by cloudflared's own rules.
@@ -785,6 +1082,11 @@ fn step(certificate: bool, consented: bool, selection: Option<&Selection>) -> Se
     }
     match selection {
         None => SetupStep::ChooseTunnel,
+        // Answered before classification, because a tunnel laplus made was never
+        // in a listing and has no classification worth branching on — and a
+        // created tunnel that fell through to `confirm-adoption` would re-offer
+        // the dedication of a tunnel this environment already owns outright.
+        Some(selection) if selection.created => SetupStep::Creating,
         Some(selection) => match selection.classification {
             Classification::External => SetupStep::VerifyHostname,
             Classification::Adoptable if selection.adoption_confirmed => SetupStep::Adopting,
@@ -854,12 +1156,94 @@ mod tests {
             classification: Classification::External,
             https_origin: "https://laplus.example.com".into(),
             adoption_confirmed: false,
+            created: false,
         };
         assert_eq!(step(true, true, Some(&external)), SetupStep::VerifyHostname);
         let adoptable = Selection {
             classification: Classification::Adoptable,
-            ..external
+            ..external.clone()
         };
         assert_eq!(step(true, true, Some(&adoptable)), SetupStep::ConfirmAdoption);
+        assert_eq!(
+            step(true, true, Some(&Selection { adoption_confirmed: true, ..adoptable.clone() })),
+            SetupStep::Adopting
+        );
+        // A tunnel laplus made is answered before classification. Falling
+        // through to the adoptable arm would re-offer the dedication of a tunnel
+        // this environment already owns outright.
+        assert_eq!(
+            step(true, true, Some(&Selection { created: true, ..adoptable })),
+            SetupStep::Creating
+        );
+        assert_eq!(
+            step(true, true, Some(&Selection { created: true, ..external })),
+            SetupStep::Creating
+        );
+    }
+
+    /// An `account.json` written before creation existed still reads, and reads
+    /// as a tunnel laplus did not create.
+    ///
+    /// The same care ticket 05 took over `RunCredential`, and for the same
+    /// reason: the wizard resumes from this file, and a shape a new build cannot
+    /// parse restarts a setup that was finished.
+    #[test]
+    fn a_selection_recorded_before_creation_existed_still_reads_as_not_created() {
+        let held = serde_json::json!({
+            "tunnelId": "22222222-2222-2222-2222-222222222222",
+            "name": "spare",
+            "classification": "adoptable",
+            "httpsOrigin": "https://spare.example.com",
+            "adoptionConfirmed": true,
+        });
+
+        let selection: Selection = serde_json::from_value(held).expect("reads");
+        assert!(selection.adoption_confirmed);
+        assert!(!selection.created);
+        assert_eq!(step(true, true, Some(&selection)), SetupStep::Adopting);
+    }
+
+    /// Two questions, two answers. A creation asks what to call the tunnel and
+    /// where it answers, and one refusal for both leaves a developer guessing.
+    #[test]
+    fn a_tunnel_name_is_validated_separately_from_the_hostname() {
+        assert_eq!(normalize_tunnel_name("  laplus-workstation  ").unwrap(), "laplus-workstation");
+        assert_eq!(
+            normalize_tunnel_name("laplus.work_station-1").unwrap(),
+            "laplus.work_station-1"
+        );
+        for refused in ["", "   ", "laplus/workstation", "laplus workstation", &"n".repeat(65)] {
+            let failure = normalize_tunnel_name(refused).expect_err(refused);
+            assert_eq!(failure.reason, RefusalReason::TunnelNameInvalid, "{refused}");
+            assert_eq!(failure.kind, crate::public_exposure::RefusalKind::Rejected);
+        }
+    }
+
+    /// `tunnel create` is asked for a name and answers with a UUID, and cleanup
+    /// targets the UUID — so the two are never assumed to be related.
+    #[test]
+    fn the_allocated_tunnel_is_read_from_the_structured_output_and_from_the_credential() {
+        assert_eq!(
+            created_tunnel_id(
+                r#"{"id":"44444444-4444-4444-4444-444444444444","name":"laplus-workstation"}"#
+            )
+            .as_deref(),
+            Some("44444444-4444-4444-4444-444444444444")
+        );
+        assert_eq!(created_tunnel_id("Created tunnel laplus with id 4444"), None);
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let credential = directory.path().join("tunnel.json");
+        assert_eq!(credential_tunnel_id(&credential), None);
+        std::fs::write(&credential, r#"{"AccountTag":"a","TunnelID":"4444","TunnelSecret":"s"}"#)
+            .unwrap();
+        assert_eq!(credential_tunnel_id(&credential).as_deref(), Some("4444"));
+        assert!(credential_for(&credential, "4444"));
+        assert!(!credential_for(&credential, "2222"));
+        // A file that exists and is not a credential is not a mutation that
+        // happened, which is the whole reason a resume reads it rather than
+        // asking whether it is there.
+        std::fs::write(&credential, r#"{"AccountTag": "acc"#).unwrap();
+        assert_eq!(credential_tunnel_id(&credential), None);
     }
 }

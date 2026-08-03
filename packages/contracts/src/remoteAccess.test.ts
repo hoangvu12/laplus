@@ -326,6 +326,7 @@ describe("CloudflareAccountSnapshot", () => {
     listedAt: null,
     selection: null,
     step: "sign-in",
+    unfinishedCreation: null,
   } as const;
   const active = {
     id: "11111111-1111-1111-1111-111111111111",
@@ -352,6 +353,7 @@ describe("CloudflareAccountSnapshot", () => {
       certificateDetected: true,
       loginState: "complete",
       step: "consent",
+      unfinishedCreation: null,
     } as const;
     expect(decodeAccount(detected).step).toBe("consent");
     // A certificate that is merely present has consented to nothing.
@@ -361,6 +363,7 @@ describe("CloudflareAccountSnapshot", () => {
       ...detected,
       certificateConsentedAt: "2026-08-03T09:00:00.000Z",
       step: "choose-tunnel",
+      unfinishedCreation: null,
       tunnels: [active, inactive],
       listedAt: "2026-08-03T09:00:01.000Z",
     } as const;
@@ -371,12 +374,14 @@ describe("CloudflareAccountSnapshot", () => {
       decodeAccount({
         ...consented,
         step: "verify-hostname",
+        unfinishedCreation: null,
         selection: {
           tunnelId: active.id,
           name: active.name,
           classification: "external",
           httpsOrigin: "https://laplus.example.com",
           adoptionConfirmed: false,
+          created: false,
         },
       }).step,
     ).toBe("verify-hostname");
@@ -384,12 +389,14 @@ describe("CloudflareAccountSnapshot", () => {
     const adoptable = decodeAccount({
       ...consented,
       step: "confirm-adoption",
+      unfinishedCreation: null,
       selection: {
         tunnelId: inactive.id,
         name: inactive.name,
         classification: "adoptable",
         httpsOrigin: "https://laplus.example.com",
         adoptionConfirmed: false,
+        created: false,
       },
     });
     expect(adoptable.step).toBe("confirm-adoption");
@@ -402,12 +409,14 @@ describe("CloudflareAccountSnapshot", () => {
     const adopting = decodeAccount({
       ...consented,
       step: "adopting",
+      unfinishedCreation: null,
       selection: {
         tunnelId: inactive.id,
         name: inactive.name,
         classification: "adoptable",
         httpsOrigin: "https://laplus.example.com",
         adoptionConfirmed: true,
+        created: false,
       },
     });
     expect(adopting.step).toBe("adopting");
@@ -417,6 +426,27 @@ describe("CloudflareAccountSnapshot", () => {
     // `tunnelOwnership` on the endpoint, and adoption makes it `adopted`.
     expect(adopting.selection?.classification).toBe("adoptable");
     expect(adopting.selection).not.toHaveProperty("ownership");
+    // Adopted is not created: the two ways a tunnel becomes dedicated are never
+    // both true, and only the second authorizes a Cloudflare deletion.
+    expect(adopting.selection?.created).toBe(false);
+
+    // The creation twin, which is its own step for exactly that reason.
+    const creating = decodeAccount({
+      ...consented,
+      step: "creating",
+      unfinishedCreation: null,
+      selection: {
+        tunnelId: "44444444-4444-4444-4444-444444444444",
+        name: "laplus-workstation",
+        classification: "adoptable",
+        httpsOrigin: "https://stable.example.com",
+        adoptionConfirmed: false,
+        created: true,
+      },
+    });
+    expect(creating.step).toBe("creating");
+    expect(creating.selection?.created).toBe(true);
+    expect(creating.selection?.adoptionConfirmed).toBe(false);
 
     expect(() => decodeAccount({ ...consented, step: "adopted" })).toThrow();
   });
@@ -453,6 +483,7 @@ describe("CloudflareAccountSnapshot", () => {
       certificateDetected: true,
       loginState: "complete",
       step: "consent",
+      unfinishedCreation: null,
       certificate: "FAKE-ACCOUNT-CERTIFICATE-SECRET",
     });
 
@@ -471,6 +502,7 @@ describe("CloudflareAccountSnapshot", () => {
       certificateConsentedAt: "2026-08-03T09:00:00.000Z",
       loginState: "complete",
       step: "choose-tunnel",
+      unfinishedCreation: null,
       tunnels: [active, inactive],
       listedAt: "2026-08-03T09:00:01.000Z",
     });

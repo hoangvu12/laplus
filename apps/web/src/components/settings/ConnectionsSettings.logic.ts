@@ -9,6 +9,7 @@ import type {
   CloudflaredExecutable,
   ExternalTunnelEndpointSnapshot,
   EnvironmentPublicExposureRefusal,
+  CloudflareUnfinishedCreation,
   ManagedCloudflareConnectorSnapshot,
   PublicExposureMutationStep,
   TunnelOwnership,
@@ -101,12 +102,18 @@ export type CloudflareWizardPath = "account" | "connector-token" | "external";
 /**
  * One screen of the Cloudflare wizard.
  *
- * Six of these — `sign-in`, `consent`, `choose-tunnel`, `verify-hostname`,
- * `confirm-adoption` and `adopting` — are named by the *server*:
+ * Seven of these — `sign-in`, `consent`, `choose-tunnel`, `verify-hostname`,
+ * `confirm-adoption`, `adopting` and `creating` — are named by the *server*:
  * `cloudflare_account.rs` computes them from what is durably true and answers
  * them in every account snapshot. They are repeated here as a type rather than
  * re-derived, so that a step the server adds is a compile error here rather
  * than a silently missing screen.
+ *
+ * `create-tunnel` is deliberately **not** one of them. It is the screen that
+ * *asks* for a tunnel name and a hostname, and neither answer exists anywhere
+ * until the developer confirms — so there is nothing durable for the server to
+ * compute it from, exactly as with `choose-path`. What the server names is
+ * `creating`, which is what is true once the mutations have happened.
  */
 export type CloudflareWizardStep =
   | "choose-path"
@@ -116,6 +123,8 @@ export type CloudflareWizardStep =
   | "verify-hostname"
   | "confirm-adoption"
   | "adopting"
+  | "create-tunnel"
+  | "creating"
   | "connector-token"
   | "external-endpoint"
   | "managed-connector";
@@ -153,6 +162,8 @@ const WIZARD_STEP_LABELS: Record<CloudflareWizardStep, string> = {
   "verify-hostname": "Verify the hostname",
   "confirm-adoption": "Dedicate the tunnel",
   adopting: "Dedicated tunnel",
+  "create-tunnel": "Create a tunnel",
+  creating: "laplus-created tunnel",
   "connector-token": "Connector token",
   "external-endpoint": "External hostname",
   "managed-connector": "Laplus-managed connector",
@@ -187,6 +198,22 @@ const ADOPTION_ACCOUNT_STEPS: ReadonlyArray<CloudflareWizardStep> = [
 ];
 
 /**
+ * The third fork: making a tunnel rather than picking one.
+ *
+ * The same length as adoption's and for the same reason — there is a
+ * confirmation to give and a connector to bring up after it — but a different
+ * pair of screens, because what the developer is confirming is two answers they
+ * supplied rather than one tunnel they chose.
+ */
+const CREATION_ACCOUNT_STEPS: ReadonlyArray<CloudflareWizardStep> = [
+  "sign-in",
+  "consent",
+  "choose-tunnel",
+  "create-tunnel",
+  "creating",
+];
+
+/**
  * Has laplus engaged the Cloudflare account path, or is a certificate merely
  * lying on this machine?
  *
@@ -198,6 +225,7 @@ const ADOPTION_ACCOUNT_STEPS: ReadonlyArray<CloudflareWizardStep> = [
  * things only laplus's own wizard produces.
  */
 const accountEngaged = (account: CloudflareAccountSnapshot): boolean =>
+  account.unfinishedCreation !== null ||
   account.certificateConsentedAt !== null ||
   account.tunnels.length > 0 ||
   account.selection !== null ||
@@ -249,12 +277,33 @@ export const cloudflareWizardState = (input: {
    * progress, and answering it is what leaves it.
    */
   readonly revisitingTunnelChoice?: boolean;
+  /**
+   * The developer asked to create a tunnel rather than choose one.
+   *
+   * **Navigation, and the only piece of the creation path the server cannot
+   * answer for.** A tunnel name and a hostname that have only been typed are not
+   * durable state, so there is no snapshot that says "this developer is part way
+   * through creating one" — exactly the situation {@link CloudflareWizardPath}
+   * itself is in. Answering it is what leaves it: the moment creation succeeds
+   * the server reports `creating` and the branches above take over.
+   */
+  readonly creatingTunnel?: boolean;
 }): CloudflareWizardState => {
   const { account, managed, external, chosenPath, revisitingPathChoice } = input;
+  const chosenAccountStep = account?.step ?? "sign-in";
+  // **A creation that never finished is progress, and outranks a typed flag.**
+  // The client's `creatingTunnel` is discarded by a reload; the server's
+  // `unfinishedCreation` is read from a journal a finished creation clears, so
+  // it is what puts a developer back on the screen that can finish the tunnel
+  // they have already half made. Without it a restart after a failed DNS route
+  // showed a wizard offering to create a tunnel that already exists.
+  const resuming = account?.unfinishedCreation != null;
   const accountStep =
     input.revisitingTunnelChoice && account !== null && account.selection !== null
       ? "choose-tunnel"
-      : (account?.step ?? "sign-in");
+      : (resuming || input.creatingTunnel) && chosenAccountStep === "choose-tunnel"
+        ? "create-tunnel"
+        : chosenAccountStep;
 
   // A connector laplus supervises is the one thing no navigation may leave:
   // there is a process running, and pretending otherwise would offer setup for
@@ -266,9 +315,16 @@ export const cloudflareWizardState = (input: {
   // showing the token panel for one would offer to reconfigure it in the one
   // vocabulary that cannot describe it. `tunnelOwnership` is the endpoint row's
   // answer, so this survives a reload and a restart the same way the step does.
+  //
+  // Adopted and laplus-created are two screens rather than one because they
+  // differ in what the screen may offer: only a laplus-created tunnel's
+  // Cloudflare resources are laplus's to delete.
   if (managed?.configured) {
-    return managed.tunnelOwnership === "external"
-      ? wizardState("managed-connector", "connector-token", false)
+    if (managed.tunnelOwnership === "external") {
+      return wizardState("managed-connector", "connector-token", false);
+    }
+    return managed.tunnelOwnership === "laplus-created"
+      ? wizardState("creating", "account", false)
       : wizardState("adopting", "account", false);
   }
   // A path picked outranks the request to pick one, so answering the choice is
@@ -303,7 +359,7 @@ const wizardState = (
   // Forget belongs to the connector's own controls rather than to the external
   // endpoint's, and offering the external Forget here would remove the record a
   // running connector restores itself from.
-  ownsConnector: step === "managed-connector" || step === "adopting",
+  ownsConnector: step === "managed-connector" || step === "adopting" || step === "creating",
   canChangePath,
 });
 
@@ -313,11 +369,66 @@ const accountPosition = (
 ): { readonly index: number; readonly total: number } | null => {
   if (path !== "account") return null;
   const steps =
-    step === "confirm-adoption" || step === "adopting"
-      ? ADOPTION_ACCOUNT_STEPS
-      : EXTERNAL_ACCOUNT_STEPS;
+    step === "create-tunnel" || step === "creating"
+      ? CREATION_ACCOUNT_STEPS
+      : step === "confirm-adoption" || step === "adopting"
+        ? ADOPTION_ACCOUNT_STEPS
+        : EXTERNAL_ACCOUNT_STEPS;
   const index = steps.indexOf(step);
   return index === -1 ? null : { index: index + 1, total: steps.length };
+};
+
+/**
+ * Everything a creation is a confirmation *of*, derived from what has been typed.
+ *
+ * **The screen may not confirm anything it cannot show.** Ticket 06 requires the
+ * preview to name the tunnel, the exact HTTPS hostname, the DNS change, the
+ * loopback target, the credential location and the public-exposure warning
+ * before the button exists — a confirmation that omits any of them is a
+ * confirmation of an abstraction, which is the argument ADR-0045 already makes
+ * about the account certificate.
+ *
+ * `null` when either answer is missing, so there is one place that decides
+ * whether a creation may be offered at all rather than a disabled button and a
+ * half-drawn list.
+ *
+ * **The origin is shown, not validated.** `normalize_hostname` on the server is
+ * the authority and refuses with `hostname-invalid`; lower-casing the host here
+ * is only so the preview shows what will actually be created rather than what
+ * was typed. Anything the server would reject is still rejected.
+ */
+export const cloudflareCreationPreview = (input: {
+  readonly name: string;
+  readonly hostname: string;
+  readonly loopbackOrigin: string | null;
+  readonly credentialPath: string | null;
+}): {
+  readonly name: string;
+  readonly httpsOrigin: string;
+  readonly dnsChange: string;
+  readonly routesTo: string;
+  readonly credentialPath: string;
+} | null => {
+  const name = input.name.trim();
+  const host = input.hostname
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  // **All five, or none.** Substituting "somewhere private" for a credential
+  // path laplus has not answered with yet would be the abstraction this exists
+  // to prevent, and the loopback target and credential path are the two the
+  // developer cannot supply themselves. They arrive with the connector
+  // snapshot, so the only cost of insisting is that the offer refuses for the
+  // moment before it loads.
+  if (name === "" || host === "" || !input.loopbackOrigin || !input.credentialPath) return null;
+  return {
+    name,
+    httpsOrigin: `https://${host}`,
+    dnsChange: `A new CNAME record for ${host} routed to this tunnel`,
+    routesTo: input.loopbackOrigin,
+    credentialPath: input.credentialPath,
+  };
 };
 
 /**
@@ -385,6 +496,35 @@ const MUTATION_STEP_LABELS: Record<PublicExposureMutationStep, string> = {
   "tunnel-delete": "deleting the tunnel",
   "configuration-remove": "removing the connector configuration",
   "credential-remove": "removing the tunnel credential",
+};
+
+/**
+ * What an unfinished creation says it did and did not do.
+ *
+ * Shares {@link MUTATION_STEP_LABELS} with {@link cloudflareRefusalSummary} on
+ * purpose: the sentence a developer reads at the moment of failure and the one
+ * they read after restarting are about the same steps, and two vocabularies for
+ * one journal is how they come to disagree.
+ *
+ * Never claims a rollback. laplus removes nothing when a creation stops, so
+ * completed work is reported as still done — which is exactly why the retry is
+ * safe.
+ */
+export const cloudflareUnfinishedCreationSummary = (
+  unfinished: Pick<CloudflareUnfinishedCreation, "completed" | "remaining">,
+): string => {
+  const sentences: Array<string> = [];
+  if (unfinished.completed.length > 0) {
+    sentences.push(
+      `Already done: ${unfinished.completed.map((step) => MUTATION_STEP_LABELS[step]).join(", ")}.`,
+    );
+  }
+  if (unfinished.remaining.length > 0) {
+    sentences.push(
+      `Still outstanding: ${unfinished.remaining.map((step) => MUTATION_STEP_LABELS[step]).join(", ")}.`,
+    );
+  }
+  return sentences.join(" ");
 };
 
 /**

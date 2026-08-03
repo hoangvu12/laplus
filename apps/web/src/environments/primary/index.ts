@@ -26,6 +26,7 @@ export {
   listCloudflareTunnels,
   readCloudflareAccount,
   adoptCloudflareTunnel,
+  createCloudflareTunnel,
   selectCloudflareTunnel,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,

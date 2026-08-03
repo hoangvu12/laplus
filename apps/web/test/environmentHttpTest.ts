@@ -26,6 +26,7 @@ import {
   type ManagedCloudflareConnectorSnapshot,
   type RegisterExternalTunnelEndpointInput,
   type SelectCloudflareTunnelInput,
+  type CreateCloudflareTunnelInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Context from "effect/Context";
@@ -111,6 +112,9 @@ interface EnvironmentHttpTestScenario {
   readonly adoptCloudflareTunnel?: (
     payload: CloudflareAccountCommandInput,
   ) => Effect.Effect<CloudflareAccountSnapshot, PublicExposureFailure>;
+  readonly createCloudflareTunnel?: (
+    payload: CreateCloudflareTunnelInput,
+  ) => Effect.Effect<CloudflareAccountSnapshot, PublicExposureFailure>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -137,6 +141,7 @@ export interface EnvironmentHttpTestCalls {
   listCloudflareTunnels: Array<CloudflareAccountCommandInput>;
   selectCloudflareTunnel: Array<SelectCloudflareTunnelInput>;
   adoptCloudflareTunnel: Array<CloudflareAccountCommandInput>;
+  createCloudflareTunnel: Array<CreateCloudflareTunnelInput>;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -180,6 +185,7 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     listCloudflareTunnels: [],
     selectCloudflareTunnel: [],
     adoptCloudflareTunnel: [],
+    createCloudflareTunnel: [],
   };
 
   const client = await Effect.runPromise(
@@ -359,6 +365,13 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
               return (
                 scenario.adoptCloudflareTunnel?.(payload) ??
                 unexpectedEndpoint("access.adoptCloudflareTunnel")
+              );
+            })
+            .handle("createCloudflareTunnel", ({ payload }) => {
+              calls.createCloudflareTunnel.push(payload);
+              return (
+                scenario.createCloudflareTunnel?.(payload) ??
+                unexpectedEndpoint("access.createCloudflareTunnel")
               );
             })
             // laplus answering itself through the public hostname, never a

@@ -252,6 +252,12 @@ closed_vocabulary! {
         NotLaplusCreated => "not-laplus-created",
         /// A previous mutation left state half-changed. Ticket 07.
         CleanupRequired => "cleanup-required",
+        /// The name for a tunnel laplus would create is not one Cloudflare
+        /// accepts. Separate from [`RefusalReason::HostnameInvalid`] because
+        /// creation asks for two different things — what to call the tunnel and
+        /// where it answers — and one reason for both leaves the developer
+        /// guessing which field to fix. Ticket 06.
+        TunnelNameInvalid => "tunnel-name-invalid",
     }
 }
 
@@ -379,6 +385,16 @@ pub fn normalize_hostname(input: &str) -> Result<String, &'static str> {
         return Err("A public DNS hostname is required.");
     }
     Ok(format!("https://{}", host.to_ascii_lowercase()))
+}
+
+/// The DNS name inside an origin [`normalize_hostname`] produced.
+///
+/// One place rather than a `trim_start_matches` at each site: the ingress file,
+/// the DNS route and the creation preview all need the bare host out of a value
+/// whose whole point is that it carries the scheme, and three hand-rolled string
+/// surgeries are three chances to disagree about a trailing dot or a case.
+pub fn hostname_of(https_origin: &str) -> &str {
+    https_origin.trim_start_matches("https://")
 }
 
 pub fn public_address(address: IpAddr) -> bool {
@@ -830,6 +846,7 @@ mod tests {
                 "tunnel-became-active",
                 "not-laplus-created",
                 "cleanup-required",
+                "tunnel-name-invalid",
             ]
         );
         for reason in RefusalReason::ALL {
@@ -893,6 +910,10 @@ mod tests {
             normalize_hostname(" Example.COM. "),
             Ok("https://example.com".into())
         );
+        // The bare host is what an ingress rule and a DNS route are written
+        // against, and it comes back out of the origin rather than out of the
+        // text somebody typed.
+        assert_eq!(hostname_of("https://example.com"), "example.com");
         assert!(normalize_hostname("http://example.com").is_err());
         assert!(normalize_hostname("https://example.com/path").is_err());
         assert!(normalize_hostname("127.0.0.1").is_err());

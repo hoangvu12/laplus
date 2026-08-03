@@ -342,8 +342,8 @@ async fn tunnel_ownership_survives_a_restart_and_is_not_the_clients_to_change() 
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.sqlite");
     let record = DnsRecord {
-        zone_id: "zone-1".into(),
-        record_id: "record-1".into(),
+        zone_id: Some("zone-1".into()),
+        record_id: Some("record-1".into()),
         name: "laplus.example.com".into(),
     };
     let database = Database::open(&path).unwrap();

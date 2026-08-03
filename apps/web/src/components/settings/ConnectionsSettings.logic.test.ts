@@ -8,7 +8,9 @@ import type { TunnelOwnership } from "@t3tools/contracts";
 import { PrimaryEnvironmentRequestError } from "../../environments/primary";
 
 import {
+  cloudflareCreationPreview,
   cloudflareFailureMessage,
+  cloudflareUnfinishedCreationSummary,
   cloudflareRefusalSummary,
   cloudflareRowSummary,
   cloudflareWizardState,
@@ -120,6 +122,7 @@ describe("the Cloudflare wizard step machine", () => {
     listedAt: null,
     selection: null,
     step: "sign-in",
+    unfinishedCreation: null,
   } as const;
   const active = {
     id: "11111111-1111-1111-1111-111111111111",
@@ -203,6 +206,7 @@ describe("the Cloudflare wizard step machine", () => {
       certificateDetected: true,
       loginState: "complete",
       step: "consent",
+      unfinishedCreation: null,
     } as const;
     expect(at({ account: detected, chosenPath: "account" }).step).toBe("consent");
     expect(at({ account: detected, chosenPath: "account" }).position).toEqual({
@@ -216,6 +220,7 @@ describe("the Cloudflare wizard step machine", () => {
       tunnels: [active, inactive],
       listedAt: "2026-08-03T09:00:01.000Z",
       step: "choose-tunnel",
+      unfinishedCreation: null,
     } as const;
     expect(at({ account: consented }).step).toBe("choose-tunnel");
     expect(at({ account: consented }).position).toEqual({ index: 3, total: 4 });
@@ -236,12 +241,14 @@ describe("the Cloudflare wizard step machine", () => {
         tunnels: [active, inactive],
         listedAt: "2026-08-03T09:00:01.000Z",
         step: "verify-hostname",
+        unfinishedCreation: null,
         selection: {
           tunnelId: active.id,
           name: active.name,
           classification: "external",
           httpsOrigin: "https://laplus.example.com",
           adoptionConfirmed: false,
+          created: false,
         },
       },
       external,
@@ -264,12 +271,14 @@ describe("the Cloudflare wizard step machine", () => {
         tunnels: [active, inactive],
         listedAt: "2026-08-03T09:00:01.000Z",
         step: "confirm-adoption",
+        unfinishedCreation: null,
         selection: {
           tunnelId: inactive.id,
           name: inactive.name,
           classification: "adoptable",
           httpsOrigin: "https://laplus.example.com",
           adoptionConfirmed: false,
+          created: false,
         },
       },
     });
@@ -337,12 +346,14 @@ describe("the Cloudflare wizard step machine", () => {
       tunnels: [active, inactive],
       listedAt: "2026-08-03T09:00:01.000Z",
       step: "verify-hostname",
+      unfinishedCreation: null,
       selection: {
         tunnelId: inactive.id,
         name: inactive.name,
         classification: "external",
         httpsOrigin: "https://laplus.example.com",
         adoptionConfirmed: false,
+        created: false,
       },
     } as const;
 
@@ -367,6 +378,146 @@ describe("the Cloudflare wizard step machine", () => {
     expect(at({ account: external, managed, revisitingTunnelChoice: true }).step).toBe(
       "managed-connector",
     );
+  });
+
+  /**
+   * The third fork: making a tunnel rather than picking one.
+   *
+   * **The screen that asks is the client's and the screen that reports is the
+   * server's**, and the boundary between them is what has been written down. A
+   * name and a hostname that have only been typed are not durable state, so no
+   * snapshot could compute `create-tunnel`; the moment creation succeeds the
+   * server answers `creating` and the client's flag stops mattering.
+   */
+  it("offers creation from the tunnel list and leaves it the moment the server records one", () => {
+    const consented = {
+      ...account,
+      certificateDetected: true,
+      certificateConsentedAt: "2026-08-03T09:00:00.000Z",
+      loginState: "complete",
+      tunnels: [active, inactive],
+      listedAt: "2026-08-03T09:00:01.000Z",
+      step: "choose-tunnel",
+      unfinishedCreation: null,
+    } as const;
+
+    const creating = at({ account: consented, chosenPath: "account", creatingTunnel: true });
+    expect(creating.step).toBe("create-tunnel");
+    expect(creating.path).toBe("account");
+    // Its own fork, and the same length as adoption's: there is a confirmation
+    // to give and a connector to bring up after it.
+    expect(creating.position).toEqual({ index: 4, total: 5 });
+    expect(creating.ownsConnector).toBe(false);
+    expect(creating.offersExternalRegistration).toBe(false);
+
+    // It is navigation, not progress. Asking to create while the server is still
+    // on sign-in cannot skip the two screens that establish the authority a
+    // creation spends.
+    expect(at({ account, chosenPath: "account", creatingTunnel: true }).step).toBe("sign-in");
+    // And it never overrides a connector laplus already supervises.
+    expect(at({ account: consented, managed, creatingTunnel: true }).step).toBe(
+      "managed-connector",
+    );
+  });
+
+  /**
+   * A creation that never finished puts the developer back where they can
+   * finish it.
+   *
+   * The client's own `creatingTunnel` flag is discarded by a reload, and the
+   * `completed`/`remaining` in the refusal body live exactly as long as the
+   * screen that received them. `unfinishedCreation` is read from a journal a
+   * finished creation clears, so it survives both — and without it a restart
+   * after a failed DNS route showed a wizard offering to create a tunnel that
+   * already existed.
+   */
+  it("resumes onto the creation screen after a restart, with no client flag set", () => {
+    const halfway = {
+      ...account,
+      certificateDetected: true,
+      certificateConsentedAt: "2026-08-03T09:00:00.000Z",
+      loginState: "complete",
+      step: "choose-tunnel",
+      unfinishedCreation: {
+        name: "laplus-workstation",
+        tunnelId: "44444444-4444-4444-4444-444444444444",
+        hostname: null,
+        completed: ["tunnel-create"],
+        remaining: ["dns-route", "configuration"],
+      },
+    } as const;
+
+    const resumed = at({ account: halfway, chosenPath: "account" });
+    expect(resumed.step).toBe("create-tunnel");
+    expect(resumed.position).toEqual({ index: 4, total: 5 });
+
+    // And with no path chosen either, because a half-made Cloudflare tunnel is
+    // engagement with the account path however the dialog was reopened.
+    expect(at({ account: halfway }).step).toBe("create-tunnel");
+
+    // A connector laplus is already supervising still outranks it: that one has
+    // a process behind it.
+    expect(at({ account: halfway, managed }).step).toBe("managed-connector");
+  });
+
+  /**
+   * A laplus-created connector is its own screen, not the adopted one.
+   *
+   * They share a panel and differ in one sentence — only a laplus-created
+   * tunnel's Cloudflare resources are laplus's to delete — and that sentence is
+   * `deletableAtCloudflare`, which the server states. Two steps rather than one
+   * so the wizard's header and the compact row can say which.
+   */
+  it("routes a laplus-created connector to the creating step and keeps it there", () => {
+    const created = {
+      ...managed,
+      tunnelOwnership: "laplus-created",
+      deletableAtCloudflare: true,
+      httpsOrigin: "https://stable.example.com",
+    } as const;
+
+    for (const chosenPath of [null, "account", "connector-token", "external"] as const) {
+      const owned = at({ account, managed: created, external, chosenPath, creatingTunnel: true });
+      expect(owned.step).toBe("creating");
+      expect(owned.path).toBe("account");
+      expect(owned.position).toEqual({ index: 5, total: 5 });
+      // laplus runs this connector, so the external endpoint's Forget is not on
+      // offer and neither is registering its hostname as somebody else's.
+      expect(owned.ownsConnector).toBe(true);
+      expect(owned.offersExternalRegistration).toBe(false);
+      expect(owned.canChangePath).toBe(false);
+    }
+
+    // Adopted and laplus-created stay two answers, which is the whole point.
+    expect(at({ account, managed: { ...managed, tunnelOwnership: "adopted" } }).step).toBe(
+      "adopting",
+    );
+  });
+
+  /**
+   * Ticket 06, checkbox 9: the row identifies a laplus-created tunnel, and
+   * preserves that across restart.
+   *
+   * The word comes from `tunnelOwnership` on the connector snapshot, which is
+   * read from the persisted endpoint row rather than remembered — so what the
+   * row says after a restart is what it said before one.
+   */
+  it("says a laplus-created tunnel is laplus-created in the compact row", () => {
+    const created = {
+      ...managed,
+      tunnelOwnership: "laplus-created",
+      deletableAtCloudflare: true,
+      httpsOrigin: "https://stable.example.com",
+    } as const;
+
+    expect(
+      cloudflareRowSummary({
+        state: at({ account, managed: created }),
+        managed: created,
+        external: null,
+        managedStateLabel: () => "Publicly verified",
+      }),
+    ).toBe("https://stable.example.com · laplus-created · Publicly verified");
   });
 
   /** The compact row names the ownership, because that is what differs. */
@@ -420,6 +571,7 @@ describe("the Cloudflare wizard step machine", () => {
       certificateDetected: true,
       loginState: "complete",
       step: "consent",
+      unfinishedCreation: null,
     } as const;
 
     expect(at({ account: stray }).step).toBe("choose-path");
@@ -446,6 +598,7 @@ describe("the Cloudflare wizard step machine", () => {
       tunnels: [active, inactive],
       listedAt: "2026-08-03T09:00:01.000Z",
       step: "choose-tunnel",
+      unfinishedCreation: null,
     } as const;
 
     expect(at({ account: engaged }).step).toBe("choose-tunnel");
@@ -660,5 +813,92 @@ describe("what a failed Cloudflare request puts on screen", () => {
     expect(cloudflareFailureMessage({}, "The Cloudflare request failed.")).toBe(
       "The Cloudflare request failed.",
     );
+  });
+});
+
+describe("the preview a tunnel creation is confirmed against", () => {
+  const complete = {
+    name: "  laplus-workstation  ",
+    hostname: "  Laplus.Example.COM  ",
+    loopbackOrigin: "http://127.0.0.1:4773",
+    credentialPath: "/data/laplus/cloudflare/tunnel.json",
+  };
+
+  /**
+   * Ticket 06, checkbox 1. Every one of these is something the developer is
+   * being asked to agree to, and a confirmation that omits one is a
+   * confirmation of an abstraction — the argument ADR-0045 already makes about
+   * the account certificate.
+   */
+  it("names the tunnel, the exact address, the DNS change, the target and the credential", () => {
+    expect(cloudflareCreationPreview(complete)).toEqual({
+      name: "laplus-workstation",
+      httpsOrigin: "https://laplus.example.com",
+      dnsChange: "A new CNAME record for laplus.example.com routed to this tunnel",
+      routesTo: "http://127.0.0.1:4773",
+      credentialPath: "/data/laplus/cloudflare/tunnel.json",
+    });
+  });
+
+  /**
+   * The address shown is the one that will be created, not the one that was
+   * typed. `normalize_hostname` on the server is still the authority and still
+   * refuses with `hostname-invalid`; this only stops the preview promising a
+   * hostname that differs in case from the record laplus would make.
+   */
+  it("shows the address that will exist rather than the text that was entered", () => {
+    expect(
+      cloudflareCreationPreview({ ...complete, hostname: "https://Box.example.com/" }),
+    ).toEqual(expect.objectContaining({ httpsOrigin: "https://box.example.com" }));
+    expect(cloudflareCreationPreview({ ...complete, hostname: "http://box.example.com" })).toEqual(
+      expect.objectContaining({ httpsOrigin: "https://box.example.com" }),
+    );
+  });
+
+  /**
+   * One decision about whether a creation may be offered at all, rather than a
+   * disabled button beside a half-drawn list.
+   */
+  it("has no preview, and therefore no offer, until both answers are given", () => {
+    expect(cloudflareCreationPreview({ ...complete, name: "   " })).toBe(null);
+    expect(cloudflareCreationPreview({ ...complete, hostname: "" })).toBe(null);
+  });
+
+  /**
+   * **All five lines, or no offer.**
+   *
+   * The loopback target and the credential location come from the connector
+   * snapshot, and they are the two the developer cannot supply themselves.
+   * Substituting "somewhere private" for a path laplus has not answered with yet
+   * would be precisely the abstraction this preview exists to prevent — so the
+   * offer refuses for the moment before the snapshot loads rather than promising
+   * something it cannot name.
+   */
+  it("has no offer while the connector snapshot cannot say where things go", () => {
+    expect(cloudflareCreationPreview({ ...complete, loopbackOrigin: null })).toBe(null);
+    expect(cloudflareCreationPreview({ ...complete, credentialPath: null })).toBe(null);
+  });
+
+  /**
+   * What a resumed offer tells a developer, and what it must never imply.
+   *
+   * laplus removes nothing when a creation stops, so completed work is reported
+   * as still done — which is exactly why pressing create again is safe. The
+   * vocabulary is shared with the refusal summary, because the sentence read at
+   * the moment of failure and the one read after a restart are about the same
+   * journal.
+   */
+  it("says what an unfinished creation did and left, and never claims a rollback", () => {
+    expect(
+      cloudflareUnfinishedCreationSummary({
+        completed: ["tunnel-create"],
+        remaining: ["dns-route", "configuration"],
+      }),
+    ).toBe(
+      "Already done: creating the tunnel. Still outstanding: creating the DNS route, writing the connector configuration.",
+    );
+    expect(
+      cloudflareUnfinishedCreationSummary({ completed: [], remaining: ["tunnel-create"] }),
+    ).toBe("Still outstanding: creating the tunnel.");
   });
 });

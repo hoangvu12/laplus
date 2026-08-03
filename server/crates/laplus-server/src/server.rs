@@ -566,6 +566,7 @@ impl Server {
             .route("/api/access/cloudflare/account/tunnels", post(list_cloudflare_tunnels))
             .route("/api/access/cloudflare/account/select", post(select_cloudflare_tunnel))
             .route("/api/access/cloudflare/account/adopt", post(adopt_cloudflare_tunnel))
+            .route("/api/access/cloudflare/account/create", post(create_cloudflare_tunnel))
             .route("/api/access/cloudflare/connector", get(cloudflare_connector_status))
             .route("/api/access/cloudflare/connector/configure", post(configure_cloudflare_connector))
             .route("/api/access/cloudflare/connector/start", post(start_cloudflare_connector))
@@ -1811,7 +1812,99 @@ async fn cloudflare_account_state(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:read") { return response; }
-    Json(state.cloudflare_account.snapshot()).into_response()
+    Json(cloudflare_account_snapshot(&state)).into_response()
+}
+
+/// The account wizard's own state, plus the creation it may have left half done.
+///
+/// **Merged here rather than inside the account module**, the way
+/// `managed_connector_snapshot` merges verification state into the connector's:
+/// the journal and the endpoint row are the database's, and `cloudflare_account`
+/// deliberately has neither.
+///
+/// A partial creation was previously visible only in the body of the request
+/// that failed. That is enough to retry from the screen you are standing on and
+/// nothing at all after a reload or a restart — so a developer whose `route dns`
+/// failed came back to a wizard that offered to create a tunnel it had already
+/// made. This is the answer that survives, and it is read from the journal, whose
+/// entries for a finished creation are cleared.
+fn cloudflare_account_snapshot(state: &ServerState) -> serde_json::Value {
+    let mut snapshot = state.cloudflare_account.snapshot();
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("unfinishedCreation".into(), unfinished_creation(state));
+    }
+    snapshot
+}
+
+/// What a creation that never finished got done, and what it has left.
+///
+/// `null` when this environment has no residual `create` journal, which is the
+/// normal case: the journal is cleared the moment a creation completes, so its
+/// presence *is* the unfinished state rather than a flag beside it.
+///
+/// The two lists are read the same way the create route reads them — from what
+/// is observably there — so the wizard cannot be told a step is done that a
+/// retry would then repeat.
+fn unfinished_creation(state: &ServerState) -> serde_json::Value {
+    let database = state.services.shell.database();
+    let Ok(journal) = database.mutation_journal() else { return serde_json::Value::Null };
+    let creation: Vec<_> = journal
+        .iter()
+        .filter(|entry| entry.intent == public_exposure::MutationIntent::Create)
+        .collect();
+    if creation.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let recorded = database.public_exposure_endpoint().ok().flatten();
+    let credential = state.cloudflare_connector.credential_path();
+    let tunnel_id = crate::cloudflare_account::credential_tunnel_id(&credential);
+    let mut completed = Vec::new();
+    if tunnel_id.is_some() {
+        completed.push(public_exposure::MutationStep::TunnelCreate);
+    }
+    // The name the allocation was asked for, which is informational: a resume
+    // finishes the tunnel that exists, so the create route ignores the name
+    // once one does.
+    //
+    // **The step is begun with the name and settled with the UUID**, because
+    // cleanup targets the resource rather than the label — so an entry whose
+    // detail is the id has had its name overwritten, and one that still differs
+    // from the id is a name. Every entry is searched rather than the first,
+    // since an attempt that failed before allocating keeps the name a later one
+    // replaced. Absent when no attempt recorded one, rather than showing the id
+    // under a label that means something else.
+    let name = creation
+        .iter()
+        .filter(|entry| entry.step == public_exposure::MutationStep::TunnelCreate)
+        .find_map(|entry| {
+            entry.detail.clone().filter(|detail| tunnel_id.as_deref() != Some(detail.as_str()))
+        });
+    let dns_name = recorded
+        .as_ref()
+        .and_then(|endpoint| endpoint.dns_record.as_ref())
+        .map(|record| record.name.clone())
+        .or_else(|| {
+            creation
+                .iter()
+                .find(|entry| {
+                    entry.step == public_exposure::MutationStep::DnsRoute
+                        && entry.state == public_exposure::MutationState::Completed
+                })
+                .and_then(|entry| entry.detail.clone())
+        });
+    if dns_name.is_some() {
+        completed.push(public_exposure::MutationStep::DnsRoute);
+    }
+    if state.cloudflare_connector.dedicated_tunnel_id().is_some() {
+        completed.push(public_exposure::MutationStep::Configuration);
+    }
+    serde_json::json!({
+        "name": name,
+        "tunnelId": tunnel_id,
+        "hostname": dns_name,
+        "completed": completed,
+        "remaining": remaining_steps(&CREATION_STEPS, &completed),
+    })
 }
 
 async fn begin_cloudflare_login(
@@ -1822,7 +1915,7 @@ async fn begin_cloudflare_login(
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.begin_login(&body.executable_path).await {
-        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Ok(()) => Json(cloudflare_account_snapshot(&state)).into_response(),
         Err(refusal) => refusal.into_response(),
     }
 }
@@ -1834,7 +1927,7 @@ async fn cancel_cloudflare_login(
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.cancel_login() {
-        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Ok(()) => Json(cloudflare_account_snapshot(&state)).into_response(),
         Err(refusal) => refusal.into_response(),
     }
 }
@@ -1847,7 +1940,7 @@ async fn consent_to_cloudflare_certificate(
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.consent(body.consented) {
-        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Ok(()) => Json(cloudflare_account_snapshot(&state)).into_response(),
         Err(refusal) => refusal.into_response(),
     }
 }
@@ -1860,7 +1953,7 @@ async fn list_cloudflare_tunnels(
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.list_tunnels(&body.executable_path).await {
-        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Ok(()) => Json(cloudflare_account_snapshot(&state)).into_response(),
         Err(refusal) => refusal.into_response(),
     }
 }
@@ -1888,7 +1981,7 @@ async fn select_cloudflare_tunnel(
             return response;
         }
     }
-    Json(state.cloudflare_account.snapshot()).into_response()
+    Json(cloudflare_account_snapshot(&state)).into_response()
 }
 
 /// Record a hostname as somebody else's, and start proving it reaches here.
@@ -1926,11 +2019,37 @@ const ADOPTION_STEPS: [public_exposure::MutationStep; 2] = [
     public_exposure::MutationStep::Configuration,
 ];
 
-fn adoption_remaining(
+/// The three mutations creating a stable tunnel performs, in order.
+///
+/// **Three, and no `Credential` among them**, because `cloudflared tunnel create
+/// --credentials-file` allocates the tunnel *and* writes the narrow credential
+/// that runs it in one command. Journaling a fourth step for something no
+/// command performs separately would put a boundary in the log that a resume
+/// could never be interrupted at — and the whole value of the log is that every
+/// entry in it names a place this can actually stop.
+///
+/// Unlike adoption's two, all three of these are Cloudflare's or laplus's own
+/// resources rather than borrowed ones, which is why creation is the only path
+/// that ends in an ownership authorizing a deletion (ADR-0049).
+const CREATION_STEPS: [public_exposure::MutationStep; 3] = [
+    public_exposure::MutationStep::TunnelCreate,
+    public_exposure::MutationStep::DnsRoute,
+    public_exposure::MutationStep::Configuration,
+];
+
+/// What a mutation has left to do, given what is observably already done.
+///
+/// The steps are a constant per intent and the arithmetic over them is not, so
+/// this is shared where ticket 05 deliberately did not share `ADOPTION_STEPS`
+/// itself: the *lists* differ and must, and subtracting one from the other is
+/// the same sentence either way.
+fn remaining_steps(
+    steps: &[public_exposure::MutationStep],
     completed: &[public_exposure::MutationStep],
 ) -> Vec<public_exposure::MutationStep> {
-    ADOPTION_STEPS
-        .into_iter()
+    steps
+        .iter()
+        .copied()
         .filter(|step| !completed.contains(step))
         .collect()
 }
@@ -2040,7 +2159,7 @@ async fn adopt_cloudflare_tunnel(
         // somebody else's — which is a complete answer rather than a partial
         // adoption. `completed` is whatever an *earlier* attempt left behind,
         // so the sentence never claims a rollback that did not happen.
-        let remaining = adoption_remaining(&completed);
+        let remaining = remaining_steps(&ADOPTION_STEPS, &completed);
         return public_exposure::Refusal::precondition(
             public_exposure::RefusalReason::TunnelBecameActive,
             "A connector started serving that tunnel, so it is externally managed. laplus \
@@ -2067,9 +2186,9 @@ async fn adopt_cloudflare_tunnel(
                 &credential_file,
             )
             .await;
-        settle_adoption_step(&state, sequence, retrieved.is_ok());
+        settle_journaled_step(&state, sequence, retrieved.is_ok(), None);
         if let Err(refusal) = retrieved {
-            return refusal.after(&completed, &adoption_remaining(&completed)).into_response();
+            return refusal.after(&completed, &remaining_steps(&ADOPTION_STEPS, &completed)).into_response();
         }
         completed.push(public_exposure::MutationStep::Credential);
     }
@@ -2090,9 +2209,9 @@ async fn adopt_cloudflare_tunnel(
             &credential_file,
         )
         .await;
-    settle_adoption_step(&state, sequence, configured.is_ok());
+    settle_journaled_step(&state, sequence, configured.is_ok(), None);
     if let Err(refusal) = configured {
-        return refusal.after(&completed, &adoption_remaining(&completed)).into_response();
+        return refusal.after(&completed, &remaining_steps(&ADOPTION_STEPS, &completed)).into_response();
     }
     completed.push(public_exposure::MutationStep::Configuration);
 
@@ -2120,15 +2239,25 @@ async fn adopt_cloudflare_tunnel(
     }
     let verification_state = Arc::clone(&state);
     tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
-    Json(state.cloudflare_account.snapshot()).into_response()
+    Json(cloudflare_account_snapshot(&state)).into_response()
 }
 
-/// Settle a journaled adoption step, if journaling it worked at all.
+/// Settle a journaled mutation step, if journaling it worked at all.
 ///
 /// A journal that cannot be written must not stop the mutation it describes:
-/// the endpoint row is the durable record, and refusing to adopt because a log
-/// line would not write would trade a working tunnel for a tidier history.
-fn settle_adoption_step(state: &ServerState, sequence: Option<i64>, succeeded: bool) {
+/// the endpoint row is the durable record, and refusing to adopt or create
+/// because a log line would not write would trade a working tunnel for a tidier
+/// history.
+///
+/// `detail` replaces what the step was started with when the caller learned
+/// something better — `tunnel create` is asked for a name and allocates a UUID,
+/// and it is the UUID a later cleanup has to target.
+fn settle_journaled_step(
+    state: &ServerState,
+    sequence: Option<i64>,
+    succeeded: bool,
+    detail: Option<&str>,
+) {
     let Some(sequence) = sequence else { return };
     let state_word = if succeeded {
         public_exposure::MutationState::Completed
@@ -2139,10 +2268,301 @@ fn settle_adoption_step(state: &ServerState, sequence: Option<i64>, succeeded: b
         .services
         .shell
         .database()
-        .settle_mutation_step(sequence, state_word, None)
+        .settle_mutation_step(sequence, state_word, detail)
     {
         eprintln!("laplus: cannot settle a Cloudflare mutation step: {error}");
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateCloudflareTunnel {
+    executable_path: std::path::PathBuf,
+    /// What to call the tunnel at Cloudflare. Not the hostname: a tunnel's name
+    /// is an account-local label and the hostname is a DNS record routed to it,
+    /// and creation is the one place a developer supplies both.
+    name: String,
+    hostname: String,
+}
+
+/// Whether a step of this intent settled as completed against exactly `detail`.
+///
+/// **The journal is observed state too.** A DNS route leaves nothing on this
+/// machine to look at — the record is at Cloudflare, and `cloudflared` reports
+/// no identifier for it — so for that one step the log *is* the observation, and
+/// reading it is not the "hopeful in-memory list" the other two steps are read
+/// off disk to avoid. The detail is compared as well as the step, so a route
+/// completed for some other hostname is not read as this one's.
+fn journaled_completion(
+    database: &crate::store::Database,
+    intent: public_exposure::MutationIntent,
+    step: public_exposure::MutationStep,
+    detail: &str,
+) -> bool {
+    database.mutation_journal().is_ok_and(|entries| {
+        entries.iter().any(|entry| {
+            entry.intent == intent
+                && entry.step == step
+                && entry.state == public_exposure::MutationState::Completed
+                && entry.detail.as_deref() == Some(detail)
+        })
+    })
+}
+
+/// Create a stable tunnel for this environment, route a hostname to it, and run
+/// it.
+///
+/// **Three mutations at two places, and every one of them can be the last.** So
+/// each is journaled before it happens and settled after, and — more importantly
+/// — each is *skipped* when the thing it would produce is already there. What
+/// "already there" means is different for all three, which is the whole reason
+/// this cannot be a replay of the log:
+///
+/// - the allocation is observable, because `tunnel create --credentials-file`
+///   writes a `<UUID>.json` into laplus's private directory and that file names
+///   the tunnel Cloudflare made;
+/// - the DNS route is not, because the record is at Cloudflare and the CLI
+///   reports no identifier for it — so the endpoint row's record name, and
+///   failing that this intent's journal, is the observation;
+/// - the configuration is observable, because it is the connector's own settings
+///   file and the manager read it back at boot.
+///
+/// **Nothing here rolls anything back.** There is no `tunnel delete` in this
+/// function and no attempt to unpick a route, because a rollback that can also
+/// fail leaves a worse-described state than the one it was trying to tidy. A
+/// partial creation is reported as what happened and what is left, and ticket 07
+/// owns removing any of it.
+///
+/// **A repeat is a read.** Once the row records the tunnel, the record and the
+/// connector, asking again reconciles and answers with what it already has,
+/// which is what makes a reloaded tab or a retried request harmless.
+async fn create_cloudflare_tunnel(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<CreateCloudflareTunnel>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    // **Both answers the developer supplied are checked before anything runs.**
+    // A rejected request must leave no journal entry and no Cloudflare
+    // resource — and each field gets its own reason, because "cloudflared said
+    // no" does not say which box to fix.
+    let https_origin = match public_exposure::normalize_hostname(&body.hostname) {
+        Ok(origin) => origin,
+        Err(message) => {
+            return public_exposure::Refusal::rejected(
+                public_exposure::RefusalReason::HostnameInvalid,
+                message,
+            )
+            .into_response()
+        }
+    };
+    let name = match crate::cloudflare_account::normalize_tunnel_name(&body.name) {
+        Ok(name) => name,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let dns_name = public_exposure::hostname_of(&https_origin).to_string();
+
+    let database = state.services.shell.database();
+    let recorded = database.public_exposure_endpoint().ok().flatten();
+    let credential_file = state.cloudflare_connector.credential_path();
+    let configuration_file = state.cloudflare_connector.configuration_path();
+    // **Whose credential is on disk?** A tunnel laplus adopted keeps its run
+    // credential at exactly this path, so "there is a credential here" is not
+    // "this creation already allocated a tunnel" — and treating it as one would
+    // register somebody else's allocation as `laplus-created` and hand ticket 07
+    // the authority to delete a tunnel laplus merely borrowed. That is the
+    // laundering ADR-0049 exists to prevent, reached the long way round: adopt,
+    // forget, create.
+    //
+    // A credential is this creation's only if something says so — the endpoint
+    // row already records it as laplus-created, or this intent's journal records
+    // an allocation that started. Both survive a restart; neither can be
+    // produced by adoption.
+    let held = crate::cloudflare_account::credential_tunnel_id(&credential_file);
+    let creation_began = database.mutation_journal().is_ok_and(|entries| {
+        entries.iter().any(|entry| {
+            entry.intent == public_exposure::MutationIntent::Create
+                && entry.step == public_exposure::MutationStep::TunnelCreate
+        })
+    });
+    let ours = recorded.as_ref().is_some_and(|endpoint| {
+        endpoint.ownership == public_exposure::TunnelOwnership::LaplusCreated
+            && endpoint.tunnel_id.is_some()
+            && endpoint.tunnel_id == held
+    }) || creation_began;
+    if held.is_some() && !ours {
+        return public_exposure::Refusal::precondition(
+            public_exposure::RefusalReason::OwnershipConflict,
+            "laplus already holds the run credential of another dedicated tunnel. Forget that \
+             setup before creating a tunnel, so that this environment has one tunnel and one \
+             owner.",
+        )
+        .into_response();
+    }
+    let allocated = held.filter(|_| ours);
+
+    // **One public endpoint, and one owner for it.** A recorded exposure this
+    // creation is not a resume of would be silently replaced by the row below,
+    // taking with it the record of resources some other owner is the only one
+    // able to delete — the laundering `ownership_is_not_the_clients_to_change`
+    // refuses on the routes a client reaches directly.
+    if let Some(endpoint) = &recorded {
+        let resuming_this_one = endpoint.ownership == public_exposure::TunnelOwnership::LaplusCreated
+            && endpoint.https_origin == https_origin
+            && endpoint.tunnel_id.is_some()
+            && endpoint.tunnel_id == allocated;
+        if endpoint.ownership != public_exposure::TunnelOwnership::External && !resuming_this_one {
+            return public_exposure::Refusal::precondition(
+                public_exposure::RefusalReason::OwnershipConflict,
+                format!(
+                    "This environment already has a {} Cloudflare tunnel at {}. Forget it before \
+                     creating another.",
+                    endpoint.ownership, endpoint.https_origin
+                ),
+            )
+            .into_response();
+        }
+    }
+    // The same question about the connector, which is written before the row and
+    // therefore survives a crash the row did not. A connector serving a
+    // different hostname, or running on a connector token, is somebody's working
+    // exposure and not this creation's to take over.
+    if state.cloudflare_connector.configured()
+        && (!state.cloudflare_connector.serves(&https_origin)
+            || state.cloudflare_connector.dedicated_tunnel_id().is_none())
+    {
+        return public_exposure::Refusal::precondition(
+            public_exposure::RefusalReason::OwnershipConflict,
+            "laplus already runs a connector for this environment. Stop and forget it before \
+             creating a tunnel.",
+        )
+        .into_response();
+    }
+
+    let mut completed: Vec<public_exposure::MutationStep> = Vec::new();
+    let refuse = |refusal: public_exposure::Refusal,
+                  completed: &[public_exposure::MutationStep]| {
+        refusal
+            .after(completed, &remaining_steps(&CREATION_STEPS, completed))
+            .into_response()
+    };
+
+    // --- the allocation, and the credential that will outlive the certificate ---
+    let tunnel_id = match allocated {
+        Some(existing) => existing,
+        None => {
+            let sequence = database
+                .begin_mutation_step(
+                    public_exposure::MutationIntent::Create,
+                    public_exposure::MutationStep::TunnelCreate,
+                    Some(&name),
+                )
+                .ok();
+            let created = state
+                .cloudflare_account
+                .create_tunnel(&body.executable_path, &name, &credential_file)
+                .await;
+            // **Settled with the UUID rather than the name, in both directions.**
+            // Cleanup targets the resource that exists and not the label it was
+            // asked for — and cloudflared can allocate a tunnel and still leave
+            // laplus unable to run it, so a failure that learned an id records
+            // that id. It is then the only name anyone has for a tunnel this
+            // machine cannot reach.
+            match created {
+                Ok(tunnel_id) => {
+                    settle_journaled_step(&state, sequence, true, Some(&tunnel_id));
+                    tunnel_id
+                }
+                Err(failure) => {
+                    settle_journaled_step(&state, sequence, false, failure.tunnel_id.as_deref());
+                    return refuse(failure.refusal, &completed);
+                }
+            }
+        }
+    };
+    completed.push(public_exposure::MutationStep::TunnelCreate);
+
+    // --- the DNS route, whose only local record is one laplus writes down ---
+    let routed = recorded.as_ref().is_some_and(|endpoint| {
+        endpoint.ownership == public_exposure::TunnelOwnership::LaplusCreated
+            && endpoint.dns_record.as_ref().is_some_and(|record| record.name == dns_name)
+    }) || journaled_completion(
+        &database,
+        public_exposure::MutationIntent::Create,
+        public_exposure::MutationStep::DnsRoute,
+        &dns_name,
+    );
+    if !routed {
+        let sequence = database
+            .begin_mutation_step(
+                public_exposure::MutationIntent::Create,
+                public_exposure::MutationStep::DnsRoute,
+                Some(&dns_name),
+            )
+            .ok();
+        let routed = state
+            .cloudflare_account
+            .route_dns(&body.executable_path, &tunnel_id, &dns_name)
+            .await;
+        settle_journaled_step(&state, sequence, routed.is_ok(), None);
+        if let Err(refusal) = routed {
+            return refuse(refusal, &completed);
+        }
+    }
+    completed.push(public_exposure::MutationStep::DnsRoute);
+
+    // --- laplus's own configuration, and never the developer's ---
+    let already_configured = state.cloudflare_connector.dedicated_tunnel_id().as_deref()
+        == Some(tunnel_id.as_str())
+        && state.cloudflare_connector.serves(&https_origin);
+    if !already_configured {
+        let sequence = database
+            .begin_mutation_step(
+                public_exposure::MutationIntent::Create,
+                public_exposure::MutationStep::Configuration,
+                Some(&configuration_file.to_string_lossy()),
+            )
+            .ok();
+        let configured = state
+            .cloudflare_connector
+            .dedicate(&https_origin, &body.executable_path, &tunnel_id, &credential_file)
+            .await;
+        settle_journaled_step(&state, sequence, configured.is_ok(), None);
+        if let Err(refusal) = configured {
+            return refuse(refusal, &completed);
+        }
+    }
+    completed.push(public_exposure::MutationStep::Configuration);
+
+    // `LaplusCreated`, with the DNS record laplus made: this is the only
+    // ownership that authorizes deleting anything at Cloudflare, and the row is
+    // where a later deletion reads both what it may remove and what to name in
+    // its confirmation (ADR-0049, ADR-0051).
+    if let Err(error) = database.register_public_exposure_endpoint(crate::store::NewPublicExposure {
+        https_origin: &https_origin,
+        ownership: public_exposure::TunnelOwnership::LaplusCreated,
+        tunnel_id: Some(&tunnel_id),
+        dns_record: Some(&crate::store::DnsRecord::named(&dns_name)),
+        credential_path: Some(&credential_file.to_string_lossy()),
+        configuration_path: Some(&configuration_file.to_string_lossy()),
+    }) {
+        eprintln!("laplus: cannot persist the created tunnel endpoint: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Err(refusal) = state.cloudflare_account.confirm_creation(&tunnel_id, &name, &https_origin)
+    {
+        return refusal.into_response();
+    }
+    // Nothing about this creation is outstanding, so its journal is not residue
+    // a later command has to reason about. Scoped to this intent, because a
+    // finished creation says nothing about a cleanup that is still half done.
+    if let Err(error) = database.clear_mutation_journal(public_exposure::MutationIntent::Create) {
+        eprintln!("laplus: cannot clear the creation journal: {error}");
+    }
+    let verification_state = Arc::clone(&state);
+    tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
+    Json(cloudflare_account_snapshot(&state)).into_response()
 }
 
 async fn cloudflare_connector_status(

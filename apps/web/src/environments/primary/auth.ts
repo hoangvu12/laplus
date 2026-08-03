@@ -18,6 +18,7 @@ import {
   type ConfigureManagedCloudflareConnectorInput,
   type ExternalTunnelEndpointSnapshot,
   type ManagedCloudflareConnectorSnapshot,
+  type CreateCloudflareTunnelInput,
   type SelectCloudflareTunnelInput,
 } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
@@ -63,6 +64,7 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "list-cloudflare-tunnels",
   "select-cloudflare-tunnel",
   "adopt-cloudflare-tunnel",
+  "create-cloudflare-tunnel",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -781,6 +783,32 @@ export async function adoptCloudflareTunnel(
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "adopt-cloudflare-tunnel",
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Create a stable tunnel for this environment and route a hostname to it.
+ *
+ * Sends the name and the hostname because neither exists anywhere yet — unlike
+ * dedication, which names nothing and lets the server use the selection it
+ * already recorded. The UUID Cloudflare allocates comes back in the answer's
+ * selection rather than being asked for, because there is nothing to ask about
+ * until Cloudflare has made it.
+ */
+export async function createCloudflareTunnel(
+  payload: CreateCloudflareTunnelInput,
+): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.createCloudflareTunnel({ headers: {}, payload })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "create-cloudflare-tunnel",
       cause: error,
     });
   }
