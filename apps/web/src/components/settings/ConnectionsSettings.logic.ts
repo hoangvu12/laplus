@@ -498,7 +498,15 @@ export const cloudflareCleanupSummary = (
 ): string => {
   const sentences: Array<string> = [];
   if (cleanup.state === "partially-deleted") {
-    sentences.push("Some of the Cloudflare resources laplus created were removed and some remain.");
+    // A deletion refused at its first step is `partially-deleted` too: the
+    // journal opened a step and settled it failed. Nothing came off Cloudflare
+    // there, and saying otherwise contradicts the outstanding work listed in the
+    // very next sentence.
+    sentences.push(
+      cleanup.completed.length > 0
+        ? "Some of the Cloudflare resources laplus created were removed and some remain."
+        : "None of the Cloudflare resources laplus created were removed; they all remain.",
+    );
   } else if (cleanup.state === "cleanup-required") {
     sentences.push("Some of laplus's own configuration and secrets are still on this computer.");
   }

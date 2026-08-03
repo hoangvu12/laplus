@@ -249,6 +249,14 @@ export function CloudflareTunnelSettingsRow({
   // precisely what ADR-0052 refuses. Cleared after a deletion, so a spent
   // confirmation is never on screen beside a button that would replay it.
   const [deletionPlan, setDeletionPlan] = useState<CloudflareDeletionPlan | null>(null);
+  /**
+   * Which forget has been asked for but not yet confirmed.
+   *
+   * `"managed"` is the dedicated panel's, `"external"` the row's — they call
+   * different routes, so the answer has to remember which was asked rather than
+   * being a bare boolean that both would spend.
+   */
+  const [forgetPending, setForgetPending] = useState<"managed" | "external" | null>(null);
   const [dnsApiToken, setDnsApiToken] = useState("");
 
   const refresh = useCallback(async () => {
@@ -749,32 +757,50 @@ export function CloudflareTunnelSettingsRow({
             />
           ) : null}
 
-          {(wizard.step === "adopting" || wizard.step === "creating") && managed?.configured ? (
-            deletionPlan ? (
-              <CloudflareDeletionConfirmation
-                plan={deletionPlan}
-                dnsApiToken={dnsApiToken}
-                canWrite={canWrite}
-                busy={busy}
-                onDnsApiTokenChange={setDnsApiToken}
-                onCancel={() => {
-                  setDeletionPlan(null);
-                  setDnsApiToken("");
-                }}
-                onConfirm={() => void deleteEverywhere()}
-              />
-            ) : (
-              <CloudflareDedicatedConnectorPanel
-                snapshot={managed}
-                canWrite={canWrite}
-                busy={busy}
-                onStart={() => void mutateManaged("start")}
-                onStop={() => void mutateManaged("stop")}
-                onRetry={() => void mutateManaged("retry")}
-                onForget={() => void forgetSetup()}
-                onDelete={() => void askToDelete()}
-              />
-            )
+          {/* **A minted confirmation is spendable wherever it was minted.** The
+              server spends one when it reads it, so the plan is the only thing
+              that decides this screen — not the step the developer happened to
+              be on when they asked. Nesting it under the dedicated panel's step
+              meant "Finish deleting" on the cleanup screen minted a confirmation
+              that could never reach a button, and the outstanding work that
+              screen had just named stayed outstanding for ever. */}
+          {deletionPlan ? (
+            <CloudflareDeletionConfirmation
+              plan={deletionPlan}
+              dnsApiToken={dnsApiToken}
+              canWrite={canWrite}
+              busy={busy}
+              onDnsApiTokenChange={setDnsApiToken}
+              onCancel={() => {
+                setDeletionPlan(null);
+                setDnsApiToken("");
+              }}
+              onConfirm={() => void deleteEverywhere()}
+            />
+          ) : forgetPending ? (
+            <CloudflareForgetConfirmation
+              httpsOrigin={managed?.httpsOrigin ?? snapshot?.httpsOrigin ?? null}
+              canWrite={canWrite}
+              busy={busy}
+              onCancel={() => setForgetPending(null)}
+              onConfirm={() => {
+                const asked = forgetPending;
+                setForgetPending(null);
+                if (asked === "managed") void forgetSetup();
+                else void mutate("forget");
+              }}
+            />
+          ) : (wizard.step === "adopting" || wizard.step === "creating") && managed?.configured ? (
+            <CloudflareDedicatedConnectorPanel
+              snapshot={managed}
+              canWrite={canWrite}
+              busy={busy}
+              onStart={() => void mutateManaged("start")}
+              onStop={() => void mutateManaged("stop")}
+              onRetry={() => void mutateManaged("retry")}
+              onForget={() => setForgetPending("managed")}
+              onDelete={() => void askToDelete()}
+            />
           ) : null}
 
           {wizard.step === "confirm-adoption" && account?.selection ? (
@@ -897,8 +923,12 @@ export function CloudflareTunnelSettingsRow({
             </Button>
           ) : null}
           {snapshot?.configured && canWrite && !wizard.ownsConnector ? (
-            <Button variant="destructive" disabled={busy} onClick={() => void mutate("forget")}>
-              Forget
+            <Button
+              variant="destructive"
+              disabled={busy}
+              onClick={() => setForgetPending("external")}
+            >
+              Forget…
             </Button>
           ) : null}
           {snapshot?.configured && canWrite ? (
@@ -1479,7 +1509,7 @@ export function CloudflareDedicatedConnectorPanel({
               "local cleanup never implies remote destruction" is the whole
               distinction ticket 07 exists to make legible. */}
           <Button size="sm" variant="outline" disabled={busy} onClick={onForget}>
-            Forget local setup
+            Forget local setup&hellip;
           </Button>
           {snapshot.deletableAtCloudflare ? (
             <Button size="sm" variant="destructive" disabled={busy} onClick={onDelete}>
@@ -1507,6 +1537,67 @@ export function CloudflareDedicatedConnectorPanel({
  * `route dns delete` at all and the account certificate is used in place and
  * never read (ADR-0045). It is sent with this one request and stored nowhere.
  */
+/**
+ * What forgetting takes away, asked before it is taken.
+ *
+ * **Separate from the deletion confirmation, and deliberately not a mode of
+ * it.** "Local cleanup never implies remote destruction" is the distinction
+ * ticket 07 exists to make legible, so this names what stays at Cloudflare as
+ * plainly as it names what goes from this computer — and it asks for no token,
+ * because nothing it does needs authority anywhere but here.
+ *
+ * It confirms for the reason the deletion does: the control sits one click from
+ * a connector that is serving a public hostname, and nothing on this screen puts
+ * back the configuration and the secret it removes.
+ */
+export function CloudflareForgetConfirmation({
+  httpsOrigin,
+  canWrite,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  readonly httpsOrigin: string | null;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onCancel: () => void;
+  readonly onConfirm: () => void;
+}) {
+  return (
+    <section className="space-y-3" aria-label="Forget local setup">
+      <div>
+        <p className="text-sm font-medium text-destructive">
+          Remove laplus&rsquo;s own setup from this computer
+        </p>
+        <p className="text-xs text-muted-foreground">
+          The connector is stopped first, then its configuration and credential are removed.
+          {httpsOrigin ? ` ${httpsOrigin} stops being advertised.` : ""}
+        </p>
+      </div>
+      <ul className="space-y-1 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
+        <li>
+          <span className="font-medium">Removed:</span> laplus&rsquo;s connector configuration and
+          the tunnel credential it stored privately.
+        </li>
+        <li>
+          <span className="font-medium">Untouched:</span> the Cloudflare tunnel and its DNS record,
+          your account certificate, and any cloudflared laplus does not own.
+        </li>
+      </ul>
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+            Keep the setup
+          </Button>
+          <Button size="sm" variant="destructive" disabled={busy} onClick={onConfirm}>
+            Forget local setup
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function CloudflareDeletionConfirmation({
   plan,
   dnsApiToken,
@@ -1647,14 +1738,13 @@ export function CloudflareConnectorStatus({
 }) {
   return (
     <div className="rounded-md border border-border/70 p-3 text-xs">
-      <p>
-        Connector{" "}
-        {snapshot.readiness === true
-          ? "ready"
-          : snapshot.readiness === false
-            ? "not ready"
-            : "readiness unknown"}
-      </p>
+      {/* **The same vocabulary the compact row uses**, rather than `readiness`.
+          A tri-state boolean collapses starting, degraded and restart-exhausted
+          into one "not ready", and those three want three different things from
+          a developer: wait, look at the logs, press Retry. Ticket 02 asks the row
+          *and* the wizard to tell them apart, and sharing the switch is what
+          stops the two from ever disagreeing. */}
+      <p>Connector: {managedCloudflareCompactState(snapshot)}</p>
       <p>Public endpoint {snapshot.verificationState}</p>
       {snapshot.failureMessage ? (
         <p className="text-destructive">{snapshot.failureMessage}</p>

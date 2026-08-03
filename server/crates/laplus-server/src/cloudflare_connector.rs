@@ -45,8 +45,10 @@ crate::public_exposure::closed_vocabulary! {
     /// What the connector is *actually* doing, as the compact row and the wizard
     /// report it.
     ///
-    /// **The last bare `String` in the Cloudflare code, and the exact shape this
-    /// macro was written to abolish.** Every word below was a literal written at
+    /// **The exact shape this macro was written to abolish** — though not the
+    /// last of it: `action` in the supervision loop below is still a bare `&str`
+    /// vocabulary (`"replace"` / `"shutdown"`) compared at four sites, and wants
+    /// the same treatment. Every word below was a literal written at
     /// a dozen sites in this file and compared against at three more, while the
     /// contract pinned the same eight words in
     /// `packages/contracts/src/remoteAccess.ts` and nothing made the two agree.

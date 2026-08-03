@@ -1029,6 +1029,26 @@ describe("what a cleanup left behind", () => {
   });
 
   /**
+   * A deletion refused before it removed anything is still `partially-deleted` —
+   * the journal opened a step and settled it failed — but nothing came off
+   * Cloudflare. Telling a developer resources "were removed" there is the one
+   * thing this summary promises never to do, and it is the sentence they would
+   * act on when deciding what is left to clean up by hand.
+   */
+  it("does not claim a removal when the deletion got nothing done", () => {
+    const nothingDone = cloudflareCleanupSummary({
+      state: "partially-deleted",
+      completed: [],
+      remaining: ["dns-record-delete", "tunnel-delete"],
+    });
+    expect(nothingDone).not.toContain("were removed and some remain");
+    expect(nothingDone).toContain("None of the Cloudflare resources laplus created were removed");
+    expect(nothingDone).toContain(
+      "Still outstanding: deleting the DNS record, deleting the tunnel.",
+    );
+  });
+
+  /**
    * A cleanup with work outstanding outranks every other screen, including a
    * connector laplus is still supervising.
    *

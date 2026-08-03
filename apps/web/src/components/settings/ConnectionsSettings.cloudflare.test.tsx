@@ -1,8 +1,10 @@
+import type { ManagedCloudflareConnectorSnapshot } from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   CloudflaredInstallationPanel,
+  CloudflareConnectorStatus,
   CloudflareLayeredHealth,
   CloudflareTunnelSettingsRow,
   ManagedCloudflareConnectorPanel,
@@ -118,7 +120,10 @@ describe("managed Cloudflare connector", () => {
       />,
     );
 
-    expect(html).toContain("Connector ready");
+    // "Locally ready" rather than "ready": this connector reached the edge and
+    // its public endpoint still failed verification, which is the distinction
+    // the next line is about.
+    expect(html).toContain("Connector: Locally ready");
     expect(html).toContain("Public endpoint failed");
     expect(html).toContain("WebSocket upgrade failed.");
   });
@@ -151,6 +156,28 @@ describe("managed Cloudflare connector", () => {
         readiness: false,
       }),
     ).toBe("Restart exhausted");
+  });
+
+  /**
+   * **The wizard says the same word the row does.** `readiness` is a tri-state,
+   * so a connector that is starting, one that is degraded and one that has spent
+   * its restart budget all read as "Connector not ready" — three situations that
+   * want three different things from a developer. Ticket 02 asks the compact row
+   * *and* the wizard to tell them apart, and one shared vocabulary is how they
+   * cannot come to disagree.
+   */
+  it("names the connector state in the wizard, not just readiness", () => {
+    const statusFor = (connectorState: ManagedCloudflareConnectorSnapshot["connectorState"]) =>
+      renderToStaticMarkup(
+        <CloudflareConnectorStatus snapshot={{ ...snapshot, connectorState, readiness: false }} />,
+      );
+
+    expect(statusFor("starting")).toContain("Starting");
+    expect(statusFor("degraded")).toContain("Degraded");
+    expect(statusFor("restart-exhausted")).toContain("Restart exhausted");
+    // Three states that used to be one sentence are now three.
+    expect(statusFor("starting")).not.toBe(statusFor("degraded"));
+    expect(statusFor("degraded")).not.toBe(statusFor("restart-exhausted"));
   });
 });
 

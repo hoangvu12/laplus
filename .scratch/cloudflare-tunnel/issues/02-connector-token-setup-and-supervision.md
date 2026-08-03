@@ -10,7 +10,7 @@
 - [x] A connector token is accepted into a private token file and never placed in process arguments, contracts, logs, errors, or non-secret persistence.
 - [x] The configured hostname, loopback origin, executable selection, remote ownership, private secret reference, and desired running state survive restart.
 - [x] Laplus starts the connector with explicit private configuration, token-file, and loopback metrics settings and reports `/ready` independently from public endpoint verification.
-- [x] The compact row and wizard distinguish starting, locally ready, publicly verified, degraded, restart-exhausted, stopped, and recoverable failure states.
+- [x] The compact row and wizard distinguish starting, locally ready, publicly verified, degraded, restart-exhausted, stopped, and recoverable failure states. **The wizard half was missing and is now built.** `CloudflareConnectorStatus` rendered `readiness`, a tri-state, so starting, degraded and restart-exhausted all read as "Connector not ready"; it now shares `managedCloudflareCompactState` with the row, which is what stops the two vocabularies from disagreeing.
 - [x] Supervision tolerates child replacement, performs bounded restarts without wall-clock assertions, exposes redacted actionable logs, and requires explicit retry after exhausting its budget.
 - [x] A stable connector starts with its owning shell or headless server and shuts down gracefully with that owner; an externally managed connector is never started or stopped.
 - [x] Stop preserves the tunnel configuration and secret, while a later start restores the same connector and re-verifies the endpoint.

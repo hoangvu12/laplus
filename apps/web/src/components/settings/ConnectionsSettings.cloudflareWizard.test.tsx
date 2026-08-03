@@ -21,7 +21,7 @@ import type {
   ExternalTunnelEndpointSnapshot,
   ManagedCloudflareConnectorSnapshot,
 } from "@t3tools/contracts";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -973,7 +973,7 @@ describe("creating a stable tunnel", () => {
       // separate destructive confirmation for the Cloudflare resources laplus
       // created. Pressing it asks the *server* what would be removed — see
       // "offers a destructive confirmation…" below.
-      expect(screen.getByRole("button", { name: "Forget local setup" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Forget local setup…" })).toBeTruthy();
       expect(screen.getByRole("button", { name: "Delete everywhere…" })).toBeTruthy();
 
       await user.click(screen.getByRole("button", { name: "Pair device" }));
@@ -1076,7 +1076,15 @@ describe("stopping, forgetting and deleting", () => {
       expect(panel.textContent).toContain("can never delete either");
       expect(screen.queryByRole("button", { name: "Delete everywhere…" })).toBe(null);
 
-      await user.click(screen.getByRole("button", { name: "Forget local setup" }));
+      await user.click(screen.getByRole("button", { name: "Forget local setup…" }));
+      // **The first press asks; it does not remove.** Ticket 07 box 2 wants
+      // forget confirmed separately, for the reason delete is: this control is
+      // one click from a connector serving a public hostname, and nothing on
+      // this screen puts back the configuration and secret it takes away.
+      const confirmation = await screen.findByLabelText("Forget local setup");
+      expect(testApi.calls.forgetExternalTunnel).toBe(0);
+
+      await user.click(within(confirmation).getByRole("button", { name: "Forget local setup" }));
       await waitFor(() => expect(testApi.calls.forgetExternalTunnel).toBe(1));
       // Local only: nothing here can have asked for a Cloudflare deletion.
       expect(testApi.calls.offerCloudflareDeletion).toBe(0);
@@ -1227,6 +1235,13 @@ describe("stopping, forgetting and deleting", () => {
       // server spent the last when it read it.
       await user.click(screen.getByRole("button", { name: "Finish deleting" }));
       await waitFor(() => expect(testApi.calls.offerCloudflareDeletion).toBe(1));
+
+      // Minting the confirmation is only half of finishing. The destructive
+      // confirmation has to reach the screen too, or the button mints a
+      // confirmation the developer has no way to spend — and the outstanding
+      // work this panel just named stays outstanding for ever.
+      const confirmation = await screen.findByLabelText("Delete everywhere");
+      expect(confirmation.textContent).toContain("stable.example.com");
     } finally {
       await testApi.dispose();
     }
@@ -1293,7 +1308,7 @@ describe("stopping, forgetting and deleting", () => {
       await openWizard(user);
 
       expect(await screen.findByLabelText("Dedicated Cloudflare tunnel")).toBeTruthy();
-      expect(screen.queryByRole("button", { name: "Forget local setup" })).toBe(null);
+      expect(screen.queryByRole("button", { name: "Forget local setup…" })).toBe(null);
       expect(screen.queryByRole("button", { name: "Delete everywhere…" })).toBe(null);
       expect(screen.queryByRole("button", { name: "Stop connector" })).toBe(null);
     } finally {
