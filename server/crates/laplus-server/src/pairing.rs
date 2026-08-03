@@ -31,15 +31,23 @@
 //! process id and the tick count. Both are fine for a correlation id and
 //! neither is fine for something that keeps a stranger out of the user's shell.
 //!
-//! ## Scopes are recorded and not enforced
+//! ## Scopes are enforced on public exposure and reported everywhere else
 //!
-//! **This is a decision, not an oversight.** The contract has eight scopes and
-//! the UI offers them when minting a code, so they are carried end to end and
-//! reported back. Nothing gates on them, because this server has no
-//! per-method authorization to gate *with* — every RPC it answers, it answers
-//! to any connection. Ticket 73 puts scope enforcement out of scope explicitly.
-//! A reader who adds it should start at [`Grant::scopes`] and
-//! [`crate::rpc`], and should expect the work to be in the latter.
+//! **The split is a decision, not a half-finished migration.** The contract has
+//! eight scopes and the UI offers them when minting a code, so they are carried
+//! end to end and reported back. Every `/api/access/cloudflare` route then
+//! *gates* on `access:read` or `access:write`, through
+//! [`crate::server::require_scope`]: `docs/adr/0047` made public exposure the
+//! first surface where a scope has to mean something, because a tunnel hands
+//! the environment to the internet and a paired phone has no business
+//! administering that. Peer address cannot stand in for it — a public tunnel's
+//! requests arrive from a loopback `cloudflared` too.
+//!
+//! Nothing else gates, because this server still has no per-method
+//! authorization to gate *with*: every RPC it answers, it answers to any
+//! connection. Ticket 73 put that out of scope, and it stays out. A reader who
+//! adds it should start at [`Grant::scopes`] and [`crate::rpc`], and should
+//! expect the work to be in the latter.
 
 use std::fmt;
 

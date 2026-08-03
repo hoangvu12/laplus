@@ -12,13 +12,19 @@ import {
   type AuthSessionState,
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
+  type EnvironmentInternalError,
+  type EnvironmentScopeRequiredError,
   type ExternalTunnelEndpointSnapshot,
   type ApproveCloudflaredReleaseInput,
+  type CloudflareAccountCommandInput,
+  type CloudflareAccountSnapshot,
+  type CloudflareCertificateConsentInput,
   type CloudflaredExecutableDiscovery,
   type CloudflaredInstallationSnapshot,
   type ConfigureManagedCloudflareConnectorInput,
   type ManagedCloudflareConnectorSnapshot,
   type RegisterExternalTunnelEndpointInput,
+  type SelectCloudflareTunnelInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Context from "effect/Context";
@@ -30,6 +36,15 @@ import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import { PrimaryEnvironmentHttpClient } from "../src/environments/primary/httpClient";
 import { __setPrimaryHttpRunnerForTests } from "../src/lib/runtime";
+
+/**
+ * What a scope-gated route may refuse with, so a scenario can drive a refusal.
+ *
+ * The Cloudflare account routes are the first here that need it: ADR-0047 makes
+ * `403` a state the UI has to render, and a handler whose error channel is
+ * `never` cannot produce one.
+ */
+type ScopedOperationFailure = EnvironmentScopeRequiredError | EnvironmentInternalError;
 
 type BrowserSessionHandler = (
   payload: AuthBrowserSessionRequest,
@@ -60,6 +75,26 @@ interface EnvironmentHttpTestScenario {
   readonly startManagedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
   readonly stopManagedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
   readonly retryManagedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
+  readonly cloudflareAccount?: () => Effect.Effect<
+    CloudflareAccountSnapshot,
+    ScopedOperationFailure
+  >;
+  readonly beginCloudflareLogin?: (
+    payload: CloudflareAccountCommandInput,
+  ) => Effect.Effect<CloudflareAccountSnapshot, ScopedOperationFailure>;
+  readonly cancelCloudflareLogin?: () => Effect.Effect<
+    CloudflareAccountSnapshot,
+    ScopedOperationFailure
+  >;
+  readonly consentToCloudflareCertificate?: (
+    payload: CloudflareCertificateConsentInput,
+  ) => Effect.Effect<CloudflareAccountSnapshot, ScopedOperationFailure>;
+  readonly listCloudflareTunnels?: (
+    payload: CloudflareAccountCommandInput,
+  ) => Effect.Effect<CloudflareAccountSnapshot, ScopedOperationFailure>;
+  readonly selectCloudflareTunnel?: (
+    payload: SelectCloudflareTunnelInput,
+  ) => Effect.Effect<CloudflareAccountSnapshot, ScopedOperationFailure>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -79,6 +114,12 @@ export interface EnvironmentHttpTestCalls {
   startManagedCloudflareConnector: number;
   stopManagedCloudflareConnector: number;
   retryManagedCloudflareConnector: number;
+  cloudflareAccount: number;
+  beginCloudflareLogin: Array<CloudflareAccountCommandInput>;
+  cancelCloudflareLogin: number;
+  consentToCloudflareCertificate: Array<CloudflareCertificateConsentInput>;
+  listCloudflareTunnels: Array<CloudflareAccountCommandInput>;
+  selectCloudflareTunnel: Array<SelectCloudflareTunnelInput>;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -115,6 +156,12 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     startManagedCloudflareConnector: 0,
     stopManagedCloudflareConnector: 0,
     retryManagedCloudflareConnector: 0,
+    cloudflareAccount: 0,
+    beginCloudflareLogin: [],
+    cancelCloudflareLogin: 0,
+    consentToCloudflareCertificate: [],
+    listCloudflareTunnels: [],
+    selectCloudflareTunnel: [],
   };
 
   const client = await Effect.runPromise(
@@ -247,7 +294,56 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
                 scenario.retryManagedCloudflareConnector?.() ??
                 unexpectedEndpoint("access.retryManagedCloudflareConnector")
               );
-            }),
+            })
+            .handle("cloudflareAccount", () => {
+              calls.cloudflareAccount += 1;
+              return (
+                scenario.cloudflareAccount?.() ?? unexpectedEndpoint("access.cloudflareAccount")
+              );
+            })
+            .handle("beginCloudflareLogin", ({ payload }) => {
+              calls.beginCloudflareLogin.push(payload);
+              return (
+                scenario.beginCloudflareLogin?.(payload) ??
+                unexpectedEndpoint("access.beginCloudflareLogin")
+              );
+            })
+            .handle("cancelCloudflareLogin", () => {
+              calls.cancelCloudflareLogin += 1;
+              return (
+                scenario.cancelCloudflareLogin?.() ??
+                unexpectedEndpoint("access.cancelCloudflareLogin")
+              );
+            })
+            .handle("consentToCloudflareCertificate", ({ payload }) => {
+              calls.consentToCloudflareCertificate.push(payload);
+              return (
+                scenario.consentToCloudflareCertificate?.(payload) ??
+                unexpectedEndpoint("access.consentToCloudflareCertificate")
+              );
+            })
+            .handle("listCloudflareTunnels", ({ payload }) => {
+              calls.listCloudflareTunnels.push(payload);
+              return (
+                scenario.listCloudflareTunnels?.(payload) ??
+                unexpectedEndpoint("access.listCloudflareTunnels")
+              );
+            })
+            .handle("selectCloudflareTunnel", ({ payload }) => {
+              calls.selectCloudflareTunnel.push(payload);
+              return (
+                scenario.selectCloudflareTunnel?.(payload) ??
+                unexpectedEndpoint("access.selectCloudflareTunnel")
+              );
+            })
+            // laplus answering itself through the public hostname, never a
+            // client. See the contract's own comment on these two.
+            .handle("externalTunnelHttpChallenge", () =>
+              unexpectedEndpoint("access.externalTunnelHttpChallenge"),
+            )
+            .handle("externalTunnelWebSocketChallenge", () =>
+              unexpectedEndpoint("access.externalTunnelWebSocketChallenge"),
+            ),
         ),
       ]),
       Effect.provideService(EnvironmentAuthenticatedAuth, authenticatedAuth),

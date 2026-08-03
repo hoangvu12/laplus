@@ -348,6 +348,51 @@ async fn an_external_endpoint_never_acquires_a_managed_connector_lifecycle() {
     server.stop().await;
 }
 
+/// The same rule read from the other end, and the one the UI cannot enforce.
+///
+/// Hiding the register control for a configured connector keeps a *person* from
+/// claiming laplus's own hostname as somebody else's. This is the route saying
+/// no, which is what stops a stale tab, a scripted client or a second window
+/// from overwriting the endpoint record the connector restores itself from.
+/// ADR-0045: every lifecycle action has one owner.
+#[tokio::test]
+async fn a_supervised_connector_refuses_to_have_its_exposure_claimed_as_external() {
+    let directory = tempfile::tempdir().unwrap();
+    let (executable, _trace, _mode) = fake_cloudflared(directory.path());
+    let server = TestServer::start_configured_in(directory.path()).await;
+    let configured = server.post_json(
+        "/api/access/cloudflare/connector/configure",
+        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"connector-secret"}),
+    ).await;
+    assert_eq!(configured.status, 200, "{}", configured.text);
+
+    let claimed = server
+        .post_json(
+            "/api/access/cloudflare",
+            &json!({"hostname":"laplus.example.com"}),
+        )
+        .await;
+    assert_eq!(claimed.status, 409, "{}", claimed.text);
+    assert!(claimed.text.contains("already runs a connector"));
+
+    let selected = server
+        .post_json(
+            "/api/access/cloudflare/account/select",
+            &json!({"tunnelId":"11111111-1111-1111-1111-111111111111",
+                    "hostname":"laplus.example.com"}),
+        )
+        .await;
+    assert_eq!(selected.status, 409, "{}", selected.text);
+
+    // The connector still owns what it owned, and still says so.
+    let endpoint = server.get("/api/access/cloudflare").await;
+    assert_eq!(endpoint.body["httpsOrigin"], "https://laplus.example.com");
+    let connector = server.get("/api/access/cloudflare/connector").await;
+    assert_eq!(connector.body["configured"], true);
+    assert_eq!(connector.body["httpsOrigin"], "https://laplus.example.com");
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn a_ready_replacement_is_adopted_without_launching_a_duplicate_and_stops_with_its_owner() {
     let directory = tempfile::tempdir().unwrap();

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  CloudflareAccountSnapshot,
   CloudflaredInstallationSnapshot,
   ExternalTunnelEndpointSnapshot,
   ManagedCloudflareConnectorSnapshot,
@@ -253,5 +254,157 @@ describe("CloudflaredInstallationSnapshot", () => {
     });
     expect(unsupported.supported).toBe(false);
     expect(unsupported.unsupportedMessage).toContain("archive");
+  });
+});
+
+describe("CloudflareAccountSnapshot", () => {
+  const decodeAccount = Schema.decodeUnknownSync(CloudflareAccountSnapshot);
+  const warning =
+    "The Cloudflare account certificate can create, list, route, and delete every tunnel in your account, and stays valid for years. laplus uses it where cloudflared put it and never copies, moves, replaces, or deletes it.";
+  const nothingYet = {
+    certificateDetected: false,
+    certificatePath: "/home/dev/.cloudflared/cert.pem",
+    certificateConsentedAt: null,
+    certificateWarning: warning,
+    loginState: "not-started",
+    authorizationUrl: null,
+    failureMessage: null,
+    tunnels: [],
+    listedAt: null,
+    selection: null,
+    step: "sign-in",
+  } as const;
+  const active = {
+    id: "11111111-1111-1111-1111-111111111111",
+    name: "already-running",
+    createdAt: "2026-01-01T00:00:00Z",
+    connectionCount: 2,
+    activity: "active",
+    classification: "external",
+  } as const;
+  const inactive = {
+    id: "22222222-2222-2222-2222-222222222222",
+    name: "spare",
+    createdAt: "2026-02-02T00:00:00Z",
+    connectionCount: 0,
+    activity: "inactive",
+    classification: "adoptable",
+  } as const;
+
+  it("decodes every step an interrupted setup can resume at", () => {
+    expect(decodeAccount(nothingYet).step).toBe("sign-in");
+
+    const detected = {
+      ...nothingYet,
+      certificateDetected: true,
+      loginState: "complete",
+      step: "consent",
+    } as const;
+    expect(decodeAccount(detected).step).toBe("consent");
+    // A certificate that is merely present has consented to nothing.
+    expect(decodeAccount(detected).certificateConsentedAt).toBeNull();
+
+    const consented = {
+      ...detected,
+      certificateConsentedAt: "2026-08-03T09:00:00.000Z",
+      step: "choose-tunnel",
+      tunnels: [active, inactive],
+      listedAt: "2026-08-03T09:00:01.000Z",
+    } as const;
+    expect(decodeAccount(consented).step).toBe("choose-tunnel");
+    expect(decodeAccount(consented).tunnels).toHaveLength(2);
+
+    expect(
+      decodeAccount({
+        ...consented,
+        step: "verify-hostname",
+        selection: {
+          tunnelId: active.id,
+          name: active.name,
+          classification: "external",
+          httpsOrigin: "https://laplus.example.com",
+          adoptionConfirmed: false,
+        },
+      }).step,
+    ).toBe("verify-hostname");
+
+    const adoptable = decodeAccount({
+      ...consented,
+      step: "confirm-adoption",
+      selection: {
+        tunnelId: inactive.id,
+        name: inactive.name,
+        classification: "adoptable",
+        httpsOrigin: "https://laplus.example.com",
+        adoptionConfirmed: false,
+      },
+    });
+    expect(adoptable.step).toBe("confirm-adoption");
+    // ADR-0045: choosing an inactive tunnel is a candidate, not a dedication.
+    expect(adoptable.selection?.adoptionConfirmed).toBe(false);
+  });
+
+  it("decodes every browser-authorization state, including the ones that end it", () => {
+    for (const loginState of [
+      "not-started",
+      "awaiting-browser",
+      "complete",
+      "cancelled",
+      "timed-out",
+      "failed",
+    ] as const) {
+      expect(
+        decodeAccount({
+          ...nothingYet,
+          loginState,
+          authorizationUrl:
+            loginState === "awaiting-browser"
+              ? "https://dash.cloudflare.com/argotunnel?callback=test"
+              : null,
+          failureMessage:
+            loginState === "timed-out"
+              ? "Cloudflare authorization timed out. Start it again when you are ready."
+              : null,
+        }).loginState,
+      ).toBe(loginState);
+    }
+  });
+
+  it("carries the certificate warning and its location, and never the certificate", () => {
+    const snapshot = decodeAccount({
+      ...nothingYet,
+      certificateDetected: true,
+      loginState: "complete",
+      step: "consent",
+      certificate: "FAKE-ACCOUNT-CERTIFICATE-SECRET",
+    });
+
+    expect(snapshot.certificateWarning).toContain("create, list, route, and delete every tunnel");
+    expect(snapshot.certificateWarning).toContain("never copies, moves, replaces, or deletes it");
+    // A path, so consent can name the file it is consent to use — and nothing
+    // that would let a client read it. See the schema's own comment.
+    expect(snapshot.certificatePath).toBe("/home/dev/.cloudflared/cert.pem");
+    expect(snapshot).not.toHaveProperty("certificate");
+  });
+
+  it("reads activity from connections and never invents a hostname or ownership", () => {
+    const snapshot = decodeAccount({
+      ...nothingYet,
+      certificateDetected: true,
+      certificateConsentedAt: "2026-08-03T09:00:00.000Z",
+      loginState: "complete",
+      step: "choose-tunnel",
+      tunnels: [active, inactive],
+      listedAt: "2026-08-03T09:00:01.000Z",
+    });
+
+    expect(snapshot.tunnels[0]?.activity).toBe("active");
+    expect(snapshot.tunnels[0]?.classification).toBe("external");
+    expect(snapshot.tunnels[1]?.activity).toBe("inactive");
+    expect(snapshot.tunnels[1]?.classification).toBe("adoptable");
+    for (const tunnel of snapshot.tunnels) {
+      expect(tunnel).not.toHaveProperty("hostname");
+      expect(tunnel).not.toHaveProperty("managementMode");
+    }
   });
 });

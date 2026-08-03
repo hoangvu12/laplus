@@ -11,11 +11,13 @@ import {
   EnvironmentHttpCommonError,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   type ApproveCloudflaredReleaseInput,
+  type CloudflareAccountSnapshot,
   type CloudflaredExecutableDiscovery,
   type CloudflaredInstallationSnapshot,
   type ConfigureManagedCloudflareConnectorInput,
   type ExternalTunnelEndpointSnapshot,
   type ManagedCloudflareConnectorSnapshot,
+  type SelectCloudflareTunnelInput,
 } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -53,6 +55,12 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "start-managed-cloudflare-connector",
   "stop-managed-cloudflare-connector",
   "retry-managed-cloudflare-connector",
+  "read-cloudflare-account",
+  "begin-cloudflare-login",
+  "cancel-cloudflare-login",
+  "consent-to-cloudflare-certificate",
+  "list-cloudflare-tunnels",
+  "select-cloudflare-tunnel",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -607,6 +615,117 @@ async function mutateManagedCloudflareConnector(
 export const startManagedCloudflareConnector = () => mutateManagedCloudflareConnector("start");
 export const stopManagedCloudflareConnector = () => mutateManagedCloudflareConnector("stop");
 export const retryManagedCloudflareConnector = () => mutateManagedCloudflareConnector("retry");
+
+/**
+ * Cloudflare account authorization and the tunnels it can see.
+ *
+ * Every one of these answers with the whole snapshot, including the step an
+ * interrupted setup resumes at, so the wizard never has to remember its own
+ * progress — see `CloudflareAccountSnapshot` in the contract.
+ */
+export async function readCloudflareAccount(): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.cloudflareAccount({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "read-cloudflare-account",
+      cause: error,
+    });
+  }
+}
+
+export async function beginCloudflareLogin(
+  executablePath: string,
+): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.beginCloudflareLogin({ headers: {}, payload: { executablePath } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "begin-cloudflare-login",
+      cause: error,
+    });
+  }
+}
+
+export async function cancelCloudflareLogin(): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.cancelCloudflareLogin({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "cancel-cloudflare-login",
+      cause: error,
+    });
+  }
+}
+
+export async function consentToCloudflareCertificate(
+  consented: boolean,
+): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.consentToCloudflareCertificate({ headers: {}, payload: { consented } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "consent-to-cloudflare-certificate",
+      cause: error,
+    });
+  }
+}
+
+export async function listCloudflareTunnels(
+  executablePath: string,
+): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.listCloudflareTunnels({ headers: {}, payload: { executablePath } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "list-cloudflare-tunnels",
+      cause: error,
+    });
+  }
+}
+
+export async function selectCloudflareTunnel(
+  payload: SelectCloudflareTunnelInput,
+): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.selectCloudflareTunnel({ headers: {}, payload })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "select-cloudflare-tunnel",
+      cause: error,
+    });
+  }
+}
 
 export async function listServerPairingLinks(): Promise<ReadonlyArray<ServerPairingLinkRecord>> {
   try {

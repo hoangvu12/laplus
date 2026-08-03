@@ -28,12 +28,17 @@ import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ApproveCloudflaredReleaseInput,
+  CloudflareAccountCommandInput,
+  CloudflareAccountSnapshot,
+  CloudflareCertificateConsentInput,
   CloudflaredInstallationSnapshot,
+  ExternalTunnelChallengeResult,
   ExternalTunnelEndpointSnapshot,
   CloudflaredExecutableDiscovery,
   ConfigureManagedCloudflareConnectorInput,
   ManagedCloudflareConnectorSnapshot,
   RegisterExternalTunnelEndpointInput,
+  SelectCloudflareTunnelInput,
 } from "./remoteAccess.ts";
 import {
   ClientOrchestrationCommand,
@@ -450,6 +455,31 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
+    // The two challenge routes below are laplus answering itself through the
+    // public hostname, so neither carries `EnvironmentAuthenticatedAuth`: the
+    // credential is a single-use diagnostic token this server minted for one
+    // probe, not a session, and a paired client has no reason to call either.
+    // They are declared so that an audit of `/api/access/cloudflare` finds every
+    // path this server serves rather than only the ones a client drives.
+    HttpApiEndpoint.get("externalTunnelHttpChallenge", "/api/access/cloudflare/challenge", {
+      headers: OptionalBearerHeaders,
+      success: ExternalTunnelChallengeResult,
+      error: [EnvironmentHttpUnauthorizedError],
+    }),
+  )
+  .add(
+    // **A 101, which `HttpApi` has no way to describe.** The success schema is
+    // therefore `Void` and describes nothing: what proves this route works is
+    // `tests/http_public_exposure.rs` and the production verifier, not a
+    // generated client. Calling it through the generated client would open no
+    // socket, which is why nothing does.
+    HttpApiEndpoint.get("externalTunnelWebSocketChallenge", "/api/access/cloudflare/challenge/ws", {
+      headers: OptionalBearerHeaders,
+      success: Schema.Void,
+      error: [EnvironmentHttpUnauthorizedError],
+    }),
+  )
+  .add(
     HttpApiEndpoint.get("cloudflaredExecutables", "/api/access/cloudflare/executables", {
       headers: OptionalBearerHeaders,
       success: CloudflaredExecutableDiscovery,
@@ -468,6 +498,73 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       headers: OptionalBearerHeaders,
       payload: ApproveCloudflaredReleaseInput,
       success: CloudflaredInstallationSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("cloudflareAccount", "/api/access/cloudflare/account", {
+      headers: OptionalBearerHeaders,
+      success: CloudflareAccountSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    // Every account action below answers with the whole snapshot rather than an
+    // acknowledgement, so the wizard's next step is read from the same place a
+    // reopened dialog reads it and the two cannot disagree.
+    //
+    // **`EnvironmentScopedOperationErrors` is the declared set, and it is not
+    // the whole truth.** These routes also refuse with 409 (a precondition the
+    // developer has to satisfy — consent, or sign in first) and 400 (cloudflared
+    // or its output said no), both carrying an untagged `{ message }` body. That
+    // is the shape every Cloudflare route has used since ticket 01, and it does
+    // not decode as a tagged error, so it is deliberately not declared here
+    // rather than declared as something it is not. Giving those two refusals a
+    // decodable shape is a change to eleven handlers and belongs with the ones
+    // that already have it.
+    HttpApiEndpoint.post("beginCloudflareLogin", "/api/access/cloudflare/account/login", {
+      headers: OptionalBearerHeaders,
+      payload: CloudflareAccountCommandInput,
+      success: CloudflareAccountSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("cancelCloudflareLogin", "/api/access/cloudflare/account/login/cancel", {
+      headers: OptionalBearerHeaders,
+      success: CloudflareAccountSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "consentToCloudflareCertificate",
+      "/api/access/cloudflare/account/consent",
+      {
+        headers: OptionalBearerHeaders,
+        payload: CloudflareCertificateConsentInput,
+        success: CloudflareAccountSnapshot,
+        error: EnvironmentScopedOperationErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    // A POST that mutates nothing at Cloudflare: it runs `tunnel list`, which is
+    // a read there and a write here, because it spends the account certificate.
+    // Repeating it reconciles what laplus knows, which is what makes an
+    // interrupted discovery safe to simply run again.
+    HttpApiEndpoint.post("listCloudflareTunnels", "/api/access/cloudflare/account/tunnels", {
+      headers: OptionalBearerHeaders,
+      payload: CloudflareAccountCommandInput,
+      success: CloudflareAccountSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("selectCloudflareTunnel", "/api/access/cloudflare/account/select", {
+      headers: OptionalBearerHeaders,
+      payload: SelectCloudflareTunnelInput,
+      success: CloudflareAccountSnapshot,
       error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )

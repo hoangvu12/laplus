@@ -21,6 +21,7 @@ The counts below are cheap to reproduce. Reproduce them.
 | ------------------------------------ | -------- | -------- |
 | RPC methods (`Rpc.make` in `rpc.ts`) | 60       | **36**   |
 | Dispatchable orchestration commands  | 20       | **20**   |
+| `/api/access/cloudflare` HTTP routes | 18       | **18**   |
 
 `projects.list`, `projects.add` and `projects.remove` appear in `WS_METHODS` but
 have no `Rpc.make`, so 63 strings resolve to 60 real methods. This is not a
@@ -32,6 +33,11 @@ which was 61's last member and has since left the contract.
 **The figure does not belong in prose.** `README.md`, `AGENTS.md` and
 `server/CLAUDE.md` have each carried a parity number, and each has been wrong.
 They now point here instead. This is the only file that should hold a count.
+
+The third row runs the other way round and is new on 2026-08-03. The first two
+count a contract the server is behind; this one counts a _server_ the contract
+was behind — eight live routes that nothing in `packages/contracts` described.
+See [Gap 4](#gap-4--http-routes-the-contract-did-not-describe-closed).
 
 ## This is not upstream drift
 
@@ -367,6 +373,44 @@ top. The MCP server gets one too: `mcp/` is a general agent-tool surface whose
 only toolkit today happens to be preview, so it outlives the preview effort and
 should not be owned by it.
 
+## Gap 4 — HTTP routes the contract did not describe: closed
+
+**This gap points the opposite way to the other three.** Gaps 1–3 are methods
+the contract declares and the server does not answer. This one was eight routes
+the _server already served_ that no `HttpApiEndpoint` described, so no generated
+client could reach them and no schema said what they answered with — a contract
+can be behind its server as easily as ahead of it, and only one of those two
+directions had ever been counted here.
+
+Found on 2026-08-03 while implementing ticket 04 of `.scratch/cloudflare-tunnel/`.
+The eight:
+
+| Route                                              | Landed by | Why it was missed                                    |
+| -------------------------------------------------- | --------- | ---------------------------------------------------- |
+| `GET /api/access/cloudflare/account`               | ticket 04 | the server half landed before the contract half      |
+| `POST /api/access/cloudflare/account/login`        | ticket 04 | as above                                             |
+| `POST /api/access/cloudflare/account/login/cancel` | ticket 04 | as above                                             |
+| `POST /api/access/cloudflare/account/consent`      | ticket 04 | as above                                             |
+| `POST /api/access/cloudflare/account/tunnels`      | ticket 04 | as above                                             |
+| `POST /api/access/cloudflare/account/select`       | ticket 04 | as above                                             |
+| `GET /api/access/cloudflare/challenge`             | ticket 01 | no client calls it — laplus answers it to itself     |
+| `GET /api/access/cloudflare/challenge/ws`          | ticket 01 | as above, and a `101` that `HttpApi` cannot describe |
+
+All eight are now declared. The two challenge routes carry no authentication
+middleware, because their caller is this server's own verifier holding a
+single-use diagnostic token rather than a session; the WebSocket one is declared
+with a `Void` success and a comment saying so, because nothing in `HttpApi` can
+express an upgrade. They are declared anyway so that a route audit finds every
+path rather than only the ones a client drives.
+
+**One thing is still undeclared and is deliberate.** Every Cloudflare route
+refuses a precondition with `409` and a rejection with `400`, both carrying an
+untagged `{ "message": … }` body. That shape has been the Cloudflare convention
+since ticket 01 and does not decode as a tagged `Environment*Error`, so it is
+absent from the declared error sets rather than declared as something it is not.
+Eleven handlers would have to change together; see `cloudflare_account_refusal`
+in `server.rs`.
+
 ## Limits of this ledger
 
 Stated so a later reader does not over-trust it:
@@ -384,6 +428,10 @@ Stated so a later reader does not over-trust it:
 - **Only the method and command surface was read**, not the provider-event
   vocabulary. What the `claude` CLI driver emits versus what the contract's
   event types allow is a separate audit.
+- **The HTTP row covers `/api/access/cloudflare` only.** The other twenty-six
+  routes in `server.rs` were not walked against the contract, so a gap of the
+  same shape may exist under `/api/auth` or `/oauth`. The command below is the
+  one to widen when someone wants that answer.
 - Counts came from static reading, not from a running server. The surface walk
   in `server/tools/ui-driver/` (`surface-walk.mjs`, `surface-actions.mjs`) is
   the dynamic check and matches on the `Method not implemented by this server`
@@ -430,6 +478,20 @@ comm -23 /tmp/declared.txt /tmp/implemented.txt
 
 **Declared commands — 20.** The `DispatchableClientOrchestrationCommand` union at
 `packages/contracts/src/orchestration.ts:749`.
+
+**`/api/access/cloudflare` routes — 18 served, 18 declared.** Both sides read as
+paths, so a route the contract spells differently shows up as one entry missing
+from each list rather than silently matching.
+
+```sh
+grep -oE '\.route\("/api/access/cloudflare[^"]*"' \
+  server/crates/laplus-server/src/server.rs \
+  | grep -oE '"[^"]+"' | tr -d '"' | sort -u > /tmp/cf-routes.txt
+grep -oE '"/api/access/cloudflare[^"]*"' \
+  packages/contracts/src/environmentHttp.ts | tr -d '"' | sort -u > /tmp/cf-contract.txt
+comm -23 /tmp/cf-routes.txt /tmp/cf-contract.txt   # served, undeclared
+comm -13 /tmp/cf-routes.txt /tmp/cf-contract.txt   # declared, unserved
+```
 
 **Answered commands — 20.** The `match` in `orchestration.rs`, ending at the
 `Command not implemented by this server` catch-all:

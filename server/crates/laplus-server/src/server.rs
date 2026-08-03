@@ -100,6 +100,7 @@ pub struct ServerState {
     external_verification_generation: AtomicU64,
     endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
     cloudflare_connector: Arc<crate::cloudflare_connector::Manager>,
+    cloudflare_account: Arc<crate::cloudflare_account::Account>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,7 @@ impl ServerState {
         mcp: Arc<dyn crate::mcp::Platform>,
         endpoint_verifier: Arc<dyn public_exposure::EndpointVerifier>,
         cloudflare_connector: Arc<crate::cloudflare_connector::Manager>,
+        cloudflare_account: Arc<crate::cloudflare_account::Account>,
     ) -> Self {
         ServerState {
             services,
@@ -133,6 +135,7 @@ impl ServerState {
             external_verification_generation: AtomicU64::new(0),
             endpoint_verifier,
             cloudflare_connector,
+            cloudflare_account,
         }
     }
 
@@ -419,6 +422,8 @@ impl Server {
         // and the status are kept fresh by it.
         let index = Index::new();
         let cloudflare_connector = crate::cloudflare_connector::Manager::open(&config.preferences);
+        let cloudflare_account =
+            crate::cloudflare_account::Account::open(&config.preferences.join("cloudflare"));
         if let Some(origin) = cloudflare_connector.snapshot()["httpsOrigin"].as_str() {
             if let Err(error) = database.register_external_tunnel_endpoint(origin) {
                 eprintln!("laplus: cannot restore managed public endpoint: {error}");
@@ -442,6 +447,7 @@ impl Server {
             mcp_platform,
             endpoint_verifier,
             Arc::clone(&cloudflare_connector),
+            cloudflare_account,
         ));
 
         // Public checks are intentionally much less frequent than connector
@@ -547,6 +553,12 @@ impl Server {
             .route("/api/access/cloudflare/challenge/ws", get(diagnostic_ws_challenge))
             .route("/api/access/cloudflare/executables", get(cloudflare_executables))
             .route("/api/access/cloudflare/install", get(cloudflare_install_state).post(install_cloudflared))
+            .route("/api/access/cloudflare/account", get(cloudflare_account_state))
+            .route("/api/access/cloudflare/account/login", post(begin_cloudflare_login))
+            .route("/api/access/cloudflare/account/login/cancel", post(cancel_cloudflare_login))
+            .route("/api/access/cloudflare/account/consent", post(consent_to_cloudflare_certificate))
+            .route("/api/access/cloudflare/account/tunnels", post(list_cloudflare_tunnels))
+            .route("/api/access/cloudflare/account/select", post(select_cloudflare_tunnel))
             .route("/api/access/cloudflare/connector", get(cloudflare_connector_status))
             .route("/api/access/cloudflare/connector/configure", post(configure_cloudflare_connector))
             .route("/api/access/cloudflare/connector/start", post(start_cloudflare_connector))
@@ -829,9 +841,13 @@ impl Server {
 /// cannot open its own Settings panel. The reference server grants its boot
 /// grant the same set (`PairingGrantStore.ts:318`).
 ///
-/// Nothing gates on a scope in this server — see [`crate::pairing`] — so this
-/// is what the session *reports*, not what it is permitted. It matters because
-/// the UI reads the reported scopes to decide which panels to offer.
+/// **These are enforced, on one surface.** Every `/api/access/cloudflare` route
+/// checks `access:read` or `access:write` through [`require_scope`] before it
+/// answers, which is what `docs/adr/0047` decided and what makes the window's
+/// grant the difference between administering public exposure and merely using
+/// it. Everywhere else the scopes are still only reported — see
+/// [`crate::pairing`] — and the UI reads what a session reports to decide which
+/// panels to offer.
 fn mint_boot_grant(state: &ServerState) -> Result<String, Box<dyn std::error::Error>> {
     let id = pairing::record_id()?;
     let credential = pairing::pairing_code()?;
@@ -1469,9 +1485,32 @@ async fn external_tunnel_status(State(state): State<Arc<ServerState>>, RawQuery(
     match external_tunnel_snapshot(&state) { Ok(snapshot) => Json(snapshot).into_response(), Err(response) => response }
 }
 
+/// Refuse to claim as *external* an exposure laplus is already running.
+///
+/// **ADR-0045 gives every lifecycle action one owner**, and an external tunnel
+/// endpoint is a promise that laplus will not start, stop, reconfigure or delete
+/// the connector behind it. Registering one while laplus supervises a connector
+/// of its own would leave this server both operating and disclaiming the same
+/// exposure — and the record it would overwrite is the one the connector
+/// restores itself from at boot.
+///
+/// The connector's own registration writes to the database directly and never
+/// passes through here, and so does adoption's: a tunnel is chosen *before* its
+/// connector is configured, so this refuses nothing tickets 05 and 06 need.
+fn managed_connector_already_owns_exposure(state: &ServerState) -> Option<Response> {
+    if state.cloudflare_connector.snapshot()["configured"] != true {
+        return None;
+    }
+    Some((StatusCode::CONFLICT, Json(serde_json::json!({
+        "message": "laplus already runs a connector for this environment. Stop and forget it before \
+                    registering a hostname somebody else operates."
+    }))).into_response())
+}
+
 async fn register_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap, Json(body): Json<public_exposure::RegisterRequest>) -> Response {
     let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
     if let Err(response) = require_scope(&grant, "access:write") { return response; }
+    if let Some(response) = managed_connector_already_owns_exposure(&state) { return response; }
     let origin = match public_exposure::normalize_hostname(&body.hostname) { Ok(origin) => origin, Err(message) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response() };
     match state.services.shell.database().register_external_tunnel_endpoint(&origin) {
         Ok(()) => Json(external_tunnel_snapshot(&state).unwrap()).into_response(),
@@ -1572,6 +1611,129 @@ async fn install_cloudflared(
             (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response()
         }
     }
+}
+
+/// Every account-management action names the executable it should run, because
+/// which `cloudflared` this environment uses is the wizard's earlier answer and
+/// not something to be re-guessed per request.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudflareAccountCommand {
+    executable_path: std::path::PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudflareCertificateConsent {
+    consented: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectCloudflareTunnel {
+    tunnel_id: String,
+    hostname: String,
+}
+
+fn cloudflare_account_refusal(refusal: crate::cloudflare_account::Refusal) -> Response {
+    let (status, message) = match refusal {
+        crate::cloudflare_account::Refusal::Precondition(message) => (StatusCode::CONFLICT, message),
+        crate::cloudflare_account::Refusal::Rejected(message) => (StatusCode::BAD_REQUEST, message),
+    };
+    (status, Json(serde_json::json!({ "message": message }))).into_response()
+}
+
+async fn cloudflare_account_state(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:read") { return response; }
+    Json(state.cloudflare_account.snapshot()).into_response()
+}
+
+async fn begin_cloudflare_login(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<CloudflareAccountCommand>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    match state.cloudflare_account.begin_login(&body.executable_path).await {
+        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Err(refusal) => cloudflare_account_refusal(refusal),
+    }
+}
+
+async fn cancel_cloudflare_login(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    match state.cloudflare_account.cancel_login() {
+        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Err(refusal) => cloudflare_account_refusal(refusal),
+    }
+}
+
+async fn consent_to_cloudflare_certificate(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<CloudflareCertificateConsent>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    match state.cloudflare_account.consent(body.consented) {
+        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Err(refusal) => cloudflare_account_refusal(refusal),
+    }
+}
+
+async fn list_cloudflare_tunnels(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<CloudflareAccountCommand>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    match state.cloudflare_account.list_tunnels(&body.executable_path).await {
+        Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
+        Err(refusal) => cloudflare_account_refusal(refusal),
+    }
+}
+
+/// Choosing an active tunnel registers the hostname the developer supplied as
+/// an external endpoint — verification and advertisement, and no lifecycle
+/// ownership. Choosing an inactive one records the candidate and stops there:
+/// adoption is a separate confirmation, and until it succeeds laplus manages
+/// nothing.
+async fn select_cloudflare_tunnel(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<SelectCloudflareTunnel>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    if let Some(response) = managed_connector_already_owns_exposure(&state) { return response; }
+    let selection = match state.cloudflare_account.select(&body.tunnel_id, &body.hostname) {
+        Ok(selection) => selection,
+        Err(refusal) => return cloudflare_account_refusal(refusal),
+    };
+    if selection.classification == "external" {
+        if let Err(error) = state
+            .services
+            .shell
+            .database()
+            .register_external_tunnel_endpoint(&selection.https_origin)
+        {
+            eprintln!("laplus: cannot register the external tunnel endpoint: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let verification_state = Arc::clone(&state);
+        tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
+    }
+    Json(state.cloudflare_account.snapshot()).into_response()
 }
 
 async fn cloudflare_connector_status(
@@ -2264,7 +2426,11 @@ mod tests {
             let index = Index::new();
             let config = ServerConfig::detect();
             let connector_preferences = tempfile::tempdir().expect("connector preferences");
-            let cloudflare_connector = crate::cloudflare_connector::Manager::open(connector_preferences.path());
+            let cloudflare_connector =
+                crate::cloudflare_connector::Manager::open(connector_preferences.path());
+            let cloudflare_account = crate::cloudflare_account::Account::open(
+                &connector_preferences.path().join("cloudflare"),
+            );
             let state = Arc::new(ServerState::new(
                 Services {
                     config: ConfigStore::new(config),
@@ -2281,6 +2447,7 @@ mod tests {
                 Arc::new(crate::mcp::Host::new()),
                 Arc::new(public_exposure::NetworkEndpointVerifier::default()),
                 cloudflare_connector,
+                cloudflare_account,
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {

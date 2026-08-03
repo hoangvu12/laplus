@@ -464,11 +464,16 @@ fn encode_scope_column(scopes: &[String]) -> String {
 
 /// The other half of [`encode_scope_column`].
 ///
-/// A column that will not parse yields no scopes rather than an error. Nothing
-/// in this server gates on a scope — see [`crate::pairing`] — so the choice is
-/// between a session that works and reports nothing and a session that cannot
-/// be read at all, and the second one locks out a paired phone over a display
-/// string.
+/// A column that will not parse yields no scopes rather than an error, so the
+/// choice is between a session that works and reports nothing and a session
+/// that cannot be read at all — and the second one locks out a paired phone
+/// over a display string.
+///
+/// **Since ADR-0047 the empty answer is also the safe one.** Every
+/// `/api/access/cloudflare` route gates on `access:read` or `access:write` (see
+/// [`crate::pairing`] for the whole of what is and is not enforced), so a row
+/// that will not decode fails closed there and open everywhere else, which is
+/// exactly the trade this default was chosen for.
 fn decode_scope_column(encoded: &str) -> Vec<String> {
     serde_json::from_str(encoded).unwrap_or_default()
 }

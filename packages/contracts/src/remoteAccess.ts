@@ -221,3 +221,156 @@ export const ConfigureManagedCloudflareConnectorInput = Schema.Struct({
 });
 export type ConfigureManagedCloudflareConnectorInput =
   typeof ConfigureManagedCloudflareConnectorInput.Type;
+
+/**
+ * Cloudflare browser authorization, as the server can observe it.
+ *
+ * A sign-in belongs to one running server: `not-started` is also what a restart
+ * reports, and the certificate on disk — not this field — is what says the
+ * authorization succeeded. The server folds that in before answering, so
+ * `complete` after a restart means "a certificate is there", which is what
+ * makes an interrupted wizard resumable rather than stuck.
+ */
+export const CloudflareAccountLoginState = Schema.Literals([
+  "not-started",
+  "awaiting-browser",
+  "complete",
+  "cancelled",
+  "timed-out",
+  "failed",
+]);
+export type CloudflareAccountLoginState = typeof CloudflareAccountLoginState.Type;
+
+/** Whether cloudflared reported any connection for this tunnel. */
+export const CloudflareTunnelActivity = Schema.Literals(["active", "inactive"]);
+export type CloudflareTunnelActivity = typeof CloudflareTunnelActivity.Type;
+
+/**
+ * What laplus may do with a listed tunnel, and nothing more.
+ *
+ * `external` — someone else's connector is already serving it, so laplus may
+ * verify and advertise the hostname and must not touch the tunnel's lifecycle.
+ * `adoptable` — it is inactive, so it *may* be dedicated to laplus, but only
+ * after the separate confirmation ADR-0045 requires. Neither value is a claim
+ * about who owns the Cloudflare allocation.
+ */
+export const CloudflareTunnelClassification = Schema.Literals(["external", "adoptable"]);
+export type CloudflareTunnelClassification = typeof CloudflareTunnelClassification.Type;
+
+/**
+ * One row of `cloudflared tunnel list --output json`, reduced to what it proves.
+ *
+ * **There is deliberately no hostname and no management mode here.** The
+ * listing carries neither, so inferring either would be the wizard inventing
+ * the one fact it exists to ask for.
+ */
+export const CloudflareAccountTunnel = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  createdAt: Schema.NullOr(Schema.String),
+  connectionCount: Schema.Number,
+  activity: CloudflareTunnelActivity,
+  classification: CloudflareTunnelClassification,
+});
+export type CloudflareAccountTunnel = typeof CloudflareAccountTunnel.Type;
+
+/**
+ * The tunnel the developer chose and the hostname they said reaches it.
+ *
+ * `adoptionConfirmed` is the whole of ADR-0045's inactive-tunnel rule: a chosen
+ * adoptable tunnel is a candidate, and stays one until dedication is separately
+ * confirmed. Nothing here makes laplus the tunnel's lifecycle owner.
+ */
+export const CloudflareTunnelSelection = Schema.Struct({
+  tunnelId: TrimmedNonEmptyString,
+  name: TrimmedNonEmptyString,
+  classification: CloudflareTunnelClassification,
+  httpsOrigin: TrimmedNonEmptyString,
+  adoptionConfirmed: Schema.Boolean,
+});
+export type CloudflareTunnelSelection = typeof CloudflareTunnelSelection.Type;
+
+/**
+ * Which step of the account wizard an interrupted setup resumes at.
+ *
+ * **Computed by the server from what is durably true** — a certificate on disk,
+ * a recorded consent, a recorded selection — rather than remembered by the
+ * browser. That is what lets a reopened dialog, a reloaded page and a restarted
+ * server agree about how far setup got.
+ */
+export const CloudflareAccountSetupStep = Schema.Literals([
+  "sign-in",
+  "consent",
+  "choose-tunnel",
+  "verify-hostname",
+  "confirm-adoption",
+]);
+export type CloudflareAccountSetupStep = typeof CloudflareAccountSetupStep.Type;
+
+/**
+ * Everything the wizard knows about Cloudflare account authorization.
+ *
+ * **`certificatePath` crosses the wire on purpose.** It is a path and never
+ * contents: `cert.pem` can create, list, route and delete every tunnel in the
+ * account and stays valid for years, and laplus reads only where cloudflared
+ * put it (ADR-0045). It is here because consent has to name the file it is
+ * consent to use — a warning about "the account certificate" with no path is
+ * consent to an abstraction, and a developer with two Cloudflare accounts on
+ * one machine cannot check which one they are about to hand over. Reading this
+ * snapshot already requires `access:read`, which ADR-0047 reserves for
+ * administrative sessions; an ordinary paired phone never sees it. The value is
+ * present even when `certificateDetected` is false, because it is then the
+ * location a sign-in would write to.
+ */
+export const CloudflareAccountSnapshot = Schema.Struct({
+  certificateDetected: Schema.Boolean,
+  certificatePath: TrimmedNonEmptyString,
+  certificateConsentedAt: Schema.NullOr(Schema.String),
+  certificateWarning: TrimmedNonEmptyString,
+  loginState: CloudflareAccountLoginState,
+  authorizationUrl: Schema.NullOr(TrimmedNonEmptyString),
+  failureMessage: Schema.NullOr(TrimmedNonEmptyString),
+  tunnels: Schema.Array(CloudflareAccountTunnel),
+  listedAt: Schema.NullOr(Schema.String),
+  selection: Schema.NullOr(CloudflareTunnelSelection),
+  step: CloudflareAccountSetupStep,
+});
+export type CloudflareAccountSnapshot = typeof CloudflareAccountSnapshot.Type;
+
+/**
+ * Which cloudflared to run for an account-management action.
+ *
+ * Named per request rather than remembered by the account module: which
+ * executable this environment uses is the wizard's earlier answer, and a server
+ * that re-guessed it could sign in with one copy and list with another.
+ */
+export const CloudflareAccountCommandInput = Schema.Struct({
+  executablePath: TrimmedNonEmptyString,
+});
+export type CloudflareAccountCommandInput = typeof CloudflareAccountCommandInput.Type;
+
+/** Consent to use — or withdrawal of consent to use — the account certificate. */
+export const CloudflareCertificateConsentInput = Schema.Struct({
+  consented: Schema.Boolean,
+});
+export type CloudflareCertificateConsentInput = typeof CloudflareCertificateConsentInput.Type;
+
+/**
+ * The hostname is the developer's answer, never anything read out of the
+ * listing — see {@link CloudflareAccountTunnel}.
+ */
+export const SelectCloudflareTunnelInput = Schema.Struct({
+  tunnelId: TrimmedNonEmptyString,
+  hostname: TrimmedNonEmptyString,
+});
+export type SelectCloudflareTunnelInput = typeof SelectCloudflareTunnelInput.Type;
+
+/**
+ * The body of the one-time HTTP challenge laplus answers to itself through the
+ * public hostname. Never called by a client: the caller is this server's own
+ * verifier, carrying a single-use diagnostic credential rather than a session.
+ */
+export const ExternalTunnelChallengeResult = Schema.Struct({
+  ok: Schema.Literal(true),
+});
+export type ExternalTunnelChallengeResult = typeof ExternalTunnelChallengeResult.Type;

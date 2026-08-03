@@ -14,12 +14,18 @@ export {
 } from "./context";
 
 export {
+  beginCloudflareLogin,
+  cancelCloudflareLogin,
+  consentToCloudflareCertificate,
   createServerPairingCredential,
   configureManagedCloudflareConnector,
   discoverCloudflaredExecutables,
   forgetExternalTunnelEndpoint,
   installCloudflaredRelease,
   fetchSessionState,
+  listCloudflareTunnels,
+  readCloudflareAccount,
+  selectCloudflareTunnel,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,
   listServerClientSessions,
