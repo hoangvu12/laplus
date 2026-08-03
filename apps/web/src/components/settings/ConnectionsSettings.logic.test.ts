@@ -3,11 +3,13 @@ import {
   EnvironmentPublicExposureRejectedError,
   EnvironmentScopeRequiredError,
 } from "@t3tools/contracts";
-import type { TunnelOwnership } from "@t3tools/contracts";
+import type { PublicExposureCleanupReport, TunnelOwnership } from "@t3tools/contracts";
 
 import { PrimaryEnvironmentRequestError } from "../../environments/primary";
 
 import {
+  cloudflareCleanupLabel,
+  cloudflareCleanupSummary,
   cloudflareCreationPreview,
   cloudflareFailureMessage,
   cloudflareUnfinishedCreationSummary,
@@ -20,6 +22,19 @@ import {
   selectableCloudflaredExecutables,
   visibleNetworkAdvertisedEndpoints,
 } from "./ConnectionsSettings.logic";
+
+/**
+ * A setup nothing has removed anything from — what these fixtures are unless
+ * they say otherwise. Ticket 07 made the cleanup report part of every endpoint
+ * snapshot, because it is the one answer that survives the setup it describes.
+ */
+const INTACT_CLEANUP = {
+  state: "intact",
+  completed: [],
+  remaining: [],
+  tunnelId: null,
+  dnsRecordName: null,
+} as const;
 
 describe("the host a remote environment was paired with", () => {
   /**
@@ -85,6 +100,7 @@ describe("verified external tunnel advertisement", () => {
       wssOrigin: endpoint.wsBaseUrl,
       ownership: "external",
       deletableAtCloudflare: false,
+      cleanup: INTACT_CLEANUP,
       health: { connector: "external", https: "unknown", webSocket: "unknown" },
       verificationState: "pending",
       failureKind: null,
@@ -166,6 +182,7 @@ describe("the Cloudflare wizard step machine", () => {
     wssOrigin: "wss://laplus.example.com",
     ownership: "external",
     deletableAtCloudflare: false,
+    cleanup: INTACT_CLEANUP,
     health: { connector: "external", https: "healthy", webSocket: "healthy" },
     verificationState: "verified",
     failureKind: null,
@@ -900,5 +917,221 @@ describe("the preview a tunnel creation is confirmed against", () => {
     expect(
       cloudflareUnfinishedCreationSummary({ completed: [], remaining: ["tunnel-create"] }),
     ).toBe("Still outstanding: creating the tunnel.");
+  });
+});
+
+/**
+ * Ticket 07: what a stop, forget or delete left behind, as the row and the
+ * wizard say it.
+ *
+ * The five states the acceptance box names have to be distinguishable *and*
+ * truthful — a partially deleted tunnel is not a healthy endpoint with a note,
+ * and a finished forget is not "Not configured".
+ */
+describe("what a cleanup left behind", () => {
+  const external = {
+    configured: true,
+    httpsOrigin: "https://laplus.example.com",
+    wssOrigin: "wss://laplus.example.com",
+    ownership: "laplus-created",
+    deletableAtCloudflare: true,
+    cleanup: INTACT_CLEANUP,
+    health: { connector: "laplus", https: "healthy", webSocket: "healthy" },
+    verificationState: "verified",
+    failureKind: null,
+    failureMessage: null,
+    lastAttemptAt: "2026-08-03T09:00:00.000Z",
+    lastVerifiedAt: "2026-08-03T09:00:00.000Z",
+    advertisedEndpoint: null,
+  } as const;
+
+  const managed = {
+    configured: true,
+    ownership: "laplus",
+    tunnelOwnership: "laplus-created",
+    deletableAtCloudflare: true,
+    desiredState: "running",
+    connectorState: "ready",
+    readiness: true,
+    httpsOrigin: "https://laplus.example.com",
+    executablePath: "/usr/bin/cloudflared",
+    detectedVersion: "2026.7.3",
+    metricsOrigin: "http://127.0.0.1:12345",
+    failureMessage: null,
+    restartCount: 0,
+    logs: [],
+    verificationState: "verified",
+    failureKind: null,
+    publicFailureMessage: null,
+    lastVerifiedAt: "2026-08-03T09:00:00.000Z",
+  } as const;
+
+  const account = {
+    certificateDetected: true,
+    certificatePath: "/home/dev/.cloudflared/cert.pem",
+    certificateConsentedAt: "2026-08-03T09:00:00.000Z",
+    certificateWarning: "warning",
+    loginState: "complete",
+    authorizationUrl: null,
+    failureMessage: null,
+    tunnels: [],
+    listedAt: "2026-08-03T09:00:01.000Z",
+    selection: null,
+    step: "choose-tunnel",
+    unfinishedCreation: null,
+  } as const;
+
+  const managedStateLabel = () => "Publicly verified";
+
+  it("gives each state a word of its own and says nothing about an untouched setup", () => {
+    expect(cloudflareCleanupLabel("intact")).toBe(null);
+    expect(cloudflareCleanupLabel("stopped")).toBe("Stopped");
+    expect(cloudflareCleanupLabel("cleanup-required")).toBe("Cleanup required");
+    expect(cloudflareCleanupLabel("partially-deleted")).toBe("Partially deleted");
+    expect(cloudflareCleanupLabel("forgotten")).toBe("Forgotten");
+    expect(cloudflareCleanupLabel("fully-removed")).toBe("Fully removed");
+  });
+
+  /**
+   * **Never claims a rollback.** What is reported as done is what the server
+   * observed to be gone; a half-deleted tunnel is described as a tunnel that
+   * still exists rather than as an operation that undid itself.
+   */
+  it("names the completed and outstanding work without implying either was undone", () => {
+    const partial = cloudflareCleanupSummary({
+      state: "partially-deleted",
+      completed: ["dns-record-delete"],
+      remaining: ["tunnel-delete", "configuration-remove", "credential-remove"],
+    });
+    expect(partial).toContain("Some of the Cloudflare resources laplus created were removed");
+    expect(partial).toContain("Already done: deleting the DNS record.");
+    expect(partial).toContain(
+      "Still outstanding: deleting the tunnel, removing the connector configuration, removing the tunnel credential.",
+    );
+    expect(partial).not.toContain("rolled back");
+
+    const local = cloudflareCleanupSummary({
+      state: "cleanup-required",
+      completed: ["configuration-remove"],
+      remaining: ["credential-remove"],
+    });
+    expect(local).toContain("still on this computer");
+    expect(local).not.toContain("Cloudflare resources");
+
+    // A finished removal has nothing outstanding, so it says only what it did.
+    expect(
+      cloudflareCleanupSummary({
+        state: "forgotten",
+        completed: ["configuration-remove", "credential-remove"],
+        remaining: [],
+      }),
+    ).toBe("Already done: removing the connector configuration, removing the tunnel credential.");
+  });
+
+  /**
+   * A cleanup with work outstanding outranks every other screen, including a
+   * connector laplus is still supervising.
+   *
+   * The alternative is the defect this exists to prevent: a partially deleted
+   * tunnel still has a connector and an endpoint row, so the dedicated panel
+   * would offer to stop a connector whose DNS record has already been deleted —
+   * a screen describing a healthy setup that no longer resolves.
+   */
+  it("takes the wizard to the cleanup screen while work is outstanding", () => {
+    const at = (cleanup: PublicExposureCleanupReport) =>
+      cloudflareWizardState({
+        account,
+        managed,
+        external: { ...external, cleanup },
+        chosenPath: null,
+      });
+
+    expect(at(INTACT_CLEANUP).step).toBe("creating");
+    expect(at({ ...INTACT_CLEANUP, state: "stopped" }).step).toBe("creating");
+    // Finished removals leave nothing to finish, so the wizard is free to offer
+    // setting up again.
+    expect(
+      at({
+        state: "fully-removed",
+        completed: ["dns-record-delete", "tunnel-delete"],
+        remaining: [],
+        tunnelId: null,
+        dnsRecordName: null,
+      }).step,
+    ).toBe("creating");
+
+    for (const state of ["cleanup-required", "partially-deleted"] as const) {
+      const stalled = at({
+        state,
+        completed: ["configuration-remove"],
+        remaining: ["credential-remove"],
+        tunnelId: "44444444-4444-4444-4444-444444444444",
+        dnsRecordName: "stable.example.com",
+      });
+      expect(stalled.step).toBe("cleanup");
+      // There is outstanding work; no navigation may leave it.
+      expect(stalled.canChangePath).toBe(false);
+      expect(stalled.ownsConnector).toBe(false);
+      expect(stalled.offersExternalRegistration).toBe(false);
+    }
+  });
+
+  /**
+   * The row says what happened rather than describing the wreckage as health.
+   */
+  it("reports the cleanup rather than the endpoint once one has run", () => {
+    const rowFor = (cleanup: PublicExposureCleanupReport) =>
+      cloudflareRowSummary({
+        state: cloudflareWizardState({
+          account,
+          managed,
+          external: { ...external, cleanup },
+          chosenPath: null,
+        }),
+        managed,
+        external: { ...external, cleanup },
+        managedStateLabel,
+      });
+
+    // A stopped connector is still a setup, and the row describes it as one.
+    expect(rowFor({ ...INTACT_CLEANUP, state: "stopped" })).toBe(
+      "https://laplus.example.com · laplus-created · Publicly verified",
+    );
+    expect(
+      rowFor({
+        state: "partially-deleted",
+        completed: ["dns-record-delete"],
+        remaining: ["tunnel-delete", "configuration-remove", "credential-remove"],
+        tunnelId: "44444444-4444-4444-4444-444444444444",
+        dnsRecordName: "stable.example.com",
+      }),
+    ).toBe("Partially deleted · 3 steps outstanding");
+    expect(
+      rowFor({
+        state: "cleanup-required",
+        completed: ["configuration-remove"],
+        remaining: ["credential-remove"],
+        tunnelId: null,
+        dnsRecordName: null,
+      }),
+    ).toBe("Cleanup required · 1 step outstanding");
+    expect(
+      rowFor({
+        state: "forgotten",
+        completed: ["configuration-remove", "credential-remove"],
+        remaining: [],
+        tunnelId: null,
+        dnsRecordName: null,
+      }),
+    ).toBe("Forgotten · nothing of laplus's remains on this computer");
+    expect(
+      rowFor({
+        state: "fully-removed",
+        completed: ["dns-record-delete", "tunnel-delete"],
+        remaining: [],
+        tunnelId: null,
+        dnsRecordName: null,
+      }),
+    ).toBe("Fully removed · nothing of laplus's remains on this computer");
   });
 });

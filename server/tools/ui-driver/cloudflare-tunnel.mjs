@@ -14,8 +14,21 @@
 //   CHROME=/usr/bin/chromium-browser node tools/ui-driver/cloudflare-tunnel.mjs
 //
 // It spends nothing: no agent turn, no network, no Cloudflare account. Ticket
-// 05 is the adoption path and ticket 06 the creation one; 07 extends this file
-// with stop/forget/delete.
+// 05 is the adoption path, ticket 06 the creation one, and ticket 07 the three
+// ways out of both: stop, forget, and delete everywhere.
+//
+// **A stand-in Cloudflare DNS API too, not only a stand-in cloudflared.**
+// `cloudflared` has no `route dns delete`, so removing the record a creation made
+// is a REST call with DNS authority of its own — modelling it as another CLI verb
+// would let the delete path pass against a command that does not exist. The
+// server is pointed at it with `LAPLUS_CLOUDFLARE_API`, which it honours only
+// towards loopback.
+//
+// **Verification and pairing are not reachable from here**, and deliberately not
+// faked: both need a hostname that genuinely resolves and a public HTTPS path
+// back to this machine, which is exactly what a scratch world does not have.
+// `tests/http_cloudflare_{adoption,creation}.rs` cover them against the hermetic
+// verifier.
 //
 // **Two isolated servers, one browser.** Adoption and creation cannot share a
 // server: each ends with a connector laplus supervises, and the wizard rightly
@@ -40,7 +53,16 @@
 // The screen looks identical and this exits 1.
 
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,7 +108,20 @@ const SELECTORS = {
   newNameField: "New tunnel name",
   newHostnameField: "New tunnel HTTPS hostname",
   create: "Create this tunnel",
+  startConnector: "Start connector",
+  forget: "Forget local setup",
+  // Two labels, one word apart on purpose: the first opens the destructive
+  // confirmation and the second is inside it. `press` matches by prefix, and the
+  // trigger is gone by the time the second is looked for.
+  offerDelete: "Delete everywhere\u2026",
+  confirmDelete: "Delete everywhere",
+  dnsTokenField: "Cloudflare DNS API token",
 };
+
+/** What the fake Cloudflare DNS API insists on being handed. */
+const DNS_API_TOKEN = "FAKE-CLOUDFLARE-DNS-API-TOKEN";
+const ZONE_ID = "zone-example-com";
+const RECORD_ID = "record-stable";
 
 const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -210,6 +245,14 @@ if 'route' in ARGS:
     print('Added CNAME %s which will route to this tunnel' % ARGS[-1])
     raise SystemExit(0)
 
+if 'delete' in ARGS:
+    # The only Cloudflare mutation a deletion can make with the account
+    # certificate. The DNS record is not removable from here at all — there is no
+    # \`route dns delete\` — which is why the driver also stands up a fake DNS API.
+    assert ARGS[1] == '--origincert' and ARGS[2] == CERT, ARGS
+    print('Deleted tunnel %s' % ARGS[-1])
+    raise SystemExit(0)
+
 if 'run' not in ARGS:
     raise SystemExit(2)
 
@@ -259,6 +302,92 @@ const tunnels = (spareConnections) =>
     },
   ]);
 
+// --- the Cloudflare DNS API, which is the one thing cloudflared cannot do ---
+
+/**
+ * A stand-in for Cloudflare's DNS API, on loopback.
+ *
+ * **Not a shortcut round the CLI — a different surface.** `cloudflared tunnel
+ * route dns` creates a CNAME and there is no `route dns delete`, so "Delete
+ * everywhere" removes the record through Cloudflare's REST API with DNS
+ * authority of its own. Modelling it as another `cloudflared` verb would let
+ * this driver pass against a command that does not exist.
+ *
+ * It lists the zones a token can see, lists the records in one, and deletes by
+ * id — because the endpoint row records the record by *name* (ADR-0051) and the
+ * deletion has to resolve it first. An unauthorized caller is answered `403`,
+ * the way Cloudflare answers one.
+ */
+function startDnsApi(recordName) {
+  const state = { records: [{ id: RECORD_ID, zone_id: ZONE_ID, name: recordName, type: "CNAME" }] };
+  const seen = [];
+  const answer = (response, status, body) => {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify(body));
+  };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    seen.push(`${request.method} ${url.pathname}`);
+    if (request.headers.authorization !== `Bearer ${DNS_API_TOKEN}`) {
+      return answer(response, 403, {
+        success: false,
+        errors: [{ code: 9109, message: "Invalid access token." }],
+      });
+    }
+    if (url.pathname === "/client/v4/zones") {
+      // Filtered by name, because that is what laplus asks: a record's zone is
+      // one of its own suffixes, looked up one at a time. Answering with
+      // everything regardless would let a build that pages a listing badly pass
+      // here — Cloudflare caps this endpoint at fifty zones per page.
+      const wanted = url.searchParams.get("name");
+      return answer(response, 200, {
+        success: true,
+        errors: [],
+        result: [{ id: ZONE_ID, name: "example.com" }].filter(
+          (zone) => wanted === null || zone.name === wanted,
+        ),
+      });
+    }
+    const listed = url.pathname.match(/^\/client\/v4\/zones\/([^/]+)\/dns_records$/);
+    if (listed) {
+      const wanted = url.searchParams.get("name");
+      return answer(response, 200, {
+        success: true,
+        errors: [],
+        result: state.records.filter(
+          (held) => held.zone_id === listed[1] && (wanted === null || held.name === wanted),
+        ),
+      });
+    }
+    const one = url.pathname.match(/^\/client\/v4\/zones\/([^/]+)\/dns_records\/([^/]+)$/);
+    if (one && request.method === "DELETE") {
+      const before = state.records.length;
+      state.records = state.records.filter(
+        (held) => !(held.id === one[2] && held.zone_id === one[1]),
+      );
+      return state.records.length === before
+        ? // Cloudflare's own shape for "that record is not here", which an
+          // idempotent retry has to read as already-done.
+          answer(response, 404, {
+            success: false,
+            errors: [{ code: 81044, message: "Record does not exist." }],
+          })
+        : answer(response, 200, { success: true, errors: [], result: { id: one[2] } });
+    }
+    answer(response, 404, { success: false, errors: [{ code: 7000, message: "No route." }] });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        origin: `http://127.0.0.1:${server.address().port}`,
+        records: () => state.records,
+        requests: () => seen,
+        stop: () => server.close(),
+      });
+    });
+  });
+}
+
 // --- isolated servers, each with its own boot credential ---
 
 const running = [];
@@ -276,10 +405,13 @@ process.on("exit", stopAll);
  * profile went — and the token is in the URL **fragment**, without which every
  * `/api` call answers 401. See the README.
  */
-async function startServer(world, port) {
+async function startServer(world, port, dnsApiOrigin) {
   const server = spawn(SERVER, ["serve", "--port", port, "--ui", BUNDLE], {
     env: {
       ...process.env,
+      // Only ever overridden towards loopback, and only by a build that checks
+      // that — the request carries a Cloudflare API token in a header.
+      ...(dnsApiOrigin ? { LAPLUS_CLOUDFLARE_API: dnsApiOrigin } : {}),
       HOME: join(world.scratch, "home"),
       USERPROFILE: join(world.scratch, "home"),
       XDG_DATA_HOME: world.data,
@@ -318,6 +450,7 @@ const listSpareAs = (state) =>
 listSpareAs("inactive");
 const creation = writeScratch();
 writeFileSync(creation.listing, tunnels([]));
+const dnsApi = await startDnsApi(NEW_HOSTNAME);
 
 const url = await startServer(adoption, PORT);
 const trace = adoption.trace;
@@ -418,6 +551,31 @@ const type = (label, value) =>
     field.dispatchEvent(new Event("input", { bubbles: true }));
     return "typed";
   `);
+
+/**
+ * The private files laplus wrote for this exposure, wherever the data directory
+ * turned out to be.
+ *
+ * Walked rather than assumed, because the point of the assertion is that forget
+ * removed *laplus's own* configuration and credential — and a path spelled by
+ * hand that happened to be wrong would pass by finding nothing.
+ */
+function privateFiles(world) {
+  const found = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (
+        ["connector.yml", "connector.json", "tunnel.json", "connector.token"].includes(entry.name)
+      ) {
+        found.push(path);
+      }
+    }
+  };
+  walk(world.data);
+  return found;
+}
 
 /** How many recorded invocations of the stand-in mention `verb`. */
 const invocations = (world, verb) =>
@@ -564,7 +722,13 @@ try {
     fail("the account certificate reached a snapshot");
   }
 
-  // Stop stays available for an adopted tunnel, and takes nothing with it.
+  // --- ticket 07: stop, restart, and forget, on the adopted tunnel ---
+  //
+  // Stop changes whether the connector runs and nothing else; forget removes
+  // laplus's own configuration and credential *after* stopping it, and touches
+  // nothing at Cloudflare — an adopted tunnel's allocation and DNS route are
+  // somebody else's throughout.
+
   await pressed(SELECTORS.stopConnector);
   const stopped = await poll(async () => {
     const answer = await serverState("/api/access/cloudflare/connector");
@@ -576,6 +740,56 @@ try {
     const after = await serverState("/api/access/cloudflare");
     check("stopping keeps the endpoint", after.body.httpsOrigin, `https://${HOSTNAME}`);
     check("stopping keeps the ownership", after.body.ownership, "adopted");
+    check("stopping is reported as stopped", after.body.cleanup?.state, "stopped");
+    check("stopping keeps everything restartable", after.body.cleanup?.remaining?.length, 0);
+    check("stopping deletes nothing at Cloudflare", invocations(adoption, "delete"), 0);
+  }
+
+  // Restart: one action, and no second credential retrieval — the whole point of
+  // stop preserving the setup rather than unwinding it.
+  await pressed(SELECTORS.startConnector);
+  const restarted = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.connectorState === "ready" ? answer : null;
+  }, 30000);
+  if (!restarted) {
+    fail("the connector did not come back after being stopped");
+  } else {
+    check("restarting needs no new credential", invocations(adoption, "token"), 1);
+    check("restarting keeps the ownership", restarted.body.tunnelOwnership, "adopted");
+  }
+
+  // Forget. Ticket 05 left this unbuilt on purpose: the route removed the
+  // endpoint row and stopped nothing, so forgetting an adopted tunnel left a
+  // connector serving a public hostname nothing recorded.
+  await pressed(SELECTORS.forget);
+  const forgotten = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare");
+    return answer.body.configured === false ? answer : null;
+  }, 20000);
+  if (!forgotten) {
+    fail("forget did not reach the server");
+  } else {
+    check("forget reports what it removed", forgotten.body.cleanup?.state, "forgotten");
+    check("forget leaves nothing outstanding", forgotten.body.cleanup?.remaining?.length, 0);
+    const bare = await serverState("/api/access/cloudflare/connector");
+    check("forget stops supervising the connector", bare.body.configured, false);
+    // **Nothing at Cloudflare, for an adopted tunnel or any other.**
+    check("forget deletes no tunnel", invocations(adoption, "delete"), 0);
+    check("forget touches no DNS record", invocations(adoption, "route"), 0);
+    // The account certificate is cloudflared's, and is exactly as it was.
+    check(
+      "the account certificate is untouched",
+      readFileSync(adoption.certificate, "utf8"),
+      "FAKE-ACCOUNT-CERTIFICATE-SECRET",
+    );
+    check("forget starts no new sign-in", invocations(adoption, "login"), 0);
+    // What laplus owned is gone, which is what releases a later creation.
+    const held = privateFiles(adoption);
+    if (held.length) fail(`forget left laplus's own files behind: ${held.join(", ")}`);
+    const account = await serverState("/api/access/cloudflare/account");
+    check("the wizard can set up again", account.body.step, "choose-tunnel");
+    check("the forgotten tunnel is no longer selected", account.body.selection, null);
   }
 
   // --- ticket 06: creating a stable tunnel, on a server of its own ---
@@ -584,7 +798,7 @@ try {
   // wizard rightly will not offer setup for an exposure that already exists.
 
   console.log("\n--- creating a tunnel ---");
-  const createdUrl = await startServer(creation, String(Number(PORT) + 1));
+  const createdUrl = await startServer(creation, String(Number(PORT) + 1), dnsApi.origin);
   const reached = await arriveAtConnections(createdUrl);
   if (!reached) giveUp("never reached the Connections page on the creation server");
 
@@ -702,6 +916,107 @@ try {
     fail("the account certificate reached a snapshot");
   }
 
+  // --- ticket 07's closeout: the laplus-created-only delete path ---
+  //
+  // Stop, restart, and then the one operation that removes something outside
+  // this machine. It is offered here and nowhere else, it is confirmed against
+  // the resources the server recorded, and it needs DNS authority the CLI cannot
+  // supply.
+
+  await pressed(SELECTORS.stopConnector);
+  const createdStopped = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.desiredState === "stopped" ? answer : null;
+  }, 20000);
+  if (!createdStopped) fail("stop did not reach the creation server");
+  await pressed(SELECTORS.startConnector);
+  const createdRestarted = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.connectorState === "ready" ? answer : null;
+  }, 30000);
+  if (!createdRestarted) {
+    fail("the created connector did not come back after being stopped");
+  } else {
+    check("a restart allocates no second tunnel", invocations(creation, "create"), 1);
+    check("a restart routes no second record", invocations(creation, "route"), 2);
+  }
+
+  await pressed(SELECTORS.offerDelete);
+  // **The confirmation is the server's, and it names the resources the row
+  // holds.** A screen that composed these from what the client believed is
+  // exactly what ADR-0052 refuses.
+  const confirmation = await poll(
+    () =>
+      session.evaluate(
+        `return document.querySelector('[aria-label="Delete everywhere"]')?.innerText ?? null;`,
+      ),
+    15000,
+  );
+  if (!confirmation) {
+    fail("the destructive confirmation never appeared");
+  } else {
+    for (const [what, shown] of [
+      ["the allocated tunnel", CREATED],
+      ["the recorded DNS record", NEW_HOSTNAME],
+      ["that the account token is never revoked", "never revokes your Cloudflare account token"],
+      ["that the certificate is never touched", "never touches your account certificate"],
+    ]) {
+      if (confirmation.includes(shown)) {
+        console.log(`  ok the confirmation names ${what}`);
+      } else {
+        fail(`the confirmation does not name ${what} (${JSON.stringify(shown)})`);
+      }
+    }
+  }
+  check("nothing is deleted by being offered", invocations(creation, "delete"), 0);
+  check("no DNS record is deleted by being offered", dnsApi.records().length, 1);
+
+  const typedToken = await type(SELECTORS.dnsTokenField, DNS_API_TOKEN);
+  if (typedToken !== "typed") fail(typedToken);
+  await settle(400);
+  await pressed(SELECTORS.confirmDelete);
+
+  const removed = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare");
+    return answer.body.cleanup?.state === "fully-removed" ? answer : null;
+  }, 30000);
+  if (!removed) {
+    const last = await serverState("/api/access/cloudflare");
+    fail(`the deletion never completed: ${JSON.stringify(last.body).slice(0, 400)}`);
+  } else {
+    check("the endpoint is gone", removed.body.configured, false);
+    check("nothing is left outstanding", removed.body.cleanup?.remaining?.length, 0);
+    check("the tunnel it removed is named", removed.body.cleanup?.tunnelId, CREATED);
+  }
+  // **The exact recorded resources, and no others.** The row carried the record
+  // by name alone, so the deletion had to resolve it through the zone first.
+  check("the recorded DNS record is gone", dnsApi.records().length, 0);
+  const deleted = dnsApi.requests().filter((line) => line.startsWith("DELETE"));
+  check("exactly one DNS record was deleted", deleted.length, 1);
+  check(
+    "and it was the recorded one",
+    deleted[0],
+    `DELETE /client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}`,
+  );
+  check("the tunnel was deleted once", invocations(creation, "delete"), 1);
+  const deletionTrace = readFileSync(creation.trace, "utf8");
+  if (!deletionTrace.includes(CREATED)) fail("the deletion did not target the allocated tunnel");
+  if (deletionTrace.includes(DNS_API_TOKEN)) fail("the DNS API token reached a command line");
+  check(
+    "the account certificate is untouched",
+    readFileSync(creation.certificate, "utf8"),
+    "FAKE-ACCOUNT-CERTIFICATE-SECRET",
+  );
+  check("the deletion starts no new sign-in", invocations(creation, "login"), 0);
+  const leftBehind = privateFiles(creation);
+  if (leftBehind.length)
+    fail(`the deletion left laplus's own files behind: ${leftBehind.join(", ")}`);
+  const afterDeletion = await serverState("/api/access/cloudflare/connector");
+  check("no connector survives the deletion", afterDeletion.body.configured, false);
+  if (JSON.stringify([removed?.body, afterDeletion.body]).includes(DNS_API_TOKEN)) {
+    fail("the DNS API token reached a snapshot");
+  }
+
   const errors = logs.filter((line) => /error|exception/i.test(line) && !/404|401/.test(line));
   if (errors.length) {
     console.log("\n=== CONSOLE ===");
@@ -710,6 +1025,7 @@ try {
 } finally {
   await session.close();
   stopAll();
+  dnsApi.stop();
   for (const world of [adoption, creation]) {
     rmSync(world.scratch, { recursive: true, force: true });
   }

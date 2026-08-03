@@ -518,6 +518,120 @@ impl Manager {
         Ok(())
     }
 
+    /// Ask this connector to stop and wait until it has, within a bounded wait.
+    ///
+    /// **Forget and delete both have to stop it before they touch anything.**
+    /// Removing a running connector's configuration leaves a `cloudflared`
+    /// serving a public hostname from a file nothing records, and `cloudflared
+    /// tunnel delete` refuses outright while the tunnel still has connections —
+    /// so "stop, then clean, then remove" is an order rather than a preference.
+    ///
+    /// Answers whether nothing is running any more, and never blocks forever:
+    /// the supervision loop is what changes the word, so a loop that is wedged
+    /// must produce a refusal the caller can report rather than a request that
+    /// hangs. A connector that was never configured is already stopped.
+    ///
+    /// **Four words mean "no child of mine is running", not one.** `stopped` is
+    /// what a connector asked to stop reaches, but a connector whose restart
+    /// budget ran out sits in `restart-exhausted` and one that never started
+    /// sits in `failed` — both with nothing alive and both already carrying
+    /// `desired_state: stopped`, so `set_desired` has nothing left to change and
+    /// the word never moves. Waiting for `stopped` alone made a cleanup refuse
+    /// to remove the setup of a connector that had already died.
+    pub async fn stop_and_settle(&self, budget: std::time::Duration) -> bool {
+        match self.set_desired(false, false) {
+            Ok(()) => {}
+            // The only refusal `set_desired(false, …)` can give is "nothing is
+            // configured", which is the state this is trying to reach.
+            Err(_) => return true,
+        }
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            {
+                let runtime = self.runtime.lock().unwrap();
+                if runtime.configuration.is_none()
+                    || matches!(
+                        runtime.connector_state.as_str(),
+                        "stopped" | "restart-exhausted" | "failed" | "unconfigured"
+                    )
+                {
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Remove laplus's own connector configuration, and nothing else.
+    ///
+    /// **Two files, both written by laplus into its own private directory**: the
+    /// ingress `--config` file and the settings file that makes the connector
+    /// start with its owner. Never `~/.cloudflared/config.yml`, which ADR-0045
+    /// puts out of scope, and never an executable — the app-managed
+    /// `cloudflared` lives under this same directory and is a *tool* rather than
+    /// this exposure's setup, so it survives (ADR-0052).
+    ///
+    /// Idempotent: a file that is already gone is this step having already
+    /// happened, which is what makes a retried cleanup safe.
+    pub fn remove_configuration(&self) -> Result<(), Refusal> {
+        for path in [self.directory.join(INGRESS), self.directory.join(SETTINGS)] {
+            remove_if_present(&path)?;
+        }
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.configuration = None;
+        runtime.connector_state = "unconfigured".into();
+        runtime.readiness = None;
+        runtime.metrics_origin = None;
+        runtime.failure_message = None;
+        runtime.restart_count = 0;
+        runtime.logs.clear();
+        runtime.generation = runtime.generation.wrapping_add(1);
+        drop(runtime);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Remove the run credentials laplus stored for this environment.
+    ///
+    /// **Both shapes, whichever this connector used.** A dedicated tunnel's
+    /// `<UUID>.json` and a connector token file are the same thing to a cleanup —
+    /// laplus-owned secrets in laplus's own directory — and the settings file
+    /// that said which one is in use may already be gone, because
+    /// [`Manager::remove_configuration`] runs first. Naming both is what lets
+    /// this step be retried after a restart without a record to read.
+    ///
+    /// This is also what releases the credential that makes creation refuse: a
+    /// forget that left `tunnel.json` behind would leave the next creation
+    /// permanently refused with `ownership-conflict`.
+    pub fn remove_credentials(&self) -> Result<(), Refusal> {
+        for path in [self.credential_path(), self.directory.join(TOKEN)] {
+            remove_if_present(&path)?;
+        }
+        Ok(())
+    }
+
+    /// Whether either run credential is still on disk.
+    ///
+    /// The observed half of [`crate::public_exposure::CleanupState`]: a cleanup
+    /// reports `credential-remove` as done because the files are gone, not
+    /// because a log line says so.
+    ///
+    /// **Anything at the path counts, not only a readable credential.** This is
+    /// asked by a cleanup rather than by a connector, and a cleanup's question is
+    /// whether there is still something of laplus's to remove — a truncated
+    /// credential, or a directory somebody left in the way, is still that.
+    pub fn holds_credentials(&self) -> bool {
+        self.credential_path().exists() || self.directory.join(TOKEN).exists()
+    }
+
+    /// Whether laplus's own connector configuration is still on disk.
+    pub fn holds_configuration(&self) -> bool {
+        self.directory.join(INGRESS).exists() || self.directory.join(SETTINGS).exists()
+    }
+
     pub async fn shutdown(&self) {
         self.runtime.lock().unwrap().shutdown = true;
         self.changed.notify_waiters();
@@ -543,6 +657,30 @@ impl Manager {
                 )
             };
             let Some(configuration) = configuration else {
+                // **Nothing is running, so say nothing is running.** The word
+                // was previously left wherever the last iteration put it, and
+                // "replace" writes `starting` optimistically before looping back
+                // here — so a connector that was reconfigured and then stopped
+                // reported `starting` for as long as it stayed stopped. The
+                // compact row said "Starting" for a connector with no child at
+                // all, and ticket 07's cleanups waited for a word that could
+                // never arrive.
+                //
+                // `restart-exhausted` and `failed` survive: both already mean
+                // nothing is running, and both are what an explicit Retry is
+                // offered for.
+                {
+                    let mut runtime = self.runtime.lock().unwrap();
+                    if runtime.configuration.is_none() {
+                        runtime.connector_state = "unconfigured".into();
+                    } else if !matches!(
+                        runtime.connector_state.as_str(),
+                        "restart-exhausted" | "failed"
+                    ) {
+                        runtime.connector_state = "stopped".into();
+                    }
+                    runtime.readiness = None;
+                }
                 self.changed.notified().await;
                 continue;
             };
@@ -990,6 +1128,20 @@ pub(crate) fn private_directory(directory: &Path) -> Result<(), Refusal> {
     #[cfg(windows)]
     protect_windows(directory, true)?;
     Ok(())
+}
+
+/// Remove one of laplus's own files, treating "already gone" as done.
+///
+/// A cleanup step is retried after a restart, and the whole point of retrying it
+/// is that the first attempt may have removed some of what it was asked to. So
+/// the absence of a file is this step having succeeded rather than a failure to
+/// report, and only a file that is *there and will not go* is a refusal.
+fn remove_if_present(path: &Path) -> Result<(), Refusal> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(local_setup("file could not be removed")),
+    }
 }
 
 /// Everything that can fail while laplus writes its own private files says so

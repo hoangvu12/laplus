@@ -460,16 +460,18 @@ async fn an_interrupted_adoption_resumes_without_repeating_the_credential() {
     let held = server.get("/api/access/cloudflare").await;
     assert_eq!(held.body["ownership"], "adopted");
 
-    // The same, with the endpoint row gone — which is the state a confirmation
-    // interrupted between configuring the connector and recording the row would
-    // leave, and the state today's local-only Forget leaves too. The connector
-    // is the surviving record, and it is enough: the tunnel is re-recorded as
-    // adopted rather than disowned because laplus is serving it.
-    let forgotten = server
-        .post_json("/api/access/cloudflare/forget", &json!({}))
-        .await;
-    assert_eq!(forgotten.status, 200, "{}", forgotten.text);
-    assert_eq!(forgotten.body["configured"], false);
+    // The same, with the endpoint row gone but the connector still running it —
+    // the state a confirmation interrupted between configuring the connector and
+    // recording the row leaves. The connector is the surviving record, and it is
+    // enough: the tunnel is re-recorded as adopted rather than disowned, because
+    // laplus is serving it. Reached by removing the row underneath a live
+    // connector, which is the crash rather than a route: since ticket 07, Forget
+    // stops the connector before it removes anything.
+    laplus_server::store::Database::open(&directory.path().join("state.sqlite"))
+        .expect("the server's own database")
+        .forget_public_exposure_endpoint()
+        .expect("the row is lost the way a crash loses it");
+    assert_eq!(server.get("/api/access/cloudflare").await.body["configured"], false);
     let recovered = server
         .post_json(
             "/api/access/cloudflare/account/adopt",
@@ -482,19 +484,21 @@ async fn an_interrupted_adoption_resumes_without_repeating_the_credential() {
     assert_eq!(repaired.body["httpsOrigin"], "https://spare.example.com");
     assert_eq!(fake.invocations("token"), 1);
 
-    // **Forget as it exists today**: local only, and nothing at Cloudflare.
-    // Ticket 07 owns the forget a supervised connector needs — stop it, remove
-    // laplus's own configuration and credential, then the row — so what is
-    // pinned here is the half that is true now: no `tunnel delete`, no `route`,
-    // and the tunnel laplus never allocated is still allocated. That the
-    // credential and configuration survive is the gap, not the behaviour.
+    // **Forget, and nothing at Cloudflare.** Ticket 07 made this stop the
+    // connector and remove laplus's own configuration and credential before the
+    // row — `http_cloudflare_cleanup.rs` is where that half is pinned. What
+    // belongs here is the half this ticket is about: an adopted tunnel's
+    // Cloudflare allocation and DNS route are somebody else's, so forgetting one
+    // runs no `tunnel delete` and no `route` at all, whatever it removes locally.
     let forgotten = server
         .post_json("/api/access/cloudflare/forget", &json!({}))
         .await;
     assert_eq!(forgotten.status, 200, "{}", forgotten.text);
     assert_eq!(forgotten.body["configured"], false);
+    assert_eq!(forgotten.body["cleanup"]["state"], "forgotten");
     assert_eq!(fake.invocations("delete"), 0);
     assert_eq!(fake.invocations("route"), 0);
+    assert!(!credential.exists(), "forget left the borrowed tunnel's credential behind");
     server.stop().await;
     std::env::remove_var("TUNNEL_ORIGIN_CERT");
 }

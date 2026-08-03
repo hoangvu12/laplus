@@ -33,7 +33,9 @@ import {
   CloudflareAccountCommandInput,
   CloudflareAccountSnapshot,
   CloudflareCertificateConsentInput,
+  CloudflareDeletionPlan,
   CloudflaredInstallationSnapshot,
+  DeleteCloudflareTunnelInput,
   ExternalTunnelChallengeResult,
   ExternalTunnelEndpointSnapshot,
   CloudflaredExecutableDiscovery,
@@ -249,6 +251,26 @@ export const PublicExposureRefusalReason = Schema.Literals([
    * given one message for both cannot tell which field to fix. Ticket 06.
    */
   "tunnel-name-invalid",
+  /**
+   * The destructive confirmation is missing, expired, already spent, or names
+   * resources this environment no longer records.
+   *
+   * This is what ticket 07's "fresh `access:write` authorization" is enforced
+   * as: a deletion is authorized by a value the server minted for the exact
+   * tunnel and DNS record it will remove, used once and expiring shortly, and
+   * checked against the endpoint row as it stands at the moment the command
+   * runs. A session scope answers who may ask; it cannot answer what they were
+   * shown. `server/docs/adr/0052`.
+   */
+  "confirmation-required",
+  /**
+   * laplus has no Cloudflare authority that can remove the recorded DNS record.
+   * Distinct from `command-failed` because no command ran and none could:
+   * `cloudflared` has no `route dns delete` at all, so the developer's next
+   * action is to supply a Cloudflare API token with DNS edit permission for the
+   * hostname's zone. Ticket 07.
+   */
+  "dns-authority-required",
 ]);
 export type PublicExposureRefusalReason = typeof PublicExposureRefusalReason.Type;
 
@@ -753,6 +775,50 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       headers: OptionalBearerHeaders,
       payload: CreateCloudflareTunnelInput,
       success: CloudflareAccountSnapshot,
+      error: EnvironmentPublicExposureErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    // What a deletion would remove, and the one-time authorization to remove it.
+    //
+    // **A POST that deletes nothing**, because it mints something: the offer is
+    // the separate destructive confirmation ticket 07 requires, and it is made
+    // by the server so that what a developer agrees to is the recorded tunnel
+    // and DNS record rather than whatever a client believed. Refused with
+    // `not-laplus-created` for every other ownership, from the same value the
+    // deletion itself refuses on — so the offer and the refusal cannot come
+    // apart. `server/docs/adr/0052`.
+    HttpApiEndpoint.post("offerCloudflareDeletion", "/api/access/cloudflare/account/deletion", {
+      headers: OptionalBearerHeaders,
+      success: CloudflareDeletionPlan,
+      error: EnvironmentPublicExposureErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    // Deleting the exact Cloudflare resources laplus created, and then its own
+    // local setup — the one command in this API that removes something at
+    // Cloudflare.
+    //
+    // **Four journaled steps at three places**: the DNS record through
+    // Cloudflare's DNS API, because `cloudflared` has no `route dns delete`; the
+    // tunnel with `cloudflared tunnel delete`; and then laplus's own
+    // configuration and credential, which is what `forgetExternalTunnel` does on
+    // its own. A partial failure answers with the exact work completed and
+    // outstanding and never claims a rollback, and repeating it skips what is
+    // already done — a record Cloudflare says is not there is read as done
+    // rather than as a new failure.
+    //
+    // Refused with `not-laplus-created` for an adopted or external tunnel,
+    // `confirmation-required` for an authorization that is missing, spent,
+    // expired or names something else, and `dns-authority-required` when there
+    // is no Cloudflare DNS authority to remove the record with — that last one
+    // before anything is attempted, because a deletion that removed the tunnel
+    // and left the record would be a weaker operation rather than a recoverable
+    // state.
+    HttpApiEndpoint.post("deleteCloudflareTunnel", "/api/access/cloudflare/account/delete", {
+      headers: OptionalBearerHeaders,
+      payload: DeleteCloudflareTunnelInput,
+      success: ExternalTunnelEndpointSnapshot,
       error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )

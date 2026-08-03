@@ -10,6 +10,19 @@ import {
   offersCloudflaredInstallation,
 } from "./ConnectionsSettings";
 
+/**
+ * A setup nothing has removed anything from — what these fixtures are unless
+ * they say otherwise. Ticket 07 made the cleanup report part of every endpoint
+ * snapshot, because it is the one answer that survives the setup it describes.
+ */
+const INTACT_CLEANUP = {
+  state: "intact",
+  completed: [],
+  remaining: [],
+  tunnelId: null,
+  dnsRecordName: null,
+} as const;
+
 describe("CloudflareTunnelSettingsRow", () => {
   it("presents external hostname registration as a compact Connections row", () => {
     const html = renderToStaticMarkup(<CloudflareTunnelSettingsRow canWrite />);
@@ -35,6 +48,7 @@ describe("CloudflareTunnelSettingsRow", () => {
           wssOrigin: "wss://laplus.example.com",
           ownership: "external",
           deletableAtCloudflare: false,
+          cleanup: INTACT_CLEANUP,
           health: { connector: "external", https: "healthy", webSocket: "failed" },
           verificationState: "failed",
           failureKind: "websocket",

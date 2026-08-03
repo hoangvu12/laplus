@@ -546,9 +546,14 @@ async fn creation_requires_write_validates_its_inputs_and_owns_the_result() {
 /// writes one to.** So a creation that treated "there is a credential here" as
 /// "this creation already allocated a tunnel" would skip `tunnel create`, route
 /// DNS for somebody else's tunnel, and record it as `laplus-created` — handing
-/// ticket 07 the authority to delete a tunnel laplus merely borrowed. Today's
-/// Forget removes only the endpoint row (ticket 05's documented gap), which is
-/// what makes the sequence reachable: adopt, forget, create.
+/// ticket 07 the authority to delete a tunnel laplus merely borrowed.
+///
+/// **The state is reached by an adoption that stopped half way**, which is where
+/// it will now come from: ticket 07's Forget removes the credential as well as
+/// the row, so adopt-forget-create no longer produces it. A dedication
+/// interrupted between retrieving the credential and writing laplus's own
+/// configuration still does, and it survives a restart — a borrowed tunnel's
+/// credential on disk with nothing recording that laplus owns anything.
 ///
 /// ADR-0049 puts ownership in one place precisely so that no request can launder
 /// it, and this is that rule pointed at the one route that could earn a deletion
@@ -595,13 +600,38 @@ async fn a_creation_cannot_adopt_an_existing_credential_and_call_the_tunnel_its_
     assert_eq!(blocked.status, 409, "{}", blocked.text);
     assert_eq!(blocked.body["reason"], "ownership-conflict");
 
-    // Forget removes the row and leaves the credential — the gap ticket 07
-    // closes — so this is the state a creation must still refuse from.
+    // **Now the state a creation must still refuse from**: the borrowed tunnel's
+    // credential on disk, and nothing recording that laplus owns anything. Forget
+    // takes both away since ticket 07, so this is reached the way a real one is —
+    // a dedication that fails after retrieving the credential and before writing
+    // laplus's own configuration, on an environment that has no endpoint yet.
     let forgotten = server
         .post_json("/api/access/cloudflare/forget", &json!({}))
         .await;
     assert_eq!(forgotten.status, 200, "{}", forgotten.text);
-    assert!(directory.path().join("cloudflare").join("tunnel.json").is_file());
+    let credential = directory.path().join("cloudflare").join("tunnel.json");
+    assert!(!credential.exists(), "forget left a borrowed tunnel's credential behind");
+
+    let configuration = directory.path().join("cloudflare").join("connector.yml");
+    std::fs::create_dir_all(&configuration).unwrap();
+    let chosen = server
+        .post_json(
+            "/api/access/cloudflare/account/select",
+            &json!({"tunnelId": SPARE, "hostname": "spare.example.com"}),
+        )
+        .await;
+    assert_eq!(chosen.status, 200, "{}", chosen.text);
+    let interrupted = server
+        .post_json(
+            "/api/access/cloudflare/account/adopt",
+            &json!({"executablePath": fake.executable}),
+        )
+        .await;
+    assert_eq!(interrupted.status, 400, "{}", interrupted.text);
+    assert_eq!(interrupted.body["completed"], json!(["credential"]));
+    assert!(credential.is_file(), "the retrieval this refusal reported did not happen");
+    assert_eq!(server.get("/api/access/cloudflare").await.body["configured"], false);
+    std::fs::remove_dir(&configuration).unwrap();
 
     let laundered = create(&server, &fake).await;
     assert_eq!(laundered.status, 409, "{}", laundered.text);

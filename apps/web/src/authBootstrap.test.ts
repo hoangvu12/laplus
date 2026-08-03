@@ -13,6 +13,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { installEnvironmentHttpTest } from "../test/environmentHttpTest";
 import { __setPrimaryHttpRunnerForTests, type PrimaryHttpEffectRunner } from "./lib/runtime";
 
+/**
+ * A setup nothing has removed anything from — what these fixtures are unless
+ * they say otherwise. Ticket 07 made the cleanup report part of every endpoint
+ * snapshot, because it is the one answer that survives the setup it describes.
+ */
+const INTACT_CLEANUP = {
+  state: "intact",
+  completed: [],
+  remaining: [],
+  tunnelId: null,
+  dnsRecordName: null,
+} as const;
+
 type TestWindow = {
   location: URL;
   history: {
@@ -527,6 +540,7 @@ describe("resolveInitialServerAuthGateState", () => {
       wssOrigin: null,
       ownership: "external",
       deletableAtCloudflare: false,
+      cleanup: INTACT_CLEANUP,
       health: { connector: "external", https: "unknown", webSocket: "unknown" },
       verificationState: "unconfigured",
       failureKind: null,

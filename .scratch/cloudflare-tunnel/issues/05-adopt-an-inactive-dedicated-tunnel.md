@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — Cloudflare sign-in and existing-tunnel discovery.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The wizard shows the selected tunnel identifier, supplied hostname, loopback target, observed inactivity, and ownership consequences before requiring explicit dedication confirmation.
 - [x] Adoption rechecks that the tunnel is inactive immediately before mutation and falls back to external ownership if an active connector appears.
@@ -13,8 +13,8 @@
 - [x] The adopted tunnel is persisted as dedicated and laplus-managed locally, while its Cloudflare allocation and DNS route remain externally owned and ineligible for deletion.
 - [x] The connector follows the existing supervision, readiness, restart, shutdown, public verification, advertisement, and pairing behavior.
 - [x] An interrupted adoption journals completed actions and resumes by reconciling observed state instead of repeating credential or configuration mutations.
-- [ ] Stop and forget remain available, but Delete everywhere is never offered for an adopted tunnel. **Two of three.** Stop is available and changes nothing at Cloudflare; Delete everywhere is never offered, and the server states that verdict (`deletableAtCloudflare`) rather than leaving a client to draw or not draw a control. Forget is _not_ offered for an adopted tunnel, for the same reason it has never been offered for a laplus-run connector-token one: the route removes the endpoint row and stops nothing, so it would leave a connector running against a hostname nothing records. The forget a supervised connector needs is ticket 07's.
-- [ ] Running-server and UI-driver tests cover successful adoption, an activation race, partial failure/restart recovery, secret redaction, verification, pairing, stop, and ownership-safe forget. **All but ownership-safe forget, which does not exist to test.** The running-server tests cover every other item; the UI-driver covers adoption, the activation race and its recovery, redaction and stop. Verification and pairing are not reachable from the driver — they need a hostname that genuinely resolves — and are covered by `http_cloudflare_adoption.rs` against the hermetic verifier.
+- [x] Stop and forget remain available, but Delete everywhere is never offered for an adopted tunnel. **Closed by ticket 07.** Stop is available and changes nothing at Cloudflare. Forget now stops the connector, removes laplus's own configuration and run credential, and only then the endpoint row — so it is offered for an adopted tunnel and leaves the Cloudflare allocation and DNS route exactly where they were. Delete everywhere is never offered _and_ is refused by the server on the recorded ownership, so a repeated, stale or forged request cannot reach one either.
+- [x] Running-server and UI-driver tests cover successful adoption, an activation race, partial failure/restart recovery, secret redaction, verification, pairing, stop, and ownership-safe forget. **Ownership-safe forget now exists and is covered at both seams** — `http_cloudflare_cleanup.rs::forget_stops_the_connector_and_removes_only_what_laplus_owns` and the driver's own forget verdicts, which assert the connector stopped, laplus's files gone, no `tunnel delete`, no `route`, and the account certificate byte-identical. Verification and pairing remain unreachable from a driver — they need a hostname that genuinely resolves — and are covered by `http_cloudflare_adoption.rs` against the hermetic verifier. Everything else was already covered.
 
 ## Comments
 
@@ -150,3 +150,21 @@ verdicts fail.
   offer never being made and by ownership being unchangeable through every route
   that writes the endpoint row — register, select, configure and forget all
   refuse. The refusal on a deletion _command_ is 07's to add.
+
+## Closed out by ticket 07 (2026-08-03)
+
+The two boxes above were left open waiting for the forget a supervised connector
+needs, and it now exists: `POST /api/access/cloudflare/forget` stops the
+connector and waits for it, removes laplus's own ingress file, settings file and
+run credential, removes the endpoint row and clears the account selection. For an
+adopted tunnel that is _all_ it does — no `tunnel delete`, no `route`, and the
+account certificate untouched — which is exactly what "laplus may configure and
+supervise it but does not own its Cloudflare allocation" has to mean when the
+setup is taken apart again.
+
+`http_cloudflare_adoption.rs`'s forget assertion has been extended rather than
+replaced, as this ticket said it should be: it still pins that nothing at
+Cloudflare is touched, and now also that the borrowed tunnel's credential does
+not survive. The state it used to reach through Forget — an endpoint row gone
+with a connector still running — is now reached the way a crash reaches it,
+because Forget no longer leaves a connector behind to test with.

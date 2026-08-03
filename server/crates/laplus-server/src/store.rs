@@ -1031,6 +1031,24 @@ impl Database {
         &self,
         exposure: NewPublicExposure<'_>,
     ) -> Result<(), StorageError> {
+        // **Recording an exposure ends the previous removal's story.** A cleanup
+        // journal outlives the endpoint it was about on purpose — that residue is
+        // how `cleanup-required` and `partially-deleted` survive a restart — but
+        // it describes a setup that no longer exists once a new one is recorded
+        // here, and a stale `completed` entry would make the *next* forget or
+        // delete skip a step it still had to perform. Registering is the one
+        // moment that means "there is something set up here again", so it is the
+        // one place this is cleared.
+        //
+        // [`Database::restore_public_exposure_endpoint`] deliberately does not:
+        // a boot must not erase outstanding cleanup work, which is exactly what
+        // a partially deleted tunnel leaves behind.
+        for intent in [
+            crate::public_exposure::MutationIntent::Forget,
+            crate::public_exposure::MutationIntent::DeleteEverywhere,
+        ] {
+            self.clear_mutation_journal(intent)?;
+        }
         let kept = verification_kept_for_the_same_hostname();
         self.lock().execute(
             &format!(
@@ -1095,6 +1113,37 @@ impl Database {
             ),
             [origin],
         ).map(|_| ()).map_err(StorageError::while_("restore the public exposure endpoint"))
+    }
+
+    /// Write down the zone and record laplus resolved for a record it could
+    /// only name.
+    ///
+    /// **The missing half of what creation could observe.** `cloudflared tunnel
+    /// route dns` reports no identifiers and the account certificate's contents
+    /// are never read, so creation records the name alone and the ids stay
+    /// `NULL` (ADR-0051). Whatever later acquires DNS authority resolves them,
+    /// and writing them back here is what makes a deletion interrupted between
+    /// the lookup and the removal address the record it already found instead of
+    /// resolving it a second time.
+    ///
+    /// Scoped to a row whose record name still matches, so a resolution that
+    /// arrives after the endpoint has been replaced writes nothing.
+    pub fn address_public_exposure_dns_record(
+        &self,
+        record_name: &str,
+        zone_id: &str,
+        record_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.lock()
+            .execute(
+                &format!(
+                    "UPDATE public_exposure_endpoint SET dns_zone_id = ?1, dns_record_id = ?2, \
+                     updated_at = {NOW} WHERE id = 0 AND dns_record_name = ?3"
+                ),
+                rusqlite::params![zone_id, record_id, record_name],
+            )
+            .map(|changed| changed == 1)
+            .map_err(StorageError::while_("address the public exposure DNS record"))
     }
 
     pub fn forget_public_exposure_endpoint(&self) -> Result<(), StorageError> {
@@ -4222,6 +4271,48 @@ mod tests {
                 name: "created.example.com".into(),
             }
             .address(),
+            Some(("zone-1", "record-1"))
+        );
+    }
+
+    /// The lookup a deletion pays for once is written back, and only onto the
+    /// record it was a lookup of.
+    ///
+    /// ADR-0051 hands ticket 07 a resolution step rather than an identifier, and
+    /// a cleanup interrupted between finding the record and removing it must
+    /// come back addressed — otherwise every retry spends the same lookup again,
+    /// and a retry that resolved a name whose row had since been replaced would
+    /// address somebody else's record.
+    #[test]
+    fn a_resolved_dns_record_is_written_back_and_only_onto_the_row_it_belongs_to() {
+        use crate::public_exposure::TunnelOwnership;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database = Database::open(&directory.path().join("state.sqlite")).expect("a database");
+        database
+            .register_public_exposure_endpoint(NewPublicExposure {
+                ownership: TunnelOwnership::LaplusCreated,
+                tunnel_id: Some("44444444-4444-4444-4444-444444444444"),
+                dns_record: Some(&DnsRecord::named("created.example.com")),
+                ..NewPublicExposure::external("https://created.example.com")
+            })
+            .expect("records a laplus-created tunnel");
+
+        assert!(database
+            .address_public_exposure_dns_record("created.example.com", "zone-1", "record-1")
+            .expect("addresses the record"));
+        assert_eq!(
+            database.public_exposure_endpoint().unwrap().unwrap().dns_record.unwrap().address(),
+            Some(("zone-1", "record-1"))
+        );
+
+        // A name this row is not about writes nothing at all, rather than
+        // pointing the row's record somewhere it was never resolved from.
+        assert!(!database
+            .address_public_exposure_dns_record("elsewhere.example.com", "zone-9", "record-9")
+            .expect("reads the row"));
+        assert_eq!(
+            database.public_exposure_endpoint().unwrap().unwrap().dns_record.unwrap().address(),
             Some(("zone-1", "record-1"))
         );
     }

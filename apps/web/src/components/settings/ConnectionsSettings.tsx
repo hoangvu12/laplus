@@ -31,7 +31,9 @@ import {
   type ManagedCloudflareConnectorSnapshot,
   type CloudflareAccountSnapshot,
   type CloudflareAccountTunnel,
+  type CloudflareDeletionPlan,
   type CloudflareUnfinishedCreation,
+  type PublicExposureCleanupReport,
   type CloudflaredExecutable,
   type CloudflaredInstallationSnapshot,
   type CloudflaredRelease,
@@ -50,6 +52,7 @@ import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestam
 import {
   cloudflareCreationPreview,
   cloudflareFailureMessage,
+  cloudflareCleanupSummary,
   cloudflareOwnershipLabel,
   cloudflareRowSummary,
   cloudflareUnfinishedCreationSummary,
@@ -129,6 +132,8 @@ import {
   registerExternalTunnelEndpoint,
   adoptCloudflareTunnel,
   createCloudflareTunnel,
+  offerCloudflareDeletion,
+  deleteCloudflareTunnel,
   selectCloudflareTunnel,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
@@ -236,6 +241,15 @@ export function CloudflareTunnelSettingsRow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pairingUrl, setPairingUrl] = useState<string | null>(null);
+  // The destructive confirmation, and the DNS authority it will spend.
+  //
+  // **The plan is held rather than rebuilt**, because it carries a
+  // single-use `confirmation` the server minted for the exact tunnel and record
+  // it named: composing a request from what this component happens to believe is
+  // precisely what ADR-0052 refuses. Cleared after a deletion, so a spent
+  // confirmation is never on screen beside a button that would replay it.
+  const [deletionPlan, setDeletionPlan] = useState<CloudflareDeletionPlan | null>(null);
+  const [dnsApiToken, setDnsApiToken] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -473,6 +487,88 @@ export function CloudflareTunnelSettingsRow({
     ]);
   }, [executablePath, mutateAccount, newTunnelName, refresh, refreshAccount, tunnelHostname]);
 
+  /**
+   * Forget, and then re-read everything it moved.
+   *
+   * Three reads for the reason dedication takes three: forget stops the
+   * connector and removes laplus's own configuration and credential before the
+   * row, so the connector snapshot, the account's wizard step and the endpoint
+   * have all changed by the time it answers — and a refusal moves the server
+   * too, because a forget that stopped half way really did remove something.
+   */
+  const removeSetup = useCallback(
+    async (run: () => Promise<ExternalTunnelEndpointSnapshot>, whenItFails: string) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const next = await run();
+        setSnapshot(next);
+        onSnapshot?.(next);
+        // The field follows the record: a removal that succeeded leaves nothing
+        // to prefill, and one that was refused leaves whatever survived.
+        setExternalHostname(registeredExternalTunnelHostname(next));
+        setPairingUrl(null);
+      } catch (cause) {
+        setError(cloudflareFailureMessage(cause, whenItFails));
+        await refresh();
+      } finally {
+        setBusy(false);
+      }
+      // Read either way, because a refusal moves the server too: a cleanup that
+      // stopped half way really did remove some of what it was asked to.
+      await Promise.all([
+        refreshAccount(),
+        readManagedCloudflareConnector()
+          .then(setManaged)
+          .catch(() => undefined),
+      ]);
+    },
+    [onSnapshot, refresh, refreshAccount],
+  );
+
+  const forgetSetup = useCallback(
+    () => removeSetup(forgetExternalTunnelEndpoint, "The setup could not be removed."),
+    [removeSetup],
+  );
+
+  /**
+   * Ask the server what a deletion would remove, and for the authorization.
+   *
+   * Sends nothing: the tunnel and the DNS record are the endpoint row's, and the
+   * verdict is the recorded ownership's. A refusal here is `not-laplus-created`,
+   * which is the same answer the deletion itself gives — so a control this
+   * component drew for the wrong tunnel cannot become a deletion.
+   */
+  const askToDelete = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setDeletionPlan(await offerCloudflareDeletion());
+    } catch (cause) {
+      setError(cloudflareFailureMessage(cause, "Deletion could not be offered."));
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const deleteEverywhere = useCallback(async () => {
+    if (!deletionPlan) return;
+    const confirmation = deletionPlan.confirmation;
+    const token = dnsApiToken;
+    // **Spent either way, and before the request rather than after it.** The
+    // server removes the confirmation when it reads it, so keeping it on screen
+    // would leave a button that could only ever be refused again — the defect
+    // ticket 05 found in the dedication offer, in the one place where a stale
+    // offer is destructive.
+    setDeletionPlan(null);
+    setDnsApiToken("");
+    await removeSetup(
+      () => deleteCloudflareTunnel({ executablePath, confirmation, dnsApiToken: token }),
+      "The deletion failed.",
+    );
+  }, [deletionPlan, dnsApiToken, executablePath, removeSetup]);
+
   const createPairing = useCallback(async () => {
     const origin = managed?.configured ? managed.httpsOrigin : snapshot?.httpsOrigin;
     if (!origin) return;
@@ -643,15 +739,42 @@ export function CloudflareTunnelSettingsRow({
               adopted one and a laplus-created one is a single sentence about
               deletion, and that sentence is `deletableAtCloudflare` — the
               server's verdict — rather than a branch here. */}
-          {(wizard.step === "adopting" || wizard.step === "creating") && managed?.configured ? (
-            <CloudflareDedicatedConnectorPanel
-              snapshot={managed}
+          {wizard.step === "cleanup" && snapshot ? (
+            <CloudflareCleanupPanel
+              cleanup={snapshot.cleanup}
               canWrite={canWrite}
               busy={busy}
-              onStart={() => void mutateManaged("start")}
-              onStop={() => void mutateManaged("stop")}
-              onRetry={() => void mutateManaged("retry")}
+              onRetryForget={() => void forgetSetup()}
+              onRetryDeletion={() => void askToDelete()}
             />
+          ) : null}
+
+          {(wizard.step === "adopting" || wizard.step === "creating") && managed?.configured ? (
+            deletionPlan ? (
+              <CloudflareDeletionConfirmation
+                plan={deletionPlan}
+                dnsApiToken={dnsApiToken}
+                canWrite={canWrite}
+                busy={busy}
+                onDnsApiTokenChange={setDnsApiToken}
+                onCancel={() => {
+                  setDeletionPlan(null);
+                  setDnsApiToken("");
+                }}
+                onConfirm={() => void deleteEverywhere()}
+              />
+            ) : (
+              <CloudflareDedicatedConnectorPanel
+                snapshot={managed}
+                canWrite={canWrite}
+                busy={busy}
+                onStart={() => void mutateManaged("start")}
+                onStop={() => void mutateManaged("stop")}
+                onRetry={() => void mutateManaged("retry")}
+                onForget={() => void forgetSetup()}
+                onDelete={() => void askToDelete()}
+              />
+            )
           ) : null}
 
           {wizard.step === "confirm-adoption" && account?.selection ? (
@@ -1286,6 +1409,8 @@ export function CloudflareDedicatedConnectorPanel({
   onStart,
   onStop,
   onRetry,
+  onForget,
+  onDelete,
 }: {
   readonly snapshot: ManagedCloudflareConnectorSnapshot;
   readonly canWrite: boolean;
@@ -1293,6 +1418,17 @@ export function CloudflareDedicatedConnectorPanel({
   readonly onStart: () => void;
   readonly onStop: () => void;
   readonly onRetry: () => void;
+  readonly onForget: () => void;
+  /**
+   * Ask the server for a destructive confirmation.
+   *
+   * Rendered only when the server says this tunnel's Cloudflare resources are
+   * laplus's to delete, and refused by the server when they are not — the offer
+   * and the refusal are `deletableAtCloudflare` and
+   * `TunnelOwnership::deletable_at_cloudflare` respectively, which is one value
+   * rather than two that can drift.
+   */
+  readonly onDelete: () => void;
 }) {
   return (
     <section className="space-y-3" aria-label="Dedicated Cloudflare tunnel">
@@ -1327,7 +1463,168 @@ export function CloudflareDedicatedConnectorPanel({
               Retry connector
             </Button>
           ) : null}
+          {/* Forget removes laplus's own configuration and secrets after
+              stopping this connector, and never touches Cloudflare — for an
+              adopted tunnel it is the only removal there is. It is a separate
+              control from Delete everywhere rather than a mode of it, because
+              "local cleanup never implies remote destruction" is the whole
+              distinction ticket 07 exists to make legible. */}
+          <Button size="sm" variant="outline" disabled={busy} onClick={onForget}>
+            Forget local setup
+          </Button>
+          {snapshot.deletableAtCloudflare ? (
+            <Button size="sm" variant="destructive" disabled={busy} onClick={onDelete}>
+              Delete everywhere…
+            </Button>
+          ) : null}
         </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * The destructive confirmation, which names the exact resources it will remove.
+ *
+ * **Every name on it is the server's.** The plan arrives from
+ * `POST /api/access/cloudflare/account/deletion`, which reads the endpoint row
+ * and refuses for any ownership but `laplus-created` — so this screen cannot be
+ * drawn for a tunnel laplus may not delete, and could not confirm the deletion
+ * of one even if it were: `confirmation` is minted for those resources, spent
+ * once, and re-checked against the row when the button is pressed
+ * (`server/docs/adr/0052`).
+ *
+ * The Cloudflare API token is asked for here because `cloudflared` has no
+ * `route dns delete` at all and the account certificate is used in place and
+ * never read (ADR-0045). It is sent with this one request and stored nowhere.
+ */
+export function CloudflareDeletionConfirmation({
+  plan,
+  dnsApiToken,
+  canWrite,
+  busy,
+  onDnsApiTokenChange,
+  onCancel,
+  onConfirm,
+}: {
+  readonly plan: CloudflareDeletionPlan;
+  readonly dnsApiToken: string;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onDnsApiTokenChange: (value: string) => void;
+  readonly onCancel: () => void;
+  readonly onConfirm: () => void;
+}) {
+  return (
+    <section className="space-y-3" aria-label="Delete everywhere">
+      <div>
+        <p className="text-sm font-medium text-destructive">
+          Delete this tunnel and its DNS record at Cloudflare
+        </p>
+        <p className="text-xs text-muted-foreground">{plan.warning}</p>
+      </div>
+      <dl className="space-y-1 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
+        <div className="flex gap-2">
+          <dt className="text-muted-foreground">Tunnel</dt>
+          <dd className="font-medium">
+            {plan.tunnelName ? `${plan.tunnelName} · ` : ""}
+            {plan.tunnelId}
+          </dd>
+        </div>
+        <div className="flex gap-2">
+          <dt className="text-muted-foreground">DNS record</dt>
+          <dd className="font-medium">{plan.dnsRecordName ?? "none recorded"}</dd>
+        </div>
+        <div className="flex gap-2">
+          <dt className="text-muted-foreground">Endpoint</dt>
+          <dd className="font-medium">{plan.httpsOrigin}</dd>
+        </div>
+      </dl>
+      <label className="block">
+        <span className="text-xs font-medium">Cloudflare API token with DNS edit permission</span>
+        <Input
+          className="mt-1"
+          aria-label="Cloudflare DNS API token"
+          type="password"
+          autoComplete="off"
+          placeholder="Used for this request only and never stored"
+          value={dnsApiToken}
+          disabled={busy || !canWrite}
+          onChange={(event) => onDnsApiTokenChange(event.target.value)}
+        />
+        <span className="mt-1 block text-xs text-muted-foreground">
+          cloudflared cannot delete a DNS record, so laplus needs DNS authority of its own. laplus
+          never revokes your Cloudflare account token and never touches your account certificate.
+        </span>
+      </label>
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+            Cancel deletion
+          </Button>
+          <Button size="sm" variant="destructive" disabled={busy} onClick={onConfirm}>
+            Delete everywhere
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * The screen a cleanup that stopped half way lands on.
+ *
+ * **It exists because every other screen would be describing a setup that is no
+ * longer whole.** A forget interrupted between its two removals has laplus's
+ * configuration gone and its credential still on disk; a deletion interrupted
+ * after the DNS record has a tunnel that still exists and a hostname that no
+ * longer routes to it. Both are truthful states with outstanding work, and the
+ * server names that work exactly — so this shows it and offers the one action
+ * that finishes it.
+ */
+export function CloudflareCleanupPanel({
+  cleanup,
+  canWrite,
+  busy,
+  onRetryForget,
+  onRetryDeletion,
+}: {
+  readonly cleanup: PublicExposureCleanupReport;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onRetryForget: () => void;
+  readonly onRetryDeletion: () => void;
+}) {
+  const partial = cleanup.state === "partially-deleted";
+  return (
+    <section className="space-y-3" aria-label="Finish removing this setup">
+      <div>
+        <p className="text-sm font-medium">
+          {partial ? "This deletion did not finish" : "This cleanup did not finish"}
+        </p>
+        <p className="text-xs text-muted-foreground">{cloudflareCleanupSummary(cleanup)}</p>
+      </div>
+      {partial ? (
+        <dl className="space-y-1 rounded-md border border-border/70 bg-muted/20 p-3 text-xs">
+          <div className="flex gap-2">
+            <dt className="text-muted-foreground">Tunnel</dt>
+            <dd className="font-medium">{cleanup.tunnelId ?? "none recorded"}</dd>
+          </div>
+          <div className="flex gap-2">
+            <dt className="text-muted-foreground">DNS record</dt>
+            <dd className="font-medium">{cleanup.dnsRecordName ?? "none recorded"}</dd>
+          </div>
+        </dl>
+      ) : null}
+      {canWrite ? (
+        <Button
+          size="sm"
+          variant="destructive"
+          disabled={busy}
+          onClick={partial ? onRetryDeletion : onRetryForget}
+        >
+          {partial ? "Finish deleting" : "Finish removing"}
+        </Button>
       ) : null}
     </section>
   );

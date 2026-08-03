@@ -856,6 +856,52 @@ impl Account {
         Ok(())
     }
 
+    /// Delete a tunnel laplus created, by the UUID Cloudflare allocated.
+    ///
+    /// **By id, and never by name.** The name is a label the account can hold
+    /// twice and a developer can retype; the UUID is the resource, and it is
+    /// what the endpoint row and the journal both record for exactly this
+    /// moment. Whether laplus is *allowed* to run this at all is decided from
+    /// the recorded ownership before the call — see `delete_cloudflare_tunnel`
+    /// in `server.rs`, which is where ADR-0049's rule lives.
+    ///
+    /// **No `--cascade` and no force.** A tunnel that still has connections is a
+    /// tunnel something is still serving, and cloudflared refusing to delete it
+    /// is the answer laplus wants: the connector is stopped first, and a refusal
+    /// after that means somebody else's replica is running and the developer has
+    /// to decide, not laplus.
+    ///
+    /// The DNS record is *not* removed by this, and cannot be: `cloudflared` has
+    /// no `route dns delete`. See [`crate::cloudflare_dns`].
+    pub async fn delete_tunnel(&self, executable: &Path, tunnel_id: &str) -> Result<(), Refusal> {
+        let (executable, certificate) = self.consented_command(executable).await?;
+        let output = tokio::process::Command::new(&executable)
+            .args([
+                "tunnel",
+                "--origincert",
+                &certificate.to_string_lossy(),
+                "delete",
+                tunnel_id,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|_| {
+                Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared could not delete the tunnel.",
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Refusal::rejected(
+                RefusalReason::CommandFailed,
+                "cloudflared could not delete that tunnel. A connector may still be serving it, \
+                 or the account certificate may no longer have authority over it.",
+            ));
+        }
+        Ok(())
+    }
+
     /// Record the tunnel laplus created, and that it created it.
     ///
     /// Written last, after the tunnel, the route and the configuration exist,
@@ -904,6 +950,28 @@ impl Account {
                 ));
             };
             selection.adoption_confirmed = true;
+            settings.clone()
+        };
+        self.persist(&settings)
+    }
+
+    /// Forget which tunnel this environment's setup was about.
+    ///
+    /// **The selection is what [`step`] resumes from**, so a forget or a delete
+    /// that removed the endpoint row and left this behind would put the wizard
+    /// back on `adopting` or `creating` for a setup that no longer exists — a
+    /// screen naming a connector nothing is running and a tunnel nothing
+    /// records.
+    ///
+    /// Consent and the listing survive on purpose. Consent is authority over the
+    /// account certificate and is not what was removed; the listing is a read
+    /// that costs a Cloudflare round trip, and keeping it means setting up again
+    /// starts at the tunnel list rather than at a refresh button. Neither says
+    /// anything about a tunnel laplus owns.
+    pub fn forget_selection(&self) -> Result<(), Refusal> {
+        let settings = {
+            let mut settings = self.settings.lock().unwrap();
+            settings.selection = None;
             settings.clone()
         };
         self.persist(&settings)

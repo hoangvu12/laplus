@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — Cloudflare sign-in and existing-tunnel discovery.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] The wizard clearly labels the tunnel as locally managed on this computer and previews its name, exact HTTPS hostname, DNS change, loopback target, credential location, and public-exposure warning before confirmation.
 - [x] Creation validates the hostname and intended dedicated ownership, then journals intent and the exact tunnel and DNS resources before and after every Cloudflare mutation. **The DNS resource is its name.** `cloudflared tunnel route dns` reports no zone or record id and the account certificate's contents are never read (ADR-0045), so the name is the only identifier creation can truthfully record; ADR-0051 is the decision and ticket 07 resolves the rest.
@@ -15,7 +15,7 @@
 - [x] Partial failure identifies completed and pending work, offers safe retry or explicit cleanup, and never claims an automatic rollback that did not occur. **Safe retry**, which is the half of the "or" this ticket owns; explicit cleanup is ticket 07's Forget and Delete everywhere.
 - [x] The completed connector follows the existing supervision, readiness, public verification, advertisement, pairing, stop, and restart behavior.
 - [x] The compact row identifies the endpoint as a laplus-created tunnel and preserves that ownership across restart.
-- [ ] Fake Cloudflare/cloudflared integration and UI-driver coverage prove success at each resumable boundary, mutation idempotence, public warnings, verification, pairing, and secret redaction. **All but "fake Cloudflare", which creation never calls.** `FakeCloudflareApi` models the Cloudflare DNS REST API, and creation makes no API call at all — every mutation it performs is a `cloudflared` verb. It stays untouched for ticket 07, whose DNS deletion is the one operation the CLI cannot do. Everything else is covered: the three resumable boundaries and mutation idempotence in `http_cloudflare_creation.rs` and again through the browser, the public warnings in the component test and eight driver verdicts, verification and pairing against the hermetic verifier, and secret redaction across four haystacks.
+- [x] Fake Cloudflare/cloudflared integration and UI-driver coverage prove success at each resumable boundary, mutation idempotence, public warnings, verification, pairing, and secret redaction. **Creation's own coverage was always complete; the fixture is no longer unused.** Every mutation creation performs is a `cloudflared` verb, so `FakeCloudflareApi` could never appear in _this_ ticket's path — it models the one operation the CLI cannot do. Ticket 07 is its first caller, and it now exercises the record this ticket created, through both `http_cloudflare_cleanup.rs` and a stand-in DNS API in the driver. What this box asked to be proven is proven: the three resumable boundaries and mutation idempotence in `http_cloudflare_creation.rs` and again through the browser, the public warnings in the component test and eight driver verdicts, verification and pairing against the hermetic verifier, and secret redaction across four haystacks.
 
 ## Comments
 
@@ -160,3 +160,31 @@ verdicts fail and the screen is identical.
   the credential on disk wins and the earlier tunnel is completed. That is the
   safe direction — the alternative strands a real Cloudflare resource — and the
   way to a different tunnel is 07's delete or forget.
+
+## Closed out by ticket 07 (2026-08-03)
+
+Every handover this ticket wrote for 07 was taken up as written.
+
+- **The DNS record's identifiers are resolved and written back.**
+  `crate::cloudflare_dns` finds the zone the recorded name sits under from the
+  zones its token can see, then the record within it, and
+  `Database::address_public_exposure_dns_record` puts both on the row — so a
+  deletion interrupted between the lookup and the removal addresses the record it
+  already found. `DnsRecord::address()` is what asks.
+- **`CREATION_STEPS` is not what a cleanup undoes.** `DELETION_STEPS` is written
+  out separately, in the order a deletion actually takes: the DNS record before
+  the tunnel, because the reverse leaves a CNAME pointing at nothing, and the two
+  local steps last, because they are what a retry needs in order to reach
+  Cloudflare again. `remaining_steps` is shared; the lists are not, exactly as
+  this ticket said.
+- **A residual `create` journal is still distinct from a cleanup residue.** They
+  are separate intents and `cleanup_report` reads only the cleanup ones; a
+  successful forget or deletion clears the `create` and `adopt` journals, because
+  the setup they described is gone.
+- **Creation's refusal while another dedicated tunnel's credential is on disk is
+  no longer a dead end.** Forget removes that credential, so the way to a
+  different tunnel is a forget or a deletion — which is what this ticket said it
+  should be. The test that pinned the laundering guard now reaches the
+  credential-on-disk-with-no-row state through a _partial adoption_ rather than
+  through a forget, because a forget no longer leaves one.
+- **`normalize_tunnel_name` was not copied**; ticket 07 grew no rename.

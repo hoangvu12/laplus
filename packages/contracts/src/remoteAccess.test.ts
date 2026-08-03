@@ -3,13 +3,24 @@ import * as Schema from "effect/Schema";
 
 import {
   CloudflareAccountSnapshot,
+  CloudflareDeletionPlan,
   CloudflaredInstallationSnapshot,
+  PublicExposureCleanupReport,
   ExternalTunnelEndpointSnapshot,
   ManagedCloudflareConnectorSnapshot,
   TunnelOwnership,
 } from "./remoteAccess.ts";
 
 const decode = Schema.decodeUnknownSync(ExternalTunnelEndpointSnapshot);
+
+/** No stop, forget or delete has happened — what most of these fixtures are. */
+const INTACT = {
+  state: "intact",
+  completed: [],
+  remaining: [],
+  tunnelId: null,
+  dnsRecordName: null,
+} as const;
 
 describe("ExternalTunnelEndpointSnapshot", () => {
   it("decodes every closed verification state and failure kind", () => {
@@ -21,6 +32,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
           wssOrigin: verificationState === "unconfigured" ? null : "wss://laplus.example.com",
           ownership: "external",
           deletableAtCloudflare: false,
+          cleanup: INTACT,
           health: { connector: "external", https: "unknown", webSocket: "unknown" },
           verificationState,
           failureKind: null,
@@ -50,6 +62,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
           wssOrigin: "wss://laplus.example.com",
           ownership: "external",
           deletableAtCloudflare: false,
+          cleanup: INTACT,
           health: { connector: "external", https: "failed", webSocket: "unknown" },
           verificationState: "failed",
           failureKind,
@@ -69,6 +82,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       wssOrigin: "wss://laplus.example.com",
       ownership: "external",
       deletableAtCloudflare: false,
+      cleanup: INTACT,
       health: { connector: "external", https: "healthy", webSocket: "healthy" },
       verificationState: "verified",
       failureKind: null,
@@ -100,6 +114,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       wssOrigin: "wss://laplus.example.com",
       ownership: "external",
       deletableAtCloudflare: false,
+      cleanup: INTACT,
       health: { connector: "external", https: "failed", webSocket: "unknown" },
       verificationState: "failed",
       failureKind: "cloudflare-access",
@@ -118,6 +133,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       wssOrigin: "wss://laplus.example.com",
       ownership: "external",
       deletableAtCloudflare: false,
+      cleanup: INTACT,
       health: { connector: "external", https: "healthy", webSocket: "failed" },
       verificationState: "failed",
       failureKind: "cloudflare-access-websocket",
@@ -515,5 +531,109 @@ describe("CloudflareAccountSnapshot", () => {
       expect(tunnel).not.toHaveProperty("hostname");
       expect(tunnel).not.toHaveProperty("managementMode");
     }
+  });
+});
+
+describe("PublicExposureCleanupReport", () => {
+  const decodeCleanup = Schema.decodeUnknownSync(PublicExposureCleanupReport);
+
+  /**
+   * The six words the row and the wizard have to be able to say truthfully, and
+   * the two lists that keep any of them from claiming a rollback.
+   */
+  it("decodes every cleanup state and the exact work each one has left", () => {
+    for (const state of [
+      "intact",
+      "stopped",
+      "cleanup-required",
+      "partially-deleted",
+      "forgotten",
+      "fully-removed",
+    ] as const) {
+      expect(
+        decodeCleanup({
+          state,
+          completed: [],
+          remaining: [],
+          tunnelId: null,
+          dnsRecordName: null,
+        }).state,
+      ).toBe(state);
+    }
+
+    // A deletion that removed the DNS record and could not remove the tunnel:
+    // both halves named, and the tunnel named so a person could remove it by
+    // hand. The endpoint row is gone by the time some of these are read, which
+    // is why the identifiers travel with the report rather than beside it.
+    const partial = decodeCleanup({
+      state: "partially-deleted",
+      completed: ["dns-record-delete"],
+      remaining: ["tunnel-delete", "configuration-remove", "credential-remove"],
+      tunnelId: "44444444-4444-4444-4444-444444444444",
+      dnsRecordName: "stable.example.com",
+    });
+    expect(partial.completed).toEqual(["dns-record-delete"]);
+    expect(partial.remaining).toEqual([
+      "tunnel-delete",
+      "configuration-remove",
+      "credential-remove",
+    ]);
+    expect(partial.tunnelId).toBe("44444444-4444-4444-4444-444444444444");
+  });
+
+  it("refuses a cleanup state this build does not know", () => {
+    expect(() =>
+      decodeCleanup({
+        state: "mostly-gone",
+        completed: [],
+        remaining: [],
+        tunnelId: null,
+        dnsRecordName: null,
+      }),
+    ).toThrow();
+  });
+});
+
+describe("CloudflareDeletionPlan", () => {
+  const decodePlan = Schema.decodeUnknownSync(CloudflareDeletionPlan);
+
+  /**
+   * The destructive confirmation names the exact recorded resources, and the
+   * authorization to remove them is minted with them rather than derived from a
+   * session. `server/docs/adr/0052`.
+   */
+  it("names the exact tunnel and DNS record, and carries a confirmation to spend", () => {
+    const plan = decodePlan({
+      tunnelId: "44444444-4444-4444-4444-444444444444",
+      tunnelName: "laplus-desk",
+      httpsOrigin: "https://stable.example.com",
+      dnsRecordName: "stable.example.com",
+      steps: ["dns-record-delete", "tunnel-delete", "configuration-remove", "credential-remove"],
+      confirmation: "one-time-confirmation",
+      expiresInSeconds: 300,
+      warning: "Deleting removes the Cloudflare tunnel and the DNS record laplus created.",
+    });
+
+    expect(plan.tunnelId).toBe("44444444-4444-4444-4444-444444444444");
+    expect(plan.dnsRecordName).toBe("stable.example.com");
+    // The DNS record goes before the tunnel, because the reverse leaves a CNAME
+    // pointing at nothing — see the schema and `DELETION_STEPS` in `server.rs`.
+    expect(plan.steps[0]).toBe("dns-record-delete");
+    expect(plan.steps[1]).toBe("tunnel-delete");
+
+    // A tunnel laplus made but never routed has no record to name, and the plan
+    // says so rather than inventing one.
+    expect(
+      decodePlan({
+        tunnelId: "44444444-4444-4444-4444-444444444444",
+        tunnelName: null,
+        httpsOrigin: "https://stable.example.com",
+        dnsRecordName: null,
+        steps: ["tunnel-delete"],
+        confirmation: "one-time-confirmation",
+        expiresInSeconds: 300,
+        warning: "Deleting removes the Cloudflare tunnel laplus created.",
+      }).dnsRecordName,
+    ).toBeNull();
   });
 });

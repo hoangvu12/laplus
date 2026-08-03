@@ -545,12 +545,12 @@ async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
     let fake = FakeCloudflared::write_into(directory.path());
-    let api = harness::cloudflare::FakeCloudflareApi::start(
-        "zone-1",
-        "record-1",
-        "laplus.example.com",
-    )
-    .await;
+    let api = harness::cloudflare::FakeCloudflareApi::start("laplus.example.com").await;
+    let record = format!(
+        "/client/v4/zones/{}/dns_records/{}",
+        harness::cloudflare::ZONE_ID,
+        harness::cloudflare::RECORD_ID
+    );
 
     // There is no such verb, and the fixture must not invent one. Invoked in
     // exactly the shape a real `route dns` takes — `--origincert` and all — so
@@ -584,9 +584,21 @@ async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
     assert!(String::from_utf8_lossy(&attempted.stderr).contains("unknown command"));
     std::env::remove_var("TUNNEL_ORIGIN_CERT");
 
+    // The API needs DNS authority of its own, which is the whole reason the
+    // deletion cannot ride on the account certificate: an unauthorized caller is
+    // answered exactly as Cloudflare answers one.
     let client = reqwest::Client::new();
+    let anonymous = client
+        .delete(format!("{}{record}", api.origin))
+        .send()
+        .await
+        .expect("the fake API answers");
+    assert_eq!(anonymous.status(), 403);
+    assert_eq!(api.records().len(), 1, "an unauthorized delete removed a record");
+
     let deleted = client
-        .delete(format!("{}/client/v4/zones/zone-1/dns_records/record-1", api.origin))
+        .delete(format!("{}{record}", api.origin))
+        .bearer_auth(harness::cloudflare::DNS_API_TOKEN)
         .send()
         .await
         .expect("the fake API answers");
@@ -597,7 +609,8 @@ async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
     // already done rather than as a new failure, which is what lets ticket 07
     // resume from observed state.
     let repeated = client
-        .delete(format!("{}/client/v4/zones/zone-1/dns_records/record-1", api.origin))
+        .delete(format!("{}{record}", api.origin))
+        .bearer_auth(harness::cloudflare::DNS_API_TOKEN)
         .send()
         .await
         .expect("the fake API answers");
@@ -609,8 +622,9 @@ async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
     assert_eq!(
         api.requests(),
         vec![
-            ("DELETE".to_string(), "/client/v4/zones/zone-1/dns_records/record-1".to_string()),
-            ("DELETE".to_string(), "/client/v4/zones/zone-1/dns_records/record-1".to_string()),
+            ("DELETE".to_string(), record.clone()),
+            ("DELETE".to_string(), record.clone()),
+            ("DELETE".to_string(), record.clone()),
         ]
     );
     api.stop();

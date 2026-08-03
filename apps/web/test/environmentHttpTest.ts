@@ -26,7 +26,9 @@ import {
   type ManagedCloudflareConnectorSnapshot,
   type RegisterExternalTunnelEndpointInput,
   type SelectCloudflareTunnelInput,
+  type CloudflareDeletionPlan,
   type CreateCloudflareTunnelInput,
+  type DeleteCloudflareTunnelInput,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Context from "effect/Context";
@@ -115,6 +117,13 @@ interface EnvironmentHttpTestScenario {
   readonly createCloudflareTunnel?: (
     payload: CreateCloudflareTunnelInput,
   ) => Effect.Effect<CloudflareAccountSnapshot, PublicExposureFailure>;
+  readonly offerCloudflareDeletion?: () => Effect.Effect<
+    CloudflareDeletionPlan,
+    PublicExposureFailure
+  >;
+  readonly deleteCloudflareTunnel?: (
+    payload: DeleteCloudflareTunnelInput,
+  ) => Effect.Effect<ExternalTunnelEndpointSnapshot, PublicExposureFailure>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -142,6 +151,8 @@ export interface EnvironmentHttpTestCalls {
   selectCloudflareTunnel: Array<SelectCloudflareTunnelInput>;
   adoptCloudflareTunnel: Array<CloudflareAccountCommandInput>;
   createCloudflareTunnel: Array<CreateCloudflareTunnelInput>;
+  offerCloudflareDeletion: number;
+  deleteCloudflareTunnel: Array<DeleteCloudflareTunnelInput>;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -186,6 +197,8 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     selectCloudflareTunnel: [],
     adoptCloudflareTunnel: [],
     createCloudflareTunnel: [],
+    offerCloudflareDeletion: 0,
+    deleteCloudflareTunnel: [],
   };
 
   const client = await Effect.runPromise(
@@ -372,6 +385,20 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
               return (
                 scenario.createCloudflareTunnel?.(payload) ??
                 unexpectedEndpoint("access.createCloudflareTunnel")
+              );
+            })
+            .handle("offerCloudflareDeletion", () => {
+              calls.offerCloudflareDeletion += 1;
+              return (
+                scenario.offerCloudflareDeletion?.() ??
+                unexpectedEndpoint("access.offerCloudflareDeletion")
+              );
+            })
+            .handle("deleteCloudflareTunnel", ({ payload }) => {
+              calls.deleteCloudflareTunnel.push(payload);
+              return (
+                scenario.deleteCloudflareTunnel?.(payload) ??
+                unexpectedEndpoint("access.deleteCloudflareTunnel")
               );
             })
             // laplus answering itself through the public hostname, never a

@@ -11,6 +11,8 @@ import type {
   EnvironmentPublicExposureRefusal,
   CloudflareUnfinishedCreation,
   ManagedCloudflareConnectorSnapshot,
+  PublicExposureCleanupReport,
+  PublicExposureCleanupState,
   PublicExposureMutationStep,
   TunnelOwnership,
 } from "@t3tools/contracts";
@@ -127,7 +129,8 @@ export type CloudflareWizardStep =
   | "creating"
   | "connector-token"
   | "external-endpoint"
-  | "managed-connector";
+  | "managed-connector"
+  | "cleanup";
 
 export interface CloudflareWizardState {
   readonly step: CloudflareWizardStep;
@@ -167,6 +170,7 @@ const WIZARD_STEP_LABELS: Record<CloudflareWizardStep, string> = {
   "connector-token": "Connector token",
   "external-endpoint": "External hostname",
   "managed-connector": "Laplus-managed connector",
+  cleanup: "Finish removing this setup",
 };
 
 export const cloudflareWizardStepLabel = (step: CloudflareWizardStep): string =>
@@ -290,6 +294,16 @@ export const cloudflareWizardState = (input: {
   readonly creatingTunnel?: boolean;
 }): CloudflareWizardState => {
   const { account, managed, external, chosenPath, revisitingPathChoice } = input;
+  // **A cleanup that stopped half way outranks everything, including a
+  // connector.** Some of laplus's own setup is gone or some of the Cloudflare
+  // resources it created are, and every other screen would describe a setup that
+  // is no longer whole — the `creating` panel would offer to stop a connector
+  // whose configuration has already been removed, and the path choice would
+  // offer to set up beside resources nothing else will now mention. This is the
+  // one screen that can name the outstanding work and finish it.
+  if (external && !cleanupIsSettled(external.cleanup.state)) {
+    return wizardState("cleanup", null, false);
+  }
   const chosenAccountStep = account?.step ?? "sign-in";
   // **A creation that never finished is progress, and outranks a typed flag.**
   // The client's `creatingTunnel` is discarded by a reload; the server's
@@ -432,6 +446,76 @@ export const cloudflareCreationPreview = (input: {
 };
 
 /**
+ * Whether a cleanup has anything outstanding.
+ *
+ * The two unsettled states are the ones with remaining work: a forget that
+ * stopped between its two removals, and a delete-everywhere that removed some of
+ * what it was asked to. `forgotten` and `fully-removed` are finished removals,
+ * and `intact` and `stopped` are setups nothing removed anything from — none of
+ * the four needs a screen of its own.
+ */
+const cleanupIsSettled = (state: PublicExposureCleanupState): boolean =>
+  state !== "cleanup-required" && state !== "partially-deleted";
+
+/**
+ * What the compact row calls each cleanup state.
+ *
+ * **An exhaustive `Record`, so a state the server adds fails typecheck** — the
+ * shape {@link WIZARD_STEP_LABELS} and {@link OWNERSHIP_LABELS} already use.
+ *
+ * These are the words ticket 07 requires the row to report truthfully, and each
+ * of them is a different thing to do next: a stopped connector starts again, an
+ * unfinished cleanup is retried, and a finished removal is set up again from
+ * scratch. `intact` has no label because a setup nothing removed anything from
+ * has nothing to say here — the row describes it by its hostname and health.
+ */
+const CLEANUP_LABELS: Record<Exclude<PublicExposureCleanupState, "intact">, string> = {
+  stopped: "Stopped",
+  "cleanup-required": "Cleanup required",
+  "partially-deleted": "Partially deleted",
+  forgotten: "Forgotten",
+  "fully-removed": "Fully removed",
+};
+
+export const cloudflareCleanupLabel = (state: PublicExposureCleanupState): string | null =>
+  state === "intact" ? null : CLEANUP_LABELS[state];
+
+/**
+ * What the wizard says a cleanup did and has left to do.
+ *
+ * Shares {@link MUTATION_STEP_LABELS} with the refusal and the unfinished
+ * creation for the reason those two share it: a developer reads about the same
+ * journal at the moment of failure, after a restart, and while retrying, and
+ * three vocabularies for one log is how they come to disagree.
+ *
+ * **Never claims a rollback.** What is reported as done is what the server
+ * observed to be gone or recorded as completed, so a partially deleted tunnel is
+ * described as a tunnel that still exists rather than as an operation that
+ * undid itself.
+ */
+export const cloudflareCleanupSummary = (
+  cleanup: Pick<PublicExposureCleanupReport, "state" | "completed" | "remaining">,
+): string => {
+  const sentences: Array<string> = [];
+  if (cleanup.state === "partially-deleted") {
+    sentences.push("Some of the Cloudflare resources laplus created were removed and some remain.");
+  } else if (cleanup.state === "cleanup-required") {
+    sentences.push("Some of laplus's own configuration and secrets are still on this computer.");
+  }
+  if (cleanup.completed.length > 0) {
+    sentences.push(
+      `Already done: ${cleanup.completed.map((step) => MUTATION_STEP_LABELS[step]).join(", ")}.`,
+    );
+  }
+  if (cleanup.remaining.length > 0) {
+    sentences.push(
+      `Still outstanding: ${cleanup.remaining.map((step) => MUTATION_STEP_LABELS[step]).join(", ")}.`,
+    );
+  }
+  return sentences.join(" ");
+};
+
+/**
  * What the compact row calls each ownership.
  *
  * **An exhaustive `Record`, so a value the server adds fails typecheck** — the
@@ -472,6 +556,18 @@ export const cloudflareRowSummary = (input: {
   readonly managedStateLabel: (snapshot: ManagedCloudflareConnectorSnapshot) => string;
 }): string => {
   const { state, managed, external, managedStateLabel } = input;
+  // **What a cleanup left is what the row says, whatever else is still lying
+  // around.** A partially deleted tunnel still has a connector and an endpoint
+  // row, and describing it by those would tell a developer their exposure is
+  // healthy while its DNS record is gone; a finished forget leaves neither, and
+  // "Not configured" would not say that anything happened.
+  const cleanup = external ? cloudflareCleanupLabel(external.cleanup.state) : null;
+  if (cleanup !== null && external?.cleanup.state !== "stopped") {
+    const outstanding = external?.cleanup.remaining.length ?? 0;
+    return outstanding > 0
+      ? `${cleanup} · ${outstanding} step${outstanding === 1 ? "" : "s"} outstanding`
+      : `${cleanup} · nothing of laplus's remains on this computer`;
+  }
   if (managed?.configured) {
     return `${managed.httpsOrigin} · ${cloudflareOwnershipLabel(managed.tunnelOwnership)} · ${managedStateLabel(managed)}`;
   }

@@ -89,6 +89,79 @@ export type AdvertisedEndpoint = typeof AdvertisedEndpoint.Type;
 export const TunnelOwnership = Schema.Literals(["external", "adopted", "laplus-created"]);
 export type TunnelOwnership = typeof TunnelOwnership.Type;
 
+/**
+ * One step of a multi-step Cloudflare mutation, as a refusal reports it.
+ *
+ * These are the words tickets 06 and 07 need in order to "identify completed
+ * and pending work" and "preserve exact remaining work for idempotent retry"
+ * without ever claiming a rollback that did not occur. `dns-record-delete` is
+ * deliberately not the mirror of `dns-route`: `cloudflared` has no
+ * `route dns delete`, so removing a record is a Cloudflare DNS API call needing
+ * its own authority.
+ */
+export const PublicExposureMutationStep = Schema.Literals([
+  "credential",
+  "tunnel-create",
+  "dns-route",
+  "configuration",
+  "dns-record-delete",
+  "tunnel-delete",
+  "configuration-remove",
+  "credential-remove",
+]);
+export type PublicExposureMutationStep = typeof PublicExposureMutationStep.Type;
+
+/**
+ * What a stop, forget or delete left behind.
+ *
+ * **Derived by the server from what is observably gone and from its own
+ * journal**, never stored as a column: a third record of a fact the other two
+ * already answer is the one that can disagree with them after a crash.
+ *
+ * - `intact` — nothing was removed and nothing is outstanding.
+ * - `stopped` — the connector is off because it was asked to be. Tunnel, DNS
+ *   record, credential, configuration and ownership all survive.
+ * - `cleanup-required` — a forget stopped half way; some of laplus's own local
+ *   configuration or secrets are still on disk. Nothing at Cloudflare is
+ *   involved, because forget never touches Cloudflare.
+ * - `partially-deleted` — a delete-everywhere stopped half way; some of the
+ *   Cloudflare resources laplus created are gone and some remain. Separate from
+ *   `cleanup-required` because finishing it needs Cloudflare authority again
+ *   rather than only a retry.
+ * - `forgotten` — laplus's own local setup is gone and everything it did not
+ *   create is untouched.
+ * - `fully-removed` — everything laplus created is gone, at Cloudflare and here.
+ */
+export const PublicExposureCleanupState = Schema.Literals([
+  "intact",
+  "stopped",
+  "cleanup-required",
+  "partially-deleted",
+  "forgotten",
+  "fully-removed",
+]);
+export type PublicExposureCleanupState = typeof PublicExposureCleanupState.Type;
+
+/**
+ * What a cleanup did and what it has left to do, as it survives a restart.
+ *
+ * **The refusal body is not enough**, for the reason
+ * {@link CloudflareUnfinishedCreation} exists: `completed`/`remaining` reach the
+ * client in the response that failed, which lasts exactly as long as the
+ * developer stays on that screen — and a half-deleted tunnel outlives the
+ * request that half-deleted it. `tunnelId` and `dnsRecordName` are what is still
+ * outstanding at Cloudflare, named so a retry can target them and a person can
+ * remove them by hand.
+ */
+export const PublicExposureCleanupReport = Schema.Struct({
+  state: PublicExposureCleanupState,
+  completed: Schema.Array(PublicExposureMutationStep),
+  remaining: Schema.Array(PublicExposureMutationStep),
+  tunnelId: Schema.NullOr(TrimmedNonEmptyString),
+  dnsRecordName: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type PublicExposureCleanupReport = typeof PublicExposureCleanupReport.Type;
+
 export const ExternalTunnelVerificationState = Schema.Literals([
   "unconfigured",
   "pending",
@@ -128,6 +201,16 @@ export const ExternalTunnelEndpointSnapshot = Schema.Struct({
    * `laplus-created`.
    */
   deletableAtCloudflare: Schema.Boolean,
+  /**
+   * What a stop, forget or delete left behind — see
+   * {@link PublicExposureCleanupReport}.
+   *
+   * **On this snapshot rather than on the connector's**, because it is the one a
+   * client can still read after the cleanup succeeded: a finished forget leaves
+   * no connector and no endpoint row, and a report that lived on either would
+   * vanish with the thing it was reporting about.
+   */
+  cleanup: PublicExposureCleanupReport,
   health: Schema.Struct({
     /**
      * Who runs the connector in front of this endpoint. Widened from the
@@ -400,28 +483,6 @@ export const CloudflareAccountSetupStep = Schema.Literals([
 export type CloudflareAccountSetupStep = typeof CloudflareAccountSetupStep.Type;
 
 /**
- * One step of a multi-step Cloudflare mutation, as a refusal reports it.
- *
- * These are the words tickets 06 and 07 need in order to "identify completed
- * and pending work" and "preserve exact remaining work for idempotent retry"
- * without ever claiming a rollback that did not occur. `dns-record-delete` is
- * deliberately not the mirror of `dns-route`: `cloudflared` has no
- * `route dns delete`, so removing a record is a Cloudflare DNS API call needing
- * its own authority.
- */
-export const PublicExposureMutationStep = Schema.Literals([
-  "credential",
-  "tunnel-create",
-  "dns-route",
-  "configuration",
-  "dns-record-delete",
-  "tunnel-delete",
-  "configuration-remove",
-  "credential-remove",
-]);
-export type PublicExposureMutationStep = typeof PublicExposureMutationStep.Type;
-
-/**
  * A creation that started and never finished, as it survives a restart.
  *
  * **The refusal body is not enough.** `completed`/`remaining` reach the client
@@ -435,6 +496,7 @@ export type PublicExposureMutationStep = typeof PublicExposureMutationStep.Type;
  * asked for. `hostname` is absent until the DNS route ran, because until then
  * nothing at Cloudflare has one.
  */
+
 export const CloudflareUnfinishedCreation = Schema.Struct({
   name: Schema.NullOr(TrimmedNonEmptyString),
   tunnelId: Schema.NullOr(TrimmedNonEmptyString),
@@ -443,6 +505,55 @@ export const CloudflareUnfinishedCreation = Schema.Struct({
   remaining: Schema.Array(PublicExposureMutationStep),
 });
 export type CloudflareUnfinishedCreation = typeof CloudflareUnfinishedCreation.Type;
+
+/**
+ * The exact resources a deletion would remove, and the authorization to remove
+ * them.
+ *
+ * **Minted by the server, not composed by the client.** Ticket 07 requires
+ * "Delete everywhere" to be offered only for a laplus-created tunnel and to name
+ * the exact recorded tunnel and DNS resources in a separate destructive
+ * confirmation — and a client that assembled that dialog from its own state
+ * would be confirming whatever it happened to believe. So the names come from
+ * the endpoint row, the verdict comes from the recorded ownership, and
+ * `confirmation` is spent exactly once against both.
+ *
+ * `dnsRecordName` is a name and not an address, because that is all creation
+ * could record (ADR-0051); the deletion resolves it with DNS authority of its
+ * own. `tunnelName` is the label Cloudflare's listing shows, present so the
+ * confirmation reads like the tunnel a person recognises — the UUID is what the
+ * deletion actually targets.
+ */
+export const CloudflareDeletionPlan = Schema.Struct({
+  tunnelId: TrimmedNonEmptyString,
+  tunnelName: Schema.NullOr(TrimmedNonEmptyString),
+  httpsOrigin: TrimmedNonEmptyString,
+  dnsRecordName: Schema.NullOr(TrimmedNonEmptyString),
+  steps: Schema.Array(PublicExposureMutationStep),
+  confirmation: TrimmedNonEmptyString,
+  expiresInSeconds: Schema.Number,
+  warning: TrimmedNonEmptyString,
+});
+export type CloudflareDeletionPlan = typeof CloudflareDeletionPlan.Type;
+
+/**
+ * What a destructive deletion request carries: two authorizations, because
+ * there are two authorities.
+ *
+ * `confirmation` is laplus's — it says this developer was shown these exact
+ * resources and agreed, recently and once. `dnsApiToken` is Cloudflare's:
+ * `cloudflared` has no `route dns delete` and ADR-0045 forbids reading the
+ * account certificate's contents to find the token inside it, so removing the
+ * record needs DNS authority supplied for this one request. It is never
+ * persisted, never logged, never put in a snapshot and never passed as a process
+ * argument.
+ */
+export const DeleteCloudflareTunnelInput = Schema.Struct({
+  executablePath: TrimmedNonEmptyString,
+  confirmation: TrimmedNonEmptyString,
+  dnsApiToken: Schema.String,
+});
+export type DeleteCloudflareTunnelInput = typeof DeleteCloudflareTunnelInput.Type;
 
 /**
  * Everything the wizard knows about Cloudflare account authorization.

@@ -1004,6 +1004,54 @@ are never read, so creation records the name alone; whatever later acquires DNS
 authority resolves and fills in the rest. A record with a name and no ids is one
 laplus made and cannot yet address. `store::DnsRecord`, ADR-0051.
 
+**Stop** — turning a laplus-managed connector off without changing anything
+else. The tunnel, the DNS record, the run credential, laplus's own configuration
+and the recorded ownership all survive, and starting it again is one action.
+_Avoid_: Disconnect, which reads as something ending at Cloudflare.
+
+**Forget** — removing laplus's own local configuration and run credential, after
+stopping the connector using them, and then the endpoint record. Never a
+Cloudflare change, for any ownership: an adopted tunnel is still allocated
+afterwards and an external endpoint's connector is still somebody else's. It
+removes no executable either — including the app-managed `cloudflared`, which
+shares the private directory but is a tool rather than this exposure's setup. It
+is also what releases the credential whose presence makes a creation refuse.
+`POST /api/access/cloudflare/forget`, ADR-0052.
+_Avoid_: Delete, which is the other operation entirely.
+
+**Delete everywhere** — removing the exact Cloudflare tunnel and DNS record
+laplus created, and then doing what Forget does. Offered only for a
+laplus-created tunnel, refused by the server on the recorded ownership rather
+than hidden by the client, and separately confirmed against the resources the
+endpoint row names. Four journaled steps at three places, because the DNS record
+is a Cloudflare API call the CLI cannot make.
+`POST /api/access/cloudflare/account/delete`, ADR-0052.
+
+**Deletion confirmation** — the one-time value laplus mints for one offered
+deletion, naming the exact tunnel and DNS record it would remove. Spent when
+read, expiring shortly, held in memory so a restart is a re-confirmation, and
+checked against the endpoint row as it stands when the command runs. This is what
+"fresh `access:write` authorization" means here: a scope says who may ask, and
+only this says what they were shown. `POST /api/access/cloudflare/account/deletion`.
+_Avoid_: Token, which is already three other things in this section.
+
+**DNS authority** — a Cloudflare API token with DNS edit permission for the
+hostname's zone, supplied for one destructive request and kept nowhere.
+`cloudflared` has no `route dns delete`, and the account certificate is used in
+place and never read (ADR-0045), so removing the record laplus created needs an
+authority of its own. Missing authority refuses before anything is attempted
+rather than deleting the tunnel and leaving the record.
+`RefusalReason::DnsAuthorityRequired`, `crate::cloudflare_dns`.
+
+**Cleanup state** — what a stop, forget or delete left behind: `intact`,
+`stopped`, `cleanup-required`, `partially-deleted`, `forgotten` or
+`fully-removed`. Derived from what is observably gone and from the mutation
+journal, never stored — a third record of a fact the other two answer is the one
+that can disagree with them after a crash. A finished removal is reported only
+while no endpoint is recorded; outstanding work is reported either way, and an
+endpoint whose local setup is being removed stops being advertised.
+`crate::public_exposure::CleanupState`.
+
 **Activation race** — a connector starting between the listing a dedication
 offer was drawn from and the confirmation of it. Answered by re-reading the
 tunnel's activity immediately before the first mutation and falling back to an

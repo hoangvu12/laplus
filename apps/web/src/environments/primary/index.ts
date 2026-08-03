@@ -27,6 +27,8 @@ export {
   readCloudflareAccount,
   adoptCloudflareTunnel,
   createCloudflareTunnel,
+  offerCloudflareDeletion,
+  deleteCloudflareTunnel,
   selectCloudflareTunnel,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,

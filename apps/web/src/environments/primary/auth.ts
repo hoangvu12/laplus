@@ -18,7 +18,9 @@ import {
   type ConfigureManagedCloudflareConnectorInput,
   type ExternalTunnelEndpointSnapshot,
   type ManagedCloudflareConnectorSnapshot,
+  type CloudflareDeletionPlan,
   type CreateCloudflareTunnelInput,
+  type DeleteCloudflareTunnelInput,
   type SelectCloudflareTunnelInput,
 } from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
@@ -65,6 +67,8 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "select-cloudflare-tunnel",
   "adopt-cloudflare-tunnel",
   "create-cloudflare-tunnel",
+  "offer-cloudflare-deletion",
+  "delete-cloudflare-tunnel",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -809,6 +813,55 @@ export async function createCloudflareTunnel(
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "create-cloudflare-tunnel",
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Ask what a deletion would remove, and for the authorization to remove it.
+ *
+ * **Sends nothing, because a client may name nothing here.** The tunnel and the
+ * DNS record come from the endpoint row and the verdict comes from the recorded
+ * ownership; a payload would be a chance for a stale tab to confirm the deletion
+ * of something else. Refused with `not-laplus-created` for every ownership but
+ * one — the same value the deletion itself refuses on.
+ */
+export async function offerCloudflareDeletion(): Promise<CloudflareDeletionPlan> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.offerCloudflareDeletion({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "offer-cloudflare-deletion",
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Delete the exact Cloudflare resources laplus created, and then its own setup.
+ *
+ * Carries the confirmation this server minted for those resources and a
+ * Cloudflare API token with DNS authority, because `cloudflared` cannot delete a
+ * DNS record at all. Neither is stored anywhere on this side: the confirmation
+ * is spent by the request and the token exists for the length of it.
+ */
+export async function deleteCloudflareTunnel(
+  payload: DeleteCloudflareTunnelInput,
+): Promise<ExternalTunnelEndpointSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.deleteCloudflareTunnel({ headers: {}, payload })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "delete-cloudflare-tunnel",
       cause: error,
     });
   }

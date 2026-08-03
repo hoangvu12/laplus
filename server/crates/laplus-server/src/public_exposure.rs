@@ -208,6 +208,60 @@ closed_vocabulary! {
 }
 
 closed_vocabulary! {
+    /// What a stop, forget or delete left behind, as the row and the wizard
+    /// report it.
+    ///
+    /// **Derived, never stored.** There is no cleanup column: every value below
+    /// is read from the same two places a resume reads — what is observably on
+    /// disk, and this environment's mutation journal for the steps that leave
+    /// nothing on this machine to look at. A column would be a third record of a
+    /// fact the other two already answer, and the one that could disagree with
+    /// them after a crash.
+    ///
+    /// The order is severity, not chronology: [`Self::Intact`] and
+    /// [`Self::Stopped`] are setups that still exist, the middle two are work
+    /// that stopped half way, and the last two are removals that finished.
+    CleanupState as "cleanup state" {
+        /// Nothing was removed and nothing is outstanding.
+        Intact => "intact",
+        /// The connector is not running because it was asked not to. Tunnel,
+        /// DNS record, credential, configuration and ownership all survive, and
+        /// starting it again is one action. Ticket 07's checkbox 1.
+        Stopped => "stopped",
+        /// A forget started and did not finish: some of laplus's own local
+        /// configuration or secrets are still on disk. Nothing at Cloudflare was
+        /// touched either way, because forget never touches Cloudflare.
+        CleanupRequired => "cleanup-required",
+        /// A delete-everywhere started and did not finish: some of the
+        /// Cloudflare resources laplus created are gone and some remain.
+        /// Distinct from [`Self::CleanupRequired`] because the outstanding work
+        /// is *remote*, so finishing it needs authority again rather than only a
+        /// retry.
+        PartiallyDeleted => "partially-deleted",
+        /// laplus's own local configuration and secrets are gone. What laplus
+        /// did not create — the Cloudflare allocation, the DNS record, the
+        /// account certificate, the executable — is untouched.
+        Forgotten => "forgotten",
+        /// Everything laplus created is gone, at Cloudflare and on this machine.
+        FullyRemoved => "fully-removed",
+    }
+}
+
+impl CleanupState {
+    /// Whether an endpoint in this state may still be advertised for pairing.
+    ///
+    /// **The endpoint stops being offered the moment its usable local setup
+    /// starts being removed**, which is ticket 07's checkbox 8. A verified
+    /// endpoint whose DNS record has just been deleted is still recorded as
+    /// verified — verification is a fact about the last attempt, and the next
+    /// one has not run — so advertisement cannot be left to the verification
+    /// state alone.
+    pub const fn advertisable(self) -> bool {
+        matches!(self, Self::Intact | Self::Stopped)
+    }
+}
+
+closed_vocabulary! {
     /// Why a public-exposure command was refused.
     ///
     /// **Named where the refusal is raised, never recovered from its prose.**
@@ -258,6 +312,19 @@ closed_vocabulary! {
         /// where it answers — and one reason for both leaves the developer
         /// guessing which field to fix. Ticket 06.
         TunnelNameInvalid => "tunnel-name-invalid",
+        /// The destructive confirmation is missing, expired, already spent, or
+        /// names resources this environment no longer records. Ticket 07's
+        /// "fresh `access:write` authorization": a deletion is authorized by a
+        /// confirmation minted for the exact tunnel and record it will remove,
+        /// not by a session that once held the scope. See ADR-0052.
+        ConfirmationRequired => "confirmation-required",
+        /// laplus has no Cloudflare authority that can remove the recorded DNS
+        /// record. **Separate from [`RefusalReason::CommandFailed`] because no
+        /// command ran**: `cloudflared` has no `route dns delete` at all, so
+        /// this is a missing capability rather than a refused invocation, and
+        /// the developer's next action is to supply a DNS token rather than to
+        /// look at cloudflared's output. Ticket 07.
+        DnsAuthorityRequired => "dns-authority-required",
     }
 }
 
@@ -333,6 +400,42 @@ impl Refusal {
     }
 }
 
+/// What a stop, forget or delete did, and what it has left to do.
+///
+/// **Both lists, always, for the reason [`Refusal::after`] carries both.** The
+/// refusal reaches the client in the response that failed, which lasts exactly
+/// as long as the developer stays on that screen; this is the answer that
+/// survives a reload, a restart and a different browser, and it is read the same
+/// way — from what is observably gone, and from this environment's journal for
+/// the two steps that leave nothing on this machine to observe.
+///
+/// `tunnel_id` and `dns_record_name` are what a partial deletion has left
+/// outstanding *at Cloudflare*, named so a retry can target them and a person
+/// can go and remove them by hand. They are non-secret identifiers by
+/// construction — the credential that runs the tunnel appears nowhere here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupReport {
+    pub state: CleanupState,
+    pub completed: Vec<MutationStep>,
+    pub remaining: Vec<MutationStep>,
+    pub tunnel_id: Option<String>,
+    pub dns_record_name: Option<String>,
+}
+
+impl CleanupReport {
+    /// Nothing was removed and nothing is outstanding.
+    pub fn intact(state: CleanupState) -> Self {
+        Self {
+            state,
+            completed: Vec::new(),
+            remaining: Vec::new(),
+            tunnel_id: None,
+            dns_record_name: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -349,6 +452,13 @@ pub struct Snapshot {
     /// — the same answer ticket 07's deletion command refuses on — so the offer
     /// and the refusal cannot disagree.
     pub deletable_at_cloudflare: bool,
+    /// What a stop, forget or delete left behind — see [`CleanupReport`].
+    ///
+    /// **On this snapshot rather than on the connector's**, because it is the
+    /// one a client can still read after the cleanup succeeded: a finished
+    /// forget leaves no connector and no endpoint row, and a report that lived
+    /// on either would vanish with the thing it was reporting about.
+    pub cleanup: CleanupReport,
     pub health: serde_json::Value,
     pub verification_state: String,
     pub failure_kind: Option<String>,
@@ -847,6 +957,8 @@ mod tests {
                 "not-laplus-created",
                 "cleanup-required",
                 "tunnel-name-invalid",
+                "confirmation-required",
+                "dns-authority-required",
             ]
         );
         for reason in RefusalReason::ALL {
@@ -886,6 +998,42 @@ mod tests {
         let untouched =
             Refusal::rejected(RefusalReason::CommandFailed, "no secret here").redacting("");
         assert_eq!(untouched.message, "no secret here");
+    }
+
+    /// An endpoint stops being offered the moment its usable local setup starts
+    /// coming apart, and goes on being offered while it is merely turned off.
+    ///
+    /// Ticket 07's checkbox 8, as one function rather than as a condition each
+    /// snapshot repeats: verification is a fact about the *last* attempt, so a
+    /// row that says `verified` is exactly what a just-deleted DNS record leaves
+    /// behind, and advertisement decided on that alone would offer a hostname
+    /// that no longer resolves.
+    #[test]
+    fn a_setup_being_taken_apart_is_not_advertised_and_a_stopped_one_still_is() {
+        assert!(CleanupState::Intact.advertisable());
+        assert!(CleanupState::Stopped.advertisable());
+        for removed in [
+            CleanupState::CleanupRequired,
+            CleanupState::PartiallyDeleted,
+            CleanupState::Forgotten,
+            CleanupState::FullyRemoved,
+        ] {
+            assert!(!removed.advertisable(), "{removed} must not be advertised");
+        }
+        for state in CleanupState::ALL {
+            assert_eq!(state.as_str().parse::<CleanupState>(), Ok(*state));
+        }
+        assert_eq!(
+            CleanupState::ALL.iter().map(|state| state.as_str()).collect::<Vec<_>>(),
+            [
+                "intact",
+                "stopped",
+                "cleanup-required",
+                "partially-deleted",
+                "forgotten",
+                "fully-removed",
+            ]
+        );
     }
 
     #[test]

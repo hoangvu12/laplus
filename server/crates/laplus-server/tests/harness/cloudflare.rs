@@ -253,6 +253,17 @@ impl FakeCloudflared {
         self.lines().next_back().is_some_and(|line| line == "stopped")
     }
 
+    /// How many connectors have shut down gracefully, whatever ran afterwards.
+    ///
+    /// [`FakeCloudflared::stopped_gracefully`] asks about the *last* thing the
+    /// executable did, which is the right question when nothing follows the
+    /// stop. Ticket 07's cleanups run `tunnel delete` after stopping the
+    /// connector, so for those the graceful stop is in the middle of the trace
+    /// rather than at the end of it.
+    pub fn graceful_stops(&self) -> usize {
+        self.lines().filter(|line| line == "stopped").count()
+    }
+
     fn lines(&self) -> impl DoubleEndedIterator<Item = String> {
         std::fs::read_to_string(&self.trace)
             .unwrap_or_default()
@@ -470,13 +481,34 @@ finally:
     }
 }
 
+/// The Cloudflare DNS API token a test hands to a deletion, and the string its
+/// redaction test hunts for in four places.
+pub const DNS_API_TOKEN: &str = "FAKE-CLOUDFLARE-DNS-API-TOKEN";
+
+/// The zone a laplus-created hostname sits under, and its identifiers.
+pub const ZONE_NAME: &str = "example.com";
+pub const ZONE_ID: &str = "zone-example-com";
+pub const RECORD_ID: &str = "record-stable";
+
 /// The Cloudflare DNS API, for the one operation the CLI cannot do.
 ///
 /// `cloudflared` has no `route dns delete`, so ticket 07's "Delete everywhere"
 /// has to remove the recorded DNS record through Cloudflare's API with DNS
-/// authority of its own. This models that end: it holds a record per zone,
-/// answers a `DELETE`, and remembers what it was asked so a test can prove the
-/// *exact* recorded record was targeted and no other.
+/// authority of its own. This models that end: it lists the zones a token can
+/// see, lists the records within one, answers a `DELETE`, and remembers what it
+/// was asked so a test can prove the *exact* recorded record was targeted and no
+/// other.
+///
+/// **The listing endpoints are not decoration.** ADR-0051 records a DNS record
+/// by name alone, because `cloudflared tunnel route dns` reports no identifiers
+/// and the account certificate's contents are never read — so a deletion has to
+/// resolve the name to a zone and a record before it can remove anything, and a
+/// fixture that only answered `DELETE` would let that resolution be skipped.
+///
+/// **A wrong or missing token is answered like Cloudflare answers one**, with
+/// `403`, because "missing authority produces a recoverable state" is one of the
+/// ticket's acceptance boxes and a fixture that authorized everybody could not
+/// exercise it.
 ///
 /// `FakeRelease` in `http_cloudflare_install.rs` is the precedent — a real local
 /// HTTP server pointed at by an environment variable, rather than a seam carved
@@ -486,26 +518,48 @@ pub struct FakeCloudflareApi {
     pub address: SocketAddr,
     requests: Arc<Mutex<Vec<(String, String)>>>,
     records: Arc<Mutex<Vec<Value>>>,
+    zones: Arc<Mutex<Vec<Value>>>,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl FakeCloudflareApi {
-    /// Start with one record, as a laplus-created route would have left.
-    pub async fn start(zone_id: &str, record_id: &str, name: &str) -> Self {
+    /// Start with one zone and one record in it, as a laplus-created route
+    /// would have left.
+    pub async fn start(record_name: &str) -> Self {
+        Self::start_with(vec![json!({"id": ZONE_ID, "name": ZONE_NAME})], record_name).await
+    }
+
+    /// Start holding a chosen set of zones.
+    ///
+    /// A token that can see no zone containing the record's name is the shape of
+    /// "sufficient Cloudflare account/DNS authority" being absent while the
+    /// token itself is perfectly valid — which is a different failure from a
+    /// rejected token and has to refuse the same way.
+    pub async fn start_with(zones: Vec<Value>, record_name: &str) -> Self {
         let records = Arc::new(Mutex::new(vec![json!({
-            "id": record_id, "zone_id": zone_id, "name": name, "type": "CNAME",
+            "id": RECORD_ID, "zone_id": ZONE_ID, "name": record_name, "type": "CNAME",
         })]));
+        let zones = Arc::new(Mutex::new(zones));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port for the fake Cloudflare API");
         let address = listener.local_addr().expect("the fake API's address");
         let router = axum::Router::new()
+            .route("/client/v4/zones", axum::routing::get(list_zones))
+            .route(
+                "/client/v4/zones/{zone}/dns_records",
+                axum::routing::get(list_records),
+            )
             .route(
                 "/client/v4/zones/{zone}/dns_records/{record}",
                 axum::routing::delete(delete_record).get(get_record),
             )
-            .with_state((Arc::clone(&records), Arc::clone(&requests)));
+            .with_state(ApiState {
+                records: Arc::clone(&records),
+                zones: Arc::clone(&zones),
+                requests: Arc::clone(&requests),
+            });
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
@@ -514,6 +568,7 @@ impl FakeCloudflareApi {
             address,
             requests,
             records,
+            zones,
             server,
         }
     }
@@ -523,9 +578,22 @@ impl FakeCloudflareApi {
         self.requests.lock().expect("the recorded requests").clone()
     }
 
+    /// How many requests of one method this API received.
+    pub fn calls(&self, method: &str) -> usize {
+        self.requests()
+            .iter()
+            .filter(|(recorded, _)| recorded == method)
+            .count()
+    }
+
     /// The records that still exist.
     pub fn records(&self) -> Vec<Value> {
         self.records.lock().expect("the records").clone()
+    }
+
+    /// The zones this token can see.
+    pub fn zones(&self) -> Vec<Value> {
+        self.zones.lock().expect("the zones").clone()
     }
 
     pub fn stop(self) {
@@ -533,18 +601,107 @@ impl FakeCloudflareApi {
     }
 }
 
-type ApiState = (Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<(String, String)>>>);
+#[derive(Clone)]
+struct ApiState {
+    records: Arc<Mutex<Vec<Value>>>,
+    zones: Arc<Mutex<Vec<Value>>>,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+}
 
-async fn delete_record(
-    axum::extract::State((records, requests)): axum::extract::State<ApiState>,
-    axum::extract::Path((zone, record)): axum::extract::Path<(String, String)>,
+impl ApiState {
+    fn record(&self, method: &str, path: String) {
+        self.requests.lock().expect("the recorded requests").push((method.into(), path));
+    }
+}
+
+/// Cloudflare's own answer to a request that carries the wrong authority.
+fn unauthorized() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(json!({"success": false, "errors": [{"code": 9109, "message": "Invalid access token."}]})),
+    )
+        .into_response()
+}
+
+fn authorized(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(&format!("Bearer {DNS_API_TOKEN}"))
+}
+
+/// `GET /client/v4/zones?name=…`, which is how a deletion finds the zone.
+///
+/// **Filtered by name, because that is what laplus asks.** Cloudflare caps this
+/// endpoint at fifty zones per page, so laplus looks each suffix of the record
+/// name up by name rather than paging a listing — a fixture that ignored `name`
+/// and answered with everything would let a build that pages badly pass here.
+async fn list_zones(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    requests
+    state.record("GET", "/client/v4/zones".into());
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    let wanted = query.get("name").cloned();
+    let zones: Vec<Value> = state
+        .zones
         .lock()
-        .expect("the recorded requests")
-        .push(("DELETE".into(), format!("/client/v4/zones/{zone}/dns_records/{record}")));
-    let mut records = records.lock().expect("the records");
+        .expect("the zones")
+        .iter()
+        .filter(|held| {
+            wanted
+                .as_deref()
+                .is_none_or(|name| held["name"].as_str() == Some(name))
+        })
+        .cloned()
+        .collect();
+    axum::Json(json!({"success": true, "errors": [], "result": zones})).into_response()
+}
+
+async fn list_records(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+    axum::extract::Path(zone): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    state.record("GET", format!("/client/v4/zones/{zone}/dns_records"));
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    let wanted = query.get("name").cloned();
+    let records: Vec<Value> = state
+        .records
+        .lock()
+        .expect("the records")
+        .iter()
+        .filter(|held| held["zone_id"].as_str() == Some(zone.as_str()))
+        .filter(|held| {
+            wanted
+                .as_deref()
+                .is_none_or(|name| held["name"].as_str() == Some(name))
+        })
+        .cloned()
+        .collect();
+    axum::Json(json!({"success": true, "errors": [], "result": records})).into_response()
+}
+
+async fn delete_record(
+    axum::extract::State(state): axum::extract::State<ApiState>,
+    axum::extract::Path((zone, record)): axum::extract::Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    state.record("DELETE", format!("/client/v4/zones/{zone}/dns_records/{record}"));
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    let mut records = state.records.lock().expect("the records");
     let before = records.len();
     records.retain(|held| {
         held["id"].as_str() != Some(record.as_str()) || held["zone_id"].as_str() != Some(zone.as_str())
@@ -563,15 +720,16 @@ async fn delete_record(
 }
 
 async fn get_record(
-    axum::extract::State((records, requests)): axum::extract::State<ApiState>,
+    axum::extract::State(state): axum::extract::State<ApiState>,
     axum::extract::Path((zone, record)): axum::extract::Path<(String, String)>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    requests
-        .lock()
-        .expect("the recorded requests")
-        .push(("GET".into(), format!("/client/v4/zones/{zone}/dns_records/{record}")));
-    let records = records.lock().expect("the records");
+    state.record("GET", format!("/client/v4/zones/{zone}/dns_records/{record}"));
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    let records = state.records.lock().expect("the records");
     match records.iter().find(|held| held["id"].as_str() == Some(record.as_str())) {
         Some(found) => {
             axum::Json(json!({"success": true, "errors": [], "result": found})).into_response()

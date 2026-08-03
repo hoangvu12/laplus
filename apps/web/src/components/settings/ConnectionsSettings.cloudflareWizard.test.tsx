@@ -38,6 +38,19 @@ if (typeof Element.prototype.getAnimations !== "function") {
 
 import { CloudflareTunnelSettingsRow } from "./ConnectionsSettings";
 
+/**
+ * A setup nothing has removed anything from — what these fixtures are unless
+ * they say otherwise. Ticket 07 made the cleanup report part of every endpoint
+ * snapshot, because it is the one answer that survives the setup it describes.
+ */
+const INTACT_CLEANUP = {
+  state: "intact",
+  completed: [],
+  remaining: [],
+  tunnelId: null,
+  dnsRecordName: null,
+} as const;
+
 const CERTIFICATE_WARNING =
   "The Cloudflare account certificate can create, list, route, and delete every tunnel in your account, and stays valid for years. laplus uses it where cloudflared put it and never copies, moves, replaces, or deletes it.";
 
@@ -47,6 +60,7 @@ const unconfiguredExternal: ExternalTunnelEndpointSnapshot = {
   wssOrigin: null,
   ownership: "external",
   deletableAtCloudflare: false,
+  cleanup: INTACT_CLEANUP,
   health: { connector: "external", https: "unknown", webSocket: "unknown" },
   verificationState: "unconfigured",
   failureKind: null,
@@ -954,13 +968,334 @@ describe("creating a stable tunnel", () => {
       // The supervision, stop and pairing behaviour every connector has.
       expect(screen.getByRole("button", { name: "Stop connector" })).toBeTruthy();
       expect(screen.queryByLabelText("Connector token")).toBe(null);
-      // Ticket 07 owns the command itself; nothing here draws one.
-      expect(screen.queryByRole("button", { name: /Delete/ })).toBe(null);
-      expect(screen.queryByRole("button", { name: "Forget" })).toBe(null);
+      // Ticket 07 built the two removals, and this is the one ownership offered
+      // both: forget takes away laplus's own setup, and delete-everywhere is a
+      // separate destructive confirmation for the Cloudflare resources laplus
+      // created. Pressing it asks the *server* what would be removed — see
+      // "offers a destructive confirmation…" below.
+      expect(screen.getByRole("button", { name: "Forget local setup" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Delete everywhere…" })).toBeTruthy();
 
       await user.click(screen.getByRole("button", { name: "Pair device" }));
       const pairing = await screen.findByLabelText("Cloudflare pairing URL");
       expect((pairing as HTMLTextAreaElement).value).toContain("https://stable.example.com");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+});
+
+/**
+ * Ticket 07: stop, forget and delete, driven through the real controls.
+ *
+ * **What is asserted is the request the component made, not the button it
+ * drew.** Every one of these is about a boundary the server enforces — an
+ * adopted tunnel is never offered a deletion, a deletion carries the
+ * confirmation the server minted rather than one this component composed, and a
+ * forget goes to the route that stops the connector first. A test that checked
+ * only for a label would pass against a component that sent the wrong thing.
+ */
+describe("stopping, forgetting and deleting", () => {
+  const adoptedAccount: CloudflareAccountSnapshot = {
+    ...listed,
+    step: "adopting",
+    unfinishedCreation: null,
+    selection: {
+      tunnelId: inactiveTunnel.id,
+      name: inactiveTunnel.name,
+      classification: "adoptable",
+      httpsOrigin: "https://spare.example.com",
+      adoptionConfirmed: true,
+      created: false,
+    },
+  };
+
+  const adoptedConnector: ManagedCloudflareConnectorSnapshot = {
+    ...readyConnector,
+    tunnelOwnership: "adopted",
+    deletableAtCloudflare: false,
+    httpsOrigin: "https://spare.example.com",
+  };
+
+  const createdAccount: CloudflareAccountSnapshot = {
+    ...listed,
+    step: "creating",
+    unfinishedCreation: null,
+    selection: {
+      tunnelId: "44444444-4444-4444-4444-444444444444",
+      name: "laplus-desk",
+      classification: "adoptable",
+      httpsOrigin: "https://stable.example.com",
+      adoptionConfirmed: false,
+      created: true,
+    },
+  };
+
+  const createdConnector: ManagedCloudflareConnectorSnapshot = {
+    ...readyConnector,
+    tunnelOwnership: "laplus-created",
+    deletableAtCloudflare: true,
+    httpsOrigin: "https://stable.example.com",
+  };
+
+  const forgotten: ExternalTunnelEndpointSnapshot = {
+    ...unconfiguredExternal,
+    cleanup: {
+      state: "forgotten",
+      completed: ["configuration-remove", "credential-remove"],
+      remaining: [],
+      tunnelId: null,
+      dnsRecordName: null,
+    },
+  };
+
+  /**
+   * An adopted tunnel is laplus's to stop and to forget, and never laplus's to
+   * delete.
+   *
+   * The verdict is the server's `deletableAtCloudflare`, which is the same value
+   * the deletion command refuses on — so what this proves is that the control
+   * follows that answer rather than the ownership word beside it.
+   */
+  it("offers forget but never a deletion for an adopted tunnel", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: adoptedAccount,
+      connector: adoptedConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "adopted",
+        httpsOrigin: "https://spare.example.com",
+      },
+      forgetExternalTunnel: () => Effect.succeed(forgotten),
+    });
+    try {
+      await openWizard(user);
+
+      const panel = await screen.findByLabelText("Dedicated Cloudflare tunnel");
+      expect(panel.textContent).toContain("can never delete either");
+      expect(screen.queryByRole("button", { name: "Delete everywhere…" })).toBe(null);
+
+      await user.click(screen.getByRole("button", { name: "Forget local setup" }));
+      await waitFor(() => expect(testApi.calls.forgetExternalTunnel).toBe(1));
+      // Local only: nothing here can have asked for a Cloudflare deletion.
+      expect(testApi.calls.offerCloudflareDeletion).toBe(0);
+      expect(testApi.calls.deleteCloudflareTunnel).toEqual([]);
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * The destructive confirmation names the exact recorded resources, and what
+   * is spent is the authorization the server minted with them.
+   *
+   * **The component composes nothing.** It asks
+   * `POST /api/access/cloudflare/account/deletion` what would go, shows that,
+   * and sends back the `confirmation` it was given — which is the whole of
+   * ADR-0052's answer to a stale or forged request, since a value this side
+   * invented is one the server has never heard of.
+   */
+  it("offers a destructive confirmation naming the recorded tunnel and record, then spends it", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: createdAccount,
+      connector: createdConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "laplus-created",
+        deletableAtCloudflare: true,
+        httpsOrigin: "https://stable.example.com",
+      },
+      offerCloudflareDeletion: () =>
+        Effect.succeed({
+          tunnelId: "44444444-4444-4444-4444-444444444444",
+          tunnelName: "laplus-desk",
+          httpsOrigin: "https://stable.example.com",
+          dnsRecordName: "stable.example.com",
+          steps: [
+            "dns-record-delete",
+            "tunnel-delete",
+            "configuration-remove",
+            "credential-remove",
+          ],
+          confirmation: "minted-by-the-server",
+          expiresInSeconds: 300,
+          warning: "Deleting removes the Cloudflare tunnel and the DNS record laplus created.",
+        }),
+      deleteCloudflareTunnel: () =>
+        Effect.succeed({
+          ...unconfiguredExternal,
+          cleanup: {
+            state: "fully-removed",
+            completed: [
+              "dns-record-delete",
+              "tunnel-delete",
+              "configuration-remove",
+              "credential-remove",
+            ],
+            remaining: [],
+            tunnelId: "44444444-4444-4444-4444-444444444444",
+            dnsRecordName: "stable.example.com",
+          },
+        }),
+    });
+    try {
+      await openWizard(user);
+      await user.click(await screen.findByRole("button", { name: "Delete everywhere…" }));
+
+      const confirmation = await screen.findByLabelText("Delete everywhere");
+      await waitFor(() => expect(testApi.calls.offerCloudflareDeletion).toBe(1));
+      // The exact resources, by the identifiers the row recorded.
+      expect(confirmation.textContent).toContain("44444444-4444-4444-4444-444444444444");
+      expect(confirmation.textContent).toContain("stable.example.com");
+      expect(confirmation.textContent).toContain("laplus-desk");
+      // And the two things ADR-0045 puts out of reach, said out loud.
+      expect(confirmation.textContent).toContain("never revokes your Cloudflare account token");
+      expect(confirmation.textContent).toContain("never touches your account certificate");
+      // Nothing is deleted by being offered.
+      expect(testApi.calls.deleteCloudflareTunnel).toEqual([]);
+
+      await user.type(screen.getByLabelText("Cloudflare DNS API token"), "cf-dns-token");
+      await user.click(screen.getByRole("button", { name: "Delete everywhere" }));
+
+      await waitFor(() => expect(testApi.calls.deleteCloudflareTunnel.length).toBe(1));
+      expect(testApi.calls.deleteCloudflareTunnel[0]).toEqual({
+        executablePath: "/usr/bin/cloudflared",
+        confirmation: "minted-by-the-server",
+        dnsApiToken: "cf-dns-token",
+      });
+      // The confirmation is spent, so the screen that would replay it is gone.
+      await waitFor(() => expect(screen.queryByLabelText("Delete everywhere")).toBe(null));
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * A cleanup that stopped half way gets its own screen, naming the exact work
+   * outstanding — and never claiming a rollback.
+   *
+   * This outranks every other step, because a partially deleted tunnel still has
+   * a connector and an endpoint row: the dedicated panel would offer to stop a
+   * connector whose DNS record is already gone, which reads as a healthy setup.
+   */
+  it("lands on the cleanup screen after a partial deletion and can finish it", async () => {
+    const user = userEvent.setup();
+    const partial: ExternalTunnelEndpointSnapshot = {
+      ...verifiedExternal,
+      ownership: "laplus-created",
+      deletableAtCloudflare: true,
+      httpsOrigin: "https://stable.example.com",
+      cleanup: {
+        state: "partially-deleted",
+        completed: ["dns-record-delete"],
+        remaining: ["tunnel-delete", "configuration-remove", "credential-remove"],
+        tunnelId: "44444444-4444-4444-4444-444444444444",
+        dnsRecordName: "stable.example.com",
+      },
+    };
+    const testApi = await mount({
+      account: createdAccount,
+      connector: createdConnector,
+      external: partial,
+      offerCloudflareDeletion: () =>
+        Effect.succeed({
+          tunnelId: "44444444-4444-4444-4444-444444444444",
+          tunnelName: "laplus-desk",
+          httpsOrigin: "https://stable.example.com",
+          dnsRecordName: "stable.example.com",
+          steps: ["dns-record-delete", "tunnel-delete"],
+          confirmation: "minted-again",
+          expiresInSeconds: 300,
+          warning: "Deleting removes the Cloudflare tunnel and the DNS record laplus created.",
+        }),
+    });
+    try {
+      await openWizard(user);
+
+      const panel = await screen.findByLabelText("Finish removing this setup");
+      expect(panel.textContent).toContain("Already done: deleting the DNS record.");
+      expect(panel.textContent).toContain("Still outstanding: deleting the tunnel");
+      // The tunnel that really does still exist, named so it can be removed.
+      expect(panel.textContent).toContain("44444444-4444-4444-4444-444444444444");
+      expect(panel.textContent).not.toContain("rolled back");
+      // The connector screen does not describe a setup that is coming apart.
+      expect(screen.queryByLabelText("Dedicated Cloudflare tunnel")).toBe(null);
+
+      // Finishing it asks for a fresh confirmation rather than reusing one: the
+      // server spent the last when it read it.
+      await user.click(screen.getByRole("button", { name: "Finish deleting" }));
+      await waitFor(() => expect(testApi.calls.offerCloudflareDeletion).toBe(1));
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * A forget that stopped between its two removals is local work, so the screen
+   * offers the repeat that finishes it rather than a Cloudflare confirmation.
+   */
+  it("offers to finish a forget that stopped half way, and asks Cloudflare for nothing", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: adoptedAccount,
+      connector: adoptedConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "adopted",
+        httpsOrigin: "https://spare.example.com",
+        cleanup: {
+          state: "cleanup-required",
+          completed: ["configuration-remove"],
+          remaining: ["credential-remove"],
+          tunnelId: inactiveTunnel.id,
+          dnsRecordName: null,
+        },
+      },
+      forgetExternalTunnel: () => Effect.succeed(forgotten),
+    });
+    try {
+      await openWizard(user);
+
+      const panel = await screen.findByLabelText("Finish removing this setup");
+      expect(panel.textContent).toContain("still on this computer");
+      expect(panel.textContent).toContain("Still outstanding: removing the tunnel credential.");
+
+      await user.click(screen.getByRole("button", { name: "Finish removing" }));
+      await waitFor(() => expect(testApi.calls.forgetExternalTunnel).toBe(1));
+      expect(testApi.calls.offerCloudflareDeletion).toBe(0);
+      expect(testApi.calls.deleteCloudflareTunnel).toEqual([]);
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * A read-only administrator sees the state and is offered none of the three
+   * mutations. The server refuses them too (ADR-0047); this is the half that
+   * keeps a control from being drawn for somebody who cannot use it.
+   */
+  it("draws no removal control without write access", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: createdAccount,
+      connector: createdConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "laplus-created",
+        deletableAtCloudflare: true,
+        httpsOrigin: "https://stable.example.com",
+      },
+      canWrite: false,
+    });
+    try {
+      await openWizard(user);
+
+      expect(await screen.findByLabelText("Dedicated Cloudflare tunnel")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Forget local setup" })).toBe(null);
+      expect(screen.queryByRole("button", { name: "Delete everywhere…" })).toBe(null);
+      expect(screen.queryByRole("button", { name: "Stop connector" })).toBe(null);
     } finally {
       await testApi.dispose();
     }
