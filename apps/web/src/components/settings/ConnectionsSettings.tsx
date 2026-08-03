@@ -29,6 +29,8 @@ import {
   type EnvironmentId,
   type ExternalTunnelEndpointSnapshot,
   type ManagedCloudflareConnectorSnapshot,
+  type CloudflareAccountSnapshot,
+  type CloudflareAccountTunnel,
   type CloudflaredExecutable,
   type CloudflaredInstallationSnapshot,
   type CloudflaredRelease,
@@ -45,10 +47,14 @@ import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import {
+  cloudflareRowSummary,
+  cloudflareWizardState,
   formatRemoteBackendHost,
   mergeVerifiedExternalEndpoint,
   registeredExternalTunnelHostname,
+  selectableCloudflaredExecutables,
   visibleNetworkAdvertisedEndpoints,
+  type CloudflareWizardPath,
 } from "./ConnectionsSettings.logic";
 import { resolveDesktopPairingUrl } from "./pairingUrls";
 import {
@@ -102,15 +108,22 @@ import {
 import { Textarea } from "../ui/textarea";
 import { getPairingTokenFromUrl, setPairingTokenOnUrl } from "../../pairingUrl";
 import {
+  beginCloudflareLogin,
+  cancelCloudflareLogin,
+  consentToCloudflareCertificate,
   createServerPairingCredential,
   configureManagedCloudflareConnector,
   discoverCloudflaredExecutables,
   forgetExternalTunnelEndpoint,
   installCloudflaredRelease,
+  isPrimaryEnvironmentRequestError,
+  listCloudflareTunnels,
+  readCloudflareAccount,
   readCloudflaredInstallation,
   readExternalTunnelEndpoint,
   readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
+  selectCloudflareTunnel,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
   revokeServerPairingLink,
@@ -160,6 +173,48 @@ const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 const EMPTY_ADVERTISED_ENDPOINTS: ReadonlyArray<AdvertisedEndpoint> = [];
 const EMPTY_DISCOVERED_SSH_HOSTS: ReadonlyArray<DesktopDiscoveredSshHost> = [];
 
+/**
+ * What to put on screen when a Cloudflare request fails.
+ *
+ * **A refused administrator is told the one thing ADR-0047 says they may
+ * learn.** Left alone, a 403 arrives here as the transport's own summary —
+ * "Primary environment request failed during list-cloudflare-tunnels (HTTP
+ * 403)" — which is a sentence for whoever wrote the client, not for whoever is
+ * holding the machine. The ADR's wording is the whole of what a denied client
+ * gets: that administrator access is required, and nothing about the Cloudflare
+ * account or configuration behind the refusal.
+ *
+ * Every other failure keeps whatever prose it came with. The server's own
+ * refusal sentences do not survive the trip either — a 409 or 400 carries an
+ * untagged `{ message }` body that no declared contract error decodes — which
+ * is recorded as Gap 4 in `.scratch/contract-parity/ledger.md` rather than
+ * papered over with a guess here.
+ */
+function cloudflareFailureMessage(cause: unknown, fallback: string): string {
+  if (isPrimaryEnvironmentRequestError(cause) && cause.status === 403) {
+    return "Administrator access is required to manage Cloudflare setup.";
+  }
+  const message = cause instanceof Error ? cause.message : "";
+  return message.trim() === "" ? fallback : message;
+}
+
+/**
+ * Cloudflare Tunnel: a compact Connections row in front of a modal wizard.
+ *
+ * **The wizard has one source of truth for how far setup got, and it is the
+ * server.** `cloudflare_account.rs` computes the step from what is durably true
+ * — a certificate on disk, a recorded consent, a recorded selection — and the
+ * connector and endpoint snapshots say the rest. `cloudflareWizardState` in
+ * `ConnectionsSettings.logic.ts` turns those three into the screen to show, so
+ * a reopened dialog, a reloaded page and a restarted server cannot disagree
+ * about progress. The only client-held piece is which path the developer just
+ * picked, which is a choice not yet committed to anything rather than progress.
+ *
+ * The three paths are three ownerships, and keeping them apart is the point:
+ * laplus may supervise a connector it was given a token for, it may be handed
+ * an inactive tunnel to dedicate, and it may verify a hostname somebody else
+ * runs — but never two of those for one hostname. ADR-0045.
+ */
 export function CloudflareTunnelSettingsRow({
   canWrite,
   onSnapshot,
@@ -168,27 +223,38 @@ export function CloudflareTunnelSettingsRow({
   readonly onSnapshot?: (snapshot: ExternalTunnelEndpointSnapshot) => void;
 }) {
   const [snapshot, setSnapshot] = useState<ExternalTunnelEndpointSnapshot | null>(null);
-  const [open, setOpen] = useState(false);
-  const [hostname, setHostname] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [pairingUrl, setPairingUrl] = useState<string | null>(null);
   const [managed, setManaged] = useState<ManagedCloudflareConnectorSnapshot | null>(null);
-  const [executablePath, setExecutablePath] = useState("");
-  const [connectorToken, setConnectorToken] = useState("");
+  const [account, setAccount] = useState<CloudflareAccountSnapshot | null>(null);
+  const [installation, setInstallation] = useState<CloudflaredInstallationSnapshot | null>(null);
   const [cloudflaredExecutables, setCloudflaredExecutables] = useState<
     ReadonlyArray<CloudflaredExecutable>
   >([]);
-  const [installation, setInstallation] = useState<CloudflaredInstallationSnapshot | null>(null);
+
+  const [open, setOpen] = useState(false);
+  const [chosenPath, setChosenPath] = useState<CloudflareWizardPath | null>(null);
+  const [revisitingPathChoice, setRevisitingPathChoice] = useState(false);
+  // **Two hostnames, deliberately.** A laplus-managed connector's hostname and
+  // an externally managed one are different claims about who owns a lifecycle,
+  // and sharing one field made "Register" hand the managed hostname to the
+  // external path — the ownership conflation ADR-0045 forbids.
+  const [managedHostname, setManagedHostname] = useState("");
+  const [externalHostname, setExternalHostname] = useState("");
+  const [tunnelHostname, setTunnelHostname] = useState("");
+  const [selectedTunnelId, setSelectedTunnelId] = useState("");
+  const [executablePath, setExecutablePath] = useState("");
+  const [connectorToken, setConnectorToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pairingUrl, setPairingUrl] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       const next = await readExternalTunnelEndpoint();
       setSnapshot(next);
-      setHostname(registeredExternalTunnelHostname(next));
+      setExternalHostname(registeredExternalTunnelHostname(next));
       onSnapshot?.(next);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not load Cloudflare Tunnel state.");
+      setError(cloudflareFailureMessage(cause, "Could not load Cloudflare Tunnel state."));
     }
   }, [onSnapshot]);
   useEffect(() => {
@@ -211,10 +277,25 @@ export function CloudflareTunnelSettingsRow({
     }
   }, []);
 
+  const refreshAccount = useCallback(async () => {
+    try {
+      setAccount(await readCloudflareAccount());
+    } catch {
+      // Swallowed on purpose, and for two different callers: a session without
+      // `access:read` is refused here by design (ADR-0047), and the poll that
+      // watches a browser sign-in runs once a second. Neither has anything to
+      // say that is not already on screen, and the wizard's external path needs
+      // no Cloudflare account at all — so a refusal or a dropped request leaves
+      // the dialog usable rather than blanking it. Anything the developer
+      // *asked* for goes through `mutateAccount`, which does show its failure.
+    }
+  }, []);
+
   useEffect(() => {
     if (!open) return;
     void refreshInstallation();
-  }, [open, refreshInstallation]);
+    void refreshAccount();
+  }, [open, refreshAccount, refreshInstallation]);
 
   const install = useCallback(
     async (release: CloudflaredRelease) => {
@@ -229,7 +310,7 @@ export function CloudflareTunnelSettingsRow({
         setCloudflaredExecutables((await discoverCloudflaredExecutables()).executables);
         if (next.installedPath) setExecutablePath(next.installedPath);
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "The installation failed.");
+        setError(cloudflareFailureMessage(cause, "The installation failed."));
         await refreshInstallation();
       } finally {
         setBusy(false);
@@ -250,7 +331,7 @@ export function CloudflareTunnelSettingsRow({
             candidates[0]?.path ??
             "",
         );
-        if (next.httpsOrigin) setHostname(new URL(next.httpsOrigin).hostname);
+        if (next.httpsOrigin) setManagedHostname(new URL(next.httpsOrigin).hostname);
       })
       .catch(() => undefined);
   }, []);
@@ -267,6 +348,15 @@ export function CloudflareTunnelSettingsRow({
     return () => window.clearInterval(interval);
   }, [managed?.configured, open]);
 
+  // A browser sign-in finishes somewhere laplus cannot see, so the only way to
+  // learn that it did is to keep asking. Stops the moment it is no longer
+  // running, which is what makes cancellation and timeout visible too.
+  useEffect(() => {
+    if (!open || account?.loginState !== "awaiting-browser") return;
+    const interval = window.setInterval(() => void refreshAccount(), 1_000);
+    return () => window.clearInterval(interval);
+  }, [account?.loginState, open, refreshAccount]);
+
   const mutateManaged = useCallback(
     async (operation: "configure" | "start" | "stop" | "retry") => {
       setBusy(true);
@@ -275,7 +365,7 @@ export function CloudflareTunnelSettingsRow({
         const next =
           operation === "configure"
             ? await configureManagedCloudflareConnector({
-                hostname,
+                hostname: managedHostname,
                 executablePath,
                 connectorToken,
               })
@@ -287,12 +377,12 @@ export function CloudflareTunnelSettingsRow({
         setManaged(next);
         if (operation === "configure") setConnectorToken("");
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "The connector request failed.");
+        setError(cloudflareFailureMessage(cause, "The connector request failed."));
       } finally {
         setBusy(false);
       }
     },
-    [connectorToken, executablePath, hostname],
+    [connectorToken, executablePath, managedHostname],
   );
 
   const mutate = useCallback(
@@ -302,63 +392,102 @@ export function CloudflareTunnelSettingsRow({
       try {
         const next =
           operation === "register"
-            ? await registerExternalTunnelEndpoint(hostname)
+            ? await registerExternalTunnelEndpoint(externalHostname)
             : operation === "test"
               ? await testExternalTunnelEndpoint()
               : await forgetExternalTunnelEndpoint();
         setSnapshot(next);
         onSnapshot?.(next);
-        if (next.httpsOrigin) setHostname(next.httpsOrigin);
+        if (next.httpsOrigin) setExternalHostname(next.httpsOrigin);
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "The request failed.");
+        setError(cloudflareFailureMessage(cause, "The request failed."));
       } finally {
         setBusy(false);
       }
     },
-    [hostname, onSnapshot],
+    [externalHostname, onSnapshot],
   );
 
+  /** Every Cloudflare account action answers with the whole snapshot. */
+  const mutateAccount = useCallback(async (run: () => Promise<CloudflareAccountSnapshot>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setAccount(await run());
+    } catch (cause) {
+      setError(cloudflareFailureMessage(cause, "The Cloudflare request failed."));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const chooseTunnel = useCallback(async () => {
+    await mutateAccount(() =>
+      selectCloudflareTunnel({ tunnelId: selectedTunnelId, hostname: tunnelHostname }),
+    );
+    // Selecting an active tunnel registers it as an external endpoint
+    // server-side, so the endpoint snapshot this row advertises has moved.
+    await refresh();
+  }, [mutateAccount, refresh, selectedTunnelId, tunnelHostname]);
+
   const createPairing = useCallback(async () => {
-    if (!snapshot?.httpsOrigin) return;
+    const origin = managed?.configured ? managed.httpsOrigin : snapshot?.httpsOrigin;
+    if (!origin) return;
     setBusy(true);
     setError(null);
     try {
       const result = await createServerPairingCredential({ label: "Cloudflare Tunnel" });
-      setPairingUrl(resolveDesktopPairingUrl(snapshot.httpsOrigin, result.credential));
+      setPairingUrl(resolveDesktopPairingUrl(origin, result.credential));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not create a pairing link.");
+      setError(cloudflareFailureMessage(cause, "Could not create a pairing link."));
     } finally {
       setBusy(false);
     }
-  }, [snapshot?.httpsOrigin]);
+  }, [managed?.configured, managed?.httpsOrigin, snapshot?.httpsOrigin]);
 
-  const stateLabel =
-    snapshot?.verificationState === "verified"
-      ? "Verified"
-      : snapshot?.configured
-        ? "Needs verification"
-        : "Not configured";
+  const wizard = cloudflareWizardState({
+    account,
+    managed,
+    external: snapshot,
+    chosenPath,
+    revisitingPathChoice,
+  });
+  const verified =
+    managed?.configured === true
+      ? managed.verificationState === "verified"
+      : snapshot?.verificationState === "verified";
+  // cloudflared is only run by the paths that run it. The external path never
+  // touches an executable, so it is never asked to choose one — and the
+  // connector panel carries its own picker, so the two never render together.
+  const runsCloudflared =
+    wizard.step === "sign-in" ||
+    wizard.step === "choose-tunnel" ||
+    wizard.step === "connector-token" ||
+    wizard.step === "managed-connector";
+  const picksExecutable = wizard.step === "sign-in" || wizard.step === "choose-tunnel";
+
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <SettingsRow
         title="Cloudflare Tunnel"
-        description={
-          managed?.configured
-            ? `${managed.httpsOrigin} · ${managedCloudflareCompactState(managed)}`
-            : snapshot?.httpsOrigin
-              ? `${snapshot.httpsOrigin} · ${stateLabel}`
-              : "Register an externally managed HTTPS hostname."
-        }
+        description={cloudflareRowSummary({
+          state: wizard,
+          managed,
+          external: snapshot,
+          managedStateLabel: managedCloudflareCompactState,
+        })}
         status={
           managed?.failureMessage ? (
             <span className="text-destructive">{managed.failureMessage}</span>
+          ) : account?.failureMessage ? (
+            <span className="text-destructive">{account.failureMessage}</span>
           ) : snapshot?.verificationState === "failed" ? (
             <span className="text-destructive">{snapshot.failureMessage}</span>
           ) : undefined
         }
         control={
           <DialogTrigger render={<Button size="xs" variant="outline" />}>
-            {snapshot?.configured ? "Manage" : "Set up"}
+            {snapshot?.configured || managed?.configured ? "Manage" : "Set up"}
           </DialogTrigger>
         }
       />
@@ -366,11 +495,13 @@ export function CloudflareTunnelSettingsRow({
         <DialogHeader>
           <DialogTitle>Cloudflare Tunnel</DialogTitle>
           <DialogDescription>
-            Register a hostname whose connector remains owned and operated outside laplus.
+            {wizard.position
+              ? `Step ${wizard.position.index} of ${wizard.position.total} · ${wizard.label}`
+              : wizard.label}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
-          {offersCloudflaredInstallation(cloudflaredExecutables) ? (
+          {runsCloudflared && offersCloudflaredInstallation(cloudflaredExecutables) ? (
             <CloudflaredInstallationPanel
               snapshot={installation}
               canWrite={canWrite}
@@ -378,25 +509,84 @@ export function CloudflareTunnelSettingsRow({
               onInstall={(release) => void install(release)}
             />
           ) : null}
-          <ManagedCloudflareConnectorPanel
-            snapshot={managed}
-            executables={cloudflaredExecutables}
-            canWrite={canWrite}
-            busy={busy}
-            hostname={hostname}
-            executablePath={executablePath}
-            connectorToken={connectorToken}
-            onHostnameChange={setHostname}
-            onExecutablePathChange={setExecutablePath}
-            onConnectorTokenChange={setConnectorToken}
-            onConfigure={() => void mutateManaged("configure")}
-            onStart={() => void mutateManaged("start")}
-            onStop={() => void mutateManaged("stop")}
-            onRetry={() => void mutateManaged("retry")}
-          />
-          {!managed?.configured ? (
-            <div className="border-t border-border/70 pt-4">
-              <p className="mb-2 text-sm font-medium">Externally managed hostname</p>
+          {picksExecutable ? (
+            <CloudflaredExecutablePicker
+              executables={cloudflaredExecutables}
+              executablePath={executablePath}
+              canWrite={canWrite}
+              busy={busy}
+              onExecutablePathChange={setExecutablePath}
+            />
+          ) : null}
+
+          {wizard.step === "choose-path" ? (
+            <CloudflareSetupPathChoice
+              canWrite={canWrite}
+              onChoose={(path) => {
+                setChosenPath(path);
+                setRevisitingPathChoice(false);
+              }}
+            />
+          ) : null}
+
+          {wizard.step === "sign-in" ? (
+            <CloudflareSignInStep
+              account={account}
+              canWrite={canWrite}
+              busy={busy}
+              executablePath={executablePath}
+              onBegin={() => void mutateAccount(() => beginCloudflareLogin(executablePath))}
+              onCancel={() => void mutateAccount(cancelCloudflareLogin)}
+            />
+          ) : null}
+
+          {wizard.step === "consent" && account ? (
+            <CloudflareCertificateConsentStep
+              account={account}
+              canWrite={canWrite}
+              busy={busy}
+              onConsent={(consented) =>
+                void mutateAccount(() => consentToCloudflareCertificate(consented))
+              }
+            />
+          ) : null}
+
+          {wizard.step === "choose-tunnel" && account ? (
+            <CloudflareTunnelChoiceStep
+              account={account}
+              canWrite={canWrite}
+              busy={busy}
+              selectedTunnelId={selectedTunnelId}
+              hostname={tunnelHostname}
+              onSelectTunnel={setSelectedTunnelId}
+              onHostnameChange={setTunnelHostname}
+              onRefresh={() => void mutateAccount(() => listCloudflareTunnels(executablePath))}
+              onChoose={() => void chooseTunnel()}
+            />
+          ) : null}
+
+          {wizard.step === "confirm-adoption" && account?.selection ? (
+            <CloudflareAdoptionOffer selection={account.selection} />
+          ) : null}
+
+          {wizard.step === "verify-hostname" && account?.selection ? (
+            <section className="space-y-2" aria-label="Verify the tunnel hostname">
+              <p className="text-sm font-medium">
+                {account.selection.name} is already serving connections
+              </p>
+              <p className="text-xs text-muted-foreground">
+                An active tunnel is operated outside laplus, so laplus records it as an external
+                tunnel endpoint: it verifies and advertises{" "}
+                <span className="font-medium">{account.selection.httpsOrigin}</span> and will never
+                start, stop, reconfigure, or delete its connector.
+              </p>
+              {snapshot?.configured ? <CloudflareLayeredHealth snapshot={snapshot} /> : null}
+            </section>
+          ) : null}
+
+          {wizard.step === "external-endpoint" ? (
+            <section className="space-y-2" aria-label="Externally managed hostname">
+              <p className="text-sm font-medium">Externally managed hostname</p>
               <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
                 laplus will verify and advertise this endpoint, but will never start, stop,
                 reconfigure, or delete its connector. The hostname is public unless you
@@ -407,10 +597,11 @@ export function CloudflareTunnelSettingsRow({
                 <span className="text-sm font-medium">HTTPS hostname</span>
                 <Input
                   className="mt-2"
+                  aria-label="External HTTPS hostname"
                   placeholder="laplus.example.com"
-                  value={hostname}
+                  value={externalHostname}
                   disabled={busy || !canWrite}
-                  onChange={(event) => setHostname(event.target.value)}
+                  onChange={(event) => setExternalHostname(event.target.value)}
                 />
               </label>
               {snapshot?.lastVerifiedAt ? (
@@ -420,18 +611,54 @@ export function CloudflareTunnelSettingsRow({
                 </p>
               ) : null}
               {snapshot?.configured ? <CloudflareLayeredHealth snapshot={snapshot} /> : null}
-              {error ? <p className="text-xs text-destructive">{error}</p> : null}
-              {pairingUrl ? (
-                <div className="flex flex-col items-center gap-3 rounded-md border p-3">
-                  <QRCodeSvg value={pairingUrl} className="size-40" />
-                  <Textarea readOnly value={pairingUrl} aria-label="Cloudflare pairing URL" />
-                </div>
-              ) : null}
+            </section>
+          ) : null}
+
+          {wizard.step === "connector-token" || wizard.step === "managed-connector" ? (
+            <ManagedCloudflareConnectorPanel
+              snapshot={managed}
+              executables={cloudflaredExecutables}
+              canWrite={canWrite}
+              busy={busy}
+              hostname={managedHostname}
+              executablePath={executablePath}
+              connectorToken={connectorToken}
+              onHostnameChange={setManagedHostname}
+              onExecutablePathChange={setExecutablePath}
+              onConnectorTokenChange={setConnectorToken}
+              onConfigure={() => void mutateManaged("configure")}
+              onStart={() => void mutateManaged("start")}
+              onStop={() => void mutateManaged("stop")}
+              onRetry={() => void mutateManaged("retry")}
+            />
+          ) : null}
+
+          {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          {/* Outside every step: a pairing link belongs to whichever endpoint
+              was verified, and nesting it under one branch is how it became
+              unreachable for a laplus-managed connector. */}
+          {pairingUrl ? (
+            <div className="flex flex-col items-center gap-3 rounded-md border p-3">
+              <QRCodeSvg value={pairingUrl} className="size-40" />
+              <Textarea readOnly value={pairingUrl} aria-label="Cloudflare pairing URL" />
             </div>
           ) : null}
         </DialogPanel>
         <DialogFooter>
-          {snapshot?.configured && canWrite ? (
+          {wizard.canChangePath && canWrite ? (
+            <Button
+              variant="ghost"
+              disabled={busy}
+              onClick={() => {
+                setChosenPath(null);
+                setRevisitingPathChoice(true);
+                setPairingUrl(null);
+              }}
+            >
+              Change setup path
+            </Button>
+          ) : null}
+          {snapshot?.configured && canWrite && !wizard.ownsConnector ? (
             <Button variant="destructive" disabled={busy} onClick={() => void mutate("forget")}>
               Forget
             </Button>
@@ -441,14 +668,14 @@ export function CloudflareTunnelSettingsRow({
               Test now
             </Button>
           ) : null}
-          {snapshot?.verificationState === "verified" && canWrite ? (
+          {verified && canWrite ? (
             <Button variant="outline" disabled={busy} onClick={() => void createPairing()}>
               Pair device
             </Button>
           ) : null}
-          {canWrite ? (
+          {wizard.offersExternalRegistration && canWrite ? (
             <Button
-              disabled={busy || hostname.trim() === ""}
+              disabled={busy || externalHostname.trim() === ""}
               onClick={() => void mutate("register")}
             >
               {busy ? "Working…" : snapshot?.configured ? "Update" : "Register"}
@@ -458,6 +685,406 @@ export function CloudflareTunnelSettingsRow({
       </DialogPopup>
     </Dialog>
   );
+}
+
+/**
+ * The wizard's first screen: three ownerships, stated as three choices.
+ *
+ * Ordered least-privilege first. A connector token runs one tunnel and manages
+ * no Cloudflare account; signing in hands this computer authority over every
+ * tunnel in the account, which is why it is not the default.
+ */
+export function CloudflareSetupPathChoice({
+  canWrite,
+  onChoose,
+}: {
+  readonly canWrite: boolean;
+  readonly onChoose: (path: CloudflareWizardPath) => void;
+}) {
+  const choices: ReadonlyArray<{
+    readonly path: CloudflareWizardPath;
+    readonly title: string;
+    readonly description: string;
+  }> = [
+    {
+      path: "connector-token",
+      title: "Use a tunnel connector token",
+      description:
+        "Create the tunnel in Cloudflare and paste its connector token. laplus runs and supervises the connector and never gains account-wide authority.",
+    },
+    {
+      path: "external",
+      title: "Register a hostname someone else runs",
+      description:
+        "A tunnel already routes this server. laplus verifies and advertises the hostname and takes no lifecycle action on its connector.",
+    },
+    {
+      path: "account",
+      title: "Sign in to Cloudflare",
+      description:
+        "Discover the tunnels this account already has. Signing in leaves an account certificate on this computer with authority over every tunnel in the account.",
+    },
+  ];
+  return (
+    <section className="space-y-2" aria-label="Choose how to connect">
+      {choices.map((choice) => (
+        <button
+          key={choice.path}
+          type="button"
+          disabled={!canWrite}
+          onClick={() => onChoose(choice.path)}
+          className="block w-full rounded-md border border-border/70 p-3 text-left hover:bg-muted/40 disabled:opacity-60"
+        >
+          <span className="text-sm font-medium">{choice.title}</span>
+          <span className="mt-1 block text-xs text-muted-foreground">{choice.description}</span>
+        </button>
+      ))}
+    </section>
+  );
+}
+
+/**
+ * Cloudflare's browser authorization, tracked from here rather than a terminal.
+ *
+ * The authorization URL is whatever cloudflared printed, shown rather than
+ * opened for the developer: this dialog can be on a phone looking at a server
+ * somewhere else, where "we opened your browser" would be a lie.
+ */
+export function CloudflareSignInStep({
+  account,
+  canWrite,
+  busy,
+  executablePath,
+  onBegin,
+  onCancel,
+}: {
+  readonly account: CloudflareAccountSnapshot | null;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly executablePath: string;
+  readonly onBegin: () => void;
+  readonly onCancel: () => void;
+}) {
+  const awaiting = account?.loginState === "awaiting-browser";
+  return (
+    <section className="space-y-2" aria-label="Sign in to Cloudflare">
+      <p className="text-sm font-medium">Authorize laplus with Cloudflare</p>
+      <p className="text-xs text-muted-foreground">
+        cloudflared opens Cloudflare&rsquo;s authorization page and writes an account certificate
+        when you approve it. No terminal is involved, and you can stop at any point.
+      </p>
+      {awaiting && account?.authorizationUrl ? (
+        <div className="space-y-2 rounded-md border border-border/70 p-3">
+          <p className="text-xs font-medium">Waiting for the browser</p>
+          <Textarea
+            readOnly
+            value={account.authorizationUrl}
+            aria-label="Cloudflare authorization URL"
+          />
+        </div>
+      ) : null}
+      {account?.failureMessage ? (
+        <p className="text-xs text-destructive">{account.failureMessage}</p>
+      ) : null}
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          {awaiting ? (
+            <Button size="sm" variant="outline" disabled={busy} onClick={onCancel}>
+              Cancel sign-in
+            </Button>
+          ) : (
+            <Button size="sm" disabled={busy || executablePath.trim() === ""} onClick={onBegin}>
+              {account?.loginState === "not-started" ? "Sign in to Cloudflare" : "Try again"}
+            </Button>
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * The consent ADR-0045 requires before a certificate laplus did not create is
+ * used.
+ *
+ * It names the file. A warning about "the account certificate" with no path is
+ * consent to an abstraction, and a developer with two Cloudflare accounts on
+ * one machine cannot otherwise tell which one they are handing over.
+ */
+export function CloudflareCertificateConsentStep({
+  account,
+  canWrite,
+  busy,
+  onConsent,
+}: {
+  readonly account: CloudflareAccountSnapshot;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onConsent: (consented: boolean) => void;
+}) {
+  return (
+    <section className="space-y-2" aria-label="Confirm certificate use">
+      <p className="text-sm font-medium">A Cloudflare account certificate is already here</p>
+      <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+        {account.certificateWarning}
+      </div>
+      <p className="break-all text-xs text-muted-foreground">{account.certificatePath}</p>
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" disabled={busy} onClick={() => onConsent(true)}>
+            Use this certificate
+          </Button>
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => onConsent(false)}>
+            Don&rsquo;t use it
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * The account's tunnels, and the one question the listing cannot answer.
+ *
+ * `tunnel list --output json` carries ids, names, timestamps and connections —
+ * and no hostname and no management mode. So the hostname is asked for, and
+ * activity is the only thing branched on.
+ */
+export function CloudflareTunnelChoiceStep({
+  account,
+  canWrite,
+  busy,
+  selectedTunnelId,
+  hostname,
+  onSelectTunnel,
+  onHostnameChange,
+  onRefresh,
+  onChoose,
+}: {
+  readonly account: CloudflareAccountSnapshot;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly selectedTunnelId: string;
+  readonly hostname: string;
+  readonly onSelectTunnel: (tunnelId: string) => void;
+  readonly onHostnameChange: (hostname: string) => void;
+  readonly onRefresh: () => void;
+  readonly onChoose: () => void;
+}) {
+  const chosen = account.tunnels.find((tunnel) => tunnel.id === selectedTunnelId);
+  return (
+    <section className="space-y-3" aria-label="Choose a tunnel">
+      <div>
+        <p className="text-sm font-medium">Tunnels in this Cloudflare account</p>
+        <p className="text-xs text-muted-foreground">
+          {account.listedAt
+            ? `Listed ${formatAccessTimestamp(account.listedAt)}`
+            : "Not listed yet."}{" "}
+          Listing reads Cloudflare and changes nothing, so it is always safe to run again.
+        </p>
+      </div>
+      {account.tunnels.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          This account has no tunnels laplus can offer.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {account.tunnels.map((tunnel) => (
+            <li key={tunnel.id}>
+              <label className="flex cursor-pointer gap-2 rounded-md border border-border/70 p-3">
+                <input
+                  type="radio"
+                  name="cloudflare-tunnel"
+                  className="mt-1"
+                  value={tunnel.id}
+                  checked={tunnel.id === selectedTunnelId}
+                  disabled={busy || !canWrite}
+                  onChange={() => onSelectTunnel(tunnel.id)}
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium">{tunnel.name}</span>
+                  <span className="block break-all text-xs text-muted-foreground">{tunnel.id}</span>
+                  <span className="block text-xs text-muted-foreground">
+                    {cloudflareTunnelActivityLabel(tunnel)}
+                    {tunnel.createdAt
+                      ? ` · created ${formatAccessTimestamp(tunnel.createdAt)}`
+                      : ""}
+                  </span>
+                </span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+      <label className="block">
+        <span className="text-sm font-medium">HTTPS hostname</span>
+        <Input
+          className="mt-1"
+          aria-label="Tunnel HTTPS hostname"
+          placeholder="laplus.example.com"
+          value={hostname}
+          disabled={busy || !canWrite}
+          onChange={(event) => onHostnameChange(event.target.value)}
+        />
+        <span className="mt-1 block text-xs text-muted-foreground">
+          Cloudflare&rsquo;s tunnel list carries no hostname, so laplus asks for it and then
+          verifies it rather than guessing one from the tunnel&rsquo;s name.
+        </span>
+      </label>
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="outline" disabled={busy} onClick={onRefresh}>
+            Refresh tunnel list
+          </Button>
+          <Button
+            size="sm"
+            disabled={busy || chosen === undefined || hostname.trim() === ""}
+            onClick={onChoose}
+          >
+            Use this tunnel
+          </Button>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+export function cloudflareTunnelActivityLabel(tunnel: CloudflareAccountTunnel): string {
+  return tunnel.activity === "active"
+    ? `Active · ${tunnel.connectionCount} connection${tunnel.connectionCount === 1 ? "" : "s"} · externally managed`
+    : "Inactive · can be dedicated to laplus";
+}
+
+/**
+ * An inactive tunnel offered for dedication, and the ownership that would and
+ * would not transfer.
+ *
+ * **No confirmation control here yet.** ADR-0045 makes dedication a separate,
+ * explicit confirmation that retrieves a narrow run credential and writes an
+ * isolated connector configuration; that is ticket 05. Until it lands, this
+ * screen is the offer and the consequences, and laplus manages nothing — which
+ * is exactly what `adoptionConfirmed: false` on the selection means.
+ */
+export function CloudflareAdoptionOffer({
+  selection,
+}: {
+  readonly selection: NonNullable<CloudflareAccountSnapshot["selection"]>;
+}) {
+  return (
+    <section className="space-y-2" aria-label="Dedicate the tunnel">
+      <p className="text-sm font-medium">Dedicate {selection.name} to this laplus environment</p>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 text-xs text-muted-foreground">
+        <dt>Tunnel</dt>
+        <dd className="break-all">{selection.tunnelId}</dd>
+        <dt>Hostname</dt>
+        <dd className="break-all">{selection.httpsOrigin}</dd>
+        <dt>Observed</dt>
+        <dd>Inactive — no connector is serving it</dd>
+      </dl>
+      <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+        Dedicating this tunnel lets laplus configure and supervise a connector for it. Its
+        Cloudflare allocation and DNS record stay owned outside laplus and can never be deleted from
+        here.
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Not dedicated yet. laplus manages nothing until dedication is separately confirmed, so this
+        tunnel is still only a choice.
+      </p>
+    </section>
+  );
+}
+
+/**
+ * The cloudflared executables discovery found, as a list rather than a path to
+ * retype.
+ *
+ * The server already looks for them and reports each one's source, version and
+ * compatibility; leaving that in a bare text field meant a developer had to
+ * know a path the server could have told them. A hand-typed path stays possible
+ * and joins the list, so what is selected is visible either way.
+ */
+export function CloudflaredExecutablePicker({
+  executables,
+  executablePath,
+  canWrite,
+  busy,
+  onExecutablePathChange,
+}: {
+  readonly executables: ReadonlyArray<CloudflaredExecutable>;
+  readonly executablePath: string;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onExecutablePathChange: (value: string) => void;
+}) {
+  const selectable = selectableCloudflaredExecutables(executables, executablePath);
+  return (
+    <section className="space-y-2" aria-label="cloudflared executable">
+      <p className="text-xs font-medium">cloudflared executable</p>
+      {selectable.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No cloudflared was found on this machine. Enter a path below, or install one above.
+        </p>
+      ) : (
+        <ul className="space-y-1">
+          {selectable.map((executable) => (
+            <li key={executable.path}>
+              <label className="flex cursor-pointer gap-2 rounded-md border border-border/70 p-2 text-xs">
+                <input
+                  type="radio"
+                  name="cloudflared-executable"
+                  className="mt-0.5"
+                  value={executable.path}
+                  checked={executable.path === executablePath.trim()}
+                  disabled={busy || !canWrite}
+                  onChange={() => onExecutablePathChange(executable.path)}
+                />
+                <span className="min-w-0">
+                  <span className="block break-all font-medium">{executable.path}</span>
+                  <span className="block text-muted-foreground">
+                    {cloudflaredExecutableSummary(executable)}
+                  </span>
+                  {executable.compatibility === "incompatible" ? (
+                    <span className="block text-destructive">
+                      {executable.failureMessage ?? "This cloudflared executable is incompatible."}
+                    </span>
+                  ) : null}
+                </span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+      <label className="block">
+        <span className="text-xs text-muted-foreground">Or enter a path</span>
+        <Input
+          className="mt-1"
+          aria-label="cloudflared executable path"
+          value={executablePath}
+          disabled={busy || !canWrite}
+          onChange={(event) => onExecutablePathChange(event.target.value)}
+        />
+      </label>
+    </section>
+  );
+}
+
+export function cloudflaredExecutableSummary(executable: CloudflaredExecutable): string {
+  const source =
+    executable.source === "app-managed"
+      ? "Installed by laplus"
+      : executable.source === "user-selected"
+        ? "Chosen by you"
+        : executable.source === "system"
+          ? "Found on this machine"
+          : "Unknown source";
+  const version = executable.version ? ` · ${executable.version}` : "";
+  const compatibility =
+    executable.compatibility === "compatible"
+      ? " · compatible"
+      : executable.compatibility === "incompatible"
+        ? " · incompatible"
+        : "";
+  return `${source}${version}${compatibility}`;
 }
 
 /**
@@ -655,20 +1282,19 @@ export function ManagedCloudflareConnectorPanel({
         <span className="text-xs font-medium">Hostname</span>
         <Input
           className="mt-1"
+          aria-label="Managed connector hostname"
           value={hostname}
           disabled={busy || !canWrite}
           onChange={(event) => onHostnameChange(event.target.value)}
         />
       </label>
-      <label className="block">
-        <span className="text-xs font-medium">cloudflared executable</span>
-        <Input
-          className="mt-1"
-          value={executablePath}
-          disabled={busy || !canWrite}
-          onChange={(event) => onExecutablePathChange(event.target.value)}
-        />
-      </label>
+      <CloudflaredExecutablePicker
+        executables={executables}
+        executablePath={executablePath}
+        canWrite={canWrite}
+        busy={busy}
+        onExecutablePathChange={onExecutablePathChange}
+      />
       {incompatible ? (
         <p className="text-xs text-destructive">
           {incompatible.failureMessage ?? "This cloudflared executable is incompatible."}
@@ -678,6 +1304,7 @@ export function ManagedCloudflareConnectorPanel({
         <span className="text-xs font-medium">Connector token</span>
         <Input
           className="mt-1"
+          aria-label="Connector token"
           type="password"
           autoComplete="off"
           value={connectorToken}

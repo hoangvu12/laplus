@@ -16,3 +16,13 @@
 - [ ] Stop preserves the tunnel configuration and secret, while a later start restores the same connector and re-verifies the endpoint.
 - [ ] Repeated commands and reconnects reconcile observed state rather than launching duplicate connectors.
 - [ ] Running-server and UI-driver tests use a fake cloudflared process to prove restart, shutdown, readiness, persistence, verification, and secret-redaction boundaries.
+
+## Note — the executable picker landed with ticket 04
+
+Checkbox 1's UI half was missing: the server discovered compatible executables
+and reported each one's source, version and compatibility, and
+`ConnectionsSettings.tsx` rendered a bare text field that showed none of it.
+`CloudflaredExecutablePicker` now renders the discovered list as a selection,
+with a hand-typed path joining it rather than replacing it. Landed in ticket
+04's commit because the account path needs to name which cloudflared it signs in
+with. The rest of this ticket is untouched and unticked.
