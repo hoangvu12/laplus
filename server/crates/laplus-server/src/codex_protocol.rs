@@ -1,6 +1,8 @@
 //! Pure types and folds for the Codex app-server JSON-RPC used by provider
 //! probing and conversation turns.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -58,6 +60,8 @@ pub struct ConversationState {
     pub assistant_messages: Vec<AssistantMessage>,
     pub reasoning_items: Vec<ReasoningItem>,
     pub command_executions: Vec<CommandExecution>,
+    #[serde(skip)]
+    subagent_paths: HashMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub approval_requests: Vec<ApprovalRequest>,
     pub unknown_events: usize,
@@ -139,9 +143,42 @@ pub enum ConversationFold {
     AssistantCompleted { item_id: String, text: String },
     CommandStarted(CommandExecution),
     CommandCompleted(CommandExecution),
+    CollaborationStarted(CollaborationCall),
+    CollaborationCompleted(CollaborationCall),
+    SubagentActivity(SubagentActivity),
+    SubagentObserved(CollaborationAgent),
     ApprovalRequested(ApprovalRequest),
     TokenUsage(crate::protocol::TokenUsage),
     TurnCompleted(Completion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollaborationCall {
+    pub id: String,
+    pub tool: String,
+    pub status: String,
+    pub sender_thread_id: String,
+    pub receiver_thread_ids: Vec<String>,
+    pub prompt: Option<String>,
+    pub agents: Vec<CollaborationAgent>,
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollaborationAgent {
+    pub thread_id: String,
+    pub status: String,
+    pub message: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentActivity {
+    pub id: String,
+    pub kind: String,
+    pub agent_thread_id: String,
+    pub agent_path: String,
+    pub raw: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +267,24 @@ impl ConversationState {
     }
 
     fn fold_notification(&mut self, method: &str, params: &Value) -> ConversationFold {
+        if let Some(event_thread_id) = params.get("threadId").and_then(Value::as_str) {
+            if self
+                .thread_id
+                .as_deref()
+                .is_some_and(|root| root != event_thread_id)
+            {
+                // Every notification about another thread is handled here, not
+                // just the ones whose agent laplus has already named. A child's
+                // first `thread/status/changed` arrives *before* the
+                // `subAgentActivity` that introduces it, so keying this on a
+                // known path would let that one status fall through to the root
+                // arms below and report the parent thread idle while its
+                // subagent is still working — which settles the turn outright
+                // once `idle_is_terminal` holds.
+                let path = self.subagent_paths.get(event_thread_id);
+                return child_notification(method, params, event_thread_id, path);
+            }
+        }
         match method {
             "thread/status/changed" => {
                 let Some(status) = params
@@ -277,6 +332,19 @@ impl ConversationState {
                         self.upsert_command(command.clone());
                         ConversationFold::CommandStarted(command)
                     }
+                    Some("collabAgentToolCall") => collaboration_call(item)
+                        .map(ConversationFold::CollaborationStarted)
+                        .unwrap_or_else(|| self.unknown_event()),
+                    Some("subAgentActivity") => match subagent_activity(item) {
+                        Some(activity) => {
+                            self.subagent_paths.insert(
+                                activity.agent_thread_id.clone(),
+                                activity.agent_path.clone(),
+                            );
+                            ConversationFold::SubagentActivity(activity)
+                        }
+                        None => self.unknown_event(),
+                    },
                     Some("userMessage" | "fileChange" | "mcpToolCall") => {
                         ConversationFold::Nothing
                     }
@@ -371,6 +439,27 @@ impl ConversationState {
                         self.upsert_command(command.clone());
                         ConversationFold::CommandCompleted(command)
                     }
+                    Some("collabAgentToolCall") => match collaboration_call(item) {
+                        Some(call) => {
+                            for thread_id in &call.receiver_thread_ids {
+                                self.subagent_paths
+                                    .entry(thread_id.clone())
+                                    .or_insert_with(|| thread_id.clone());
+                            }
+                            ConversationFold::CollaborationCompleted(call)
+                        }
+                        None => self.unknown_event(),
+                    },
+                    Some("subAgentActivity") => match subagent_activity(item) {
+                        Some(activity) => {
+                            self.subagent_paths.insert(
+                                activity.agent_thread_id.clone(),
+                                activity.agent_path.clone(),
+                            );
+                            ConversationFold::SubagentActivity(activity)
+                        }
+                        None => self.unknown_event(),
+                    },
                     Some("userMessage" | "fileChange" | "mcpToolCall") => {
                         ConversationFold::Nothing
                     }
@@ -382,6 +471,9 @@ impl ConversationState {
                 let Some(turn_id) = turn["id"].as_str() else {
                     return self.unknown_event();
                 };
+                if self.turn_id.as_deref().is_some_and(|active| active != turn_id) {
+                    return ConversationFold::Nothing;
+                }
                 self.turn_id = Some(turn_id.to_string());
                 self.turn_status = turn["status"].as_str().map(str::to_string);
                 self.turn_error = error_message(turn.get("error"));
@@ -507,6 +599,114 @@ fn command_execution(item: &Value) -> Option<CommandExecution> {
             .map(str::to_string),
         exit_code: item.get("exitCode").and_then(Value::as_i64),
         duration_ms: item.get("durationMs").and_then(Value::as_u64),
+    })
+}
+
+fn collaboration_call(item: &Value) -> Option<CollaborationCall> {
+    let id = item.get("id")?.as_str()?.to_string();
+    let tool = item.get("tool")?.as_str()?.to_string();
+    let status = item.get("status")?.as_str()?.to_string();
+    if !matches!(tool.as_str(), "spawnAgent" | "sendInput" | "resumeAgent" | "wait" | "closeAgent")
+        || !matches!(status.as_str(), "inProgress" | "completed" | "failed")
+    {
+        return None;
+    }
+    let sender_thread_id = item.get("senderThreadId")?.as_str()?.to_string();
+    let receiver_thread_ids = item
+        .get("receiverThreadIds")?
+        .as_array()?
+        .iter()
+        .map(|id| id.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    let prompt = item.get("prompt").and_then(Value::as_str).map(str::to_string);
+    let mut agents = item
+        .get("agentsStates")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(thread_id, state)| {
+            let status = state.get("status")?.as_str()?.to_string();
+            if !matches!(
+                status.as_str(),
+                "pendingInit" | "running" | "interrupted" | "completed" | "errored"
+                    | "shutdown" | "notFound"
+            ) {
+                return None;
+            }
+            Some(CollaborationAgent {
+                thread_id: thread_id.clone(),
+                status,
+                message: state.get("message").and_then(Value::as_str).map(str::to_string),
+                path: None,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    agents.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    Some(CollaborationCall {
+        id,
+        tool,
+        status,
+        sender_thread_id,
+        receiver_thread_ids,
+        prompt,
+        agents,
+        raw: item.clone(),
+    })
+}
+
+fn subagent_activity(item: &Value) -> Option<SubagentActivity> {
+    let kind = item.get("kind")?.as_str()?.to_string();
+    if !matches!(kind.as_str(), "started" | "interacted" | "interrupted") {
+        return None;
+    }
+    Some(SubagentActivity {
+        id: item.get("id")?.as_str()?.to_string(),
+        kind,
+        agent_thread_id: item.get("agentThreadId")?.as_str()?.to_string(),
+        agent_path: item.get("agentPath")?.as_str()?.to_string(),
+        raw: item.clone(),
+    })
+}
+
+/// What another thread's notification is worth to this conversation.
+///
+/// Only a child's `turn/completed` says anything laplus can render — it is the
+/// one signal Codex 0.146.0 actually carries a subagent's outcome on, because
+/// the `agentsStates` map on a collaboration call arrives empty. Everything
+/// else about a child thread is deliberately dropped rather than folded into
+/// the root: its statuses, turns and items belong to a conversation this state
+/// is not tracking. `path` is absent until a `subAgentActivity` names the agent.
+fn child_notification(
+    method: &str,
+    params: &Value,
+    thread_id: &str,
+    path: Option<&String>,
+) -> ConversationFold {
+    if method != "turn/completed" {
+        return ConversationFold::Nothing;
+    }
+    let turn = params.get("turn").unwrap_or(&Value::Null);
+    let status = match turn.get("status").and_then(Value::as_str).unwrap_or("failed") {
+        "completed" => "completed",
+        "interrupted" | "cancelled" => "interrupted",
+        _ => "errored",
+    };
+    let message = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| error_message(turn.get("error")));
+    ConversationFold::SubagentObserved(CollaborationAgent {
+        thread_id: thread_id.to_string(),
+        status: status.to_string(),
+        message,
+        path: path.cloned(),
     })
 }
 
@@ -1114,8 +1314,8 @@ mod tests {
 
     #[test]
     fn the_provider_fixture_received_half_folds_to_the_expected_snapshot() {
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/codex-app-server");
+        let directory =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/codex-app-server");
         let fixture = std::fs::read_to_string(directory.join("01-provider-probe.jsonl"))
             .expect("reads the provider fixture");
         let mut responses = HashMap::new();
@@ -1276,9 +1476,179 @@ mod tests {
     }
 
     #[test]
+    fn codex_collaboration_items_preserve_the_call_and_sorted_agent_states() {
+        let mut state = ConversationState::new();
+        let folded = state.fold_message(json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call-1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "parent-thread",
+                    "receiverThreadIds": ["child-b", "child-a"],
+                    "prompt": "Inspect the decoder.",
+                    "agentsStates": {
+                        "child-b": {"status": "completed", "message": "Done B"},
+                        "child-a": {"status": "running"}
+                    }
+                }
+            }
+        }));
+
+        let ConversationFold::CollaborationCompleted(call) = folded else {
+            panic!("collaboration completion was not decoded");
+        };
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.tool, "spawnAgent");
+        assert_eq!(call.status, "completed");
+        assert_eq!(call.receiver_thread_ids, vec!["child-b", "child-a"]);
+        assert_eq!(
+            call.agents
+                .iter()
+                .map(|agent| (agent.thread_id.as_str(), agent.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("child-a", "running"), ("child-b", "completed")]
+        );
+        assert_eq!(call.agents[1].message.as_deref(), Some("Done B"));
+        assert_eq!(state.unknown_events, 0);
+    }
+
+    #[test]
+    fn codex_subagent_activity_is_a_first_class_fold() {
+        let mut state = ConversationState::new();
+        let folded = state.fold_message(json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "kind": "started",
+                    "agentThreadId": "child-thread",
+                    "agentPath": "/root/reviewer"
+                }
+            }
+        }));
+
+        let ConversationFold::SubagentActivity(activity) = folded else {
+            panic!("subagent activity was not decoded");
+        };
+        assert_eq!(activity.agent_thread_id, "child-thread");
+        assert_eq!(activity.agent_path, "/root/reviewer");
+        assert_eq!(activity.kind, "started");
+        assert_eq!(state.unknown_events, 0);
+    }
+
+    /// Recorded ordering, from `fixtures/codex-app-server/09-subagent-spawn`:
+    /// the child's first `thread/status/changed` arrives one frame *before* the
+    /// `subAgentActivity` that names it. Folding that status into the root would
+    /// report the parent thread idle while its subagent is still working, and
+    /// an idle-terminal handshake settles the turn on exactly that.
+    #[test]
+    fn a_child_status_arriving_before_its_agent_is_named_leaves_the_parent_alone() {
+        let mut state = ConversationState::new();
+        state.fold_message(json!({"result": {"thread": {"id": "parent-thread"}}}));
+        state.thread_status = Some("active".to_string());
+
+        let folded = state.fold_message(json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "child-thread",
+                "status": {"type": "idle"}
+            }
+        }));
+
+        assert!(
+            matches!(folded, ConversationFold::Nothing),
+            "a child's status is not the parent's: {folded:?}"
+        );
+        assert_eq!(state.thread_status.as_deref(), Some("active"));
+        assert_eq!(state.unknown_events, 0);
+    }
+
+    #[test]
+    fn a_child_turn_completion_updates_the_agent_without_completing_the_parent() {
+        let mut state = ConversationState::new();
+        assert!(matches!(
+            state.fold_message(json!({"result": {"thread": {"id": "parent-thread"}}})),
+            ConversationFold::ThreadStarted { .. }
+        ));
+        state.turn_id = Some("parent-turn".to_string());
+        state.fold_message(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "parent-thread",
+                "turnId": "parent-turn",
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "kind": "started",
+                    "agentThreadId": "child-thread",
+                    "agentPath": "/root/reviewer"
+                }
+            }
+        }));
+
+        let folded = state.fold_message(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "child-thread",
+                "turn": {
+                    "id": "child-turn",
+                    "status": "completed",
+                    "error": null,
+                    "items": [{
+                        "type": "agentMessage",
+                        "id": "answer-1",
+                        "text": "No defects found.",
+                        "phase": "final_answer"
+                    }]
+                }
+            }
+        }));
+
+        let ConversationFold::SubagentObserved(agent) = folded else {
+            panic!("child completion was not kept on the child lifecycle");
+        };
+        assert_eq!(agent.thread_id, "child-thread");
+        assert_eq!(agent.status, "completed");
+        assert_eq!(agent.message.as_deref(), Some("No defects found."));
+        assert_eq!(agent.path.as_deref(), Some("/root/reviewer"));
+        assert_eq!(state.turn_id.as_deref(), Some("parent-turn"));
+        assert_eq!(state.unknown_events, 0);
+    }
+
+    #[test]
+    fn unknown_collaboration_states_remain_protocol_drift() {
+        let mut state = ConversationState::new();
+        let folded = state.fold_message(json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "call-1",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "parent-thread",
+                    "receiverThreadIds": ["child"],
+                    "agentsStates": {"child": {"status": "futureStatus"}}
+                }
+            }
+        }));
+
+        assert_eq!(folded, ConversationFold::Nothing);
+        assert_eq!(state.unknown_events, 1);
+    }
+
+    #[test]
     fn every_approval_kind_keeps_only_contract_decisions() {
         for (method, kind, tool) in [
-            ("item/commandExecution/requestApproval", "command", "Command"),
+            (
+                "item/commandExecution/requestApproval",
+                "command",
+                "Command",
+            ),
             ("item/fileRead/requestApproval", "file-read", "Read"),
             ("item/fileChange/requestApproval", "file-change", "Write"),
         ] {

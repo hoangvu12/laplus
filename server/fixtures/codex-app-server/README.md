@@ -78,10 +78,13 @@ and completed turn needed to exercise laplus's fallback after that point.
 
 `07-synthetic-drift.jsonl` is **synthetic, not recorded**. A healthy Codex
 cannot emit the future and malformed traffic it exists to test. Against the
-v0.146.0 `ThreadItem` union it covers all twelve item kinds this driver does not
-handle: `hookPrompt`, `plan`, `dynamicToolCall`, `collabAgentToolCall`,
-`subAgentActivity`, `webSearch`, `imageView`, `sleep`, `imageGeneration`,
-`enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`. It also carries
+v0.146.0 `ThreadItem` union it covers the item kinds this driver does not
+handle: `hookPrompt`, `plan`, `dynamicToolCall`, `webSearch`, `imageView`,
+`sleep`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and
+`contextCompaction`. It still carries `collabAgentToolCall` and
+`subAgentActivity`, which the driver now decodes — they stay because this
+capture's copies are malformed, so they prove the decoder rejects a bad shape as
+drift rather than proving the item kind is unknown. It also carries
 two unhandled notification methods, a parsed `item/started` whose item has the
 wrong shape, a `turn/start` result without its required turn id, an unknown
 notification before the thread response, and one line that is not JSON.
@@ -94,3 +97,32 @@ app-server with no turn dispatched; host and installation notifications are
 omitted. The generated v2 schema identifies the replacement as an internally
 tagged object whose `type` is `readOnly`, `workspaceWrite`, or
 `dangerFullAccess`.
+
+`09-subagent-spawn.jsonl` records one real Codex 0.146.0 turn that spawned a
+subagent, waited for it, and reported its answer. It is the only evidence in
+this directory for what collaboration traffic actually looks like — the
+synthetic drift capture above proves the decoder survives a _malformed_
+collaboration item, which is the opposite job, and it cannot show field presence
+or ordering. Three things this recording establishes, all of which contradict
+what the protocol's own field documentation suggests:
+
+- **No `spawnAgent` call is emitted at all.** The spawn is announced only as a
+  `subAgentActivity` whose `kind` is `started`; the sole `collabAgentToolCall`
+  is the `wait`. A reader expecting to learn the child's id from a spawn call
+  learns it from the activity instead.
+- **`agentsStates` and `receiverThreadIds` arrive empty**, on both the started
+  and the completed `wait`. So the agent-state map documented as "the last known
+  status of each target agent" carries no terminal state here, and the decoder
+  cannot depend on it to complete a subagent row.
+- **The child's own `turn/completed` is therefore the only completion signal**,
+  and it arrives while the parent turn is still open. The child's first
+  `thread/status/changed` lands one frame _before_ the activity that names the
+  agent, which is why `fold_notification` routes every non-root thread id rather
+  than only the ones already introduced.
+
+Timestamps, token accounting, rate limits and startup notifications are dropped;
+thread snapshots keep only the fields the decoder reads. Its fold shows
+`unknownEvents: 1` on purpose: Codex sends a `turn/started` notification that
+this driver does not handle, because it takes the turn id from the `turn/start`
+response instead. That is real, pre-existing drift on every turn, recorded here
+rather than hidden.

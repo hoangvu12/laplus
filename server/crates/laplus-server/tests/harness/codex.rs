@@ -41,6 +41,92 @@ impl ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("02-command-execution", None)
     }
 
+    pub fn subagent_conversation() -> ScriptedCodex {
+        let codex = ScriptedCodex::plain_conversation();
+        let events = codex.directory.path().join("turn-events-before-pause");
+        let existing = std::fs::read_to_string(&events).expect("reads the turn events");
+        let collaboration = [
+            serde_json::json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "codex-thread-1",
+                    "turnId": "codex-turn-1",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "spawn-call-1",
+                        "tool": "spawnAgent",
+                        "status": "inProgress",
+                        "senderThreadId": "codex-thread-1",
+                        "receiverThreadIds": [],
+                        "prompt": "Review the decoder.",
+                        "agentsStates": {}
+                    }
+                }
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-thread-1",
+                    "turnId": "codex-turn-1",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "spawn-call-1",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "codex-thread-1",
+                        "receiverThreadIds": ["child-thread-12345678"],
+                        "prompt": "Review the decoder.",
+                        "agentsStates": {
+                            "child-thread-12345678": {"status": "running"}
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-thread-1",
+                    "turnId": "codex-turn-1",
+                    "item": {
+                        "type": "subAgentActivity",
+                        "id": "activity-1",
+                        "kind": "started",
+                        "agentThreadId": "child-thread-12345678",
+                        "agentPath": "/root/reviewer"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "codex-thread-1",
+                    "turnId": "codex-turn-1",
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "wait-call-1",
+                        "tool": "wait",
+                        "status": "completed",
+                        "senderThreadId": "codex-thread-1",
+                        "receiverThreadIds": ["child-thread-12345678"],
+                        "prompt": null,
+                        "agentsStates": {
+                            "child-thread-12345678": {
+                                "status": "completed",
+                                "message": "No defects found."
+                            }
+                        }
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+        std::fs::write(events, format!("{collaboration}{existing}"))
+            .expect("writes subagent events");
+        codex
+    }
+
     pub fn context_usage_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::plain_conversation();
         let events = codex.directory.path().join("turn-events-before-pause");
@@ -106,8 +192,11 @@ impl ScriptedCodex {
 
     pub fn malformed_turn_start_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
-        std::fs::write(codex.directory.path().join("conversation-turn-result"), "{}")
-            .expect("writes the malformed turn/start result");
+        std::fs::write(
+            codex.directory.path().join("conversation-turn-result"),
+            "{}",
+        )
+        .expect("writes the malformed turn/start result");
         codex
     }
 
@@ -277,8 +366,11 @@ impl ScriptedCodex {
             std::fs::write(codex.directory.path().join(name), content)
                 .unwrap_or_else(|error| panic!("writes {name}: {error}"));
         }
-        std::fs::write(codex.directory.path().join("skip-provider-startup-noise"), "")
-            .expect("keeps the capture 06 replay free of provider-fixture noise");
+        std::fs::write(
+            codex.directory.path().join("skip-provider-startup-noise"),
+            "",
+        )
+        .expect("keeps the capture 06 replay free of provider-fixture noise");
         std::fs::write(codex.app_server_path(), codex.conversation_script())
             .expect("writes the missing-resume app-server");
         codex
@@ -305,7 +397,10 @@ impl ScriptedCodex {
         .expect("the thread result is JSON");
         fresh["thread"]["id"] = Value::String("codex-thread-fresh".to_string());
         std::fs::write(
-            codex.directory.path().join("conversation-fallback-thread-result"),
+            codex
+                .directory
+                .path()
+                .join("conversation-fallback-thread-result"),
             fresh.to_string(),
         )
         .expect("writes the fallback thread result");
@@ -381,8 +476,7 @@ impl ScriptedCodex {
 
     pub fn rejected_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", None);
-        std::fs::write(codex.directory.path().join("reject-turn"), "")
-            .expect("rejects turn/start");
+        std::fs::write(codex.directory.path().join("reject-turn"), "").expect("rejects turn/start");
         codex
     }
 
@@ -402,7 +496,10 @@ impl ScriptedCodex {
                 .unwrap_or_else(|| panic!("the fixture has the {name} response"))["msg"]["result"]
                 .clone();
             std::fs::write(
-                codex.directory.path().join(format!("conversation-{name}-result")),
+                codex
+                    .directory
+                    .path()
+                    .join(format!("conversation-{name}-result")),
                 result.to_string(),
             )
             .expect("writes a fixture response");
@@ -443,7 +540,9 @@ impl ScriptedCodex {
             .skip(1)
             .filter(|record| record["dir"] == "recv" || record["dir"] == "recv-raw")
             .collect();
-        let terminal = events.last().expect("the fixture has a terminal turn event");
+        let terminal = events
+            .last()
+            .expect("the fixture has a terminal turn event");
         let approval_pause = events
             .iter()
             .position(|record| {
@@ -525,7 +624,7 @@ impl ScriptedCodex {
                 codex.app_server_path(),
                 std::fs::Permissions::from_mode(0o755),
             )
-                .expect("sets the mode");
+            .expect("sets the mode");
         }
         codex
     }
@@ -558,10 +657,7 @@ impl ScriptedCodex {
     }
 
     pub fn missing_model_data() -> ScriptedCodex {
-        ScriptedCodex::with_response(
-            7,
-            r#"{"id":3,"result":{"nextCursor":"page-2"}}"#,
-        )
+        ScriptedCodex::with_response(7, r#"{"id":3,"result":{"nextCursor":"page-2"}}"#)
     }
 
     pub fn missing_skills_data() -> ScriptedCodex {
@@ -684,7 +780,10 @@ impl ScriptedCodex {
             .map(|record| record["msg"].clone())
             .collect();
         let actual: Vec<Value> = self.requests().into_iter().take(expected.len()).collect();
-        assert_eq!(actual, expected, "the missing-resume replay drifted from capture 06");
+        assert_eq!(
+            actual, expected,
+            "the missing-resume replay drifted from capture 06"
+        );
     }
 
     fn conversation_requests(&self) -> Vec<Value> {
@@ -780,7 +879,13 @@ impl ScriptedCodex {
         #[cfg(windows)]
         {
             let output = std::process::Command::new("tasklist.exe")
-                .args(["/FI", &format!("PID eq {}", pid.trim()), "/FO", "CSV", "/NH"])
+                .args([
+                    "/FI",
+                    &format!("PID eq {}", pid.trim()),
+                    "/FO",
+                    "CSV",
+                    "/NH",
+                ])
                 .output()
                 .expect("tasklist checks the conversation app-server process");
             let listed = String::from_utf8_lossy(&output.stdout);

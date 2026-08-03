@@ -1625,6 +1625,77 @@ async fn a_codex_turn_streams_settles_reuses_its_process_and_is_reaped() {
 }
 
 #[tokio::test]
+async fn codex_subagent_calls_publish_separate_operation_and_agent_lifecycles() {
+    let codex = ScriptedCodex::subagent_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Delegate a review."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+    let activities = events
+        .iter()
+        .filter(|event| event["event"]["type"] == "thread.activity-appended")
+        .map(|event| &event["event"]["payload"]["activity"])
+        .filter(|activity| activity["payload"]["itemType"] == "collab_agent_tool_call")
+        .collect::<Vec<_>>();
+
+    assert!(activities.iter().any(|activity| {
+        activity["kind"] == "tool.updated"
+            && activity["summary"] == "Starting subagent"
+            && activity["payload"]["status"] == "inProgress"
+            && activity["payload"]["data"]["toolCallId"] == "spawn-call-1"
+    }));
+    assert!(activities.iter().any(|activity| {
+        activity["kind"] == "tool.completed"
+            && activity["summary"] == "Spawned subagent"
+            && activity["payload"]["status"] == "completed"
+    }));
+    assert!(activities.iter().any(|activity| {
+        activity["kind"] == "tool.updated"
+            && activity["payload"]["status"] == "inProgress"
+            && activity["payload"]["data"]["toolCallId"] == "agent:child-thread-12345678"
+    }));
+    assert!(
+        activities.iter().any(|activity| {
+            activity["kind"] == "tool.completed"
+                && activity["payload"]["status"] == "completed"
+                && activity["payload"]["detail"] == "No defects found."
+                && activity["payload"]["data"]["toolCallId"] == "agent:child-thread-12345678"
+        }),
+        "subagent activities: {activities:#?}"
+    );
+    assert_eq!(
+        last_session(&events, "the subagent Codex turn")["payload"]["session"]["status"],
+        "ready"
+    );
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
 async fn codex_protocol_drift_is_per_turn_the_payload_is_cumulative_and_the_session_carries_on() {
     let codex = ScriptedCodex::synthetic_drift_conversation();
     let workspace = Workspace::with(&["src/main.rs"]);
@@ -1640,22 +1711,22 @@ async fn codex_protocol_drift_is_per_turn_the_payload_is_cumulative_and_the_sess
         .await
         .expect_success();
     client
-        .call(
-            "orchestration.dispatchCommand",
-            codex_thread("full-access"),
-        )
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
         .await
         .expect_success();
     let subscription = client.watch_conversation("codex-thread").await;
 
-    for (message_id, expected_turn, expected_total, expected_parse_errors) in [
-        ("message-1", 17, 17, 1),
-        ("message-2", 16, 33, 2),
-    ] {
+    for (message_id, expected_turn, expected_total, expected_parse_errors) in
+        [("message-1", 17, 17, 1), ("message-2", 16, 33, 2)]
+    {
         client
             .call(
                 "orchestration.dispatchCommand",
-                follow_up("codex-thread", message_id, "Keep going after protocol drift."),
+                follow_up(
+                    "codex-thread",
+                    message_id,
+                    "Keep going after protocol drift.",
+                ),
             )
             .await
             .expect_success();

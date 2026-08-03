@@ -25,8 +25,8 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::approval::ApprovalRequest;
 use crate::codex_protocol::{
-    self as protocol, Access, Capabilities, CommandExecution, ConversationFold,
-    ConversationState, Incoming, Request,
+    self as protocol, Access, Capabilities, CollaborationAgent, CollaborationCall,
+    CommandExecution, ConversationFold, ConversationState, Incoming, Request, SubagentActivity,
 };
 use crate::config::{CodexSettings, ProviderAuth, ProviderModel};
 use crate::config_store::ProviderProcessLifetime;
@@ -524,8 +524,50 @@ fn decide(folded: ConversationFold, driving: &mut Driving, drift: Drift) -> Deci
                         duration_ms: command.duration_ms,
                     },
                     turn_id,
-                ),
-            ));
+                )));
+        }
+        ConversationFold::CollaborationStarted(call) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(collaboration_call_row(
+                    &call, false, turn_id,
+                )));
+        }
+        ConversationFold::CollaborationCompleted(call) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(collaboration_call_row(
+                    &call,
+                    true,
+                    turn_id.clone(),
+                )));
+            for agent in &call.agents {
+                decided
+                    .changes
+                    .push(Change::Activity(collaboration_agent_row(
+                        agent,
+                        None,
+                        turn_id.clone(),
+                    )));
+            }
+        }
+        ConversationFold::SubagentActivity(activity) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(subagent_activity_row(&activity, turn_id)));
+        }
+        ConversationFold::SubagentObserved(agent) => {
+            let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(collaboration_agent_row(
+                    &agent,
+                    agent.path.as_deref(),
+                    turn_id,
+                )));
         }
         ConversationFold::ApprovalRequested(request) => {
             let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
@@ -576,6 +618,130 @@ fn command_call(command: &CommandExecution) -> crate::worklog::Call {
             "processId": command.process_id,
         }),
     }
+}
+
+fn collaboration_call_row(
+    call: &CollaborationCall,
+    ended: bool,
+    turn_id: Option<String>,
+) -> Activity {
+    let (verb, past) = match call.tool.as_str() {
+        "spawnAgent" => ("Starting subagent", "Spawned subagent"),
+        "sendInput" => ("Sending input to subagent", "Sent input to subagent"),
+        "resumeAgent" => ("Resuming subagent", "Resumed subagent"),
+        "wait" => ("Waiting for subagents", "Waited for subagents"),
+        "closeAgent" => ("Closing subagent", "Closed subagent"),
+        _ => ("Running subagent operation", "Subagent operation finished"),
+    };
+    let status = if !ended {
+        "inProgress"
+    } else if call.status == "failed" {
+        "failed"
+    } else {
+        "completed"
+    };
+    let title = if ended { past } else { verb };
+    let mut payload = serde_json::json!({
+        "itemType": "collab_agent_tool_call",
+        "status": status,
+        "title": title,
+        "data": {
+            "toolCallId": call.id,
+            "operation": call.tool,
+            "senderThreadId": call.sender_thread_id,
+            "receiverThreadIds": call.receiver_thread_ids,
+            "protocol": call.raw,
+        },
+    });
+    if let Some(prompt) = call.prompt.as_deref() {
+        payload["detail"] = Value::String(worklog_preview(prompt));
+    }
+    Activity::tool(
+        if ended {
+            "tool.completed"
+        } else {
+            "tool.updated"
+        },
+        title,
+        payload,
+        turn_id,
+    )
+}
+
+fn collaboration_agent_row(
+    agent: &CollaborationAgent,
+    detail: Option<&str>,
+    turn_id: Option<String>,
+) -> Activity {
+    let status = match agent.status.as_str() {
+        "pendingInit" | "running" => "inProgress",
+        "completed" => "completed",
+        "errored" | "notFound" => "failed",
+        "interrupted" | "shutdown" => "stopped",
+        _ => "failed",
+    };
+    let title = format!("Subagent {}", short_agent_id(&agent.thread_id));
+    let shown_detail = agent.message.as_deref().or(detail);
+    let mut payload = serde_json::json!({
+        "itemType": "collab_agent_tool_call",
+        "status": status,
+        "title": title,
+        "data": {
+            "toolCallId": format!("agent:{}", agent.thread_id),
+            "agentThreadId": agent.thread_id,
+            "agentStatus": agent.status,
+            "message": agent.message,
+            "agentPath": agent.path,
+        },
+    });
+    if let Some(detail) = shown_detail {
+        payload["detail"] = Value::String(worklog_preview(detail));
+    }
+    Activity::tool(
+        if status == "inProgress" {
+            "tool.updated"
+        } else {
+            "tool.completed"
+        },
+        &title,
+        payload,
+        turn_id,
+    )
+}
+
+fn subagent_activity_row(activity: &SubagentActivity, turn_id: Option<String>) -> Activity {
+    let status = if activity.kind == "interrupted" {
+        "interrupted"
+    } else {
+        "running"
+    };
+    let agent = CollaborationAgent {
+        thread_id: activity.agent_thread_id.clone(),
+        status: status.to_string(),
+        message: None,
+        path: Some(activity.agent_path.clone()),
+    };
+    let mut row = collaboration_agent_row(&agent, Some(&activity.agent_path), turn_id);
+    row.payload["data"]["activity"] = activity.raw.clone();
+    row
+}
+
+fn short_agent_id(thread_id: &str) -> &str {
+    let end = thread_id
+        .char_indices()
+        .nth(8)
+        .map(|(index, _)| index)
+        .unwrap_or(thread_id.len());
+    &thread_id[..end]
+}
+
+fn worklog_preview(value: &str) -> String {
+    const LIMIT: usize = 180;
+    if value.chars().count() <= LIMIT {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(LIMIT - 3).collect();
+    format!("{kept}...")
 }
 
 enum Ending {
@@ -1102,5 +1268,75 @@ impl Drop for Client {
     fn drop(&mut self) {
         drop(self.stdin.take());
         crate::process::terminate_tree_and_wait(&mut self.child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_completed_spawn_and_its_running_agent_are_separate_rows() {
+        let call = CollaborationCall {
+            id: "call-1".to_string(),
+            tool: "spawnAgent".to_string(),
+            status: "completed".to_string(),
+            sender_thread_id: "parent-thread".to_string(),
+            receiver_thread_ids: vec!["child-thread".to_string()],
+            prompt: Some("Review the decoder.".to_string()),
+            agents: Vec::new(),
+            raw: serde_json::json!({"type": "collabAgentToolCall"}),
+        };
+        let operation = collaboration_call_row(&call, true, Some("turn-1".to_string()));
+        let agent = collaboration_agent_row(
+            &CollaborationAgent {
+                thread_id: "child-thread".to_string(),
+                status: "running".to_string(),
+                message: None,
+                path: None,
+            },
+            None,
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(operation.kind, "tool.completed");
+        assert_eq!(operation.payload["status"], "completed");
+        assert_eq!(operation.payload["data"]["toolCallId"], "call-1");
+        assert_eq!(agent.kind, "tool.updated");
+        assert_eq!(agent.payload["status"], "inProgress");
+        assert_eq!(agent.payload["data"]["toolCallId"], "agent:child-thread");
+    }
+
+    #[test]
+    fn observed_terminal_agent_states_use_the_same_stable_row_key() {
+        let running = collaboration_agent_row(
+            &CollaborationAgent {
+                thread_id: "child-thread".to_string(),
+                status: "running".to_string(),
+                message: None,
+                path: Some("/root/reviewer".to_string()),
+            },
+            Some("/root/reviewer"),
+            None,
+        );
+        let completed = collaboration_agent_row(
+            &CollaborationAgent {
+                thread_id: "child-thread".to_string(),
+                status: "completed".to_string(),
+                message: Some("No defects found.".to_string()),
+                path: Some("/root/reviewer".to_string()),
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(running.kind, "tool.updated");
+        assert_eq!(completed.kind, "tool.completed");
+        assert_eq!(completed.payload["status"], "completed");
+        assert_eq!(completed.payload["detail"], "No defects found.");
+        assert_eq!(
+            running.payload["data"]["toolCallId"],
+            completed.payload["data"]["toolCallId"]
+        );
     }
 }
