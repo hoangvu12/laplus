@@ -1,12 +1,18 @@
-import type { ManagedCloudflareConnectorSnapshot } from "@t3tools/contracts";
+import type {
+  ExternalTunnelEndpointSnapshot,
+  ExternalTunnelFailureKind,
+  ManagedCloudflareConnectorSnapshot,
+} from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   CloudflaredInstallationPanel,
   CloudflareConnectorStatus,
+  CloudflareDedicatedConnectorPanel,
   CloudflareLayeredHealth,
   CloudflareTunnelSettingsRow,
+  CloudflareVerificationFailure,
   ManagedCloudflareConnectorPanel,
   managedCloudflareCompactState,
   offersCloudflaredInstallation,
@@ -64,6 +70,55 @@ describe("CloudflareTunnelSettingsRow", () => {
     expect(html).toContain("Connector external");
     expect(html).toContain("HTTPS healthy");
     expect(html).toContain("WebSocket failed");
+  });
+});
+
+/**
+ * **Checkbox 6, on the screen rather than on the wire.** The contract has
+ * declared ten typed failure kinds since the first slice and the server sets
+ * every one of them; the client rendered `failureMessage` and nothing else, so
+ * a developer was told a sentence about the probe and never which of ten
+ * different things to go and fix.
+ */
+describe("a failed verification names the kind of failure", () => {
+  const failureFor = (
+    failureKind: ExternalTunnelFailureKind,
+    failureMessage: string | null = null,
+  ) =>
+    renderToStaticMarkup(
+      <CloudflareVerificationFailure failureKind={failureKind} failureMessage={failureMessage} />,
+    );
+
+  it("tells a DNS failure apart from a Cloudflare Access interception", () => {
+    const dns = failureFor("dns", "DNS lookup failed.");
+    const access = failureFor("cloudflare-access", "An access page intercepted the challenge.");
+
+    // Both keep what the server observed…
+    expect(dns).toContain("DNS lookup failed.");
+    expect(access).toContain("An access page intercepted the challenge.");
+    // …and each says which class of failure that observation is.
+    expect(dns).toContain("DNS");
+    expect(access).toContain("Cloudflare Access");
+    expect(dns).not.toBe(access);
+  });
+
+  /**
+   * The distinction the layered health already draws — HTTPS healthy, WebSocket
+   * failed — said in words, because "exempt the WebSocket path too" is a
+   * different Access policy edit from "exempt laplus".
+   */
+  it("separates an intercepted WebSocket upgrade from a plain one", () => {
+    expect(failureFor("cloudflare-access-websocket")).toContain("WebSocket");
+    expect(failureFor("cloudflare-access-websocket")).not.toBe(failureFor("websocket"));
+  });
+
+  /** A verification that did not fail draws nothing at all. */
+  it("renders nothing when nothing failed", () => {
+    expect(
+      renderToStaticMarkup(
+        <CloudflareVerificationFailure failureKind={null} failureMessage={null} />,
+      ),
+    ).toBe("");
   });
 });
 
@@ -178,6 +233,64 @@ describe("managed Cloudflare connector", () => {
     // Three states that used to be one sentence are now three.
     expect(statusFor("starting")).not.toBe(statusFor("degraded"));
     expect(statusFor("degraded")).not.toBe(statusFor("restart-exhausted"));
+  });
+
+  /**
+   * **A connector snapshot carries the same typed kind the endpoint row does**,
+   * and this panel dropped it just as thoroughly: "WebSocket upgrade failed."
+   * is what the probe saw, and the connector being locally ready while its
+   * public socket is intercepted is what a developer has to act on.
+   */
+  it("says which class of failure kept the public endpoint unverified", () => {
+    const html = renderToStaticMarkup(<CloudflareConnectorStatus snapshot={snapshot} />);
+
+    expect(html).toContain("WebSocket upgrade failed.");
+    expect(html).toContain("WebSocket");
+    expect(html).not.toBe(
+      renderToStaticMarkup(
+        <CloudflareConnectorStatus snapshot={{ ...snapshot, failureKind: "dns" }} />,
+      ),
+    );
+  });
+
+  /**
+   * **Checkbox 8, for the ownership it was never true of.** The dedicated panel
+   * is the only screen a laplus-created or adopted tunnel ever lands on, and it
+   * stated one origin — so the address the WebSocket will actually use appeared
+   * nowhere for the two ownerships laplus itself set up.
+   */
+  it("states both advertised origins for a tunnel laplus supervises", () => {
+    const endpoint: ExternalTunnelEndpointSnapshot = {
+      configured: true,
+      httpsOrigin: "https://laplus.example.com",
+      wssOrigin: "wss://laplus.example.com",
+      ownership: "laplus-created",
+      deletableAtCloudflare: true,
+      cleanup: INTACT_CLEANUP,
+      health: { connector: "laplus", https: "healthy", webSocket: "healthy" },
+      verificationState: "verified",
+      failureKind: null,
+      failureMessage: null,
+      lastAttemptAt: "2026-08-03T09:00:00.000Z",
+      lastVerifiedAt: "2026-08-03T09:00:00.000Z",
+      advertisedEndpoint: null,
+    };
+    const html = renderToStaticMarkup(
+      <CloudflareDedicatedConnectorPanel
+        snapshot={{ ...snapshot, tunnelOwnership: "laplus-created", deletableAtCloudflare: true }}
+        endpoint={endpoint}
+        canWrite
+        busy={false}
+        onStart={() => {}}
+        onStop={() => {}}
+        onRetry={() => {}}
+        onForget={() => {}}
+        onDelete={() => {}}
+      />,
+    );
+
+    expect(html).toContain("https://laplus.example.com");
+    expect(html).toContain("wss://laplus.example.com");
   });
 });
 

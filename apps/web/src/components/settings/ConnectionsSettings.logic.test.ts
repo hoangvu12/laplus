@@ -3,7 +3,11 @@ import {
   EnvironmentPublicExposureRejectedError,
   EnvironmentScopeRequiredError,
 } from "@t3tools/contracts";
-import type { PublicExposureCleanupReport, TunnelOwnership } from "@t3tools/contracts";
+import type {
+  ExternalTunnelFailureKind,
+  PublicExposureCleanupReport,
+  TunnelOwnership,
+} from "@t3tools/contracts";
 
 import { PrimaryEnvironmentRequestError } from "../../environments/primary";
 
@@ -11,7 +15,9 @@ import {
   cloudflareCleanupLabel,
   cloudflareCleanupSummary,
   cloudflareCreationPreview,
+  cloudflareFailureKindLabel,
   cloudflareFailureMessage,
+  cloudflareVerificationFailureSummary,
   cloudflareUnfinishedCreationSummary,
   cloudflareRefusalSummary,
   cloudflareRowSummary,
@@ -652,7 +658,9 @@ describe("the Cloudflare wizard step machine", () => {
         external,
         managedStateLabel,
       }),
-    ).toBe("https://laplus.example.com · Externally owned · Publicly verified");
+    ).toBe(
+      "https://laplus.example.com · wss://laplus.example.com · Externally owned · Publicly verified",
+    );
     expect(
       cloudflareRowSummary({
         state: at({ account }),
@@ -661,6 +669,54 @@ describe("the Cloudflare wizard step machine", () => {
         managedStateLabel,
       }),
     ).toBe("Register an externally managed HTTPS hostname.");
+  });
+
+  /**
+   * **Ticket 01, checkbox 8, which is unqualified by ownership.** "Its
+   * HTTPS/WSS endpoint … appear in Connections" was answered by a wizard step
+   * only the external path ever reaches, so a laplus-managed endpoint's socket
+   * address appeared nowhere at all — and the compact row is the part of
+   * Connections a developer reads without opening anything.
+   *
+   * **The pair comes from the endpoint row, never from the connector's origin
+   * with a scheme swapped.** That substitution is the server's to make
+   * (`https_origin.replacen`), and a client that made it too would be free to
+   * disagree with the address verification actually probed.
+   */
+  it("states the WSS origin beside the HTTPS one, whoever owns the tunnel", () => {
+    const managedStateLabel = () => "Publicly verified";
+    const dedicated = { ...managed, tunnelOwnership: "laplus-created" } as const;
+
+    expect(
+      cloudflareRowSummary({
+        state: at({ account, managed: dedicated, external }),
+        managed: dedicated,
+        external,
+        managedStateLabel,
+      }),
+    ).toBe(
+      "https://laplus.example.com · wss://laplus.example.com · laplus-created · Publicly verified",
+    );
+    expect(
+      cloudflareRowSummary({
+        state: at({ account, external }),
+        managed: null,
+        external,
+        managedStateLabel,
+      }),
+    ).toBe("https://laplus.example.com · wss://laplus.example.com · Externally owned · Verified");
+
+    // A connector whose hostname is not the one the endpoint row records is
+    // mid-reconfiguration, and pairing that connector's HTTPS origin with the
+    // old row's WSS origin would state an address that answers for neither.
+    expect(
+      cloudflareRowSummary({
+        state: at({ account, managed: dedicated, external }),
+        managed: { ...dedicated, httpsOrigin: "https://moved.example.com" },
+        external,
+        managedStateLabel,
+      }),
+    ).toBe("https://moved.example.com · laplus-created · Publicly verified");
   });
 
   /**
@@ -681,11 +737,13 @@ describe("the Cloudflare wizard step machine", () => {
       });
 
     expect(rowFor("laplus-created")).toBe(
-      "https://laplus.example.com · laplus-created · Publicly verified",
+      "https://laplus.example.com · wss://laplus.example.com · laplus-created · Publicly verified",
     );
-    expect(rowFor("adopted")).toBe("https://laplus.example.com · Adopted · Publicly verified");
+    expect(rowFor("adopted")).toBe(
+      "https://laplus.example.com · wss://laplus.example.com · Adopted · Publicly verified",
+    );
     expect(rowFor("external")).toBe(
-      "https://laplus.example.com · Externally owned · Publicly verified",
+      "https://laplus.example.com · wss://laplus.example.com · Externally owned · Publicly verified",
     );
 
     // An endpoint laplus does not run reads its ownership from its own record,
@@ -697,7 +755,7 @@ describe("the Cloudflare wizard step machine", () => {
         external: { ...external, ownership: "adopted" },
         managedStateLabel,
       }),
-    ).toBe("https://laplus.example.com · Adopted · Verified");
+    ).toBe("https://laplus.example.com · wss://laplus.example.com · Adopted · Verified");
   });
 });
 
@@ -829,6 +887,100 @@ describe("what a failed Cloudflare request puts on screen", () => {
     );
     expect(cloudflareFailureMessage({}, "The Cloudflare request failed.")).toBe(
       "The Cloudflare request failed.",
+    );
+  });
+});
+
+/**
+ * **Ten typed failure kinds crossed the wire and the screen read none of them.**
+ * Ticket 01's checkbox 6 asks for DNS, TLS, wrong-environment, authentication,
+ * WebSocket and Cloudflare Access failures to be *distinguishable*; the server
+ * has declared and set all ten since the first slice, and the client rendered
+ * `failureMessage` alone — one opaque sentence for ten different things to go
+ * and fix. "DNS did not resolve" and "Cloudflare Access intercepted this" are
+ * not the same afternoon.
+ */
+describe("what a failed verification says is wrong", () => {
+  /**
+   * Every kind the contract declares. Hand-written rather than derived, the way
+   * `remoteAccess.test.ts` writes it — what makes this exhaustive is the
+   * `Record` behind {@link cloudflareFailureKindLabel}, which fails typecheck
+   * when the server adds an eleventh.
+   */
+  const KINDS: ReadonlyArray<ExternalTunnelFailureKind> = [
+    "dns",
+    "tls",
+    "destination",
+    "http",
+    "identity",
+    "wrong-environment",
+    "authentication",
+    "websocket",
+    "cloudflare-access",
+    "cloudflare-access-websocket",
+  ];
+
+  it("gives every kind a sentence of its own", () => {
+    const sentences = KINDS.map(cloudflareFailureKindLabel);
+
+    // Ten kinds, ten sentences: a mapping that collapsed any two of them would
+    // be the opaque sentence this replaces, wearing a different word.
+    expect(new Set(sentences).size).toBe(KINDS.length);
+    for (const sentence of sentences) {
+      expect(sentence.trim()).not.toBe("");
+    }
+    expect(cloudflareFailureKindLabel("dns")).toContain("DNS");
+    expect(cloudflareFailureKindLabel("cloudflare-access")).toContain("Cloudflare Access");
+  });
+
+  /**
+   * The pair the server works hardest to tell apart: an Access policy that
+   * exempts the HTTPS paths and not the WebSocket one leaves HTTPS healthy and
+   * the socket intercepted, which is a different policy edit from an Access
+   * policy in front of everything.
+   */
+  it("separates an intercepted WebSocket upgrade from an intercepted request", () => {
+    expect(cloudflareFailureKindLabel("cloudflare-access-websocket")).not.toBe(
+      cloudflareFailureKindLabel("cloudflare-access"),
+    );
+    expect(cloudflareFailureKindLabel("cloudflare-access-websocket")).toContain("WebSocket");
+    expect(cloudflareFailureKindLabel("websocket")).not.toContain("Cloudflare Access");
+  });
+
+  /**
+   * Both halves, because they answer different questions: the server's sentence
+   * is what its probe observed, and the kind is what that class of failure means
+   * and where to go and change something.
+   */
+  it("says what the server observed as well as what the kind means", () => {
+    const summary = cloudflareVerificationFailureSummary({
+      failureKind: "dns",
+      failureMessage: "DNS lookup failed.",
+    });
+
+    expect(summary).toContain("DNS lookup failed.");
+    expect(summary).toContain(cloudflareFailureKindLabel("dns"));
+  });
+
+  it("still speaks when it has only one of the two", () => {
+    expect(cloudflareVerificationFailureSummary({ failureKind: "tls", failureMessage: null })).toBe(
+      cloudflareFailureKindLabel("tls"),
+    );
+    expect(
+      cloudflareVerificationFailureSummary({
+        failureKind: null,
+        failureMessage: "The endpoint could not be reached.",
+      }),
+    ).toBe("The endpoint could not be reached.");
+  });
+
+  /** Nothing failed, so there is nothing to put on screen. */
+  it("has nothing to say about a verification that did not fail", () => {
+    expect(cloudflareVerificationFailureSummary({ failureKind: null, failureMessage: null })).toBe(
+      null,
+    );
+    expect(cloudflareVerificationFailureSummary({ failureKind: null, failureMessage: "   " })).toBe(
+      null,
     );
   });
 });
@@ -1115,7 +1267,7 @@ describe("what a cleanup left behind", () => {
 
     // A stopped connector is still a setup, and the row describes it as one.
     expect(rowFor({ ...INTACT_CLEANUP, state: "stopped" })).toBe(
-      "https://laplus.example.com · laplus-created · Publicly verified",
+      "https://laplus.example.com · wss://laplus.example.com · laplus-created · Publicly verified",
     );
     expect(
       rowFor({

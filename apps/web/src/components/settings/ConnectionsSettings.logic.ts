@@ -8,6 +8,7 @@ import type {
   CloudflareAccountSnapshot,
   CloudflaredExecutable,
   ExternalTunnelEndpointSnapshot,
+  ExternalTunnelFailureKind,
   EnvironmentPublicExposureRefusal,
   CloudflareUnfinishedCreation,
   ManagedCloudflareConnectorSnapshot,
@@ -546,6 +547,106 @@ export const cloudflareOwnershipLabel = (ownership: TunnelOwnership): string =>
   OWNERSHIP_LABELS[ownership];
 
 /**
+ * What each typed verification failure means, and where to go and change
+ * something.
+ *
+ * **An exhaustive `Record`, so a kind the server adds fails typecheck** — the
+ * shape {@link WIZARD_STEP_LABELS} and {@link OWNERSHIP_LABELS} already use, and
+ * the property that matters most here: the ten kinds are declared in
+ * `remoteAccess.ts` and set by `verify_with_network`, and a client that fell
+ * through to a default sentence would silently answer an eleventh kind with the
+ * opaque line this exists to replace.
+ *
+ * **These are diagnoses, and the snapshot's `failureMessage` is an observation.**
+ * The server says what its probe saw — "DNS lookup failed", "An access page
+ * intercepted the WebSocket upgrade" — which is precise about the attempt and
+ * silent about what it implies. Ticket 01's checkbox 6 asks for the *kinds* to
+ * be distinguishable, and what makes them so is that each names a different
+ * thing to fix: a missing DNS record and an Access policy that covers the
+ * WebSocket path are not the same afternoon's work. So each sentence adds what
+ * the observation does not, and {@link cloudflareVerificationFailureSummary}
+ * shows both.
+ *
+ * They are deliberately not phrased as certainties. Verification observes one
+ * attempt from this server, so "may" and "check" are honest where "is" would be
+ * this client asserting something it did not see.
+ */
+const FAILURE_KIND_LABELS: Record<ExternalTunnelFailureKind, string> = {
+  dns: "DNS did not resolve this hostname. Check that a record for it exists and points at the tunnel.",
+  tls: "The TLS connection could not be established. The tunnel may not be serving a certificate for this hostname yet.",
+  destination:
+    "The hostname resolves to an address laplus will not probe. A public tunnel hostname has to resolve to a public address.",
+  http: "The HTTPS request itself failed. The connector in front of this hostname may be down or still starting.",
+  identity:
+    "Something answered, but not with this laplus environment's descriptor. Another service may be serving the hostname.",
+  "wrong-environment":
+    "The hostname reaches a different laplus environment. Route it to this one, or register the hostname that already points here.",
+  authentication:
+    "The hostname was reached and the authenticated challenge was refused. Something in front of it may be stripping or rejecting the Authorization header.",
+  websocket:
+    "HTTPS works and the WebSocket upgrade does not. Check that WebSockets are enabled for this hostname.",
+  "cloudflare-access":
+    "Cloudflare Access is intercepting requests to this hostname. Exempt laplus's paths from the Access policy, or give laplus a service token.",
+  "cloudflare-access-websocket":
+    "Cloudflare Access is intercepting the WebSocket upgrade in particular: HTTPS passes and the socket does not. An Access policy that exempts laplus's HTTPS paths has to exempt its WebSocket path too.",
+};
+
+export const cloudflareFailureKindLabel = (kind: ExternalTunnelFailureKind): string =>
+  FAILURE_KIND_LABELS[kind];
+
+/**
+ * What to put on screen about a verification that failed.
+ *
+ * Both halves, in the order a developer reads them: what the server's probe
+ * observed, then what that class of failure means. `null` when there is nothing
+ * to report, so one decision — rather than each call site's own truthiness test
+ * — settles whether a failure is drawn at all.
+ *
+ * Either half alone still speaks. A snapshot from a server older than the typed
+ * kinds carries only a message, and a kind with no message is still the more
+ * useful of the two.
+ */
+export const cloudflareVerificationFailureSummary = (snapshot: {
+  readonly failureKind: ExternalTunnelFailureKind | null;
+  readonly failureMessage: string | null;
+}): string | null => {
+  const observed = snapshot.failureMessage?.trim() ?? "";
+  const diagnosis =
+    snapshot.failureKind === null ? "" : cloudflareFailureKindLabel(snapshot.failureKind);
+  const summary = [observed, diagnosis].filter((sentence) => sentence !== "").join(" ");
+  return summary === "" ? null : summary;
+};
+
+/**
+ * The addresses one endpoint answers on, as a row states them.
+ *
+ * **Both, because the endpoint is one hostname and two protocols.** Ticket 01's
+ * checkbox 8 asks for the HTTPS/WSS endpoint to appear in Connections without
+ * qualifying it by ownership, and the socket address was drawn only inside the
+ * external path's wizard step — so for a tunnel laplus adopted or created it
+ * appeared nowhere. A pairing that reaches HTTPS while its WebSocket is
+ * intercepted is the failure this whole feature distinguishes, and the compact
+ * row is what a developer reads before deciding whether to open anything.
+ *
+ * **The `wss://` origin is the endpoint row's, never derived here.** The server
+ * makes it by substituting one scheme (`https_origin.replacen`), and a client
+ * that repeated the substitution would be free to disagree with the address
+ * verification actually probed. `httpsOrigin` is the caller's, because a
+ * supervised connector's own origin is what its panel and row are describing —
+ * so the pair is stated only when the endpoint row is recording that same
+ * hostname. A connector mid-reconfiguration is the case that matters: pairing
+ * its new HTTPS origin with the old row's WSS origin would name an address that
+ * answers for neither.
+ */
+const advertisedOrigins = (
+  httpsOrigin: string | null,
+  endpoint: ExternalTunnelEndpointSnapshot | null,
+): string | null =>
+  httpsOrigin !== null && endpoint?.httpsOrigin === httpsOrigin && endpoint.wssOrigin !== null
+    ? `${httpsOrigin} · ${endpoint.wssOrigin}`
+    : httpsOrigin;
+
+/**
  * What the compact Connections row says under "Cloudflare Tunnel".
  *
  * An unfinished setup names the step it stopped at, because a row that says
@@ -556,6 +657,9 @@ export const cloudflareOwnershipLabel = (ownership: TunnelOwnership): string =>
  * "adopted" differ in exactly what the destructive controls beneath the row may
  * offer — and a row that showed only a hostname and a health word made two
  * endpoints with opposite deletion authority look identical.
+ *
+ * It names both origins for the reason {@link advertisedOrigins} gives: this row
+ * is the part of Connections a developer reads without opening anything.
  */
 export const cloudflareRowSummary = (input: {
   readonly state: CloudflareWizardState;
@@ -577,12 +681,12 @@ export const cloudflareRowSummary = (input: {
       : `${cleanup} · nothing of laplus's remains on this computer`;
   }
   if (managed?.configured) {
-    return `${managed.httpsOrigin} · ${cloudflareOwnershipLabel(managed.tunnelOwnership)} · ${managedStateLabel(managed)}`;
+    return `${advertisedOrigins(managed.httpsOrigin, external)} · ${cloudflareOwnershipLabel(managed.tunnelOwnership)} · ${managedStateLabel(managed)}`;
   }
   if (external?.httpsOrigin) {
     const verification =
       external.verificationState === "verified" ? "Verified" : "Needs verification";
-    return `${external.httpsOrigin} · ${cloudflareOwnershipLabel(external.ownership)} · ${verification}`;
+    return `${advertisedOrigins(external.httpsOrigin, external)} · ${cloudflareOwnershipLabel(external.ownership)} · ${verification}`;
   }
   if (state.step === "choose-path") {
     return "Register an externally managed HTTPS hostname.";

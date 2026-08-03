@@ -983,6 +983,39 @@ describe("creating a stable tunnel", () => {
       await testApi.dispose();
     }
   });
+
+  /**
+   * **Checkbox 8 for a tunnel laplus owns.** `CloudflareEndpointOrigins` was
+   * mounted inside the external step alone, so the WSS address of the endpoint
+   * laplus created — the one this whole path exists to produce — was on the
+   * wire and on no screen. The pair comes from the endpoint row rather than
+   * from the connector's origin with its scheme swapped, so what is shown is
+   * the address verification probed.
+   */
+  it("shows the WSS origin of the endpoint it created, not only the HTTPS one", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: created,
+      connector: createdConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "laplus-created",
+        deletableAtCloudflare: true,
+        httpsOrigin: "https://stable.example.com",
+        wssOrigin: "wss://stable.example.com",
+        health: { connector: "laplus", https: "healthy", webSocket: "healthy" },
+      },
+    });
+    try {
+      await openWizard(user);
+
+      const origins = await screen.findByLabelText("Cloudflare endpoint addresses");
+      expect(origins.textContent).toContain("https://stable.example.com");
+      expect(origins.textContent).toContain("wss://stable.example.com");
+    } finally {
+      await testApi.dispose();
+    }
+  });
 });
 
 /**
@@ -1420,6 +1453,49 @@ describe("the external tunnel endpoint path", () => {
       expect(section.textContent).toContain("HTTPS healthy");
       expect(section.textContent).toContain("WebSocket healthy");
       expect(section.textContent).toContain("Last verified");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * **Checkbox 6, which was ticked against a snapshot field nothing read.** The
+   * server distinguishes ten failure kinds and sets them; the wizard rendered
+   * none of them, and on this path it rendered no failure text at all — the one
+   * place the external message appeared was the compact row's status slot,
+   * behind the dialog the developer is working in. So a failed registration
+   * showed a hostname box, three health words and no reason.
+   */
+  it("says why verification failed, in the panel and not only in the row", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      external: {
+        ...verifiedExternal,
+        health: { connector: "external", https: "healthy", webSocket: "failed" },
+        verificationState: "failed",
+        failureKind: "cloudflare-access-websocket",
+        failureMessage: "An access page intercepted the WebSocket upgrade.",
+        lastAttemptAt: "2026-08-03T10:00:00.000Z",
+      },
+    });
+    try {
+      // The row said this much before, and still does.
+      await screen.findByText("Cloudflare Tunnel");
+      expect(document.body.textContent).toContain(
+        "An access page intercepted the WebSocket upgrade.",
+      );
+
+      await openWizard(user);
+      const section = screen.getByLabelText("Externally managed hostname");
+      // The observation the probe made…
+      expect(section.textContent).toContain("An access page intercepted the WebSocket upgrade.");
+      // …and which of the ten kinds it was, which is what says where to go.
+      expect(section.textContent).toContain("Cloudflare Access");
+      expect(section.textContent).toContain("WebSocket");
+      // The last success is retained beside the failure rather than replaced by
+      // it — checkbox 6's second clause.
+      expect(section.textContent).toContain("Last verified");
+      expect(section.textContent).toContain("stale");
     } finally {
       await testApi.dispose();
     }

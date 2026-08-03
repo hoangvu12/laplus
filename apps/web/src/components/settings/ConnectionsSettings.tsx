@@ -28,6 +28,7 @@ import {
   type DesktopServerExposureState,
   type EnvironmentId,
   type ExternalTunnelEndpointSnapshot,
+  type ExternalTunnelFailureKind,
   type ManagedCloudflareConnectorSnapshot,
   type CloudflareAccountSnapshot,
   type CloudflareAccountTunnel,
@@ -56,6 +57,7 @@ import {
   cloudflareOwnershipLabel,
   cloudflareRowSummary,
   cloudflareUnfinishedCreationSummary,
+  cloudflareVerificationFailureSummary,
   cloudflareWizardState,
   formatRemoteBackendHost,
   mergeVerifiedExternalEndpoint,
@@ -643,7 +645,10 @@ export function CloudflareTunnelSettingsRow({
           ) : account?.failureMessage ? (
             <span className="text-destructive">{account.failureMessage}</span>
           ) : snapshot?.verificationState === "failed" ? (
-            <span className="text-destructive">{snapshot.failureMessage}</span>
+            <CloudflareVerificationFailure
+              failureKind={snapshot.failureKind}
+              failureMessage={snapshot.failureMessage}
+            />
           ) : undefined
         }
         control={
@@ -793,6 +798,7 @@ export function CloudflareTunnelSettingsRow({
           ) : (wizard.step === "adopting" || wizard.step === "creating") && managed?.configured ? (
             <CloudflareDedicatedConnectorPanel
               snapshot={managed}
+              endpoint={snapshot}
               canWrite={canWrite}
               busy={busy}
               onStart={() => void mutateManaged("start")}
@@ -859,6 +865,19 @@ export function CloudflareTunnelSettingsRow({
                 />
               </label>
               {snapshot?.configured ? <CloudflareEndpointOrigins snapshot={snapshot} /> : null}
+              {/* **The failure belongs in the panel the developer is working
+                  in.** It rendered only in the compact row's status slot, which
+                  this dialog is drawn on top of — so a registration that failed
+                  showed a hostname box, three health words and no reason at
+                  all. The last success stays on screen beside it, which is
+                  checkbox 6's "the last successful verification and stale state
+                  are retained". */}
+              {snapshot ? (
+                <CloudflareVerificationFailure
+                  failureKind={snapshot.failureKind}
+                  failureMessage={snapshot.failureMessage}
+                />
+              ) : null}
               {snapshot?.lastVerifiedAt ? (
                 <p className="text-xs text-muted-foreground">
                   Last verified {formatAccessTimestamp(snapshot.lastVerifiedAt)}
@@ -1443,6 +1462,7 @@ export function CloudflareAdoptionOffer({
  */
 export function CloudflareDedicatedConnectorPanel({
   snapshot,
+  endpoint,
   canWrite,
   busy,
   onStart,
@@ -1452,6 +1472,17 @@ export function CloudflareDedicatedConnectorPanel({
   onDelete,
 }: {
   readonly snapshot: ManagedCloudflareConnectorSnapshot;
+  /**
+   * The endpoint row this connector serves, for the addresses it advertises.
+   *
+   * **Both origins come from one record**, which is why this is the row rather
+   * than a scheme substituted onto {@link snapshot}'s own origin: the server
+   * derives `wssOrigin` from the hostname verification actually probed, and a
+   * client that derived it too could disagree. There is one endpoint row per
+   * environment and a supervised connector registers itself into it, so this is
+   * the same hostname the heading above states.
+   */
+  readonly endpoint: ExternalTunnelEndpointSnapshot | null;
   readonly canWrite: boolean;
   readonly busy: boolean;
   readonly onStart: () => void;
@@ -1478,6 +1509,11 @@ export function CloudflareDedicatedConnectorPanel({
         <p className="text-xs text-muted-foreground">
           laplus configures and supervises this connector from its own credential and configuration.
         </p>
+        {/* The heading names the hostname; this names the two addresses it
+            answers on. A dedicated tunnel never reaches the external step, so
+            without this the `wss://` origin of the endpoint laplus itself
+            created was on the wire and on no screen. */}
+        {endpoint ? <CloudflareEndpointOrigins snapshot={endpoint} /> : null}
       </div>
       <CloudflareConnectorStatus snapshot={snapshot} />
       <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
@@ -1749,9 +1785,14 @@ export function CloudflareConnectorStatus({
       {snapshot.failureMessage ? (
         <p className="text-destructive">{snapshot.failureMessage}</p>
       ) : null}
-      {snapshot.publicFailureMessage ? (
-        <p className="text-destructive">{snapshot.publicFailureMessage}</p>
-      ) : null}
+      {/* The connector's own failure is about the process; this one is about the
+          public endpoint in front of it, and it is the one that carries a typed
+          kind. A locally ready connector whose hostname fails verification is
+          the case the two lines exist to keep apart. */}
+      <CloudflareVerificationFailure
+        failureKind={snapshot.failureKind}
+        failureMessage={snapshot.publicFailureMessage}
+      />
       {snapshot.logs.length > 0 ? (
         <pre className="mt-2 whitespace-pre-wrap text-muted-foreground">
           {snapshot.logs.join("\n")}
@@ -2152,6 +2193,39 @@ export function CloudflareEndpointOrigins({
           <span className="font-mono">{snapshot.wssOrigin}</span>
         </>
       ) : null}
+    </p>
+  );
+}
+
+/**
+ * Why a verification failed: what the probe saw, and which of the ten typed
+ * kinds it was.
+ *
+ * **The kind is the part that says where to go.** `remoteAccess.ts` declares ten
+ * `ExternalTunnelFailureKind`s and the server sets every one of them; until this
+ * existed the client read none, so ten different faults — a missing DNS record,
+ * an Access policy over the WebSocket path, a hostname pointing at somebody
+ * else's laplus — arrived as one sentence about a request that did not work.
+ * {@link cloudflareVerificationFailureSummary} is the mapping, and it is a
+ * `Record` so an eleventh kind is a compile error rather than a blank.
+ *
+ * Shared by the connector snapshot and the endpoint snapshot, which carry the
+ * same `failureKind` axis and are read on three screens. One vocabulary rather
+ * than three, for the reason `MUTATION_STEP_LABELS` already gives about the
+ * journal: three sets of words for one axis is how the screens come to disagree.
+ */
+export function CloudflareVerificationFailure({
+  failureKind,
+  failureMessage,
+}: {
+  readonly failureKind: ExternalTunnelFailureKind | null;
+  readonly failureMessage: string | null;
+}) {
+  const summary = cloudflareVerificationFailureSummary({ failureKind, failureMessage });
+  if (summary === null) return null;
+  return (
+    <p className="text-xs text-destructive" aria-label="Cloudflare verification failure">
+      {summary}
     </p>
   );
 }

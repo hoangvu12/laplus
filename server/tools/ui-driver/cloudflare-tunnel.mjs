@@ -14,8 +14,9 @@
 //   CHROME=/usr/bin/chromium-browser node tools/ui-driver/cloudflare-tunnel.mjs
 //
 // It spends nothing: no agent turn, no network, no Cloudflare account. Ticket
-// 05 is the adoption path, ticket 06 the creation one, and ticket 07 the three
-// ways out of both: stop, forget, and delete everywhere.
+// 05 is the adoption path, ticket 06 the creation one, ticket 07 the three ways
+// out of both — stop, forget, and delete everywhere — and ticket 02 the
+// connector-token path, its supervision and its persistence.
 //
 // **A stand-in Cloudflare DNS API too, not only a stand-in cloudflared.**
 // `cloudflared` has no `route dns delete`, so removing the record a creation made
@@ -30,12 +31,21 @@
 // `tests/http_cloudflare_{adoption,creation}.rs` cover them against the hermetic
 // verifier.
 //
-// **Two isolated servers, one browser.** Adoption and creation cannot share a
-// server: each ends with a connector laplus supervises, and the wizard rightly
-// refuses to offer setup for an exposure that already exists. So each walkthrough
-// gets its own scratch directory, its own stand-in `cloudflared`, its own port
-// and its own boot credential, and the page is navigated between them the same
-// way it was booted the first time.
+// **Three isolated servers, one browser.** Adoption, creation and the
+// connector-token path cannot share a server: each ends with a connector laplus
+// supervises, and the wizard rightly refuses to offer setup for an exposure that
+// already exists. So each walkthrough gets its own scratch directory, its own
+// stand-in `cloudflared`, its own port and its own boot credential, and the page
+// is navigated between them the same way it was booted the first time.
+//
+// **The third world is where the driver stops being polite.** Ticket 02's
+// checkboxes are about a connector that is *not* being asked nicely: it names
+// restarts, a spent budget and a configuration that survives its own server. So
+// that world writes no account certificate at all, kills the connector out from
+// under the supervisor `MAX_RESTARTS` times, and stops and replaces its whole
+// server against the same data directory. Stop and Start are the operator's
+// buttons and reach `set_desired`; nothing a developer can press reaches
+// `child_failed`, which is the only place `restartCount` moves.
 //
 // **What it asserts is server state, never a label.** The wizard reads its
 // progress out of the server's own snapshots, so a screen that says "adopted"
@@ -61,6 +71,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -87,6 +98,20 @@ const NEW_NAME = "laplus-desk";
 const NEW_HOSTNAME = "stable.example.com";
 /** Ticket 01: a hostname laplus verifies and advertises and never operates. */
 const EXTERNAL_HOSTNAME = "somebody-elses.example.com";
+/**
+ * Ticket 02's own path: a tunnel-specific connector token, and no account.
+ *
+ * A distinct literal from every other secret here, so a leak can be attributed
+ * to the thing that leaked it rather than to "a secret".
+ */
+const CONNECTOR_TOKEN = "FAKE-CONNECTOR-TOKEN-SECRET";
+const TOKEN_HOSTNAME = "connector-token.example.com";
+/**
+ * `MAX_RESTARTS` in `cloudflare_connector.rs`. Restated rather than imported,
+ * because the driver's claim is about the number a running server enforces —
+ * a copy that drifts is this driver failing, which is the correct outcome.
+ */
+const MAX_RESTARTS = 3;
 
 /**
  * Everything this driver reaches into `ConnectionsSettings.tsx` for.
@@ -111,12 +136,24 @@ const SELECTORS = {
   newHostnameField: "New tunnel HTTPS hostname",
   create: "Create this tunnel",
   startConnector: "Start connector",
-  forget: "Forget local setup",
+  // Two labels, one ellipsis apart, for the same reason the delete pair below
+  // is two: `3cf96ae` gave Forget a confirmation of its own, and a driver that
+  // pressed the trigger and waited would wait forever. `press` matches by
+  // prefix, and the trigger is gone by the time the second is looked for.
+  forget: "Forget local setup…",
+  confirmForget: "Forget local setup",
   // Ticket 01's path: a hostname somebody else's connector already serves.
   externalPath: "Register a hostname someone else runs",
   externalHostnameField: "External HTTPS hostname",
   register: "Register",
   changePath: "Change setup path",
+  // Ticket 02's own panel: an existing cloudflared plus a tunnel-specific
+  // connector token, reached without signing in to anything.
+  tokenPath: "Use a tunnel connector token",
+  managedHostnameField: "Managed connector hostname",
+  connectorTokenField: "Connector token",
+  saveConnector: "Save connector",
+  retryConnector: "Retry connector",
   // Two labels, one word apart on purpose: the first opens the destructive
   // confirmation and the second is inside it. `press` matches by prefix, and the
   // trigger is gone by the time the second is looked for.
@@ -170,8 +207,13 @@ const giveUp = (why) => {
  * test binaries, and importing it here would mean building a Rust crate to run
  * a browser. What has to agree is the *interface* cloudflared presents, and both
  * are written against that.
+ *
+ * `certificate: false` writes no account certificate at all, which is what
+ * makes ticket 02's connector-token walkthrough mean anything: a world where a
+ * certificate is merely unused proves nothing about a path whose whole claim is
+ * that it never needs one.
  */
-function writeScratch() {
+function writeScratch({ certificate = true } = {}) {
   const scratch = mkdtempSync(join(tmpdir(), "laplus-cloudflare-"));
   // On `PATH`, and named `cloudflared`, because discovery is what the wizard
   // offers to choose between — a stand-in somewhere else would need a path typed
@@ -183,21 +225,31 @@ function writeScratch() {
     bin,
     cloudflared: join(bin, "cloudflared"),
     certificate: join(scratch, "cert.pem"),
+    hasCertificate: certificate,
     trace: join(scratch, "cloudflared.trace"),
     listing: join(scratch, "tunnels.json"),
     mode: join(scratch, "cloudflared.mode"),
+    // Which connector is running right now, so the supervision walkthrough can
+    // kill *this* child rather than guess at a pid or match on a name.
+    pidfile: join(scratch, "connector.pid"),
+    // How long a relaunched connector takes to answer `/ready`. `degraded` is
+    // the window between a restart and the replacement being ready, and a
+    // stand-in that binds its port instantly makes that window unobservable.
+    slow: join(scratch, "cloudflared.slow"),
     data: join(scratch, "data"),
   };
 
   writeFileSync(
     world.cloudflared,
     `#!/usr/bin/env python3
-import http.server, json, os, signal, sys
+import http.server, json, os, signal, sys, time
 ARGS = sys.argv[1:]
 TRACE = ${JSON.stringify(world.trace)}
 CERT = ${JSON.stringify(world.certificate)}
 LISTING = ${JSON.stringify(world.listing)}
 MODE = ${JSON.stringify(world.mode)}
+PIDFILE = ${JSON.stringify(world.pidfile)}
+SLOW = ${JSON.stringify(world.slow)}
 CREATED = ${JSON.stringify(CREATED)}
 
 if '--version' in ARGS:
@@ -263,12 +315,31 @@ if 'delete' in ARGS:
 if 'run' not in ARGS:
     raise SystemExit(2)
 
+# Written first, and overwritten on every launch, so "the connector running now"
+# is a fact the driver can read rather than infer.
+with open(PIDFILE, 'w') as f:
+    f.write(str(os.getpid()))
+
 config = after('--config')
 assert config is not None, ARGS
-lines = [line.strip() for line in open(config).read().splitlines()]
-assert [l for l in lines if l.startswith('tunnel:')], lines
-held = [l for l in lines if l.startswith('credentials-file:')]
-assert held and os.path.exists(held[0].split(':', 1)[1].strip()), lines
+token_file = after('--token-file')
+if token_file is not None:
+    # **Ticket 02's own credential.** A connector token carries its tunnel with
+    # it, so laplus's configuration names neither a tunnel nor a credentials
+    # file — what it must name is a *file* holding the token, never the token.
+    # Asserted here, so a build that passed \`--token <value>\` would break the
+    # stand-in rather than quietly pass the driver.
+    assert '--token' not in ARGS, ARGS
+    secret = open(token_file).read().strip()
+    assert secret, token_file
+    said = 'connector starting with token=%s' % secret
+else:
+    lines = [line.strip() for line in open(config).read().splitlines()]
+    assert [l for l in lines if l.startswith('tunnel:')], lines
+    held = [l for l in lines if l.startswith('credentials-file:')]
+    assert held and os.path.exists(held[0].split(':', 1)[1].strip()), lines
+    held = json.load(open(held[0].split(':', 1)[1].strip()))
+    said = 'connector starting with TunnelSecret=%s' % held['TunnelSecret']
 
 class Ready(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -281,8 +352,7 @@ class Ready(http.server.BaseHTTPRequestHandler):
 # the redaction verdict reads — and a connector's output is drained when the
 # child exits, which is exactly when a cleanup may already have removed the file
 # the secret would have been recognised from.
-held = json.load(open(held[0].split(':', 1)[1].strip()))
-print('connector starting with TunnelSecret=%s' % held['TunnelSecret'], file=sys.stderr)
+print(said, file=sys.stderr)
 sys.stderr.flush()
 
 def stopped(*_):
@@ -293,8 +363,12 @@ def stopped(*_):
     sys.exit(0)
 
 host, port = after('--metrics').rsplit(':', 1)
+# Installed before the slow start below, so a stop that arrives while this
+# connector is still coming up is still a graceful one.
 signal.signal(signal.SIGTERM, stopped)
 signal.signal(signal.SIGINT, stopped)
+if os.path.exists(SLOW):
+    time.sleep(float(open(SLOW).read().strip() or '0'))
 http.server.HTTPServer((host, int(port)), Ready).serve_forever()
 `,
     { mode: 0o700 },
@@ -303,7 +377,7 @@ http.server.HTTPServer((host, int(port)), Ready).serve_forever()
   // Detected rather than created, so the wizard opens on the consent step — the
   // path ADR-0045 is strictest about, because merely finding a certificate
   // grants laplus nothing.
-  writeFileSync(world.certificate, "FAKE-ACCOUNT-CERTIFICATE-SECRET");
+  if (certificate) writeFileSync(world.certificate, "FAKE-ACCOUNT-CERTIFICATE-SECRET");
   mkdirSync(world.data, { recursive: true });
   return world;
 }
@@ -443,12 +517,15 @@ async function startServer(world, port, dnsApiOrigin) {
       PATH: `${world.bin}:${process.env.PATH ?? ""}`,
       LOCALAPPDATA: undefined,
       APPDATA: undefined,
-      TUNNEL_ORIGIN_CERT: world.certificate,
+      // Absent, rather than pointed at a file that is not there, for the
+      // connector-token world: the claim is that the path needs no account.
+      ...(world.hasCertificate ? { TUNNEL_ORIGIN_CERT: world.certificate } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.on("error", () => giveUp(`${SERVER} would not run — cargo build -p laplus-server first`));
   running.push(server);
+  const exited = new Promise((resolve) => server.once("exit", resolve));
 
   let announced = "";
   server.stdout.on("data", (chunk) => {
@@ -465,8 +542,23 @@ async function startServer(world, port, dnsApiOrigin) {
     giveUp(`the server never announced a paired URL. What it said:\n${announced.slice(0, 2000)}`);
   }
   console.log(`server ${new URL(url).origin}`);
-  return url;
+  return { url, process: server, exited };
 }
+
+/**
+ * Stop one server and wait until it is actually gone.
+ *
+ * **Waiting is the point.** The persistence walkthrough starts a replacement on
+ * the same port against the same data directory, and a start that races the
+ * previous process's exit fails at `bind` — which would read as a server that
+ * lost its configuration.
+ */
+const stopServer = async (started) => {
+  const index = running.indexOf(started.process);
+  if (index >= 0) running.splice(index, 1);
+  started.process.kill("SIGTERM");
+  await started.exited;
+};
 
 const adoption = writeScratch();
 const listSpareAs = (state) =>
@@ -474,9 +566,12 @@ const listSpareAs = (state) =>
 listSpareAs("inactive");
 const creation = writeScratch();
 writeFileSync(creation.listing, tunnels([]));
+// No certificate at all: ticket 02's path is the one that never signs in.
+const connectorToken = writeScratch({ certificate: false });
+const worlds = [adoption, creation, connectorToken];
 const dnsApi = await startDnsApi(NEW_HOSTNAME);
 
-const url = await startServer(adoption, PORT);
+const { url } = await startServer(adoption, PORT);
 const trace = adoption.trace;
 
 // --- the browser ---
@@ -606,6 +701,68 @@ const invocations = (world, verb) =>
   readFileSync(world.trace, "utf8")
     .split("\n")
     .filter((line) => line.includes(`"${verb}"`)).length;
+
+/**
+ * Every file anywhere under this world that contains `secret`, contents-first.
+ *
+ * The box's claim is about *non-secret* persistence, so the answer this is
+ * asked for is "the private credential file, and nothing else" — a database, a
+ * settings file, an ingress configuration or a command trace holding the same
+ * bytes is the failure. Walked from the scratch root rather than from a path
+ * spelled by hand, because a wrong path would pass by finding nothing.
+ */
+function filesHolding(world, secret) {
+  const held = [];
+  const walk = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else if (readFileSync(path).includes(secret)) held.push(path);
+    }
+  };
+  walk(world.scratch);
+  return held;
+}
+
+/** The stand-in connector this world is running right now. */
+const connectorPid = (world) => Number(readFileSync(world.pidfile, "utf8").trim());
+
+/**
+ * Kill the connector out from under the server, and answer which pid died.
+ *
+ * **A kill is not the Stop button**, and that distinction is the whole of this
+ * walkthrough. Stop is the operator asking, and it reaches `set_desired`;
+ * nothing a developer can press reaches `child_failed`, which is the only
+ * place `restartCount` moves and `degraded` and `restart-exhausted` are
+ * written. `SIGKILL` so the stand-in's own signal handler cannot run: a child
+ * that exits gracefully on its own is still a child that went away.
+ */
+const killConnector = (world) => {
+  const doomed = connectorPid(world);
+  process.kill(doomed, "SIGKILL");
+  return doomed;
+};
+
+/**
+ * Nothing this driver started may outlive it, including a connector whose
+ * server was killed while it was up.
+ *
+ * The pid is confirmed against its own command line before anything is
+ * signalled — a pid file outlives its process and pids are reused, so a
+ * teardown that trusted the number could kill somebody else's work.
+ */
+const reapConnectors = () => {
+  for (const world of worlds) {
+    try {
+      const pid = connectorPid(world);
+      if (readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(world.scratch)) {
+        process.kill(pid, "SIGKILL");
+      }
+    } catch {
+      // No connector ever ran in this world, or it is already gone.
+    }
+  }
+};
 
 try {
   const arrived = await arriveAtConnections(url);
@@ -824,6 +981,27 @@ try {
   // endpoint row and stopped nothing, so forgetting an adopted tunnel left a
   // connector serving a public hostname nothing recorded.
   await pressed(SELECTORS.forget);
+  // **Offered is not done.** The confirmation names what is removed and what is
+  // untouched, and nothing has happened until the second press.
+  const forgetOffer = await session.evaluate(
+    `return document.querySelector('[aria-label="Forget local setup"]')?.innerText ?? null;`,
+  );
+  if (!forgetOffer) {
+    fail("the forget confirmation never appeared");
+  } else {
+    for (const [what, shown] of [
+      ["what it removes", "connector configuration"],
+      ["that Cloudflare is untouched", "the Cloudflare tunnel and its DNS record"],
+    ]) {
+      if (forgetOffer.includes(shown)) {
+        console.log(`  ok the forget confirmation names ${what}`);
+      } else {
+        fail(`the forget confirmation does not name ${what} (${JSON.stringify(shown)})`);
+      }
+    }
+  }
+  check("nothing is forgotten by being offered", privateFiles(adoption).length > 0, true);
+  await pressed(SELECTORS.confirmForget);
   const forgotten = await poll(async () => {
     const answer = await serverState("/api/access/cloudflare");
     return answer.body.configured === false ? answer : null;
@@ -934,7 +1112,7 @@ try {
   // wizard rightly will not offer setup for an exposure that already exists.
 
   console.log("\n--- creating a tunnel ---");
-  const createdUrl = await startServer(creation, String(Number(PORT) + 1), dnsApi.origin);
+  const { url: createdUrl } = await startServer(creation, String(Number(PORT) + 1), dnsApi.origin);
   const reached = await arriveAtConnections(createdUrl);
   if (!reached) giveUp("never reached the Connections page on the creation server");
 
@@ -1153,6 +1331,361 @@ try {
     fail("the DNS API token reached a snapshot");
   }
 
+  // --- ticket 02: a connector token, and no Cloudflare account anywhere ---
+  //
+  // **The surface this ticket is named for**, and the one path here that signs
+  // in to nothing: a developer who already made the tunnel at Cloudflare brings
+  // a compatible `cloudflared` and that tunnel's own connector token. laplus
+  // runs and supervises the connector; Cloudflare keeps the control plane, so
+  // there is nothing for laplus to delete and nothing for it to allocate.
+  //
+  // A third server, and a world with **no account certificate written at all**.
+  // A world where a certificate merely goes unused would prove nothing about a
+  // path whose entire claim is that it never needs one.
+
+  console.log("\n--- a connector token, and no account ---");
+  const tokenPort = String(Number(PORT) + 2);
+  let tokenServer = await startServer(connectorToken, tokenPort);
+  if (!(await arriveAtConnections(tokenServer.url))) {
+    giveUp("never reached the Connections page on the connector-token server");
+  }
+
+  await pressed(SELECTORS.openWizard);
+  await pressed(SELECTORS.tokenPath);
+
+  // Discovered rather than typed. Checkbox 1's claim is that the wizard offers
+  // the executables it found, so a path pasted into the free-text field would
+  // drive the panel while proving nothing about discovery.
+  const picked = await session.evaluate(`
+    const radios = [...document.querySelectorAll('input[name="cloudflared-executable"]')];
+    const found = radios.find((element) => element.value === ${JSON.stringify(connectorToken.cloudflared)});
+    if (!found) return "NOT DISCOVERED, offered: " + radios.map((one) => one.value).join(", ");
+    found.click();
+    return "picked";
+  `);
+  check("the wizard discovered the stand-in cloudflared", picked, "picked");
+  const namedHost = await type(SELECTORS.managedHostnameField, TOKEN_HOSTNAME);
+  if (namedHost !== "typed") fail(namedHost);
+  const pastedToken = await type(SELECTORS.connectorTokenField, CONNECTOR_TOKEN);
+  if (pastedToken !== "typed") fail(pastedToken);
+  await settle(400);
+  await pressed(SELECTORS.saveConnector);
+
+  const ran = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.connectorState === "ready" ? answer : null;
+  }, 30000);
+  if (!ran) {
+    const last = await serverState("/api/access/cloudflare/connector");
+    fail(
+      `the connector-token connector never became ready: ${JSON.stringify(last.body).slice(0, 400)}`,
+    );
+  } else {
+    check("the connector is ready", ran.body.readiness, true);
+    check("laplus supervises it", ran.body.desiredState, "running");
+    // Two owners, one connector: laplus owns the process and Cloudflare owns
+    // the tunnel. Collapsing them is what ADR-0049 exists to stop.
+    check("laplus runs the process", ran.body.ownership, "laplus");
+    check("Cloudflare keeps the tunnel", ran.body.tunnelOwnership, "external");
+    check("so nothing here is laplus's to delete", ran.body.deletableAtCloudflare, false);
+    check("the hostname the developer typed", ran.body.httpsOrigin, `https://${TOKEN_HOSTNAME}`);
+    check(
+      "the executable the developer chose",
+      ran.body.executablePath,
+      connectorToken.cloudflared,
+    );
+    check(
+      "the credential is a private file",
+      ran.body.credentialPath?.endsWith("connector.token"),
+      true,
+    );
+    // Readiness is the connector's own `/ready`, reached without any public
+    // endpoint having been proven — the separation checkbox 4 is about.
+    const endpoint = await serverState("/api/access/cloudflare");
+    check("the endpoint is somebody else's tunnel", endpoint.body.ownership, "external");
+    check("with laplus's connector in front of it", endpoint.body.health?.connector, "laplus");
+    check(
+      "a locally ready connector is not publicly verified",
+      endpoint.body.advertisedEndpoint,
+      null,
+    );
+  }
+
+  // **Nothing at Cloudflare was touched, because nothing could be.** No
+  // certificate exists in this world, so a build that reached for the account
+  // path here would fail rather than quietly succeed against a stale one.
+  const accountless = await serverState("/api/access/cloudflare/account");
+  check("no account certificate exists", accountless.body.certificateDetected, false);
+  check("no sign-in was ever started", accountless.body.loginState, "not-started");
+  check("no certificate was consented to", accountless.body.certificateConsentedAt, null);
+  check("no tunnel was selected", accountless.body.selection, null);
+  check("no tunnel was listed", invocations(connectorToken, "list"), 0);
+  check("no tunnel was allocated", invocations(connectorToken, "create"), 0);
+  check("no DNS record was routed", invocations(connectorToken, "route"), 0);
+  check("no run credential was fetched", invocations(connectorToken, "token"), 0);
+  check("no sign-in was attempted", invocations(connectorToken, "login"), 0);
+
+  // --- where the token is, and every place it must not be ---
+
+  const tokenTrace = readFileSync(connectorToken.trace, "utf8");
+  check("the token is handed over by file", tokenTrace.includes("--token-file"), true);
+  if (tokenTrace.includes(CONNECTOR_TOKEN)) fail("the connector token reached a command line");
+  const tokenAnswers = JSON.stringify([ran?.body, accountless.body]);
+  if (tokenAnswers.includes(CONNECTOR_TOKEN)) fail("the connector token reached a snapshot");
+  // **Non-secret persistence, read off the disk rather than off the wire.**
+  // Everything laplus wrote for this world is walked, and exactly one file may
+  // hold the token: the private one it was written to on purpose.
+  const holding = filesHolding(connectorToken, CONNECTOR_TOKEN);
+  check("exactly one file on disk holds the token", holding.length, 1);
+  check(
+    "and it is the private credential file",
+    holding[0]?.endsWith("connector.token") ?? null,
+    true,
+  );
+  const tokenFile = holding.length === 1 ? holding[0] : null;
+  if (tokenFile) {
+    check("kept private to this user", (statSync(tokenFile).mode & 0o777).toString(8), "600");
+  }
+  /**
+   * When the token file was last written, which is when setup last ran.
+   *
+   * `configure` is the only thing that writes it, so "unchanged" is the
+   * strongest available form of "the developer did not re-enter the token" —
+   * stronger than the field being empty on screen, which a client could fake.
+   */
+  const tokenWrittenAt = () => (tokenFile ? statSync(tokenFile).mtimeMs : null);
+  const setupRanAt = tokenWrittenAt();
+
+  // --- supervision: the child dies, and nothing a developer pressed did it ---
+  //
+  // A prior audit of this driver found its "stop and restart" to be the
+  // operator's own two buttons. Nothing killed a connector, so `restartCount`,
+  // `degraded` and `restart-exhausted` never appeared in a verdict at all. Here
+  // the stand-in is killed out from under the server, three times, which is the
+  // budget `MAX_RESTARTS` sets — and the budget is *not* refilled by a
+  // connector that recovers, only by an explicit Retry.
+  //
+  // The replacement is made slow to come up on purpose: `degraded` is the
+  // window between the restart and the replacement answering `/ready`, and a
+  // stand-in that binds instantly makes that window too small to read.
+  writeFileSync(connectorToken.slow, "3");
+
+  for (const spent of [1, 2]) {
+    const doomed = killConnector(connectorToken);
+    const degraded = await poll(async () => {
+      const answer = await serverState("/api/access/cloudflare/connector");
+      return answer.body.connectorState === "degraded" ? answer : null;
+    }, 25000);
+    if (!degraded) {
+      const last = await serverState("/api/access/cloudflare/connector");
+      fail(
+        `a killed connector never reported degraded: ${JSON.stringify(last.body).slice(0, 300)}`,
+      );
+    } else {
+      check(`restart ${spent} is counted`, degraded.body.restartCount, spent);
+      check("a connector being restarted is not ready", degraded.body.readiness, false);
+      check("and is still wanted running", degraded.body.desiredState, "running");
+      // Degraded, never failed: the budget is not spent, so this is recoverable
+      // and the row must not say the setup is broken.
+      if (degraded.body.failureMessage === null) {
+        fail("a degraded connector said nothing about why");
+      } else {
+        check(
+          "with an actionable reason",
+          degraded.body.failureMessage.includes("cloudflared"),
+          true,
+        );
+      }
+      if (JSON.stringify(degraded.body).includes(CONNECTOR_TOKEN)) {
+        fail("the connector token reached a failure snapshot");
+      }
+    }
+    const recovered = await poll(async () => {
+      const answer = await serverState("/api/access/cloudflare/connector");
+      return answer.body.connectorState === "ready" ? answer : null;
+    }, 30000);
+    if (!recovered) {
+      fail(`the supervisor did not restart the connector after kill ${spent}`);
+    } else {
+      check(
+        "the supervisor started a different process",
+        connectorPid(connectorToken) !== doomed,
+        true,
+      );
+      // **The budget is spent, not lent.** A connector that comes back does not
+      // get its restarts back — that is what makes three kills reach the end of
+      // the budget rather than three separate first failures.
+      check("a recovered connector keeps its spent budget", recovered.body.restartCount, spent);
+      check("and needed no new token", tokenWrittenAt(), setupRanAt);
+    }
+  }
+
+  // The last one in the budget: no fourth launch, and an explicit retry is now
+  // the only way back.
+  const launchesBeforeExhaustion = invocations(connectorToken, "run");
+  killConnector(connectorToken);
+  const exhausted = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.connectorState === "restart-exhausted" ? answer : null;
+  }, 25000);
+  if (!exhausted) {
+    const last = await serverState("/api/access/cloudflare/connector");
+    fail(`the restart budget never ran out: ${JSON.stringify(last.body).slice(0, 300)}`);
+  } else {
+    check("the budget is what the server enforces", exhausted.body.restartCount, MAX_RESTARTS);
+    // Persisted, so a server that came back would not relaunch into the same
+    // failure loop unattended.
+    check("and is no longer wanted running", exhausted.body.desiredState, "stopped");
+    check("the setup itself survives", exhausted.body.httpsOrigin, `https://${TOKEN_HOSTNAME}`);
+  }
+  await settle(2000);
+  check(
+    "no fourth restart was attempted",
+    invocations(connectorToken, "run"),
+    launchesBeforeExhaustion,
+  );
+  const settled = await serverState("/api/access/cloudflare/connector");
+  // **`null`, not `false`.** Readiness is a fact about a running connector, and
+  // an exhausted one has no child at all — the same answer a stopped one gives.
+  // `false` would mean "running and not ready", which is a different screen.
+  check("an exhausted connector reports no readiness at all", settled.body.readiness, null);
+  check("and still says why it stopped", settled.body.failureMessage !== null, true);
+  if (JSON.stringify(settled.body).includes(CONNECTOR_TOKEN)) {
+    fail("the connector token reached an exhausted connector's snapshot");
+  }
+
+  // **Explicit retry, and nothing less.** Start is the same button as ever and
+  // must be refused while the budget is spent, or "bounded restarts" would be
+  // a bound the operator's own reflex walks straight through.
+  await pressed(SELECTORS.startConnector);
+  await settle(1500);
+  const refused = await serverState("/api/access/cloudflare/connector");
+  check("a plain start is refused", refused.body.connectorState, "restart-exhausted");
+  check("and changes nothing", refused.body.desiredState, "stopped");
+  check("still no further restart", invocations(connectorToken, "run"), launchesBeforeExhaustion);
+  const explained = await session.evaluate(
+    `return document.body?.innerText?.includes("Automatic restarts are exhausted") ? "said" : "missing";`,
+  );
+  check("the screen says Retry is what is needed", explained, "said");
+
+  rmSync(connectorToken.slow, { force: true });
+  await pressed(SELECTORS.retryConnector);
+  const retried = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.connectorState === "ready" ? answer : null;
+  }, 30000);
+  if (!retried) {
+    const last = await serverState("/api/access/cloudflare/connector");
+    fail(
+      `an explicit retry did not start the connector: ${JSON.stringify(last.body).slice(0, 300)}`,
+    );
+  } else {
+    check("retry refills the budget", retried.body.restartCount, 0);
+    check("and starts the connector again", retried.body.desiredState, "running");
+    check("retry re-entered no token", tokenWrittenAt(), setupRanAt);
+  }
+
+  // **Redacted, and read back off the server.** The stand-in printed its own
+  // token on stderr the way a real cloudflared complaining about its credential
+  // would, and that output is drained when the child exits — which here is a
+  // kill rather than a stop, the harsher of the two moments ADR-0053 is about.
+  const spoken = (await serverState("/api/access/cloudflare/connector")).body.logs ?? [];
+  if (spoken.length === 0) {
+    fail("the connector never reported the output the stand-in wrote");
+  } else {
+    const said = spoken.join("\n");
+    if (said.includes(CONNECTOR_TOKEN)) {
+      fail(`the connector's logs quoted its connector token: ${said.slice(0, 300)}`);
+    } else {
+      check("connector-token logs are redacted", true, true);
+    }
+    check("redacted rather than dropped", said.includes("[REDACTED]"), true);
+    check("and still name what happened", said.includes("connector starting"), true);
+  }
+
+  // --- persistence: this server stops, and another one starts on its state ---
+  //
+  // The gap the box named. Each of the two walkthroughs above starts one server
+  // and never restarts it, so every field checkbox 3 lists was only ever read
+  // from the process that wrote it. Here the server is stopped and replaced
+  // against the same data directory, and each field is read back **by name**.
+
+  console.log("\n--- the same connector, after a server restart ---");
+  const before = await serverState("/api/access/cloudflare/connector");
+  const launchesBeforeRestart = invocations(connectorToken, "run");
+  const graceful = (readFileSync(connectorToken.trace, "utf8").match(/^stopped$/gm) ?? []).length;
+
+  await stopServer(tokenServer);
+  // Checkbox 7's other half, and free here: a connector shuts down *with its
+  // owner*. The stand-in can only write this line from its own signal handler,
+  // so a server that dropped its child on the way out cannot produce it.
+  const shutDown = await poll(
+    async () =>
+      (readFileSync(connectorToken.trace, "utf8").match(/^stopped$/gm) ?? []).length > graceful
+        ? "yes"
+        : null,
+    15000,
+  );
+  check("the connector shut down with the server that owned it", shutDown, "yes");
+
+  tokenServer = await startServer(connectorToken, tokenPort);
+  if (!(await arriveAtConnections(tokenServer.url))) {
+    giveUp("never reached the Connections page on the restarted server");
+  }
+  const survived = await poll(async () => {
+    const answer = await serverState("/api/access/cloudflare/connector");
+    return answer.body.connectorState === "ready" ? answer : null;
+  }, 40000);
+  if (!survived) {
+    const last = await serverState("/api/access/cloudflare/connector");
+    fail(
+      `the connector did not survive a server restart: ${JSON.stringify(last.body).slice(0, 400)}`,
+    );
+  } else {
+    // Every field checkbox 3 names, read back by name rather than implied by a
+    // connector that reached `ready`.
+    check("the configuration survives at all", survived.body.configured, true);
+    check("the hostname survives", survived.body.httpsOrigin, before.body.httpsOrigin);
+    check("the loopback origin survives", survived.body.loopbackOrigin, before.body.loopbackOrigin);
+    check(
+      "the executable selection survives",
+      survived.body.executablePath,
+      connectorToken.cloudflared,
+    );
+    check(
+      "the private secret reference survives",
+      survived.body.credentialPath,
+      before.body.credentialPath,
+    );
+    check("the tunnel ownership survives", survived.body.tunnelOwnership, "external");
+    check("the process ownership survives", survived.body.desiredState, "running");
+    check("and the connector is ready again", survived.body.readiness, true);
+    // **Restored, not re-set-up.** Nothing was typed into this browser after
+    // the restart: the token file is untouched, no sign-in happened, and the
+    // supervisor launched cloudflared again on its own.
+    check(
+      "the connector came back on its own",
+      invocations(connectorToken, "run") > launchesBeforeRestart,
+      true,
+    );
+    check("setup was not re-run", tokenWrittenAt(), setupRanAt);
+    check("the restored connector starts fresh on its budget", survived.body.restartCount, 0);
+    check("and still needs no account", invocations(connectorToken, "login"), 0);
+    const restoredEndpoint = await serverState("/api/access/cloudflare");
+    check(
+      "the endpoint row survives too",
+      restoredEndpoint.body.httpsOrigin,
+      `https://${TOKEN_HOSTNAME}`,
+    );
+    check("with its ownership", restoredEndpoint.body.ownership, "external");
+    check("and laplus still runs its connector", restoredEndpoint.body.health?.connector, "laplus");
+    if (JSON.stringify([survived.body, restoredEndpoint.body]).includes(CONNECTOR_TOKEN)) {
+      fail("the connector token reached a snapshot after a restart");
+    }
+  }
+  const stillHolding = filesHolding(connectorToken, CONNECTOR_TOKEN);
+  check("a restart widens nothing", stillHolding.length, 1);
+
   const errors = logs.filter((line) => /error|exception/i.test(line) && !/404|401/.test(line));
   if (errors.length) {
     console.log("\n=== CONSOLE ===");
@@ -1161,8 +1694,12 @@ try {
 } finally {
   await session.close();
   stopAll();
+  // After the servers, because a live server would restart a connector this
+  // reaped — and before the scratch directories, because it identifies each
+  // process by the scratch path in its own command line.
+  reapConnectors();
   dnsApi.stop();
-  for (const world of [adoption, creation]) {
+  for (const world of worlds) {
     rmSync(world.scratch, { recursive: true, force: true });
   }
 }
