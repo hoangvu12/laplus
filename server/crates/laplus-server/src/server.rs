@@ -830,12 +830,59 @@ impl Server {
         self.state.services.shell.flush().await;
     }
 
-    /// Serve until the process is interrupted. This is what the binary calls.
+    /// Serve until the process is asked to stop. This is what the binary calls.
     pub async fn serve_until_interrupted(self) {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("laplus: cannot listen for interrupt: {error}");
-        }
+        asked_to_stop().await;
         self.shutdown().await;
+    }
+}
+
+/// Resolves when the operating system asks this process to stop.
+///
+/// **`SIGTERM` as well as `SIGINT`, because the headless case only ever gets
+/// the first one.** `docs/adr/0048` says laplus gracefully shuts down the
+/// connectors it started and names systemd doing it; `systemctl stop`,
+/// `docker stop` and a plain `kill` all send `SIGTERM`, and this only ever
+/// waited for `ctrl_c`. So the default disposition ran — the process died
+/// immediately, [`Server::shutdown`] never ran, and the connector child, which
+/// [`crate::cloudflare_connector`] deliberately puts in its own process group so
+/// that a terminal's `^C` cannot reach it, was left running with nothing in
+/// laplus able to stop it. A public hostname outlived the server it exposed.
+///
+/// The agents and terminals `shutdown` reaps have the same property and the
+/// same bug, which is the other half of why this is not only a Cloudflare fix.
+///
+/// Windows has no `SIGTERM`; `ctrl_c` there covers `CTRL_C_EVENT` and
+/// `CTRL_CLOSE_EVENT`, which are the ways that platform asks.
+async fn asked_to_stop() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // A handler that will not install is reported and not fatal: a server
+        // that refused to run because it could not hear one signal would be a
+        // worse outcome than one that still hears the other.
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("laplus: cannot listen for termination: {error}");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    eprintln!("laplus: cannot listen for interrupt: {error}");
+                }
+                return;
+            }
+        };
+        tokio::select! {
+            interrupt = tokio::signal::ctrl_c() => {
+                if let Err(error) = interrupt {
+                    eprintln!("laplus: cannot listen for interrupt: {error}");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("laplus: cannot listen for interrupt: {error}");
     }
 }
 
