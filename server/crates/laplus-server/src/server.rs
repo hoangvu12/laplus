@@ -501,10 +501,12 @@ impl Server {
             let mut delay = std::time::Duration::from_secs(30);
             let mut verifier_shutdown = verifier_state.shutdown.clone();
             loop {
-                let jitter = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                    .map(|value| value.subsec_millis() as u64 % 5).unwrap_or(0);
+                let jitter = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(public_exposure::background_jitter)
+                    .unwrap_or_default();
                 tokio::select! {
-                    _ = tokio::time::sleep(delay + std::time::Duration::from_secs(jitter)) => {},
+                    _ = tokio::time::sleep(delay + jitter) => {},
                     changed = verifier_shutdown.changed() => {
                         if changed.is_err() || *verifier_shutdown.borrow() { break; }
                         continue;

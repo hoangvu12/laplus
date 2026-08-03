@@ -1301,3 +1301,266 @@ describe("stopping, forgetting and deleting", () => {
     }
   });
 });
+
+/**
+ * Ticket 01's own path, which the wizard tests above only ever reached on the
+ * way to somewhere else.
+ *
+ * Registering somebody else's hostname is the one setup path that runs no
+ * `cloudflared`, owns no process and may delete nothing — so what it has to get
+ * right is what it *says*, and what it reopens on after a restart.
+ */
+describe("the external tunnel endpoint path", () => {
+  const pendingExternal: ExternalTunnelEndpointSnapshot = {
+    ...verifiedExternal,
+    health: { connector: "external", https: "unknown", webSocket: "unknown" },
+    verificationState: "pending",
+    lastAttemptAt: null,
+    lastVerifiedAt: null,
+  };
+
+  /**
+   * **Checkbox 3, for the path this ticket is about.** The account path's
+   * resume has been asserted since ticket 04; the external one was a single
+   * line in `cloudflareWizardState` keyed on `configured` alone, and the only
+   * test that reached it supplied an already-*verified* snapshot. "Registration
+   * **and incomplete verification state** survive a restart and reopen at the
+   * truthful wizard step" is specifically about the case where verification has
+   * not succeeded — a reload that dropped a registered-but-unverified developer
+   * back on the path choice would offer to set up an exposure that exists.
+   */
+  it("reopens on the registered hostname when verification has not succeeded yet", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({ external: pendingExternal });
+    try {
+      await openWizard(user);
+
+      // The truthful step, not the path choice.
+      expect(screen.getByLabelText("Externally managed hostname")).toBeTruthy();
+      expect(screen.queryByText("Register a hostname someone else runs")).toBe(null);
+      // Carrying what was registered, so "Update" acts on it rather than on "".
+      // The full origin rather than the bare hostname: the server's normalizer
+      // accepts either and answers with the origin, so what is shown is what was
+      // recorded — and re-registering it is the idempotent read the running
+      // server test `repeating_registration_keeps_the_verified_endpoint_available`
+      // pins.
+      const hostname = screen.getByLabelText("External HTTPS hostname") as HTMLInputElement;
+      expect(hostname.value).toBe("https://laplus.example.com");
+      expect(screen.getByRole("button", { name: "Update" })).toBeTruthy();
+      // And it does not claim a verification that has not happened.
+      expect(document.body.textContent).not.toContain("Last verified");
+      expect(screen.queryByRole("button", { name: "Pair device" })).toBe(null);
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * **Checkbox 1's second clause.** "Clearly state that its connector remains
+   * operator-owned" is a sentence, and a sentence with no test is a sentence
+   * that can be deleted — which is exactly what makes ADR-0045's boundary
+   * invisible to the developer being asked to trust it.
+   */
+  it("states that laplus operates none of this connector's lifecycle", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({ external: pendingExternal });
+    try {
+      await openWizard(user);
+      const section = screen.getByLabelText("Externally managed hostname");
+
+      expect(section.textContent).toContain(
+        "will never start, stop, reconfigure, or delete its connector",
+      );
+      // And the two warnings the specification puts beside it, because a public
+      // hostname is the risk this whole feature introduces.
+      expect(section.textContent).toContain("laplus authentication remains required");
+      expect(section.textContent).toContain("Cloudflare Access");
+      // No lifecycle control is drawn for a connector laplus does not run.
+      expect(screen.queryByRole("button", { name: "Start" })).toBe(null);
+      expect(screen.queryByRole("button", { name: "Stop" })).toBe(null);
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * **Checkbox 8, on the screen rather than on the wire.** The snapshot has
+   * carried `wssOrigin` since the first slice and nothing rendered it, so
+   * "its HTTPS/WSS endpoint … appear in Connections" was true of the contract
+   * and false of Connections. The layered health is asserted here too, because
+   * its only previous evidence was a `renderToStaticMarkup` string check.
+   */
+  it("shows both advertised origins and the three health layers separately", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({ external: verifiedExternal });
+    try {
+      await openWizard(user);
+
+      const origins = screen.getByLabelText("Cloudflare endpoint addresses");
+      expect(origins.textContent).toContain("https://laplus.example.com");
+      expect(origins.textContent).toContain("wss://laplus.example.com");
+
+      const section = screen.getByLabelText("Externally managed hostname");
+      expect(section.textContent).toContain("Connector external");
+      expect(section.textContent).toContain("HTTPS healthy");
+      expect(section.textContent).toContain("WebSocket healthy");
+      expect(section.textContent).toContain("Last verified");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * **Checkbox 9, from the endpoint this ticket is actually about.** All three
+   * existing pairing tests mount a laplus-managed connector, so the branch that
+   * pairs from a purely external endpoint — the `snapshot?.httpsOrigin`
+   * fallback — had never run. The QR is asserted because it can otherwise be
+   * deleted with a green suite, and the payload because "without granting the
+   * paired client Cloudflare administration scopes" is a property of the
+   * request rather than of the screen.
+   */
+  it("pairs from a verified external endpoint, with a QR and no Cloudflare scopes", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      external: verifiedExternal,
+      pairingCredential: () =>
+        Effect.succeed({
+          id: "pairing-link",
+          credential: "pairing-credential",
+          expiresAt: DateTime.makeUnsafe("2026-08-03T09:05:00.000Z"),
+        }),
+    });
+    try {
+      await openWizard(user);
+      await user.click(await screen.findByRole("button", { name: "Pair device" }));
+
+      const pairing = (await screen.findByLabelText(
+        "Cloudflare pairing URL",
+      )) as HTMLTextAreaElement;
+      expect(pairing.value).toContain("https://laplus.example.com");
+
+      // The QR carries the same URL and is actually in the document.
+      const qr = screen.getByRole("img", {
+        name: "Cloudflare pairing link — scan to open on another device",
+      });
+      expect(qr).toBeTruthy();
+      expect(qr.tagName.toLowerCase()).toBe("svg");
+
+      // Least privilege: the request asks for no scopes at all, so the server's
+      // standard preset applies and no `access:*` is granted.
+      expect(testApi.calls.pairingCredential).toHaveLength(1);
+      const asked = JSON.stringify(testApi.calls.pairingCredential[0] ?? {});
+      expect(asked).not.toContain("access:write");
+      expect(asked).not.toContain("access:read");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+});
+
+/**
+ * **Checkbox 5 of ticket 02**, which had exactly one of its eight words under
+ * test. The compact row is the only place a developer sees these, and the
+ * `ready` split — locally ready versus publicly verified — is two of the seven
+ * states the checkbox names, decided by a field that is not `connectorState` at
+ * all.
+ */
+describe("the compact row distinguishes every connector state", () => {
+  const at = (
+    connectorState: ManagedCloudflareConnectorSnapshot["connectorState"],
+    verificationState: ManagedCloudflareConnectorSnapshot["verificationState"] = "pending",
+  ): ManagedCloudflareConnectorSnapshot => ({
+    ...readyConnector,
+    connectorState,
+    verificationState,
+  });
+
+  const cases: ReadonlyArray<readonly [string, ManagedCloudflareConnectorSnapshot]> = [
+    ["Starting", at("starting")],
+    ["Locally ready", at("ready", "pending")],
+    ["Publicly verified", at("ready", "verified")],
+    ["Degraded", at("degraded")],
+    ["Restart exhausted", at("restart-exhausted")],
+    ["Stopping", at("stopping")],
+    ["Stopped", at("stopped")],
+    ["Setup failed", at("failed")],
+  ];
+
+  for (const [label, connector] of cases) {
+    it(`says ${label}`, async () => {
+      const testApi = await mount({ connector, external: verifiedExternal });
+      try {
+        const row = await screen.findByText("Cloudflare Tunnel");
+        const description = row.closest("div")?.parentElement?.textContent ?? "";
+        expect(description).toContain(label);
+      } finally {
+        await testApi.dispose();
+      }
+    });
+  }
+
+  /**
+   * The split is decided by the endpoint's verification and not by the
+   * connector's own word, which is the distinction "connected never overstates
+   * what works" exists for: the same `ready` connector reads differently
+   * depending on whether the public hostname was proven to reach it.
+   */
+  it("never calls a connector publicly verified on its own readiness", async () => {
+    const testApi = await mount({
+      connector: at("ready", "failed"),
+      external: verifiedExternal,
+    });
+    try {
+      await screen.findByText("Cloudflare Tunnel");
+      expect(document.body.textContent).toContain("Locally ready");
+      expect(document.body.textContent).not.toContain("Publicly verified");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+});
+
+/**
+ * **Checkbox 1 of ticket 02.** The picker's selection was already driven by a
+ * test; what it *reports* about each executable was not, and matching a radio
+ * on a path substring would still pass with the summary line deleted.
+ */
+describe("the cloudflared picker reports what discovery found", () => {
+  const withIncompatible: CloudflaredExecutableDiscovery = {
+    executables: [
+      ...discovery.executables,
+      {
+        path: "/opt/old/cloudflared",
+        source: "user-selected",
+        version: "2021.4.0",
+        compatibility: "incompatible",
+        selected: false,
+        failureMessage: "cloudflared version 2024 or newer is required.",
+      },
+    ],
+  };
+
+  it("names each executable's source, version and compatibility", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: { ...signedOut, certificateDetected: true },
+      cloudflaredExecutables: () => Effect.succeed(withIncompatible),
+    });
+    try {
+      await openWizard(user);
+      await user.click(await screen.findByText("Sign in to Cloudflare"));
+
+      const picker = await screen.findByLabelText("cloudflared executable");
+      // The discovered list, rather than a path a developer has to know.
+      expect(picker.textContent).toContain("/usr/bin/cloudflared");
+      expect(picker.textContent).toContain("2026.7.3");
+      expect(picker.textContent).toContain("/data/laplus/cloudflare/tools/cloudflared-2026.7.4");
+      // Detected incompatibility is reported *with its version*, which is what
+      // makes the failure actionable rather than a refusal to proceed.
+      expect(picker.textContent).toContain("2021.4.0");
+      expect(picker.textContent).toContain("cloudflared version 2024 or newer is required.");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+});

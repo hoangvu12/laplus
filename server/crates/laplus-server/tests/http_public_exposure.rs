@@ -478,3 +478,116 @@ async fn a_half_finished_mutation_keeps_its_remaining_work_across_a_restart() {
         Some("tunnel-uuid")
     );
 }
+
+/// Checkbox 10's second half, for the credential the *pairing* button mints.
+///
+/// **The diagnostic tokens already had a scan and this one had none.** A
+/// verified endpoint's whole purpose is to be paired from, so the wizard mints
+/// an ordinary pairing credential and shows it — and every Cloudflare surface an
+/// administrator can read afterwards is a place it must not turn up. Ticket 01
+/// puts them in one sentence because they leak the same way: through a snapshot
+/// that grew a field, or a refusal that quoted its input.
+///
+/// **`auth_pairing_links` is deliberately excluded, and that is not a loophole.**
+/// `pairing::PairingLink` stores the code in plaintext on purpose, so Settings
+/// can show a link the developer minted a minute ago — that table is the secret
+/// store rather than the "non-secret persistence" this checkbox is about. What
+/// is asserted here is that the credential is confined to it.
+#[tokio::test]
+async fn a_pairing_credential_minted_for_a_verified_endpoint_stays_out_of_cloudflare_surfaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let verifier = Arc::new(ScriptedVerifier::new([Ok(())]));
+    let server = TestServer::start_at_with_endpoint_verifier(&path, verifier.clone()).await;
+    server
+        .post_json("/api/access/cloudflare", &json!({"hostname": "laplus.example.com"}))
+        .await;
+    let verified = server.post_json("/api/access/cloudflare/test", &json!({})).await;
+    assert_eq!(verified.body["verificationState"], "verified");
+    assert_eq!(verified.body["advertisedEndpoint"]["status"], "available");
+
+    // What the wizard's "Pair device" button does: an ordinary pairing
+    // credential, labelled, with no scopes asked for.
+    let minted = server
+        .post_json("/api/auth/pairing-token", &json!({"label": "Cloudflare Tunnel"}))
+        .await;
+    assert_eq!(minted.status, 200, "{}", minted.text);
+    let credential = minted.body["credential"].as_str().expect("a credential").to_string();
+    assert!(!credential.is_empty());
+    // Least privilege, and the reason the checkbox says "without granting the
+    // paired client Cloudflare administration scopes": the credential this
+    // button mints cannot read or change Cloudflare setup at all.
+    let granted = minted.body["scopes"].to_string();
+    assert!(!granted.contains("access:write"), "{granted}");
+    assert!(!granted.contains("access:read"), "{granted}");
+
+    // Every Cloudflare surface an administrator can read.
+    for route in [
+        "/api/access/cloudflare",
+        "/api/access/cloudflare/connector",
+        "/api/access/cloudflare/account",
+        "/api/access/cloudflare/executables",
+    ] {
+        let snapshot = server.get(route).await;
+        assert!(!snapshot.text.contains(&credential), "{route} quoted the pairing credential");
+    }
+
+    // And every error these routes can answer with. A refusal that echoed its
+    // input is how a secret reaches a log without ever reaching a snapshot.
+    //
+    // The values below are refused for a reason that has nothing to do with the
+    // credential inside them — a scheme that is not HTTPS, an executable that
+    // does not exist — precisely so that what is under test is whether the
+    // *refusal* quotes its input. An earlier draft passed the bare credential as
+    // a hostname and discovered that a twelve-character pairing code is a
+    // perfectly good hostname: the route answered 200 and re-registered the
+    // endpoint, which proved nothing and undid the verification above.
+    for (route, body) in [
+        ("/api/access/cloudflare", json!({"hostname": format!("http://{credential}.example.com")})),
+        (
+            "/api/access/cloudflare/connector/configure",
+            json!({
+                "hostname": "laplus.example.com",
+                "executablePath": format!("/nonexistent/{credential}/cloudflared"),
+                "connectorToken": credential,
+            }),
+        ),
+    ] {
+        let refused = server.post_json(route, &body).await;
+        assert!(refused.status >= 400, "{route} did not refuse: {}", refused.text);
+        assert!(!refused.text.contains(&credential), "{route} echoed the pairing credential");
+    }
+
+    // Nothing above changed the endpoint, so it is still the verified one the
+    // credential was minted for.
+    let after = server.get("/api/access/cloudflare").await;
+    assert_eq!(after.body["verificationState"], "verified");
+    assert_eq!(after.body["httpsOrigin"], "https://laplus.example.com");
+
+    // Non-secret persistence: the Cloudflare setup laplus keeps on disk. The
+    // database holds the link by design, so what is scanned is laplus's own
+    // private Cloudflare directory — the place a connector's files live.
+    let cloudflare = directory.path().join("cloudflare");
+    if cloudflare.exists() {
+        for entry in std::fs::read_dir(&cloudflare).unwrap().flatten() {
+            let held = std::fs::read(entry.path()).unwrap_or_default();
+            assert!(
+                !held.windows(credential.len()).any(|window| window == credential.as_bytes()),
+                "{:?} held the pairing credential",
+                entry.path()
+            );
+        }
+    }
+
+    // The diagnostic tokens the same run minted are held to the same rule, so
+    // the two halves of this checkbox are answered in one place.
+    let snapshot = server.get("/api/access/cloudflare").await;
+    let persisted = std::fs::read(&path).unwrap();
+    for (http_token, ws_token) in verifier.credentials.lock().unwrap().iter() {
+        for token in [http_token, ws_token] {
+            assert!(!snapshot.text.contains(token));
+            assert!(!persisted.windows(token.len()).any(|window| window == token.as_bytes()));
+        }
+    }
+    server.stop().await;
+}

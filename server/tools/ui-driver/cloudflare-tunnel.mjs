@@ -85,6 +85,8 @@ const HOSTNAME = "spare.example.com";
 const CREATED = "44444444-4444-4444-4444-444444444444";
 const NEW_NAME = "laplus-desk";
 const NEW_HOSTNAME = "stable.example.com";
+/** Ticket 01: a hostname laplus verifies and advertises and never operates. */
+const EXTERNAL_HOSTNAME = "somebody-elses.example.com";
 
 /**
  * Everything this driver reaches into `ConnectionsSettings.tsx` for.
@@ -110,6 +112,11 @@ const SELECTORS = {
   create: "Create this tunnel",
   startConnector: "Start connector",
   forget: "Forget local setup",
+  // Ticket 01's path: a hostname somebody else's connector already serves.
+  externalPath: "Register a hostname someone else runs",
+  externalHostnameField: "External HTTPS hostname",
+  register: "Register",
+  changePath: "Change setup path",
   // Two labels, one word apart on purpose: the first opens the destructive
   // confirmation and the second is inside it. `press` matches by prefix, and the
   // trigger is gone by the time the second is looked for.
@@ -269,8 +276,25 @@ class Ready(http.server.BaseHTTPRequestHandler):
         self.end_headers()
     def log_message(self, *args): pass
 
+# Say the quiet part on stderr, the way a real cloudflared complaining about its
+# credential would. laplus captures this as the connector's log, so it is what
+# the redaction verdict reads — and a connector's output is drained when the
+# child exits, which is exactly when a cleanup may already have removed the file
+# the secret would have been recognised from.
+held = json.load(open(held[0].split(':', 1)[1].strip()))
+print('connector starting with TunnelSecret=%s' % held['TunnelSecret'], file=sys.stderr)
+sys.stderr.flush()
+
+def stopped(*_):
+    # The proof of a *graceful* stop: a SIGKILL, or a laplus that dropped its
+    # child without asking it to go, cannot write this line.
+    with open(TRACE, 'a') as f:
+        f.write('stopped\\n')
+    sys.exit(0)
+
 host, port = after('--metrics').rsplit(':', 1)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+signal.signal(signal.SIGTERM, stopped)
+signal.signal(signal.SIGINT, stopped)
 http.server.HTTPServer((host, int(port)), Ready).serve_forever()
 `,
     { mode: 0o700 },
@@ -743,6 +767,43 @@ try {
     check("stopping is reported as stopped", after.body.cleanup?.state, "stopped");
     check("stopping keeps everything restartable", after.body.cleanup?.remaining?.length, 0);
     check("stopping deletes nothing at Cloudflare", invocations(adoption, "delete"), 0);
+
+    // **Gracefully, which is a different claim from "no longer running".** The
+    // stand-in writes this line from its `SIGTERM` handler, so a laplus that
+    // hard-killed its child — or dropped it without asking it to go — cannot
+    // produce it. The same assertion the Rust harness spells
+    // `FakeCloudflared::stopped_gracefully()`, made here through the button a
+    // developer actually presses.
+    const graceful = await poll(
+      async () => (readFileSync(adoption.trace, "utf8").includes("stopped") ? "yes" : null),
+      20000,
+    );
+    check("the connector was asked to stop rather than killed", graceful, "yes");
+
+    // **Ticket 02, checkbox 6: the logs a developer is shown are redacted.** The
+    // stand-in prints its own `TunnelSecret` on stderr the way a real cloudflared
+    // complaining about its credential would, and a connector's output is only
+    // drained when the child exits — so this is the first moment there is
+    // anything to read, and the last moment before a cleanup could remove the
+    // file the secret would have been recognised from.
+    const logged = await poll(async () => {
+      const answer = await serverState("/api/access/cloudflare/connector");
+      return (answer.body.logs ?? []).length > 0 ? answer : null;
+    }, 20000);
+    if (!logged) {
+      fail("the connector never reported the output the stand-in wrote");
+    } else {
+      const spoken = (logged.body.logs ?? []).join("\n");
+      if (spoken.includes("FAKE-TUNNEL-CREDENTIAL-SECRET")) {
+        fail(`the connector's logs quoted its run credential: ${spoken}`);
+      } else {
+        check("connector logs are redacted", true, true);
+      }
+      // Redacted rather than dropped: the actionable half has to survive, or the
+      // rule would be satisfied by showing nothing.
+      check("connector logs stay actionable", spoken.includes("[REDACTED]"), true);
+      check("connector logs still name what happened", spoken.includes("connector starting"), true);
+    }
   }
 
   // Restart: one action, and no second credential retrieval — the whole point of
@@ -790,6 +851,81 @@ try {
     const account = await serverState("/api/access/cloudflare/account");
     check("the wizard can set up again", account.body.step, "choose-tunnel");
     check("the forgotten tunnel is no longer selected", account.body.selection, null);
+  }
+
+  // --- ticket 01: registering a hostname somebody else runs ---
+  //
+  // **Driven here because this is the one moment it is reachable.** Registering
+  // an external endpoint is refused while laplus supervises a connector — one
+  // lifecycle, one owner (ADR-0045) — and the forget above is what released
+  // this environment. So ticket 01's path gets the world ticket 07 left behind
+  // rather than a third server.
+  //
+  // **Verification and pairing are still not reachable, and still not faked.**
+  // A verified endpoint needs a hostname that genuinely resolves in public DNS
+  // and an HTTPS path back to this machine, which a scratch world has neither
+  // of; pairing is only offered once verification succeeded. Both are covered
+  // against the hermetic verifier in `tests/http_public_exposure.rs`. What a
+  // browser *can* prove is everything up to the probe: that the wizard reaches
+  // the step, that the hostname is normalized and recorded as somebody else's,
+  // that laplus starts no process for it, and that an unverified endpoint is not
+  // advertised for pairing.
+  await pressed(SELECTORS.changePath);
+  await pressed(SELECTORS.externalPath);
+  const launchesBefore = invocations(adoption, "run");
+  const typed = await type(
+    SELECTORS.externalHostnameField,
+    `  ${EXTERNAL_HOSTNAME.toUpperCase()}. `,
+  );
+  if (typed !== "typed") {
+    fail(`the external hostname field was not reachable: ${typed}`);
+  } else {
+    await settle(300);
+    await pressed(SELECTORS.register);
+    const registered = await poll(async () => {
+      const answer = await serverState("/api/access/cloudflare");
+      return answer.body.configured === true ? answer : null;
+    }, 20000);
+    if (!registered) {
+      fail("registering an external hostname did not reach the server");
+    } else {
+      // Normalized by the server, from a hostname typed with the padding,
+      // casing and trailing dot a developer actually produces.
+      check(
+        "the external hostname is normalized",
+        registered.body.httpsOrigin,
+        `https://${EXTERNAL_HOSTNAME}`,
+      );
+      check(
+        "the endpoint derives its own wss origin",
+        registered.body.wssOrigin,
+        `wss://${EXTERNAL_HOSTNAME}`,
+      );
+      // The whole of what this path claims: laplus verifies and advertises, and
+      // owns nothing.
+      check(
+        "an external endpoint is somebody else's tunnel",
+        registered.body.ownership,
+        "external",
+      );
+      check("and is never laplus's to delete", registered.body.deletableAtCloudflare, false);
+      check("its connector is external", registered.body.health?.connector, "external");
+      // No process, no Cloudflare mutation. This path runs no cloudflared at all.
+      check("registering launches no connector", invocations(adoption, "run"), launchesBefore);
+      check("registering allocates no tunnel", invocations(adoption, "create"), 0);
+      check("registering routes no DNS record", invocations(adoption, "route"), 0);
+      const bare = await serverState("/api/access/cloudflare/connector");
+      check("laplus supervises nothing for it", bare.body.configured, false);
+      // **Only a verified endpoint is advertised.** Verification cannot succeed
+      // here, which is precisely what makes this the assertion worth having: an
+      // endpoint that has never been proven must not be offered for pairing.
+      check("an unverified endpoint is not advertised", registered.body.advertisedEndpoint, null);
+      if (registered.body.verificationState === "verified") {
+        fail("a scratch hostname reported itself verified, which it cannot be");
+      } else {
+        check("verification is attempted rather than assumed", true, true);
+      }
+    }
   }
 
   // --- ticket 06: creating a stable tunnel, on a server of its own ---

@@ -832,6 +832,7 @@ export function CloudflareTunnelSettingsRow({
                   onChange={(event) => setExternalHostname(event.target.value)}
                 />
               </label>
+              {snapshot?.configured ? <CloudflareEndpointOrigins snapshot={snapshot} /> : null}
               {snapshot?.lastVerifiedAt ? (
                 <p className="text-xs text-muted-foreground">
                   Last verified {formatAccessTimestamp(snapshot.lastVerifiedAt)}
@@ -867,7 +868,15 @@ export function CloudflareTunnelSettingsRow({
               unreachable for a laplus-managed connector. */}
           {pairingUrl ? (
             <div className="flex flex-col items-center gap-3 rounded-md border p-3">
-              <QRCodeSvg value={pairingUrl} className="size-40" />
+              {/* Titled, which is what gives it `role="img"` and a name — an
+                  unlabelled `<svg>` is invisible to a screen reader and to a
+                  test, and this block could be deleted with a green suite for
+                  exactly as long as it had no name. */}
+              <QRCodeSvg
+                value={pairingUrl}
+                className="size-40"
+                title="Cloudflare pairing link — scan to open on another device"
+              />
               <Textarea readOnly value={pairingUrl} aria-label="Cloudflare pairing URL" />
             </div>
           ) : null}
@@ -2021,6 +2030,39 @@ export function ManagedCloudflareConnectorPanel({
         </div>
       ) : null}
     </section>
+  );
+}
+
+/**
+ * Both origins this endpoint advertises, as the server derived them.
+ *
+ * **The `wss://` one is not decoration.** The endpoint is one hostname and two
+ * protocols, and a pairing that reaches HTTPS while its WebSocket is intercepted
+ * is the failure this whole feature distinguishes — so a developer reading
+ * Connections has to be able to see the address the socket will actually use.
+ * It crossed the wire on the snapshot from the first slice and was rendered
+ * nowhere, which made checkbox 8's "its HTTPS/WSS endpoint … appear in
+ * Connections" true of the contract and false of the screen.
+ *
+ * Derived by the server from the fixed `https://` origin rather than assembled
+ * here, so the client cannot disagree with what verification actually probed.
+ */
+export function CloudflareEndpointOrigins({
+  snapshot,
+}: {
+  readonly snapshot: ExternalTunnelEndpointSnapshot;
+}) {
+  if (snapshot.httpsOrigin === null) return null;
+  return (
+    <p className="text-xs text-muted-foreground" aria-label="Cloudflare endpoint addresses">
+      <span className="font-mono">{snapshot.httpsOrigin}</span>
+      {snapshot.wssOrigin ? (
+        <>
+          <span aria-hidden> · </span>
+          <span className="font-mono">{snapshot.wssOrigin}</span>
+        </>
+      ) : null}
+    </p>
   );
 }
 

@@ -41,6 +41,78 @@ crate::public_exposure::closed_vocabulary! {
     }
 }
 
+crate::public_exposure::closed_vocabulary! {
+    /// What the connector is *actually* doing, as the compact row and the wizard
+    /// report it.
+    ///
+    /// **The last bare `String` in the Cloudflare code, and the exact shape this
+    /// macro was written to abolish.** Every word below was a literal written at
+    /// a dozen sites in this file and compared against at three more, while the
+    /// contract pinned the same eight words in
+    /// `packages/contracts/src/remoteAccess.ts` and nothing made the two agree.
+    /// That is how `ownership` went wrong before ADR-0049 — a value written
+    /// unconditionally and never read back — and how a connector could report
+    /// `starting` for as long as it stayed stopped: adding a word cost nothing,
+    /// so no site had to answer for it.
+    ///
+    /// Ticket 02's checkbox 5 asks the row to distinguish starting, locally
+    /// ready, publicly verified, degraded, restart-exhausted, stopped and
+    /// recoverable failure. Six of those seven are here; **"locally ready" and
+    /// "publicly verified" are both [`Self::Ready`]**, because this enum answers
+    /// for the connector alone. Whether the public endpoint verified is the
+    /// endpoint row's answer, merged in beside this one — a ready connector is
+    /// not evidence that a hostname reaches it, which is the whole reason the
+    /// two are separate fields.
+    ConnectorState as "connector state" {
+        /// Nothing is set up: no child, and no configuration to start one from.
+        Unconfigured => "unconfigured",
+        /// A child has been launched, or is about to be, and has not answered
+        /// `/ready` yet.
+        Starting => "starting",
+        /// The child answers `/ready` on its loopback metrics address. **A local
+        /// fact only** — see the note above.
+        Ready => "ready",
+        /// A child died and is being restarted within the budget.
+        Degraded => "degraded",
+        /// The restart budget is spent. Nothing is running and nothing will be
+        /// until an explicit retry, which is why this survives a stop.
+        RestartExhausted => "restart-exhausted",
+        /// Asked to stop, with a child still being terminated.
+        Stopping => "stopping",
+        /// Asked to stop, and stopped. The configuration, credential and
+        /// ownership all survive, and starting again is one action.
+        Stopped => "stopped",
+        /// Setup itself failed — a metrics address that could not be bound, an
+        /// ingress file that could not be written, a `cloudflared` that would not
+        /// spawn. Recoverable, and distinct from [`Self::RestartExhausted`]
+        /// because nothing was ever running to exhaust a budget for.
+        Failed => "failed",
+    }
+}
+
+impl ConnectorState {
+    /// Whether no child of laplus's is running.
+    ///
+    /// **Four words mean this, not one**, which is what
+    /// [`Manager::stop_and_settle`] waits on: a connector asked to stop reaches
+    /// [`Self::Stopped`], but one whose restart budget ran out sits in
+    /// [`Self::RestartExhausted`] and one that never started sits in
+    /// [`Self::Failed`] — both already carrying `desired_state: stopped`, so
+    /// `set_desired` has nothing left to change and the word never moves.
+    /// Waiting for `stopped` alone made a cleanup refuse to remove the setup of
+    /// a connector that had already died.
+    pub const fn settled(self) -> bool {
+        matches!(self, Self::Stopped | Self::RestartExhausted | Self::Failed | Self::Unconfigured)
+    }
+
+    /// Whether this word names a failure an explicit retry is offered for, and
+    /// therefore one that a supervision loop parking with no child must *not*
+    /// overwrite with [`Self::Stopped`].
+    pub const fn awaiting_retry(self) -> bool {
+        matches!(self, Self::RestartExhausted | Self::Failed)
+    }
+}
+
 /// Which narrow credential this connector runs on, and therefore what laplus
 /// must write for it.
 ///
@@ -122,12 +194,22 @@ struct Prepared {
 #[derive(Debug)]
 struct Runtime {
     configuration: Option<Configuration>,
-    connector_state: String,
+    connector_state: ConnectorState,
     readiness: Option<bool>,
     metrics_origin: Option<String>,
     detected_version: Option<String>,
     failure_message: Option<String>,
     restart_count: u8,
+    /// Every run-credential secret this process has held, longest first.
+    ///
+    /// **Remembered rather than re-read, which is the whole point.** Redaction
+    /// used to open the credential file at the moment a log line arrived, so a
+    /// file that could not be read redacted *nothing* — and the connector's
+    /// stderr is drained when the child exits, which is precisely when Forget
+    /// has stopped it and is removing that file. Once a secret is known it stays
+    /// known for the life of the process; a later read that finds nothing adds
+    /// nothing and takes nothing away.
+    secrets: Vec<String>,
     logs: Vec<String>,
     shutdown: bool,
     generation: u64,
@@ -153,20 +235,21 @@ impl Manager {
             .as_ref()
             .map(|value: &Configuration| value.desired_state)
         {
-            Some(DesiredState::Running) => "starting",
-            _ => "stopped",
+            Some(DesiredState::Running) => ConnectorState::Starting,
+            _ => ConnectorState::Stopped,
         };
-        Arc::new(Self {
+        let manager = Arc::new(Self {
             installer: crate::cloudflare_install::Installer::open(&directory),
             directory,
             runtime: Mutex::new(Runtime {
                 configuration,
-                connector_state: connector_state.into(),
+                connector_state,
                 readiness: None,
                 metrics_origin: None,
                 detected_version: None,
                 failure_message: None,
                 restart_count: 0,
+                secrets: Vec::new(),
                 logs: Vec::new(),
                 shutdown: false,
                 generation: 0,
@@ -174,7 +257,13 @@ impl Manager {
             changed: Notify::new(),
             task: Mutex::new(None),
             owner_origin: Mutex::new(None),
-        })
+        });
+        // A connector restored at boot has a credential on disk and no child
+        // yet. Learning its secret here rather than at the first log line is
+        // what makes the redaction independent of whether the file outlives the
+        // connector.
+        manager.remember_secrets();
+        manager
     }
 
     pub fn begin(self: &Arc<Self>) {
@@ -358,12 +447,13 @@ impl Manager {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.configuration = Some(configuration);
             runtime.detected_version = Some(version);
-            runtime.connector_state = "starting".into();
+            runtime.connector_state = ConnectorState::Starting;
             runtime.readiness = None;
             runtime.failure_message = None;
             runtime.restart_count = 0;
             runtime.generation = runtime.generation.wrapping_add(1);
         }
+        self.remember_secrets();
         self.begin();
         self.changed.notify_waiters();
         Ok(())
@@ -375,7 +465,7 @@ impl Manager {
             let mut unconfigured = json!({
                 "configured": false, "ownership": CONNECTOR_OWNERSHIP,
                 "desiredState": DesiredState::Stopped,
-                "connectorState": "unconfigured", "readiness": null, "httpsOrigin": null,
+                "connectorState": ConnectorState::Unconfigured, "readiness": null, "httpsOrigin": null,
                 "executablePath": null, "detectedVersion": null, "metricsOrigin": null,
                 "failureMessage": null, "restartCount": 0, "logs": []
             });
@@ -413,9 +503,22 @@ impl Manager {
             "executablePath": configuration.executable_path,
             "detectedVersion": runtime.detected_version,
             "metricsOrigin": runtime.metrics_origin,
-            "failureMessage": runtime.failure_message,
+            "failureMessage": runtime.failure_message
+                .as_deref()
+                .map(|message| redacted_against(&runtime.secrets, message)),
             "restartCount": runtime.restart_count,
-            "logs": runtime.logs,
+            // **Redacted again on the way out, having been redacted on the way
+            // in.** Not belt and braces for its own sake: `record_log` is one
+            // function that one code path calls, and ticket 02's checkbox 2 is a
+            // claim about everything that crosses this wire rather than about
+            // that function. Anything that reaches `logs` or `failureMessage` by
+            // another route — a future caller, a message built from a command's
+            // own output — is answered here without that caller having to know
+            // the rule. ADR-0053.
+            "logs": runtime.logs
+                .iter()
+                .map(|line| redacted_against(&runtime.secrets, line))
+                .collect::<Vec<_>>(),
         })
     }
 
@@ -487,7 +590,7 @@ impl Manager {
                     "Configure a connector first.",
                 ));
             }
-            if running && !retry && runtime.connector_state == "restart-exhausted" {
+            if running && !retry && runtime.connector_state == ConnectorState::RestartExhausted {
                 return Err(Refusal::rejected(
                     RefusalReason::RestartsExhausted,
                     "Automatic restarts are exhausted; use Retry to start the connector again.",
@@ -507,7 +610,8 @@ impl Manager {
                 runtime.failure_message = None;
             }
             runtime.generation = runtime.generation.wrapping_add(1);
-            runtime.connector_state = if running { "starting" } else { "stopping" }.into();
+            runtime.connector_state =
+                if running { ConnectorState::Starting } else { ConnectorState::Stopping };
             runtime.readiness = None;
             let configuration = runtime.configuration.as_mut().unwrap();
             configuration.desired_state = desired;
@@ -549,12 +653,7 @@ impl Manager {
         loop {
             {
                 let runtime = self.runtime.lock().unwrap();
-                if runtime.configuration.is_none()
-                    || matches!(
-                        runtime.connector_state.as_str(),
-                        "stopped" | "restart-exhausted" | "failed" | "unconfigured"
-                    )
-                {
+                if runtime.configuration.is_none() || runtime.connector_state.settled() {
                     return true;
                 }
             }
@@ -582,7 +681,7 @@ impl Manager {
         }
         let mut runtime = self.runtime.lock().unwrap();
         runtime.configuration = None;
-        runtime.connector_state = "unconfigured".into();
+        runtime.connector_state = ConnectorState::Unconfigured;
         runtime.readiness = None;
         runtime.metrics_origin = None;
         runtime.failure_message = None;
@@ -672,12 +771,9 @@ impl Manager {
                 {
                     let mut runtime = self.runtime.lock().unwrap();
                     if runtime.configuration.is_none() {
-                        runtime.connector_state = "unconfigured".into();
-                    } else if !matches!(
-                        runtime.connector_state.as_str(),
-                        "restart-exhausted" | "failed"
-                    ) {
-                        runtime.connector_state = "stopped".into();
+                        runtime.connector_state = ConnectorState::Unconfigured;
+                    } else if !runtime.connector_state.awaiting_retry() {
+                        runtime.connector_state = ConnectorState::Stopped;
                     }
                     runtime.readiness = None;
                 }
@@ -697,6 +793,11 @@ impl Manager {
                 self.changed.notified().await;
                 continue;
             }
+            // The last moment the credential is certainly readable: cloudflared
+            // is about to read it too. Anything this child says afterwards is
+            // redacted against what was learned here, whatever later happens to
+            // the file.
+            self.remember_secrets();
             let config_file = self.directory.join(INGRESS);
             let mut arguments = vec![
                 "tunnel".to_string(),
@@ -734,21 +835,19 @@ impl Manager {
             let process_group = child.id();
             let mut log_task = child.stderr.take().map(|mut stderr| {
                 let manager = Arc::clone(&self);
-                let configuration = configuration.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let _ = stderr.read_to_end(&mut bytes).await;
-                    manager.record_log(&String::from_utf8_lossy(&bytes), &configuration);
+                    manager.record_log(&String::from_utf8_lossy(&bytes));
                 })
             });
             {
                 let mut runtime = self.runtime.lock().unwrap();
                 runtime.connector_state = if runtime.restart_count == 0 {
-                    "starting"
+                    ConnectorState::Starting
                 } else {
-                    "degraded"
-                }
-                .into();
+                    ConnectorState::Degraded
+                };
                 runtime.metrics_origin = Some(format!("http://{metrics}"));
                 runtime.readiness = Some(false);
             }
@@ -777,11 +876,10 @@ impl Manager {
                     }
                     let mut runtime = self.runtime.lock().unwrap();
                     runtime.connector_state = if action == "replace" {
-                        "starting"
+                        ConnectorState::Starting
                     } else {
-                        "stopped"
-                    }
-                    .into();
+                        ConnectorState::Stopped
+                    };
                     runtime.readiness = None;
                     if action == "shutdown" {
                         return;
@@ -800,7 +898,7 @@ impl Manager {
                             }
                             {
                                 let mut runtime = self.runtime.lock().unwrap();
-                                runtime.connector_state = "ready".into();
+                                runtime.connector_state = ConnectorState::Ready;
                                 runtime.readiness = Some(true);
                                 runtime.failure_message = None;
                             }
@@ -825,11 +923,10 @@ impl Manager {
                                     terminate_group(process_group).await;
                                     let mut runtime = self.runtime.lock().unwrap();
                                     runtime.connector_state = if action == "replace" {
-                                        "starting"
+                                        ConnectorState::Starting
                                     } else {
-                                        "stopped"
-                                    }
-                                    .into();
+                                        ConnectorState::Stopped
+                                    };
                                     runtime.readiness = None;
                                     if action == "shutdown" {
                                         return;
@@ -869,7 +966,7 @@ impl Manager {
                 }
                 if ready(&client, &metrics).await {
                     let mut runtime = self.runtime.lock().unwrap();
-                    runtime.connector_state = "ready".into();
+                    runtime.connector_state = ConnectorState::Ready;
                     runtime.readiness = Some(true);
                     runtime.failure_message = None;
                 }
@@ -887,13 +984,13 @@ impl Manager {
         runtime.readiness = Some(false);
         runtime.failure_message = Some(message.into());
         if runtime.restart_count >= MAX_RESTARTS {
-            runtime.connector_state = "restart-exhausted".into();
+            runtime.connector_state = ConnectorState::RestartExhausted;
             if let Some(configuration) = runtime.configuration.as_mut() {
                 configuration.desired_state = DesiredState::Stopped;
                 let _ = persist(&self.directory, configuration);
             }
         } else {
-            runtime.connector_state = "degraded".into();
+            runtime.connector_state = ConnectorState::Degraded;
         }
     }
 
@@ -911,28 +1008,52 @@ impl Manager {
     fn fail(&self, message: String, exhausted: bool) {
         let mut runtime = self.runtime.lock().unwrap();
         runtime.failure_message = Some(message);
-        runtime.connector_state = if exhausted {
-            "restart-exhausted"
-        } else {
-            "failed"
-        }
-        .into();
+        runtime.connector_state =
+            if exhausted { ConnectorState::RestartExhausted } else { ConnectorState::Failed };
         runtime.readiness = Some(false);
+    }
+
+    /// Learn this connector's run-credential secret, and never forget it.
+    ///
+    /// Read for whichever credential this connector has: a tunnel credential is
+    /// a JSON document whose `TunnelSecret` is the secret, so redacting the
+    /// file's whole contents would miss it in every sentence cloudflared could
+    /// quote it in. [`secrets_within`] answers both shapes.
+    ///
+    /// **Merged, never replaced.** A read that finds nothing — because the file
+    /// is being removed, or was never readable — must leave what is already
+    /// known in place, or a cleanup would widen the redaction gap it is walking
+    /// through. Called wherever a credential is known to exist: at boot, after a
+    /// configuration writes one, and before each launch.
+    fn remember_secrets(&self) {
+        let held = {
+            let runtime = self.runtime.lock().unwrap();
+            let Some(configuration) = runtime.configuration.as_ref() else {
+                return;
+            };
+            let path = configuration.credential.file().to_path_buf();
+            drop(runtime);
+            std::fs::read_to_string(path).unwrap_or_default()
+        };
+        let mut runtime = self.runtime.lock().unwrap();
+        for secret in secrets_within(&held) {
+            if !runtime.secrets.contains(&secret) {
+                runtime.secrets.push(secret);
+            }
+        }
+        // Longest first, so a value that contains another is replaced before its
+        // substring is and the shorter one cannot half-redact the longer.
+        runtime.secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     }
 
     /// Keep the connector's own output, with its run credential taken out of it.
     ///
-    /// Read from the file rather than remembered, and read for whichever
-    /// credential this connector has: a tunnel credential is a JSON document
-    /// whose `TunnelSecret` is the secret, so redacting the file's whole
-    /// contents would miss it in every sentence cloudflared could quote it in.
-    fn record_log(&self, text: &str, configuration: &Configuration) {
-        let held = std::fs::read_to_string(configuration.credential.file()).unwrap_or_default();
-        let mut redacted = text.to_string();
-        for secret in secrets_within(&held) {
-            redacted = redacted.replace(&secret, "[REDACTED]");
-        }
+    /// Redacted against what this process has *remembered* rather than against
+    /// what the credential file says right now — see [`Runtime::secrets`] for
+    /// the failure that distinction closes.
+    fn record_log(&self, text: &str) {
         let mut runtime = self.runtime.lock().unwrap();
+        let redacted = redacted_against(&runtime.secrets, text);
         runtime.logs.extend(
             redacted
                 .lines()
@@ -944,6 +1065,20 @@ impl Manager {
             runtime.logs.drain(..excess);
         }
     }
+}
+
+/// One sentence with every known secret taken out of it.
+///
+/// **Applied twice on purpose**, at capture and again as the snapshot is built
+/// (ADR-0053). The two calls share this function but not their timing: the first
+/// is what keeps a secret out of laplus's own memory, and the second is what
+/// keeps one that reached memory by any other route from crossing the wire.
+fn redacted_against(secrets: &[String], text: &str) -> String {
+    let mut redacted = text.to_string();
+    for secret in secrets {
+        redacted = redacted.replace(secret.as_str(), "[REDACTED]");
+    }
+    redacted
 }
 
 /// Every string a run-credential file holds, longest first.
@@ -1279,6 +1414,127 @@ fn write_ingress(directory: &Path, configuration: &Configuration) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manager over a scratch directory, holding `credential` as its
+    /// connector token. Enough to exercise redaction without a `cloudflared`.
+    fn manager_holding(secret: &str) -> (tempfile::TempDir, Arc<Manager>, PathBuf) {
+        let directory = tempfile::tempdir().expect("a directory");
+        let manager = Manager::open(directory.path());
+        let token_file = directory.path().join(DIRECTORY).join(TOKEN);
+        std::fs::create_dir_all(token_file.parent().expect("a parent")).expect("the directory");
+        std::fs::write(&token_file, secret).expect("the token");
+        {
+            let mut runtime = manager.runtime.lock().unwrap();
+            runtime.configuration = Some(Configuration {
+                https_origin: "https://laplus.example.com".into(),
+                loopback_origin: "http://127.0.0.1:4773".into(),
+                executable_path: PathBuf::from("/usr/bin/cloudflared"),
+                credential: RunCredential::ConnectorToken { token_file: token_file.clone() },
+                desired_state: DesiredState::Running,
+            });
+        }
+        (directory, manager, token_file)
+    }
+
+    /// **The defect: redaction read the credential file at the moment a log line
+    /// arrived, so a file that was gone redacted nothing.**
+    ///
+    /// That is not a hypothetical window. A connector's stderr is drained when
+    /// the child exits, and Forget stops the connector and *then* removes its
+    /// run credential — so the one moment cloudflared is most likely to be
+    /// complaining about its token is the one moment laplus could no longer
+    /// recognise it. The secret is remembered while the file is readable and
+    /// stays remembered, so the removal cannot widen the gap it walks through.
+    #[test]
+    fn a_connector_token_stays_redacted_after_its_file_is_removed() {
+        let (_directory, manager, token_file) = manager_holding("connector-secret");
+        manager.remember_secrets();
+
+        // Forget's order of operations: the credential goes, and only then does
+        // the child's last word arrive.
+        std::fs::remove_file(&token_file).expect("removed");
+        manager.record_log("cloudflared refused connector-secret while shutting down");
+
+        let snapshot = manager.snapshot();
+        let logs = snapshot["logs"].as_array().expect("logs").clone();
+        let spoken = logs.iter().filter_map(|line| line.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(!spoken.contains("connector-secret"), "{spoken}");
+        assert!(spoken.contains("[REDACTED]"), "{spoken}");
+        // And the actionable half of the sentence survives, which is the reason
+        // the whole line is not simply dropped.
+        assert!(spoken.contains("while shutting down"), "{spoken}");
+    }
+
+    /// The second layer: a line that reached `logs` without passing
+    /// `record_log` is still answered on the way out. ADR-0053.
+    #[test]
+    fn the_snapshot_redacts_logs_and_failures_it_did_not_capture_itself() {
+        let (_directory, manager, _token_file) = manager_holding("connector-secret");
+        manager.remember_secrets();
+        {
+            let mut runtime = manager.runtime.lock().unwrap();
+            runtime.logs.push("a line nothing redacted: connector-secret".into());
+            runtime.failure_message = Some("cloudflared rejected connector-secret".into());
+        }
+
+        let snapshot = manager.snapshot();
+        let spoken = snapshot.to_string();
+        assert!(!spoken.contains("connector-secret"), "{spoken}");
+        assert!(snapshot["failureMessage"].as_str().expect("a message").contains("[REDACTED]"));
+    }
+
+    /// Every word the Rust side can report is one the contract declares.
+    ///
+    /// The two lists are written separately — this enum and
+    /// `ManagedCloudflareConnectorState` in `packages/contracts/src/remoteAccess.ts`
+    /// — and before the vocabulary existed nothing made them agree. Adding a
+    /// variant here without adding it there now fails this.
+    #[test]
+    fn every_connector_state_is_a_word_the_contract_declares() {
+        let declared = [
+            "unconfigured",
+            "starting",
+            "ready",
+            "degraded",
+            "restart-exhausted",
+            "stopping",
+            "stopped",
+            "failed",
+        ];
+        let ours: Vec<&str> = ConnectorState::ALL.iter().map(|state| state.as_str()).collect();
+        assert_eq!(ours, declared);
+        for word in declared {
+            assert_eq!(word.parse::<ConnectorState>().expect("declared").as_str(), word);
+        }
+        // A word outside the vocabulary is a refused read rather than a default,
+        // because every default available would be a guess about whether a
+        // public endpoint is up.
+        assert!("connected".parse::<ConnectorState>().is_err());
+    }
+
+    /// The four words that mean "no child of mine is running", and the two that
+    /// a parked supervision loop must not overwrite.
+    #[test]
+    fn settled_and_awaiting_retry_name_the_states_cleanup_depends_on() {
+        for state in [
+            ConnectorState::Stopped,
+            ConnectorState::RestartExhausted,
+            ConnectorState::Failed,
+            ConnectorState::Unconfigured,
+        ] {
+            assert!(state.settled(), "{state} means nothing is running");
+        }
+        for state in [ConnectorState::Starting, ConnectorState::Ready, ConnectorState::Degraded] {
+            assert!(!state.settled(), "{state} may still have a child");
+        }
+        // `Stopping` is on its way and is deliberately not settled: a cleanup
+        // that removed the configuration here would be removing it out from
+        // under a child still being terminated.
+        assert!(!ConnectorState::Stopping.settled());
+        assert!(ConnectorState::RestartExhausted.awaiting_retry());
+        assert!(ConnectorState::Failed.awaiting_retry());
+        assert!(!ConnectorState::Stopped.awaiting_retry());
+    }
 
     /// **A settings file written before adoption existed still runs.**
     ///

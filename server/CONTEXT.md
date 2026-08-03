@@ -1065,6 +1065,32 @@ stored in a private file, passed by file and never by argument, redacted out of
 logs and errors — and apart from ownership, which is the endpoint row's.
 `crate::cloudflare_connector::RunCredential`.
 
+**Connector state** — what a laplus-managed connector is actually doing:
+`unconfigured`, `starting`, `ready`, `degraded`, `restart-exhausted`,
+`stopping`, `stopped` or `failed`. The _actual_ state, as against the desired
+one, and a local fact throughout — `ready` means the child answers `/ready` on
+its loopback metrics address and says nothing about whether a public hostname
+reaches it. The compact row's "Locally ready" and "Publicly verified" are both
+this word plus the endpoint's verification, which is why they are two fields and
+not one. `crate::cloudflare_connector::ConnectorState`.
+_Avoid_: Connected, which claims the layer this cannot see.
+
+**Settled connector** — one with no child of laplus's running, which four words
+mean rather than one: `stopped`, `restart-exhausted`, `failed` and
+`unconfigured`. What a stop, forget or delete waits for before it removes
+anything, because the last three already carry `desiredState: stopped` and never
+move again. `ConnectorState::settled`.
+
+**Redaction boundary** — where a run credential is taken out of what laplus
+reports, which is the server and never the client: at capture as the connector's
+output is read, and again as the snapshot is built. Substitution rather than
+removal, so the sentence a developer needs survives with `[REDACTED]` where the
+secret was. The secrets are learned while the credential file is certainly
+readable and remembered thereafter — a redaction that re-read the file at log
+time redacted nothing exactly when a cleanup had removed it. ADR-0053.
+_Avoid_: Masking, which is a client-side affordance and not a boundary — a secret
+that reached the browser has already leaked.
+
 **Deletion verdict** — whether laplus may offer to delete a tunnel's Cloudflare
 resources, stated by the server beside the ownership rather than derived by the
 client. True only for a laplus-created tunnel, and the same answer the deletion

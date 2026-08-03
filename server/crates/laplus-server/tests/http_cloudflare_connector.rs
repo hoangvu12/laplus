@@ -2,7 +2,7 @@
 
 mod harness;
 
-use harness::cloudflare::{FakeCloudflared, VerifiedEndpoint};
+use harness::cloudflare::{CountingVerifiedEndpoint, FakeCloudflared, VerifiedEndpoint};
 use harness::TestServer;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
@@ -96,6 +96,28 @@ async fn managed_connector_uses_private_files_becomes_ready_and_survives_restart
     let restored = wait_for_json(&restarted, |body| body["connectorState"] == "ready").await;
     assert_eq!(restored["httpsOrigin"], "https://laplus.example.com");
     assert!(restored.to_string().find("connector-secret").is_none());
+    // **Each field checkbox 3 names, read back by name.** A restored connector
+    // that merely reaches `ready` proves these survived only by implication —
+    // and an implication is what the previous `ownership` was, written every
+    // boot and read back by nothing.
+    assert_eq!(restored["executablePath"], fake.executable.to_string_lossy().as_ref());
+    assert_eq!(restored["desiredState"], "running");
+    assert_eq!(restored["tunnelOwnership"], "external");
+    assert_eq!(
+        restored["credentialPath"],
+        token_file.to_string_lossy().as_ref(),
+        "the secret is referenced by path and never by value"
+    );
+    // The loopback origin is persisted and then re-pointed at whatever port this
+    // boot actually bound — the one field that must *not* survive verbatim,
+    // because a connector restored onto last run's port would forward the public
+    // hostname to nothing. What survives is the promise, not the number.
+    let loopback = restored["loopbackOrigin"].as_str().expect("a loopback origin");
+    assert_eq!(
+        loopback,
+        format!("http://127.0.0.1:{}", restarted.addr().port()),
+        "it names this server, not the last one"
+    );
     wait_for_json(&restarted, |body| body["verificationState"] == "verified").await;
     restarted.stop().await;
 }
@@ -105,7 +127,17 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
     let directory = tempfile::tempdir().unwrap();
     let fake = FakeCloudflared::write_into(directory.path());
     fake.rehearse("crash");
-    let server = TestServer::start_configured_in(directory.path()).await;
+    // A verifier that counts, because checkbox 8's "a later start … re-verifies
+    // the endpoint" is not visible in the endpoint row: a stopped connector's
+    // row still reads `verified`, since verification is a fact about the last
+    // attempt and a stop is not an attempt. The count is the only place the
+    // second check exists.
+    let verifier = std::sync::Arc::new(CountingVerifiedEndpoint::default());
+    let server = TestServer::start_configured_in_with_endpoint_verifier(
+        directory.path(),
+        verifier.clone(),
+    )
+    .await;
     let configured = server.post_json(
         "/api/access/cloudflare/connector/configure",
         &json!({"hostname":"laplus.example.com","executablePath":fake.executable,"connectorToken":"connector-secret"}),
@@ -200,6 +232,9 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
     assert_eq!(stopped.status, 200);
     wait_for_json(&server, |body| body["connectorState"] == "stopped").await;
     assert!(directory.path().join("cloudflare/connector.token").exists());
+    // The row still says what the last attempt found, which is exactly why the
+    // count below is the assertion and this is not.
+    let after_stop = verifier.count();
     let started = server
         .post_json("/api/access/cloudflare/connector/start", &json!({}))
         .await;
@@ -212,6 +247,17 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
             .filter(|line| line.starts_with('['))
             .count(),
         launches + 1
+    );
+    for _ in 0..500 {
+        if verifier.count() > after_stop {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        verifier.count() > after_stop,
+        "starting re-verified the endpoint: {after_stop} then {}",
+        verifier.count()
     );
     server.stop().await;
 }

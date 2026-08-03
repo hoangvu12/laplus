@@ -97,6 +97,37 @@ impl laplus_server::public_exposure::EndpointVerifier for VerifiedEndpoint {
     }
 }
 
+/// [`VerifiedEndpoint`] that says how many times it was asked.
+///
+/// **Because "re-verifies the endpoint" is not visible in the endpoint row.** A
+/// stopped connector's row still reads `verified` — verification is a fact about
+/// the last attempt, and stopping is not an attempt — so a test that only read
+/// the state back would pass against a start that verified nothing. The count is
+/// the only place the second check exists.
+#[derive(Debug, Default)]
+pub struct CountingVerifiedEndpoint {
+    pub verifications: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingVerifiedEndpoint {
+    pub fn count(&self) -> usize {
+        self.verifications.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl laplus_server::public_exposure::EndpointVerifier for CountingVerifiedEndpoint {
+    fn verify<'a>(
+        &'a self,
+        _origin: &'a str,
+        _environment_id: &'a str,
+        _http_token: &'a str,
+        _ws_token: &'a str,
+    ) -> laplus_server::public_exposure::VerificationFuture<'a> {
+        self.verifications.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// What the account fake's `tunnel list` answers with by default: one active
 /// tunnel (externally managed), one inactive (adoptable), one deleted (not a
 /// choice at all).

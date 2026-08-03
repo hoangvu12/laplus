@@ -636,6 +636,25 @@ pub fn next_background_delay(current: Duration, succeeded: bool) -> Duration {
     }
 }
 
+/// The upper bound of the jitter added to each background verification wait,
+/// exclusive. Small: it exists to break a lockstep, not to spread load.
+pub const BACKGROUND_JITTER_SECONDS: u64 = 5;
+
+/// A small process-local offset, so that several environments restarting
+/// together do not probe Cloudflare in lockstep for ever.
+///
+/// **Extracted from the spawned loop so that it is a decision rather than a
+/// term.** Inline, deleting `+ jitter` broke no test, and the specification
+/// asks for backoff *and* jitter by name — the backoff had
+/// [`next_background_delay`] and its unit test while this had neither, which is
+/// exactly the asymmetry that lets one of a pair quietly disappear.
+///
+/// Takes the clock rather than reading it, because a function that reads
+/// `SystemTime` can only be tested by asserting on the time it happens to be.
+pub fn background_jitter(since_epoch: Duration) -> Duration {
+    Duration::from_secs(u64::from(since_epoch.subsec_millis()) % BACKGROUND_JITTER_SECONDS)
+}
+
 impl EndpointVerifier for NetworkEndpointVerifier {
     fn verify<'a>(
         &'a self,
@@ -1092,6 +1111,34 @@ mod tests {
             assert_eq!(delay, Duration::from_secs(expected));
         }
         assert_eq!(next_background_delay(delay, true), Duration::from_secs(300));
+    }
+
+    /// The other half of "bounded backoff **and** jitter".
+    ///
+    /// Bounded, so it can never turn a 30-second floor into a minute, and
+    /// actually varying, so several environments that restarted together stop
+    /// probing in lockstep. A jitter that always answered zero would satisfy a
+    /// test that only checked the bound, which is why the spread is asserted
+    /// too.
+    #[test]
+    fn background_jitter_is_bounded_and_actually_spreads() {
+        let mut seen = std::collections::BTreeSet::new();
+        for millisecond in 0..1000u32 {
+            let jitter = background_jitter(Duration::new(17, millisecond * 1_000_000));
+            assert!(
+                jitter < Duration::from_secs(BACKGROUND_JITTER_SECONDS),
+                "{millisecond}ms produced {jitter:?}"
+            );
+            seen.insert(jitter.as_secs());
+        }
+        assert_eq!(
+            seen,
+            (0..BACKGROUND_JITTER_SECONDS).collect(),
+            "every offset in the range has to be reachable"
+        );
+        // Whole seconds only, so the wait stays a number a developer reading the
+        // log can recognise.
+        assert_eq!(background_jitter(Duration::new(0, 3_500_000)).subsec_nanos(), 0);
     }
 
     #[test]
