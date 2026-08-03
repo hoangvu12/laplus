@@ -101,12 +101,12 @@ export type CloudflareWizardPath = "account" | "connector-token" | "external";
 /**
  * One screen of the Cloudflare wizard.
  *
- * Five of these — `sign-in`, `consent`, `choose-tunnel`, `verify-hostname` and
- * `confirm-adoption` — are named by the *server*: `cloudflare_account.rs`
- * computes them from what is durably true and answers them in every account
- * snapshot. They are repeated here as a type rather than re-derived, so that a
- * step the server adds is a compile error here rather than a silently missing
- * screen.
+ * Six of these — `sign-in`, `consent`, `choose-tunnel`, `verify-hostname`,
+ * `confirm-adoption` and `adopting` — are named by the *server*:
+ * `cloudflare_account.rs` computes them from what is durably true and answers
+ * them in every account snapshot. They are repeated here as a type rather than
+ * re-derived, so that a step the server adds is a compile error here rather
+ * than a silently missing screen.
  */
 export type CloudflareWizardStep =
   | "choose-path"
@@ -115,6 +115,7 @@ export type CloudflareWizardStep =
   | "choose-tunnel"
   | "verify-hostname"
   | "confirm-adoption"
+  | "adopting"
   | "connector-token"
   | "external-endpoint"
   | "managed-connector";
@@ -151,6 +152,7 @@ const WIZARD_STEP_LABELS: Record<CloudflareWizardStep, string> = {
   "choose-tunnel": "Choose a tunnel",
   "verify-hostname": "Verify the hostname",
   "confirm-adoption": "Dedicate the tunnel",
+  adopting: "Dedicated tunnel",
   "connector-token": "Connector token",
   "external-endpoint": "External hostname",
   "managed-connector": "Laplus-managed connector",
@@ -159,11 +161,29 @@ const WIZARD_STEP_LABELS: Record<CloudflareWizardStep, string> = {
 export const cloudflareWizardStepLabel = (step: CloudflareWizardStep): string =>
   WIZARD_STEP_LABELS[step];
 
-const ACCOUNT_STEPS: ReadonlyArray<CloudflareWizardStep> = [
+/**
+ * The account path forks after a tunnel is chosen, because the two answers are
+ * different lengths.
+ *
+ * An *active* tunnel is somebody else's: the hostname is registered, verified
+ * and advertised, and that is the end of it. An *inactive* one has a
+ * confirmation to give and a connector to bring up afterwards, so "step 4 of 4"
+ * would tell a developer they were finished at the moment they were being asked
+ * the only question that changes anything.
+ */
+const EXTERNAL_ACCOUNT_STEPS: ReadonlyArray<CloudflareWizardStep> = [
   "sign-in",
   "consent",
   "choose-tunnel",
   "verify-hostname",
+];
+
+const ADOPTION_ACCOUNT_STEPS: ReadonlyArray<CloudflareWizardStep> = [
+  "sign-in",
+  "consent",
+  "choose-tunnel",
+  "confirm-adoption",
+  "adopting",
 ];
 
 /**
@@ -216,14 +236,41 @@ export const cloudflareWizardState = (input: {
    * listing or registration had already been recorded.
    */
   readonly revisitingPathChoice?: boolean;
+  /**
+   * The developer asked to go back to the tunnel list.
+   *
+   * **Navigation, and the way out of an activation race.** When a tunnel turns
+   * out to be active the server records the hostname as somebody else's and the
+   * step becomes `verify-hostname` — a truthful answer with no way back, since
+   * every branch below it is derived from a selection that is now external.
+   * Without this the developer's only recourse was to change setup path, which
+   * lands on the same step again. Client-held for the same reason
+   * {@link revisitingPathChoice} is: it is a request to be asked again, not
+   * progress, and answering it is what leaves it.
+   */
+  readonly revisitingTunnelChoice?: boolean;
 }): CloudflareWizardState => {
   const { account, managed, external, chosenPath, revisitingPathChoice } = input;
-  const accountStep = account?.step ?? "sign-in";
+  const accountStep =
+    input.revisitingTunnelChoice && account !== null && account.selection !== null
+      ? "choose-tunnel"
+      : (account?.step ?? "sign-in");
 
   // A connector laplus supervises is the one thing no navigation may leave:
   // there is a process running, and pretending otherwise would offer setup for
   // an exposure that already exists.
-  if (managed?.configured) return wizardState("managed-connector", "connector-token", false);
+  //
+  // **Which connector it is comes from the tunnel it runs, not from the panel
+  // that made it.** A dedicated tunnel has no connector token and no hostname
+  // to retype — Cloudflare does not hold its configuration, laplus does — so
+  // showing the token panel for one would offer to reconfigure it in the one
+  // vocabulary that cannot describe it. `tunnelOwnership` is the endpoint row's
+  // answer, so this survives a reload and a restart the same way the step does.
+  if (managed?.configured) {
+    return managed.tunnelOwnership === "external"
+      ? wizardState("managed-connector", "connector-token", false)
+      : wizardState("adopting", "account", false);
+  }
   // A path picked outranks the request to pick one, so answering the choice is
   // what leaves it — no caller has to remember to clear the flag as well.
   if (chosenPath === "connector-token") return wizardState("connector-token", "connector-token");
@@ -252,7 +299,11 @@ const wizardState = (
   // registered it when the active tunnel was selected — so it verifies and
   // pairs, and has nothing left to register.
   offersExternalRegistration: step === "external-endpoint",
-  ownsConnector: step === "managed-connector",
+  // A dedicated tunnel is a connector laplus runs, exactly like a token one:
+  // Forget belongs to the connector's own controls rather than to the external
+  // endpoint's, and offering the external Forget here would remove the record a
+  // running connector restores itself from.
+  ownsConnector: step === "managed-connector" || step === "adopting",
   canChangePath,
 });
 
@@ -261,8 +312,12 @@ const accountPosition = (
   path: CloudflareWizardPath | null,
 ): { readonly index: number; readonly total: number } | null => {
   if (path !== "account") return null;
-  const index = ACCOUNT_STEPS.indexOf(step === "confirm-adoption" ? "verify-hostname" : step);
-  return index === -1 ? null : { index: index + 1, total: ACCOUNT_STEPS.length };
+  const steps =
+    step === "confirm-adoption" || step === "adopting"
+      ? ADOPTION_ACCOUNT_STEPS
+      : EXTERNAL_ACCOUNT_STEPS;
+  const index = steps.indexOf(step);
+  return index === -1 ? null : { index: index + 1, total: steps.length };
 };
 
 /**

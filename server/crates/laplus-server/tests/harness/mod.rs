@@ -289,16 +289,50 @@ impl TestServer {
         let mut config = ServerConfig::detect_in(preferences.to_path_buf())
             .with_remote_access(RemoteAccess::none());
         somewhere_that_is_not_the_developers(&mut config);
-        let server =
-            Server::bind_with(0, config, Database::in_memory().expect("a database"), Assets::none())
-                .await
-                .expect("server binds to a free loopback port");
+        let server = Server::bind_with(
+            0,
+            config,
+            Database::in_memory().expect("a database"),
+            Assets::none(),
+        )
+        .await
+        .expect("server binds to a free loopback port");
         TestServer::bootstrapped(server, None).await
     }
 
     pub async fn start_configured_in_with_endpoint_verifier(
         preferences: &Path,
         verifier: std::sync::Arc<dyn laplus_server::public_exposure::EndpointVerifier>,
+    ) -> TestServer {
+        Self::configured_in(preferences, verifier, Database::in_memory().expect("a database")).await
+    }
+
+    /// A server whose settings *and* database both live in `preferences`.
+    ///
+    /// **Start a second one on the same directory and that is a whole restart.**
+    /// [`TestServer::start_configured_in`] and its verifier twin keep the
+    /// database in memory, so a restart through either loses every row and
+    /// keeps only the files — which is the right seam for "the connector starts
+    /// with its owner" and the wrong one for anything the database is the
+    /// record of. Tunnel ownership is exactly that (`docs/adr/0049`): the
+    /// connector's settings file deliberately says nothing about it, so a
+    /// restart onto an empty database reads `external` and would make a test of
+    /// persisted ownership pass or fail for reasons that are the harness's.
+    ///
+    /// It is also the only way to byte-scan the database for a secret, which
+    /// an in-memory one has no file to be scanned.
+    pub async fn start_persistent_in(
+        preferences: &Path,
+        verifier: std::sync::Arc<dyn laplus_server::public_exposure::EndpointVerifier>,
+    ) -> TestServer {
+        let database = Database::open(&preferences.join("state.sqlite")).expect("a database file");
+        Self::configured_in(preferences, verifier, database).await
+    }
+
+    async fn configured_in(
+        preferences: &Path,
+        verifier: std::sync::Arc<dyn laplus_server::public_exposure::EndpointVerifier>,
+        database: Database,
     ) -> TestServer {
         let mut config = ServerConfig::detect_in(preferences.to_path_buf())
             .with_remote_access(RemoteAccess::none());

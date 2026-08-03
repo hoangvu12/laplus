@@ -972,6 +972,34 @@ Cloudflare; deletion is never implied by turning it off or forgetting it.
 a dedicated tunnel. Laplus may configure and supervise it but does not own its
 Cloudflare allocation or DNS route and cannot delete either.
 
+**Dedication** — the explicit confirmation that turns an inactive existing
+tunnel into an adopted one, and the two mutations behind it: retrieving the
+tunnel's run credential and writing laplus's own connector configuration. A
+separate step because it is the first thing in the account path that changes
+anything (ADR-0045), and journaled because it can be interrupted between the
+two. `POST /api/access/cloudflare/account/adopt`, ADR-0050.
+_Avoid_: Adoption for the screen that merely offers it — that is a choice, and
+`adoptionConfirmed` is still false.
+
+**Activation race** — a connector starting between the listing a dedication
+offer was drawn from and the confirmation of it. Answered by re-reading the
+tunnel's activity immediately before the first mutation and falling back to an
+external tunnel endpoint, never by acting on the listing that produced the
+screen. `RefusalReason::TunnelBecameActive`, ADR-0050.
+
+**Run credential** — the narrow secret one connector runs on, whichever kind it
+is: a connector token for a tunnel Cloudflare configures, or a tunnel credential
+for one laplus configures. Named together because the rules are the same —
+stored in a private file, passed by file and never by argument, redacted out of
+logs and errors — and apart from ownership, which is the endpoint row's.
+`crate::cloudflare_connector::RunCredential`.
+
+**Deletion verdict** — whether laplus may offer to delete a tunnel's Cloudflare
+resources, stated by the server beside the ownership rather than derived by the
+client. True only for a laplus-created tunnel, and the same answer the deletion
+command refuses on, so an offer and a refusal cannot disagree.
+`deletableAtCloudflare`, `TunnelOwnership::deletable_at_cloudflare`.
+
 **External tunnel endpoint** — a hostname already routed to laplus by a tunnel
 managed elsewhere. Laplus may verify and advertise the endpoint but does not
 reconfigure, restart or delete its tunnel.

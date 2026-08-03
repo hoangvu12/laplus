@@ -301,12 +301,13 @@ impl Refusal {
 
     /// Attach the exact work a partial mutation finished and left outstanding.
     ///
-    /// Tickets 06 and 07 both require a failure to name both halves, so that a
-    /// retry repeats nothing and the wizard never claims a rollback it could
-    /// not perform. Nothing journals yet — the two lists are empty on every
-    /// refusal this build raises — but the shape is the one those tickets fill,
-    /// so they add a call rather than a contract.
-    #[allow(dead_code)]
+    /// Tickets 05, 06 and 07 all require a failure to name both halves, so that
+    /// a retry repeats nothing and the wizard never claims a rollback it could
+    /// not perform. Adoption is the first caller: its two steps are journaled
+    /// before they run and settled after, and what it passes here is what is
+    /// *observably* done rather than what this attempt did — a credential an
+    /// earlier attempt retrieved is completed work however the current request
+    /// went.
     pub fn after(mut self, completed: &[MutationStep], remaining: &[MutationStep]) -> Self {
         self.completed = completed.to_vec();
         self.remaining = remaining.to_vec();
@@ -333,6 +334,15 @@ pub struct Snapshot {
     pub https_origin: Option<String>,
     pub wss_origin: Option<String>,
     pub ownership: TunnelOwnership,
+    /// Whether laplus may offer to delete this tunnel's Cloudflare resources.
+    ///
+    /// **Stated by the server rather than derived by the client.** ADR-0045
+    /// gives every lifecycle action one owner, and "Delete everywhere is never
+    /// offered for an adopted tunnel" is a fact about authority, not about which
+    /// button a client chose to draw. It is [`TunnelOwnership::deletable_at_cloudflare`]
+    /// — the same answer ticket 07's deletion command refuses on — so the offer
+    /// and the refusal cannot disagree.
+    pub deletable_at_cloudflare: bool,
     pub health: serde_json::Value,
     pub verification_state: String,
     pub failure_kind: Option<String>,

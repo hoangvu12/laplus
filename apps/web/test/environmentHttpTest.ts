@@ -13,6 +13,7 @@ import {
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
   type EnvironmentInternalError,
+  type EnvironmentPublicExposureRefusal,
   type EnvironmentScopeRequiredError,
   type ExternalTunnelEndpointSnapshot,
   type ApproveCloudflaredReleaseInput,
@@ -45,6 +46,18 @@ import { __setPrimaryHttpRunnerForTests } from "../src/lib/runtime";
  * `never` cannot produce one.
  */
 type ScopedOperationFailure = EnvironmentScopeRequiredError | EnvironmentInternalError;
+
+/**
+ * What a public-exposure route may refuse with, on top of the scope answer.
+ *
+ * A `409` or `400` from `/api/access/cloudflare` is a tagged refusal carrying a
+ * closed reason and the mutations a partial failure completed and left
+ * outstanding — and the wizard renders all three. Cloudflare ticket 05's
+ * activation race is the first scenario that needs one; before it, a handler
+ * whose error channel stopped at the scope refusal could not produce the shape
+ * the component branches on.
+ */
+type PublicExposureFailure = ScopedOperationFailure | EnvironmentPublicExposureRefusal;
 
 type BrowserSessionHandler = (
   payload: AuthBrowserSessionRequest,
@@ -95,6 +108,9 @@ interface EnvironmentHttpTestScenario {
   readonly selectCloudflareTunnel?: (
     payload: SelectCloudflareTunnelInput,
   ) => Effect.Effect<CloudflareAccountSnapshot, ScopedOperationFailure>;
+  readonly adoptCloudflareTunnel?: (
+    payload: CloudflareAccountCommandInput,
+  ) => Effect.Effect<CloudflareAccountSnapshot, PublicExposureFailure>;
 }
 
 export interface EnvironmentHttpTestCalls {
@@ -120,6 +136,7 @@ export interface EnvironmentHttpTestCalls {
   consentToCloudflareCertificate: Array<CloudflareCertificateConsentInput>;
   listCloudflareTunnels: Array<CloudflareAccountCommandInput>;
   selectCloudflareTunnel: Array<SelectCloudflareTunnelInput>;
+  adoptCloudflareTunnel: Array<CloudflareAccountCommandInput>;
 }
 
 const unexpectedEndpoint = (endpoint: string) =>
@@ -162,6 +179,7 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     consentToCloudflareCertificate: [],
     listCloudflareTunnels: [],
     selectCloudflareTunnel: [],
+    adoptCloudflareTunnel: [],
   };
 
   const client = await Effect.runPromise(
@@ -334,6 +352,13 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
               return (
                 scenario.selectCloudflareTunnel?.(payload) ??
                 unexpectedEndpoint("access.selectCloudflareTunnel")
+              );
+            })
+            .handle("adoptCloudflareTunnel", ({ payload }) => {
+              calls.adoptCloudflareTunnel.push(payload);
+              return (
+                scenario.adoptCloudflareTunnel?.(payload) ??
+                unexpectedEndpoint("access.adoptCloudflareTunnel")
               );
             })
             // laplus answering itself through the public hostname, never a

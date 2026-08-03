@@ -82,6 +82,7 @@ describe("verified external tunnel advertisement", () => {
       httpsOrigin: endpoint.httpBaseUrl,
       wssOrigin: endpoint.wsBaseUrl,
       ownership: "external",
+      deletableAtCloudflare: false,
       health: { connector: "external", https: "unknown", webSocket: "unknown" },
       verificationState: "pending",
       failureKind: null,
@@ -140,6 +141,7 @@ describe("the Cloudflare wizard step machine", () => {
     configured: true,
     ownership: "laplus",
     tunnelOwnership: "external",
+    deletableAtCloudflare: false,
     desiredState: "running",
     connectorState: "ready",
     readiness: true,
@@ -160,6 +162,7 @@ describe("the Cloudflare wizard step machine", () => {
     httpsOrigin: "https://laplus.example.com",
     wssOrigin: "wss://laplus.example.com",
     ownership: "external",
+    deletableAtCloudflare: false,
     health: { connector: "external", https: "healthy", webSocket: "healthy" },
     verificationState: "verified",
     failureKind: null,
@@ -274,6 +277,112 @@ describe("the Cloudflare wizard step machine", () => {
     expect(chosenInactive.step).toBe("confirm-adoption");
     expect(chosenInactive.ownsConnector).toBe(false);
     expect(chosenInactive.offersExternalRegistration).toBe(false);
+    // The two answers to "which tunnel" are different lengths, and saying "4 of
+    // 4" here would tell a developer they were finished at the moment they were
+    // being asked the only question that changes anything.
+    expect(chosenInactive.position).toEqual({ index: 4, total: 5 });
+  });
+
+  /**
+   * A dedicated tunnel is a connector laplus supervises, and it is *not* the
+   * connector-token screen.
+   *
+   * That panel's controls are a hostname and a connector token, and a dedicated
+   * tunnel has neither: Cloudflare does not hold its configuration, laplus does.
+   * Which one this is comes from `tunnelOwnership` — the endpoint row's answer —
+   * so a reopened dialog and a restarted server cannot disagree about it.
+   */
+  it("routes a dedicated tunnel's connector to its own screen, not the token one", () => {
+    const adopted = {
+      ...managed,
+      tunnelOwnership: "adopted",
+      deletableAtCloudflare: false,
+      httpsOrigin: "https://spare.example.com",
+    } as const;
+
+    for (const chosenPath of [null, "account", "connector-token", "external"] as const) {
+      const dedicated = at({ account, managed: adopted, external, chosenPath });
+      expect(dedicated.step).toBe("adopting");
+      expect(dedicated.path).toBe("account");
+      expect(dedicated.position).toEqual({ index: 5, total: 5 });
+      // laplus runs this connector, so the external endpoint's Forget — which
+      // would delete the record the connector restores itself from — is not on
+      // offer, and neither is registering its hostname as somebody else's.
+      expect(dedicated.ownsConnector).toBe(true);
+      expect(dedicated.offersExternalRegistration).toBe(false);
+      expect(dedicated.canChangePath).toBe(false);
+    }
+
+    // A connector-token connector is still the token screen: its tunnel is
+    // configured at Cloudflare, which is what `external` ownership means here.
+    expect(at({ account, managed, external }).step).toBe("managed-connector");
+  });
+
+  /**
+   * The way out of an activation race.
+   *
+   * When a tunnel turns out to be active the server records the hostname as
+   * somebody else's and answers `verify-hostname` — truthfully, and with no way
+   * back, because every branch below that is derived from a selection which is
+   * now external. Changing setup path lands on the same step again. So the
+   * request to be asked about tunnels again is client-held, exactly as the
+   * request to be asked about paths is.
+   */
+  it("can be sent back to the tunnel list after a selection turned out to be external", () => {
+    const external = {
+      ...account,
+      certificateDetected: true,
+      certificateConsentedAt: "2026-08-03T09:00:00.000Z",
+      loginState: "complete",
+      tunnels: [active, inactive],
+      listedAt: "2026-08-03T09:00:01.000Z",
+      step: "verify-hostname",
+      selection: {
+        tunnelId: inactive.id,
+        name: inactive.name,
+        classification: "external",
+        httpsOrigin: "https://laplus.example.com",
+        adoptionConfirmed: false,
+      },
+    } as const;
+
+    expect(at({ account: external, chosenPath: "account" }).step).toBe("verify-hostname");
+    const revisited = at({
+      account: external,
+      chosenPath: "account",
+      revisitingTunnelChoice: true,
+    });
+    expect(revisited.step).toBe("choose-tunnel");
+    expect(revisited.path).toBe("account");
+
+    // It is navigation, not progress: with nothing chosen there is nothing to
+    // be sent back from, and the server's own step still decides.
+    expect(
+      at({
+        account: { ...external, selection: null, step: "choose-tunnel" },
+        revisitingTunnelChoice: true,
+      }).step,
+    ).toBe("choose-tunnel");
+    // And it never overrides a connector laplus is already supervising.
+    expect(at({ account: external, managed, revisitingTunnelChoice: true }).step).toBe(
+      "managed-connector",
+    );
+  });
+
+  /** The compact row names the ownership, because that is what differs. */
+  it("says an adopted tunnel is adopted in the compact row", () => {
+    expect(
+      cloudflareRowSummary({
+        state: at({ account, managed: { ...managed, tunnelOwnership: "adopted" } }),
+        managed: {
+          ...managed,
+          tunnelOwnership: "adopted",
+          httpsOrigin: "https://spare.example.com",
+        },
+        external: null,
+        managedStateLabel: () => "Publicly verified",
+      }),
+    ).toBe("https://spare.example.com · Adopted · Publicly verified");
   });
 
   /**

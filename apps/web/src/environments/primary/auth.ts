@@ -62,6 +62,7 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "consent-to-cloudflare-certificate",
   "list-cloudflare-tunnels",
   "select-cloudflare-tunnel",
+  "adopt-cloudflare-tunnel",
 ]);
 type PrimaryEnvironmentRequestOperation = typeof PrimaryEnvironmentRequestOperation.Type;
 
@@ -753,6 +754,33 @@ export async function selectCloudflareTunnel(
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "select-cloudflare-tunnel",
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Dedicate the selected inactive tunnel to this environment.
+ *
+ * Sends the executable rather than the tunnel, because which tunnel is being
+ * dedicated is the selection the server already recorded — a client that named
+ * it again could name a different one, and dedication is the point at which
+ * that stops being a harmless disagreement.
+ */
+export async function adoptCloudflareTunnel(
+  executablePath: string,
+): Promise<CloudflareAccountSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.adoptCloudflareTunnel({ headers: {}, payload: { executablePath } }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "adopt-cloudflare-tunnel",
       cause: error,
     });
   }

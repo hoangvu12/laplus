@@ -25,6 +25,7 @@ export {
   fetchSessionState,
   listCloudflareTunnels,
   readCloudflareAccount,
+  adoptCloudflareTunnel,
   selectCloudflareTunnel,
   isPrimaryEnvironmentPairingCredentialRejectedError,
   isPrimaryEnvironmentRequestError,

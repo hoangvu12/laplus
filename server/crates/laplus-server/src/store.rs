@@ -4157,6 +4157,54 @@ mod tests {
         assert_eq!(adopted.dns_record, None);
     }
 
+    /// What a boot is allowed to do to ownership: nothing.
+    ///
+    /// The connector's settings file says which hostname to serve and says
+    /// nothing about who owns the tunnel (`docs/adr/0049`), so the restore a
+    /// boot performs must leave an `adopted` row alone — otherwise a restart
+    /// would silently demote a tunnel laplus configured and supervises to a
+    /// hostname it merely verifies, and the credential and configuration paths
+    /// Forget removes would go with it.
+    #[test]
+    fn restoring_a_connectors_hostname_at_boot_keeps_the_ownership_already_recorded() {
+        use crate::public_exposure::TunnelOwnership;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let database = Database::open(&directory.path().join("state.sqlite")).expect("opens");
+        database
+            .register_public_exposure_endpoint(NewPublicExposure {
+                ownership: TunnelOwnership::Adopted,
+                tunnel_id: Some("22222222-2222-2222-2222-222222222222"),
+                credential_path: Some("/private/tunnel.json"),
+                configuration_path: Some("/private/connector.yml"),
+                ..NewPublicExposure::external("https://spare.example.com")
+            })
+            .expect("adopts a tunnel");
+
+        database
+            .restore_public_exposure_endpoint("https://spare.example.com")
+            .expect("restores the connector's hostname");
+
+        let restored = database.public_exposure_endpoint().unwrap().unwrap();
+        assert_eq!(restored.ownership, TunnelOwnership::Adopted);
+        assert_eq!(
+            restored.tunnel_id.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(restored.credential_path.as_deref(), Some("/private/tunnel.json"));
+
+        // A *different* hostname is a different endpoint, and the only safe
+        // guess about one nothing recorded is the ownership that authorizes no
+        // deletion.
+        database
+            .restore_public_exposure_endpoint("https://elsewhere.example.com")
+            .expect("restores a hostname nothing recorded");
+        let replaced = database.public_exposure_endpoint().unwrap().unwrap();
+        assert_eq!(replaced.ownership, TunnelOwnership::External);
+        assert_eq!(replaced.tunnel_id, None);
+        assert_eq!(replaced.credential_path, None);
+    }
+
     /// This ships to installs that already have a row. The endpoints they hold
     /// are external — nothing before this schema could create or adopt one —
     /// and `external` is also the ownership that authorizes no deletion, so a

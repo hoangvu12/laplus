@@ -116,6 +116,18 @@ export const ExternalTunnelEndpointSnapshot = Schema.Struct({
   httpsOrigin: Schema.NullOr(TrimmedNonEmptyString),
   wssOrigin: Schema.NullOr(TrimmedNonEmptyString),
   ownership: TunnelOwnership,
+  /**
+   * Whether laplus may offer to delete this tunnel's Cloudflare resources.
+   *
+   * **Stated by the server rather than derived here.** ADR-0045 gives every
+   * lifecycle action one owner, and "Delete everywhere is never offered for an
+   * adopted tunnel" is a fact about authority rather than about which control a
+   * client chose to draw. It is `TunnelOwnership::deletable_at_cloudflare` in
+   * `public_exposure.rs` — the same answer ticket 07's deletion command refuses
+   * on — so the offer and the refusal cannot come apart. True only for
+   * `laplus-created`.
+   */
+  deletableAtCloudflare: Schema.Boolean,
   health: Schema.Struct({
     /**
      * Who runs the connector in front of this endpoint. Widened from the
@@ -184,6 +196,8 @@ export const ManagedCloudflareConnectorSnapshot = Schema.Struct({
    * running. Ticket 06's compact row reads this to say "laplus-created".
    */
   tunnelOwnership: TunnelOwnership,
+  /** The deletion verdict — see {@link ExternalTunnelEndpointSnapshot}. */
+  deletableAtCloudflare: Schema.Boolean,
   desiredState: Schema.Literals(["running", "stopped"]),
   connectorState: ManagedCloudflareConnectorState,
   readiness: Schema.NullOr(Schema.Boolean),
@@ -341,6 +355,12 @@ export const CloudflareAccountSetupStep = Schema.Literals([
   "choose-tunnel",
   "verify-hostname",
   "confirm-adoption",
+  /**
+   * Dedication is confirmed: laplus holds the tunnel's run credential, wrote
+   * its own isolated configuration, and is supervising the connector. Nothing
+   * is left to ask, which is why this is where an adopted setup resumes.
+   */
+  "adopting",
 ]);
 export type CloudflareAccountSetupStep = typeof CloudflareAccountSetupStep.Type;
 

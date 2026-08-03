@@ -729,6 +729,26 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
+    // Dedicating an inactive existing tunnel to this environment: retrieve its
+    // narrow run credential, write laplus's own isolated configuration, and
+    // supervise a connector for it. The Cloudflare allocation and DNS route stay
+    // owned outside laplus — ADR-0045 — which is what `adopted` means and why it
+    // authorizes no deletion.
+    //
+    // **Repeating it is a reconciliation.** An adoption already recorded answers
+    // with what it recorded; an interrupted one resumes from the credential and
+    // configuration that are actually there. `tunnel-became-active` is the
+    // refusal when a connector started between the offer and this call, and it
+    // arrives with the hostname registered as an external tunnel endpoint
+    // instead.
+    HttpApiEndpoint.post("adoptCloudflareTunnel", "/api/access/cloudflare/account/adopt", {
+      headers: OptionalBearerHeaders,
+      payload: CloudflareAccountCommandInput,
+      success: CloudflareAccountSnapshot,
+      error: EnvironmentPublicExposureErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
     HttpApiEndpoint.get("managedCloudflareConnector", "/api/access/cloudflare/connector", {
       headers: OptionalBearerHeaders,
       success: ManagedCloudflareConnectorSnapshot,

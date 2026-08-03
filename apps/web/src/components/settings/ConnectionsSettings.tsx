@@ -48,6 +48,7 @@ import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import {
   cloudflareFailureMessage,
+  cloudflareOwnershipLabel,
   cloudflareRowSummary,
   cloudflareWizardState,
   formatRemoteBackendHost,
@@ -123,6 +124,7 @@ import {
   readExternalTunnelEndpoint,
   readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
+  adoptCloudflareTunnel,
   selectCloudflareTunnel,
   revokeOtherServerClientSessions,
   revokeServerClientSession,
@@ -208,6 +210,10 @@ export function CloudflareTunnelSettingsRow({
   const [open, setOpen] = useState(false);
   const [chosenPath, setChosenPath] = useState<CloudflareWizardPath | null>(null);
   const [revisitingPathChoice, setRevisitingPathChoice] = useState(false);
+  // The way out of an activation race: the server truthfully reports the
+  // hostname as somebody else's, and every step derived from that selection
+  // then leads back to the same screen. See `cloudflareWizardState`.
+  const [revisitingTunnelChoice, setRevisitingTunnelChoice] = useState(false);
   // **Two hostnames, deliberately.** A laplus-managed connector's hostname and
   // an externally managed one are different claims about who owns a lifecycle,
   // and sharing one field made "Register" hand the managed hostname to the
@@ -397,6 +403,7 @@ export function CloudflareTunnelSettingsRow({
   }, []);
 
   const chooseTunnel = useCallback(async () => {
+    setRevisitingTunnelChoice(false);
     await mutateAccount(() =>
       selectCloudflareTunnel({ tunnelId: selectedTunnelId, hostname: tunnelHostname }),
     );
@@ -404,6 +411,31 @@ export function CloudflareTunnelSettingsRow({
     // server-side, so the endpoint snapshot this row advertises has moved.
     await refresh();
   }, [mutateAccount, refresh, selectedTunnelId, tunnelHostname]);
+
+  /**
+   * Confirm dedication, then re-read everything the answer could have moved.
+   *
+   * **A refusal moves the server too, which is why this refreshes either way.**
+   * An activation race reclassifies the selection as external and registers the
+   * hostname as somebody else's — so a client that kept the snapshot it already
+   * had would go on offering to dedicate a tunnel the server has just disowned,
+   * with the refusal's sentence above a button that could only be refused
+   * again. Driving the wizard headlessly is how that was found.
+   *
+   * Three reads because the answer arrives in three snapshots: the account says
+   * which step the wizard is on, the connector says what laplus is now
+   * supervising, and the endpoint says who owns the tunnel behind it.
+   */
+  const dedicateTunnel = useCallback(async () => {
+    await mutateAccount(() => adoptCloudflareTunnel(executablePath));
+    await Promise.all([
+      refreshAccount(),
+      readManagedCloudflareConnector()
+        .then(setManaged)
+        .catch(() => undefined),
+      refresh(),
+    ]);
+  }, [executablePath, mutateAccount, refresh, refreshAccount]);
 
   const createPairing = useCallback(async () => {
     const origin = managed?.configured ? managed.httpsOrigin : snapshot?.httpsOrigin;
@@ -426,6 +458,7 @@ export function CloudflareTunnelSettingsRow({
     external: snapshot,
     chosenPath,
     revisitingPathChoice,
+    revisitingTunnelChoice,
   });
   const verified =
     managed?.configured === true
@@ -437,9 +470,17 @@ export function CloudflareTunnelSettingsRow({
   const runsCloudflared =
     wizard.step === "sign-in" ||
     wizard.step === "choose-tunnel" ||
+    wizard.step === "confirm-adoption" ||
+    wizard.step === "adopting" ||
     wizard.step === "connector-token" ||
     wizard.step === "managed-connector";
-  const picksExecutable = wizard.step === "sign-in" || wizard.step === "choose-tunnel";
+  // Dedication runs cloudflared twice — once to re-read the tunnel's activity
+  // and once to retrieve its credential — so the screen that asks for it is
+  // also a screen that has to say which executable will do it.
+  const picksExecutable =
+    wizard.step === "sign-in" ||
+    wizard.step === "choose-tunnel" ||
+    wizard.step === "confirm-adoption";
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -541,7 +582,24 @@ export function CloudflareTunnelSettingsRow({
           ) : null}
 
           {wizard.step === "confirm-adoption" && account?.selection ? (
-            <CloudflareAdoptionOffer selection={account.selection} />
+            <CloudflareAdoptionOffer
+              selection={account.selection}
+              loopbackOrigin={managed?.loopbackOrigin ?? null}
+              canWrite={canWrite}
+              busy={busy}
+              onConfirm={() => void dedicateTunnel()}
+            />
+          ) : null}
+
+          {wizard.step === "adopting" && managed?.configured ? (
+            <CloudflareDedicatedConnectorPanel
+              snapshot={managed}
+              canWrite={canWrite}
+              busy={busy}
+              onStart={() => void mutateManaged("start")}
+              onStop={() => void mutateManaged("stop")}
+              onRetry={() => void mutateManaged("retry")}
+            />
           ) : null}
 
           {wizard.step === "verify-hostname" && account?.selection ? (
@@ -556,6 +614,16 @@ export function CloudflareTunnelSettingsRow({
                 start, stop, reconfigure, or delete its connector.
               </p>
               {snapshot?.configured ? <CloudflareLayeredHealth snapshot={snapshot} /> : null}
+              {canWrite ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => setRevisitingTunnelChoice(true)}
+                >
+                  Choose a different tunnel
+                </Button>
+              ) : null}
             </section>
           ) : null}
 
@@ -934,16 +1002,30 @@ export function cloudflareTunnelActivityLabel(tunnel: CloudflareAccountTunnel): 
  * An inactive tunnel offered for dedication, and the ownership that would and
  * would not transfer.
  *
- * **No confirmation control here yet.** ADR-0045 makes dedication a separate,
- * explicit confirmation that retrieves a narrow run credential and writes an
- * isolated connector configuration; that is ticket 05. Until it lands, this
- * screen is the offer and the consequences, and laplus manages nothing — which
- * is exactly what `adoptionConfirmed: false` on the selection means.
+ * **Everything the confirmation is a confirmation of is on this screen.** The
+ * tunnel it names, the hostname the developer supplied, where that hostname
+ * would be routed to, what was observed about the tunnel, and which half of the
+ * ownership moves — a consent that omits the loopback target is consent to an
+ * abstraction. ADR-0045 makes this a separate, explicit step precisely because
+ * the mutation behind it retrieves a run credential and writes a connector
+ * configuration.
+ *
+ * The observed inactivity is what the *listing* proved, and the server re-reads
+ * it immediately before mutating: a connector that starts in between makes the
+ * tunnel externally managed, and the confirmation is refused rather than obeyed.
  */
 export function CloudflareAdoptionOffer({
   selection,
+  loopbackOrigin,
+  canWrite,
+  busy,
+  onConfirm,
 }: {
   readonly selection: NonNullable<CloudflareAccountSnapshot["selection"]>;
+  readonly loopbackOrigin: string | null;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onConfirm: () => void;
 }) {
   return (
     <section className="space-y-2" aria-label="Dedicate the tunnel">
@@ -953,19 +1035,130 @@ export function CloudflareAdoptionOffer({
         <dd className="break-all">{selection.tunnelId}</dd>
         <dt>Hostname</dt>
         <dd className="break-all">{selection.httpsOrigin}</dd>
+        <dt>Routes to</dt>
+        <dd className="break-all">{loopbackOrigin ?? "this laplus server on loopback"}</dd>
         <dt>Observed</dt>
         <dd>Inactive — no connector is serving it</dd>
       </dl>
       <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
-        Dedicating this tunnel lets laplus configure and supervise a connector for it. Its
-        Cloudflare allocation and DNS record stay owned outside laplus and can never be deleted from
-        here.
+        Dedicating this tunnel lets laplus retrieve its run credential, write its own connector
+        configuration, and supervise the connector. Its Cloudflare allocation and DNS record stay
+        owned outside laplus and can never be deleted from here. The hostname is public unless you
+        independently protect it; laplus authentication remains required.
       </div>
       <p className="text-xs text-muted-foreground">
-        Not dedicated yet. laplus manages nothing until dedication is separately confirmed, so this
-        tunnel is still only a choice.
+        Not dedicated yet. laplus manages nothing until you confirm, so this tunnel is still only a
+        choice.
       </p>
+      {canWrite ? (
+        <Button size="sm" disabled={busy} onClick={onConfirm}>
+          {busy ? "Working…" : "Dedicate this tunnel"}
+        </Button>
+      ) : null}
     </section>
+  );
+}
+
+/**
+ * A dedicated tunnel laplus is supervising: an adopted one today, a
+ * laplus-created one when ticket 06 lands.
+ *
+ * **Deliberately not {@link ManagedCloudflareConnectorPanel}.** That panel's
+ * controls are a hostname and a connector token, and a dedicated tunnel has
+ * neither to offer: Cloudflare does not hold its configuration, laplus does, and
+ * the hostname is the one the dedication was confirmed against. What is left is
+ * what the connector is doing, and the lifecycle actions that do not change
+ * ownership.
+ *
+ * **`deletableAtCloudflare` is the server's answer, not a layout decision.** It
+ * is `TunnelOwnership::deletable_at_cloudflare` in `public_exposure.rs` — the
+ * same value ticket 07's deletion command refuses on — so an adopted tunnel is
+ * never offered a control that would be refused, and the sentence says why
+ * rather than leaving a developer to wonder where the option went.
+ */
+export function CloudflareDedicatedConnectorPanel({
+  snapshot,
+  canWrite,
+  busy,
+  onStart,
+  onStop,
+  onRetry,
+}: {
+  readonly snapshot: ManagedCloudflareConnectorSnapshot;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onStart: () => void;
+  readonly onStop: () => void;
+  readonly onRetry: () => void;
+}) {
+  return (
+    <section className="space-y-3" aria-label="Dedicated Cloudflare tunnel">
+      <div>
+        <p className="text-sm font-medium">
+          {snapshot.httpsOrigin} · {cloudflareOwnershipLabel(snapshot.tunnelOwnership)}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          laplus configures and supervises this connector from its own credential and configuration.
+        </p>
+      </div>
+      <CloudflareConnectorStatus snapshot={snapshot} />
+      <div className="rounded-md border border-border/70 bg-muted/20 p-3 text-xs text-muted-foreground">
+        {snapshot.deletableAtCloudflare
+          ? "laplus created this tunnel and its DNS record, so it can also delete them — separately, and with its own confirmation."
+          : "laplus did not create this tunnel or its DNS record, so it can never delete either. Stopping the connector or forgetting the local setup leaves both untouched."}
+      </div>
+      {canWrite ? (
+        <div className="flex flex-wrap gap-2">
+          {snapshot.desiredState === "stopped" ? (
+            <Button size="sm" disabled={busy} onClick={onStart}>
+              Start connector
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" disabled={busy} onClick={onStop}>
+              Stop connector
+            </Button>
+          )}
+          {snapshot.connectorState === "restart-exhausted" ||
+          snapshot.connectorState === "failed" ? (
+            <Button size="sm" disabled={busy} onClick={onRetry}>
+              Retry connector
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/** What the connector is doing, shared by both connector panels. */
+export function CloudflareConnectorStatus({
+  snapshot,
+}: {
+  readonly snapshot: ManagedCloudflareConnectorSnapshot;
+}) {
+  return (
+    <div className="rounded-md border border-border/70 p-3 text-xs">
+      <p>
+        Connector{" "}
+        {snapshot.readiness === true
+          ? "ready"
+          : snapshot.readiness === false
+            ? "not ready"
+            : "readiness unknown"}
+      </p>
+      <p>Public endpoint {snapshot.verificationState}</p>
+      {snapshot.failureMessage ? (
+        <p className="text-destructive">{snapshot.failureMessage}</p>
+      ) : null}
+      {snapshot.publicFailureMessage ? (
+        <p className="text-destructive">{snapshot.publicFailureMessage}</p>
+      ) : null}
+      {snapshot.logs.length > 0 ? (
+        <pre className="mt-2 whitespace-pre-wrap text-muted-foreground">
+          {snapshot.logs.join("\n")}
+        </pre>
+      ) : null}
+    </div>
   );
 }
 
@@ -1292,30 +1485,7 @@ export function ManagedCloudflareConnectorPanel({
           onChange={(event) => onConnectorTokenChange(event.target.value)}
         />
       </label>
-      {snapshot ? (
-        <div className="rounded-md border border-border/70 p-3 text-xs">
-          <p>
-            Connector{" "}
-            {snapshot.readiness === true
-              ? "ready"
-              : snapshot.readiness === false
-                ? "not ready"
-                : "readiness unknown"}
-          </p>
-          <p>Public endpoint {snapshot.verificationState}</p>
-          {snapshot.failureMessage ? (
-            <p className="text-destructive">{snapshot.failureMessage}</p>
-          ) : null}
-          {snapshot.publicFailureMessage ? (
-            <p className="text-destructive">{snapshot.publicFailureMessage}</p>
-          ) : null}
-          {snapshot.logs.length > 0 ? (
-            <pre className="mt-2 whitespace-pre-wrap text-muted-foreground">
-              {snapshot.logs.join("\n")}
-            </pre>
-          ) : null}
-        </div>
-      ) : null}
+      {snapshot ? <CloudflareConnectorStatus snapshot={snapshot} /> : null}
       {canWrite ? (
         <div className="flex flex-wrap gap-2">
           <Button
@@ -3700,11 +3870,19 @@ export function ConnectionsSettings() {
                     only where something can act on it — a tailnet name still
                     works here, through the tunnel list below. */}
                 {desktopBridge ? renderTailscaleRow() : null}
-                <CloudflareTunnelSettingsRow canWrite onSnapshot={acceptExternalTunnelSnapshot} />
               </>
             ) : (
               <>{renderDisabledNetworkAccessRow()}</>
             )}
+            {/* **Outside the desktop-bridge branch, on purpose.** What gates
+                Cloudflare setup is a scope, not a shell: ADR-0047 gives it to
+                `access:read` and `access:write`, and ADR-0048 makes a headless
+                `laplus-server` a connector's owner as much as the window is.
+                Nested under `canManageNetworkAccess` it was invisible to
+                exactly the deployment the feature exists for — a browser
+                pointed at a server running under systemd, which is also the
+                only shape `tools/ui-driver/cloudflare-tunnel.mjs` can drive. */}
+            <CloudflareTunnelSettingsRow canWrite onSnapshot={acceptExternalTunnelSnapshot} />
           </SettingsSection>
 
           {isLocalBackendRemotelyReachable ? (

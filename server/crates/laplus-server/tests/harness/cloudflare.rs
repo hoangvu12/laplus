@@ -7,9 +7,18 @@
 //! different version string, and `http_cloudflare_account.rs` had a disjoint one
 //! that answered `tunnel login` and `tunnel list` and `raise SystemExit(2)` on
 //! everything else. Between them they emulated none of `tunnel create`,
-//! `tunnel route dns`, `tunnel delete` or credential retrieval — which tickets
-//! 06 and 07 cannot begin without, and which a fourth copy would have had to
-//! grow on its own.
+//! `tunnel token`, `tunnel route dns` or `tunnel delete` — which tickets 05, 06
+//! and 07 cannot begin without, and which a fourth copy would have had to grow
+//! on its own.
+//!
+//! **`create` and `token` are two different credentials.** `tunnel create
+//! --credentials-file` allocates a tunnel and writes its `<UUID>.json`;
+//! `tunnel token --cred-file` retrieves the same file for a tunnel that already
+//! exists. Ticket 06 uses the first and ticket 05 uses the second, and running
+//! either connector needs laplus's own configuration file to name the tunnel and
+//! point at the credential — which the `run` branch below checks, because a
+//! connector given a config missing either would look to a test exactly like one
+//! that was merely slow to become ready.
 //!
 //! So this is one script with every verb, switched on by what it is asked to do
 //! rather than by which test wrote it. A test that needs only `--version` pays
@@ -140,6 +149,11 @@ pub const CERTIFICATE: &str = "FAKE-ACCOUNT-CERTIFICATE-SECRET";
 /// The connector token the supervision fake insists on being handed by file.
 pub const CONNECTOR_TOKEN: &str = "connector-secret";
 
+/// What a `<UUID>.json` run credential contains, and the string ticket 05's
+/// redaction test hunts for in four places: the response, the snapshot, the
+/// process argv, and the database file read as bytes.
+pub const TUNNEL_CREDENTIAL_SECRET: &str = "FAKE-TUNNEL-CREDENTIAL-SECRET";
+
 /// `--version` for every copy of the fake. Compatible: 2024 or newer.
 pub const VERSION: &str = "cloudflared version 2026.7.3";
 
@@ -189,6 +203,9 @@ impl FakeCloudflared {
     ///   wedged connector can still be stopped.
     /// - `replace` — the connector forks and the original exits, which is what
     ///   cloudflared's self-replacement looks like to a supervisor.
+    /// - `token-fails` — `tunnel token --cred-file` writes a truncated
+    ///   credential and *then* refuses, which is ticket 05's failed retrieval
+    ///   and the reason a resume cannot decide by file existence alone.
     /// - `create-fails` — `tunnel create` refuses *after* writing nothing, so a
     ///   resume has no orphan to reconcile.
     /// - `route-fails` — `tunnel create` succeeds and `tunnel route dns` refuses,
@@ -247,11 +264,26 @@ impl FakeCloudflared {
 
     /// Where `tunnel create --credentials-file` was told to write, if it ran.
     pub fn credential_written_to(&self) -> Option<PathBuf> {
+        self.argument_after("create", "--credentials-file")
+    }
+
+    /// Where `tunnel token --cred-file` was told to write, if it ran.
+    ///
+    /// The adoption twin of [`FakeCloudflared::credential_written_to`]: an
+    /// adopted tunnel already exists at Cloudflare, so laplus *retrieves* its
+    /// narrow run credential rather than creating one, and the flag the CLI
+    /// spells for that is `--cred-file`.
+    pub fn retrieved_credential_path(&self) -> Option<PathBuf> {
+        self.argument_after("token", "--cred-file")
+    }
+
+    /// The value the first invocation containing `verb` passed after `flag`.
+    fn argument_after(&self, verb: &str, flag: &str) -> Option<PathBuf> {
         self.lines()
             .filter_map(|line| serde_json::from_str::<Vec<String>>(&line).ok())
-            .find(|argv| argv.contains(&"create".to_string()))
+            .find(|argv| argv.iter().any(|word| word == verb))
             .and_then(|argv| {
-                let index = argv.iter().position(|word| word == "--credentials-file")?;
+                let index = argv.iter().position(|word| word == flag)?;
                 argv.get(index + 1).map(PathBuf::from)
             })
     }
@@ -308,6 +340,28 @@ if 'list' in ARGS:
     print(open(TUNNELS).read())
     raise SystemExit(0)
 
+if 'token' in ARGS:
+    # An adopted tunnel already exists, so its narrow run credential is
+    # *retrieved* rather than created. `--cred-file` writes the same
+    # `<UUID>.json` shape `create` does, which is what lets laplus run a tunnel
+    # it did not allocate without ever holding account-wide authority again.
+    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
+    credentials = after('--cred-file')
+    assert credentials is not None, ARGS
+    if mode == 'token-fails':
+        # Writes and *then* fails, which is the shape that matters: a resume
+        # deciding by file existence alone would skip a retrieval it still needs
+        # and run a connector against a credential that authenticates nothing.
+        with open(credentials, 'w') as f:
+            f.write('{{"AccountTag": "acc')
+        print('failed to retrieve credentials for tunnel %s' % ARGS[-1], file=sys.stderr)
+        raise SystemExit(1)
+    with open(credentials, 'w') as f:
+        json.dump({{'AccountTag': 'account', 'TunnelID': ARGS[-1],
+                   'TunnelSecret': {credential:?}}}, f)
+    os.chmod(credentials, 0o600)
+    raise SystemExit(0)
+
 if 'create' in ARGS:
     # `--credentials-file` is what keeps the narrow run credential out of
     # cloudflared's own default location and inside laplus's private directory.
@@ -319,7 +373,7 @@ if 'create' in ARGS:
         raise SystemExit(1)
     with open(credentials, 'w') as f:
         json.dump({{'AccountTag': 'account', 'TunnelID': CREATED,
-                   'TunnelSecret': 'FAKE-TUNNEL-CREDENTIAL-SECRET'}}, f)
+                   'TunnelSecret': {credential:?}}}, f)
     os.chmod(credentials, 0o600)
     if '--output' in ARGS:
         print(json.dumps({{'id': CREATED, 'name': ARGS[-1],
@@ -360,12 +414,22 @@ if 'run' not in ARGS:
 
 metrics = after('--metrics')
 token_file = after('--token-file')
-credentials = after('--credentials-file')
+config = after('--config')
 if token_file is not None:
     with open(token_file) as f:
         assert f.read() == {token:?}
-if credentials is not None:
-    assert os.path.exists(credentials), credentials
+else:
+    # A dedicated tunnel carries no connector token: everything cloudflared
+    # needs is in laplus's own configuration file, which must name the tunnel
+    # and point at a credential that is actually there. Asserted rather than
+    # assumed, because a config missing either would make the connector fail
+    # at Cloudflare where a test can only see "not ready".
+    assert config is not None, ARGS
+    lines = [line.strip() for line in open(config).read().splitlines()]
+    named = [line for line in lines if line.startswith('tunnel:')]
+    held = [line for line in lines if line.startswith('credentials-file:')]
+    assert named and held, lines
+    assert os.path.exists(held[0].split(':', 1)[1].strip()), lines
 
 if mode == 'crash':
     print('connector failed with %s' % {token:?}, file=sys.stderr)
@@ -401,6 +465,7 @@ finally:
             version = VERSION,
             content = CERTIFICATE,
             token = CONNECTOR_TOKEN,
+            credential = TUNNEL_CREDENTIAL_SECRET,
         )
     }
 }

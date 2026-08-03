@@ -14,6 +14,11 @@ use tokio::sync::Notify;
 const DIRECTORY: &str = "cloudflare";
 const SETTINGS: &str = "connector.json";
 const TOKEN: &str = "connector.token";
+/// The narrow `<UUID>.json` run credential of a dedicated tunnel. One name
+/// rather than the tunnel's own UUID, because there is one dedicated tunnel per
+/// environment and a path the endpoint row records has to be reconstructible
+/// before that row exists — which is what a resumed adoption does.
+const CREDENTIAL: &str = "tunnel.json";
 const INGRESS: &str = "connector.yml";
 const MAX_RESTARTS: u8 = 3;
 /// Who runs the connector *process*, which is a different question from who owns
@@ -36,6 +41,51 @@ crate::public_exposure::closed_vocabulary! {
     }
 }
 
+/// Which narrow credential this connector runs on, and therefore what laplus
+/// must write for it.
+///
+/// **The two are not interchangeable, and the difference is who configures the
+/// tunnel.** A connector token belongs to a tunnel Cloudflare configures: the
+/// token is the whole of the run authority and the ingress rules live at
+/// Cloudflare. A `<UUID>.json` tunnel credential belongs to a tunnel *laplus*
+/// configures, so laplus's own file has to name the tunnel and the credential
+/// as well as the ingress — which is why this is a shape and not a flag.
+///
+/// Untagged and flattened on purpose: `{ "tokenFile": … }` is exactly what
+/// every connector settings file written before adoption existed contains, so
+/// an installed connector keeps running across this change rather than losing
+/// the desired state that makes it start with its owner.
+/// `rename_all` on the variants rather than on the enum, because on an enum it
+/// renames the *variant names* — which an untagged enum never writes — and
+/// leaves the fields in `snake_case`. That silently produced a settings file
+/// no build could read back, and the connector that stopped coming back after a
+/// restart looked like a supervision bug rather than a serialization one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RunCredential {
+    /// Cloudflare owns the tunnel's configuration; laplus only runs it.
+    #[serde(rename_all = "camelCase")]
+    ConnectorToken { token_file: PathBuf },
+    /// laplus owns the tunnel's configuration: an adopted or laplus-created
+    /// dedicated tunnel, run from the credential retrieved or created for it.
+    #[serde(rename_all = "camelCase")]
+    TunnelCredential {
+        tunnel_id: String,
+        credential_file: PathBuf,
+    },
+}
+
+impl RunCredential {
+    /// Where the secret is, so that redaction and cleanup can find it without
+    /// knowing which kind it is.
+    pub fn file(&self) -> &Path {
+        match self {
+            Self::ConnectorToken { token_file } => token_file,
+            Self::TunnelCredential { credential_file, .. } => credential_file,
+        }
+    }
+}
+
 /// What a connector needs to run, and nothing about who owns its tunnel.
 ///
 /// **Ownership deliberately lives in one place, and it is not here.** This file
@@ -45,14 +95,28 @@ crate::public_exposure::closed_vocabulary! {
 /// of them wins. The durable answer is the `public_exposure_endpoint` row —
 /// `docs/adr/0049` — and `managed_connector_snapshot` in `server.rs` reads it
 /// from there the same way it reads verification state.
+///
+/// [`RunCredential`] is not an exception to that. It says which *file* runs the
+/// connector, which laplus needs in order to build a command line; it does not
+/// say who may delete the tunnel, and an adopted tunnel and a laplus-created one
+/// are indistinguishable here by design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     pub https_origin: String,
     pub loopback_origin: String,
     pub executable_path: PathBuf,
-    pub token_file: PathBuf,
+    #[serde(flatten)]
+    pub credential: RunCredential,
     pub desired_state: DesiredState,
+}
+
+/// What both configuration paths establish before either writes anything.
+struct Prepared {
+    https_origin: String,
+    loopback_origin: String,
+    executable_path: PathBuf,
+    version: String,
 }
 
 #[derive(Debug)]
@@ -140,8 +204,6 @@ impl Manager {
         executable: &Path,
         connector_token: &str,
     ) -> Result<(), Refusal> {
-        let https_origin = crate::public_exposure::normalize_hostname(hostname)
-            .map_err(|message| Refusal::rejected(RefusalReason::HostnameInvalid, message))?;
         let token_file = self.directory.join(TOKEN);
         if connector_token.trim().is_empty() && !token_file.is_file() {
             return Err(Refusal::rejected(
@@ -149,30 +211,128 @@ impl Manager {
                 "Enter the tunnel-specific connector token.",
             ));
         }
-        let executable = Search::from_environment().startable(executable).ok_or_else(|| {
+        // **Everything that can refuse, refuses before the secret is written.**
+        // A hostname this server will not accept or an executable it cannot run
+        // are answers it can give without keeping the token the request carried,
+        // and writing it first would leave a rejected request's secret on disk.
+        let prepared = self.prepare(hostname, executable).await?;
+        private_directory(&self.directory)?;
+        if !connector_token.trim().is_empty() {
+            private_write(&token_file, connector_token.as_bytes())?;
+        }
+        self.commit(prepared, RunCredential::ConnectorToken { token_file })
+    }
+
+    /// Where the narrow run credential of a dedicated tunnel belongs.
+    ///
+    /// Answered before the credential exists, because adoption has to journal
+    /// the path it is *about* to write and a resume has to look for the file at
+    /// the same place without re-reading anything from Cloudflare.
+    pub fn credential_path(&self) -> PathBuf {
+        self.directory.join(CREDENTIAL)
+    }
+
+    /// Where laplus's own isolated ingress configuration belongs.
+    ///
+    /// **Never the developer's `~/.cloudflared/config.yml`** — ADR-0045 puts
+    /// editing that out of scope entirely, so every connector laplus runs is
+    /// pointed at this path with `--config`.
+    pub fn configuration_path(&self) -> PathBuf {
+        self.directory.join(INGRESS)
+    }
+
+    /// The dedicated tunnel this connector is already configured to run, if it
+    /// runs one.
+    ///
+    /// **Observed state, and the only record of it that survives a database
+    /// write that did not.** Adoption writes the endpoint row last, so a crash
+    /// between configuring the connector and recording the row leaves laplus
+    /// running a tunnel nothing says it owns — and the next confirmation would
+    /// see laplus's *own* connections in the listing and conclude the tunnel was
+    /// somebody else's. This is how that resume tells the two apart.
+    pub fn dedicated_tunnel_id(&self) -> Option<String> {
+        match &self.runtime.lock().unwrap().configuration.as_ref()?.credential {
+            RunCredential::TunnelCredential { tunnel_id, .. } => Some(tunnel_id.clone()),
+            RunCredential::ConnectorToken { .. } => None,
+        }
+    }
+
+    /// The loopback origin a connector would be pointed at, whether or not one
+    /// is configured yet.
+    ///
+    /// The adoption offer has to show it *before* anything is configured: the
+    /// developer is being asked to route a public hostname somewhere, and a
+    /// confirmation that does not say where is a confirmation of an abstraction.
+    pub fn loopback_origin(&self) -> Option<String> {
+        self.owner_origin.lock().unwrap().clone()
+    }
+
+    /// Run a connector for a dedicated tunnel laplus configures itself.
+    ///
+    /// The credential is already on disk — retrieved by adoption or written by
+    /// creation — so this only decides how to run it. Nothing here says who owns
+    /// the tunnel; `docs/adr/0049` keeps that on the endpoint row.
+    pub async fn dedicate(
+        self: &Arc<Self>,
+        hostname: &str,
+        executable: &Path,
+        tunnel_id: &str,
+        credential_file: &Path,
+    ) -> Result<(), Refusal> {
+        if !credential_file.is_file() {
+            return Err(Refusal::rejected(
+                RefusalReason::ConnectorRequired,
+                "The tunnel credential is not on disk.",
+            ));
+        }
+        let prepared = self.prepare(hostname, executable).await?;
+        self.commit(
+            prepared,
+            RunCredential::TunnelCredential {
+                tunnel_id: tunnel_id.to_string(),
+                credential_file: credential_file.to_path_buf(),
+            },
+        )
+    }
+
+    /// Everything both paths must establish before either writes anything.
+    async fn prepare(&self, hostname: &str, executable: &Path) -> Result<Prepared, Refusal> {
+        let https_origin = crate::public_exposure::normalize_hostname(hostname)
+            .map_err(|message| Refusal::rejected(RefusalReason::HostnameInvalid, message))?;
+        let executable_path = Search::from_environment().startable(executable).ok_or_else(|| {
             Refusal::rejected(
                 RefusalReason::ExecutableUnusable,
                 "The selected cloudflared executable cannot be started.",
             )
         })?;
-        let version = compatible_version(&executable).await?;
+        let version = compatible_version(&executable_path).await?;
         let loopback_origin = self.owner_origin.lock().unwrap().clone().ok_or_else(|| {
             Refusal::rejected(
                 RefusalReason::ConnectorRequired,
                 "The connector owner has not finished starting.",
             )
         })?;
+        Ok(Prepared { https_origin, loopback_origin, executable_path, version })
+    }
+
+    /// Write the configuration down and ask supervision to converge on it.
+    fn commit(self: &Arc<Self>, prepared: Prepared, credential: RunCredential) -> Result<(), Refusal> {
         private_directory(&self.directory)?;
-        if !connector_token.trim().is_empty() {
-            private_write(&token_file, connector_token.as_bytes())?;
-        }
+        let Prepared { https_origin, loopback_origin, executable_path, version } = prepared;
         let configuration = Configuration {
             https_origin,
             loopback_origin,
-            executable_path: executable,
-            token_file,
+            executable_path,
+            credential,
             desired_state: DesiredState::Running,
         };
+        // **Here as well as in `supervise`, so that it can fail out loud.** The
+        // supervision loop writes the same file before each launch and can only
+        // report a failure as a connector that never became ready; adoption
+        // journals this as its `configuration` step and needs the refusal
+        // synchronously, with the step marked failed and named as remaining
+        // work. `write_ingress` is idempotent, so the second write is a no-op.
+        write_ingress(&self.directory, &configuration)?;
         persist(&self.directory, &configuration)?;
         {
             let mut runtime = self.runtime.lock().unwrap();
@@ -192,13 +352,27 @@ impl Manager {
     pub fn snapshot(&self) -> Value {
         let runtime = self.runtime.lock().unwrap();
         let Some(configuration) = &runtime.configuration else {
-            return json!({
+            let mut unconfigured = json!({
                 "configured": false, "ownership": CONNECTOR_OWNERSHIP,
                 "desiredState": DesiredState::Stopped,
                 "connectorState": "unconfigured", "readiness": null, "httpsOrigin": null,
                 "executablePath": null, "detectedVersion": null, "metricsOrigin": null,
                 "failureMessage": null, "restartCount": 0, "logs": []
             });
+            // Present before anything is configured, because ticket 05's
+            // dedication confirmation has to show the developer where the
+            // public hostname would be routed *to* — and there is nothing else
+            // on the wire that knows.
+            //
+            // **Absent rather than `null` when there is nothing to say.** The
+            // contract declares it `Schema.optional`, which admits a missing key
+            // and not a null one, so emitting `null` would fail the decode of
+            // the *whole* snapshot — and only in the window before the listener
+            // has a port, which is exactly where nothing would be watching.
+            if let Some(origin) = self.owner_origin.lock().unwrap().clone() {
+                unconfigured["loopbackOrigin"] = json!(origin);
+            }
+            return unconfigured;
         };
         json!({
             "configured": true,
@@ -358,18 +532,23 @@ impl Manager {
                 continue;
             }
             let config_file = self.directory.join(INGRESS);
+            let mut arguments = vec![
+                "tunnel".to_string(),
+                "--config".into(),
+                config_file.to_string_lossy().into_owned(),
+            ];
+            // **Both secrets are passed by file and never as a value.** A
+            // connector token names its file; a dedicated tunnel names nothing
+            // at all here, because the credential's path is inside laplus's own
+            // configuration — which is the strongest form of the same rule.
+            if let RunCredential::ConnectorToken { token_file } = &configuration.credential {
+                arguments.push("--token-file".into());
+                arguments.push(token_file.to_string_lossy().into_owned());
+            }
+            arguments.extend(["--metrics".to_string(), metrics.clone(), "run".into()]);
             let mut command = tokio::process::Command::new(&configuration.executable_path);
             command
-                .args([
-                    "tunnel",
-                    "--config",
-                    &config_file.to_string_lossy(),
-                    "--token-file",
-                    &configuration.token_file.to_string_lossy(),
-                    "--metrics",
-                    &metrics,
-                    "run",
-                ])
+                .args(&arguments)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -575,9 +754,18 @@ impl Manager {
         runtime.readiness = Some(false);
     }
 
+    /// Keep the connector's own output, with its run credential taken out of it.
+    ///
+    /// Read from the file rather than remembered, and read for whichever
+    /// credential this connector has: a tunnel credential is a JSON document
+    /// whose `TunnelSecret` is the secret, so redacting the file's whole
+    /// contents would miss it in every sentence cloudflared could quote it in.
     fn record_log(&self, text: &str, configuration: &Configuration) {
-        let token = std::fs::read_to_string(&configuration.token_file).unwrap_or_default();
-        let redacted = text.replace(token.trim(), "[REDACTED]");
+        let held = std::fs::read_to_string(configuration.credential.file()).unwrap_or_default();
+        let mut redacted = text.to_string();
+        for secret in secrets_within(&held) {
+            redacted = redacted.replace(&secret, "[REDACTED]");
+        }
         let mut runtime = self.runtime.lock().unwrap();
         runtime.logs.extend(
             redacted
@@ -590,6 +778,39 @@ impl Manager {
             runtime.logs.drain(..excess);
         }
     }
+}
+
+/// Every string a run-credential file holds, longest first.
+///
+/// **Two shapes, one rule.** A connector token file *is* the secret. A tunnel
+/// credential file is JSON, and it is the `TunnelSecret` inside it that must
+/// never be quoted back — redacting the whole document would leave the secret
+/// itself readable in any sentence that mentioned only it.
+///
+/// Secret-shaped *fields*, not every field: an account tag and a tunnel id are
+/// also in there, and both appear in the snapshot already — blanking them would
+/// turn "the connector for tunnel 2222 failed" into a sentence nobody can act
+/// on. Matched by what the key is called rather than by its exact spelling, so
+/// a credential shape laplus has not seen still has its secret taken out.
+/// Longest first, so a value that contains another is replaced before its
+/// substring is.
+fn secrets_within(held: &str) -> Vec<String> {
+    let mut secrets = vec![held.trim().to_string()];
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(held) {
+        secrets.extend(
+            fields
+                .iter()
+                .filter(|(name, _)| {
+                    let name = name.to_ascii_lowercase();
+                    name.contains("secret") || name.contains("token") || name.contains("password")
+                })
+                .filter_map(|(_, value)| value.as_str())
+                .map(str::to_string),
+        );
+    }
+    secrets.retain(|secret| !secret.trim().is_empty());
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets
 }
 
 /// Whether the connector answers `/ready`, within a bounded wait.
@@ -752,6 +973,13 @@ fn local_setup(what: &str) -> Refusal {
     )
 }
 
+/// Write a private file, atomically, leaving nothing behind if it fails.
+///
+/// **The cleanup is the point of the wrapper.** The temporary is opened with
+/// `create_new`, so a temporary left behind by a failed write makes every later
+/// write to the same path fail for a reason that has nothing to do with it —
+/// which is how a retried adoption came to fail again at a step whose cause had
+/// already been removed.
 pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
     let temporary = path.with_file_name(format!(
         "{}.private-{}",
@@ -760,6 +988,14 @@ pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
             .unwrap_or("connector"),
         std::process::id(),
     ));
+    let outcome = write_privately(&temporary, path, bytes);
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    outcome
+}
+
+fn write_privately(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -768,7 +1004,7 @@ pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
         options.mode(0o600);
     }
     let mut file = options
-        .open(&temporary)
+        .open(temporary)
         .map_err(|_| local_setup("credential could not be written"))?;
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
@@ -776,16 +1012,16 @@ pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| local_setup("credential could not be protected"))?;
     }
     #[cfg(windows)]
-    protect_windows(&temporary, false)?;
+    protect_windows(temporary, false)?;
     #[cfg(windows)]
     if path.exists() {
         std::fs::remove_file(path).map_err(|_| local_setup("credential could not be replaced"))?;
     }
-    std::fs::rename(&temporary, path)
+    std::fs::rename(temporary, path)
         .map_err(|_| local_setup("credential could not be installed"))?;
     Ok(())
 }
@@ -825,17 +1061,201 @@ fn persist(directory: &Path, configuration: &Configuration) -> Result<(), Refusa
     private_write(&directory.join(SETTINGS), &bytes)
 }
 
+/// laplus's own `cloudflared` configuration, and only ever laplus's own.
+///
+/// **Never `~/.cloudflared/config.yml`.** ADR-0045 puts editing the developer's
+/// default configuration out of scope, so this file lives in laplus's private
+/// directory and is reached with an explicit `--config`.
+///
+/// A dedicated tunnel adds two lines the connector-token form does not have and
+/// cannot have: the tunnel it runs and the credential that runs it. Cloudflare
+/// keeps a token tunnel's ingress, so writing either for one would be laplus
+/// claiming configuration authority it does not hold.
 fn write_ingress(directory: &Path, configuration: &Configuration) -> Result<(), Refusal> {
-    let contents = format!(
+    let mut contents = String::new();
+    if let RunCredential::TunnelCredential { tunnel_id, credential_file } = &configuration.credential
+    {
+        contents.push_str(&format!(
+            "tunnel: {tunnel_id}\ncredentials-file: {}\n",
+            credential_file.display()
+        ));
+    }
+    contents.push_str(&format!(
         "ingress:\n  - hostname: {}\n    service: {}\n  - service: http_status:404\n",
         configuration.https_origin.trim_start_matches("https://"),
         configuration.loopback_origin
-    );
-    private_write(&directory.join(INGRESS), contents.as_bytes())
+    ));
+    // Idempotent, so that the two callers do not fight: a dedication writes
+    // this to find out whether it *can*, and every launch writes it again to
+    // recreate a file somebody removed. Rewriting identical bytes would replace
+    // the inode a running connector is holding for no gain.
+    let path = directory.join(INGRESS);
+    if std::fs::read_to_string(&path).is_ok_and(|held| held == contents) {
+        return Ok(());
+    }
+    private_write(&path, contents.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// **A settings file written before adoption existed still runs.**
+    ///
+    /// `connector.json` is what makes a connector start with its owner, so a
+    /// shape this build cannot read is a public endpoint that silently stops
+    /// coming back after an upgrade — and a connector-token file has no
+    /// ownership in it to migrate, which is the whole reason the untagged form
+    /// is the compatible one.
+    #[test]
+    fn a_connector_token_settings_file_from_before_adoption_still_reads() {
+        let held = serde_json::json!({
+            "httpsOrigin": "https://laplus.example.com",
+            "loopbackOrigin": "http://127.0.0.1:4773",
+            "executablePath": "/usr/bin/cloudflared",
+            "tokenFile": "/private/connector.token",
+            "desiredState": "running",
+        });
+
+        let configuration: Configuration = serde_json::from_value(held.clone()).expect("reads");
+        assert_eq!(
+            configuration.credential,
+            RunCredential::ConnectorToken { token_file: "/private/connector.token".into() }
+        );
+        assert_eq!(configuration.desired_state, DesiredState::Running);
+        // And writes back the same shape, so an upgrade is not a one-way door
+        // for a downgrade either.
+        assert_eq!(serde_json::to_value(&configuration).unwrap(), held);
+    }
+
+    /// The adopted twin, which the connector-token arm must not swallow.
+    #[test]
+    fn a_dedicated_tunnels_settings_file_names_its_tunnel_and_credential() {
+        let held = serde_json::json!({
+            "httpsOrigin": "https://spare.example.com",
+            "loopbackOrigin": "http://127.0.0.1:4773",
+            "executablePath": "/usr/bin/cloudflared",
+            "tunnelId": "22222222-2222-2222-2222-222222222222",
+            "credentialFile": "/private/tunnel.json",
+            "desiredState": "stopped",
+        });
+
+        let configuration: Configuration = serde_json::from_value(held.clone()).expect("reads");
+        assert_eq!(
+            configuration.credential,
+            RunCredential::TunnelCredential {
+                tunnel_id: "22222222-2222-2222-2222-222222222222".into(),
+                credential_file: "/private/tunnel.json".into(),
+            }
+        );
+        assert_eq!(configuration.credential.file(), Path::new("/private/tunnel.json"));
+        assert_eq!(serde_json::to_value(&configuration).unwrap(), held);
+        // Still nothing about who owns the tunnel: that is the endpoint row's
+        // answer and only the endpoint row's. `docs/adr/0049`.
+        assert!(!held.to_string().contains("ownership"));
+        assert!(!held.to_string().contains("adopted"));
+    }
+
+    /// laplus's configuration is laplus's, and a dedicated tunnel's carries two
+    /// lines a connector-token tunnel must never be given — Cloudflare owns that
+    /// one's configuration.
+    #[test]
+    fn only_a_dedicated_tunnel_gets_a_tunnel_and_a_credential_in_the_config() {
+        let directory = tempfile::tempdir().expect("a directory");
+        private_directory(directory.path()).expect("a private directory");
+        let base = Configuration {
+            https_origin: "https://spare.example.com".into(),
+            loopback_origin: "http://127.0.0.1:4773".into(),
+            executable_path: "/usr/bin/cloudflared".into(),
+            credential: RunCredential::ConnectorToken { token_file: "/private/t".into() },
+            desired_state: DesiredState::Running,
+        };
+
+        write_ingress(directory.path(), &base).expect("writes the token form");
+        let token_form = std::fs::read_to_string(directory.path().join(INGRESS)).unwrap();
+        assert!(!token_form.contains("tunnel:"), "{token_form}");
+        assert!(!token_form.contains("credentials-file:"), "{token_form}");
+        assert!(token_form.contains("hostname: spare.example.com"), "{token_form}");
+        assert!(token_form.contains("service: http://127.0.0.1:4773"), "{token_form}");
+
+        let dedicated = Configuration {
+            credential: RunCredential::TunnelCredential {
+                tunnel_id: "22222222".into(),
+                credential_file: "/private/tunnel.json".into(),
+            },
+            ..base
+        };
+        write_ingress(directory.path(), &dedicated).expect("replaces it with the dedicated form");
+        let dedicated_form = std::fs::read_to_string(directory.path().join(INGRESS)).unwrap();
+        assert!(dedicated_form.starts_with("tunnel: 22222222\n"), "{dedicated_form}");
+        assert!(
+            dedicated_form.contains("credentials-file: /private/tunnel.json"),
+            "{dedicated_form}"
+        );
+        assert!(dedicated_form.contains("hostname: spare.example.com"), "{dedicated_form}");
+    }
+
+    /// A credential file's secret is taken out of the connector's own output.
+    ///
+    /// A tunnel credential is a JSON document, so redacting the file's whole
+    /// contents would leave the `TunnelSecret` inside it readable in any
+    /// sentence that quoted only that.
+    #[test]
+    fn a_tunnel_credentials_secret_is_redacted_and_its_tunnel_id_is_not() {
+        let held = r#"{"AccountTag":"account","TunnelID":"2222","TunnelSecret":"sekret-value"}"#;
+        let secrets = secrets_within(held);
+        assert!(secrets.contains(&"sekret-value".to_string()));
+        assert!(secrets.contains(&held.to_string()));
+        // Not every field: the tunnel id and the account tag are in the
+        // snapshot already, and blanking them turns "the connector for tunnel
+        // 2222 failed" into a sentence nobody can act on.
+        assert!(!secrets.contains(&"2222".to_string()));
+        assert!(!secrets.contains(&"account".to_string()));
+        // Longest first, so a value containing another is replaced before its
+        // substring is and the shorter one cannot half-redact the longer.
+        assert_eq!(secrets.first().map(String::len), Some(held.len()));
+
+        let mut spoken = "cloudflared refused sekret-value for tunnel 2222".to_string();
+        for secret in secrets {
+            spoken = spoken.replace(&secret, "[REDACTED]");
+        }
+        assert!(!spoken.contains("sekret-value"), "{spoken}");
+        assert!(spoken.contains("[REDACTED]"), "{spoken}");
+        assert!(spoken.contains("tunnel 2222"), "{spoken}");
+
+        // A connector token file is the secret itself, and an empty file
+        // redacts nothing rather than every gap in the sentence.
+        assert_eq!(secrets_within("connector-secret\n"), ["connector-secret"]);
+        assert!(secrets_within("   ").is_empty());
+    }
+
+    /// A failed write leaves nothing behind.
+    ///
+    /// The temporary is opened with `create_new`, so one left over makes every
+    /// later write to the same path fail for a reason that has nothing to do
+    /// with it — which is how a retried adoption failed a second time at a step
+    /// whose cause had already been removed.
+    #[test]
+    fn a_failed_private_write_does_not_poison_the_next_one() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("connector.yml");
+        // A file cannot be renamed over a directory, which is the same failure
+        // an interrupted adoption produced.
+        std::fs::create_dir(&path).expect("something in the way");
+
+        assert!(private_write(&path, b"first").is_err());
+        std::fs::remove_dir(&path).expect("the obstruction is removed");
+        private_write(&path, b"second").expect("the next write succeeds");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        let leftovers: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().contains(".private-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[test]
     fn restart_backoff_grows_without_deciding_exhaustion() {
         assert_eq!(

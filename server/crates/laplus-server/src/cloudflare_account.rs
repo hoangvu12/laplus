@@ -94,15 +94,20 @@ crate::public_exposure::closed_vocabulary! {
     /// browser, which is what lets a reopened dialog, a reloaded page and a
     /// restarted server agree about how far setup got.
     ///
-    /// **Ticket 05 adds `adopting` here and ticket 06 adds `creating`.** Adding
-    /// one is now a compile error in `step` and a type error in the UI's
-    /// `WIZARD_STEP_LABELS`, which is the point of the enum.
+    /// **Ticket 06 adds `creating` here.** Adding one is a compile error in
+    /// `step` and a type error in the UI's `WIZARD_STEP_LABELS`, which is the
+    /// point of the enum.
     SetupStep as "setup step" {
         SignIn => "sign-in",
         Consent => "consent",
         ChooseTunnel => "choose-tunnel",
         VerifyHostname => "verify-hostname",
         ConfirmAdoption => "confirm-adoption",
+        /// Dedication is confirmed: laplus holds the tunnel's run credential,
+        /// wrote its own configuration, and is bringing the connector up. The
+        /// step an adopted setup resumes at from here on, because there is
+        /// nothing left to ask and everything left to watch.
+        Adopting => "adopting",
     }
 }
 
@@ -395,12 +400,14 @@ impl Account {
         self.persist(&settings)
     }
 
-    /// List the account's tunnels, using the certificate where it already is.
+    /// A startable, compatible cloudflared and the certificate it may spend.
     ///
-    /// Read-only at Cloudflare: repeating it reconciles what laplus knows and
-    /// mutates nothing, which is what makes an interrupted discovery safe to
-    /// simply run again.
-    pub async fn list_tunnels(&self, executable: &Path) -> Result<(), Refusal> {
+    /// Every account-management command needs the same four answers — there is
+    /// a certificate, its authority was accepted, the named executable runs,
+    /// and it is new enough — and each of them is a different refusal. Asked
+    /// once here so that adoption cannot answer them differently from listing,
+    /// which is exactly the sort of drift a second copy produces.
+    async fn consented_command(&self, executable: &Path) -> Result<(PathBuf, PathBuf), Refusal> {
         let certificate = certificate_path();
         if !certificate.is_file() {
             return Err(sign_in_first());
@@ -418,6 +425,21 @@ impl Account {
             .startable(executable)
             .ok_or_else(unusable_executable)?;
         crate::cloudflare_connector::compatible_version(&executable).await?;
+        Ok((executable, certificate))
+    }
+
+    /// What the developer chose, if anything.
+    pub fn selection(&self) -> Option<Selection> {
+        self.settings.lock().unwrap().selection.clone()
+    }
+
+    /// List the account's tunnels, using the certificate where it already is.
+    ///
+    /// Read-only at Cloudflare: repeating it reconciles what laplus knows and
+    /// mutates nothing, which is what makes an interrupted discovery safe to
+    /// simply run again.
+    pub async fn list_tunnels(&self, executable: &Path) -> Result<(), Refusal> {
+        let (executable, certificate) = self.consented_command(executable).await?;
         let output = tokio::process::Command::new(&executable)
             .args([
                 "tunnel",
@@ -497,6 +519,150 @@ impl Account {
         Ok(settings.selection.expect("a selection was just recorded"))
     }
 
+    /// Re-read the selected tunnel's activity from Cloudflare, right now.
+    ///
+    /// **The listing that produced the offer is evidence about the past.** A
+    /// connector can be started between the moment a developer is shown "no
+    /// connector is serving it" and the moment they press the button, and
+    /// ADR-0045 makes an active tunnel externally managed — so the answer laplus
+    /// acts on has to be re-read immediately before the first mutation rather
+    /// than carried from the screen. `list` mutates nothing at Cloudflare, so
+    /// asking again costs a read and buys the race.
+    pub async fn recheck_activity(
+        &self,
+        executable: &Path,
+        tunnel_id: &str,
+    ) -> Result<Activity, Refusal> {
+        self.list_tunnels(executable).await?;
+        self.settings
+            .lock()
+            .unwrap()
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == tunnel_id)
+            .map(|tunnel| tunnel.activity)
+            .ok_or_else(|| {
+                Refusal::precondition(
+                    RefusalReason::SelectionStale,
+                    "That tunnel is no longer in the account's listing. Refresh and choose again.",
+                )
+            })
+    }
+
+    /// Record that the selected tunnel turned out to be somebody else's after
+    /// all, and keep the hostname the developer supplied.
+    ///
+    /// The fallback ADR-0045 requires: an active tunnel is an external tunnel
+    /// endpoint, which laplus verifies and advertises and never operates. The
+    /// choice survives so that the wizard lands on `verify-hostname` rather than
+    /// throwing away an answer that is still true.
+    pub fn reclassify_as_external(&self) -> Result<(), Refusal> {
+        let settings = {
+            let mut settings = self.settings.lock().unwrap();
+            if let Some(selection) = settings.selection.as_mut() {
+                selection.classification = Classification::External;
+                selection.adoption_confirmed = false;
+            }
+            settings.clone()
+        };
+        self.persist(&settings)
+    }
+
+    /// Retrieve the narrow run credential for one existing tunnel.
+    ///
+    /// **`token --cred-file`, not `create`.** An adopted tunnel already exists,
+    /// so laplus fetches the `<UUID>.json` that runs it rather than allocating
+    /// anything — the whole difference between adoption and creation at
+    /// Cloudflare. The credential is written by cloudflared straight into
+    /// laplus's private directory and never passes through a laplus argument,
+    /// a log, a snapshot or an error: what crosses this boundary is a path.
+    ///
+    /// Idempotent by observation. A credential already on disk *for this tunnel*
+    /// is the mutation having already happened, which is what lets an
+    /// interrupted adoption resume without spending the account certificate a
+    /// second time.
+    pub async fn retrieve_tunnel_credential(
+        &self,
+        executable: &Path,
+        tunnel_id: &str,
+        credential_file: &Path,
+    ) -> Result<(), Refusal> {
+        if credential_for(credential_file, tunnel_id) {
+            return Ok(());
+        }
+        let (executable, certificate) = self.consented_command(executable).await?;
+        if let Some(parent) = credential_file.parent() {
+            crate::cloudflare_connector::private_directory(parent)?;
+        }
+        let output = tokio::process::Command::new(&executable)
+            .args([
+                "tunnel",
+                "--origincert",
+                &certificate.to_string_lossy(),
+                "token",
+                "--cred-file",
+                &credential_file.to_string_lossy(),
+                tunnel_id,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|_| {
+                Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared could not retrieve the tunnel credential.",
+                )
+            })?;
+        if !output.status.success() || !credential_for(credential_file, tunnel_id) {
+            // **Take the wreckage with it.** A `token` that failed after
+            // creating the file leaves something that is not a usable
+            // credential, and the resume above decides by looking — so a
+            // half-written file left here would make the *next* attempt skip
+            // the retrieval and configure a connector against garbage.
+            let _ = std::fs::remove_file(credential_file);
+            return Err(Refusal::rejected(
+                RefusalReason::CommandFailed,
+                "cloudflared could not retrieve a run credential for that tunnel. Tunnels created \
+                 before cloudflared 2022.3.0 cannot supply one.",
+            ));
+        }
+        // cloudflared's own umask decides the mode it wrote with, and this file
+        // is the whole of the authority to run the tunnel.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(credential_file, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| {
+                    Refusal::rejected(
+                        RefusalReason::LocalSetupFailed,
+                        "The tunnel credential could not be protected.",
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Record that dedication was confirmed and completed.
+    ///
+    /// Written last, after the credential and the configuration exist, because
+    /// it is what [`step`] reads to say the wizard has moved past the offer —
+    /// and a setup that claimed to have moved on from work it had not done is
+    /// the thing the journal exists to prevent.
+    pub fn confirm_adoption(&self) -> Result<(), Refusal> {
+        let settings = {
+            let mut settings = self.settings.lock().unwrap();
+            let Some(selection) = settings.selection.as_mut() else {
+                return Err(Refusal::precondition(
+                    RefusalReason::SelectionStale,
+                    "Choose a tunnel before dedicating one.",
+                ));
+            };
+            selection.adoption_confirmed = true;
+            settings.clone()
+        };
+        self.persist(&settings)
+    }
+
     /// Write the wizard's own state down.
     ///
     /// Everything that can go wrong here is local — a directory that will not
@@ -513,6 +679,22 @@ impl Account {
         })?;
         crate::cloudflare_connector::private_write(&self.directory.join(SETTINGS), &bytes)
     }
+}
+
+/// Whether the file at `path` is a usable run credential for `tunnel_id`.
+///
+/// **Existence is not the question a resume should ask.** An interrupted
+/// adoption decides whether to spend the account certificate again by looking at
+/// what is on disk, and a file that exists but is truncated, empty, or left over
+/// from a different tunnel would make it skip a retrieval it still needs — and
+/// then configure a connector that can never authenticate. `TunnelID` is
+/// cloudflared's own field name in the `<UUID>.json` credential it writes.
+pub fn credential_for(path: &Path, tunnel_id: &str) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|held| held.get("TunnelID")?.as_str().map(str::to_string))
+        .is_some_and(|held| held == tunnel_id)
 }
 
 /// Where the account certificate is, by cloudflared's own rules.
@@ -601,10 +783,13 @@ fn step(certificate: bool, consented: bool, selection: Option<&Selection>) -> Se
     if !consented {
         return SetupStep::Consent;
     }
-    match selection.map(|selection| selection.classification) {
+    match selection {
         None => SetupStep::ChooseTunnel,
-        Some(Classification::External) => SetupStep::VerifyHostname,
-        Some(Classification::Adoptable) => SetupStep::ConfirmAdoption,
+        Some(selection) => match selection.classification {
+            Classification::External => SetupStep::VerifyHostname,
+            Classification::Adoptable if selection.adoption_confirmed => SetupStep::Adopting,
+            Classification::Adoptable => SetupStep::ConfirmAdoption,
+        },
     }
 }
 

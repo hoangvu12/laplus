@@ -20,6 +20,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
           httpsOrigin: verificationState === "unconfigured" ? null : "https://laplus.example.com",
           wssOrigin: verificationState === "unconfigured" ? null : "wss://laplus.example.com",
           ownership: "external",
+          deletableAtCloudflare: false,
           health: { connector: "external", https: "unknown", webSocket: "unknown" },
           verificationState,
           failureKind: null,
@@ -48,6 +49,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
           httpsOrigin: "https://laplus.example.com",
           wssOrigin: "wss://laplus.example.com",
           ownership: "external",
+          deletableAtCloudflare: false,
           health: { connector: "external", https: "failed", webSocket: "unknown" },
           verificationState: "failed",
           failureKind,
@@ -66,6 +68,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       httpsOrigin: "https://laplus.example.com",
       wssOrigin: "wss://laplus.example.com",
       ownership: "external",
+      deletableAtCloudflare: false,
       health: { connector: "external", https: "healthy", webSocket: "healthy" },
       verificationState: "verified",
       failureKind: null,
@@ -96,6 +99,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       httpsOrigin: "https://laplus.example.com",
       wssOrigin: "wss://laplus.example.com",
       ownership: "external",
+      deletableAtCloudflare: false,
       health: { connector: "external", https: "failed", webSocket: "unknown" },
       verificationState: "failed",
       failureKind: "cloudflare-access",
@@ -113,6 +117,7 @@ describe("ExternalTunnelEndpointSnapshot", () => {
       httpsOrigin: "https://laplus.example.com",
       wssOrigin: "wss://laplus.example.com",
       ownership: "external",
+      deletableAtCloudflare: false,
       health: { connector: "external", https: "healthy", webSocket: "failed" },
       verificationState: "failed",
       failureKind: "cloudflare-access-websocket",
@@ -136,6 +141,7 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
       configured: true,
       ownership: "laplus",
       tunnelOwnership: "laplus-created",
+      deletableAtCloudflare: true,
       desiredState: "running",
       connectorState: "ready",
       readiness: true,
@@ -172,6 +178,7 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
     const base = {
       configured: true,
       ownership: "laplus",
+      deletableAtCloudflare: false,
       desiredState: "running",
       connectorState: "ready",
       readiness: true,
@@ -188,7 +195,14 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
       lastVerifiedAt: "2026-08-03T09:00:00.000Z",
     };
     for (const tunnelOwnership of TunnelOwnership.literals) {
-      expect(decodeManaged({ ...base, tunnelOwnership }).tunnelOwnership).toBe(tunnelOwnership);
+      // The server states the deletion verdict beside the ownership rather than
+      // leaving a client to derive it, so that "Delete everywhere is never
+      // offered for an adopted tunnel" is one answer rather than two that could
+      // disagree. Only `laplus-created` is laplus's to delete — ADR-0045.
+      const deletableAtCloudflare = tunnelOwnership === "laplus-created";
+      const snapshot = decodeManaged({ ...base, tunnelOwnership, deletableAtCloudflare });
+      expect(snapshot.tunnelOwnership).toBe(tunnelOwnership);
+      expect(snapshot.deletableAtCloudflare).toBe(deletableAtCloudflare);
     }
     expect(TunnelOwnership.literals).toEqual(["external", "adopted", "laplus-created"]);
     expect(() => decodeManaged({ ...base, tunnelOwnership: "cloudflare" })).toThrow();
@@ -200,6 +214,7 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
       configured: false,
       ownership: "laplus",
       tunnelOwnership: "external",
+      deletableAtCloudflare: false,
       desiredState: "stopped",
       connectorState: "stopped",
       readiness: null,
@@ -380,6 +395,30 @@ describe("CloudflareAccountSnapshot", () => {
     expect(adoptable.step).toBe("confirm-adoption");
     // ADR-0045: choosing an inactive tunnel is a candidate, not a dedication.
     expect(adoptable.selection?.adoptionConfirmed).toBe(false);
+
+    // And dedication confirmed is a *different* step, so a reopened dialog and
+    // a restarted server agree that the offer has been answered rather than
+    // presenting it again over a connector laplus is already supervising.
+    const adopting = decodeAccount({
+      ...consented,
+      step: "adopting",
+      selection: {
+        tunnelId: inactive.id,
+        name: inactive.name,
+        classification: "adoptable",
+        httpsOrigin: "https://laplus.example.com",
+        adoptionConfirmed: true,
+      },
+    });
+    expect(adopting.step).toBe("adopting");
+    expect(adopting.selection?.adoptionConfirmed).toBe(true);
+    // Still `adoptable`: the listing's word for what may be done with a tunnel
+    // never became a claim about who owns its Cloudflare allocation. That is
+    // `tunnelOwnership` on the endpoint, and adoption makes it `adopted`.
+    expect(adopting.selection?.classification).toBe("adoptable");
+    expect(adopting.selection).not.toHaveProperty("ownership");
+
+    expect(() => decodeAccount({ ...consented, step: "adopted" })).toThrow();
   });
 
   it("decodes every browser-authorization state, including the ones that end it", () => {

@@ -565,6 +565,7 @@ impl Server {
             .route("/api/access/cloudflare/account/consent", post(consent_to_cloudflare_certificate))
             .route("/api/access/cloudflare/account/tunnels", post(list_cloudflare_tunnels))
             .route("/api/access/cloudflare/account/select", post(select_cloudflare_tunnel))
+            .route("/api/access/cloudflare/account/adopt", post(adopt_cloudflare_tunnel))
             .route("/api/access/cloudflare/connector", get(cloudflare_connector_status))
             .route("/api/access/cloudflare/connector/configure", post(configure_cloudflare_connector))
             .route("/api/access/cloudflare/connector/start", post(start_cloudflare_connector))
@@ -1544,7 +1545,7 @@ fn external_tunnel_snapshot(state: &ServerState) -> Result<public_exposure::Snap
     })?;
     Ok(match endpoint {
         None => public_exposure::Snapshot { configured: false, https_origin: None, wss_origin: None,
-            ownership: public_exposure::TunnelOwnership::External, health: serde_json::json!({"connector":"external","https":"unknown","webSocket":"unknown"}), verification_state: "unconfigured".into(), failure_kind: None,
+            ownership: public_exposure::TunnelOwnership::External, deletable_at_cloudflare: false, health: serde_json::json!({"connector":"external","https":"unknown","webSocket":"unknown"}), verification_state: "unconfigured".into(), failure_kind: None,
             failure_message: None, last_attempt_at: None, last_verified_at: None, advertised_endpoint: None },
         Some(endpoint) => {
             let wss = endpoint.https_origin.replacen("https://", "wss://", 1);
@@ -1560,7 +1561,9 @@ fn external_tunnel_snapshot(state: &ServerState) -> Result<public_exposure::Snap
                 "description": if managed { "Connector supervised by laplus" } else { "Externally managed by your operator" }
             }));
             public_exposure::Snapshot { configured: true, https_origin: Some(endpoint.https_origin),
-                wss_origin: Some(wss), ownership: endpoint.ownership, health: serde_json::json!({
+                wss_origin: Some(wss), ownership: endpoint.ownership,
+                deletable_at_cloudflare: endpoint.ownership.deletable_at_cloudflare(),
+                health: serde_json::json!({
                     // Who runs the connector, which the row now knows rather
                     // than assumes: this said `external` even while laplus was
                     // supervising the connector behind the hostname.
@@ -1650,6 +1653,19 @@ async fn register_external_tunnel(State(state): State<Arc<ServerState>>, RawQuer
     }
 }
 
+/// Forget the local record of an endpoint. Never a Cloudflare change.
+///
+/// **This removes the endpoint row and nothing else**, which is the whole of
+/// what forget means for a hostname laplus only verifies. It is deliberately
+/// still reachable for an adopted tunnel — ticket 05's acceptance keeps stop and
+/// forget available — but it is not yet the forget a *supervised* connector
+/// needs: ticket 07 stops the connector and removes laplus's own configuration
+/// and credential first. Until then, forgetting one leaves that connector
+/// running against a hostname nothing records, and the next boot restores it as
+/// `external` because the connector's settings file says nothing about
+/// ownership (`docs/adr/0049`). Losing a record is the safe direction —
+/// `external` authorizes no deletion — but it is a record laplus needs, so
+/// ticket 07 replaces this.
 async fn forget_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
     let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
     if let Err(response) = require_scope(&grant, "access:write") { return response; }
@@ -1683,9 +1699,13 @@ fn managed_connector_snapshot(state: &ServerState) -> serde_json::Value {
         // connector's own file — one record of one fact, `docs/adr/0049`. A
         // connector configured before its endpoint was recorded reads
         // `external`, which is the ownership that authorizes nothing.
-        object.insert("tunnelOwnership".into(), serde_json::json!(verification.as_ref()
+        let ownership = verification.as_ref()
             .map(|endpoint| endpoint.ownership)
-            .unwrap_or(public_exposure::TunnelOwnership::External)));
+            .unwrap_or(public_exposure::TunnelOwnership::External);
+        object.insert("tunnelOwnership".into(), serde_json::json!(ownership));
+        // The offer and the refusal read the same answer — see `Snapshot`.
+        object.insert("deletableAtCloudflare".into(),
+            serde_json::json!(ownership.deletable_at_cloudflare()));
         object.insert("verificationState".into(), serde_json::json!(verification.as_ref()
             .map(|endpoint| endpoint.verification_state.as_str()).unwrap_or("unconfigured")));
         object.insert("failureKind".into(), serde_json::json!(verification.as_ref().and_then(|endpoint| endpoint.failure_kind.as_deref())));
@@ -1864,21 +1884,265 @@ async fn select_cloudflare_tunnel(
         Err(refusal) => return refusal.into_response(),
     };
     if selection.classification == crate::cloudflare_account::Classification::External {
-        if let Err(error) = state
-            .services
-            .shell
-            .database()
-            .register_public_exposure_endpoint(crate::store::NewPublicExposure::external(
-                &selection.https_origin,
-            ))
-        {
-            eprintln!("laplus: cannot register the external tunnel endpoint: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        if let Err(response) = record_external_endpoint(&state, &selection.https_origin) {
+            return response;
         }
-        let verification_state = Arc::clone(&state);
-        tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
     }
     Json(state.cloudflare_account.snapshot()).into_response()
+}
+
+/// Record a hostname as somebody else's, and start proving it reaches here.
+///
+/// **Both places an active tunnel is discovered end the same way**: choosing one
+/// from the listing, and finding that the one being dedicated has become active.
+/// ADR-0045 makes them one outcome — an external tunnel endpoint, verified and
+/// advertised and never operated — so they are one function rather than two
+/// copies that could drift into meaning different things.
+fn record_external_endpoint(state: &Arc<ServerState>, origin: &str) -> Result<(), Response> {
+    state
+        .services
+        .shell
+        .database()
+        .register_public_exposure_endpoint(crate::store::NewPublicExposure::external(origin))
+        .map_err(|error| {
+            eprintln!("laplus: cannot register the external tunnel endpoint: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+    let verifying = Arc::clone(state);
+    tokio::spawn(async move { let _ = run_external_verification(&verifying).await; });
+    Ok(())
+}
+
+/// The two mutations dedicating an inactive tunnel performs, in order.
+///
+/// Named once because three things have to agree about them: what is journaled,
+/// what a refusal reports as completed, and what it reports as still
+/// outstanding. Neither touches the Cloudflare *allocation* — adoption
+/// retrieves a credential for a tunnel that already exists and writes laplus's
+/// own configuration, which is why an adopted tunnel is never laplus's to
+/// delete (ADR-0049).
+const ADOPTION_STEPS: [public_exposure::MutationStep; 2] = [
+    public_exposure::MutationStep::Credential,
+    public_exposure::MutationStep::Configuration,
+];
+
+fn adoption_remaining(
+    completed: &[public_exposure::MutationStep],
+) -> Vec<public_exposure::MutationStep> {
+    ADOPTION_STEPS
+        .into_iter()
+        .filter(|step| !completed.contains(step))
+        .collect()
+}
+
+/// Dedicate an inactive existing tunnel to this environment.
+///
+/// **Three rules, and each of them is a separate refusal.**
+///
+/// *The offer is evidence about the past.* A connector can start between the
+/// listing that produced the dedication screen and the button that confirms it,
+/// and ADR-0045 makes an active tunnel externally managed. So activity is
+/// re-read immediately before the first mutation, and a tunnel that has become
+/// active falls back to an external tunnel endpoint — the hostname is still
+/// verified and advertised, and laplus operates nothing.
+///
+/// *A repeat is a reconciliation.* An adoption already recorded returns what it
+/// recorded. That is not merely an optimisation: the recheck above would find
+/// laplus's *own* connector serving the tunnel and would disown a tunnel this
+/// environment is correctly running.
+///
+/// *A partial adoption resumes.* Each mutation is journaled before it happens
+/// and settled after, and a credential already on disk is the mutation having
+/// already occurred — so a retry after a failure spends the account certificate
+/// once, not twice, and the refusal names both what is done and what is left.
+async fn adopt_cloudflare_tunnel(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<CloudflareAccountCommand>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    let Some(selection) = state.cloudflare_account.selection() else {
+        return public_exposure::Refusal::precondition(
+            public_exposure::RefusalReason::SelectionStale,
+            "Choose a tunnel and give its hostname before dedicating one.",
+        ).into_response();
+    };
+    if selection.classification != crate::cloudflare_account::Classification::Adoptable {
+        return public_exposure::Refusal::precondition(
+            public_exposure::RefusalReason::OwnershipConflict,
+            "That tunnel is already serving connections, so it is externally managed. laplus can \
+             verify and advertise its hostname but never operate it.",
+        ).into_response();
+    }
+    let database = state.services.shell.database();
+    let recorded = database.public_exposure_endpoint().ok().flatten();
+    if let Some(endpoint) = &recorded {
+        if endpoint.ownership != public_exposure::TunnelOwnership::External
+            && endpoint.tunnel_id.as_deref() != Some(selection.tunnel_id.as_str())
+        {
+            return public_exposure::Refusal::precondition(
+                public_exposure::RefusalReason::OwnershipConflict,
+                format!(
+                    "This environment already has a {} Cloudflare tunnel. Forget it before \
+                     dedicating another.",
+                    endpoint.ownership
+                ),
+            ).into_response();
+        }
+    }
+
+    // **Is laplus already running this tunnel?** Two records answer it and
+    // either is enough, because they are written at different moments: the
+    // endpoint row is written last, so a confirmation interrupted between
+    // configuring the connector and recording the row leaves only the second.
+    // Skipping the recheck on either is what stops a resume from reading
+    // laplus's *own* connections as somebody else's and disowning a tunnel this
+    // environment is correctly serving. ADR-0050.
+    let already_running_it = recorded.as_ref().is_some_and(|endpoint| {
+        endpoint.ownership == public_exposure::TunnelOwnership::Adopted
+            && endpoint.tunnel_id.as_deref() == Some(selection.tunnel_id.as_str())
+    }) || state.cloudflare_connector.dedicated_tunnel_id().as_deref()
+        == Some(selection.tunnel_id.as_str());
+
+    let credential_file = state.cloudflare_connector.credential_path();
+    let configuration_file = state.cloudflare_connector.configuration_path();
+    // **What a previous attempt left, before anything else is decided.** Every
+    // refusal below has to name the work already done, and a refusal that
+    // reported none because *this* attempt had done none would be the
+    // untruthful recovery state the spec forbids — the credential a failed
+    // first try retrieved is still at Cloudflare's expense and still on disk.
+    let mut completed: Vec<public_exposure::MutationStep> = Vec::new();
+    if crate::cloudflare_account::credential_for(&credential_file, &selection.tunnel_id) {
+        completed.push(public_exposure::MutationStep::Credential);
+    }
+
+    let activity = if already_running_it {
+        crate::cloudflare_account::Activity::Inactive
+    } else {
+        match state
+            .cloudflare_account
+            .recheck_activity(&body.executable_path, &selection.tunnel_id)
+            .await
+        {
+            Ok(activity) => activity,
+            Err(refusal) => return refusal.into_response(),
+        }
+    };
+    if activity == crate::cloudflare_account::Activity::Active {
+        if let Err(refusal) = state.cloudflare_account.reclassify_as_external() {
+            return refusal.into_response();
+        }
+        if let Err(response) = record_external_endpoint(&state, &selection.https_origin) {
+            return response;
+        }
+        // This attempt mutated nothing, and the hostname is now registered as
+        // somebody else's — which is a complete answer rather than a partial
+        // adoption. `completed` is whatever an *earlier* attempt left behind,
+        // so the sentence never claims a rollback that did not happen.
+        let remaining = adoption_remaining(&completed);
+        return public_exposure::Refusal::precondition(
+            public_exposure::RefusalReason::TunnelBecameActive,
+            "A connector started serving that tunnel, so it is externally managed. laplus \
+             registered the hostname as an external tunnel endpoint instead and will verify and \
+             advertise it without operating the tunnel.",
+        )
+        .after(&completed, &remaining)
+        .into_response();
+    }
+
+    if !completed.contains(&public_exposure::MutationStep::Credential) {
+        let sequence = database
+            .begin_mutation_step(
+                public_exposure::MutationIntent::Adopt,
+                public_exposure::MutationStep::Credential,
+                Some(&credential_file.to_string_lossy()),
+            )
+            .ok();
+        let retrieved = state
+            .cloudflare_account
+            .retrieve_tunnel_credential(
+                &body.executable_path,
+                &selection.tunnel_id,
+                &credential_file,
+            )
+            .await;
+        settle_adoption_step(&state, sequence, retrieved.is_ok());
+        if let Err(refusal) = retrieved {
+            return refusal.after(&completed, &adoption_remaining(&completed)).into_response();
+        }
+        completed.push(public_exposure::MutationStep::Credential);
+    }
+
+    let sequence = database
+        .begin_mutation_step(
+            public_exposure::MutationIntent::Adopt,
+            public_exposure::MutationStep::Configuration,
+            Some(&configuration_file.to_string_lossy()),
+        )
+        .ok();
+    let configured = state
+        .cloudflare_connector
+        .dedicate(
+            &selection.https_origin,
+            &body.executable_path,
+            &selection.tunnel_id,
+            &credential_file,
+        )
+        .await;
+    settle_adoption_step(&state, sequence, configured.is_ok());
+    if let Err(refusal) = configured {
+        return refusal.after(&completed, &adoption_remaining(&completed)).into_response();
+    }
+    completed.push(public_exposure::MutationStep::Configuration);
+
+    // `Adopted`, with no DNS record: laplus configured and runs this tunnel and
+    // did not allocate it or route it, so it is the one ownership that is
+    // laplus-managed locally and undeletable at Cloudflare. ADR-0049.
+    if let Err(error) = database.register_public_exposure_endpoint(crate::store::NewPublicExposure {
+        https_origin: &selection.https_origin,
+        ownership: public_exposure::TunnelOwnership::Adopted,
+        tunnel_id: Some(&selection.tunnel_id),
+        dns_record: None,
+        credential_path: Some(&credential_file.to_string_lossy()),
+        configuration_path: Some(&configuration_file.to_string_lossy()),
+    }) {
+        eprintln!("laplus: cannot persist the adopted tunnel endpoint: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Err(refusal) = state.cloudflare_account.confirm_adoption() {
+        return refusal.into_response();
+    }
+    // Nothing about this adoption is outstanding, so its journal is not
+    // residue a later command has to reason about.
+    if let Err(error) = database.clear_mutation_journal(public_exposure::MutationIntent::Adopt) {
+        eprintln!("laplus: cannot clear the adoption journal: {error}");
+    }
+    let verification_state = Arc::clone(&state);
+    tokio::spawn(async move { let _ = run_external_verification(&verification_state).await; });
+    Json(state.cloudflare_account.snapshot()).into_response()
+}
+
+/// Settle a journaled adoption step, if journaling it worked at all.
+///
+/// A journal that cannot be written must not stop the mutation it describes:
+/// the endpoint row is the durable record, and refusing to adopt because a log
+/// line would not write would trade a working tunnel for a tidier history.
+fn settle_adoption_step(state: &ServerState, sequence: Option<i64>, succeeded: bool) {
+    let Some(sequence) = sequence else { return };
+    let state_word = if succeeded {
+        public_exposure::MutationState::Completed
+    } else {
+        public_exposure::MutationState::Failed
+    };
+    if let Err(error) = state
+        .services
+        .shell
+        .database()
+        .settle_mutation_step(sequence, state_word, None)
+    {
+        eprintln!("laplus: cannot settle a Cloudflare mutation step: {error}");
+    }
 }
 
 async fn cloudflare_connector_status(
@@ -1897,6 +2161,11 @@ async fn configure_cloudflare_connector(
     Json(body): Json<ConfigureCloudflareConnector>,
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    // The third laundering route, and the one adoption opened. A connector-token
+    // connector is `external` by definition, so configuring one over an adopted
+    // or laplus-created tunnel would rewrite the row that says laplus configured
+    // it — and with it the credential and configuration paths Forget removes.
+    if let Some(response) = ownership_is_not_the_clients_to_change(&state) { return response; }
     if let Err(refusal) = state.cloudflare_connector.configure(
         &body.hostname, &body.executable_path, &body.connector_token,
     ).await {

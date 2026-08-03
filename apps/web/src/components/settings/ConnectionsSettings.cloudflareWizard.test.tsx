@@ -11,7 +11,10 @@
  * handlers (`test/environmentHttpTest.ts`), so a payload the contract would
  * reject fails here rather than in a browser.
  */
-import { EnvironmentScopeRequiredError } from "@t3tools/contracts";
+import {
+  EnvironmentPublicExposurePreconditionError,
+  EnvironmentScopeRequiredError,
+} from "@t3tools/contracts";
 import type {
   CloudflareAccountSnapshot,
   CloudflaredExecutableDiscovery,
@@ -43,6 +46,7 @@ const unconfiguredExternal: ExternalTunnelEndpointSnapshot = {
   httpsOrigin: null,
   wssOrigin: null,
   ownership: "external",
+  deletableAtCloudflare: false,
   health: { connector: "external", https: "unknown", webSocket: "unknown" },
   verificationState: "unconfigured",
   failureKind: null,
@@ -67,10 +71,14 @@ const unconfiguredConnector: ManagedCloudflareConnectorSnapshot = {
   configured: false,
   ownership: "laplus",
   tunnelOwnership: "external",
+  deletableAtCloudflare: false,
   desiredState: "stopped",
   connectorState: "stopped",
   readiness: null,
   httpsOrigin: null,
+  // The server answers this before anything is configured, because the
+  // dedication confirmation has to show where the public hostname would go.
+  loopbackOrigin: "http://127.0.0.1:4773",
   executablePath: null,
   detectedVersion: null,
   metricsOrigin: null,
@@ -617,6 +625,157 @@ describe("an administrator who cannot write", () => {
       expect(screen.queryByRole("button", { name: "Use this tunnel" })).toBe(null);
       expect(screen.queryByRole("button", { name: "Refresh tunnel list" })).toBe(null);
       expect(screen.queryByRole("button", { name: "Register" })).toBe(null);
+    } finally {
+      await testApi.dispose();
+    }
+  });
+});
+
+describe("dedicating an inactive tunnel", () => {
+  const offered: CloudflareAccountSnapshot = {
+    ...listed,
+    step: "confirm-adoption",
+    selection: {
+      tunnelId: inactiveTunnel.id,
+      name: inactiveTunnel.name,
+      classification: "adoptable",
+      httpsOrigin: "https://spare.example.com",
+      adoptionConfirmed: false,
+    },
+  };
+
+  const dedicated: CloudflareAccountSnapshot = {
+    ...offered,
+    step: "adopting",
+    selection: { ...offered.selection!, adoptionConfirmed: true },
+  };
+
+  const adoptedConnector: ManagedCloudflareConnectorSnapshot = {
+    ...readyConnector,
+    tunnelOwnership: "adopted",
+    deletableAtCloudflare: false,
+    httpsOrigin: "https://spare.example.com",
+  };
+
+  /**
+   * ADR-0045 makes dedication a separate, explicit confirmation, so what it
+   * confirms has to be on the screen that asks for it — including where the
+   * public hostname would be routed to, which nothing else on the wire says.
+   */
+  it("shows the tunnel, hostname, loopback target and consequences, then dedicates", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: offered,
+      adoptCloudflareTunnel: () => Effect.succeed(dedicated),
+      managedCloudflareConnector: () => Effect.succeed(unconfiguredConnector),
+    });
+    try {
+      await openWizard(user);
+
+      const offer = await screen.findByLabelText("Dedicate the tunnel");
+      expect(offer.textContent).toContain(inactiveTunnel.id);
+      expect(offer.textContent).toContain("https://spare.example.com");
+      expect(offer.textContent).toContain("http://127.0.0.1:4773");
+      expect(offer.textContent).toContain("Inactive");
+      expect(offer.textContent).toContain("can never be deleted from here");
+
+      await user.click(screen.getByRole("button", { name: "Dedicate this tunnel" }));
+
+      await waitFor(() =>
+        expect(testApi.calls.adoptCloudflareTunnel).toEqual([
+          { executablePath: "/usr/bin/cloudflared" },
+        ]),
+      );
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * The activation race, as the developer sees it. The server refuses and
+   * registers the hostname as somebody else's instead; the screen has to say
+   * both that nothing was done and what is therefore still outstanding, rather
+   * than claiming a rollback that never happened.
+   */
+  it("reports a tunnel that became active without claiming a rollback", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: offered,
+      adoptCloudflareTunnel: () =>
+        Effect.fail(
+          new EnvironmentPublicExposurePreconditionError({
+            code: "public_exposure_refused",
+            reason: "tunnel-became-active",
+            message:
+              "A connector started serving that tunnel, so it is externally managed. laplus registered the hostname as an external tunnel endpoint instead.",
+            completed: [],
+            remaining: ["credential", "configuration"],
+            traceId: "trace",
+          }),
+        ),
+    });
+    try {
+      await openWizard(user);
+      await user.click(await screen.findByRole("button", { name: "Dedicate this tunnel" }));
+
+      const refusal = await screen.findByText(/externally managed/);
+      expect(refusal.textContent).toContain("external tunnel endpoint instead");
+      expect(refusal.textContent).toContain(
+        "Still outstanding: the tunnel credential, writing the connector configuration.",
+      );
+      expect(refusal.textContent).not.toContain("Already done");
+    } finally {
+      await testApi.dispose();
+    }
+  });
+
+  /**
+   * The whole of ticket 05's last acceptance line that this half owns: an
+   * adopted tunnel keeps Stop, and is never offered a Cloudflare deletion —
+   * because the *server* says it is not deletable, not because a control was
+   * left out of a layout.
+   */
+  it("keeps stop available and never offers to delete an adopted tunnel", async () => {
+    const user = userEvent.setup();
+    const testApi = await mount({
+      account: dedicated,
+      connector: adoptedConnector,
+      external: {
+        ...verifiedExternal,
+        ownership: "adopted",
+        httpsOrigin: "https://spare.example.com",
+      },
+      pairingCredential: () =>
+        Effect.succeed({
+          id: "pairing-link",
+          credential: "pairing-credential",
+          expiresAt: DateTime.makeUnsafe("2026-08-03T09:05:00.000Z"),
+        }),
+    });
+    try {
+      await openWizard(user);
+
+      const panel = await screen.findByLabelText("Dedicated Cloudflare tunnel");
+      expect(panel.textContent).toContain("Adopted");
+      expect(panel.textContent).toContain("can never delete either");
+      expect(screen.getByRole("button", { name: "Stop connector" })).toBeTruthy();
+      // Neither the connector-token panel's controls nor any deletion.
+      expect(screen.queryByLabelText("Connector token")).toBe(null);
+      expect(screen.queryByRole("button", { name: /Delete/ })).toBe(null);
+      // Nor the *external* endpoint's Forget, which removes the row and stops
+      // nothing — the same treatment a laplus-run connector-token connector has
+      // always had. The forget a supervised connector needs stops it and
+      // removes laplus's own credential and configuration first, and that is
+      // ticket 07's; this ticket's last checkbox is met only in part because of
+      // it.
+      expect(screen.queryByRole("button", { name: "Forget" })).toBe(null);
+
+      // A verified adopted endpoint pairs like any other: the pairing link
+      // belongs to whichever endpoint was verified, not to a setup path.
+      await user.click(screen.getByRole("button", { name: "Pair device" }));
+      const pairing = await screen.findByLabelText("Cloudflare pairing URL");
+      expect((pairing as HTMLTextAreaElement).value).toContain("https://spare.example.com");
+      expect(testApi.calls.pairingCredential).toHaveLength(1);
     } finally {
       await testApi.dispose();
     }
