@@ -546,6 +546,7 @@ impl Server {
             .route("/api/access/cloudflare/challenge", get(diagnostic_http_challenge))
             .route("/api/access/cloudflare/challenge/ws", get(diagnostic_ws_challenge))
             .route("/api/access/cloudflare/executables", get(cloudflare_executables))
+            .route("/api/access/cloudflare/install", get(cloudflare_install_state).post(install_cloudflared))
             .route("/api/access/cloudflare/connector", get(cloudflare_connector_status))
             .route("/api/access/cloudflare/connector/configure", post(configure_cloudflare_connector))
             .route("/api/access/cloudflare/connector/start", post(start_cloudflare_connector))
@@ -1533,6 +1534,44 @@ async fn cloudflare_executables(
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:read") { return response; }
     Json(state.cloudflare_connector.discover().await).into_response()
+}
+
+async fn cloudflare_install_state(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:read") { return response; }
+    Json(state.cloudflare_connector.install_snapshot().await).into_response()
+}
+
+/// Approving an installation means approving one identified release, so the
+/// client sends back the version and digest it was shown. A feed that has moved
+/// on is a conflict the developer re-approves, never a different executable
+/// installed under an approval given for another one.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovedCloudflaredRelease {
+    version: String,
+    checksum: String,
+}
+
+async fn install_cloudflared(
+    State(state): State<Arc<ServerState>>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    Json(body): Json<ApprovedCloudflaredRelease>,
+) -> Response {
+    if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
+    match state.cloudflare_connector.install(&body.version, &body.checksum).await {
+        Ok(()) => Json(state.cloudflare_connector.install_snapshot().await).into_response(),
+        Err(crate::cloudflare_install::Refusal::Conflict(message)) => {
+            (StatusCode::CONFLICT, Json(serde_json::json!({"message": message}))).into_response()
+        }
+        Err(crate::cloudflare_install::Refusal::Rejected(message)) => {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response()
+        }
+    }
 }
 
 async fn cloudflare_connector_status(

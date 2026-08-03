@@ -27,6 +27,8 @@ import {
 import { AuthSessionId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
+  ApproveCloudflaredReleaseInput,
+  CloudflaredInstallationSnapshot,
   ExternalTunnelEndpointSnapshot,
   CloudflaredExecutableDiscovery,
   ConfigureManagedCloudflareConnectorInput,
@@ -451,6 +453,21 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
     HttpApiEndpoint.get("cloudflaredExecutables", "/api/access/cloudflare/executables", {
       headers: OptionalBearerHeaders,
       success: CloudflaredExecutableDiscovery,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("cloudflaredInstallation", "/api/access/cloudflare/install", {
+      headers: OptionalBearerHeaders,
+      success: CloudflaredInstallationSnapshot,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("installCloudflaredRelease", "/api/access/cloudflare/install", {
+      headers: OptionalBearerHeaders,
+      payload: ApproveCloudflaredReleaseInput,
+      success: CloudflaredInstallationSnapshot,
       error: EnvironmentScopedOperationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )

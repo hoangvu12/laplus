@@ -13,7 +13,9 @@ import {
   type ExecutionEnvironmentDescriptor,
   type EnvironmentAuthInvalidError,
   type ExternalTunnelEndpointSnapshot,
+  type ApproveCloudflaredReleaseInput,
   type CloudflaredExecutableDiscovery,
+  type CloudflaredInstallationSnapshot,
   type ConfigureManagedCloudflareConnectorInput,
   type ManagedCloudflareConnectorSnapshot,
   type RegisterExternalTunnelEndpointInput,
@@ -47,6 +49,10 @@ interface EnvironmentHttpTestScenario {
   readonly testExternalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
   readonly forgetExternalTunnel?: () => Effect.Effect<ExternalTunnelEndpointSnapshot>;
   readonly cloudflaredExecutables?: () => Effect.Effect<CloudflaredExecutableDiscovery>;
+  readonly cloudflaredInstallation?: () => Effect.Effect<CloudflaredInstallationSnapshot>;
+  readonly installCloudflaredRelease?: (
+    payload: ApproveCloudflaredReleaseInput,
+  ) => Effect.Effect<CloudflaredInstallationSnapshot>;
   readonly managedCloudflareConnector?: () => Effect.Effect<ManagedCloudflareConnectorSnapshot>;
   readonly configureManagedCloudflareConnector?: (
     payload: ConfigureManagedCloudflareConnectorInput,
@@ -66,6 +72,8 @@ export interface EnvironmentHttpTestCalls {
   testExternalTunnel: number;
   forgetExternalTunnel: number;
   cloudflaredExecutables: number;
+  cloudflaredInstallation: number;
+  installCloudflaredRelease: Array<ApproveCloudflaredReleaseInput>;
   managedCloudflareConnector: number;
   configureManagedCloudflareConnector: Array<ConfigureManagedCloudflareConnectorInput>;
   startManagedCloudflareConnector: number;
@@ -100,6 +108,8 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
     testExternalTunnel: 0,
     forgetExternalTunnel: 0,
     cloudflaredExecutables: 0,
+    cloudflaredInstallation: 0,
+    installCloudflaredRelease: [],
     managedCloudflareConnector: 0,
     configureManagedCloudflareConnector: [],
     startManagedCloudflareConnector: 0,
@@ -187,6 +197,20 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
               return (
                 scenario.cloudflaredExecutables?.() ??
                 unexpectedEndpoint("access.cloudflaredExecutables")
+              );
+            })
+            .handle("cloudflaredInstallation", () => {
+              calls.cloudflaredInstallation += 1;
+              return (
+                scenario.cloudflaredInstallation?.() ??
+                unexpectedEndpoint("access.cloudflaredInstallation")
+              );
+            })
+            .handle("installCloudflaredRelease", ({ payload }) => {
+              calls.installCloudflaredRelease.push(payload);
+              return (
+                scenario.installCloudflaredRelease?.(payload) ??
+                unexpectedEndpoint("access.installCloudflaredRelease")
               );
             })
             .handle("managedCloudflareConnector", () => {

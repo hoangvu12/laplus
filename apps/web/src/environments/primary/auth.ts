@@ -10,7 +10,9 @@ import type {
 import {
   EnvironmentHttpCommonError,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type ApproveCloudflaredReleaseInput,
   type CloudflaredExecutableDiscovery,
+  type CloudflaredInstallationSnapshot,
   type ConfigureManagedCloudflareConnectorInput,
   type ExternalTunnelEndpointSnapshot,
   type ManagedCloudflareConnectorSnapshot,
@@ -44,6 +46,8 @@ const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "test-external-tunnel-endpoint",
   "forget-external-tunnel-endpoint",
   "discover-cloudflared-executables",
+  "read-cloudflared-installation",
+  "install-cloudflared-release",
   "read-managed-cloudflare-connector",
   "configure-managed-cloudflare-connector",
   "start-managed-cloudflare-connector",
@@ -504,6 +508,40 @@ export async function discoverCloudflaredExecutables(): Promise<CloudflaredExecu
   } catch (error) {
     throw PrimaryEnvironmentRequestError.fromCause({
       operation: "discover-cloudflared-executables",
+      cause: error,
+    });
+  }
+}
+
+export async function readCloudflaredInstallation(): Promise<CloudflaredInstallationSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) => client.access.cloudflaredInstallation({ headers: {} })),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "read-cloudflared-installation",
+      cause: error,
+    });
+  }
+}
+
+export async function installCloudflaredRelease(
+  payload: ApproveCloudflaredReleaseInput,
+): Promise<CloudflaredInstallationSnapshot> {
+  try {
+    return await runPrimaryHttp(
+      PrimaryEnvironmentHttpClient.pipe(
+        Effect.flatMap((client) =>
+          client.access.installCloudflaredRelease({ headers: {}, payload }),
+        ),
+      ),
+    );
+  } catch (error) {
+    throw PrimaryEnvironmentRequestError.fromCause({
+      operation: "install-cloudflared-release",
       cause: error,
     });
   }

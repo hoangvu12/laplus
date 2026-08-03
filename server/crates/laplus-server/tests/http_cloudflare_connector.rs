@@ -29,7 +29,7 @@ fn fake_cloudflared(
     let mode = directory.join("cloudflared.mode");
     let source = format!(
         r#"#!/usr/bin/env python3
-import http.server, json, os, signal, sys
+import http.server, json, os, signal, sys, time
 TRACE = {trace:?}
 MODE = {mode:?}
 if '--version' in sys.argv:
@@ -50,6 +50,8 @@ if os.path.exists(MODE) and open(MODE).read().strip() == 'replace':
         raise SystemExit(0)
 class Ready(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        while os.path.exists(MODE) and open(MODE).read().strip() == 'hang':
+            time.sleep(0.05)
         self.send_response(200 if self.path == '/ready' else 404)
         self.end_headers()
     def log_message(self, *args): pass
@@ -76,7 +78,10 @@ async fn wait_for_json(
     predicate: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
     let mut last = serde_json::Value::Null;
-    for _ in 0..100 {
+    // A hang detector, not a budget — see `READ_TIMEOUT` in the harness. Wide
+    // enough that a supervisor waiting out an unanswered probe still converges
+    // here, and a genuine wedge is still a failure rather than a hung suite.
+    for _ in 0..500 {
         let response = server.get("/api/access/cloudflare/connector").await;
         last = response.body.clone();
         if response.status == 200 && predicate(&response.body) {
@@ -266,6 +271,39 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
             .count(),
         launches + 1
     );
+    server.stop().await;
+}
+
+/// A connector that accepts a readiness probe and never answers it must still
+/// be stoppable.
+///
+/// The probe is the supervision loop's body, so an unbounded one is a connector
+/// that cannot be turned off: the stop is recorded, the desired state changes,
+/// and nothing acts on it because the task is still inside the request. This
+/// went unnoticed until the whole suite ran at once and the wedge became likely
+/// enough to happen. The budget is a hang detector — the assertion is that the
+/// connector stops, never how long it took.
+#[tokio::test]
+async fn a_connector_that_never_answers_a_probe_can_still_be_stopped() {
+    let directory = tempfile::tempdir().unwrap();
+    let (executable, _, mode) = fake_cloudflared(directory.path());
+    std::fs::write(&mode, "hang").unwrap();
+    let server = TestServer::start_configured_in(directory.path()).await;
+    let configured = server.post_json(
+        "/api/access/cloudflare/connector/configure",
+        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"connector-secret"}),
+    ).await;
+    assert_eq!(configured.status, 200, "{}", configured.text);
+    let starting = wait_for_json(&server, |body| body["connectorState"] == "starting").await;
+    assert_eq!(starting["readiness"], false);
+
+    let stopped = server
+        .post_json("/api/access/cloudflare/connector/stop", &json!({}))
+        .await;
+    assert_eq!(stopped.status, 200, "{}", stopped.text);
+    let settled = wait_for_json(&server, |body| body["connectorState"] == "stopped").await;
+    assert_eq!(settled["readiness"], serde_json::Value::Null);
+    assert_eq!(settled["desiredState"], "stopped");
     server.stop().await;
 }
 

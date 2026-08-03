@@ -15,6 +15,7 @@ const SETTINGS: &str = "connector.json";
 const TOKEN: &str = "connector.token";
 const INGRESS: &str = "connector.yml";
 const MAX_RESTARTS: u8 = 3;
+const READY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +45,7 @@ struct Runtime {
 #[derive(Debug)]
 pub struct Manager {
     directory: PathBuf,
+    installer: crate::cloudflare_install::Installer,
     runtime: Mutex<Runtime>,
     changed: Notify,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -64,6 +66,7 @@ impl Manager {
             _ => "stopped",
         };
         Arc::new(Self {
+            installer: crate::cloudflare_install::Installer::open(&directory),
             directory,
             runtime: Mutex::new(Runtime {
                 configuration,
@@ -182,6 +185,12 @@ impl Manager {
         })
     }
 
+    /// Every executable this environment could run, in the order the policy
+    /// prefers them: a system installation, then whatever the developer
+    /// selected, then the copy laplus installed for itself.
+    ///
+    /// The source is what makes ownership legible — it is the difference
+    /// between an executable laplus may replace and one it must leave alone.
     pub async fn discover(&self) -> Value {
         let selected = self
             .runtime
@@ -190,21 +199,28 @@ impl Manager {
             .configuration
             .as_ref()
             .map(|configuration| configuration.executable_path.clone());
-        let mut candidates = Vec::new();
-        if let Some(path) = selected.clone() {
-            candidates.push(path);
-        }
+        let app_managed = self.installer.installed_path();
+        let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
         if let Some(path) = Search::from_environment().locate("cloudflared") {
-            if !candidates.contains(&path) {
-                candidates.push(path);
+            candidates.push((path, "system"));
+        }
+        for path in [selected.clone(), app_managed.clone()].into_iter().flatten() {
+            if candidates.iter().any(|(known, _)| known == &path) {
+                continue;
             }
+            let source = if app_managed.as_ref() == Some(&path) {
+                "app-managed"
+            } else {
+                "user-selected"
+            };
+            candidates.push((path, source));
         }
         let mut executables = Vec::new();
-        for path in candidates {
+        for (path, source) in candidates {
             let detected = detect_version(&path).await;
             executables.push(json!({
                 "path": path,
-                "source": if selected.as_ref() == Some(&path) { "user-selected" } else { "system" },
+                "source": source,
                 "selected": selected.as_ref() == Some(&path),
                 "version": detected.as_ref().ok(),
                 "compatibility": if detected.as_ref().is_ok_and(|version| compatible_version_text(version)) { "compatible" } else { "incompatible" },
@@ -212,6 +228,20 @@ impl Manager {
             }));
         }
         json!({ "executables": executables })
+    }
+
+    /// What the wizard may offer, and what laplus has already installed.
+    pub async fn install_snapshot(&self) -> Value {
+        self.installer.snapshot().await
+    }
+
+    /// Install the release the developer approved, by version and digest.
+    pub async fn install(
+        &self,
+        version: &str,
+        checksum: &str,
+    ) -> Result<(), crate::cloudflare_install::Refusal> {
+        self.installer.install(version, checksum).await
     }
 
     pub fn set_desired(&self, running: bool, retry: bool) -> Result<(), String> {
@@ -426,12 +456,7 @@ impl Manager {
                                     }
                                     break;
                                 }
-                                if !client
-                                    .get(format!("http://{metrics}/ready"))
-                                    .send()
-                                    .await
-                                    .is_ok_and(|response| response.status().is_success())
-                                {
+                                if !ready(&client, &metrics).await {
                                     self.child_failed(
                                         "The replacement cloudflared connector is no longer ready.",
                                     );
@@ -462,12 +487,7 @@ impl Manager {
                     }
                     Ok(None) => {}
                 }
-                if client
-                    .get(format!("http://{metrics}/ready"))
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
-                {
+                if ready(&client, &metrics).await {
                     let mut runtime = self.runtime.lock().unwrap();
                     runtime.connector_state = "ready".into();
                     runtime.readiness = Some(true);
@@ -537,6 +557,25 @@ impl Manager {
     }
 }
 
+/// Whether the connector answers `/ready`, within a bounded wait.
+///
+/// **Bounded on purpose, and bounded here rather than on the client.** A probe
+/// is the supervision loop's whole body, so one that can wait forever is a
+/// connector that can never be stopped: a connector wedged with its metrics
+/// port open but unanswering held the supervision task inside `send()` while a
+/// stop request sat unprocessed. Wrapping the call means the budget survives a
+/// client that was built without one. It is a hang detector rather than a
+/// performance target — a connector that cannot answer on loopback within it is
+/// not ready, which is what the next iteration concludes anyway.
+async fn ready(client: &reqwest::Client, metrics: &str) -> bool {
+    tokio::time::timeout(
+        READY_PROBE_TIMEOUT,
+        client.get(format!("http://{metrics}/ready")).send(),
+    )
+    .await
+    .is_ok_and(|answer| answer.is_ok_and(|response| response.status().is_success()))
+}
+
 pub fn restart_delay(restart_count: u8) -> std::time::Duration {
     std::time::Duration::from_millis(
         100 * 2u64.saturating_pow(restart_count.saturating_sub(1).into()),
@@ -594,12 +633,7 @@ async fn terminate_group(process_group: Option<u32>) {
 
 async fn replacement_is_ready(client: &reqwest::Client, metrics: &str) -> bool {
     for _ in 0..5 {
-        if client
-            .get(format!("http://{metrics}/ready"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
+        if ready(client, metrics).await {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -607,7 +641,12 @@ async fn replacement_is_ready(client: &reqwest::Client, metrics: &str) -> bool {
     false
 }
 
-async fn compatible_version(executable: &Path) -> Result<String, String> {
+/// What an executable says it is, or nothing if it cannot say.
+pub(crate) async fn detected_version(executable: &Path) -> Option<String> {
+    detect_version(executable).await.ok()
+}
+
+pub(crate) async fn compatible_version(executable: &Path) -> Result<String, String> {
     let version = detect_version(executable).await?;
     if !compatible_version_text(&version) {
         return Err("The selected cloudflared executable is incompatible; version 2024 or newer is required.".into());
@@ -650,7 +689,7 @@ async fn free_loopback_address() -> Result<String, String> {
     Ok(address.to_string())
 }
 
-fn private_directory(directory: &Path) -> Result<(), String> {
+pub(crate) fn private_directory(directory: &Path) -> Result<(), String> {
     std::fs::create_dir_all(directory)
         .map_err(|_| "The private connector directory could not be created.".to_string())?;
     #[cfg(unix)]
@@ -664,7 +703,7 @@ fn private_directory(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temporary = path.with_file_name(format!(
         "{}.private-{}",
         path.file_name()

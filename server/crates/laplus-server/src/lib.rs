@@ -74,6 +74,7 @@ pub mod catalogue;
 pub mod checkpoints;
 pub mod clock;
 pub mod cloudflare_connector;
+pub mod cloudflare_install;
 pub mod codes;
 pub mod codex;
 pub mod codex_protocol;

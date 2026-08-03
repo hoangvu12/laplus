@@ -165,6 +165,55 @@ export const ManagedCloudflareConnectorSnapshot = Schema.Struct({
 });
 export type ManagedCloudflareConnectorSnapshot = typeof ManagedCloudflareConnectorSnapshot.Type;
 
+/** An app-managed installation is one of four states, and never "probably". */
+export const CloudflaredInstallationState = Schema.Literals([
+  "not-installed",
+  "installing",
+  "installed",
+  "failed",
+]);
+export type CloudflaredInstallationState = typeof CloudflaredInstallationState.Type;
+
+/** The identified release a developer approves before anything is downloaded. */
+export const CloudflaredRelease = Schema.Struct({
+  version: TrimmedNonEmptyString,
+  assetName: TrimmedNonEmptyString,
+  downloadUrl: TrimmedNonEmptyString,
+  checksum: TrimmedNonEmptyString,
+});
+export type CloudflaredRelease = typeof CloudflaredRelease.Type;
+
+export const CloudflaredInstallationSnapshot = Schema.Struct({
+  supported: Schema.Boolean,
+  platform: TrimmedNonEmptyString,
+  architecture: TrimmedNonEmptyString,
+  assetName: Schema.NullOr(TrimmedNonEmptyString),
+  ownership: Schema.Literal("app-managed"),
+  unsupportedMessage: Schema.NullOr(TrimmedNonEmptyString),
+  state: CloudflaredInstallationState,
+  installedPath: Schema.NullOr(TrimmedNonEmptyString),
+  /** The release laplus fetched and verified. */
+  installedVersion: Schema.NullOr(TrimmedNonEmptyString),
+  /** What that executable reports now — cloudflared may have replaced itself. */
+  detectedVersion: Schema.NullOr(TrimmedNonEmptyString),
+  installedAt: Schema.NullOr(Schema.String),
+  failureMessage: Schema.NullOr(TrimmedNonEmptyString),
+  release: Schema.NullOr(CloudflaredRelease),
+  releaseFailureMessage: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type CloudflaredInstallationSnapshot = typeof CloudflaredInstallationSnapshot.Type;
+
+/**
+ * Approval names the exact release. The server re-reads the feed and refuses
+ * when it has moved on, so this is consent to one artifact rather than to
+ * "whatever is latest at the moment the button is pressed".
+ */
+export const ApproveCloudflaredReleaseInput = Schema.Struct({
+  version: TrimmedNonEmptyString,
+  checksum: TrimmedNonEmptyString,
+});
+export type ApproveCloudflaredReleaseInput = typeof ApproveCloudflaredReleaseInput.Type;
+
 export const ConfigureManagedCloudflareConnectorInput = Schema.Struct({
   hostname: TrimmedNonEmptyString,
   executablePath: TrimmedNonEmptyString,

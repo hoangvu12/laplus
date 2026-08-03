@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  CloudflaredInstallationSnapshot,
   ExternalTunnelEndpointSnapshot,
   ManagedCloudflareConnectorSnapshot,
 } from "./remoteAccess.ts";
@@ -177,5 +178,80 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
     });
 
     expect(snapshot.configured).toBe(false);
+  });
+});
+
+describe("CloudflaredInstallationSnapshot", () => {
+  it("previews the exact release an installation would fetch", () => {
+    const decodeInstallation = Schema.decodeUnknownSync(CloudflaredInstallationSnapshot);
+    const snapshot = decodeInstallation({
+      supported: true,
+      platform: "linux",
+      architecture: "x86_64",
+      assetName: "cloudflared-linux-amd64",
+      ownership: "app-managed",
+      unsupportedMessage: null,
+      state: "not-installed",
+      installedPath: null,
+      installedVersion: null,
+      detectedVersion: null,
+      installedAt: null,
+      failureMessage: null,
+      release: {
+        version: "2026.7.3",
+        assetName: "cloudflared-linux-amd64",
+        downloadUrl:
+          "https://github.com/cloudflare/cloudflared/releases/download/2026.7.3/cloudflared-linux-amd64",
+        checksum: "9d71c677db00134c1bd4144b7783486b654ad281b1ea62b4972098d19f770f17",
+      },
+      releaseFailureMessage: null,
+    });
+
+    expect(snapshot.release?.version).toBe("2026.7.3");
+    expect(snapshot.ownership).toBe("app-managed");
+  });
+
+  it("decodes every installation state, including a platform with no offer", () => {
+    const decodeInstallation = Schema.decodeUnknownSync(CloudflaredInstallationSnapshot);
+    for (const state of ["not-installed", "installing", "installed", "failed"] as const) {
+      expect(
+        decodeInstallation({
+          supported: true,
+          platform: "linux",
+          architecture: "x86_64",
+          assetName: "cloudflared-linux-amd64",
+          ownership: "app-managed",
+          unsupportedMessage: null,
+          state,
+          installedPath:
+            state === "installed" ? "/data/cloudflare/tools/cloudflared-2026.7.3" : null,
+          installedVersion: state === "installed" ? "2026.7.3" : null,
+          detectedVersion: state === "installed" ? "cloudflared version 2026.7.3" : null,
+          installedAt: state === "installed" ? "2026-08-02T10:00:00.000Z" : null,
+          failureMessage: state === "failed" ? "The checksum did not match." : null,
+          release: null,
+          releaseFailureMessage: null,
+        }).state,
+      ).toBe(state);
+    }
+
+    const unsupported = decodeInstallation({
+      supported: false,
+      platform: "macos",
+      architecture: "aarch64",
+      assetName: null,
+      ownership: "app-managed",
+      unsupportedMessage: "Cloudflare publishes cloudflared for macOS only as an archive.",
+      state: "not-installed",
+      installedPath: null,
+      installedVersion: null,
+      detectedVersion: null,
+      installedAt: null,
+      failureMessage: null,
+      release: null,
+      releaseFailureMessage: "Cloudflare publishes cloudflared for macOS only as an archive.",
+    });
+    expect(unsupported.supported).toBe(false);
+    expect(unsupported.unsupportedMessage).toContain("archive");
   });
 });

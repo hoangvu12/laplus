@@ -30,6 +30,8 @@ import {
   type ExternalTunnelEndpointSnapshot,
   type ManagedCloudflareConnectorSnapshot,
   type CloudflaredExecutable,
+  type CloudflaredInstallationSnapshot,
+  type CloudflaredRelease,
 } from "@t3tools/contracts";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import {
@@ -104,6 +106,8 @@ import {
   configureManagedCloudflareConnector,
   discoverCloudflaredExecutables,
   forgetExternalTunnelEndpoint,
+  installCloudflaredRelease,
+  readCloudflaredInstallation,
   readExternalTunnelEndpoint,
   readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
@@ -175,6 +179,7 @@ export function CloudflareTunnelSettingsRow({
   const [cloudflaredExecutables, setCloudflaredExecutables] = useState<
     ReadonlyArray<CloudflaredExecutable>
   >([]);
+  const [installation, setInstallation] = useState<CloudflaredInstallationSnapshot | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -189,6 +194,49 @@ export function CloudflareTunnelSettingsRow({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const refreshInstallation = useCallback(async () => {
+    try {
+      const discovery = await discoverCloudflaredExecutables();
+      setCloudflaredExecutables(discovery.executables);
+      setInstallation(
+        offersCloudflaredInstallation(discovery.executables)
+          ? await readCloudflaredInstallation()
+          : null,
+      );
+    } catch {
+      // Discovery and the release preview are both advisory: the wizard's other
+      // paths — an executable typed in by hand, an externally managed hostname —
+      // stay usable without them.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    void refreshInstallation();
+  }, [open, refreshInstallation]);
+
+  const install = useCallback(
+    async (release: CloudflaredRelease) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const next = await installCloudflaredRelease({
+          version: release.version,
+          checksum: release.checksum,
+        });
+        setInstallation(next);
+        setCloudflaredExecutables((await discoverCloudflaredExecutables()).executables);
+        if (next.installedPath) setExecutablePath(next.installedPath);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "The installation failed.");
+        await refreshInstallation();
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refreshInstallation],
+  );
 
   useEffect(() => {
     void Promise.all([readManagedCloudflareConnector(), discoverCloudflaredExecutables()])
@@ -322,6 +370,14 @@ export function CloudflareTunnelSettingsRow({
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-4">
+          {offersCloudflaredInstallation(cloudflaredExecutables) ? (
+            <CloudflaredInstallationPanel
+              snapshot={installation}
+              canWrite={canWrite}
+              busy={busy}
+              onInstall={(release) => void install(release)}
+            />
+          ) : null}
           <ManagedCloudflareConnectorPanel
             snapshot={managed}
             executables={cloudflaredExecutables}
@@ -401,6 +457,131 @@ export function CloudflareTunnelSettingsRow({
         </DialogFooter>
       </DialogPopup>
     </Dialog>
+  );
+}
+
+/**
+ * Whether the wizard should offer to install `cloudflared` at all.
+ *
+ * Only when this environment has nothing usable of its own: a compatible system
+ * or user-selected executable is preferred and is never replaced, so offering a
+ * download beside one would invite an installation nobody needs. An executable
+ * laplus already installed keeps the panel visible, because that is where its
+ * ownership and version are stated.
+ *
+ * Decided from discovery alone, and deliberately so: reading the installation
+ * snapshot reaches Cloudflare's release feed, and an environment that will never
+ * be offered a download should not put that request on the wire every time this
+ * dialog opens.
+ */
+export function offersCloudflaredInstallation(
+  executables: ReadonlyArray<CloudflaredExecutable>,
+): boolean {
+  if (executables.some((executable) => executable.source === "app-managed")) {
+    return true;
+  }
+  return !executables.some(
+    (executable) =>
+      executable.compatibility === "compatible" && executable.source !== "app-managed",
+  );
+}
+
+export function CloudflaredInstallationPanel({
+  snapshot,
+  canWrite,
+  busy,
+  onInstall,
+}: {
+  readonly snapshot: CloudflaredInstallationSnapshot | null;
+  readonly canWrite: boolean;
+  readonly busy: boolean;
+  readonly onInstall: (release: CloudflaredRelease) => void;
+}) {
+  if (!snapshot) {
+    return null;
+  }
+  if (snapshot.state === "installed") {
+    return (
+      <section
+        className="rounded-md border border-border/70 p-3 text-xs"
+        aria-label="App-managed cloudflared"
+      >
+        <p className="text-sm font-medium">cloudflared {snapshot.installedVersion} installed</p>
+        <p className="text-muted-foreground">{snapshot.installedPath}</p>
+        {snapshot.detectedVersion &&
+        !snapshot.detectedVersion.includes(snapshot.installedVersion ?? "") ? (
+          <p className="text-muted-foreground">
+            Now reporting {snapshot.detectedVersion} — cloudflared updates itself, and laplus does
+            not manage that.
+          </p>
+        ) : null}
+        <p className="mt-1 text-muted-foreground">
+          Installed and owned by laplus. It stays inside laplus&rsquo;s own data, your PATH is
+          unchanged, and laplus replaces or removes only this copy.
+        </p>
+      </section>
+    );
+  }
+  if (!snapshot.supported) {
+    return (
+      <section
+        className="rounded-md border border-border/70 p-3 text-xs text-muted-foreground"
+        aria-label="App-managed cloudflared"
+      >
+        <p className="text-sm font-medium text-foreground">
+          laplus cannot install cloudflared here
+        </p>
+        <p>{snapshot.unsupportedMessage}</p>
+      </section>
+    );
+  }
+  const release = snapshot.release;
+  return (
+    <section
+      className="space-y-2 rounded-md border border-border/70 p-3 text-xs"
+      aria-label="App-managed cloudflared"
+    >
+      <p className="text-sm font-medium">Install cloudflared with laplus</p>
+      {release ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 text-muted-foreground">
+          <dt>Release</dt>
+          <dd>{release.version}</dd>
+          <dt>Platform</dt>
+          <dd>
+            {snapshot.platform} {snapshot.architecture}
+          </dd>
+          <dt>Artifact</dt>
+          <dd>{release.assetName}</dd>
+          <dt>Source</dt>
+          <dd className="break-all">{release.downloadUrl}</dd>
+          <dt>SHA-256</dt>
+          <dd className="break-all">{release.checksum}</dd>
+          <dt>Ownership</dt>
+          <dd>
+            App-managed: kept in laplus&rsquo;s data directory, with no PATH change and no
+            elevation. A system executable is never overwritten.
+          </dd>
+        </dl>
+      ) : (
+        <p className="text-muted-foreground">{snapshot.releaseFailureMessage}</p>
+      )}
+      {snapshot.failureMessage ? (
+        <p className="text-destructive">{snapshot.failureMessage}</p>
+      ) : null}
+      {canWrite && release ? (
+        <Button
+          size="sm"
+          disabled={busy || snapshot.state === "installing"}
+          onClick={() => onInstall(release)}
+        >
+          {snapshot.state === "installing"
+            ? "Downloading and verifying…"
+            : snapshot.state === "failed"
+              ? `Retry cloudflared ${release.version}`
+              : `Download and verify cloudflared ${release.version}`}
+        </Button>
+      ) : null}
+    </section>
   );
 }
 
