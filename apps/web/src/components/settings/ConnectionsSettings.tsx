@@ -47,6 +47,7 @@ import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { cn } from "../../lib/utils";
 import { formatElapsedDurationLabel, formatExpiresInLabel } from "../../timestampFormat";
 import {
+  cloudflareFailureMessage,
   cloudflareRowSummary,
   cloudflareWizardState,
   formatRemoteBackendHost,
@@ -116,7 +117,6 @@ import {
   discoverCloudflaredExecutables,
   forgetExternalTunnelEndpoint,
   installCloudflaredRelease,
-  isPrimaryEnvironmentRequestError,
   listCloudflareTunnels,
   readCloudflareAccount,
   readCloudflaredInstallation,
@@ -172,31 +172,6 @@ import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
 const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 const EMPTY_ADVERTISED_ENDPOINTS: ReadonlyArray<AdvertisedEndpoint> = [];
 const EMPTY_DISCOVERED_SSH_HOSTS: ReadonlyArray<DesktopDiscoveredSshHost> = [];
-
-/**
- * What to put on screen when a Cloudflare request fails.
- *
- * **A refused administrator is told the one thing ADR-0047 says they may
- * learn.** Left alone, a 403 arrives here as the transport's own summary —
- * "Primary environment request failed during list-cloudflare-tunnels (HTTP
- * 403)" — which is a sentence for whoever wrote the client, not for whoever is
- * holding the machine. The ADR's wording is the whole of what a denied client
- * gets: that administrator access is required, and nothing about the Cloudflare
- * account or configuration behind the refusal.
- *
- * Every other failure keeps whatever prose it came with. The server's own
- * refusal sentences do not survive the trip either — a 409 or 400 carries an
- * untagged `{ message }` body that no declared contract error decodes — which
- * is recorded as Gap 4 in `.scratch/contract-parity/ledger.md` rather than
- * papered over with a guess here.
- */
-function cloudflareFailureMessage(cause: unknown, fallback: string): string {
-  if (isPrimaryEnvironmentRequestError(cause) && cause.status === 403) {
-    return "Administrator access is required to manage Cloudflare setup.";
-  }
-  const message = cause instanceof Error ? cause.message : "";
-  return message.trim() === "" ? fallback : message;
-}
 
 /**
  * Cloudflare Tunnel: a compact Connections row in front of a modal wizard.

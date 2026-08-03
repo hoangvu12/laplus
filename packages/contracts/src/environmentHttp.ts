@@ -180,6 +180,154 @@ export class EnvironmentResourceNotFoundError extends Schema.TaggedErrorClass<En
   }
 }
 
+/**
+ * Why a public-exposure command was refused.
+ *
+ * **A closed set rather than a sentence, because the sentence never arrived.**
+ * Every Cloudflare route answered a refusal as an untagged `{ "message": … }`,
+ * which decodes as no declared error at all — so the client had a 409 or a 400
+ * and nothing to render, and the reason a developer needed was thrown away at
+ * the boundary. That is Gap 4 in `.scratch/contract-parity/ledger.md`.
+ *
+ * It is a *set* rather than free text because tickets 05, 06 and 07 are all
+ * specified in terms of a client deciding what to offer next: an activation
+ * race offers a different recovery from a missing consent, and "the tunnel is
+ * not laplus's to delete" must be legible to the UI without parsing prose.
+ */
+export const PublicExposureRefusalReason = Schema.Literals([
+  /** Sign in to Cloudflare first. */
+  "sign-in-required",
+  /** The account certificate may not be used until its authority is accepted. */
+  "consent-required",
+  /** The chosen tunnel is no longer in the listing; refresh and choose again. */
+  "selection-stale",
+  /** There is no connector to act on yet. */
+  "connector-required",
+  /** Nothing is running that could be cancelled. */
+  "nothing-running",
+  /** laplus already owns this exposure, or another owner already does. */
+  "ownership-conflict",
+  /** Automatic restarts are spent; an explicit retry is required. */
+  "restarts-exhausted",
+  /** The named cloudflared cannot be started, or is too old. */
+  "executable-unusable",
+  /** The hostname is not a bare public HTTPS host. */
+  "hostname-invalid",
+  /** The approved release is no longer the one the feed offers. */
+  "release-moved",
+  /** cloudflared ran and said no. */
+  "command-failed",
+  /**
+   * laplus could not write its own private configuration or credential.
+   * Distinct from `command-failed` because nothing at Cloudflare went wrong
+   * and the retry is local.
+   */
+  "local-setup-failed",
+  /**
+   * The tunnel became active between listing and mutation, so it is externally
+   * managed after all. Ticket 05's activation race.
+   */
+  "tunnel-became-active",
+  /**
+   * Only a laplus-created tunnel may be deleted at Cloudflare. Ticket 07 —
+   * a server-side refusal, not merely a hidden button.
+   */
+  "not-laplus-created",
+  /**
+   * A previous mutation left Cloudflare or local state half-changed, and that
+   * has to be resolved before this command can run. Ticket 07.
+   */
+  "cleanup-required",
+]);
+export type PublicExposureRefusalReason = typeof PublicExposureRefusalReason.Type;
+
+/**
+ * One step of a multi-step Cloudflare mutation, as a refusal reports it.
+ *
+ * These are the words tickets 06 and 07 need in order to "identify completed
+ * and pending work" and "preserve exact remaining work for idempotent retry"
+ * without ever claiming a rollback that did not occur. `dns-record-delete` is
+ * deliberately not the mirror of `dns-route`: `cloudflared` has no
+ * `route dns delete`, so removing a record is a Cloudflare DNS API call needing
+ * its own authority.
+ */
+export const PublicExposureMutationStep = Schema.Literals([
+  "credential",
+  "tunnel-create",
+  "dns-route",
+  "configuration",
+  "dns-record-delete",
+  "tunnel-delete",
+  "configuration-remove",
+  "credential-remove",
+]);
+export type PublicExposureMutationStep = typeof PublicExposureMutationStep.Type;
+
+const PublicExposureRefusalFields = {
+  code: Schema.Literal("public_exposure_refused"),
+  reason: PublicExposureRefusalReason,
+  /** What to show a developer. Never contains a secret; see the redaction rule. */
+  message: Schema.String,
+  /**
+   * Mutations that did happen and must not be repeated by a retry. Empty for
+   * every refusal that changed nothing, which is most of them.
+   */
+  completed: Schema.Array(PublicExposureMutationStep),
+  /**
+   * Mutations that were started and never settled — the exact remaining work.
+   * A non-empty list is the difference between "nothing happened" and "this is
+   * half done", which is the distinction ticket 07 forbids the UI to blur.
+   */
+  remaining: Schema.Array(PublicExposureMutationStep),
+  traceId: TrimmedNonEmptyString,
+} as const;
+
+/**
+ * The developer has to do something before this command can run.
+ *
+ * `409`, matching the status the Cloudflare routes have answered since ticket
+ * 01 — the shape changed, not the code.
+ */
+export class EnvironmentPublicExposurePreconditionError extends Schema.TaggedErrorClass<EnvironmentPublicExposurePreconditionError>()(
+  "EnvironmentPublicExposurePreconditionError",
+  PublicExposureRefusalFields,
+  { httpApiStatus: 409 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentPublicExposurePreconditionError)(this, {
+      status: 409,
+    });
+  }
+}
+
+/** cloudflared, its output, or the request itself said no. `400`. */
+export class EnvironmentPublicExposureRejectedError extends Schema.TaggedErrorClass<EnvironmentPublicExposureRejectedError>()(
+  "EnvironmentPublicExposureRejectedError",
+  PublicExposureRefusalFields,
+  { httpApiStatus: 400 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(EnvironmentPublicExposureRejectedError)(this, {
+      status: 400,
+    });
+  }
+}
+
+/**
+ * Either refusal a public-exposure command can answer with.
+ *
+ * **`EnvironmentScopeRequiredError` is deliberately not folded in here.** A
+ * client without `access:write` is refused before any of this is evaluated and
+ * learns only the scope it needs, which is ADR-0047's rule that a refusal
+ * discloses nothing: a reason from this set would tell an unauthorized caller
+ * whether a tunnel exists, whether it is laplus-created, and how far setup got.
+ */
+export const EnvironmentPublicExposureRefusal = Schema.Union([
+  EnvironmentPublicExposurePreconditionError,
+  EnvironmentPublicExposureRejectedError,
+]);
+export type EnvironmentPublicExposureRefusal = typeof EnvironmentPublicExposureRefusal.Type;
+
 export const EnvironmentHttpCommonError = Schema.Union([
   EnvironmentRequestInvalidError,
   EnvironmentAuthInvalidError,
@@ -424,6 +572,20 @@ export class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}
 
+/**
+ * What a public-exposure *mutation* can answer with.
+ *
+ * The scope refusal comes first and on its own — see
+ * {@link EnvironmentPublicExposureRefusal} for why a client that fails it never
+ * sees one of these.
+ */
+const EnvironmentPublicExposureErrors = [
+  EnvironmentScopeRequiredError,
+  EnvironmentPublicExposurePreconditionError,
+  EnvironmentPublicExposureRejectedError,
+  EnvironmentInternalError,
+] as const;
+
 export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
   .add(
     HttpApiEndpoint.get("externalTunnel", "/api/access/cloudflare", {
@@ -437,7 +599,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       headers: OptionalBearerHeaders,
       payload: RegisterExternalTunnelEndpointInput,
       success: ExternalTunnelEndpointSnapshot,
-      error: EnvironmentScopedOperationErrors,
+      error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
@@ -498,7 +660,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       headers: OptionalBearerHeaders,
       payload: ApproveCloudflaredReleaseInput,
       success: CloudflaredInstallationSnapshot,
-      error: EnvironmentScopedOperationErrors,
+      error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
@@ -513,27 +675,25 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
     // acknowledgement, so the wizard's next step is read from the same place a
     // reopened dialog reads it and the two cannot disagree.
     //
-    // **`EnvironmentScopedOperationErrors` is the declared set, and it is not
-    // the whole truth.** These routes also refuse with 409 (a precondition the
-    // developer has to satisfy — consent, or sign in first) and 400 (cloudflared
-    // or its output said no), both carrying an untagged `{ message }` body. That
-    // is the shape every Cloudflare route has used since ticket 01, and it does
-    // not decode as a tagged error, so it is deliberately not declared here
-    // rather than declared as something it is not. Giving those two refusals a
-    // decodable shape is a change to eleven handlers and belongs with the ones
-    // that already have it.
+    // **A refused one answers with a tagged refusal**, which it did not used to.
+    // Until this cleanup pass, 409 and 400 both carried an untagged
+    // `{ message }` that decoded as no declared error at all, so the reason a
+    // developer needed never reached the browser — Gap 4 in
+    // `.scratch/contract-parity/ledger.md`. `EnvironmentPublicExposureRefusal`
+    // is that shape, and it is on every route that can refuse for a reason
+    // other than scope.
     HttpApiEndpoint.post("beginCloudflareLogin", "/api/access/cloudflare/account/login", {
       headers: OptionalBearerHeaders,
       payload: CloudflareAccountCommandInput,
       success: CloudflareAccountSnapshot,
-      error: EnvironmentScopedOperationErrors,
+      error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.post("cancelCloudflareLogin", "/api/access/cloudflare/account/login/cancel", {
       headers: OptionalBearerHeaders,
       success: CloudflareAccountSnapshot,
-      error: EnvironmentScopedOperationErrors,
+      error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
@@ -544,7 +704,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
         headers: OptionalBearerHeaders,
         payload: CloudflareCertificateConsentInput,
         success: CloudflareAccountSnapshot,
-        error: EnvironmentScopedOperationErrors,
+        error: EnvironmentPublicExposureErrors,
       },
     ).middleware(EnvironmentAuthenticatedAuth),
   )
@@ -557,7 +717,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       headers: OptionalBearerHeaders,
       payload: CloudflareAccountCommandInput,
       success: CloudflareAccountSnapshot,
-      error: EnvironmentScopedOperationErrors,
+      error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
@@ -565,7 +725,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       headers: OptionalBearerHeaders,
       payload: SelectCloudflareTunnelInput,
       success: CloudflareAccountSnapshot,
-      error: EnvironmentScopedOperationErrors,
+      error: EnvironmentPublicExposureErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
@@ -583,7 +743,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
         headers: OptionalBearerHeaders,
         payload: ConfigureManagedCloudflareConnectorInput,
         success: ManagedCloudflareConnectorSnapshot,
-        error: EnvironmentScopedOperationErrors,
+        error: EnvironmentPublicExposureErrors,
       },
     ).middleware(EnvironmentAuthenticatedAuth),
   )
@@ -594,7 +754,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       {
         headers: OptionalBearerHeaders,
         success: ManagedCloudflareConnectorSnapshot,
-        error: EnvironmentScopedOperationErrors,
+        error: EnvironmentPublicExposureErrors,
       },
     ).middleware(EnvironmentAuthenticatedAuth),
   )
@@ -605,7 +765,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       {
         headers: OptionalBearerHeaders,
         success: ManagedCloudflareConnectorSnapshot,
-        error: EnvironmentScopedOperationErrors,
+        error: EnvironmentPublicExposureErrors,
       },
     ).middleware(EnvironmentAuthenticatedAuth),
   )
@@ -616,7 +776,7 @@ export class EnvironmentAccessHttpApi extends HttpApiGroup.make("access")
       {
         headers: OptionalBearerHeaders,
         success: ManagedCloudflareConnectorSnapshot,
-        error: EnvironmentScopedOperationErrors,
+        error: EnvironmentPublicExposureErrors,
       },
     ).middleware(EnvironmentAuthenticatedAuth),
   ) {}

@@ -35,6 +35,7 @@ export {
   readManagedCloudflareConnector,
   registerExternalTunnelEndpoint,
   peekPairingTokenFromUrl,
+  publicExposureRefusal,
   PrimaryEnvironmentPairingCredentialRejectedError,
   PrimaryEnvironmentRequestError,
   reauthenticatePrimaryEnvironment,

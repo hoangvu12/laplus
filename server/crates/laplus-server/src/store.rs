@@ -388,6 +388,89 @@ const MIGRATIONS: &[&str] = &[
         updated_at               TEXT NOT NULL
     ) STRICT;
     "#,
+    // v12 — the Cloudflare cleanup pass. Who owns the tunnel, which exact
+    // resources laplus made, and how far a multi-step mutation got.
+    //
+    // **The table is renamed because its name was already a lie.** Both
+    // `register_external_tunnel_endpoint` callers wrote into it: the one that
+    // registers somebody else's hostname *and* the one that registers the
+    // hostname of a connector laplus supervises. One row held two ownerships
+    // and said "external" for both, which is why ticket 07's whole matrix —
+    // external, adopted, laplus-created — had nowhere to live.
+    //
+    // Existing rows migrate to `external`. That is the truth for every endpoint
+    // this schema could previously record: adoption and creation do not exist
+    // yet, and the connector-token path Cloudflare still configures is external
+    // by `TunnelOwnership`'s own definition. It is also the safe direction —
+    // `external` is the one ownership that authorizes no Cloudflare deletion.
+    r#"
+    CREATE TABLE public_exposure_endpoint (
+        id                       INTEGER PRIMARY KEY CHECK (id = 0),
+        https_origin             TEXT NOT NULL,
+        -- `crate::public_exposure::TunnelOwnership`. Read through its `FromStr`,
+        -- so a word this build does not know is a refused read rather than a
+        -- guess about who may delete a tunnel.
+        ownership                TEXT NOT NULL,
+        -- The Cloudflare tunnel UUID, where laplus knows one. Null for a bare
+        -- external hostname, which is a route and not a tunnel laplus can name.
+        tunnel_id                TEXT,
+        -- The exact DNS resource, so cleanup targets that record and no other.
+        -- Three columns rather than one, because deleting a record through the
+        -- Cloudflare API needs the zone as well as the record, and the name is
+        -- what a destructive confirmation has to show a human.
+        dns_zone_id              TEXT,
+        dns_record_id            TEXT,
+        dns_record_name          TEXT,
+        -- Where the narrow run credential and laplus's own ingress file are.
+        -- Locations, never contents: secrets stay in private files, and this
+        -- column exists so Forget can remove exactly what laplus owns.
+        credential_path          TEXT,
+        configuration_path       TEXT,
+        verification_state       TEXT NOT NULL,
+        failure_kind             TEXT,
+        failure_message          TEXT,
+        last_attempt_at          TEXT,
+        last_verified_at         TEXT,
+        created_at               TEXT NOT NULL,
+        updated_at               TEXT NOT NULL
+    ) STRICT;
+
+    INSERT INTO public_exposure_endpoint
+        (id, https_origin, ownership, verification_state, failure_kind,
+         failure_message, last_attempt_at, last_verified_at, created_at, updated_at)
+    SELECT id, https_origin, 'external', verification_state, failure_kind,
+         failure_message, last_attempt_at, last_verified_at, created_at, updated_at
+    FROM external_tunnel_endpoint;
+
+    DROP TABLE external_tunnel_endpoint;
+
+    -- What a partial Cloudflare mutation left behind.
+    --
+    -- **A log rather than a status column**, because tickets 06 and 07 both ask
+    -- for the same two answers after a crash: which mutations already happened,
+    -- so a retry does not repeat them, and which were started and never
+    -- settled, so the wizard can name the remaining work instead of claiming a
+    -- rollback that did not occur. A single "phase" column can answer neither.
+    --
+    -- Not keyed to the endpoint row: a `delete-everywhere` that fails half way
+    -- outlives the endpoint it was deleting, and that residue is exactly the
+    -- `cleanup-required` state ticket 07 has to keep reporting.
+    CREATE TABLE public_exposure_journal (
+        sequence   INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- `crate::public_exposure::MutationIntent`.
+        intent     TEXT NOT NULL,
+        -- `crate::public_exposure::MutationStep`.
+        step       TEXT NOT NULL,
+        -- `crate::public_exposure::MutationState`.
+        state      TEXT NOT NULL,
+        -- The exact resource this step touched, for a retry to target and a
+        -- confirmation to display. Non-secret by construction: a credential
+        -- appears here as its path, never its contents.
+        detail     TEXT,
+        started_at TEXT NOT NULL,
+        settled_at TEXT
+    ) STRICT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -446,14 +529,75 @@ pub struct NewSession<'a> {
     pub label: Option<&'a str>,
 }
 
+/// The exact DNS record laplus created, so cleanup can name it and target it.
+///
+/// A struct because ticket 07 requires "Delete everywhere" to name the record
+/// in its confirmation and then delete *that* record — and because the CLI has
+/// no `route dns delete`, so the delete is a Cloudflare API call that needs the
+/// zone as well as the record id. See `.scratch/cloudflare-tunnel/research.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalTunnelEndpoint {
+pub struct DnsRecord {
+    pub zone_id: String,
+    pub record_id: String,
+    pub name: String,
+}
+
+/// The one public endpoint this environment exposes, and who owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicExposureEndpoint {
     pub https_origin: String,
+    pub ownership: crate::public_exposure::TunnelOwnership,
+    pub tunnel_id: Option<String>,
+    pub dns_record: Option<DnsRecord>,
+    pub credential_path: Option<String>,
+    pub configuration_path: Option<String>,
     pub verification_state: String,
     pub failure_kind: Option<String>,
     pub failure_message: Option<String>,
     pub last_attempt_at: Option<String>,
     pub last_verified_at: Option<String>,
+}
+
+/// What [`Database::register_public_exposure_endpoint`] needs.
+///
+/// A struct rather than eight arguments, for the reason [`NewPairingLink`]
+/// above is one: most of them are optional strings, and an argument list of
+/// optional strings is a bug waiting for a refactor to reorder it.
+#[derive(Debug, Clone, Copy)]
+pub struct NewPublicExposure<'a> {
+    pub https_origin: &'a str,
+    pub ownership: crate::public_exposure::TunnelOwnership,
+    pub tunnel_id: Option<&'a str>,
+    pub dns_record: Option<&'a DnsRecord>,
+    pub credential_path: Option<&'a str>,
+    pub configuration_path: Option<&'a str>,
+}
+
+impl<'a> NewPublicExposure<'a> {
+    /// A hostname somebody else's connector serves: no tunnel laplus can name,
+    /// nothing of laplus's on disk, and no authority to delete anything.
+    pub fn external(https_origin: &'a str) -> Self {
+        Self {
+            https_origin,
+            ownership: crate::public_exposure::TunnelOwnership::External,
+            tunnel_id: None,
+            dns_record: None,
+            credential_path: None,
+            configuration_path: None,
+        }
+    }
+}
+
+/// One step of a multi-step Cloudflare mutation, as it survives a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationJournalEntry {
+    pub sequence: i64,
+    pub intent: crate::public_exposure::MutationIntent,
+    pub step: crate::public_exposure::MutationStep,
+    pub state: crate::public_exposure::MutationState,
+    pub detail: Option<String>,
+    pub started_at: String,
+    pub settled_at: Option<String>,
 }
 
 /// Scopes go into their column as a JSON array. See the migration's note on
@@ -760,54 +904,183 @@ pub fn default_path() -> PathBuf {
     crate::config::data_dir().join("state.sqlite")
 }
 
+/// Read one of the closed vocabularies back out of its column.
+///
+/// A word this build does not know is a failed read rather than a default,
+/// because every default available here would be a guess about who may delete a
+/// Cloudflare tunnel. Nothing outside this crate writes these columns, so the
+/// only way to reach the error is a genuine bug — and a bug that silently
+/// picked `laplus-created` is the one this project cannot afford.
+fn closed_word<T: std::str::FromStr<Err = crate::public_exposure::UnknownWord>>(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<T> {
+    let word: String = row.get(column)?;
+    word.parse().map_err(|failure: crate::public_exposure::UnknownWord| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, failure.to_string())),
+        )
+    })
+}
+
+/// What an upsert of the *same* hostname keeps, in both senses of the word.
+///
+/// Shared by [`Database::register_public_exposure_endpoint`] and
+/// [`Database::restore_public_exposure_endpoint`], which differ only in what
+/// they do to *ownership* — registering states it, restoring preserves it — and
+/// agree entirely about this. A hostname that has not changed is the same
+/// endpoint, so the verification it already earned survives; a different one is
+/// a different endpoint and starts unverified.
+fn verification_kept_for_the_same_hostname() -> String {
+    format!(
+        "verification_state = CASE WHEN https_origin = excluded.https_origin \
+             THEN verification_state ELSE 'pending' END, \
+         failure_kind = CASE WHEN https_origin = excluded.https_origin \
+             THEN failure_kind ELSE NULL END, \
+         failure_message = CASE WHEN https_origin = excluded.https_origin \
+             THEN failure_message ELSE NULL END, \
+         last_attempt_at = CASE WHEN https_origin = excluded.https_origin \
+             THEN last_attempt_at ELSE NULL END, \
+         last_verified_at = CASE WHEN https_origin = excluded.https_origin \
+             THEN last_verified_at ELSE NULL END, updated_at = {NOW}"
+    )
+}
+
+/// The endpoint row's columns, in the order [`public_exposure_from_row`] reads
+/// them. Named once so the two cannot drift apart — see [`PROJECT_COLUMNS`].
+const PUBLIC_EXPOSURE_COLUMNS: &str = "https_origin, ownership, tunnel_id, dns_zone_id, \
+     dns_record_id, dns_record_name, credential_path, configuration_path, verification_state, \
+     failure_kind, failure_message, last_attempt_at, last_verified_at";
+
+fn public_exposure_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublicExposureEndpoint> {
+    let zone_id: Option<String> = row.get(3)?;
+    let record_id: Option<String> = row.get(4)?;
+    let name: Option<String> = row.get(5)?;
+    Ok(PublicExposureEndpoint {
+        https_origin: row.get(0)?,
+        ownership: closed_word(row, 1)?,
+        tunnel_id: row.get(2)?,
+        // All three or none: a record laplus cannot both name and address is
+        // not a record cleanup could target, and a partial one would let a
+        // confirmation display a hostname it could never actually delete.
+        dns_record: match (zone_id, record_id, name) {
+            (Some(zone_id), Some(record_id), Some(name)) => {
+                Some(DnsRecord { zone_id, record_id, name })
+            }
+            _ => None,
+        },
+        credential_path: row.get(6)?,
+        configuration_path: row.get(7)?,
+        verification_state: row.get(8)?,
+        failure_kind: row.get(9)?,
+        failure_message: row.get(10)?,
+        last_attempt_at: row.get(11)?,
+        last_verified_at: row.get(12)?,
+    })
+}
+
 impl Database {
-    pub fn external_tunnel_endpoint(&self) -> Result<Option<ExternalTunnelEndpoint>, StorageError> {
+    pub fn public_exposure_endpoint(
+        &self,
+    ) -> Result<Option<PublicExposureEndpoint>, StorageError> {
         self.lock()
             .query_row(
-                "SELECT https_origin, verification_state, failure_kind, failure_message, \
-                 last_attempt_at, last_verified_at FROM external_tunnel_endpoint WHERE id = 0",
+                &format!(
+                    "SELECT {PUBLIC_EXPOSURE_COLUMNS} FROM public_exposure_endpoint WHERE id = 0"
+                ),
                 [],
-                |row| Ok(ExternalTunnelEndpoint {
-                    https_origin: row.get(0)?,
-                    verification_state: row.get(1)?,
-                    failure_kind: row.get(2)?,
-                    failure_message: row.get(3)?,
-                    last_attempt_at: row.get(4)?,
-                    last_verified_at: row.get(5)?,
-                }),
+                public_exposure_from_row,
             )
             .optional()
-            .map_err(StorageError::while_("read the external tunnel endpoint"))
+            .map_err(StorageError::while_("read the public exposure endpoint"))
     }
 
-    pub fn register_external_tunnel_endpoint(&self, origin: &str) -> Result<(), StorageError> {
+    /// Record the one endpoint this environment exposes, and who owns it.
+    ///
+    /// **Re-registering the same hostname keeps its verification**, which is
+    /// what makes a repeated registration a reconciliation rather than a reset;
+    /// a different hostname is a different endpoint and starts unverified. The
+    /// ownership and the recorded resources are replaced either way, because
+    /// they are the caller's current answer and not history — adoption and
+    /// creation both re-register a hostname they have just learned more about.
+    pub fn register_public_exposure_endpoint(
+        &self,
+        exposure: NewPublicExposure<'_>,
+    ) -> Result<(), StorageError> {
+        let kept = verification_kept_for_the_same_hostname();
         self.lock().execute(
             &format!(
-                "INSERT INTO external_tunnel_endpoint \
-                 (id, https_origin, verification_state, created_at, updated_at) \
-                 VALUES (0, ?1, 'pending', {NOW}, {NOW}) \
+                "INSERT INTO public_exposure_endpoint \
+                 (id, https_origin, ownership, tunnel_id, dns_zone_id, dns_record_id, \
+                  dns_record_name, credential_path, configuration_path, verification_state, \
+                  created_at, updated_at) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', {NOW}, {NOW}) \
                  ON CONFLICT(id) DO UPDATE SET https_origin = excluded.https_origin, \
-                 verification_state = CASE WHEN https_origin = excluded.https_origin \
-                     THEN verification_state ELSE 'pending' END, \
-                 failure_kind = CASE WHEN https_origin = excluded.https_origin \
-                     THEN failure_kind ELSE NULL END, \
-                 failure_message = CASE WHEN https_origin = excluded.https_origin \
-                     THEN failure_message ELSE NULL END, \
-                 last_attempt_at = CASE WHEN https_origin = excluded.https_origin \
-                     THEN last_attempt_at ELSE NULL END, \
-                 last_verified_at = CASE WHEN https_origin = excluded.https_origin \
-                     THEN last_verified_at ELSE NULL END, updated_at = {NOW}"
+                 ownership = excluded.ownership, tunnel_id = excluded.tunnel_id, \
+                 dns_zone_id = excluded.dns_zone_id, dns_record_id = excluded.dns_record_id, \
+                 dns_record_name = excluded.dns_record_name, \
+                 credential_path = excluded.credential_path, \
+                 configuration_path = excluded.configuration_path, \
+                 {kept}"
+            ),
+            rusqlite::params![
+                exposure.https_origin,
+                exposure.ownership.as_str(),
+                exposure.tunnel_id,
+                exposure.dns_record.map(|record| record.zone_id.as_str()),
+                exposure.dns_record.map(|record| record.record_id.as_str()),
+                exposure.dns_record.map(|record| record.name.as_str()),
+                exposure.credential_path,
+                exposure.configuration_path,
+            ],
+        ).map(|_| ()).map_err(StorageError::while_("register the public exposure endpoint"))
+    }
+
+    /// Make sure a hostname a connector is already configured for is recorded,
+    /// without deciding who owns it.
+    ///
+    /// **What a restart is allowed to do.** The endpoint row has just survived
+    /// the restart, and it is the record of ownership; the connector's own file
+    /// says only which hostname to serve. So an unchanged hostname keeps
+    /// whatever ownership was recorded, and only a hostname nothing has
+    /// recorded starts as `external` — the ownership that authorizes no
+    /// Cloudflare deletion, and therefore the only safe guess.
+    pub fn restore_public_exposure_endpoint(&self, origin: &str) -> Result<(), StorageError> {
+        let kept = verification_kept_for_the_same_hostname();
+        self.lock().execute(
+            &format!(
+                "INSERT INTO public_exposure_endpoint \
+                 (id, https_origin, ownership, verification_state, created_at, updated_at) \
+                 VALUES (0, ?1, 'external', 'pending', {NOW}, {NOW}) \
+                 ON CONFLICT(id) DO UPDATE SET https_origin = excluded.https_origin, \
+                 ownership = CASE WHEN https_origin = excluded.https_origin \
+                     THEN ownership ELSE 'external' END, \
+                 tunnel_id = CASE WHEN https_origin = excluded.https_origin \
+                     THEN tunnel_id ELSE NULL END, \
+                 dns_zone_id = CASE WHEN https_origin = excluded.https_origin \
+                     THEN dns_zone_id ELSE NULL END, \
+                 dns_record_id = CASE WHEN https_origin = excluded.https_origin \
+                     THEN dns_record_id ELSE NULL END, \
+                 dns_record_name = CASE WHEN https_origin = excluded.https_origin \
+                     THEN dns_record_name ELSE NULL END, \
+                 credential_path = CASE WHEN https_origin = excluded.https_origin \
+                     THEN credential_path ELSE NULL END, \
+                 configuration_path = CASE WHEN https_origin = excluded.https_origin \
+                     THEN configuration_path ELSE NULL END, \
+                 {kept}"
             ),
             [origin],
-        ).map(|_| ()).map_err(StorageError::while_("register the external tunnel endpoint"))
+        ).map(|_| ()).map_err(StorageError::while_("restore the public exposure endpoint"))
     }
 
-    pub fn forget_external_tunnel_endpoint(&self) -> Result<(), StorageError> {
-        self.lock().execute("DELETE FROM external_tunnel_endpoint WHERE id = 0", [])
-            .map(|_| ()).map_err(StorageError::while_("forget the external tunnel endpoint"))
+    pub fn forget_public_exposure_endpoint(&self) -> Result<(), StorageError> {
+        self.lock().execute("DELETE FROM public_exposure_endpoint WHERE id = 0", [])
+            .map(|_| ()).map_err(StorageError::while_("forget the public exposure endpoint"))
     }
 
-    pub fn record_external_tunnel_verification(
+    pub fn record_public_exposure_verification(
         &self,
         origin: &str,
         verified: bool,
@@ -816,13 +1089,109 @@ impl Database {
     ) -> Result<bool, StorageError> {
         self.lock().execute(
             &format!(
-                "UPDATE external_tunnel_endpoint SET verification_state = ?1, failure_kind = ?2, \
+                "UPDATE public_exposure_endpoint SET verification_state = ?1, failure_kind = ?2, \
                  failure_message = ?3, last_attempt_at = {NOW}, \
                  last_verified_at = CASE WHEN ?1 = 'verified' THEN {NOW} ELSE last_verified_at END, \
                  updated_at = {NOW} WHERE id = 0 AND https_origin = ?4"
             ),
             rusqlite::params![if verified { "verified" } else { "failed" }, failure_kind, failure_message, origin],
-        ).map(|changed| changed == 1).map_err(StorageError::while_("record external tunnel verification"))
+        ).map(|changed| changed == 1).map_err(StorageError::while_("record public exposure verification"))
+    }
+
+    /// Write down that a Cloudflare mutation is *about* to happen.
+    ///
+    /// Before, not after: a step recorded only on success cannot tell a crash
+    /// apart from a step that never started, and that difference is the whole
+    /// of what tickets 06 and 07 mean by resuming from observed state. The
+    /// returned sequence is what [`Database::settle_mutation_step`] settles.
+    pub fn begin_mutation_step(
+        &self,
+        intent: crate::public_exposure::MutationIntent,
+        step: crate::public_exposure::MutationStep,
+        detail: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let connection = self.lock();
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO public_exposure_journal (intent, step, state, detail, started_at) \
+                     VALUES (?1, ?2, 'pending', ?3, {NOW})"
+                ),
+                rusqlite::params![intent.as_str(), step.as_str(), detail],
+            )
+            .map(|_| connection.last_insert_rowid())
+            .map_err(StorageError::while_("journal a Cloudflare mutation step"))
+    }
+
+    /// Say how the step ended, and what it ended up touching.
+    ///
+    /// `detail` is replaced rather than merged when the caller has a better
+    /// answer — a `tunnel-create` knows the intended name going in and the
+    /// allocated UUID coming out, and cleanup needs the second one.
+    pub fn settle_mutation_step(
+        &self,
+        sequence: i64,
+        state: crate::public_exposure::MutationState,
+        detail: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        self.lock()
+            .execute(
+                &format!(
+                    "UPDATE public_exposure_journal SET state = ?1, \
+                     detail = COALESCE(?2, detail), settled_at = {NOW} WHERE sequence = ?3"
+                ),
+                rusqlite::params![state.as_str(), detail, sequence],
+            )
+            .map(|changed| changed == 1)
+            .map_err(StorageError::while_("settle a Cloudflare mutation step"))
+    }
+
+    /// Every journaled step, oldest first.
+    ///
+    /// The whole log rather than "the unfinished ones", because a resume needs
+    /// both halves: what already happened, so it is not repeated, and what was
+    /// started and never settled, so it can be named as remaining work.
+    pub fn mutation_journal(&self) -> Result<Vec<MutationJournalEntry>, StorageError> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, intent, step, state, detail, started_at, settled_at \
+                 FROM public_exposure_journal ORDER BY sequence",
+            )
+            .map_err(StorageError::while_("read the Cloudflare mutation journal"))?;
+        let entries = statement
+            .query_map([], |row| {
+                Ok(MutationJournalEntry {
+                    sequence: row.get(0)?,
+                    intent: closed_word(row, 1)?,
+                    step: closed_word(row, 2)?,
+                    state: closed_word(row, 3)?,
+                    detail: row.get(4)?,
+                    started_at: row.get(5)?,
+                    settled_at: row.get(6)?,
+                })
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(StorageError::while_("read the Cloudflare mutation journal"))?;
+        Ok(entries)
+    }
+
+    /// Drop one intent's journal once nothing about it is outstanding.
+    ///
+    /// Scoped to an intent rather than emptying the table, because a completed
+    /// `create` says nothing about a `delete-everywhere` that is still half
+    /// done — and ticket 07's `cleanup-required` is precisely that residue.
+    pub fn clear_mutation_journal(
+        &self,
+        intent: crate::public_exposure::MutationIntent,
+    ) -> Result<(), StorageError> {
+        self.lock()
+            .execute(
+                "DELETE FROM public_exposure_journal WHERE intent = ?1",
+                [intent.as_str()],
+            )
+            .map(|_| ())
+            .map_err(StorageError::while_("clear the Cloudflare mutation journal"))
     }
 
     /// Open the database at `path`, creating the file, its parent directories
@@ -3718,14 +4087,205 @@ mod tests {
     #[test]
     fn a_verification_result_cannot_be_applied_after_the_hostname_changes() {
         let database = Database::in_memory().expect("a database");
-        database.register_external_tunnel_endpoint("https://a.example.com").unwrap();
-        database.register_external_tunnel_endpoint("https://b.example.com").unwrap();
+        database
+            .register_public_exposure_endpoint(NewPublicExposure::external("https://a.example.com"))
+            .unwrap();
+        database
+            .register_public_exposure_endpoint(NewPublicExposure::external("https://b.example.com"))
+            .unwrap();
 
         assert!(!database
-            .record_external_tunnel_verification("https://a.example.com", true, None, None)
+            .record_public_exposure_verification("https://a.example.com", true, None, None)
             .unwrap());
-        let endpoint = database.external_tunnel_endpoint().unwrap().unwrap();
+        let endpoint = database.public_exposure_endpoint().unwrap().unwrap();
         assert_eq!(endpoint.https_origin, "https://b.example.com");
         assert_eq!(endpoint.verification_state, "pending");
+    }
+
+    /// Ticket 07's acceptance matrix is indexed by ownership, so the three
+    /// values have to be three values on the way back out — not one literal the
+    /// snapshot prints. Reopening rather than reading through the same handle,
+    /// because the claim is about the column and not about a cached struct.
+    #[test]
+    fn ownership_and_the_resources_laplus_created_are_read_back_distinctly() {
+        use crate::public_exposure::TunnelOwnership;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+        let record = DnsRecord {
+            zone_id: "zone-1".into(),
+            record_id: "record-1".into(),
+            name: "laplus.example.com".into(),
+        };
+        {
+            let database = Database::open(&path).expect("creates the database");
+            database
+                .register_public_exposure_endpoint(NewPublicExposure {
+                    https_origin: "https://laplus.example.com",
+                    ownership: TunnelOwnership::LaplusCreated,
+                    tunnel_id: Some("11111111-1111-1111-1111-111111111111"),
+                    dns_record: Some(&record),
+                    credential_path: Some("/private/tunnel.json"),
+                    configuration_path: Some("/private/connector.yml"),
+                })
+                .expect("records a laplus-created tunnel");
+        }
+
+        let database = Database::open(&path).expect("reopens the database");
+        let endpoint = database.public_exposure_endpoint().unwrap().unwrap();
+        assert_eq!(endpoint.ownership, TunnelOwnership::LaplusCreated);
+        assert_ne!(endpoint.ownership, TunnelOwnership::Adopted);
+        assert_ne!(endpoint.ownership, TunnelOwnership::External);
+        assert!(endpoint.ownership.deletable_at_cloudflare());
+        assert_eq!(endpoint.tunnel_id.as_deref(), Some("11111111-1111-1111-1111-111111111111"));
+        assert_eq!(endpoint.dns_record, Some(record));
+        assert_eq!(endpoint.credential_path.as_deref(), Some("/private/tunnel.json"));
+        assert_eq!(endpoint.configuration_path.as_deref(), Some("/private/connector.yml"));
+
+        // Adoption keeps the local setup and loses the deletion authority, which
+        // is the distinction ticket 07 refuses "Delete everywhere" on.
+        database
+            .register_public_exposure_endpoint(NewPublicExposure {
+                ownership: TunnelOwnership::Adopted,
+                dns_record: None,
+                ..NewPublicExposure::external("https://laplus.example.com")
+            })
+            .expect("re-registers as adopted");
+        let adopted = database.public_exposure_endpoint().unwrap().unwrap();
+        assert_eq!(adopted.ownership, TunnelOwnership::Adopted);
+        assert!(!adopted.ownership.deletable_at_cloudflare());
+        assert_eq!(adopted.dns_record, None);
+    }
+
+    /// This ships to installs that already have a row. The endpoints they hold
+    /// are external — nothing before this schema could create or adopt one —
+    /// and `external` is also the ownership that authorizes no deletion, so a
+    /// wrong guess in this direction cannot destroy anything.
+    #[test]
+    fn an_endpoint_recorded_before_ownership_existed_is_read_as_external() {
+        const BEFORE_OWNERSHIP: usize = 11;
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+        {
+            let connection = Connection::open(&path).expect("creates the file");
+            for (index, statements) in MIGRATIONS.iter().take(BEFORE_OWNERSHIP).enumerate() {
+                connection
+                    .execute_batch(&format!(
+                        "BEGIN; {statements} PRAGMA user_version = {}; COMMIT;",
+                        index + 1
+                    ))
+                    .expect("applies a released migration");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO external_tunnel_endpoint \
+                        (id, https_origin, verification_state, last_verified_at, \
+                         created_at, updated_at) \
+                     VALUES (0, 'https://operator.example.com', 'verified', \
+                        '2026-07-26T00:23:04.909Z', '2026-07-26T00:23:04.909Z', \
+                        '2026-07-26T00:23:04.909Z');",
+                )
+                .expect("an endpoint from before ownership was recorded");
+        }
+
+        let database = Database::open(&path).expect("migrates the existing file");
+        let endpoint = database.public_exposure_endpoint().unwrap().unwrap();
+
+        assert_eq!(endpoint.https_origin, "https://operator.example.com");
+        assert_eq!(endpoint.ownership, crate::public_exposure::TunnelOwnership::External);
+        assert!(!endpoint.ownership.deletable_at_cloudflare());
+        // The verification it had already earned is not thrown away by the
+        // migration: a developer's endpoint should not go back to unverified
+        // because laplus learned a new word for who owns it.
+        assert_eq!(endpoint.verification_state, "verified");
+        assert_eq!(endpoint.last_verified_at.as_deref(), Some("2026-07-26T00:23:04.909Z"));
+    }
+
+    /// The two answers a resume needs: what already happened, so it is not
+    /// repeated, and what was started and never settled, so it can be named as
+    /// remaining work rather than reported as a rollback that did not occur.
+    #[test]
+    fn the_mutation_journal_survives_a_reopen_and_keeps_unsettled_work() {
+        use crate::public_exposure::{MutationIntent, MutationState, MutationStep};
+
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("state.sqlite");
+        let interrupted = {
+            let database = Database::open(&path).expect("creates the database");
+            let created = database
+                .begin_mutation_step(MutationIntent::Create, MutationStep::TunnelCreate, Some("laplus"))
+                .expect("journals the intent before the mutation");
+            database
+                .settle_mutation_step(created, MutationState::Completed, Some("tunnel-uuid"))
+                .expect("settles it with the resource it actually made");
+            database
+                .begin_mutation_step(
+                    MutationIntent::Create,
+                    MutationStep::DnsRoute,
+                    Some("laplus.example.com"),
+                )
+                .expect("journals the DNS route it never finished")
+        };
+
+        let database = Database::open(&path).expect("reopens the database");
+        let journal = database.mutation_journal().expect("reads the journal");
+
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal[0].step, MutationStep::TunnelCreate);
+        assert_eq!(journal[0].state, MutationState::Completed);
+        // Settled with the allocated UUID, not the name it was asked for —
+        // cleanup has to target the resource, and only the second one names it.
+        assert_eq!(journal[0].detail.as_deref(), Some("tunnel-uuid"));
+        assert!(journal[0].settled_at.is_some());
+        assert_eq!(journal[1].sequence, interrupted);
+        assert_eq!(journal[1].step, MutationStep::DnsRoute);
+        assert_eq!(journal[1].state, MutationState::Pending);
+        assert_eq!(journal[1].detail.as_deref(), Some("laplus.example.com"));
+        assert_eq!(journal[1].settled_at, None);
+
+        assert!(database
+            .settle_mutation_step(interrupted, MutationState::Failed, None)
+            .expect("settles the resumed step"));
+        let resumed = database.mutation_journal().unwrap();
+        assert_eq!(resumed[1].state, MutationState::Failed);
+        // A `Failed` step keeps the resource it was aiming at, because that is
+        // what a retry targets.
+        assert_eq!(resumed[1].detail.as_deref(), Some("laplus.example.com"));
+
+        // Clearing one intent leaves another's residue alone: a finished
+        // creation says nothing about a half-done deletion.
+        let cleanup = database
+            .begin_mutation_step(MutationIntent::DeleteEverywhere, MutationStep::DnsRecordDelete, None)
+            .expect("journals a deletion step");
+        database.clear_mutation_journal(MutationIntent::Create).expect("clears the creation");
+        let remaining = database.mutation_journal().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence, cleanup);
+        assert_eq!(remaining[0].intent, MutationIntent::DeleteEverywhere);
+    }
+
+    /// Nothing outside this crate writes these columns, so a word that is not
+    /// in the vocabulary is a bug — and the one thing it must not do is resolve
+    /// to an ownership that authorizes deleting somebody else's tunnel.
+    #[test]
+    fn an_ownership_this_build_does_not_know_is_refused_rather_than_guessed() {
+        let database = Database::in_memory().expect("a database");
+        database
+            .register_public_exposure_endpoint(NewPublicExposure::external("https://x.example.com"))
+            .unwrap();
+        database
+            .lock()
+            .execute(
+                "UPDATE public_exposure_endpoint SET ownership = 'laplus-owned' WHERE id = 0",
+                [],
+            )
+            .expect("writes a word from some other build");
+
+        let failure = database.public_exposure_endpoint().expect_err("refuses the row");
+        assert!(
+            failure.to_string().contains("tunnel ownership"),
+            "the refusal must name the vocabulary: {failure}"
+        );
     }
 }

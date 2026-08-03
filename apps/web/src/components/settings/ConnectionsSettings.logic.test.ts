@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vite-plus/test";
+import {
+  EnvironmentPublicExposureRejectedError,
+  EnvironmentScopeRequiredError,
+} from "@t3tools/contracts";
+import type { TunnelOwnership } from "@t3tools/contracts";
+
+import { PrimaryEnvironmentRequestError } from "../../environments/primary";
 
 import {
+  cloudflareFailureMessage,
+  cloudflareRefusalSummary,
   cloudflareRowSummary,
   cloudflareWizardState,
   formatRemoteBackendHost,
@@ -130,6 +139,7 @@ describe("the Cloudflare wizard step machine", () => {
   const managed = {
     configured: true,
     ownership: "laplus",
+    tunnelOwnership: "external",
     desiredState: "running",
     connectorState: "ready",
     readiness: true,
@@ -363,7 +373,7 @@ describe("the Cloudflare wizard step machine", () => {
         external,
         managedStateLabel,
       }),
-    ).toBe("https://laplus.example.com · Publicly verified");
+    ).toBe("https://laplus.example.com · Externally owned · Publicly verified");
     expect(
       cloudflareRowSummary({
         state: at({ account }),
@@ -372,6 +382,83 @@ describe("the Cloudflare wizard step machine", () => {
         managedStateLabel,
       }),
     ).toBe("Register an externally managed HTTPS hostname.");
+  });
+
+  /**
+   * Ticket 06 needs the row to identify a laplus-created tunnel and preserve
+   * that across restart, and ticket 07 makes the same word decide whether
+   * "Delete everywhere" is offered at all. A row that showed only a hostname
+   * and a health word made two endpoints with opposite deletion authority read
+   * identically.
+   */
+  it("says which ownership the endpoint has, not only how healthy it is", () => {
+    const managedStateLabel = () => "Publicly verified";
+    const rowFor = (ownership: TunnelOwnership) =>
+      cloudflareRowSummary({
+        state: at({ account, managed, external }),
+        managed: { ...managed, tunnelOwnership: ownership },
+        external,
+        managedStateLabel,
+      });
+
+    expect(rowFor("laplus-created")).toBe(
+      "https://laplus.example.com · laplus-created · Publicly verified",
+    );
+    expect(rowFor("adopted")).toBe("https://laplus.example.com · Adopted · Publicly verified");
+    expect(rowFor("external")).toBe(
+      "https://laplus.example.com · Externally owned · Publicly verified",
+    );
+
+    // An endpoint laplus does not run reads its ownership from its own record,
+    // which is now three-valued rather than the literal `"external"`.
+    expect(
+      cloudflareRowSummary({
+        state: at({ account, external }),
+        managed: null,
+        external: { ...external, ownership: "adopted" },
+        managedStateLabel,
+      }),
+    ).toBe("https://laplus.example.com · Adopted · Verified");
+  });
+});
+
+/**
+ * A refusal that changed nothing reads as it always did; one that changed half
+ * of something says which half. Tickets 06 and 07 both forbid the wizard from
+ * claiming a rollback that did not occur, and this is the sentence that keeps
+ * that promise.
+ */
+describe("what a refused Cloudflare command tells the developer", () => {
+  it("carries the server's sentence alone when nothing was mutated", () => {
+    expect(
+      cloudflareRefusalSummary({
+        message: "Sign in to Cloudflare first.",
+        completed: [],
+        remaining: [],
+      }),
+    ).toBe("Sign in to Cloudflare first.");
+  });
+
+  it("names completed and outstanding work separately", () => {
+    expect(
+      cloudflareRefusalSummary({
+        message: "The DNS route could not be created.",
+        completed: ["credential", "tunnel-create"],
+        remaining: ["dns-route"],
+      }),
+    ).toBe(
+      "The DNS route could not be created. Already done: the tunnel credential, creating the tunnel. Still outstanding: creating the DNS route.",
+    );
+  });
+
+  it("names remaining remote cleanup without claiming the rest was undone", () => {
+    const summary = cloudflareRefusalSummary({
+      message: "The tunnel was deleted but its DNS record was not.",
+      completed: ["tunnel-delete"],
+      remaining: ["dns-record-delete"],
+    });
+    expect(summary).toContain("Already done: deleting the tunnel.");
+    expect(summary).toContain("Still outstanding: deleting the DNS record.");
   });
 });
 
@@ -387,5 +474,82 @@ describe("the cloudflared executables a developer can pick between", () => {
       discovered,
     );
     expect(selectableCloudflaredExecutables(discovered, "  ")).toEqual(discovered);
+  });
+});
+
+/**
+ * The end of the road for Gap 4: what a refused Cloudflare command actually
+ * puts on screen. The server's sentence used to be dropped at the boundary —
+ * an untagged `{ message }` decoded as no declared error — so the only thing
+ * that reached here was the transport's own summary, which is a sentence for
+ * whoever wrote the client rather than whoever is holding the machine.
+ */
+describe("what a failed Cloudflare request puts on screen", () => {
+  const refusal = (over: Partial<EnvironmentPublicExposureRejectedError> = {}) =>
+    new EnvironmentPublicExposureRejectedError({
+      code: "public_exposure_refused",
+      reason: "command-failed",
+      message: "cloudflared could not list the account's tunnels.",
+      completed: [],
+      remaining: [],
+      traceId: "trace-1",
+      ...over,
+    });
+
+  it("shows the server's own sentence rather than the transport's summary", () => {
+    const wrapped = PrimaryEnvironmentRequestError.fromCause({
+      operation: "list-cloudflare-tunnels",
+      cause: refusal(),
+    });
+
+    expect(wrapped.message).toContain("Primary environment request failed");
+    expect(cloudflareFailureMessage(wrapped, "The Cloudflare request failed.")).toBe(
+      "cloudflared could not list the account's tunnels.",
+    );
+  });
+
+  it("names the work a partial failure finished and left outstanding", () => {
+    const wrapped = PrimaryEnvironmentRequestError.fromCause({
+      operation: "list-cloudflare-tunnels",
+      cause: refusal({
+        reason: "cleanup-required",
+        message: "The tunnel was deleted but its DNS record was not.",
+        completed: ["tunnel-delete"],
+        remaining: ["dns-record-delete"],
+      }),
+    });
+
+    const shown = cloudflareFailureMessage(wrapped, "The Cloudflare request failed.");
+    expect(shown).toContain("The tunnel was deleted but its DNS record was not.");
+    expect(shown).toContain("Already done: deleting the tunnel.");
+    expect(shown).toContain("Still outstanding: deleting the DNS record.");
+  });
+
+  /**
+   * ADR-0047: a denied client learns that administrator access is required and
+   * nothing about the Cloudflare account or configuration behind the refusal.
+   */
+  it("tells a client without the scope only that it needs one", () => {
+    const denied = PrimaryEnvironmentRequestError.fromCause({
+      operation: "list-cloudflare-tunnels",
+      cause: new EnvironmentScopeRequiredError({
+        code: "insufficient_scope",
+        requiredScope: "access:write",
+        traceId: "trace-2",
+      }),
+    });
+
+    expect(cloudflareFailureMessage(denied, "The Cloudflare request failed.")).toBe(
+      "Administrator access is required to manage Cloudflare setup.",
+    );
+  });
+
+  it("falls back when the failure carries nothing worth showing", () => {
+    expect(cloudflareFailureMessage(new Error("   "), "The Cloudflare request failed.")).toBe(
+      "The Cloudflare request failed.",
+    );
+    expect(cloudflareFailureMessage({}, "The Cloudflare request failed.")).toBe(
+      "The Cloudflare request failed.",
+    );
   });
 });

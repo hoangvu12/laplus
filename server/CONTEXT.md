@@ -982,6 +982,33 @@ identify this laplus environment and carry an authenticated HTTP request and
 WebSocket upgrade. A ready connector alone is not a verified endpoint.
 _Avoid_: Connected tunnel, when only the connector is known to be connected.
 
+**Tunnel ownership** — who owns the Cloudflare tunnel behind an endpoint:
+`external`, `adopted`, or `laplus-created`. Persisted, and the only thing that
+authorizes deleting a Cloudflare resource. A tunnel run from a connector token
+is external, because Cloudflare keeps its configuration and allocation.
+`crate::public_exposure::TunnelOwnership`, ADR-0049.
+_Avoid_: Ownership unqualified, which is also asked of a connector and of an
+executable and has a different answer for each.
+
+**Connector ownership** — who runs the connector process: laplus, or an external
+supervisor. Independent of tunnel ownership — laplus may run a connector for a
+tunnel it may not delete, and an adopted tunnel is laplus-run and externally
+owned.
+
+**Mutation journal** — what a multi-step Cloudflare change wrote down before and
+after each step, so that a resume knows which mutations already happened and
+which were started and never settled. The second list is the _remaining work_; a
+recovery that cannot name it can only claim a rollback it did not perform.
+`public_exposure_journal`.
+_Avoid_: Setup state, which is one word for a thing that has to be a log.
+
+**Public-exposure refusal** — a tagged answer to a refused Cloudflare command,
+carrying a reason from a closed set, the sentence to show, and the mutations
+completed and left outstanding. Distinct from a scope refusal, which discloses
+only the required scope (ADR-0047) and is answered first.
+_Avoid_: Error message, which is what this replaced and what could not carry a
+reason a client could act on.
+
 **Administrative session** — an authenticated laplus session granted
 `access:write`. It may change who or what can reach the environment; an ordinary
 paired client may use an endpoint without administering it.

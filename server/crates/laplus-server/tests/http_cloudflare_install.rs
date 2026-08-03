@@ -9,29 +9,13 @@
 
 mod harness;
 
-use harness::{ClientIdentity, TestServer};
+use harness::cloudflare::{client_with, FakeCloudflared, VerifiedEndpoint};
+use harness::TestServer;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// The public path is already covered end to end by the verification tests; what
-/// matters here is that an installed executable reaches it at all.
-#[derive(Debug)]
-struct VerifiedEndpoint;
-
-impl laplus_server::public_exposure::EndpointVerifier for VerifiedEndpoint {
-    fn verify<'a>(
-        &'a self,
-        _origin: &'a str,
-        _environment_id: &'a str,
-        _http_token: &'a str,
-        _ws_token: &'a str,
-    ) -> laplus_server::public_exposure::VerificationFuture<'a> {
-        Box::pin(async { Ok(()) })
-    }
-}
 
 /// The release-feed override is process-wide, so these tests take turns.
 ///
@@ -42,22 +26,6 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn serially() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-const GRANT_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
-const BOOTSTRAP_TOKEN_TYPE: &str = "urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap";
-const ACCESS_TOKEN_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
-
-async fn client_with(server: &TestServer, scopes: &[&str]) -> ClientIdentity {
-    let minted = server
-        .post_json("/api/auth/pairing-token", &json!({ "scopes": scopes }))
-        .await;
-    let credential = minted.body["credential"].as_str().unwrap();
-    let exchanged = server.post_form(
-        "/oauth/token",
-        &format!("grant_type={GRANT_TYPE}&subject_token={credential}&subject_token_type={BOOTSTRAP_TOKEN_TYPE}&requested_token_type={ACCESS_TOKEN_TYPE}"),
-    ).await;
-    ClientIdentity::anonymous().with_bearer(exchanged.body["access_token"].as_str().unwrap())
 }
 
 /// A stand-in for Cloudflare's published release, and for the executable.
@@ -77,32 +45,6 @@ struct FeedState {
     version: String,
     /// `ok`, `corrupt`, `truncate`, `no-checksum`, or `no-asset`.
     mode: String,
-}
-
-fn connector_artifact(trace: &std::path::Path) -> Vec<u8> {
-    format!(
-        r#"#!/usr/bin/env python3
-import http.server, json, signal, sys
-TRACE = {trace:?}
-if '--version' in sys.argv:
-    print('cloudflared version 2026.7.3')
-    raise SystemExit(0)
-with open(TRACE, 'a') as f:
-    f.write(json.dumps(sys.argv[1:]) + '\n')
-metrics = sys.argv[sys.argv.index('--metrics') + 1]
-class Ready(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200 if self.path == '/ready' else 404)
-        self.end_headers()
-    def log_message(self, *args): pass
-host, port = metrics.rsplit(':', 1)
-server = http.server.HTTPServer((host, int(port)), Ready)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-server.serve_forever()
-"#,
-        trace = trace.display().to_string()
-    )
-    .into_bytes()
 }
 
 impl FakeRelease {
@@ -267,7 +209,7 @@ async fn an_approved_release_is_verified_promoted_and_runs_the_connector() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("cloudflared.trace");
-    let release = FakeRelease::start("2026.7.3", connector_artifact(&trace)).await;
+    let release = FakeRelease::start("2026.7.3", FakeCloudflared::artifact(directory.path())).await;
     std::env::set_var("LAPLUS_CLOUDFLARED_RELEASE_API", &release.origin);
     let server = TestServer::start_configured_in_with_endpoint_verifier(
         directory.path(),
@@ -366,7 +308,7 @@ async fn a_corrupt_or_interrupted_download_is_never_promoted_and_stays_retryable
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("cloudflared.trace");
-    let release = FakeRelease::start("2026.7.3", connector_artifact(&trace)).await;
+    let release = FakeRelease::start("2026.7.3", FakeCloudflared::artifact(directory.path())).await;
     std::env::set_var("LAPLUS_CLOUDFLARED_RELEASE_API", &release.origin);
     let server = TestServer::start_configured_in(directory.path()).await;
     let approval = json!({"version": "2026.7.3", "checksum": release.checksum()});
@@ -410,7 +352,7 @@ async fn an_unpublished_artifact_or_checksum_is_refused_before_anything_is_downl
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("cloudflared.trace");
-    let release = FakeRelease::start("2026.7.3", connector_artifact(&trace)).await;
+    let release = FakeRelease::start("2026.7.3", FakeCloudflared::artifact(directory.path())).await;
     std::env::set_var("LAPLUS_CLOUDFLARED_RELEASE_API", &release.origin);
     let server = TestServer::start_configured_in(directory.path()).await;
     let approval = json!({"version": "2026.7.3", "checksum": release.checksum()});
@@ -444,7 +386,7 @@ async fn a_failed_reinstall_of_the_installed_version_stops_claiming_to_be_instal
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("cloudflared.trace");
-    let release = FakeRelease::start("2026.7.3", connector_artifact(&trace)).await;
+    let release = FakeRelease::start("2026.7.3", FakeCloudflared::artifact(directory.path())).await;
     std::env::set_var("LAPLUS_CLOUDFLARED_RELEASE_API", &release.origin);
     let server = TestServer::start_configured_in(directory.path()).await;
 
@@ -488,7 +430,7 @@ async fn installing_replaces_only_the_copy_laplus_owns() {
     let elsewhere = directory.path().join("system-cloudflared");
     std::fs::write(&elsewhere, "#!/bin/sh\necho 'cloudflared version 2026.1.0'\n").unwrap();
     std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let release = FakeRelease::start("2026.7.3", connector_artifact(&trace)).await;
+    let release = FakeRelease::start("2026.7.3", FakeCloudflared::artifact(directory.path())).await;
     std::env::set_var("LAPLUS_CLOUDFLARED_RELEASE_API", &release.origin);
     let server = TestServer::start_configured_in(directory.path()).await;
 
@@ -527,7 +469,7 @@ async fn installation_requires_write_and_state_requires_read() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
     let trace = directory.path().join("cloudflared.trace");
-    let release = FakeRelease::start("2026.7.3", connector_artifact(&trace)).await;
+    let release = FakeRelease::start("2026.7.3", FakeCloudflared::artifact(directory.path())).await;
     std::env::set_var("LAPLUS_CLOUDFLARED_RELEASE_API", &release.origin);
     let server = TestServer::start_configured_in(directory.path()).await;
 

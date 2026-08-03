@@ -1,9 +1,17 @@
+import {
+  isPrimaryEnvironmentRequestError,
+  publicExposureRefusal,
+} from "../../environments/primary";
+
 import type {
   AdvertisedEndpoint,
   CloudflareAccountSnapshot,
   CloudflaredExecutable,
   ExternalTunnelEndpointSnapshot,
+  EnvironmentPublicExposureRefusal,
   ManagedCloudflareConnectorSnapshot,
+  PublicExposureMutationStep,
+  TunnelOwnership,
 } from "@t3tools/contracts";
 
 /**
@@ -258,11 +266,38 @@ const accountPosition = (
 };
 
 /**
+ * What the compact row calls each ownership.
+ *
+ * **An exhaustive `Record`, so a value the server adds fails typecheck** — the
+ * same shape as {@link WIZARD_STEP_LABELS} above, and for the same reason.
+ *
+ * The words are `CONTEXT.md`'s: a laplus-created tunnel is the only one laplus
+ * may delete, an adopted one is configured and supervised by laplus but
+ * allocated elsewhere, and an external one is somebody else's throughout. The
+ * row has to be able to say which, because ticket 06 requires it to identify a
+ * laplus-created tunnel and preserve that across restart, and ticket 07 makes
+ * the same word decide whether "Delete everywhere" is offered at all.
+ */
+const OWNERSHIP_LABELS: Record<TunnelOwnership, string> = {
+  external: "Externally owned",
+  adopted: "Adopted",
+  "laplus-created": "laplus-created",
+};
+
+export const cloudflareOwnershipLabel = (ownership: TunnelOwnership): string =>
+  OWNERSHIP_LABELS[ownership];
+
+/**
  * What the compact Connections row says under "Cloudflare Tunnel".
  *
  * An unfinished setup names the step it stopped at, because a row that says
  * only "Not configured" gives a developer who was interrupted no reason to
  * believe reopening the dialog will pick up where they left off.
+ *
+ * A configured endpoint names its ownership, because "laplus-created" and
+ * "adopted" differ in exactly what the destructive controls beneath the row may
+ * offer — and a row that showed only a hostname and a health word made two
+ * endpoints with opposite deletion authority look identical.
  */
 export const cloudflareRowSummary = (input: {
   readonly state: CloudflareWizardState;
@@ -272,17 +307,54 @@ export const cloudflareRowSummary = (input: {
 }): string => {
   const { state, managed, external, managedStateLabel } = input;
   if (managed?.configured) {
-    return `${managed.httpsOrigin} · ${managedStateLabel(managed)}`;
+    return `${managed.httpsOrigin} · ${cloudflareOwnershipLabel(managed.tunnelOwnership)} · ${managedStateLabel(managed)}`;
   }
   if (external?.httpsOrigin) {
     const verification =
       external.verificationState === "verified" ? "Verified" : "Needs verification";
-    return `${external.httpsOrigin} · ${verification}`;
+    return `${external.httpsOrigin} · ${cloudflareOwnershipLabel(external.ownership)} · ${verification}`;
   }
   if (state.step === "choose-path") {
     return "Register an externally managed HTTPS hostname.";
   }
   return `Setup in progress · ${state.label}`;
+};
+
+/** What a refusal calls each journaled mutation step. */
+const MUTATION_STEP_LABELS: Record<PublicExposureMutationStep, string> = {
+  credential: "the tunnel credential",
+  "tunnel-create": "creating the tunnel",
+  "dns-route": "creating the DNS route",
+  configuration: "writing the connector configuration",
+  "dns-record-delete": "deleting the DNS record",
+  "tunnel-delete": "deleting the tunnel",
+  "configuration-remove": "removing the connector configuration",
+  "credential-remove": "removing the tunnel credential",
+};
+
+/**
+ * What to tell a developer after a refused Cloudflare command.
+ *
+ * **Never claims a rollback that did not occur**, which is the rule tickets 06
+ * and 07 both state: work the server recorded as done is reported as done, and
+ * work it started and never settled is reported as outstanding. A refusal that
+ * changed nothing carries neither list and reads exactly as it did before.
+ */
+export const cloudflareRefusalSummary = (
+  refusal: Pick<EnvironmentPublicExposureRefusal, "message" | "completed" | "remaining">,
+): string => {
+  const sentences = [refusal.message.trim()];
+  if (refusal.completed.length > 0) {
+    sentences.push(
+      `Already done: ${refusal.completed.map((step) => MUTATION_STEP_LABELS[step]).join(", ")}.`,
+    );
+  }
+  if (refusal.remaining.length > 0) {
+    sentences.push(
+      `Still outstanding: ${refusal.remaining.map((step) => MUTATION_STEP_LABELS[step]).join(", ")}.`,
+    );
+  }
+  return sentences.filter((sentence) => sentence !== "").join(" ");
 };
 
 /**
@@ -304,3 +376,40 @@ export const selectableCloudflaredExecutables = (
   // a path that has only been typed here has no such answer yet.
   return [...executables, { path: trimmed, source: "user-selected", selected: false }];
 };
+
+/**
+ * What to put on screen when a Cloudflare request fails.
+ *
+ * **A refused administrator is told the one thing ADR-0047 says they may
+ * learn.** Left alone, a 403 arrives here as the transport's own summary —
+ * "Primary environment request failed during list-cloudflare-tunnels (HTTP
+ * 403)" — which is a sentence for whoever wrote the client, not for whoever is
+ * holding the machine. The ADR's wording is the whole of what a denied client
+ * gets: that administrator access is required, and nothing about the Cloudflare
+ * account or configuration behind the refusal.
+ *
+ * **A refused command now says why.** A 409 or a 400 from `/api/access/cloudflare`
+ * carries a tagged `EnvironmentPublicExposure{Precondition,Rejected}Error` with
+ * a closed `reason`, the server's own sentence, and the exact mutations a
+ * partial failure completed and left outstanding — which is what closes Gap 4
+ * in `.scratch/contract-parity/ledger.md`. Before that shape existed the body
+ * was an untagged `{ message }` that decoded as nothing, so the only thing that
+ * reached this function was the transport's summary and the reason was thrown
+ * away at the boundary.
+ *
+ * The 403 stays deliberately mute: ADR-0047 gives a client without the scope
+ * the required scope and nothing else, and the refusal is answered before any
+ * of the reasons above is evaluated.
+ */
+export function cloudflareFailureMessage(cause: unknown, fallback: string): string {
+  if (isPrimaryEnvironmentRequestError(cause) && cause.status === 403) {
+    return "Administrator access is required to manage Cloudflare setup.";
+  }
+  const refusal = publicExposureRefusal(cause);
+  if (refusal !== null) {
+    const summary = cloudflareRefusalSummary(refusal);
+    return summary === "" ? fallback : summary;
+  }
+  const message = cause instanceof Error ? cause.message : "";
+  return message.trim() === "" ? fallback : message;
+}

@@ -24,6 +24,7 @@
 
 pub mod agent;
 pub mod captures;
+pub mod cloudflare;
 pub mod codex;
 pub mod conversation;
 pub mod shape;

@@ -403,13 +403,29 @@ with a `Void` success and a comment saying so, because nothing in `HttpApi` can
 express an upgrade. They are declared anyway so that a route audit finds every
 path rather than only the ones a client drives.
 
-**One thing is still undeclared and is deliberate.** Every Cloudflare route
-refuses a precondition with `409` and a rejection with `400`, both carrying an
-untagged `{ "message": … }` body. That shape has been the Cloudflare convention
-since ticket 01 and does not decode as a tagged `Environment*Error`, so it is
-absent from the declared error sets rather than declared as something it is not.
-Eleven handlers would have to change together; see `cloudflare_account_refusal`
-in `server.rs`.
+**The untagged refusal body is closed too**, by the Cloudflare cleanup pass on
+2026-08-03. Every Cloudflare route used to refuse a precondition with `409` and
+a rejection with `400`, both carrying an untagged `{ "message": … }` that
+decoded as no tagged `Environment*Error` — so the reason never reached the
+browser and the routes' declared error sets were a partial truth. The eleven
+mutating endpoints now declare `EnvironmentPublicExposurePreconditionError`
+(409) and `EnvironmentPublicExposureRejectedError` (400), which carry a closed
+`reason`, the server's sentence, and the mutations a partial failure completed
+and left outstanding. `Refused` in `server.rs` builds them.
+
+`EnvironmentScopeRequiredError` is deliberately not folded into that union: a
+client without the scope is refused before any reason is evaluated and learns
+only which scope it needs, which is ADR-0047's rule that a refusal discloses
+nothing. `http_cloudflare_account.rs` asserts that the scope refusal carries no
+`reason` and no `message`.
+
+**One untagged body is left, and it is recorded rather than fixed.**
+`POST /api/access/cloudflare/test` answers `504` with `{ "message":
+"Verification is still running." }` when a bounded verification has not settled.
+It is outside the eleven because it is neither a precondition nor a rejection —
+nothing was refused, the answer is not ready — and giving it a shape would mean
+a third tagged class for one route. It is the same defect as the eleven, at a
+tenth of the cost to leave, so it is written down here instead of forgotten.
 
 ## Limits of this ledger
 

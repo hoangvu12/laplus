@@ -1,6 +1,7 @@
 //! Lifecycle of a laplus-managed `cloudflared` connector.
 
 use crate::process::Search;
+use crate::public_exposure::{Refusal, RefusalReason};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -15,17 +16,43 @@ const SETTINGS: &str = "connector.json";
 const TOKEN: &str = "connector.token";
 const INGRESS: &str = "connector.yml";
 const MAX_RESTARTS: u8 = 3;
+/// Who runs the connector *process*, which is a different question from who owns
+/// the tunnel it serves — see [`crate::public_exposure::TunnelOwnership`]. This
+/// manager only ever supervises laplus's own, so the answer here is a constant;
+/// an externally managed connector is never represented by a [`Manager`] at all.
+const CONNECTOR_OWNERSHIP: &str = "laplus";
 const READY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+crate::public_exposure::closed_vocabulary! {
+    /// Whether laplus should be running this connector.
+    ///
+    /// The *desired* state, which is not the actual one: `connector_state`
+    /// reports what the child is doing, and the gap between the two is what
+    /// supervision closes. Persisted, because it is the answer a restart
+    /// resumes from.
+    DesiredState as "desired connector state" {
+        Running => "running",
+        Stopped => "stopped",
+    }
+}
+
+/// What a connector needs to run, and nothing about who owns its tunnel.
+///
+/// **Ownership deliberately lives in one place, and it is not here.** This file
+/// used to carry `ownership: "adopted"`, written unconditionally and never read
+/// back; making it a real value would have left two records of one fact, and a
+/// boot that restores the endpoint row from this file would then decide which
+/// of them wins. The durable answer is the `public_exposure_endpoint` row —
+/// `docs/adr/0049` — and `managed_connector_snapshot` in `server.rs` reads it
+/// from there the same way it reads verification state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Configuration {
     pub https_origin: String,
     pub loopback_origin: String,
     pub executable_path: PathBuf,
-    pub ownership: String,
     pub token_file: PathBuf,
-    pub desired_state: String,
+    pub desired_state: DesiredState,
 }
 
 #[derive(Debug)]
@@ -60,9 +87,9 @@ impl Manager {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         let connector_state = match configuration
             .as_ref()
-            .map(|value: &Configuration| value.desired_state.as_str())
+            .map(|value: &Configuration| value.desired_state)
         {
-            Some("running") => "starting",
+            Some(DesiredState::Running) => "starting",
             _ => "stopped",
         };
         Arc::new(Self {
@@ -112,23 +139,29 @@ impl Manager {
         hostname: &str,
         executable: &Path,
         connector_token: &str,
-    ) -> Result<(), String> {
-        let https_origin =
-            crate::public_exposure::normalize_hostname(hostname).map_err(str::to_string)?;
+    ) -> Result<(), Refusal> {
+        let https_origin = crate::public_exposure::normalize_hostname(hostname)
+            .map_err(|message| Refusal::rejected(RefusalReason::HostnameInvalid, message))?;
         let token_file = self.directory.join(TOKEN);
         if connector_token.trim().is_empty() && !token_file.is_file() {
-            return Err("Enter the tunnel-specific connector token.".into());
+            return Err(Refusal::rejected(
+                RefusalReason::ConnectorRequired,
+                "Enter the tunnel-specific connector token.",
+            ));
         }
-        let executable = Search::from_environment()
-            .startable(executable)
-            .ok_or_else(|| "The selected cloudflared executable cannot be started.".to_string())?;
+        let executable = Search::from_environment().startable(executable).ok_or_else(|| {
+            Refusal::rejected(
+                RefusalReason::ExecutableUnusable,
+                "The selected cloudflared executable cannot be started.",
+            )
+        })?;
         let version = compatible_version(&executable).await?;
-        let loopback_origin = self
-            .owner_origin
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "The connector owner has not finished starting.".to_string())?;
+        let loopback_origin = self.owner_origin.lock().unwrap().clone().ok_or_else(|| {
+            Refusal::rejected(
+                RefusalReason::ConnectorRequired,
+                "The connector owner has not finished starting.",
+            )
+        })?;
         private_directory(&self.directory)?;
         if !connector_token.trim().is_empty() {
             private_write(&token_file, connector_token.as_bytes())?;
@@ -137,9 +170,8 @@ impl Manager {
             https_origin,
             loopback_origin,
             executable_path: executable,
-            ownership: "adopted".into(),
             token_file,
-            desired_state: "running".into(),
+            desired_state: DesiredState::Running,
         };
         persist(&self.directory, &configuration)?;
         {
@@ -161,7 +193,8 @@ impl Manager {
         let runtime = self.runtime.lock().unwrap();
         let Some(configuration) = &runtime.configuration else {
             return json!({
-                "configured": false, "ownership": "laplus", "desiredState": "stopped",
+                "configured": false, "ownership": CONNECTOR_OWNERSHIP,
+                "desiredState": DesiredState::Stopped,
                 "connectorState": "unconfigured", "readiness": null, "httpsOrigin": null,
                 "executablePath": null, "detectedVersion": null, "metricsOrigin": null,
                 "failureMessage": null, "restartCount": 0, "logs": []
@@ -169,8 +202,7 @@ impl Manager {
         };
         json!({
             "configured": true,
-            "ownership": "laplus",
-            "remoteOwnership": "cloudflare",
+            "ownership": CONNECTOR_OWNERSHIP,
             "desiredState": configuration.desired_state,
             "connectorState": runtime.connector_state,
             "readiness": runtime.readiness,
@@ -244,19 +276,22 @@ impl Manager {
         self.installer.install(version, checksum).await
     }
 
-    pub fn set_desired(&self, running: bool, retry: bool) -> Result<(), String> {
+    pub fn set_desired(&self, running: bool, retry: bool) -> Result<(), Refusal> {
         let configuration = {
             let mut runtime = self.runtime.lock().unwrap();
             if runtime.configuration.is_none() {
-                return Err("Configure a connector first.".to_string());
+                return Err(Refusal::rejected(
+                    RefusalReason::ConnectorRequired,
+                    "Configure a connector first.",
+                ));
             }
             if running && !retry && runtime.connector_state == "restart-exhausted" {
-                return Err(
-                    "Automatic restarts are exhausted; use Retry to start the connector again."
-                        .into(),
-                );
+                return Err(Refusal::rejected(
+                    RefusalReason::RestartsExhausted,
+                    "Automatic restarts are exhausted; use Retry to start the connector again.",
+                ));
             }
-            let desired = if running { "running" } else { "stopped" };
+            let desired = if running { DesiredState::Running } else { DesiredState::Stopped };
             if !retry
                 && runtime
                     .configuration
@@ -273,7 +308,7 @@ impl Manager {
             runtime.connector_state = if running { "starting" } else { "stopping" }.into();
             runtime.readiness = None;
             let configuration = runtime.configuration.as_mut().unwrap();
-            configuration.desired_state = desired.into();
+            configuration.desired_state = desired;
             configuration.clone()
         };
         persist(&self.directory, &configuration)?;
@@ -301,7 +336,7 @@ impl Manager {
                     runtime
                         .configuration
                         .clone()
-                        .filter(|value| value.desired_state == "running"),
+                        .filter(|value| value.desired_state == DesiredState::Running),
                     runtime.generation,
                 )
             };
@@ -317,8 +352,8 @@ impl Manager {
                     continue;
                 }
             };
-            if let Err(message) = write_ingress(&self.directory, &configuration) {
-                self.fail(message, true);
+            if let Err(refusal) = write_ingress(&self.directory, &configuration) {
+                self.fail(refusal.message, true);
                 self.changed.notified().await;
                 continue;
             }
@@ -381,7 +416,7 @@ impl Manager {
                     } else if runtime
                         .configuration
                         .as_ref()
-                        .is_none_or(|value| value.desired_state != "running")
+                        .is_none_or(|value| value.desired_state != DesiredState::Running)
                     {
                         "stop"
                     } else if runtime.generation != generation {
@@ -432,7 +467,7 @@ impl Manager {
                                     } else if runtime
                                         .configuration
                                         .as_ref()
-                                        .is_none_or(|value| value.desired_state != "running")
+                                        .is_none_or(|value| value.desired_state != DesiredState::Running)
                                     {
                                         "stop"
                                     } else if runtime.generation != generation {
@@ -509,7 +544,7 @@ impl Manager {
         if runtime.restart_count >= MAX_RESTARTS {
             runtime.connector_state = "restart-exhausted".into();
             if let Some(configuration) = runtime.configuration.as_mut() {
-                configuration.desired_state = "stopped".into();
+                configuration.desired_state = DesiredState::Stopped;
                 let _ = persist(&self.directory, configuration);
             }
         } else {
@@ -646,10 +681,16 @@ pub(crate) async fn detected_version(executable: &Path) -> Option<String> {
     detect_version(executable).await.ok()
 }
 
-pub(crate) async fn compatible_version(executable: &Path) -> Result<String, String> {
-    let version = detect_version(executable).await?;
+pub(crate) async fn compatible_version(executable: &Path) -> Result<String, Refusal> {
+    let version = detect_version(executable).await.map_err(|message| {
+        Refusal::rejected(RefusalReason::ExecutableUnusable, message)
+    })?;
     if !compatible_version_text(&version) {
-        return Err("The selected cloudflared executable is incompatible; version 2024 or newer is required.".into());
+        return Err(Refusal::rejected(
+            RefusalReason::ExecutableUnusable,
+            "The selected cloudflared executable is incompatible; version 2024 or newer is \
+             required.",
+        ));
     }
     Ok(version)
 }
@@ -689,21 +730,29 @@ async fn free_loopback_address() -> Result<String, String> {
     Ok(address.to_string())
 }
 
-pub(crate) fn private_directory(directory: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(directory)
-        .map_err(|_| "The private connector directory could not be created.".to_string())?;
+pub(crate) fn private_directory(directory: &Path) -> Result<(), Refusal> {
+    std::fs::create_dir_all(directory).map_err(|_| local_setup("directory could not be created"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| "The private connector directory could not be protected.".to_string())?;
+            .map_err(|_| local_setup("directory could not be protected"))?;
     }
     #[cfg(windows)]
     protect_windows(directory, true)?;
     Ok(())
 }
 
-pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Everything that can fail while laplus writes its own private files says so
+/// the same way: nothing at Cloudflare went wrong, and the retry is local.
+fn local_setup(what: &str) -> Refusal {
+    Refusal::rejected(
+        RefusalReason::LocalSetupFailed,
+        format!("The private connector {what}."),
+    )
+}
+
+pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
     let temporary = path.with_file_name(format!(
         "{}.private-{}",
         path.file_name()
@@ -720,33 +769,31 @@ pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let mut file = options
         .open(&temporary)
-        .map_err(|_| "The private connector credential could not be written.".to_string())?;
+        .map_err(|_| local_setup("credential could not be written"))?;
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
-        .map_err(|_| "The private connector credential could not be written.".to_string())?;
+        .map_err(|_| local_setup("credential could not be written"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-            .map_err(|_| "The private connector credential could not be protected.".to_string())?;
+            .map_err(|_| local_setup("credential could not be protected"))?;
     }
     #[cfg(windows)]
     protect_windows(&temporary, false)?;
     #[cfg(windows)]
     if path.exists() {
-        std::fs::remove_file(path).map_err(|_| {
-            "The previous private connector credential could not be replaced.".to_string()
-        })?;
+        std::fs::remove_file(path).map_err(|_| local_setup("credential could not be replaced"))?;
     }
     std::fs::rename(&temporary, path)
-        .map_err(|_| "The private connector credential could not be installed.".to_string())?;
+        .map_err(|_| local_setup("credential could not be installed"))?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn protect_windows(path: &Path, directory: bool) -> Result<(), String> {
+fn protect_windows(path: &Path, directory: bool) -> Result<(), Refusal> {
     let user = std::env::var("USERNAME")
-        .map_err(|_| "The current Windows account could not be identified.".to_string())?;
+        .map_err(|_| local_setup("credential ACL needs a Windows account"))?;
     let grant = if directory {
         format!("{user}:(OI)(CI)F")
     } else {
@@ -764,21 +811,21 @@ fn protect_windows(path: &Path, directory: bool) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|_| "The private connector credential ACL could not be applied.".to_string())?;
+        .map_err(|_| local_setup("credential ACL could not be applied"))?;
     if !status.success() {
-        return Err("The private connector credential ACL could not be applied.".into());
+        return Err(local_setup("credential ACL could not be applied"));
     }
     Ok(())
 }
 
-fn persist(directory: &Path, configuration: &Configuration) -> Result<(), String> {
+fn persist(directory: &Path, configuration: &Configuration) -> Result<(), Refusal> {
     private_directory(directory)?;
     let bytes = serde_json::to_vec_pretty(configuration)
-        .map_err(|_| "Connector settings could not be encoded.".to_string())?;
+        .map_err(|_| local_setup("settings could not be encoded"))?;
     private_write(&directory.join(SETTINGS), &bytes)
 }
 
-fn write_ingress(directory: &Path, configuration: &Configuration) -> Result<(), String> {
+fn write_ingress(directory: &Path, configuration: &Configuration) -> Result<(), Refusal> {
     let contents = format!(
         "ingress:\n  - hostname: {}\n    service: {}\n  - service: http_status:404\n",
         configuration.https_origin.trim_start_matches("https://"),

@@ -9,6 +9,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   EnvironmentHttpCommonError,
+  EnvironmentPublicExposureRefusal,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   type ApproveCloudflaredReleaseInput,
   type CloudflareAccountSnapshot,
@@ -146,6 +147,30 @@ export const isPrimaryEnvironmentPairingCredentialRequiredError = Schema.is(
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
 
+/**
+ * Whether a decoded error is one of the two public-exposure refusals.
+ *
+ * Private: callers want {@link publicExposureRefusal}, which also unwraps the
+ * transport. A Cloudflare refusal used to arrive as an untagged `{ message }`
+ * that decoded as nothing, so the UI could show only the transport's own
+ * summary — see {@link PrimaryEnvironmentRequestError}.
+ */
+const isPublicExposureRefusal = Schema.is(EnvironmentPublicExposureRefusal);
+
+/**
+ * The refusal behind a failed public-exposure request, if there was one.
+ *
+ * The transport wraps whatever the client decoded, so the tagged refusal is the
+ * `cause` rather than the error itself.
+ */
+export function publicExposureRefusal(error: unknown): EnvironmentPublicExposureRefusal | null {
+  if (isPublicExposureRefusal(error)) return error;
+  if (isPrimaryEnvironmentRequestError(error) && isPublicExposureRefusal(error.cause)) {
+    return error.cause;
+  }
+  return null;
+}
+
 export interface ServerPairingLinkRecord {
   readonly id: string;
   readonly credential: string;
@@ -263,6 +288,12 @@ export async function fetchSessionState(): Promise<AuthSessionState> {
 function readHttpApiStatus(error: unknown): number | null {
   if (isEnvironmentHttpCommonError(error)) {
     return readEnvironmentHttpErrorStatus(error);
+  }
+  // A precondition the developer has to satisfy is a 409; a rejection is a 400.
+  // Read from the tag rather than from the response, because by the time this
+  // runs the client has already decoded the body into one of the two.
+  if (isPublicExposureRefusal(error)) {
+    return error._tag === "EnvironmentPublicExposurePreconditionError" ? 409 : 400;
   }
   return HttpClientError.isHttpClientError(error) && error.response !== undefined
     ? error.response.status

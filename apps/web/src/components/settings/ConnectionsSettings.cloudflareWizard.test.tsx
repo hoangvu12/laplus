@@ -66,6 +66,7 @@ const verifiedExternal: ExternalTunnelEndpointSnapshot = {
 const unconfiguredConnector: ManagedCloudflareConnectorSnapshot = {
   configured: false,
   ownership: "laplus",
+  tunnelOwnership: "external",
   desiredState: "stopped",
   connectorState: "stopped",
   readiness: null,
@@ -85,7 +86,6 @@ const unconfiguredConnector: ManagedCloudflareConnectorSnapshot = {
 const readyConnector: ManagedCloudflareConnectorSnapshot = {
   ...unconfiguredConnector,
   configured: true,
-  remoteOwnership: "cloudflare",
   desiredState: "running",
   connectorState: "ready",
   readiness: true,

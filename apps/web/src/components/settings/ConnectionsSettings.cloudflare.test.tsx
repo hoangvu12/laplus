@@ -54,7 +54,7 @@ describe("managed Cloudflare connector", () => {
   const snapshot = {
     configured: true,
     ownership: "laplus",
-    remoteOwnership: "cloudflare",
+    tunnelOwnership: "external",
     desiredState: "running",
     connectorState: "ready",
     readiness: true,

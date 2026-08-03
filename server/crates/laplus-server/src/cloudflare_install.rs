@@ -284,7 +284,8 @@ impl Installer {
     }
 
     async fn acquire(&self, release: &Release) -> Result<Record, String> {
-        crate::cloudflare_connector::private_directory(&self.directory)?;
+        crate::cloudflare_connector::private_directory(&self.directory)
+            .map_err(|refusal| refusal.message)?;
         // A partial download is never executable and never has the installed
         // name: promotion is a rename of something already whole and already
         // verified, so an interrupted run cannot leave a runnable file behind.
@@ -314,9 +315,9 @@ impl Installer {
             let _ = std::fs::remove_file(&partial);
             return Err("The verified cloudflared could not be installed.".into());
         }
-        if let Err(message) = crate::cloudflare_connector::compatible_version(&installed).await {
+        if let Err(refusal) = crate::cloudflare_connector::compatible_version(&installed).await {
             let _ = std::fs::remove_file(&installed);
-            return Err(message);
+            return Err(refusal.message);
         }
         // Only ever the copy laplus put here: a system or user-selected
         // executable is never named by a record, so it is never removed.
@@ -334,7 +335,8 @@ impl Installer {
         };
         let bytes = serde_json::to_vec_pretty(&record)
             .map_err(|_| "The installation record could not be encoded.".to_string())?;
-        crate::cloudflare_connector::private_write(&self.directory.join(RECORD), &bytes)?;
+        crate::cloudflare_connector::private_write(&self.directory.join(RECORD), &bytes)
+            .map_err(|refusal| refusal.message)?;
         Ok(record)
     }
 }

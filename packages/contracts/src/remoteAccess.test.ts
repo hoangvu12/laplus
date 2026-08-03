@@ -6,6 +6,7 @@ import {
   CloudflaredInstallationSnapshot,
   ExternalTunnelEndpointSnapshot,
   ManagedCloudflareConnectorSnapshot,
+  TunnelOwnership,
 } from "./remoteAccess.ts";
 
 const decode = Schema.decodeUnknownSync(ExternalTunnelEndpointSnapshot);
@@ -134,7 +135,7 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
     const snapshot = decodeManaged({
       configured: true,
       ownership: "laplus",
-      remoteOwnership: "cloudflare",
+      tunnelOwnership: "laplus-created",
       desiredState: "running",
       connectorState: "ready",
       readiness: true,
@@ -155,6 +156,42 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
     expect(snapshot.readiness).toBe(true);
     expect(snapshot.verificationState).toBe("failed");
     expect(snapshot).not.toHaveProperty("connectorToken");
+    // Who runs the connector and who owns the tunnel are two answers, and they
+    // were one string literal each until the ownership model landed. laplus
+    // supervises this connector; the tunnel behind it is laplus's to delete.
+    expect(snapshot.ownership).toBe("laplus");
+    expect(snapshot.tunnelOwnership).toBe("laplus-created");
+  });
+
+  /**
+   * Ticket 07's whole stop/forget/delete matrix is indexed by this value, so
+   * all three have to survive the wire — and an invented fourth must not.
+   */
+  it("decodes every tunnel ownership and refuses one it does not know", () => {
+    const decodeManaged = Schema.decodeUnknownSync(ManagedCloudflareConnectorSnapshot);
+    const base = {
+      configured: true,
+      ownership: "laplus",
+      desiredState: "running",
+      connectorState: "ready",
+      readiness: true,
+      httpsOrigin: "https://laplus.example.com",
+      executablePath: "/usr/bin/cloudflared",
+      detectedVersion: "2026.7.0",
+      metricsOrigin: "http://127.0.0.1:12345",
+      failureMessage: null,
+      restartCount: 0,
+      logs: [],
+      verificationState: "verified",
+      failureKind: null,
+      publicFailureMessage: null,
+      lastVerifiedAt: "2026-08-03T09:00:00.000Z",
+    };
+    for (const tunnelOwnership of TunnelOwnership.literals) {
+      expect(decodeManaged({ ...base, tunnelOwnership }).tunnelOwnership).toBe(tunnelOwnership);
+    }
+    expect(TunnelOwnership.literals).toEqual(["external", "adopted", "laplus-created"]);
+    expect(() => decodeManaged({ ...base, tunnelOwnership: "cloudflare" })).toThrow();
   });
 
   it("represents an unconfigured connector without exposing a secret", () => {
@@ -162,6 +199,7 @@ describe("ManagedCloudflareConnectorSnapshot", () => {
     const snapshot = decodeManaged({
       configured: false,
       ownership: "laplus",
+      tunnelOwnership: "external",
       desiredState: "stopped",
       connectorState: "stopped",
       readiness: null,

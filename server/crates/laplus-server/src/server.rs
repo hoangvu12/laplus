@@ -424,8 +424,14 @@ impl Server {
         let cloudflare_connector = crate::cloudflare_connector::Manager::open(&config.preferences);
         let cloudflare_account =
             crate::cloudflare_account::Account::open(&config.preferences.join("cloudflare"));
+        // **Restore, not register.** The endpoint row is the record of who owns
+        // this tunnel (`docs/adr/0049`), and it has just survived the restart
+        // this is recovering from — so re-registering the connector's hostname
+        // here would overwrite an `adopted` or `laplus-created` row with the
+        // only ownership a connector file can imply. `restore` writes `external`
+        // when there is nothing recorded and leaves an existing answer alone.
         if let Some(origin) = cloudflare_connector.snapshot()["httpsOrigin"].as_str() {
-            if let Err(error) = database.register_external_tunnel_endpoint(origin) {
+            if let Err(error) = database.restore_public_exposure_endpoint(origin) {
                 eprintln!("laplus: cannot restore managed public endpoint: {error}");
             }
         }
@@ -468,7 +474,7 @@ impl Server {
                         continue;
                     }
                 }
-                if verifier_state.services.shell.database().external_tunnel_endpoint().ok().flatten().is_none() {
+                if verifier_state.services.shell.database().public_exposure_endpoint().ok().flatten().is_none() {
                     delay = std::time::Duration::from_secs(30);
                     continue;
                 }
@@ -1444,14 +1450,54 @@ fn require_scope(grant: &pairing::Grant, scope: &str) -> Result<(), Response> {
     }))).into_response())
 }
 
+/// The status and tag a refusal is answered with.
+///
+/// **The shape changed; the codes did not.** Every Cloudflare route already
+/// refused a precondition with `409` and a rejection with `400` — what was
+/// missing was a body a client could decode, which is Gap 4 in
+/// `.scratch/contract-parity/ledger.md`. Changing a status here as well would
+/// have been a second, unasked-for change hidden inside the first.
+///
+/// **This is never the answer to a missing scope.** ADR-0047 requires a refused
+/// client to learn only which scope it needs, and every
+/// [`public_exposure::RefusalReason`] would disclose Cloudflare state — whether
+/// a tunnel exists, whether laplus created it, how far setup got.
+/// [`require_scope`] answers first and returns `EnvironmentScopeRequiredError`
+/// on its own.
+impl IntoResponse for public_exposure::Refusal {
+    fn into_response(self) -> Response {
+        let (status, tag) = match self.kind {
+            public_exposure::RefusalKind::Precondition => {
+                (StatusCode::CONFLICT, "EnvironmentPublicExposurePreconditionError")
+            }
+            public_exposure::RefusalKind::Rejected => {
+                (StatusCode::BAD_REQUEST, "EnvironmentPublicExposureRejectedError")
+            }
+        };
+        (status, Json(serde_json::json!({
+            "_tag": tag,
+            "code": "public_exposure_refused",
+            "reason": self.reason,
+            // Kept beside the reason rather than replaced by it: the reason is
+            // what the UI branches on, and the message is what cloudflared or
+            // this server actually said, which is the half a developer debugs
+            // with. Secrets are removed by `Refusal::redacting` before here.
+            "message": self.message,
+            "completed": self.completed,
+            "remaining": self.remaining,
+            "traceId": auth::trace_id(),
+        }))).into_response()
+    }
+}
+
 fn external_tunnel_snapshot(state: &ServerState) -> Result<public_exposure::Snapshot, Response> {
-    let endpoint = state.services.shell.database().external_tunnel_endpoint().map_err(|error| {
+    let endpoint = state.services.shell.database().public_exposure_endpoint().map_err(|error| {
         eprintln!("laplus: cannot read public endpoint state: {error}");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
     Ok(match endpoint {
         None => public_exposure::Snapshot { configured: false, https_origin: None, wss_origin: None,
-            ownership: "external", health: serde_json::json!({"connector":"external","https":"unknown","webSocket":"unknown"}), verification_state: "unconfigured".into(), failure_kind: None,
+            ownership: public_exposure::TunnelOwnership::External, health: serde_json::json!({"connector":"external","https":"unknown","webSocket":"unknown"}), verification_state: "unconfigured".into(), failure_kind: None,
             failure_message: None, last_attempt_at: None, last_verified_at: None, advertised_endpoint: None },
         Some(endpoint) => {
             let wss = endpoint.https_origin.replacen("https://", "wss://", 1);
@@ -1467,8 +1513,11 @@ fn external_tunnel_snapshot(state: &ServerState) -> Result<public_exposure::Snap
                 "description": if managed { "Connector supervised by laplus" } else { "Externally managed by your operator" }
             }));
             public_exposure::Snapshot { configured: true, https_origin: Some(endpoint.https_origin),
-                wss_origin: Some(wss), ownership: "external", health: serde_json::json!({
-                    "connector": "external",
+                wss_origin: Some(wss), ownership: endpoint.ownership, health: serde_json::json!({
+                    // Who runs the connector, which the row now knows rather
+                    // than assumes: this said `external` even while laplus was
+                    // supervising the connector behind the hostname.
+                    "connector": if managed { "laplus" } else { "external" },
                     "https": if endpoint.verification_state == "verified" || matches!(endpoint.failure_kind.as_deref(), Some("websocket" | "cloudflare-access-websocket")) { "healthy" } else if endpoint.verification_state == "failed" { "failed" } else { "unknown" },
                     "webSocket": if endpoint.verification_state == "verified" { "healthy" } else if matches!(endpoint.failure_kind.as_deref(), Some("websocket" | "cloudflare-access-websocket")) { "failed" } else { "unknown" }
                 }), verification_state: endpoint.verification_state,
@@ -1501,18 +1550,54 @@ fn managed_connector_already_owns_exposure(state: &ServerState) -> Option<Respon
     if state.cloudflare_connector.snapshot()["configured"] != true {
         return None;
     }
-    Some((StatusCode::CONFLICT, Json(serde_json::json!({
-        "message": "laplus already runs a connector for this environment. Stop and forget it before \
-                    registering a hostname somebody else operates."
-    }))).into_response())
+    Some(public_exposure::Refusal::precondition(
+        public_exposure::RefusalReason::OwnershipConflict,
+        "laplus already runs a connector for this environment. Stop and forget it before \
+         registering a hostname somebody else operates.",
+    ).into_response())
+}
+
+/// Refuse to re-describe a tunnel laplus owns as somebody else's.
+///
+/// **Ownership is not a field a client may set.** The guard above catches the
+/// case where a connector is *configured*, and that is not the same question:
+/// an adopted tunnel whose connector is stopped, or a laplus-created one whose
+/// connector failed to restore, would leave a persisted `adopted` or
+/// `laplus-created` row that a plain hostname registration would quietly rewrite
+/// to `external` — and with it the record of the tunnel and DNS resources laplus
+/// made and is the only owner of.
+///
+/// Ticket 07 requires that adopted and external tunnels never reach a deletion
+/// command "including through repeated, stale, or forged client requests"; this
+/// is the same rule pointed the other way, because a laundered ownership is how
+/// a forged request would earn one. Adoption and creation write their ownership
+/// through the store directly and never pass through here.
+fn ownership_is_not_the_clients_to_change(state: &ServerState) -> Option<Response> {
+    let recorded = state.services.shell.database().public_exposure_endpoint().ok().flatten()?;
+    if recorded.ownership == public_exposure::TunnelOwnership::External {
+        return None;
+    }
+    Some(public_exposure::Refusal::precondition(
+        public_exposure::RefusalReason::OwnershipConflict,
+        format!(
+            "This environment already has a {} Cloudflare tunnel. Forget it before registering a \
+             hostname somebody else operates.",
+            recorded.ownership
+        ),
+    ).into_response())
 }
 
 async fn register_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap, Json(body): Json<public_exposure::RegisterRequest>) -> Response {
     let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
     if let Err(response) = require_scope(&grant, "access:write") { return response; }
     if let Some(response) = managed_connector_already_owns_exposure(&state) { return response; }
-    let origin = match public_exposure::normalize_hostname(&body.hostname) { Ok(origin) => origin, Err(message) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response() };
-    match state.services.shell.database().register_external_tunnel_endpoint(&origin) {
+    if let Some(response) = ownership_is_not_the_clients_to_change(&state) { return response; }
+    let origin = match public_exposure::normalize_hostname(&body.hostname) { Ok(origin) => origin, Err(message) => return public_exposure::Refusal::rejected(public_exposure::RefusalReason::HostnameInvalid, message).into_response() };
+    // Registration through this route is always a claim about somebody else's
+    // tunnel: `managed_connector_already_owns_exposure` above has just refused
+    // the case where laplus runs the connector, and adoption and creation write
+    // their own ownership directly rather than passing through here.
+    match state.services.shell.database().register_public_exposure_endpoint(crate::store::NewPublicExposure::external(&origin)) {
         Ok(()) => Json(external_tunnel_snapshot(&state).unwrap()).into_response(),
         Err(error) => { eprintln!("laplus: cannot register public endpoint: {error}"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
     }
@@ -1521,13 +1606,13 @@ async fn register_external_tunnel(State(state): State<Arc<ServerState>>, RawQuer
 async fn forget_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
     let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
     if let Err(response) = require_scope(&grant, "access:write") { return response; }
-    match state.services.shell.database().forget_external_tunnel_endpoint() { Ok(()) => Json(external_tunnel_snapshot(&state).unwrap()).into_response(), Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    match state.services.shell.database().forget_public_exposure_endpoint() { Ok(()) => Json(external_tunnel_snapshot(&state).unwrap()).into_response(), Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response() }
 }
 
 async fn test_external_tunnel(State(state): State<Arc<ServerState>>, RawQuery(query): RawQuery, headers: HeaderMap) -> Response {
     let (_, grant) = match authorized(&state, query.as_deref(), &headers) { Ok(value) => value, Err(response) => return response };
     if let Err(response) = require_scope(&grant, "access:write") { return response; }
-    if state.services.shell.database().external_tunnel_endpoint().ok().flatten().is_none() { return StatusCode::NOT_FOUND.into_response() };
+    if state.services.shell.database().public_exposure_endpoint().ok().flatten().is_none() { return StatusCode::NOT_FOUND.into_response() };
     run_external_verification(&state).await;
     if state.external_verification_running.load(Ordering::Acquire) {
         return (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"message": "Verification is still running."}))).into_response();
@@ -1545,8 +1630,15 @@ struct ConfigureCloudflareConnector {
 
 fn managed_connector_snapshot(state: &ServerState) -> serde_json::Value {
     let mut snapshot = state.cloudflare_connector.snapshot();
-    let verification = state.services.shell.database().external_tunnel_endpoint().ok().flatten();
+    let verification = state.services.shell.database().public_exposure_endpoint().ok().flatten();
     if let Some(object) = snapshot.as_object_mut() {
+        // Who owns the tunnel comes from the endpoint row and never from the
+        // connector's own file — one record of one fact, `docs/adr/0049`. A
+        // connector configured before its endpoint was recorded reads
+        // `external`, which is the ownership that authorizes nothing.
+        object.insert("tunnelOwnership".into(), serde_json::json!(verification.as_ref()
+            .map(|endpoint| endpoint.ownership)
+            .unwrap_or(public_exposure::TunnelOwnership::External)));
         object.insert("verificationState".into(), serde_json::json!(verification.as_ref()
             .map(|endpoint| endpoint.verification_state.as_str()).unwrap_or("unconfigured")));
         object.insert("failureKind".into(), serde_json::json!(verification.as_ref().and_then(|endpoint| endpoint.failure_kind.as_deref())));
@@ -1604,11 +1696,22 @@ async fn install_cloudflared(
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_connector.install(&body.version, &body.checksum).await {
         Ok(()) => Json(state.cloudflare_connector.install_snapshot().await).into_response(),
+        // A feed that has moved on is a conflict the developer re-approves, so
+        // it names the release rather than the executable: the approval was for
+        // one artifact and that artifact is no longer what would be installed.
         Err(crate::cloudflare_install::Refusal::Conflict(message)) => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({"message": message}))).into_response()
+            public_exposure::Refusal::precondition(
+                public_exposure::RefusalReason::ReleaseMoved,
+                message,
+            )
+            .into_response()
         }
         Err(crate::cloudflare_install::Refusal::Rejected(message)) => {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response()
+            public_exposure::Refusal::rejected(
+                public_exposure::RefusalReason::CommandFailed,
+                message,
+            )
+            .into_response()
         }
     }
 }
@@ -1635,14 +1738,6 @@ struct SelectCloudflareTunnel {
     hostname: String,
 }
 
-fn cloudflare_account_refusal(refusal: crate::cloudflare_account::Refusal) -> Response {
-    let (status, message) = match refusal {
-        crate::cloudflare_account::Refusal::Precondition(message) => (StatusCode::CONFLICT, message),
-        crate::cloudflare_account::Refusal::Rejected(message) => (StatusCode::BAD_REQUEST, message),
-    };
-    (status, Json(serde_json::json!({ "message": message }))).into_response()
-}
-
 async fn cloudflare_account_state(
     State(state): State<Arc<ServerState>>,
     RawQuery(query): RawQuery,
@@ -1661,7 +1756,7 @@ async fn begin_cloudflare_login(
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.begin_login(&body.executable_path).await {
         Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
-        Err(refusal) => cloudflare_account_refusal(refusal),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
@@ -1673,7 +1768,7 @@ async fn cancel_cloudflare_login(
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.cancel_login() {
         Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
-        Err(refusal) => cloudflare_account_refusal(refusal),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
@@ -1686,7 +1781,7 @@ async fn consent_to_cloudflare_certificate(
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.consent(body.consented) {
         Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
-        Err(refusal) => cloudflare_account_refusal(refusal),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
@@ -1699,7 +1794,7 @@ async fn list_cloudflare_tunnels(
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     match state.cloudflare_account.list_tunnels(&body.executable_path).await {
         Ok(()) => Json(state.cloudflare_account.snapshot()).into_response(),
-        Err(refusal) => cloudflare_account_refusal(refusal),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
@@ -1716,16 +1811,19 @@ async fn select_cloudflare_tunnel(
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
     if let Some(response) = managed_connector_already_owns_exposure(&state) { return response; }
+    if let Some(response) = ownership_is_not_the_clients_to_change(&state) { return response; }
     let selection = match state.cloudflare_account.select(&body.tunnel_id, &body.hostname) {
         Ok(selection) => selection,
-        Err(refusal) => return cloudflare_account_refusal(refusal),
+        Err(refusal) => return refusal.into_response(),
     };
-    if selection.classification == "external" {
+    if selection.classification == crate::cloudflare_account::Classification::External {
         if let Err(error) = state
             .services
             .shell
             .database()
-            .register_external_tunnel_endpoint(&selection.https_origin)
+            .register_public_exposure_endpoint(crate::store::NewPublicExposure::external(
+                &selection.https_origin,
+            ))
         {
             eprintln!("laplus: cannot register the external tunnel endpoint: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1752,14 +1850,21 @@ async fn configure_cloudflare_connector(
     Json(body): Json<ConfigureCloudflareConnector>,
 ) -> Response {
     if let Err(response) = connector_authorized(&state, query.as_deref(), &headers, "access:write") { return response; }
-    if let Err(message) = state.cloudflare_connector.configure(
+    if let Err(refusal) = state.cloudflare_connector.configure(
         &body.hostname, &body.executable_path, &body.connector_token,
     ).await {
-        let redacted = message.replace(&body.connector_token, "[REDACTED]");
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": redacted}))).into_response();
+        // One redaction, at the boundary: the token reaches several of the
+        // sentences below by way of cloudflared's own output, and a redaction
+        // that has to be remembered at each raise site is one that will be
+        // forgotten at the next.
+        return refusal.redacting(&body.connector_token).into_response();
     }
+    // Registered as `external` on purpose: a connector-token tunnel is
+    // configured at Cloudflare and merely run here, so laplus owns the process
+    // and nothing it could delete. Tickets 05 and 06 register `adopted` and
+    // `laplus-created` from their own routes.
     if let Some(origin) = state.cloudflare_connector.snapshot()["httpsOrigin"].as_str() {
-        if let Err(error) = state.services.shell.database().register_external_tunnel_endpoint(origin) {
+        if let Err(error) = state.services.shell.database().register_public_exposure_endpoint(crate::store::NewPublicExposure::external(origin)) {
             eprintln!("laplus: cannot persist managed public endpoint: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
@@ -1782,7 +1887,7 @@ async fn mutate_cloudflare_connector(
             }
             Json(managed_connector_snapshot(&state)).into_response()
         }
-        Err(message) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"message": message}))).into_response(),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
@@ -1805,7 +1910,7 @@ async fn run_external_verification(state: &Arc<ServerState>) -> bool {
         }
         return tokio::time::timeout(std::time::Duration::from_secs(55), finished).await.is_ok();
     }
-    let Some(endpoint) = state.services.shell.database().external_tunnel_endpoint().ok().flatten() else {
+    let Some(endpoint) = state.services.shell.database().public_exposure_endpoint().ok().flatten() else {
         state.external_verification_running.store(false, Ordering::Release);
         state.external_verification_generation.fetch_add(1, Ordering::AcqRel);
         state.external_verification_finished.notify_waiters();
@@ -1833,7 +1938,7 @@ async fn run_external_verification(state: &Arc<ServerState>) -> bool {
     state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(&http_token);
     state.diagnostic_challenges.lock().expect("diagnostic challenges").remove(&ws_token);
     let succeeded = result.is_ok();
-    let recorded = match result { Ok(()) => state.services.shell.database().record_external_tunnel_verification(&endpoint.https_origin, true, None, None), Err(failure) => state.services.shell.database().record_external_tunnel_verification(&endpoint.https_origin, false, Some(failure.kind), Some(failure.message)) };
+    let recorded = match result { Ok(()) => state.services.shell.database().record_public_exposure_verification(&endpoint.https_origin, true, None, None), Err(failure) => state.services.shell.database().record_public_exposure_verification(&endpoint.https_origin, false, Some(failure.kind), Some(failure.message)) };
     state.external_verification_running.store(false, Ordering::Release);
     state.external_verification_generation.fetch_add(1, Ordering::AcqRel);
     state.external_verification_finished.notify_waiters();

@@ -67,6 +67,28 @@ export const AdvertisedEndpoint = Schema.Struct({
 });
 export type AdvertisedEndpoint = typeof AdvertisedEndpoint.Type;
 
+/**
+ * Who owns the Cloudflare tunnel behind an endpoint.
+ *
+ * **Not the same question as who runs the connector**, and the two used to be
+ * one hardcoded string each. `CONTEXT.md`'s "Remote access" section is the
+ * vocabulary; `server/docs/adr/0049` is the decision to persist this rather
+ * than emit it as a literal, and why it is the axis ticket 07's whole
+ * stop/forget/delete matrix is indexed by.
+ *
+ * - `external` — somebody else's tunnel. laplus verifies and advertises a
+ *   hostname and touches nothing. Also the honest answer for a connector-token
+ *   tunnel whose connector laplus runs: Cloudflare still owns its configuration
+ *   and allocation, so laplus may not delete it.
+ * - `adopted` — an inactive existing tunnel explicitly dedicated to this
+ *   environment. laplus configures and supervises it; the Cloudflare allocation
+ *   and DNS route stay someone else's, so deletion is never offered. Ticket 05.
+ * - `laplus-created` — laplus made the allocation and the DNS route, and is the
+ *   only owner that may delete either. Ticket 06.
+ */
+export const TunnelOwnership = Schema.Literals(["external", "adopted", "laplus-created"]);
+export type TunnelOwnership = typeof TunnelOwnership.Type;
+
 export const ExternalTunnelVerificationState = Schema.Literals([
   "unconfigured",
   "pending",
@@ -93,9 +115,14 @@ export const ExternalTunnelEndpointSnapshot = Schema.Struct({
   configured: Schema.Boolean,
   httpsOrigin: Schema.NullOr(TrimmedNonEmptyString),
   wssOrigin: Schema.NullOr(TrimmedNonEmptyString),
-  ownership: Schema.Literal("external"),
+  ownership: TunnelOwnership,
   health: Schema.Struct({
-    connector: Schema.Literal("external"),
+    /**
+     * Who runs the connector in front of this endpoint. Widened from the
+     * literal `"external"` with {@link TunnelOwnership}: an endpoint laplus
+     * supervises reported `external` here even while laplus was supervising it.
+     */
+    connector: Schema.Literals(["external", "laplus"]),
     https: Schema.Literals(["unknown", "healthy", "failed"]),
     webSocket: Schema.Literals(["unknown", "healthy", "failed"]),
   }),
@@ -145,8 +172,18 @@ export type ManagedCloudflareConnectorState = typeof ManagedCloudflareConnectorS
 
 export const ManagedCloudflareConnectorSnapshot = Schema.Struct({
   configured: Schema.Boolean,
+  /**
+   * Who runs the connector process. Always laplus here — an externally managed
+   * connector is never represented by this snapshot at all.
+   */
   ownership: Schema.Literal("laplus"),
-  remoteOwnership: Schema.optional(Schema.Literal("cloudflare")),
+  /**
+   * Who owns the tunnel this connector serves. **Persisted, and read back**;
+   * it was the string literal `"cloudflare"` until the ownership model landed,
+   * which made every laplus-managed connector look alike whatever it was
+   * running. Ticket 06's compact row reads this to say "laplus-created".
+   */
+  tunnelOwnership: TunnelOwnership,
   desiredState: Schema.Literals(["running", "stopped"]),
   connectorState: ManagedCloudflareConnectorState,
   readiness: Schema.NullOr(Schema.Boolean),

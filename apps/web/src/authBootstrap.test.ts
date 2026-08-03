@@ -570,6 +570,7 @@ describe("resolveInitialServerAuthGateState", () => {
     const snapshot = {
       configured: false,
       ownership: "laplus",
+      tunnelOwnership: "external",
       desiredState: "stopped",
       connectorState: "stopped",
       readiness: null,

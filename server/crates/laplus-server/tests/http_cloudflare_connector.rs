@@ -2,76 +2,10 @@
 
 mod harness;
 
+use harness::cloudflare::{FakeCloudflared, VerifiedEndpoint};
 use harness::TestServer;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
-
-#[derive(Debug)]
-struct VerifiedEndpoint;
-
-impl laplus_server::public_exposure::EndpointVerifier for VerifiedEndpoint {
-    fn verify<'a>(
-        &'a self,
-        _origin: &'a str,
-        _environment_id: &'a str,
-        _http_token: &'a str,
-        _ws_token: &'a str,
-    ) -> laplus_server::public_exposure::VerificationFuture<'a> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-fn fake_cloudflared(
-    directory: &std::path::Path,
-) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let executable = directory.join("cloudflared-fake.py");
-    let trace = directory.join("cloudflared.trace");
-    let mode = directory.join("cloudflared.mode");
-    let source = format!(
-        r#"#!/usr/bin/env python3
-import http.server, json, os, signal, sys, time
-TRACE = {trace:?}
-MODE = {mode:?}
-if '--version' in sys.argv:
-    print('cloudflared version 2026.7.0')
-    raise SystemExit(0)
-with open(TRACE, 'a') as f:
-    f.write(json.dumps(sys.argv[1:]) + '\n')
-metrics = sys.argv[sys.argv.index('--metrics') + 1]
-token_file = sys.argv[sys.argv.index('--token-file') + 1]
-with open(token_file) as f:
-    assert f.read() == 'connector-secret'
-if os.path.exists(MODE) and open(MODE).read().strip() == 'crash':
-    print('connector failed with connector-secret', file=sys.stderr)
-    raise SystemExit(17)
-if os.path.exists(MODE) and open(MODE).read().strip() == 'replace':
-    os.remove(MODE)
-    if os.fork() > 0:
-        raise SystemExit(0)
-class Ready(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        while os.path.exists(MODE) and open(MODE).read().strip() == 'hang':
-            time.sleep(0.05)
-        self.send_response(200 if self.path == '/ready' else 404)
-        self.end_headers()
-    def log_message(self, *args): pass
-host, port = metrics.rsplit(':', 1)
-server = http.server.HTTPServer((host, int(port)), Ready)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-try:
-    server.serve_forever()
-finally:
-    with open(TRACE, 'a') as f: f.write('stopped\n')
-"#,
-        trace = trace.display().to_string(),
-        mode = mode.display().to_string()
-    );
-    std::fs::write(&executable, source).unwrap();
-    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(&executable, permissions).unwrap();
-    (executable, trace, mode)
-}
 
 async fn wait_for_json(
     server: &TestServer,
@@ -96,7 +30,7 @@ async fn wait_for_json(
 #[tokio::test]
 async fn managed_connector_uses_private_files_becomes_ready_and_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
-    let (executable, trace, _) = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     let server = TestServer::start_configured_in_with_endpoint_verifier(
         directory.path(),
         std::sync::Arc::new(VerifiedEndpoint),
@@ -108,7 +42,7 @@ async fn managed_connector_uses_private_files_becomes_ready_and_survives_restart
             "/api/access/cloudflare/connector/configure",
             &json!({
                 "hostname": "laplus.example.com",
-                "executablePath": executable,
+                "executablePath": fake.executable,
                 "connectorToken": "connector-secret"
             }),
         )
@@ -122,7 +56,7 @@ async fn managed_connector_uses_private_files_becomes_ready_and_survives_restart
     assert_eq!(ready["readiness"], true);
     let verified = wait_for_json(&server, |body| body["verificationState"] == "verified").await;
     assert_eq!(verified["connectorState"], "ready");
-    let invocation = std::fs::read_to_string(&trace).unwrap();
+    let invocation = std::fs::read_to_string(&fake.trace).unwrap();
     assert!(invocation.contains("--config"));
     assert!(invocation.contains("--token-file"));
     assert!(invocation.contains("--metrics"));
@@ -141,7 +75,7 @@ async fn managed_connector_uses_private_files_becomes_ready_and_survives_restart
             "/api/access/cloudflare/connector/configure",
             &json!({
                 "hostname": "laplus.example.com",
-                "executablePath": executable,
+                "executablePath": fake.executable,
                 "connectorToken": ""
             }),
         )
@@ -169,12 +103,12 @@ async fn managed_connector_uses_private_files_becomes_ready_and_survives_restart
 #[tokio::test]
 async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_commands() {
     let directory = tempfile::tempdir().unwrap();
-    let (executable, trace, mode) = fake_cloudflared(directory.path());
-    std::fs::write(&mode, "crash").unwrap();
+    let fake = FakeCloudflared::write_into(directory.path());
+    fake.rehearse("crash");
     let server = TestServer::start_configured_in(directory.path()).await;
     let configured = server.post_json(
         "/api/access/cloudflare/connector/configure",
-        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"connector-secret"}),
+        &json!({"hostname":"laplus.example.com","executablePath":fake.executable,"connectorToken":"connector-secret"}),
     ).await;
     assert_eq!(configured.status, 200, "{}", configured.text);
     let exhausted = wait_for_json(&server, |body| {
@@ -185,7 +119,7 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
     assert!(exhausted.to_string().contains("[REDACTED]"));
     assert!(!exhausted.to_string().contains("connector-secret"));
     assert_eq!(
-        std::fs::read_to_string(&trace)
+        std::fs::read_to_string(&fake.trace)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with('['))
@@ -193,19 +127,27 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
         3
     );
 
+    // The shape changed and the status did not: this route has answered `400`
+    // since ticket 01, and what was missing was a body a client could decode.
+    // The reason is what the wizard branches on; the sentence is what it shows.
     let refused = server
         .post_json("/api/access/cloudflare/connector/start", &json!({}))
         .await;
-    assert_eq!(refused.status, 400);
-    assert!(refused.text.contains("use Retry"));
+    assert_eq!(refused.status, 400, "{}", refused.text);
+    assert_eq!(refused.body["_tag"], "EnvironmentPublicExposureRejectedError");
+    assert_eq!(refused.body["reason"], "restarts-exhausted");
+    assert!(refused.body["message"].as_str().unwrap().contains("use Retry"));
+    // Nothing was mutated, so nothing is claimed as done or outstanding.
+    assert_eq!(refused.body["completed"], json!([]));
+    assert_eq!(refused.body["remaining"], json!([]));
 
-    std::fs::write(&mode, "ready").unwrap();
+    fake.behave();
     let retried = server
         .post_json("/api/access/cloudflare/connector/retry", &json!({}))
         .await;
     assert_eq!(retried.status, 200, "{}", retried.text);
     wait_for_json(&server, |body| body["connectorState"] == "ready").await;
-    let launches = std::fs::read_to_string(&trace)
+    let launches = std::fs::read_to_string(&fake.trace)
         .unwrap()
         .lines()
         .filter(|line| line.starts_with('['))
@@ -219,7 +161,7 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
     }
     tokio::task::yield_now().await;
     assert_eq!(
-        std::fs::read_to_string(&trace)
+        std::fs::read_to_string(&fake.trace)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with('['))
@@ -244,7 +186,7 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
     wait_for_json(&server, |body| body["connectorState"] == "ready").await;
     let launches = launches + 1;
     assert_eq!(
-        std::fs::read_to_string(&trace)
+        std::fs::read_to_string(&fake.trace)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with('['))
@@ -264,7 +206,7 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
     assert_eq!(started.status, 200);
     wait_for_json(&server, |body| body["connectorState"] == "ready").await;
     assert_eq!(
-        std::fs::read_to_string(&trace)
+        std::fs::read_to_string(&fake.trace)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with('['))
@@ -286,12 +228,12 @@ async fn exhausted_connector_requires_retry_and_reconciles_repeated_start_stop_c
 #[tokio::test]
 async fn a_connector_that_never_answers_a_probe_can_still_be_stopped() {
     let directory = tempfile::tempdir().unwrap();
-    let (executable, _, mode) = fake_cloudflared(directory.path());
-    std::fs::write(&mode, "hang").unwrap();
+    let fake = FakeCloudflared::write_into(directory.path());
+    fake.rehearse("hang");
     let server = TestServer::start_configured_in(directory.path()).await;
     let configured = server.post_json(
         "/api/access/cloudflare/connector/configure",
-        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"connector-secret"}),
+        &json!({"hostname":"laplus.example.com","executablePath":fake.executable,"connectorToken":"connector-secret"}),
     ).await;
     assert_eq!(configured.status, 200, "{}", configured.text);
     let starting = wait_for_json(&server, |body| body["connectorState"] == "starting").await;
@@ -310,19 +252,15 @@ async fn a_connector_that_never_answers_a_probe_can_still_be_stopped() {
 #[tokio::test]
 async fn incompatible_selected_executable_is_actionable_without_echoing_the_token() {
     let directory = tempfile::tempdir().unwrap();
-    let executable = directory.path().join("old-cloudflared");
-    std::fs::write(
-        &executable,
-        "#!/bin/sh\necho 'cloudflared version 2023.10.0'\n",
-    )
-    .unwrap();
-    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    let outdated = directory.path().join("old-cloudflared");
+    std::fs::write(&outdated, "#!/bin/sh\necho 'cloudflared version 2023.10.0'\n").unwrap();
+    let mut permissions = std::fs::metadata(&outdated).unwrap().permissions();
     permissions.set_mode(0o700);
-    std::fs::set_permissions(&executable, permissions).unwrap();
+    std::fs::set_permissions(&outdated, permissions).unwrap();
     let server = TestServer::start_configured_in(directory.path()).await;
     let response = server.post_json(
         "/api/access/cloudflare/connector/configure",
-        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"never-echo-this"}),
+        &json!({"hostname":"laplus.example.com","executablePath":outdated,"connectorToken":"never-echo-this"}),
     ).await;
     assert_eq!(response.status, 400);
     assert!(response.text.contains("incompatible"));
@@ -358,11 +296,11 @@ async fn an_external_endpoint_never_acquires_a_managed_connector_lifecycle() {
 #[tokio::test]
 async fn a_supervised_connector_refuses_to_have_its_exposure_claimed_as_external() {
     let directory = tempfile::tempdir().unwrap();
-    let (executable, _trace, _mode) = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     let server = TestServer::start_configured_in(directory.path()).await;
     let configured = server.post_json(
         "/api/access/cloudflare/connector/configure",
-        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"connector-secret"}),
+        &json!({"hostname":"laplus.example.com","executablePath":fake.executable,"connectorToken":"connector-secret"}),
     ).await;
     assert_eq!(configured.status, 200, "{}", configured.text);
 
@@ -396,17 +334,17 @@ async fn a_supervised_connector_refuses_to_have_its_exposure_claimed_as_external
 #[tokio::test]
 async fn a_ready_replacement_is_adopted_without_launching_a_duplicate_and_stops_with_its_owner() {
     let directory = tempfile::tempdir().unwrap();
-    let (executable, trace, mode) = fake_cloudflared(directory.path());
-    std::fs::write(&mode, "replace").unwrap();
+    let fake = FakeCloudflared::write_into(directory.path());
+    fake.rehearse("replace");
     let server = TestServer::start_configured_in(directory.path()).await;
     let configured = server.post_json(
         "/api/access/cloudflare/connector/configure",
-        &json!({"hostname":"laplus.example.com","executablePath":executable,"connectorToken":"connector-secret"}),
+        &json!({"hostname":"laplus.example.com","executablePath":fake.executable,"connectorToken":"connector-secret"}),
     ).await;
     assert_eq!(configured.status, 200, "{}", configured.text);
     wait_for_json(&server, |body| body["connectorState"] == "ready").await;
     assert_eq!(
-        std::fs::read_to_string(&trace)
+        std::fs::read_to_string(&fake.trace)
             .unwrap()
             .lines()
             .filter(|line| line.starts_with('['))
@@ -418,6 +356,42 @@ async fn a_ready_replacement_is_adopted_without_launching_a_duplicate_and_stops_
         .await;
     assert_eq!(stopped.status, 200);
     wait_for_json(&server, |body| body["connectorState"] == "stopped").await;
-    assert!(std::fs::read_to_string(&trace).unwrap().contains("stopped"));
+    assert!(std::fs::read_to_string(&fake.trace).unwrap().contains("stopped"));
+    server.stop().await;
+}
+
+/// The connector-token path is the one that reaches `configure`, and its tunnel
+/// is Cloudflare's: laplus receives run authority and no more. It was recorded
+/// as `"adopted"` — written unconditionally by `configure` and never read back —
+/// while the snapshot printed `"ownership":"laplus"` and
+/// `"remoteOwnership":"cloudflare"` as string literals.
+///
+/// Persistence across a restart is `http_public_exposure.rs`, which is where
+/// the harness gives a server a database on disk.
+#[tokio::test]
+async fn a_connector_token_tunnel_is_owned_by_cloudflare_and_run_by_laplus() {
+    let directory = tempfile::tempdir().unwrap();
+    let fake = FakeCloudflared::write_into(directory.path());
+    let server = TestServer::start_configured_in_with_endpoint_verifier(
+        directory.path(),
+        std::sync::Arc::new(VerifiedEndpoint),
+    )
+    .await;
+    let configured = server.post_json(
+        "/api/access/cloudflare/connector/configure",
+        &json!({"hostname":"laplus.example.com","executablePath":fake.executable,"connectorToken":"connector-secret"}),
+    ).await;
+    assert_eq!(configured.status, 200, "{}", configured.text);
+
+    // Two answers, not one: who runs the process, and who owns the tunnel.
+    assert_eq!(configured.body["ownership"], "laplus");
+    assert_eq!(configured.body["tunnelOwnership"], "external");
+    assert!(configured.body.get("remoteOwnership").is_none());
+
+    let endpoint = server.get("/api/access/cloudflare").await;
+    assert_eq!(endpoint.body["ownership"], "external");
+    // The endpoint row knows laplus runs the connector in front of it, rather
+    // than reporting `external` here while laplus supervised it.
+    assert_eq!(endpoint.body["health"]["connector"], "laplus");
     server.stop().await;
 }

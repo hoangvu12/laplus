@@ -1,6 +1,7 @@
 mod harness;
 
-use harness::{ClientIdentity, TestServer};
+use harness::cloudflare::client_with;
+use harness::TestServer;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -131,20 +132,6 @@ impl laplus_server::public_exposure::EndpointVerifier for BlockingVerifier {
     }
 }
 
-const GRANT_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
-const BOOTSTRAP_TOKEN_TYPE: &str = "urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap";
-const ACCESS_TOKEN_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
-
-async fn client_with(server: &TestServer, scopes: &[&str]) -> ClientIdentity {
-    let minted = server.post_json("/api/auth/pairing-token", &json!({ "scopes": scopes })).await;
-    let credential = minted.body["credential"].as_str().unwrap();
-    let exchanged = server.post_form(
-        "/oauth/token",
-        &format!("grant_type={GRANT_TYPE}&subject_token={credential}&subject_token_type={BOOTSTRAP_TOKEN_TYPE}&requested_token_type={ACCESS_TOKEN_TYPE}"),
-    ).await;
-    ClientIdentity::anonymous().with_bearer(exchanged.body["access_token"].as_str().unwrap())
-}
-
 #[tokio::test]
 async fn setup_state_requires_read_and_mutations_require_write_without_disclosing_state() {
     let server = TestServer::start().await;
@@ -197,15 +184,12 @@ async fn repeating_registration_keeps_the_verified_endpoint_available() {
     let path = directory.path().join("state.sqlite");
     let database = laplus_server::store::Database::open(&path).unwrap();
     database
-        .register_external_tunnel_endpoint("https://laplus.example.com")
+        .register_public_exposure_endpoint(laplus_server::store::NewPublicExposure::external(
+            "https://laplus.example.com",
+        ))
         .unwrap();
     database
-        .record_external_tunnel_verification(
-            "https://laplus.example.com",
-            true,
-            None,
-            None,
-        )
+        .record_public_exposure_verification("https://laplus.example.com", true, None, None)
         .unwrap();
     drop(database);
 
@@ -339,4 +323,158 @@ async fn diagnostic_http_and_websocket_credentials_are_distinct_and_single_use()
     let verified = server.post_json("/api/access/cloudflare/test", &json!({})).await;
     assert_eq!(verified.body["verificationState"], "verified");
     server.stop().await;
+}
+
+/// Ticket 07's whole acceptance matrix is external / adopted / laplus-created,
+/// and none of it was represented anywhere: the snapshot printed
+/// `"ownership":"laplus"` and `"remoteOwnership":"cloudflare"` as string
+/// literals and the singleton row held origin and verification state only.
+///
+/// So the server is restarted between every read: what is under test is the
+/// column, not a struct that happens to still be in memory. Adoption and
+/// creation are tickets 05 and 06, so the rows are recorded through the store
+/// the way those routes will record them.
+#[tokio::test]
+async fn tunnel_ownership_survives_a_restart_and_is_not_the_clients_to_change() {
+    use laplus_server::public_exposure::TunnelOwnership;
+    use laplus_server::store::{Database, DnsRecord, NewPublicExposure};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let record = DnsRecord {
+        zone_id: "zone-1".into(),
+        record_id: "record-1".into(),
+        name: "laplus.example.com".into(),
+    };
+    let database = Database::open(&path).unwrap();
+
+    for owned in [TunnelOwnership::Adopted, TunnelOwnership::LaplusCreated] {
+        database
+            .register_public_exposure_endpoint(NewPublicExposure {
+                ownership: owned,
+                tunnel_id: Some("44444444-4444-4444-4444-444444444444"),
+                dns_record: (owned == TunnelOwnership::LaplusCreated).then_some(&record),
+                credential_path: Some("/private/tunnel.json"),
+                ..NewPublicExposure::external("https://laplus.example.com")
+            })
+            .unwrap();
+
+        let server = TestServer::start_at(&path).await;
+        let read_back = server.get("/api/access/cloudflare").await;
+        assert_eq!(read_back.status, 200, "{}", read_back.text);
+        assert_eq!(read_back.body["ownership"], owned.as_str(), "{owned} did not survive");
+        assert_ne!(read_back.body["ownership"], "external");
+
+        // Ownership is not a field a client may set. Registering a hostname
+        // "somebody else operates" over a tunnel laplus owns would launder the
+        // record of the resources laplus made and is the only owner of — which
+        // is ticket 07's "including through repeated, stale, or forged client
+        // requests" pointed the other way.
+        let laundered = server
+            .post_json(
+                "/api/access/cloudflare",
+                &json!({"hostname": "somebody-else.example.com"}),
+            )
+            .await;
+        assert_eq!(laundered.status, 409, "{}", laundered.text);
+        assert_eq!(laundered.body["_tag"], "EnvironmentPublicExposurePreconditionError");
+        assert_eq!(laundered.body["reason"], "ownership-conflict");
+        server.stop().await;
+
+        let after = database.public_exposure_endpoint().unwrap().unwrap();
+        assert_eq!(after.ownership, owned);
+        assert_eq!(after.https_origin, "https://laplus.example.com");
+        assert_eq!(after.tunnel_id.as_deref(), Some("44444444-4444-4444-4444-444444444444"));
+        assert_eq!(after.credential_path.as_deref(), Some("/private/tunnel.json"));
+        // Only the tunnel laplus created carries the DNS record it created,
+        // and only that one may ever reach a Cloudflare deletion command.
+        assert_eq!(
+            after.ownership.deletable_at_cloudflare(),
+            owned == TunnelOwnership::LaplusCreated
+        );
+    }
+
+    // An external endpoint is registrable through the route as it always was,
+    // and reads back as the one ownership that authorizes nothing.
+    database.forget_public_exposure_endpoint().unwrap();
+    let server = TestServer::start_at(&path).await;
+    let registered = server
+        .post_json(
+            "/api/access/cloudflare",
+            &json!({"hostname": "operator.example.com"}),
+        )
+        .await;
+    assert_eq!(registered.status, 200, "{}", registered.text);
+    assert_eq!(registered.body["ownership"], "external");
+    assert_eq!(registered.body["health"]["connector"], "external");
+    server.stop().await;
+
+    let restarted = TestServer::start_at(&path).await;
+    assert_eq!(restarted.get("/api/access/cloudflare").await.body["ownership"], "external");
+    restarted.stop().await;
+}
+
+/// Tickets 06 and 07 both require journaled steps that survive restart and
+/// resume idempotently: the mutations that already happened, so a retry does
+/// not repeat them, and the ones started and never settled, so the wizard can
+/// name the remaining work instead of claiming a rollback that did not occur.
+#[tokio::test]
+async fn a_half_finished_mutation_keeps_its_remaining_work_across_a_restart() {
+    use laplus_server::public_exposure::{MutationIntent, MutationState, MutationStep};
+    use laplus_server::store::Database;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    {
+        let database = Database::open(&path).unwrap();
+        let credential = database
+            .begin_mutation_step(MutationIntent::Create, MutationStep::Credential, None)
+            .unwrap();
+        database
+            .settle_mutation_step(credential, MutationState::Completed, Some("/private/tunnel.json"))
+            .unwrap();
+        let created = database
+            .begin_mutation_step(MutationIntent::Create, MutationStep::TunnelCreate, Some("laplus"))
+            .unwrap();
+        database
+            .settle_mutation_step(created, MutationState::Completed, Some("tunnel-uuid"))
+            .unwrap();
+        // The step the process died inside.
+        database
+            .begin_mutation_step(
+                MutationIntent::Create,
+                MutationStep::DnsRoute,
+                Some("laplus.example.com"),
+            )
+            .unwrap();
+    }
+
+    // A server boots over it without objecting: an unfinished mutation is state
+    // to reconcile, not a database this build refuses to open.
+    let server = TestServer::start_at(&path).await;
+    assert_eq!(server.get("/api/access/cloudflare").await.status, 200);
+    server.stop().await;
+
+    let database = Database::open(&path).unwrap();
+    let journal = database.mutation_journal().unwrap();
+    let completed: Vec<_> = journal
+        .iter()
+        .filter(|entry| entry.state == MutationState::Completed)
+        .map(|entry| entry.step)
+        .collect();
+    let remaining: Vec<_> = journal
+        .iter()
+        .filter(|entry| entry.state == MutationState::Pending)
+        .map(|entry| entry.step)
+        .collect();
+    assert_eq!(completed, [MutationStep::Credential, MutationStep::TunnelCreate]);
+    assert_eq!(remaining, [MutationStep::DnsRoute]);
+    // The resource a retry has to target, not the name it was asked for.
+    assert_eq!(
+        journal
+            .iter()
+            .find(|entry| entry.step == MutationStep::TunnelCreate)
+            .and_then(|entry| entry.detail.as_deref()),
+        Some("tunnel-uuid")
+    );
 }

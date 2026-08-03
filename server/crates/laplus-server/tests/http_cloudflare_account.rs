@@ -9,10 +9,10 @@
 
 mod harness;
 
-use harness::{ClientIdentity, TestServer};
+use harness::cloudflare::{client_with, FakeCloudflared, CERTIFICATE};
+use harness::TestServer;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// `TUNNEL_ORIGIN_CERT` is process-wide — cloudflared's own variable, and the
@@ -24,117 +24,6 @@ fn serially() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-const CERTIFICATE: &str = "FAKE-ACCOUNT-CERTIFICATE-SECRET";
-const GRANT_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
-const BOOTSTRAP_TOKEN_TYPE: &str = "urn%3At3%3Aparams%3Aoauth%3Atoken-type%3Aenvironment-bootstrap";
-const ACCESS_TOKEN_TYPE: &str = "urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
-
-async fn client_with(server: &TestServer, scopes: &[&str]) -> ClientIdentity {
-    let minted = server
-        .post_json("/api/auth/pairing-token", &json!({ "scopes": scopes }))
-        .await;
-    let credential = minted.body["credential"].as_str().unwrap();
-    let exchanged = server.post_form(
-        "/oauth/token",
-        &format!("grant_type={GRANT_TYPE}&subject_token={credential}&subject_token_type={BOOTSTRAP_TOKEN_TYPE}&requested_token_type={ACCESS_TOKEN_TYPE}"),
-    ).await;
-    ClientIdentity::anonymous().with_bearer(exchanged.body["access_token"].as_str().unwrap())
-}
-
-struct Cloudflared {
-    executable: PathBuf,
-    trace: PathBuf,
-    mode: PathBuf,
-    signal: PathBuf,
-    tunnels: PathBuf,
-    certificate: PathBuf,
-}
-
-/// A `cloudflared` that signs in and lists, and nothing else.
-///
-/// It writes the certificate where `TUNNEL_ORIGIN_CERT` says, which is where
-/// the real one looks — so laplus finds it the same way in the suite as on a
-/// developer's machine.
-fn fake_cloudflared(directory: &Path) -> Cloudflared {
-    let fake = Cloudflared {
-        executable: directory.join("cloudflared-fake.py"),
-        trace: directory.join("cloudflared.trace"),
-        mode: directory.join("cloudflared.mode"),
-        signal: directory.join("browser.signal"),
-        tunnels: directory.join("tunnels.json"),
-        certificate: directory.join("cert.pem"),
-    };
-    let source = format!(
-        r#"#!/usr/bin/env python3
-import json, os, sys, time
-ARGS = sys.argv[1:]
-TRACE = {trace:?}
-MODE = {mode:?}
-SIGNAL = {signal:?}
-TUNNELS = {tunnels:?}
-if '--version' in ARGS:
-    print('cloudflared version 2026.7.3')
-    raise SystemExit(0)
-with open(TRACE, 'a') as f:
-    f.write(json.dumps(ARGS) + '\n')
-mode = open(MODE).read().strip() if os.path.exists(MODE) else 'ok'
-certificate = os.environ.get('TUNNEL_ORIGIN_CERT', '')
-if ARGS[:2] == ['tunnel', 'login']:
-    print('Please open the following URL and log in with your Cloudflare account:')
-    print('https://dash.cloudflare.com/argotunnel?callback=test-callback')
-    sys.stdout.flush()
-    if mode == 'fail':
-        print('failed to reach the Cloudflare login page', file=sys.stderr)
-        raise SystemExit(1)
-    if mode == 'await':
-        while not os.path.exists(SIGNAL):
-            time.sleep(0.02)
-    with open(certificate, 'w') as f:
-        f.write({content:?})
-    raise SystemExit(0)
-if 'list' in ARGS:
-    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
-    if not os.path.exists(certificate):
-        print('Cannot determine default origin certificate path', file=sys.stderr)
-        raise SystemExit(1)
-    print(open(TUNNELS).read())
-    raise SystemExit(0)
-raise SystemExit(2)
-"#,
-        trace = fake.trace.display().to_string(),
-        mode = fake.mode.display().to_string(),
-        signal = fake.signal.display().to_string(),
-        tunnels = fake.tunnels.display().to_string(),
-        content = CERTIFICATE,
-    );
-    std::fs::write(&fake.executable, source).unwrap();
-    std::fs::set_permissions(&fake.executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::write(
-        &fake.tunnels,
-        r#"[
-          {"id":"11111111-1111-1111-1111-111111111111","name":"already-running",
-           "created_at":"2026-01-01T00:00:00Z","deleted_at":null,
-           "connections":[{"id":"c1","origin_ip":"203.0.113.5"},{"id":"c2","origin_ip":"203.0.113.6"}]},
-          {"id":"22222222-2222-2222-2222-222222222222","name":"spare",
-           "created_at":"2026-02-02T00:00:00Z","deleted_at":null,"connections":[]},
-          {"id":"33333333-3333-3333-3333-333333333333","name":"removed",
-           "created_at":"2026-03-03T00:00:00Z","deleted_at":"2026-04-04T00:00:00Z","connections":[]}
-        ]"#,
-    )
-    .unwrap();
-    fake
-}
-
-impl Cloudflared {
-    fn invocations(&self, verb: &str) -> usize {
-        std::fs::read_to_string(&self.trace)
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| line.contains(verb))
-            .count()
-    }
 }
 
 async fn wait_for_authorization_url(server: &TestServer) -> String {
@@ -165,7 +54,7 @@ async fn wait_for_login(server: &TestServer, state: &str) -> Value {
 async fn browser_authorization_is_tracked_consented_and_survives_a_restart() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
-    let fake = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
     std::fs::write(&fake.mode, "await").unwrap();
     let server = TestServer::start_configured_in(directory.path()).await;
@@ -225,7 +114,7 @@ async fn browser_authorization_is_tracked_consented_and_survives_a_restart() {
 async fn a_detected_certificate_grants_nothing_until_consent_and_is_never_touched() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
-    let fake = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     std::fs::write(&fake.certificate, CERTIFICATE).unwrap();
     std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
     let before = std::fs::metadata(&fake.certificate).unwrap();
@@ -244,7 +133,19 @@ async fn a_detected_certificate_grants_nothing_until_consent_and_is_never_touche
         )
         .await;
     assert_eq!(refused.status, 409, "{}", refused.text);
-    assert!(refused.text.contains("Confirm"));
+    // A tagged refusal, not a bare `{ message }`. The reason is a closed word
+    // the wizard branches on; the sentence is what it puts on screen. Both used
+    // to be thrown away at the boundary — Gap 4 in the parity ledger.
+    assert_eq!(refused.body["_tag"], "EnvironmentPublicExposurePreconditionError");
+    assert_eq!(refused.body["code"], "public_exposure_refused");
+    assert_eq!(refused.body["reason"], "consent-required");
+    assert!(refused.body["message"].as_str().unwrap().contains("Confirm"));
+    assert!(refused.body["traceId"].is_string());
+    // Nothing was mutated, so the refusal claims nothing about work done.
+    assert_eq!(refused.body["completed"], json!([]));
+    assert_eq!(refused.body["remaining"], json!([]));
+    // And still no secret, in the new shape as in the old one.
+    assert!(!refused.text.contains(CERTIFICATE));
     assert_eq!(fake.invocations("list"), 0);
 
     let consented = server
@@ -306,7 +207,7 @@ async fn a_detected_certificate_grants_nothing_until_consent_and_is_never_touche
 async fn discovery_branches_on_activity_without_inventing_a_hostname() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
-    let fake = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     std::fs::write(&fake.certificate, CERTIFICATE).unwrap();
     std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
     let server = TestServer::start_configured_in(directory.path()).await;
@@ -413,7 +314,7 @@ async fn discovery_branches_on_activity_without_inventing_a_hostname() {
 async fn a_cancelled_or_failed_authorization_leaves_setup_resumable() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
-    let fake = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
     std::fs::write(&fake.mode, "await").unwrap();
     let server = TestServer::start_configured_in(directory.path()).await;
@@ -479,7 +380,7 @@ async fn a_cancelled_or_failed_authorization_leaves_setup_resumable() {
 async fn account_state_requires_read_and_every_account_action_requires_write() {
     let _serial = serially();
     let directory = tempfile::tempdir().unwrap();
-    let fake = fake_cloudflared(directory.path());
+    let fake = FakeCloudflared::write_into(directory.path());
     std::fs::write(&fake.certificate, CERTIFICATE).unwrap();
     std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
     let server = TestServer::start_configured_in(directory.path()).await;
@@ -524,9 +425,193 @@ async fn account_state_requires_read_and_every_account_action_requires_write() {
         assert_eq!(refused.body["requiredScope"], "access:write");
         assert!(refused.body.get("certificateDetected").is_none());
         assert!(refused.body.get("tunnels").is_none());
+        // ADR-0047: a refusal discloses nothing. The scope answer is not the
+        // public-exposure refusal, precisely so that a client without the scope
+        // cannot read a `reason` off it — every one of those words would say
+        // something about Cloudflare state, and a session that may not read the
+        // snapshot may not learn it a sentence at a time either.
+        assert_eq!(refused.body["_tag"], "EnvironmentScopeRequiredError", "{path}");
+        assert!(refused.body.get("reason").is_none(), "{path}");
+        assert!(refused.body.get("message").is_none(), "{path}");
+        assert!(refused.body.get("completed").is_none(), "{path}");
     }
     assert_eq!(fake.invocations("login"), 0);
     assert_eq!(fake.invocations("list"), 0);
     server.stop().await;
     std::env::remove_var("TUNNEL_ORIGIN_CERT");
+}
+
+/// The commands tickets 06 and 07 will drive, pinned before they drive them.
+///
+/// **Nothing in the server invokes these yet**, and the test above asserts it
+/// stays that way for ticket 04's sake. What this pins is the *fixture*: the
+/// argument shapes `cloudflared` accepts, that `--credentials-file` is what
+/// keeps the narrow run credential inside laplus's private directory, that
+/// `create` reports an allocated id different from the name it was asked for,
+/// and that a partial creation is rehearsable. A fixture nothing exercises rots
+/// silently, and this one is the thing those tickets cannot start without.
+#[tokio::test]
+async fn the_fixture_answers_every_command_a_dedicated_tunnel_needs() {
+    let _serial = serially();
+    let directory = tempfile::tempdir().unwrap();
+    let fake = FakeCloudflared::write_into(directory.path());
+    std::fs::write(&fake.certificate, CERTIFICATE).unwrap();
+    std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
+    let credentials = directory.path().join("private").join("tunnel.json");
+    std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+
+    let run = |arguments: Vec<String>| {
+        let executable = fake.executable.clone();
+        let certificate = fake.certificate.clone();
+        async move {
+            tokio::process::Command::new(&executable)
+                .args(&arguments)
+                .env("TUNNEL_ORIGIN_CERT", &certificate)
+                .output()
+                .await
+                .expect("the fake runs")
+        }
+    };
+    let origincert = fake.certificate.to_string_lossy().to_string();
+    let argv = |rest: &[&str]| {
+        let mut arguments = vec!["tunnel".to_string(), "--origincert".into(), origincert.clone()];
+        arguments.extend(rest.iter().map(|word| word.to_string()));
+        arguments
+    };
+
+    let created = run(argv(&[
+        "create",
+        "--credentials-file",
+        &credentials.to_string_lossy(),
+        "--output",
+        "json",
+        "laplus",
+    ]))
+    .await;
+    assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+    let reported: Value = serde_json::from_slice(&created.stdout).expect("structured output");
+    // The allocation is the tunnel's identity, and it is not the name that was
+    // asked for — cleanup has to target the first and a confirmation shows both.
+    assert_eq!(reported["id"], harness::cloudflare::CREATED_TUNNEL_ID);
+    assert_eq!(reported["name"], "laplus");
+    // The narrow run credential lands where laplus said, not in cloudflared's
+    // own default location, and is private.
+    assert!(credentials.is_file());
+    assert_eq!(
+        std::fs::metadata(&credentials).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    let held: Value = serde_json::from_slice(&std::fs::read(&credentials).unwrap()).unwrap();
+    assert_eq!(held["TunnelID"], harness::cloudflare::CREATED_TUNNEL_ID);
+    assert_eq!(fake.credential_written_to().as_deref(), Some(credentials.as_path()));
+
+    let routed = run(argv(&["route", "dns", harness::cloudflare::CREATED_TUNNEL_ID, "laplus.example.com"])).await;
+    assert!(routed.status.success(), "{}", String::from_utf8_lossy(&routed.stderr));
+
+    let deleted = run(argv(&["delete", harness::cloudflare::CREATED_TUNNEL_ID])).await;
+    assert!(deleted.status.success(), "{}", String::from_utf8_lossy(&deleted.stderr));
+
+    // Ticket 06's partial creation: the tunnel exists and its route does not.
+    fake.rehearse("route-fails");
+    let failed = run(argv(&["route", "dns", harness::cloudflare::CREATED_TUNNEL_ID, "laplus.example.com"])).await;
+    assert!(!failed.status.success());
+    // Ticket 07's partial remote cleanup: the DNS record outlives the attempt.
+    fake.rehearse("delete-fails");
+    let refused = run(argv(&["delete", harness::cloudflare::CREATED_TUNNEL_ID])).await;
+    assert!(!refused.status.success());
+    fake.behave();
+
+    assert_eq!(fake.invocations("create"), 1);
+    assert_eq!(fake.invocations("route"), 2);
+    assert_eq!(fake.invocations("delete"), 2);
+    // No secret in the trace: the credential is a path there, never contents.
+    let trace = std::fs::read_to_string(&fake.trace).unwrap();
+    assert!(!trace.contains("FAKE-TUNNEL-CREDENTIAL-SECRET"));
+    assert!(!trace.contains(CERTIFICATE));
+    std::env::remove_var("TUNNEL_ORIGIN_CERT");
+}
+
+/// `cloudflared` has no `route dns delete`.
+///
+/// Ticket 07's "Delete everywhere" therefore cannot be `cloudflared tunnel
+/// delete` alone: removing the recorded DNS record is a Cloudflare API call
+/// needing DNS authority of its own — the cleanup asymmetry in
+/// `.scratch/cloudflare-tunnel/research.md`. Modelling it as a CLI verb would
+/// let that ticket be built against a command that does not exist, so the fake
+/// is a real local HTTP server, in the way `FakeRelease` models the download
+/// feed.
+#[tokio::test]
+async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
+    let _serial = serially();
+    let directory = tempfile::tempdir().unwrap();
+    let fake = FakeCloudflared::write_into(directory.path());
+    let api = harness::cloudflare::FakeCloudflareApi::start(
+        "zone-1",
+        "record-1",
+        "laplus.example.com",
+    )
+    .await;
+
+    // There is no such verb, and the fixture must not invent one. Invoked in
+    // exactly the shape a real `route dns` takes — `--origincert` and all — so
+    // that what is refused is the *verb* and not a malformed argument list; the
+    // first version of this test passed because it omitted `--origincert`, and
+    // would have gone on passing if the fixture had grown a `delete` branch.
+    std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
+    std::fs::write(&fake.certificate, CERTIFICATE).unwrap();
+    let origincert = fake.certificate.to_string_lossy().to_string();
+    let created = tokio::process::Command::new(&fake.executable)
+        .args(["tunnel", "--origincert", &origincert, "route", "dns", "t", "laplus.example.com"])
+        .env("TUNNEL_ORIGIN_CERT", &fake.certificate)
+        .output()
+        .await
+        .expect("the fake runs");
+    assert!(
+        created.status.success(),
+        "`route dns` must work, or the refusal below proves nothing: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let attempted = tokio::process::Command::new(&fake.executable)
+        .args(["tunnel", "--origincert", &origincert, "route", "dns", "delete", "laplus.example.com"])
+        .env("TUNNEL_ORIGIN_CERT", &fake.certificate)
+        .output()
+        .await
+        .expect("the fake runs");
+    assert!(
+        !attempted.status.success(),
+        "the CLI has no `route dns delete`; the fixture must not pretend otherwise"
+    );
+    assert!(String::from_utf8_lossy(&attempted.stderr).contains("unknown command"));
+    std::env::remove_var("TUNNEL_ORIGIN_CERT");
+
+    let client = reqwest::Client::new();
+    let deleted = client
+        .delete(format!("{}/client/v4/zones/zone-1/dns_records/record-1", api.origin))
+        .send()
+        .await
+        .expect("the fake API answers");
+    assert_eq!(deleted.status(), 200);
+    assert!(api.records().is_empty());
+
+    // Idempotent retry after a partial cleanup: a record already gone reads as
+    // already done rather than as a new failure, which is what lets ticket 07
+    // resume from observed state.
+    let repeated = client
+        .delete(format!("{}/client/v4/zones/zone-1/dns_records/record-1", api.origin))
+        .send()
+        .await
+        .expect("the fake API answers");
+    assert_eq!(repeated.status(), 404);
+    let body: Value = repeated.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], 81044);
+
+    // The exact recorded resource was targeted, and no other.
+    assert_eq!(
+        api.requests(),
+        vec![
+            ("DELETE".to_string(), "/client/v4/zones/zone-1/dns_records/record-1".to_string()),
+            ("DELETE".to_string(), "/client/v4/zones/zone-1/dns_records/record-1".to_string()),
+        ]
+    );
+    api.stop();
 }

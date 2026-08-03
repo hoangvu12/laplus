@@ -17,13 +17,322 @@ pub struct RegisterRequest {
     pub hostname: String,
 }
 
+/// A string that arrived where one of a closed set of words was expected.
+///
+/// Returned rather than defaulted, because every one of these vocabularies
+/// decides what laplus is allowed to *delete*, and a parse that silently picked
+/// a value would pick it for a row nothing wrote. See [`TunnelOwnership`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownWord {
+    pub vocabulary: &'static str,
+    pub found: String,
+}
+
+impl std::fmt::Display for UnknownWord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} is not a {}", self.found, self.vocabulary)
+    }
+}
+
+/// A closed vocabulary that crosses a module boundary, as a Rust enum.
+///
+/// **The point of the macro is the `match` it generates.** Every one of these
+/// used to be a `String` compared against a literal in another file — the
+/// server asked `selection.classification == "external"`, the connector wrote
+/// `ownership: "adopted"` and nothing ever read it back. Adding a state to a
+/// set of literals is silent; adding a variant here is a compile error at every
+/// site that has to answer for it, which is the whole reason tickets 05, 06 and
+/// 07 can add `adopting`, `creating`, `cleanup-required` and `partially-deleted`
+/// without auditing the tree by hand.
+///
+/// The wire spelling is pinned beside the variant rather than derived, because
+/// the contract in `packages/contracts/src/remoteAccess.ts` already fixed these
+/// words and a rename here must not be able to change them by accident.
+macro_rules! closed_vocabulary {
+    (
+        $(#[$meta:meta])*
+        $name:ident as $vocabulary:literal { $($(#[$variant_meta:meta])* $variant:ident => $wire:literal),+ $(,)? }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant),+
+        }
+
+        impl $name {
+            /// The word the contract pins for this variant.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+
+            /// Every variant, so a caller that must cover the vocabulary can
+            /// iterate it instead of repeating it.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = $crate::public_exposure::UnknownWord;
+
+            fn from_str(word: &str) -> Result<Self, $crate::public_exposure::UnknownWord> {
+                match word {
+                    $($wire => Ok(Self::$variant),)+
+                    other => Err($crate::public_exposure::UnknownWord {
+                        vocabulary: $vocabulary,
+                        found: other.to_string(),
+                    }),
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let word = <String as serde::Deserialize>::deserialize(deserializer)?;
+                word.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+pub(crate) use closed_vocabulary;
+
+closed_vocabulary! {
+    /// Who owns the Cloudflare tunnel behind an endpoint.
+    ///
+    /// **Not the same question as who runs the connector.** A connector token
+    /// tunnel is configured at Cloudflare and run by laplus; an adopted tunnel
+    /// is allocated at Cloudflare and configured *and* run by laplus; only a
+    /// laplus-created tunnel is laplus's to delete. `CONTEXT.md`'s "Remote
+    /// access" section is the vocabulary and `docs/adr/0049` is the decision to
+    /// persist it rather than emit it as a literal.
+    ///
+    /// This is the value ticket 07's whole acceptance matrix is indexed by, and
+    /// the reason "Delete everywhere is never offered for an adopted tunnel" can
+    /// be a server-side refusal rather than a hidden button.
+    TunnelOwnership as "tunnel ownership" {
+        /// Somebody else's tunnel. laplus verifies and advertises a hostname and
+        /// touches nothing — including when laplus runs the connector from a
+        /// tunnel-specific token, because Cloudflare still owns the tunnel's
+        /// configuration and allocation.
+        External => "external",
+        /// An inactive existing tunnel explicitly dedicated to this environment.
+        /// laplus may configure and supervise it; the Cloudflare allocation and
+        /// DNS route remain someone else's. Ticket 05.
+        Adopted => "adopted",
+        /// laplus created the allocation and the DNS route, and is the only
+        /// owner that may delete either. Ticket 06.
+        LaplusCreated => "laplus-created",
+    }
+}
+
+impl TunnelOwnership {
+    /// Whether laplus may delete this tunnel's Cloudflare resources.
+    ///
+    /// One method rather than a comparison at each call site, because ticket 07
+    /// forbids adopted and external tunnels from *ever* reaching a deletion
+    /// command "including through repeated, stale, or forged client requests" —
+    /// which means the check belongs somewhere a route cannot forget to make.
+    pub const fn deletable_at_cloudflare(self) -> bool {
+        matches!(self, Self::LaplusCreated)
+    }
+}
+
+closed_vocabulary! {
+    /// Which multi-step Cloudflare mutation a journal entry belongs to.
+    MutationIntent as "mutation intent" {
+        /// Dedicate an inactive existing tunnel to this environment. Ticket 05.
+        Adopt => "adopt",
+        /// Create a stable tunnel and its DNS route. Ticket 06.
+        Create => "create",
+        /// Delete the exact Cloudflare resources laplus created. Ticket 07.
+        DeleteEverywhere => "delete-everywhere",
+        /// Remove laplus-owned local configuration and secrets. Ticket 07.
+        Forget => "forget",
+    }
+}
+
+closed_vocabulary! {
+    /// One journaled step of a Cloudflare mutation.
+    ///
+    /// **Journaled before and after, which is what makes a step resumable.** A
+    /// step recorded `Pending` and never settled is exactly the "remaining
+    /// work" tickets 06 and 07 require a partial failure to preserve; a step
+    /// recorded `Completed` is the mutation a retry must not repeat.
+    MutationStep as "mutation step" {
+        /// Retrieve or create the narrow run credential for the tunnel.
+        Credential => "credential",
+        /// `cloudflared tunnel create`.
+        TunnelCreate => "tunnel-create",
+        /// `cloudflared tunnel route dns`.
+        DnsRoute => "dns-route",
+        /// Write laplus's own isolated ingress configuration.
+        Configuration => "configuration",
+        /// Delete the exact recorded DNS record. **Not a cloudflared command**:
+        /// the CLI has no `route dns delete`, so this step is a Cloudflare DNS
+        /// API call and needs DNS authority of its own. See `research.md`.
+        DnsRecordDelete => "dns-record-delete",
+        /// `cloudflared tunnel delete`.
+        TunnelDelete => "tunnel-delete",
+        /// Remove laplus's own ingress configuration.
+        ConfigurationRemove => "configuration-remove",
+        /// Remove the narrow run credential laplus stored.
+        CredentialRemove => "credential-remove",
+    }
+}
+
+closed_vocabulary! {
+    /// How far a journaled step got.
+    MutationState as "mutation state" {
+        /// Started and not settled. After a restart this is the remaining work.
+        Pending => "pending",
+        /// Done at Cloudflare or on disk. A retry must not repeat it.
+        Completed => "completed",
+        /// Attempted and refused. Distinct from `Pending` because a retry may
+        /// safely start it again, and because a wizard that reported it as
+        /// merely unfinished would be claiming a rollback that did not occur.
+        Failed => "failed",
+    }
+}
+
+closed_vocabulary! {
+    /// Why a public-exposure command was refused.
+    ///
+    /// **Named where the refusal is raised, never recovered from its prose.**
+    /// The first version of this crossed the wire as a `&'static str` chosen by
+    /// prefix-matching the message in the route — which is the same mistake
+    /// [`TunnelOwnership`] exists to undo, and it had already produced one: a
+    /// connector whose settings file could not be written was reported as
+    /// `restarts-exhausted`, because the only thing the route could see was a
+    /// string. A reason is a decision the code that failed already made.
+    RefusalReason as "refusal reason" {
+        /// Sign in to Cloudflare first.
+        SignInRequired => "sign-in-required",
+        /// The account certificate may not be used until its authority is
+        /// accepted.
+        ConsentRequired => "consent-required",
+        /// The chosen tunnel is no longer in the listing.
+        SelectionStale => "selection-stale",
+        /// There is no connector to act on yet, or not enough to make one.
+        ConnectorRequired => "connector-required",
+        /// Nothing is running that could be cancelled.
+        NothingRunning => "nothing-running",
+        /// laplus already owns this exposure, or another owner already does.
+        OwnershipConflict => "ownership-conflict",
+        /// Automatic restarts are spent; an explicit retry is required.
+        RestartsExhausted => "restarts-exhausted",
+        /// The named cloudflared cannot be started, or is too old.
+        ExecutableUnusable => "executable-unusable",
+        /// The hostname is not a bare public HTTPS host.
+        HostnameInvalid => "hostname-invalid",
+        /// The approved release is no longer the one the feed offers.
+        ReleaseMoved => "release-moved",
+        /// cloudflared ran and said no.
+        CommandFailed => "command-failed",
+        /// laplus could not write its own private configuration or credential.
+        /// Distinct from `CommandFailed` because nothing at Cloudflare went
+        /// wrong and a retry is local.
+        LocalSetupFailed => "local-setup-failed",
+        /// The tunnel became active between listing and mutation, so it is
+        /// externally managed after all. Ticket 05's activation race.
+        TunnelBecameActive => "tunnel-became-active",
+        /// Only a laplus-created tunnel may be deleted at Cloudflare. Ticket 07.
+        NotLaplusCreated => "not-laplus-created",
+        /// A previous mutation left state half-changed. Ticket 07.
+        CleanupRequired => "cleanup-required",
+    }
+}
+
+/// Which half of the refusal contract this is, and therefore its status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The developer has to do something first. `409`.
+    Precondition,
+    /// cloudflared, its output, or the request itself said no. `400`.
+    Rejected,
+}
+
+/// A refused public-exposure command, in the shape a client can decode.
+///
+/// **One refusal type for the whole surface.** The account module, the connector
+/// manager and the routes each used to refuse in their own currency — two
+/// bespoke enums and a bare `String` — so the route was left inferring a
+/// contract word from a sentence somebody else wrote. Every site that can refuse
+/// now says which reason it is refusing for, because it is the only place that
+/// knows.
+///
+/// `IntoResponse` lives in `server.rs`, which is where the status and the tag
+/// belong.
+#[derive(Debug)]
+pub struct Refusal {
+    pub kind: RefusalKind,
+    pub reason: RefusalReason,
+    pub message: String,
+    pub completed: Vec<MutationStep>,
+    pub remaining: Vec<MutationStep>,
+}
+
+impl Refusal {
+    /// The developer has to do something first. `409`.
+    pub fn precondition(reason: RefusalReason, message: impl Into<String>) -> Self {
+        Self::new(RefusalKind::Precondition, reason, message)
+    }
+
+    /// cloudflared, its output, or the request itself said no. `400`.
+    pub fn rejected(reason: RefusalReason, message: impl Into<String>) -> Self {
+        Self::new(RefusalKind::Rejected, reason, message)
+    }
+
+    fn new(kind: RefusalKind, reason: RefusalReason, message: impl Into<String>) -> Self {
+        Self { kind, reason, message: message.into(), completed: Vec::new(), remaining: Vec::new() }
+    }
+
+    /// Attach the exact work a partial mutation finished and left outstanding.
+    ///
+    /// Tickets 06 and 07 both require a failure to name both halves, so that a
+    /// retry repeats nothing and the wizard never claims a rollback it could
+    /// not perform. Nothing journals yet — the two lists are empty on every
+    /// refusal this build raises — but the shape is the one those tickets fill,
+    /// so they add a call rather than a contract.
+    #[allow(dead_code)]
+    pub fn after(mut self, completed: &[MutationStep], remaining: &[MutationStep]) -> Self {
+        self.completed = completed.to_vec();
+        self.remaining = remaining.to_vec();
+        self
+    }
+
+    /// Redact a secret from the sentence, wherever it came from.
+    ///
+    /// Applied at the boundary rather than at each raise site: a connector token
+    /// reaches several of them by way of `cloudflared`'s own output, and a
+    /// redaction that has to be remembered is one that will be forgotten.
+    pub fn redacting(mut self, secret: &str) -> Self {
+        if !secret.trim().is_empty() {
+            self.message = self.message.replace(secret, "[REDACTED]");
+        }
+        self
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub configured: bool,
     pub https_origin: Option<String>,
     pub wss_origin: Option<String>,
-    pub ownership: &'static str,
+    pub ownership: TunnelOwnership,
     pub health: serde_json::Value,
     pub verification_state: String,
     pub failure_kind: Option<String>,
@@ -438,6 +747,135 @@ async fn verify_with_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vocabulary crosses two process boundaries — a SQLite column and the
+    /// JSON contract — so the words have to survive both round trips exactly.
+    #[test]
+    fn tunnel_ownership_survives_the_wire_and_the_column_unchanged() {
+        for ownership in TunnelOwnership::ALL {
+            assert_eq!(
+                ownership.as_str().parse::<TunnelOwnership>(),
+                Ok(*ownership),
+                "{ownership} does not read back"
+            );
+            assert_eq!(
+                serde_json::to_string(ownership).unwrap(),
+                format!("\"{}\"", ownership.as_str())
+            );
+        }
+        assert_eq!(
+            TunnelOwnership::ALL
+                .iter()
+                .map(|ownership| ownership.as_str())
+                .collect::<Vec<_>>(),
+            ["external", "adopted", "laplus-created"]
+        );
+    }
+
+    /// ADR-0045 gives every lifecycle action one owner, and this is the half of
+    /// it that decides whether a *destructive* Cloudflare command may run at
+    /// all. Ticket 07 forbids adopted and external tunnels from reaching one
+    /// through any request, so the answer lives here rather than in a route.
+    #[test]
+    fn only_a_laplus_created_tunnel_may_be_deleted_at_cloudflare() {
+        assert!(TunnelOwnership::LaplusCreated.deletable_at_cloudflare());
+        assert!(!TunnelOwnership::Adopted.deletable_at_cloudflare());
+        assert!(!TunnelOwnership::External.deletable_at_cloudflare());
+    }
+
+    /// A word nothing in this build wrote is refused rather than defaulted,
+    /// because every default here would be a guess about deletion authority.
+    #[test]
+    fn a_word_outside_the_vocabulary_is_refused_and_says_what_it_was() {
+        let failure = "laplus".parse::<TunnelOwnership>().expect_err("refused");
+        assert_eq!(failure.vocabulary, "tunnel ownership");
+        assert_eq!(failure.found, "laplus");
+        assert!("".parse::<MutationStep>().is_err());
+        assert!("done".parse::<MutationState>().is_err());
+    }
+
+    /// **The cross-check the wire needs.** `RefusalReason` and
+    /// `PublicExposureRefusalReason` in
+    /// `packages/contracts/src/environmentHttp.ts` are the same closed set on
+    /// two sides of a socket, and nothing links them but agreement. Both are
+    /// pinned to this list in this order, so adding a word to one without the
+    /// other fails a test rather than reaching a client that cannot decode it.
+    #[test]
+    fn every_refusal_reason_matches_the_contract_vocabulary() {
+        assert_eq!(
+            RefusalReason::ALL.iter().map(|reason| reason.as_str()).collect::<Vec<_>>(),
+            [
+                "sign-in-required",
+                "consent-required",
+                "selection-stale",
+                "connector-required",
+                "nothing-running",
+                "ownership-conflict",
+                "restarts-exhausted",
+                "executable-unusable",
+                "hostname-invalid",
+                "release-moved",
+                "command-failed",
+                "local-setup-failed",
+                "tunnel-became-active",
+                "not-laplus-created",
+                "cleanup-required",
+            ]
+        );
+        for reason in RefusalReason::ALL {
+            assert_eq!(reason.as_str().parse::<RefusalReason>(), Ok(*reason));
+        }
+    }
+
+    /// A refusal that changed nothing says so, rather than leaving the client
+    /// to guess whether the two lists were merely not filled in.
+    #[test]
+    fn a_refusal_carries_no_completed_work_unless_it_is_given_some() {
+        let refused = Refusal::precondition(RefusalReason::ConsentRequired, "Confirm first.");
+        assert_eq!(refused.kind, RefusalKind::Precondition);
+        assert!(refused.completed.is_empty() && refused.remaining.is_empty());
+
+        let partial = Refusal::rejected(RefusalReason::CleanupRequired, "The DNS record remains.")
+            .after(&[MutationStep::TunnelDelete], &[MutationStep::DnsRecordDelete]);
+        assert_eq!(partial.kind, RefusalKind::Rejected);
+        assert_eq!(partial.completed, [MutationStep::TunnelDelete]);
+        assert_eq!(partial.remaining, [MutationStep::DnsRecordDelete]);
+    }
+
+    /// The connector token reaches a refusal by way of cloudflared's own
+    /// output, so redaction is done once at the boundary rather than at each
+    /// site that could quote it.
+    #[test]
+    fn a_refusal_can_have_a_secret_taken_out_of_it_wherever_it_came_from() {
+        let refused = Refusal::rejected(
+            RefusalReason::CommandFailed,
+            "cloudflared rejected the token sekret-value.",
+        )
+        .redacting("sekret-value");
+        assert!(!refused.message.contains("sekret-value"));
+        assert!(refused.message.contains("[REDACTED]"));
+        // An empty secret redacts nothing rather than replacing every gap in
+        // the sentence, which is what `str::replace` on "" would do.
+        let untouched =
+            Refusal::rejected(RefusalReason::CommandFailed, "no secret here").redacting("");
+        assert_eq!(untouched.message, "no secret here");
+    }
+
+    #[test]
+    fn every_journal_word_reads_back_as_itself() {
+        for step in MutationStep::ALL {
+            assert_eq!(step.as_str().parse::<MutationStep>(), Ok(*step));
+        }
+        for state in MutationState::ALL {
+            assert_eq!(state.as_str().parse::<MutationState>(), Ok(*state));
+        }
+        for intent in MutationIntent::ALL {
+            assert_eq!(intent.as_str().parse::<MutationIntent>(), Ok(*intent));
+        }
+        // The one step that is not a cloudflared command, and the reason
+        // ticket 07 needs Cloudflare DNS authority separately from the CLI.
+        assert_eq!(MutationStep::DnsRecordDelete.as_str(), "dns-record-delete");
+    }
 
     #[test]
     fn registration_normalizes_only_https_hostnames() {

@@ -49,6 +49,63 @@ struct Settings {
     selection: Option<Selection>,
 }
 
+crate::public_exposure::closed_vocabulary! {
+    /// Whether cloudflared reported any connection for a listed tunnel.
+    ///
+    /// The only evidence of activity `tunnel list --output json` carries, and
+    /// therefore the only thing this module may claim about one.
+    Activity as "tunnel activity" {
+        Active => "active",
+        Inactive => "inactive",
+    }
+}
+
+crate::public_exposure::closed_vocabulary! {
+    /// What laplus may *do* with a listed tunnel, and nothing more.
+    ///
+    /// Not a claim about who owns the Cloudflare allocation — that is
+    /// [`crate::public_exposure::TunnelOwnership`], which is settled by adoption
+    /// or creation rather than by a listing.
+    Classification as "tunnel classification" {
+        /// Someone else's connector is already serving it.
+        External => "external",
+        /// Inactive, so it *may* be dedicated to laplus — after the separate
+        /// confirmation ADR-0045 requires, which ticket 05 builds.
+        Adoptable => "adoptable",
+    }
+}
+
+crate::public_exposure::closed_vocabulary! {
+    /// Cloudflare browser authorization, as this server can observe it.
+    LoginState as "login state" {
+        NotStarted => "not-started",
+        AwaitingBrowser => "awaiting-browser",
+        Complete => "complete",
+        Cancelled => "cancelled",
+        TimedOut => "timed-out",
+        Failed => "failed",
+    }
+}
+
+crate::public_exposure::closed_vocabulary! {
+    /// Which step of the account wizard an interrupted setup resumes at.
+    ///
+    /// Computed from what is durably true rather than remembered by the
+    /// browser, which is what lets a reopened dialog, a reloaded page and a
+    /// restarted server agree about how far setup got.
+    ///
+    /// **Ticket 05 adds `adopting` here and ticket 06 adds `creating`.** Adding
+    /// one is now a compile error in `step` and a type error in the UI's
+    /// `WIZARD_STEP_LABELS`, which is the point of the enum.
+    SetupStep as "setup step" {
+        SignIn => "sign-in",
+        Consent => "consent",
+        ChooseTunnel => "choose-tunnel",
+        VerifyHostname => "verify-hostname",
+        ConfirmAdoption => "confirm-adoption",
+    }
+}
+
 /// One row of `tunnel list --output json`, reduced to what it actually proves.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -57,10 +114,8 @@ pub struct Tunnel {
     pub name: String,
     pub created_at: Option<String>,
     pub connection_count: usize,
-    /// `active` or `inactive`.
-    pub activity: String,
-    /// `external` for an active tunnel, `adoptable` for an inactive one.
-    pub classification: String,
+    pub activity: Activity,
+    pub classification: Classification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,7 +123,7 @@ pub struct Tunnel {
 pub struct Selection {
     pub tunnel_id: String,
     pub name: String,
-    pub classification: String,
+    pub classification: Classification,
     pub https_origin: String,
     /// Always false here. Adoption is a later, separate confirmation; until it
     /// succeeds an inactive tunnel is a choice and not a laplus-managed tunnel.
@@ -77,7 +132,7 @@ pub struct Selection {
 
 #[derive(Debug)]
 struct Login {
-    state: &'static str,
+    state: LoginState,
     authorization_url: Option<String>,
     failure: Option<String>,
     running: bool,
@@ -97,12 +152,26 @@ pub struct Account {
 }
 
 /// Every refusal this module can produce, in the shape the route needs.
-#[derive(Debug)]
-pub enum Refusal {
-    /// The developer has to do something first — consent, or sign in.
-    Precondition(String),
-    /// cloudflared, or its output, said no.
-    Rejected(String),
+///
+/// **The type is `crate::public_exposure::Refusal`**, shared with the connector
+/// manager and the routes. This module used to have its own two-variant enum
+/// carrying only a sentence, which left `server.rs` recovering the contract's
+/// reason by matching the prose — see [`RefusalReason`]'s own note.
+pub use crate::public_exposure::{Refusal, RefusalReason};
+
+/// The two sentences about a missing certificate, which three callers share.
+fn sign_in_first() -> Refusal {
+    Refusal::precondition(
+        RefusalReason::SignInRequired,
+        "No Cloudflare account certificate was found. Sign in first.",
+    )
+}
+
+fn unusable_executable() -> Refusal {
+    Refusal::rejected(
+        RefusalReason::ExecutableUnusable,
+        "The selected cloudflared executable cannot be started.",
+    )
 }
 
 impl Account {
@@ -125,7 +194,7 @@ impl Account {
             directory: cloudflare_directory.to_path_buf(),
             settings: Mutex::new(settings),
             login: Mutex::new(Login {
-                state: "not-started",
+                state: LoginState::NotStarted,
                 authorization_url: None,
                 failure: None,
                 running: false,
@@ -143,8 +212,8 @@ impl Account {
         // A sign-in that was running when the server stopped is gone with it.
         // What is true after a restart is whether a certificate is there, which
         // is what makes the wizard resumable rather than stuck mid-step.
-        let login_state = if login.state == "not-started" && detected {
-            "complete"
+        let login_state = if login.state == LoginState::NotStarted && detected {
+            LoginState::Complete
         } else {
             login.state
         };
@@ -168,12 +237,8 @@ impl Account {
     pub async fn begin_login(self: &Arc<Self>, executable: &Path) -> Result<(), Refusal> {
         let executable = crate::process::Search::from_environment()
             .startable(executable)
-            .ok_or_else(|| {
-                Refusal::Rejected("The selected cloudflared executable cannot be started.".into())
-            })?;
-        crate::cloudflare_connector::compatible_version(&executable)
-            .await
-            .map_err(Refusal::Rejected)?;
+            .ok_or_else(unusable_executable)?;
+        crate::cloudflare_connector::compatible_version(&executable).await?;
         {
             let mut login = self.login.lock().unwrap();
             if login.running {
@@ -181,7 +246,7 @@ impl Account {
             }
             login.running = true;
             login.cancelled = false;
-            login.state = "awaiting-browser";
+            login.state = LoginState::AwaitingBrowser;
             login.authorization_url = None;
             login.failure = None;
         }
@@ -202,7 +267,7 @@ impl Account {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let Ok(mut child) = command.spawn() else {
-            self.finish("failed", Some("cloudflared could not be started.".into()));
+            self.finish(LoginState::Failed, Some("cloudflared could not be started.".into()));
             return;
         };
         let mut readers = Vec::new();
@@ -217,12 +282,12 @@ impl Account {
         let outcome = tokio::select! {
             status = child.wait() => match status {
                 Ok(status) if status.success() => None,
-                Ok(_) => Some(("failed", "Cloudflare authorization did not complete.")),
-                Err(_) => Some(("failed", "Cloudflare authorization could not be observed.")),
+                Ok(_) => Some((LoginState::Failed, "Cloudflare authorization did not complete.")),
+                Err(_) => Some((LoginState::Failed, "Cloudflare authorization could not be observed.")),
             },
-            () = self.cancellation() => Some(("cancelled", "Cloudflare authorization was cancelled.")),
+            () = self.cancellation() => Some((LoginState::Cancelled, "Cloudflare authorization was cancelled.")),
             () = tokio::time::sleep(LOGIN_TIMEOUT) => {
-                Some(("timed-out", "Cloudflare authorization timed out. Start it again when you are ready."))
+                Some((LoginState::TimedOut, "Cloudflare authorization timed out. Start it again when you are ready."))
             }
         };
         let _ = child.kill().await;
@@ -240,10 +305,10 @@ impl Account {
                     settings.clone()
                 };
                 let _ = self.persist(&settings);
-                self.finish("complete", None);
+                self.finish(LoginState::Complete, None);
             }
             None => self.finish(
-                "failed",
+                LoginState::Failed,
                 Some("Cloudflare authorization finished without writing a certificate.".into()),
             ),
             Some((state, message)) => self.finish(state, Some(message.into())),
@@ -281,12 +346,12 @@ impl Account {
         }
     }
 
-    fn finish(&self, state: &'static str, failure: Option<String>) {
+    fn finish(&self, state: LoginState, failure: Option<String>) {
         let mut login = self.login.lock().unwrap();
         login.running = false;
         login.state = state;
         login.failure = failure;
-        if state != "awaiting-browser" && state != "complete" {
+        if !matches!(state, LoginState::AwaitingBrowser | LoginState::Complete) {
             login.authorization_url = None;
         }
     }
@@ -295,8 +360,9 @@ impl Account {
         {
             let mut login = self.login.lock().unwrap();
             if !login.running {
-                return Err(Refusal::Precondition(
-                    "No Cloudflare authorization is running.".into(),
+                return Err(Refusal::precondition(
+                    RefusalReason::NothingRunning,
+                    "No Cloudflare authorization is running.",
                 ));
             }
             login.cancelled = true;
@@ -308,9 +374,7 @@ impl Account {
     /// Record — or withdraw — consent to use the certificate cloudflared owns.
     pub fn consent(&self, consented: bool) -> Result<(), Refusal> {
         if consented && !certificate_path().is_file() {
-            return Err(Refusal::Precondition(
-                "No Cloudflare account certificate was found. Sign in first.".into(),
-            ));
+            return Err(sign_in_first());
         }
         let settings = {
             let mut settings = self.settings.lock().unwrap();
@@ -339,23 +403,21 @@ impl Account {
     pub async fn list_tunnels(&self, executable: &Path) -> Result<(), Refusal> {
         let certificate = certificate_path();
         if !certificate.is_file() {
-            return Err(Refusal::Precondition(
-                "No Cloudflare account certificate was found. Sign in first.".into(),
-            ));
+            return Err(sign_in_first());
         }
         if self.settings.lock().unwrap().consented_at.is_none() {
-            return Err(Refusal::Precondition(format!(
-                "Confirm that laplus may use the Cloudflare account certificate. {CERTIFICATE_WARNING}"
-            )));
+            return Err(Refusal::precondition(
+                RefusalReason::ConsentRequired,
+                format!(
+                    "Confirm that laplus may use the Cloudflare account certificate. \
+                     {CERTIFICATE_WARNING}"
+                ),
+            ));
         }
         let executable = crate::process::Search::from_environment()
             .startable(executable)
-            .ok_or_else(|| {
-                Refusal::Rejected("The selected cloudflared executable cannot be started.".into())
-            })?;
-        crate::cloudflare_connector::compatible_version(&executable)
-            .await
-            .map_err(Refusal::Rejected)?;
+            .ok_or_else(unusable_executable)?;
+        crate::cloudflare_connector::compatible_version(&executable).await?;
         let output = tokio::process::Command::new(&executable)
             .args([
                 "tunnel",
@@ -369,17 +431,23 @@ impl Account {
             .output()
             .await
             .map_err(|_| {
-                Refusal::Rejected("cloudflared could not list the account's tunnels.".into())
+                Refusal::rejected(
+                    RefusalReason::CommandFailed,
+                    "cloudflared could not list the account's tunnels.",
+                )
             })?;
         if !output.status.success() {
-            return Err(Refusal::Rejected(
+            return Err(Refusal::rejected(
+                RefusalReason::CommandFailed,
                 "cloudflared could not list the account's tunnels. Sign in again if the \
-                 certificate has expired."
-                    .into(),
+                 certificate has expired.",
             ));
         }
         let tunnels = parse_tunnels(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
-            Refusal::Rejected("cloudflared listed the tunnels in a shape laplus cannot read.".into())
+            Refusal::rejected(
+                RefusalReason::CommandFailed,
+                "cloudflared listed the tunnels in a shape laplus cannot read.",
+            )
         })?;
         let settings = {
             let mut settings = self.settings.lock().unwrap();
@@ -401,10 +469,8 @@ impl Account {
     /// external here and takes no laplus lifecycle action; an inactive one is
     /// only a candidate until adoption is separately confirmed.
     pub fn select(&self, tunnel_id: &str, hostname: &str) -> Result<Selection, Refusal> {
-        let https_origin =
-            crate::public_exposure::normalize_hostname(hostname).map_err(|message| {
-                Refusal::Rejected(message.to_string())
-            })?;
+        let https_origin = crate::public_exposure::normalize_hostname(hostname)
+            .map_err(|message| Refusal::rejected(RefusalReason::HostnameInvalid, message))?;
         let settings = {
             let mut settings = self.settings.lock().unwrap();
             let tunnel = settings
@@ -412,9 +478,9 @@ impl Account {
                 .iter()
                 .find(|tunnel| tunnel.id == tunnel_id)
                 .ok_or_else(|| {
-                    Refusal::Precondition(
-                        "That tunnel is not in the current listing. Refresh and choose again."
-                            .into(),
+                    Refusal::precondition(
+                        RefusalReason::SelectionStale,
+                        "That tunnel is not in the current listing. Refresh and choose again.",
                     )
                 })?
                 .clone();
@@ -431,14 +497,21 @@ impl Account {
         Ok(settings.selection.expect("a selection was just recorded"))
     }
 
+    /// Write the wizard's own state down.
+    ///
+    /// Everything that can go wrong here is local — a directory that will not
+    /// open, a file that will not write — so it is `LocalSetupFailed` rather
+    /// than `CommandFailed`: nothing at Cloudflare went wrong and the retry is
+    /// on this machine.
     fn persist(&self, settings: &Settings) -> Result<(), Refusal> {
-        crate::cloudflare_connector::private_directory(&self.directory)
-            .map_err(Refusal::Rejected)?;
+        crate::cloudflare_connector::private_directory(&self.directory)?;
         let bytes = serde_json::to_vec_pretty(settings).map_err(|_| {
-            Refusal::Rejected("Cloudflare account settings could not be encoded.".into())
+            Refusal::rejected(
+                RefusalReason::LocalSetupFailed,
+                "Cloudflare account settings could not be encoded.",
+            )
         })?;
         crate::cloudflare_connector::private_write(&self.directory.join(SETTINGS), &bytes)
-            .map_err(Refusal::Rejected)
     }
 }
 
@@ -504,9 +577,16 @@ pub fn parse_tunnels(output: &str) -> Option<Vec<Tunnel>> {
                     name: tunnel.name,
                     created_at: tunnel.created_at,
                     connection_count,
-                    activity: if connection_count > 0 { "active" } else { "inactive" }.into(),
-                    classification: if connection_count > 0 { "external" } else { "adoptable" }
-                        .into(),
+                    activity: if connection_count > 0 {
+                        Activity::Active
+                    } else {
+                        Activity::Inactive
+                    },
+                    classification: if connection_count > 0 {
+                        Classification::External
+                    } else {
+                        Classification::Adoptable
+                    },
                 }
             })
             .collect(),
@@ -514,17 +594,17 @@ pub fn parse_tunnels(output: &str) -> Option<Vec<Tunnel>> {
 }
 
 /// Which step of the wizard an interrupted setup resumes at.
-fn step(certificate: bool, consented: bool, selection: Option<&Selection>) -> &'static str {
+fn step(certificate: bool, consented: bool, selection: Option<&Selection>) -> SetupStep {
     if !certificate {
-        return "sign-in";
+        return SetupStep::SignIn;
     }
     if !consented {
-        return "consent";
+        return SetupStep::Consent;
     }
-    match selection {
-        None => "choose-tunnel",
-        Some(selection) if selection.classification == "external" => "verify-hostname",
-        Some(_) => "confirm-adoption",
+    match selection.map(|selection| selection.classification) {
+        None => SetupStep::ChooseTunnel,
+        Some(Classification::External) => SetupStep::VerifyHostname,
+        Some(Classification::Adoptable) => SetupStep::ConfirmAdoption,
     }
 }
 
@@ -547,11 +627,11 @@ mod tests {
         .expect("cloudflared's own list shape");
 
         assert_eq!(tunnels.len(), 2);
-        assert_eq!(tunnels[0].activity, "active");
-        assert_eq!(tunnels[0].classification, "external");
+        assert_eq!(tunnels[0].activity, Activity::Active);
+        assert_eq!(tunnels[0].classification, Classification::External);
         assert_eq!(tunnels[0].connection_count, 2);
-        assert_eq!(tunnels[1].activity, "inactive");
-        assert_eq!(tunnels[1].classification, "adoptable");
+        assert_eq!(tunnels[1].activity, Activity::Inactive);
+        assert_eq!(tunnels[1].classification, Classification::Adoptable);
         // Nothing in the output says where a tunnel is reachable, so nothing
         // here may claim to.
         let encoded = serde_json::to_string(&tunnels).unwrap();
@@ -580,21 +660,21 @@ mod tests {
 
     #[test]
     fn an_interrupted_setup_resumes_at_the_step_it_reached() {
-        assert_eq!(step(false, false, None), "sign-in");
-        assert_eq!(step(true, false, None), "consent");
-        assert_eq!(step(true, true, None), "choose-tunnel");
+        assert_eq!(step(false, false, None), SetupStep::SignIn);
+        assert_eq!(step(true, false, None), SetupStep::Consent);
+        assert_eq!(step(true, true, None), SetupStep::ChooseTunnel);
         let external = Selection {
             tunnel_id: "aaa".into(),
             name: "live".into(),
-            classification: "external".into(),
+            classification: Classification::External,
             https_origin: "https://laplus.example.com".into(),
             adoption_confirmed: false,
         };
-        assert_eq!(step(true, true, Some(&external)), "verify-hostname");
+        assert_eq!(step(true, true, Some(&external)), SetupStep::VerifyHostname);
         let adoptable = Selection {
-            classification: "adoptable".into(),
+            classification: Classification::Adoptable,
             ..external
         };
-        assert_eq!(step(true, true, Some(&adoptable)), "confirm-adoption");
+        assert_eq!(step(true, true, Some(&adoptable)), SetupStep::ConfirmAdoption);
     }
 }
