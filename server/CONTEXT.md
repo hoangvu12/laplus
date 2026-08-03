@@ -932,6 +932,61 @@ and can be given a new shell by name. A terminal that was _closed_ is gone: the
 developer said so, the process was killed and waited for, and the id no longer
 names anything. Reaping happens at the second, never the first.
 
+## Remote access
+
+**Cloudflare tunnel** — a public HTTPS endpoint whose traffic Cloudflare
+forwards to a loopback laplus server. The endpoint may be temporary or stable;
+the Cloudflare account, tunnel allocation and DNS record remain owned outside
+laplus.
+
+**Temporary tunnel** — a public Cloudflare tunnel belonging to one running
+laplus process. Its generated hostname is disposable and is never restored as
+a boot or service configuration.
+_Avoid_: Quick Tunnel, except when naming Cloudflare's mechanism specifically.
+
+**Laplus-managed connector** — a `cloudflared` connector started and supervised
+by laplus. Management covers the local connector process, not ownership of or
+authority to delete the Cloudflare tunnel or its DNS record.
+_Avoid_: Managed tunnel
+
+**Cloudflare account certificate** — the broad, long-lived `cert.pem` created
+and owned by `cloudflared` login. Laplus may use it in place for an explicit
+account-management action but never copies, replaces or deletes it.
+_Avoid_: Tunnel credential
+
+**Tunnel credential** — the narrow credential that can run one stable tunnel
+and cannot manage the Cloudflare account. A laplus-created connector keeps this
+credential in laplus's private data directory.
+_Avoid_: Cloudflare token, account certificate
+
+**Dedicated tunnel** — a stable Cloudflare tunnel reserved for one laplus
+environment and either created by laplus or explicitly handed to it while
+inactive. Laplus may configure and supervise it.
+_Avoid_: Existing tunnel, which does not say who owns its configuration.
+
+**Laplus-created tunnel** — a dedicated tunnel whose Cloudflare allocation and
+DNS route laplus created. It is the only tunnel laplus may offer to delete from
+Cloudflare; deletion is never implied by turning it off or forgetting it.
+
+**Adopted tunnel** — an inactive existing tunnel explicitly handed to laplus as
+a dedicated tunnel. Laplus may configure and supervise it but does not own its
+Cloudflare allocation or DNS route and cannot delete either.
+
+**External tunnel endpoint** — a hostname already routed to laplus by a tunnel
+managed elsewhere. Laplus may verify and advertise the endpoint but does not
+reconfigure, restart or delete its tunnel.
+_Avoid_: Imported tunnel
+
+**Verified tunnel endpoint** — a public HTTPS hostname recently proven to
+identify this laplus environment and carry an authenticated HTTP request and
+WebSocket upgrade. A ready connector alone is not a verified endpoint.
+_Avoid_: Connected tunnel, when only the connector is known to be connected.
+
+**Administrative session** — an authenticated laplus session granted
+`access:write`. It may change who or what can reach the environment; an ordinary
+paired client may use an endpoint without administering it.
+_Avoid_: Local session, because a tunnel also arrives through a local process.
+
 ## Shell
 
 **Shell** — laplus as a desktop application: a window, and the server
