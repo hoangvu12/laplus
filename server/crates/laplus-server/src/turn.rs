@@ -520,18 +520,6 @@ impl Ending {
     }
 }
 
-/// Fold one line and say what it turned out to be.
-///
-/// No [`crate::threads::Threads`], no lock, no clock and no child process: a
-/// [`SessionState`], a [`Driving`] and a line in, a [`Decided`] out. That is the whole of what this
-/// commit bought and the whole of why the tests at the bottom of this file can
-/// exist — see [`Decided`] and `docs/adr/0027`.
-///
-/// It is **not** pure, and the difference is worth being exact about rather than
-/// claiming otherwise in a doc comment. It advances the reducer, it mutates the
-/// turn in flight, and the five [`Activity`] constructors it calls read a clock
-/// and mint identifiers exactly as ADR-0025 left them. What changed is that it
-/// returns its results instead of applying them.
 /// A turn for something the agent said when nothing had asked it to speak.
 ///
 /// **The background-subagent case, and it is the developer's whole experience of
@@ -573,6 +561,18 @@ fn unprompted(folding: &mut SessionState, decided: &mut Decided) -> InFlight {
     }
 }
 
+/// Fold one line and say what it turned out to be.
+///
+/// No [`crate::threads::Threads`], no lock, no clock and no child process: a
+/// [`SessionState`], a [`Driving`] and a line in, a [`Decided`] out. That is the whole of what this
+/// commit bought and the whole of why the tests at the bottom of this file can
+/// exist — see [`Decided`] and `docs/adr/0027`.
+///
+/// It is **not** pure, and the difference is worth being exact about rather than
+/// claiming otherwise in a doc comment. It advances the reducer, it mutates the
+/// turn in flight, and the five [`Activity`] constructors it calls read a clock
+/// and mint identifiers exactly as ADR-0025 left them. What changed is that it
+/// returns its results instead of applying them.
 fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Decided {
     let folded = folding.fold_line(line);
     let mut decided = Decided::default();
