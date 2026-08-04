@@ -340,7 +340,7 @@ impl TestServer {
         let server = Server::bind_with_platform_and_verifier(
             0,
             config,
-            Database::in_memory().expect("a database"),
+            database,
             Assets::none(),
             laplus_server::provider_maintenance::ProviderMaintenance::new(),
             std::sync::Arc::new(laplus_server::mcp::Host::new()),
