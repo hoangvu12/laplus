@@ -475,12 +475,18 @@ pub fn subagent(task: &crate::protocol::SubagentTask, turn_id: Option<String>) -
         Some(kind) if !kind.trim().is_empty() => format!("Subagent {kind}"),
         _ => "Subagent task".to_string(),
     };
-    // The summary is the subagent's final report and only a notification carries
-    // one; while it runs, the description is what it is doing now.
+    // Three things could label the row, and they are ranked by how much they
+    // were worth waiting for. The summary is the subagent's final report and only
+    // a notification carries one. `said` is the subagent's own prose, forwarded
+    // while it works — better than the description, because the description is
+    // the CLI saying "Running Bash" and this is the subagent saying what it
+    // found. The description is what is left when the flag is off.
     let detail = task
         .summary
         .as_deref()
         .filter(|summary| !summary.trim().is_empty())
+        .or(task.said.as_deref())
+        .filter(|said| !said.trim().is_empty())
         .or(task.description.as_deref())
         .filter(|detail| !detail.trim().is_empty());
     let mut payload = json!({
@@ -1043,7 +1049,36 @@ mod tests {
             description: Some("Count to three".to_string()),
             subagent_type: Some("general-purpose".to_string()),
             summary: summary.map(str::to_string),
+            said: None,
         }
+    }
+
+    /// What the row says, in the order the three candidates are worth having. The
+    /// description is the CLI's account of what the subagent is up to; `said` is
+    /// the subagent's own words, forwarded while it works; the summary is its
+    /// final report. Each outranks the one before it.
+    #[test]
+    fn a_row_prefers_the_subagents_own_words_to_a_description_of_them() {
+        let described = subagent(&task("running", None), None);
+        assert_eq!(described.payload["detail"], json!("Count to three"));
+
+        let spoke = crate::protocol::SubagentTask {
+            said: Some("found eleven variants".to_string()),
+            ..task("running", None)
+        };
+        assert_eq!(
+            subagent(&spoke, None).payload["detail"],
+            json!("found eleven variants"),
+            "the description outranked the subagent's own words"
+        );
+
+        // And the report outranks both, so the finished row is the answer rather
+        // than the last thing said on the way to it.
+        let reported = crate::protocol::SubagentTask {
+            said: Some("found eleven variants".to_string()),
+            ..task("completed", Some("eleven"))
+        };
+        assert_eq!(subagent(&reported, None).payload["detail"], json!("eleven"));
     }
 
     /// The collapse key is the subagent's, not the spawning call's. A background

@@ -247,6 +247,20 @@ impl Agent {
             .arg("stream-json")
             .arg("--include-partial-messages")
             .arg("--verbose")
+            // What a subagent says, on the same wire. Without it a subagent is
+            // only ever a row that says how far along it is; with it the row can
+            // say what the thing is actually doing, which is the question a
+            // developer watching one has.
+            //
+            // Not a setting, because there is no version of this application
+            // where watching an agent work is opt-in — and it costs nothing when
+            // no subagent is running, since the lines only exist if one is.
+            //
+            // Safe to pass only because `parent_tool_use_id` is read: the
+            // forwarded lines are ordinary `assistant` and `user` envelopes, and
+            // a build that did not tell them apart would file a subagent's words
+            // in the developer's transcript as the agent's own.
+            .arg("--forward-subagent-text")
             // Where a permission prompt goes. See [`PERMISSION_PROMPT_TOOL`].
             .arg("--permission-prompt-tool")
             .arg(PERMISSION_PROMPT_TOOL)

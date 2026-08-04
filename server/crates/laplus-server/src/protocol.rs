@@ -512,6 +512,7 @@ impl TaskEvent {
             description: self.description.clone(),
             subagent_type: self.subagent_type.clone(),
             summary: self.summary.clone(),
+            said: None,
         }
     }
 }
@@ -557,6 +558,13 @@ pub struct SubagentTask {
     pub subagent_type: Option<String>,
     /// The subagent's final report, on the event that finishes it.
     pub summary: Option<String>,
+    /// The last thing the subagent said, under `--forward-subagent-text`.
+    ///
+    /// Its own prose rather than a description of it: `description` is the CLI
+    /// summarising what the subagent is up to, and this is the subagent talking.
+    /// Absent on every event that is not a forwarded message, which is all of them
+    /// when the flag is off.
+    pub said: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1183,6 +1191,20 @@ pub struct SessionState {
     #[serde(skip)]
     subagents: BTreeMap<String, Subagent>,
 
+    /// Which subagent a forwarded line belongs to, by the id of the call that
+    /// spawned it.
+    ///
+    /// The two halves of a subagent are named differently and this is the join.
+    /// `task_*` events carry a `task_id`, which is what the row collapses on;
+    /// forwarded messages carry only `parent_tool_use_id`, which is the id of the
+    /// `Task` call. `task_started` carries both, so the mapping is recorded as the
+    /// subagent is announced and read when it speaks.
+    ///
+    /// A line whose call is unknown is dropped rather than guessed at: it would
+    /// have to be attributed to *some* row, and the wrong row is worse than none.
+    #[serde(skip)]
+    subagent_calls: BTreeMap<String, String>,
+
     /// Completed turns, in order.
     pub transcript: Vec<Turn>,
     /// Text accumulated from `content_block_delta` for the in-flight turn.
@@ -1420,6 +1442,10 @@ impl SessionState {
     /// and a subagent whose notification never came would then have a row that
     /// reads as still running forever.
     fn subagent_moved(&mut self, task: SubagentTask) -> Folded {
+        if let Some(call) = &task.tool_use_id {
+            self.subagent_calls
+                .insert(call.clone(), task.task_id.clone());
+        }
         let record = self.subagents.entry(task.task_id.clone()).or_default();
         if let Some(kind) = &task.subagent_type {
             record.kind = Some(kind.clone());
@@ -1435,6 +1461,48 @@ impl SessionState {
         Folded::SubagentProgress(SubagentTask {
             subagent_type: task.subagent_type.or_else(|| record.kind.clone()),
             ..task
+        })
+    }
+
+    /// A subagent said something: put it on that subagent's row.
+    ///
+    /// Reached only under `--forward-subagent-text`, and it publishes the same
+    /// [`Folded::SubagentProgress`] the `task_*` events do, so the words land on
+    /// the row the developer is already watching rather than starting one of
+    /// their own — same `task_id`, same collapse key.
+    ///
+    /// **`running` is asserted rather than carried.** A forwarded message says
+    /// nothing about whether the subagent is finished, and this arrives while it
+    /// plainly is not. Passing a status through from a message would let a line of
+    /// prose tick a subagent off; the events that end one are the `task_*` events,
+    /// and they are the only things here that may.
+    ///
+    /// Three ways to say nothing, all of them ordinary: a subagent whose call was
+    /// never announced (no `task_started` seen, so nothing to attribute it to),
+    /// one already reported finished (a late line must not reopen a closed row),
+    /// and a message with no prose in it — a subagent that only called a tool
+    /// emits an envelope whose blocks are all `tool_use`.
+    fn subagent_said(&mut self, call: &str, said: String) -> Folded {
+        if said.trim().is_empty() {
+            return Folded::Nothing;
+        }
+        let Some(task_id) = self.subagent_calls.get(call) else {
+            return Folded::Nothing;
+        };
+        let Some(record) = self.subagents.get(task_id) else {
+            return Folded::Nothing;
+        };
+        if record.finished {
+            return Folded::Nothing;
+        }
+        Folded::SubagentProgress(SubagentTask {
+            task_id: task_id.clone(),
+            tool_use_id: Some(call.to_string()),
+            status: "running".to_string(),
+            description: None,
+            subagent_type: record.kind.clone(),
+            summary: None,
+            said: Some(said),
         })
     }
 
@@ -1534,6 +1602,7 @@ impl SessionState {
                         description: None,
                         subagent_type: None,
                         summary: None,
+                        said: None,
                     }),
                     _ => Folded::Nothing,
                 }
@@ -1617,15 +1686,28 @@ impl SessionState {
             },
 
             // A subagent talking, not the agent this conversation is with. Both
-            // halves of its exchange arrive on this wire — its own prose and the
-            // results of the tools it ran — and neither is the developer's
-            // transcript. See [`MessageEnvelope::parent_tool_use_id`]; the
-            // subagent's work is reported by the `task_*` events, which can say
-            // whose it is.
+            // halves of its exchange arrive on this wire under
+            // `--forward-subagent-text` — its own prose and the results of the
+            // tools it ran — and **neither is the developer's transcript**. See
+            // [`MessageEnvelope::parent_tool_use_id`]. Filing these as the agent's
+            // own words was the original bug: eleven of sixteen entries in the
+            // first capture's transcript were a subagent's.
+            //
+            // What its prose *is* good for is the row. A `task_progress` says the
+            // subagent is "Running Bash"; this says what it concluded, which is
+            // the thing a developer watching one wants to read.
             Event::Assistant(env) if env.parent_tool_use_id.is_some() => {
                 self.bump("assistant/subagent");
-                Folded::Nothing
+                let Some(call) = env.parent_tool_use_id.clone() else {
+                    return Folded::Nothing;
+                };
+                self.subagent_said(&call, visible(&env.message))
             }
+            // The other half, which is the subagent's *input*: the prompt it was
+            // given, and the results of the tools it ran. Dropped rather than
+            // shown, because a row is a place for one line and the subagent's own
+            // conclusion is the better line to spend it on — the prompt is already
+            // the row's description.
             Event::User(env) if env.parent_tool_use_id.is_some() => {
                 self.bump("user/subagent");
                 Folded::Nothing
@@ -2005,6 +2087,71 @@ mod tests {
             }
             other => panic!("expected the report, got {other:?}"),
         }
+    }
+
+    /// `--forward-subagent-text` puts the subagent's own prose on the wire, as
+    /// ordinary `assistant` envelopes carrying `parent_tool_use_id`. They belong
+    /// on that subagent's row — same `task_id`, so the row a developer is already
+    /// watching starts saying what the thing found.
+    ///
+    /// Shapes taken from a real capture with the flag on
+    /// (`.scratch/codex-subagents/claude-forward.jsonl`): the join is
+    /// `task_started.tool_use_id`, because a forwarded line names the *call* and a
+    /// row is keyed on the *task*.
+    #[test]
+    fn a_subagents_own_words_reach_its_row_rather_than_the_transcript() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Compute 2+2","subagent_type":"general-purpose"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Compute 2+2."}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"4"}]},"parent_tool_use_id":"toolu_1"}"#,
+        ]);
+
+        // The prompt it was given is not a row; its answer is.
+        assert!(matches!(outcomes[1], Folded::Nothing), "{:?}", outcomes[1]);
+        match &outcomes[2] {
+            Folded::SubagentProgress(task) => {
+                assert_eq!(task.said.as_deref(), Some("4"));
+                assert_eq!(task.task_id, "t1", "onto the row it belongs to");
+                assert_eq!(
+                    task.status, "running",
+                    "prose may not tick a subagent off — only a task event may"
+                );
+                assert_eq!(
+                    task.subagent_type.as_deref(),
+                    Some("general-purpose"),
+                    "and it keeps the row's name"
+                );
+            }
+            other => panic!("the subagent's words were dropped: {other:?}"),
+        }
+    }
+
+    /// Three ways a forwarded line says nothing, all ordinary. Attributing one to
+    /// the wrong row would be worse than dropping it, and reopening a finished row
+    /// would have a subagent come back to life after its report.
+    #[test]
+    fn a_forwarded_line_with_nowhere_to_go_is_dropped() {
+        // A call that was never announced — no `task_started`, so nothing says
+        // which subagent this is.
+        let orphan = outcomes(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"4"}]},"parent_tool_use_id":"toolu_unknown"}"#,
+        ]);
+        assert!(matches!(orphan[0], Folded::Nothing), "{:?}", orphan[0]);
+
+        // A subagent that has already reported, and a message with no prose in it
+        // — a subagent that only called a tool emits one of those.
+        let late = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","subagent_type":"Explore"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"   "}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"four"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"and another thing"}]},"parent_tool_use_id":"toolu_1"}"#,
+        ]);
+        assert!(matches!(late[1], Folded::Nothing), "{:?}", late[1]);
+        assert!(
+            matches!(late[3], Folded::Nothing),
+            "a finished subagent spoke again: {:?}",
+            late[3]
+        );
     }
 
     #[test]

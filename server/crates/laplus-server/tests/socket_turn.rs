@@ -1134,6 +1134,15 @@ async fn a_background_subagent_gets_its_own_row_and_stays_out_of_the_transcript(
         .count();
     assert_eq!(endings, 1, "the turn ended {endings} times");
 
+    // And the agent was started able to say what its subagents are doing. Not a
+    // setting: watching an agent work is what this application is for, so the
+    // flag is pinned here rather than left to a configuration nobody sets.
+    let argv = agent.arguments().join(" ");
+    assert!(
+        argv.contains("--forward-subagent-text"),
+        "a subagent's own words never reach the row: {argv}"
+    );
+
     // And the conversation is the developer's, not the subagent's. The subagent
     // counted "1", "2", "3" and reported on being refused permission; none of
     // that is something anyone in this conversation said.
