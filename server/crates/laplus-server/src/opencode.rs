@@ -422,6 +422,26 @@ pub async fn rollback(
 /// in its input.
 const TASK_TOOL: &str = "task";
 
+/// What [`OpenCode::subagent_row`] decided to draw for a part, which is a
+/// three-way question the [`Option`] it used to return could only answer two
+/// ways. Not to be confused with [`SubagentRow`], which is what is *known* about
+/// a subagent; this is what to put on screen for one part.
+///
+/// The two silences mean opposite things. "Not a subagent" invites the ordinary
+/// [`tool_activity`] to draw the part; "nothing to draw yet" asks for no row at
+/// all, and answering it with the tool row is what put a second row, keyed on the
+/// bare call id, beside every subagent's own — see
+/// `a_subagent_is_not_also_drawn_as_a_tool_called_task`.
+enum Drawn {
+    /// Some other tool. The ordinary tool row should handle it.
+    NotASubagent,
+    /// A subagent's part, but not one worth drawing yet. The naming rule in
+    /// [`OpenCode::subagent_row`] says why waiting is right; this says that
+    /// waiting means waiting rather than falling through.
+    TooEarly,
+    Row(crate::threads::Activity),
+}
+
 /// What is known about one subagent, accumulated across the events that mention
 /// it.
 ///
@@ -1003,9 +1023,11 @@ impl OpenCode {
 
     /// The `task` tool is a subagent, so it gets a subagent's row.
     ///
-    /// Returns `None` for every other tool, which is what leaves the ordinary
-    /// [`tool_activity`] to handle them — and what stops a subagent being drawn
-    /// twice, once as itself and once as a tool called `task`.
+    /// Returns [`Drawn::NotASubagent`] for every other tool, which is what
+    /// leaves the ordinary [`tool_activity`] to handle them. A `task` part is
+    /// never handed to it, whatever this decides about drawing one — that is what
+    /// stops a subagent being drawn twice, once as itself and once as a tool
+    /// called `task`.
     ///
     /// The row is [`crate::worklog::subagent`], the same builder the Claude driver
     /// uses, so a subagent looks like a subagent whichever agent is running. That
@@ -1022,14 +1044,20 @@ impl OpenCode {
         &mut self,
         part: &Value,
         driving: &crate::session::Driving,
-    ) -> Option<crate::threads::Activity> {
+    ) -> Drawn {
         if part.get("type").and_then(Value::as_str) != Some("tool")
             || part.get("tool").and_then(Value::as_str) != Some(TASK_TOOL)
         {
-            return None;
+            return Drawn::NotASubagent;
         }
-        let call = part.get("callID").and_then(Value::as_str)?.to_string();
-        let state = part.get("state")?;
+        // From here the part is a subagent's whatever else is true of it. A `task`
+        // part too malformed to build a row from is still not a tool row.
+        let Some(call) = part.get("callID").and_then(Value::as_str).map(str::to_string) else {
+            return Drawn::TooEarly;
+        };
+        let Some(state) = part.get("state") else {
+            return Drawn::TooEarly;
+        };
         let status = state
             .get("status")
             .and_then(Value::as_str)
@@ -1067,10 +1095,10 @@ impl OpenCode {
         // waits until the subagent can be named — unless the call is already over,
         // because an unnamed subagent that failed still has to be reported.
         if kind.is_none() && !matches!(status, "completed" | "error") {
-            return None;
+            return Drawn::TooEarly;
         }
 
-        Some(crate::worklog::subagent(
+        Drawn::Row(crate::worklog::subagent(
             &crate::protocol::SubagentTask {
                 task_id: call.clone(),
                 tool_use_id: Some(call),
@@ -1506,19 +1534,25 @@ impl crate::session::Driver for OpenCode {
                     .get("part")
                     .unwrap_or(&envelope.properties);
                 // A subagent before a tool, because `task` is both and only one of
-                // them is what the developer wants to read.
-                if let Some(activity) = self.subagent_row(part, driving) {
-                    decided
+                // them is what the developer wants to read. `TooEarly` draws
+                // nothing *and falls through to nothing* — the tool row is not a
+                // consolation prize for a row that is not ready.
+                match self.subagent_row(part, driving) {
+                    Drawn::Row(activity) => decided
                         .changes
-                        .push(crate::threads::Change::Activity(activity));
-                } else if let Some(activity) = tool_activity(
-                    part,
-                    &serde_json::to_value(envelope).unwrap_or(Value::Null),
-                    driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
-                ) {
-                    decided
-                        .changes
-                        .push(crate::threads::Change::Activity(activity));
+                        .push(crate::threads::Change::Activity(activity)),
+                    Drawn::TooEarly => {}
+                    Drawn::NotASubagent => {
+                        if let Some(activity) = tool_activity(
+                            part,
+                            &serde_json::to_value(envelope).unwrap_or(Value::Null),
+                            driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+                        ) {
+                            decided
+                                .changes
+                                .push(crate::threads::Change::Activity(activity));
+                        }
+                    }
                 }
                 self.normalize_part(part, driving, &mut decided);
             }

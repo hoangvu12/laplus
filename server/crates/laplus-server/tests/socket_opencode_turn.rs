@@ -2024,6 +2024,59 @@ async fn a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing() {
     server.stop().await;
 }
 
+/// The other half of [`a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing`],
+/// and the half that was only ever assumed.
+///
+/// `subagent_row` returns `None` for two opposite reasons — "not a subagent",
+/// which is an invitation to draw the ordinary tool row, and "a subagent that
+/// cannot be named yet", which is a request to draw nothing at all. The caller
+/// cannot tell them apart, so the `pending` `task` part OpenCode opens every
+/// subagent with fell through to `tool_activity` and put a second row on the
+/// thread, keyed `call_task_1` beside the subagent's own `subagent:call_task_1`.
+///
+/// One call, one row. The sibling test filters on the prefixed key and so cannot
+/// see the other one however wrong it gets, which is why this is a test rather
+/// than an assertion added over there.
+#[tokio::test]
+async fn a_subagent_is_not_also_drawn_as_a_tool_called_task() {
+    let SocketTurn {
+        opencode: _opencode,
+        server,
+        mut client,
+        subscription,
+        ..
+    } = start_socket_turn(
+        FakeOpenCode::spawning_a_subagent(),
+        "project-1",
+        "thread-open",
+    )
+    .await;
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let strays: Vec<String> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .filter(|activity| activity["payload"]["data"]["toolCallId"] == "call_task_1")
+        .map(|activity| {
+            format!(
+                "{} {:?}",
+                activity["kind"].as_str().unwrap_or("?"),
+                activity["payload"]["title"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+
+    assert!(
+        strays.is_empty(),
+        "the subagent was drawn a second time as a tool called `task`: {strays:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
     let SocketTurn {
