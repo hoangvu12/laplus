@@ -49,8 +49,8 @@ sent, and then abort a turn nobody had stopped.
 | `17-rate-limited.ndjson`                   | Hand-written           | Three `rate_limit_event`s — fine, close to the limit, refused — and the failed turn the third produces                                                                                                          |
 | `18-compacted.ndjson`                      | Hand-written           | A `system`/`compact_boundary` between two turns: the agent's memory rewritten, and the transcript deliberately unchanged by it                                                                                  |
 | `19-context-usage.ndjson`                  | Recorded, ticket 76    | The CLI answering how full its own window is, twice — as the session announces itself and as the turn ends — around a turn that uses a tool                                                                     |
-| `20-modes-changed-mid-conversation.ndjson` | Recorded, ticket 11    | A runtime mode and a model pushed to a *running* child between two turns: the first turn writes a file unasked, the second is stopped for permission, and the model on it is the one that was pushed            |
-| `21-modes-refused.ndjson`                  | Recorded, ticket 11    | The same two requests refused — an unnameable mode and an unrecognised model — which is the first `control_response` with `"subtype": "error"` in this directory                                                 |
+| `20-modes-changed-mid-conversation.ndjson` | Recorded, ticket 11    | A runtime mode and a model pushed to a _running_ child between two turns: the first turn writes a file unasked, the second is stopped for permission, and the model on it is the one that was pushed            |
+| `21-modes-refused.ndjson`                  | Recorded, ticket 11    | The same two requests refused — an unnameable mode and an unrecognised model — which is the first `control_response` with `"subtype": "error"` in this directory                                                |
 
 The raw STEP 1 originals these two were curated from lived in `.scratch/` and
 were deleted on 2026-07-29; the committed, test-facing copies here are now the
@@ -58,6 +58,47 @@ only ones. `04`–`15` were recorded straight into
 `fixtures/` against `claude-haiku-4-5`, with the same flags
 [`crate::agent`](../../crates/lightcode-server/src/agent.rs) passes, and `19`
 was recorded the same way.
+
+## What `22` settled
+
+A recording of one background subagent, against `claude` 2.1.220 with this
+server's own flags: the model called `Agent` with `run_in_background: true`, the
+subagent worked, and the CLI told the main agent when it finished. It settled
+three things, and the first two were costing the developer something on every
+background subagent they ran.
+
+**A subagent's messages arrive on this wire, tagged with the `Agent` call that
+owns them.** Not behind `--forward-subagent-text` — that flag governs the
+_foreground_ case, and a background subagent forwards regardless. Nothing read
+`parent_tool_use_id`, so all of it folded into the transcript as the main agent
+talking: **eleven of this capture's sixteen transcript entries were the
+subagent's**, including its final report, and the golden now has five. That is
+the whole of the difference, and it is why the field is read rather than the flag
+left off.
+
+**The `task_*` system events are how a subagent can be seen at all.**
+`task_started`, `task_progress`, `task_updated` and `task_notification` reached
+`SystemEvent::Other` and were dropped in silence, which is why a running subagent
+showed as nothing whatsoever. They carry more than enough for a row: a stable
+`task_id`, the spawning `tool_use_id`, a `description` that says what the
+subagent is doing _now_, and on the notification the `summary` that is the
+subagent's own final answer.
+
+**One invocation emits two `result` lines.** The capture ends `result, result`,
+and the second arrived after the turn had been taken — reporting a second
+completion for a turn already over and settling a turn id of `None`. It is
+counted and dropped now.
+
+What this capture does **not** show is a turn ending while a subagent was still
+running: the CLI held the process open until the background work was done, then
+emitted both results. So the composer going idle mid-subagent is not something
+this recording reproduces, and nothing here should be read as evidence for it.
+
+The `sleep` commands inside the subagent were refused — the recording was made
+without `--permission-prompt-tool`, so the child had no way to ask. That is an
+artefact of how it was captured and not of the feature; it is left in because the
+subagent's own account of being refused is exactly the kind of text that used to
+end up attributed to the main agent.
 
 ## What `20` and `21` settled
 
@@ -69,7 +110,7 @@ against `claude` 2.1.220 with this server's own launch flags.
 
 - **`set_permission_mode` moves a live child, both ways.** `20` opens under
   `bypassPermissions`, writes a file with nothing asked of the developer, is
-  pushed to `default` between turns, and is then *stopped for permission* on the
+  pushed to `default` between turns, and is then _stopped for permission_ on the
   second turn's identical `Write`. That prompt is the whole evidence: it exists
   only because the push landed.
 - **`set_model` moves a live child too**, and takes the bare slug — `opus`, which
@@ -86,13 +127,13 @@ against `claude` 2.1.220 with this server's own launch flags.
 - **A `set_model` push makes the CLI narrate itself a `user` line** reading
   `<local-command-stdout>Set model to opus (claude-opus-5)</local-command-stdout>`
   and marked `isReplay`, with `content` as a bare string rather than a list of
-  blocks. This server folded *every* user line into the transcript on the stated
+  blocks. This server folded _every_ user line into the transcript on the stated
   grounds that it does not pass `--replay-user-messages`; that reasoning no longer
   holds, and the line is now read and dropped. Both halves of the trap are in the
   golden: no eighth transcript entry, and `parse_errors: 0`.
 - **`approval-required` maps cleanly to `default` as a pushed mode**, so
   tightening and loosening are the same operation in opposite directions — the
-  asymmetry the ticket worried about was a property of the *launch* table, which
+  asymmetry the ticket worried about was a property of the _launch_ table, which
   is deliberately left lossy.
 
 `21` is the refusal half, and it is why the two are separate captures: a healthy

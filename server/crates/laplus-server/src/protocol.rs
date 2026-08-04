@@ -442,8 +442,108 @@ pub enum SystemEvent {
     /// The one `system` subtype besides `init` that a developer needs told
     /// about — see [`Compaction`].
     CompactBoundary(Box<CompactBoundaryEvent>),
+    /// A subagent started. Carries what it was asked to do and the `Agent` tool
+    /// call it belongs to, so its row can be tied to the call that spawned it.
+    TaskStarted(Box<TaskEvent>),
+    /// A subagent got further. `description` is the CLI's own phrasing of what it
+    /// is doing right now ("Running Pause 3 seconds"), which is the one thing
+    /// here that answers "what is it working on".
+    TaskProgress(Box<TaskEvent>),
+    /// A subagent's record changed — most usefully `patch.status`, which is how a
+    /// terminal state arrives without a summary attached.
+    TaskUpdated(Box<TaskUpdatedEvent>),
+    /// A subagent finished and the CLI is telling the *main agent* so. `summary`
+    /// is the subagent's final report, which is what the main agent then answers
+    /// from, and the reason this is not merely a status change.
+    TaskNotification(Box<TaskEvent>),
     #[serde(other)]
     Other,
+}
+
+/// A subagent, as the `task_started`, `task_progress` and `task_notification`
+/// events describe one.
+///
+/// Every field past `task_id` is optional because the shape is the CLI's rather
+/// than a contract, and the three subtypes populate different subsets of it: a
+/// start carries the `prompt`, a progress carries `last_tool_name`, and only a
+/// notification carries the `summary`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct TaskEvent {
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub last_tool_name: Option<String>,
+    /// Present on a notification, and the subagent's own final answer.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// `completed` on a notification for a subagent that finished.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct TaskUpdatedEvent {
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub patch: TaskPatch,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct TaskPatch {
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+impl TaskEvent {
+    fn progress(&self, status: &str) -> SubagentTask {
+        SubagentTask {
+            task_id: self.task_id.clone(),
+            tool_use_id: self.tool_use_id.clone(),
+            status: status.to_string(),
+            // A progress event's `description` is what it is doing now; a start's
+            // is what it was asked for. Either is the best label available.
+            description: self.description.clone(),
+            subagent_type: self.subagent_type.clone(),
+            summary: self.summary.clone(),
+        }
+    }
+}
+
+/// The row status a CLI task status becomes, or `None` when it is not terminal.
+///
+/// Only the endings are mapped. A status this build has not seen is treated as
+/// still running rather than as an ending, because inventing a completion for a
+/// subagent that is still working is the one wrong answer here.
+fn terminal_task_status(status: &str) -> Option<&'static str> {
+    match status {
+        "completed" | "success" => Some("completed"),
+        "failed" | "error" | "cancelled" | "canceled" | "killed" | "timeout" => Some("failed"),
+        _ => None,
+    }
+}
+
+/// What a subagent's row is told to say.
+///
+/// One of these per `task_*` event, carrying the identity the row collapses on
+/// and whatever that event knew. The driver turns it into a work-log row; the
+/// terminal states are the ones that stop it reading as still running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentTask {
+    pub task_id: String,
+    pub tool_use_id: Option<String>,
+    /// `running`, `completed`, or `failed` — what the row's status becomes.
+    pub status: String,
+    pub description: Option<String>,
+    pub subagent_type: Option<String>,
+    /// The subagent's final report, on the event that finishes it.
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,6 +641,19 @@ pub struct MessageEnvelope {
     /// `fixtures/claude-cli/20-modes-changed-mid-conversation.ndjson` has it.
     #[serde(default, rename = "isReplay", alias = "is_replay")]
     pub is_replay: bool,
+    /// The subagent this message belongs to, named by the `Agent` tool call that
+    /// spawned it — absent on everything the *main* agent says.
+    ///
+    /// Read for the same reason as [`Self::is_replay`]: folding it would grow the
+    /// developer's transcript with words nobody in the conversation said. A
+    /// background subagent forwards its whole inner monologue on this wire, and
+    /// `fixtures/claude-cli/22-background-subagent.ndjson` is what that costs —
+    /// eleven of its sixteen transcript entries were the subagent's, including
+    /// its final report, all of them attributed to the main agent. The subagent's
+    /// work is reported through the `task_*` system events instead, which say
+    /// whose it is.
+    #[serde(default, rename = "parent_tool_use_id", alias = "parentToolUseId")]
+    pub parent_tool_use_id: Option<String>,
 }
 
 /// The inner payload is the standard Anthropic Messages API `Message`.
@@ -1035,6 +1148,16 @@ pub struct SessionState {
     pub permission_mode: Option<String>,
     pub tool_count: usize,
 
+    /// Whether a terminal `result` has already been reported since the last
+    /// prompt went out, which is what tells a *duplicate* one from a legitimate
+    /// `result` that simply has no turn in flight behind it. One invocation emits
+    /// two when a background subagent ran; see [`crate::turn`]'s `Completed` arms.
+    ///
+    /// Left out of the serialized form for the same reason `counts` is: it is the
+    /// reducer's bookkeeping, and the goldens pin outcomes.
+    #[serde(skip)]
+    pub(crate) completion_reported: bool,
+
     /// Completed turns, in order.
     pub transcript: Vec<Turn>,
     /// Text accumulated from `content_block_delta` for the in-flight turn.
@@ -1183,6 +1306,10 @@ pub enum Folded {
     /// than the event. It is a variant of its own only so that the arm which
     /// reports a *refused* request does not have to wonder whether this was one.
     Measured,
+    /// A subagent started, got further, or finished. Rendered as a row of its
+    /// own rather than folded into the transcript, because a subagent's work is
+    /// the *agent's* doing and not another voice in the conversation.
+    SubagentProgress(SubagentTask),
     /// The terminal `result` for the turn. `last_result` holds the duration and
     /// the cost.
     Completed,
@@ -1242,7 +1369,9 @@ impl SessionState {
         Self::default()
     }
 
-    fn bump(&mut self, key: &str) {
+    /// Visible to the driver so it can count a line it recognised but chose not
+    /// to act on — see the second trailing `result` in [`crate::turn`].
+    pub(crate) fn bump(&mut self, key: &str) {
         *self.counts.entry(key.to_string()).or_insert(0) += 1;
     }
 
@@ -1314,6 +1443,41 @@ impl SessionState {
                 self.bump("system/compact_boundary");
                 Folded::Compacted(boundary.compact_metadata)
             }
+            Event::System(SystemEvent::TaskStarted(task)) => {
+                self.bump("system/task_started");
+                Folded::SubagentProgress(task.progress("running"))
+            }
+            Event::System(SystemEvent::TaskProgress(task)) => {
+                self.bump("system/task_progress");
+                Folded::SubagentProgress(task.progress("running"))
+            }
+            // A status in a patch and nothing else, so a subagent that ended
+            // without a notification still stops reading as running. Anything
+            // non-terminal is the record being touched rather than the subagent
+            // moving, and says nothing a row needs.
+            Event::System(SystemEvent::TaskUpdated(update)) => {
+                self.bump("system/task_updated");
+                match update.patch.status.as_deref().map(terminal_task_status) {
+                    Some(Some(status)) => Folded::SubagentProgress(SubagentTask {
+                        task_id: update.task_id.clone(),
+                        tool_use_id: None,
+                        status: status.to_string(),
+                        description: None,
+                        subagent_type: None,
+                        summary: None,
+                    }),
+                    _ => Folded::Nothing,
+                }
+            }
+            Event::System(SystemEvent::TaskNotification(task)) => {
+                self.bump("system/task_notification");
+                let status = task
+                    .status
+                    .as_deref()
+                    .and_then(terminal_task_status)
+                    .unwrap_or("completed");
+                Folded::SubagentProgress(task.progress(status))
+            }
             Event::System(SystemEvent::Other) => {
                 self.bump("system/other");
                 Folded::Nothing
@@ -1382,6 +1546,21 @@ impl SessionState {
                     Folded::Nothing
                 }
             },
+
+            // A subagent talking, not the agent this conversation is with. Both
+            // halves of its exchange arrive on this wire — its own prose and the
+            // results of the tools it ran — and neither is the developer's
+            // transcript. See [`MessageEnvelope::parent_tool_use_id`]; the
+            // subagent's work is reported by the `task_*` events, which can say
+            // whose it is.
+            Event::Assistant(env) if env.parent_tool_use_id.is_some() => {
+                self.bump("assistant/subagent");
+                Folded::Nothing
+            }
+            Event::User(env) if env.parent_tool_use_id.is_some() => {
+                self.bump("user/subagent");
+                Folded::Nothing
+            }
 
             Event::Assistant(env) => {
                 self.bump("assistant");
@@ -1669,6 +1848,77 @@ mod tests {
     fn outcomes(lines: &[&str]) -> Vec<Folded> {
         let mut state = SessionState::new();
         lines.iter().map(|line| state.fold_line(line)).collect()
+    }
+
+    /// Recorded in `fixtures/claude-cli/22-background-subagent.ndjson`: a
+    /// background subagent forwards its whole exchange on this wire, tagged with
+    /// the `Agent` call that owns it. Folding those put eleven of that capture's
+    /// sixteen transcript entries — including the subagent's final report — in
+    /// front of the developer as the *main* agent's words.
+    #[test]
+    fn a_subagents_own_messages_stay_out_of_the_transcript() {
+        let state = fold(&[
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"mine"}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"the subagent's"}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"toolu_1","message":{"role":"user","content":[{"type":"tool_result","content":"the subagent's tool"}]}}"#,
+        ]);
+
+        assert_eq!(state.transcript.len(), 1, "{:?}", state.transcript);
+        assert_eq!(state.transcript[0].text, "mine");
+        // Counted rather than passed over, so the day this shape changes there is
+        // a number saying how often it arrived.
+        assert_eq!((state.unknown_events, state.parse_errors), (0, 0));
+    }
+
+    #[test]
+    fn the_task_events_describe_a_subagent_the_developer_can_see() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count to three","subagent_type":"general-purpose"}"#,
+            r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"toolu_1","description":"Running Pause 3 seconds","last_tool_name":"Bash"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"1 2 3 — done"}"#,
+        ]);
+
+        let progress: Vec<&SubagentTask> = outcomes
+            .iter()
+            .filter_map(|folded| match folded {
+                Folded::SubagentProgress(task) => Some(task),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress.len(), 3, "{outcomes:?}");
+        assert_eq!(progress[0].status, "running");
+        assert_eq!(progress[0].subagent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(progress[1].status, "running");
+        assert_eq!(progress[1].description.as_deref(), Some("Running Pause 3 seconds"));
+        assert_eq!(progress[2].status, "completed");
+        assert_eq!(progress[2].summary.as_deref(), Some("1 2 3 — done"));
+        // Every one of them reached a real arm rather than `SystemEvent::Other`.
+        assert!(progress.iter().all(|task| task.task_id == "t1"));
+    }
+
+    /// `task_updated` is how an ending arrives with no summary attached, but the
+    /// same event also carries ordinary record edits. Reading a non-terminal one
+    /// as an ending would mark a working subagent finished.
+    #[test]
+    fn only_a_terminal_task_update_ends_the_subagents_row() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"end_time":1}}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"in_progress"}}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"queued_for_a_future_release"}}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"failed"}}"#,
+        ]);
+
+        assert!(matches!(outcomes[0], Folded::Nothing), "{:?}", outcomes[0]);
+        assert!(matches!(outcomes[1], Folded::Nothing), "{:?}", outcomes[1]);
+        assert!(
+            matches!(outcomes[2], Folded::Nothing),
+            "an unknown status is still running, not an ending: {:?}",
+            outcomes[2]
+        );
+        let Folded::SubagentProgress(task) = &outcomes[3] else {
+            panic!("a failure is an ending: {:?}", outcomes[3]);
+        };
+        assert_eq!(task.status, "failed");
     }
 
     #[test]

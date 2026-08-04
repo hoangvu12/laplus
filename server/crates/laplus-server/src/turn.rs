@@ -264,6 +264,9 @@ impl Driver for Claude {
     }
 
     async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
+        // A new prompt means the next `result` is this turn's rather than a
+        // duplicate of the last one's. See `SessionState::completion_reported`.
+        self.folding.completion_reported = false;
         self.agent.send(&prompt.text).await
     }
 
@@ -655,6 +658,16 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
         // developer would otherwise experience as the agent losing the thread —
         // a follow-up that refers to what is plainly on screen may be answered
         // by an agent that no longer has it.
+        // A subagent moved. One row per subagent, kept up to date — the work the
+        // developer could not see at all before, because every `task_*` event
+        // reached `SystemEvent::Other` and was dropped in silence.
+        Folded::SubagentProgress(task) => {
+            let turn_id = turn.as_ref().map(|turn| turn.turn_id.clone());
+            decided
+                .changes
+                .push(Change::Activity(crate::worklog::subagent(&task, turn_id)));
+        }
+
         Folded::Compacted(compaction) => {
             decided.changes.push(Change::Activity(Activity::info(
                 "session.compacted",
@@ -823,7 +836,25 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
             )));
         }
 
+        // A *second* terminal `result` for a turn already reported ended. One
+        // invocation emits two when a background subagent ran — see
+        // `fixtures/claude-cli/22-background-subagent.ndjson`, whose recording
+        // ends `result, result` — and the second arrived with the turn already
+        // taken, reporting a completion for nothing.
+        //
+        // Both halves of the condition are load-bearing. A `result` with no turn
+        // in flight is *not* on its own a duplicate: it still settles the
+        // session's idea of one, and the `None` it names is a value that matches
+        // the session's own `activeTurnId` — which is what
+        // `a_result_with_no_turn_behind_it_names_the_turn_it_is_about_anyway`
+        // pins. What makes this one a duplicate is that a completion has already
+        // been reported since the last prompt went out.
+        Folded::Completed if driving.turn.is_none() && folding.completion_reported => {
+            folding.bump("result/duplicate");
+        }
+
         Folded::Completed => {
+            folding.completion_reported = true;
             let finished = driving.turn.take();
             let active = finished.as_ref().map(|turn| turn.turn_id.clone());
             let summary = folding.last_result.as_ref();
@@ -1695,6 +1726,45 @@ mod tests {
             driving.finished.is_none(),
             "there is no checkpoint status that means interrupted"
         );
+    }
+
+    /// One invocation emits two `result` lines when a background subagent ran —
+    /// `fixtures/claude-cli/22-background-subagent.ndjson` ends `result, result`.
+    /// The first ends the turn; the second would report a second ending for a turn
+    /// already over, which is a row saying something untrue.
+    #[test]
+    fn a_second_result_does_not_end_the_turn_twice() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let first = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":5674,"num_turns":2}"#,
+        );
+        assert_eq!(kinds(&first), vec!["turn.completed"]);
+        assert_eq!(
+            first.settles.expect("the first result ends the turn").turn_id,
+            Some("turn-1".to_string())
+        );
+
+        let second = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":2082,"num_turns":1}"#,
+        );
+        assert!(kinds(&second).is_empty(), "{:?}", kinds(&second));
+        assert!(second.settles.is_none(), "the turn was already settled");
+
+        // And the next prompt clears it, so that turn's own result still lands.
+        folding.completion_reported = false;
+        driving.turn = Some(in_flight(None));
+        let next = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":7}"#,
+        );
+        assert_eq!(kinds(&next), vec!["turn.completed"]);
     }
 
     /// A `result` that arrives with no turn in flight still ends the session's

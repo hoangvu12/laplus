@@ -1,0 +1,109 @@
+{
+  "session_id": "c209f29c-f4e1-4721-99dd-2896066c45fc",
+  "model": "claude-opus-5[1m]",
+  "cwd": "/tmp/claude-subagent-67uvr5ba",
+  "permission_mode": "default",
+  "tool_count": 56,
+  "transcript": [
+    {
+      "role": "assistant",
+      "text": "I'll launch it in the background now.",
+      "from_deltas": true,
+      "content": [
+        {
+          "type": "text",
+          "text": "I'll launch it in the background now."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_017Ss3w6XvCKZE63sbzSE8CD",
+          "name": "Agent",
+          "input": {
+            "description": "Count to three slowly",
+            "prompt": "Count to 3 slowly. For each number 1, 2, and 3: state the number, then use the Bash tool to run a command that pauses briefly before the next number (e.g. `python3 -c \"import time; time.sleep(3)\"`). When done, return the text \"1 2 3 — done\".",
+            "run_in_background": true
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "text": "",
+      "from_deltas": false,
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_017Ss3w6XvCKZE63sbzSE8CD",
+          "content": [
+            {
+              "text": "Async agent launched successfully. (This tool result is internal metadata — never quote or paste any part of it, including the agentId below, into a user-facing reply.)\nagentId: ab80091070230889d (internal ID - do not mention to user. Use SendMessage with to: 'ab80091070230889d', summary: '<5-10 word recap>' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes. You know nothing about its results until that notification arrives — do not report, assume, or predict them; continue other work or respond to the user in the meantime.\nDo not duplicate this agent's work — avoid working with the same files or topics it is using.\noutput_file: /tmp/claude-1001/-tmp-claude-subagent-67uvr5ba/c209f29c-f4e1-4721-99dd-2896066c45fc/tasks/ab80091070230889d.output\nDo NOT Read or tail this file via the shell tool — it is the full subagent JSONL transcript and reading it will overflow your context. If the user asks for progress, say the agent is still running; you'll get a completion notification.",
+              "type": "text"
+            }
+          ],
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "The subagent is off counting to 3 in the background, and I'll let you know when it finishes.",
+      "from_deltas": true,
+      "content": [
+        {
+          "type": "text",
+          "text": "The subagent is off counting to 3 in the background, and I'll let you know when it finishes."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "The subagent finished — it counted 1, 2, 3 and returned \"1 2 3 — done\", though its `sleep` commands were blocked by permissions, so there were no actual pauses between the numbers.",
+      "from_deltas": true,
+      "content": [
+        {
+          "type": "text",
+          "text": "The subagent finished — it counted 1, 2, 3 and returned \"1 2 3 — done\", though its `sleep` commands were blocked by permissions, so there were no actual pauses between the numbers."
+        }
+      ]
+    }
+  ],
+  "live_text": "",
+  "streaming": false,
+  "permissions": [],
+  "last_result": {
+    "is_error": false,
+    "stop_reason": "end_turn",
+    "num_turns": 1,
+    "duration_ms": 2082,
+    "total_cost_usd": 0.24090249999999996,
+    "error": null,
+    "token_usage": {
+      "used_tokens": 24484,
+      "total_processed_tokens": null,
+      "max_tokens": 1000000,
+      "input_tokens": 24417,
+      "output_tokens": 67,
+      "compacts_automatically": null
+    }
+  },
+  "token_usage": {
+    "used_tokens": 24484,
+    "total_processed_tokens": null,
+    "max_tokens": 1000000,
+    "input_tokens": 24417,
+    "output_tokens": 67,
+    "compacts_automatically": null
+  },
+  "context_window": 1000000,
+  "total_processed_tokens": 24484,
+  "compacts_automatically": null,
+  "unknown_events": 0,
+  "parse_errors": 0
+}

@@ -457,6 +457,58 @@ const STALE: &str = "Unknown pending permission request";
 /// activities, so the flag this server publishes and the panel the client
 /// renders cannot disagree. Deriving rather than counting is also what makes it
 /// survive a restart, because the activities do.
+/// A subagent, as a row that lives as long as the subagent does.
+///
+/// **Its own row, not the `Agent` call's.** A background `Agent` call returns as
+/// soon as the subagent is launched — its result is literally "Async agent
+/// launched successfully" — so collapsing the two would mark the subagent
+/// finished at the moment it started. The collapse key is therefore
+/// `subagent:<task_id>` rather than the spawning call's id, which is also what
+/// lets several subagents run without folding into each other.
+///
+/// `tool.updated` while it runs for the reason the rest of this module uses it:
+/// the UI drops `tool.started` before deriving the work log, so a row announced
+/// that way would never appear.
+pub fn subagent(task: &crate::protocol::SubagentTask, turn_id: Option<String>) -> Activity {
+    let ended = task.status != "running";
+    let title = match task.subagent_type.as_deref() {
+        Some(kind) if !kind.trim().is_empty() => format!("Subagent {kind}"),
+        _ => "Subagent task".to_string(),
+    };
+    // The summary is the subagent's final report and only a notification carries
+    // one; while it runs, the description is what it is doing now.
+    let detail = task
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+        .or(task.description.as_deref())
+        .filter(|detail| !detail.trim().is_empty());
+    let mut payload = json!({
+        "itemType": "collab_agent_tool_call",
+        "status": task.status,
+        "title": title,
+        "data": {
+            "toolCallId": format!("subagent:{}", task.task_id),
+            "taskId": task.task_id,
+            // The call that spawned it, kept so a later ticket can tie the two
+            // rows together without re-deriving the link from ordering.
+            "spawnedBy": task.tool_use_id,
+            "subagentType": task.subagent_type,
+            "summary": task.summary,
+        },
+    });
+    if let Some(detail) = detail {
+        payload["detail"] = json!(truncate(detail, DETAIL));
+    }
+
+    Activity::tool(
+        if ended { "tool.completed" } else { "tool.updated" },
+        &title,
+        payload,
+        turn_id,
+    )
+}
+
 pub fn unanswered(activities: &[Activity]) -> Vec<&str> {
     let mut open: Vec<&str> = Vec::new();
     for activity in activities {
@@ -981,6 +1033,50 @@ mod tests {
             "file_change",
             "`create` reaches the file rules first, as it does upstream"
         );
+    }
+
+    fn task(status: &str, summary: Option<&str>) -> crate::protocol::SubagentTask {
+        crate::protocol::SubagentTask {
+            task_id: "t1".to_string(),
+            tool_use_id: Some("toolu_1".to_string()),
+            status: status.to_string(),
+            description: Some("Count to three".to_string()),
+            subagent_type: Some("general-purpose".to_string()),
+            summary: summary.map(str::to_string),
+        }
+    }
+
+    /// The collapse key is the subagent's, not the spawning call's. A background
+    /// `Agent` call answers "Async agent launched successfully" and completes
+    /// immediately, so sharing a key would tick the subagent off at the moment it
+    /// started — and two subagents would fold into one row.
+    #[test]
+    fn a_subagent_row_collapses_on_the_subagent_rather_than_the_call() {
+        let running = subagent(&task("running", None), None);
+
+        assert_eq!(running.kind, "tool.updated", "a started row would be dropped");
+        assert_eq!(running.payload["status"], "running");
+        assert_eq!(running.payload["data"]["toolCallId"], "subagent:t1");
+        assert_ne!(running.payload["data"]["toolCallId"], "toolu_1");
+        assert_eq!(running.payload["data"]["spawnedBy"], "toolu_1");
+        // While it runs, the row says what it is doing.
+        assert_eq!(running.payload["detail"], "Count to three");
+    }
+
+    #[test]
+    fn a_finished_subagent_row_carries_its_report() {
+        let done = subagent(&task("completed", Some("1 2 3 — done")), None);
+
+        assert_eq!(done.kind, "tool.completed");
+        assert_eq!(done.payload["status"], "completed");
+        // The same key, so this replaces the running row rather than adding one.
+        assert_eq!(done.payload["data"]["toolCallId"], "subagent:t1");
+        // The subagent's own answer wins over the description it started with.
+        assert_eq!(done.payload["detail"], "1 2 3 — done");
+
+        let failed = subagent(&task("failed", None), None);
+        assert_eq!(failed.kind, "tool.completed");
+        assert_eq!(failed.payload["status"], "failed");
     }
 
     /// The row has to name the tool and what it was given. For a command that is

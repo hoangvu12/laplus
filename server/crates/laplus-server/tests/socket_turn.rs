@@ -1048,6 +1048,120 @@ async fn a_turn_for_a_project_this_server_does_not_know_is_refused_by_name() {
     server.stop().await;
 }
 
+/// Driven against `fixtures/claude-cli/22-background-subagent.ndjson`, a
+/// recording of a background subagent — the case where a developer could see
+/// nothing at all, and where what they *did* see was the subagent's words
+/// attributed to the agent they were talking to.
+///
+/// Three things at once, because they are one turn: the subagent gets a row that
+/// runs and then finishes, its own messages stay out of the transcript, and the
+/// two trailing `result` lines end the turn once.
+#[tokio::test]
+async fn a_background_subagent_gets_its_own_row_and_stays_out_of_the_transcript() {
+    let agent = ScriptedAgent::replaying("22-background-subagent");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count to three in the background"),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let activities: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .collect();
+
+    // The subagent's row, keyed on the subagent rather than on the `Agent` call
+    // that launched it — that call completes immediately, and sharing its key
+    // would tick the subagent off at the moment it started.
+    let subagent_rows: Vec<&Value> = activities
+        .iter()
+        .copied()
+        .filter(|activity| {
+            activity["payload"]["itemType"] == "collab_agent_tool_call"
+                && activity["payload"]["data"]["taskId"].is_string()
+        })
+        .collect();
+    assert!(
+        !subagent_rows.is_empty(),
+        "a running subagent was invisible: {activities:#?}"
+    );
+    let statuses: Vec<&str> = subagent_rows
+        .iter()
+        .filter_map(|row| row["payload"]["status"].as_str())
+        .collect();
+    assert!(
+        statuses.contains(&"running"),
+        "the subagent never showed as working: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.last(),
+        Some(&"completed"),
+        "the subagent never finished: {statuses:?}"
+    );
+    // Its final report reached the row, which is the thing the main agent then
+    // answered from. `detail` is the bounded preview the log renders and `data`
+    // is the record, so the whole answer is looked for in the record — this
+    // subagent's report is long enough that its last line does not survive the
+    // preview's truncation.
+    let finished = subagent_rows.last().expect("a terminal subagent row");
+    assert!(
+        finished["payload"]["data"]["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("1 2 3 — done")),
+        "the subagent's answer is missing: {finished:#?}"
+    );
+    assert!(
+        finished["payload"]["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.trim().is_empty()),
+        "the row previews nothing: {finished:#?}"
+    );
+
+    // The turn ended once, though the recording carries two `result` lines.
+    let endings = activities
+        .iter()
+        .filter(|activity| activity["kind"] == "turn.completed")
+        .count();
+    assert_eq!(endings, 1, "the turn ended {endings} times");
+
+    // And the conversation is the developer's, not the subagent's. The subagent
+    // counted "1", "2", "3" and reported on being refused permission; none of
+    // that is something anyone in this conversation said.
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await;
+    let said: Vec<String> = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["text"].as_str())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        said.iter().any(|text| text.contains("in the background")),
+        "the agent's own answer is missing: {said:#?}"
+    );
+    assert!(
+        !said.iter().any(|text| text.trim() == "1"),
+        "the subagent's counting reached the transcript: {said:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
 /// Nothing here may reach the developer's own agent, and the way one could is a
 /// test that forgot to configure a stand-in: the default `binaryPath` is a bare
 /// name, which resolves on `PATH` to whatever is installed.
