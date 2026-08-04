@@ -691,6 +691,13 @@ async fn drive<D: Driver>(
                 // itself, rather than the badge flipping back with nothing
                 // beside it saying why.
                 let reverts = decided.reverts.take();
+                // Before the changes, so the assistant text that opened this turn
+                // arrives naming a turn the client is already drawing as running.
+                // The other order shows the words first and the working indicator
+                // second, which reads as a reply that arrived after the reply.
+                if let Some(opened) = decided.opens.take() {
+                    running(&threads, &start, &opened);
+                }
                 spend(&threads, &start, decided);
                 if let Some(refused) = reverts {
                     refused.revert(&mut start);
@@ -1815,6 +1822,23 @@ pub(crate) struct Decided {
     /// A push the agent refused, and what this session's capture of itself has to
     /// go back to.
     pub(crate) reverts: Option<Pushed>,
+    /// The driver opened a turn nobody asked for, and this is its id.
+    ///
+    /// A turn normally begins because the developer pressed send, which is why the
+    /// loop above is the only thing that mints one. A background subagent breaks
+    /// that: it finishes after the turn that spawned it has settled, the CLI tells
+    /// the agent, and the agent answers — into a session with no turn in flight.
+    /// Every one of those words was being dropped on the floor
+    /// ([`crate::turn::decide`]'s `Folded::Streamed` arm returned early), so the
+    /// developer's only way to learn what a subagent found was to ask again.
+    ///
+    /// It travels beside `changes` rather than in them for [`reverts`]'s reason:
+    /// the session event that announces a turn needs a [`Start`] the driver does
+    /// not hold. The loop publishes it *before* spending the changes, so the
+    /// message that occasioned it lands in a turn the client already knows about.
+    ///
+    /// [`reverts`]: Decided::reverts
+    pub(crate) opens: Option<String>,
 }
 
 /// The end of a turn, as whatever ended it reports it.

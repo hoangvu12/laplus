@@ -532,6 +532,47 @@ impl Ending {
 /// turn in flight, and the five [`Activity`] constructors it calls read a clock
 /// and mint identifiers exactly as ADR-0025 left them. What changed is that it
 /// returns its results instead of applying them.
+/// A turn for something the agent said when nothing had asked it to speak.
+///
+/// **The background-subagent case, and it is the developer's whole experience of
+/// one.** A subagent launched with `run_in_background` outlives the turn that
+/// spawned it: that turn settles, the session goes idle, and some seconds later
+/// the CLI hands the agent a `task_notification` and the agent replies with what
+/// the subagent found. Until this existed, both arms that publish assistant text
+/// returned early on a session with no turn in flight, so that reply — the entire
+/// answer — was discarded. The developer saw the work log tick along and then
+/// nothing, and the only way to recover the answer was to ask a question that
+/// opened a turn by hand.
+///
+/// Opening one is a smaller change than it sounds: the turn is real by every test
+/// the rest of this file applies to a turn. The agent is working, the work has an
+/// id, its text belongs to that id, and the trailing `result` ends it through the
+/// ordinary [`Folded::Completed`] arm. What is unusual is only who started it, and
+/// the client needs no new vocabulary for that — `thread.session-set` naming an
+/// active turn is enough for its reducer to draw one.
+///
+/// Two facts have to move together, which is why this is a function rather than a
+/// literal in two arms:
+///
+/// - the id has to reach the loop, because announcing a turn needs a [`Start`]
+///   this module does not have. It travels in [`Decided::opens`].
+/// - `completion_reported` has to come off, or the duplicate-`result` guard
+///   swallows the very `result` that would end this turn — the previous turn's
+///   ending was reported, and without this the flag still says so. That would
+///   leave the session `running` on a turn nothing can settle, which is the
+///   spinner-forever failure and worse than the one being fixed.
+fn unprompted(folding: &mut SessionState, decided: &mut Decided) -> InFlight {
+    let turn_id = crate::threads::fresh_turn_id();
+    folding.completion_reported = false;
+    decided.opens = Some(turn_id.clone());
+    InFlight {
+        turn_id,
+        assistant_message_id: None,
+        tools: std::collections::HashMap::new(),
+        stopped: None,
+    }
+}
+
 fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Decided {
     let folded = folding.fold_line(line);
     let mut decided = Decided::default();
@@ -709,8 +750,11 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
         }
 
         Folded::Streamed(text) => {
-            let Some(active) = turn.as_mut() else {
-                return decided;
+            let active = match turn {
+                Some(active) => active,
+                // Nobody asked for this, so a turn is opened to hold it rather
+                // than the words being dropped — see [`unprompted`].
+                None => turn.insert(unprompted(folding, &mut decided)),
             };
             let message_id = active
                 .assistant_message_id
@@ -724,8 +768,13 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
         }
 
         Folded::Turn { index } => {
-            let Some(active) = turn.as_mut() else {
-                return decided;
+            let active = match turn {
+                Some(active) => active,
+                // [`Folded::Streamed`]'s reason, and reached when a message
+                // buffers without having streamed — the deltas are a flag this
+                // server passes rather than something the CLI owes it, so the
+                // between-turns message this catches is the same message.
+                None => turn.insert(unprompted(folding, &mut decided)),
             };
             let completed = &folding.transcript[index];
 
@@ -1789,23 +1838,112 @@ mod tests {
         assert!(driving.finished.is_none(), "no turn, no tree to record");
     }
 
-    /// Every line that reaches a turn asks for one first, and a line that arrives
-    /// with none says nothing rather than inventing a turn to attribute it to.
-    /// Three arms return early for this and each of them has to carry the
-    /// context-window row out with it — see below.
+    /// An acknowledgement is the one line left that needs a turn and says nothing
+    /// without one, and it is the right answer for that line: it answers an
+    /// interrupt *this server* sent, so one arriving with no turn behind it is
+    /// about a turn that has already ended.
+    ///
+    /// **Assistant text used to be in this list.** Both arms that publish it gave
+    /// up the same way, which is what made a background subagent's report vanish —
+    /// see [`unprompted`] and the test below.
     #[test]
-    fn a_line_that_needs_a_turn_and_has_none_publishes_nothing() {
+    fn an_acknowledgement_with_no_turn_behind_it_publishes_nothing() {
         let mut folding = SessionState::new();
         let mut driving = driver(None);
 
-        for line in [
-            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#,
+        let decided = decide(
+            &mut folding,
+            &mut driving,
             r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
-        ] {
-            let decided = decide(&mut folding, &mut driving, line);
-            assert!(decided.changes.is_empty(), "{line}: {:?}", kinds(&decided));
-            assert!(decided.settles.is_none(), "{line}");
+        );
+        assert!(decided.changes.is_empty(), "{:?}", kinds(&decided));
+        assert!(decided.settles.is_none());
+        assert!(decided.opens.is_none(), "nothing was said, so nothing began");
+    }
+
+    /// A background subagent outlives the turn that spawned it: that turn settles,
+    /// and some seconds later the CLI hands the agent a `task_notification` and the
+    /// agent answers into a session with no turn in flight. That answer was being
+    /// dropped, so the only way to learn what a subagent found was to ask again —
+    /// which opened a turn by hand and let the CLI say it a second time.
+    ///
+    /// The turn it opens has to end, too. The assertion on the trailing `result`
+    /// is the one that matters most here: the duplicate-`result` guard reads a
+    /// flag set by the *previous* turn's ending, and a turn opened without
+    /// clearing it would be a session left running with nothing able to settle it.
+    #[test]
+    fn a_report_arriving_after_the_turn_settled_opens_one_to_land_in() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(Some(in_flight(None)));
+
+        let ended = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":5674,"num_turns":2}"#,
+        );
+        assert_eq!(kinds(&ended), vec!["turn.completed"]);
+        assert!(driving.turn.is_none(), "the turn that spawned it is over");
+
+        let spoken = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The subagent finished"}}}"#,
+        );
+        assert_eq!(kinds(&spoken), vec!["<delta>"]);
+        let opened = spoken.opens.clone().expect("the text opened a turn");
+        assert_ne!(
+            opened, "turn-1",
+            "a turn of its own, not the settled one reopened"
+        );
+        assert_eq!(
+            driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+            Some(opened.clone()),
+            "and the driver is now working on it"
+        );
+        match spoken.changes.as_slice() {
+            [Change::AssistantDelta { turn_id, text, .. }] => {
+                assert_eq!(turn_id, &opened, "the words belong to the turn they opened");
+                assert_eq!(text, "The subagent finished");
+            }
+            other => panic!("expected one delta, got {other:?}"),
+        }
+
+        let settled = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"result","subtype":"success","duration_ms":28963,"num_turns":1}"#,
+        );
+        assert_eq!(kinds(&settled), vec!["turn.completed"]);
+        assert_eq!(
+            settled
+                .settles
+                .expect("the opened turn ends like any other")
+                .turn_id,
+            Some(opened)
+        );
+    }
+
+    /// The buffered half of the same story, reached when a message arrives without
+    /// having streamed — the partial-message flag is one this server passes rather
+    /// than something the CLI owes it.
+    #[test]
+    fn a_buffered_message_after_the_turn_settled_opens_one_too() {
+        let mut folding = SessionState::new();
+        let mut driving = driver(None);
+
+        let decided = decide(
+            &mut folding,
+            &mut driving,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the subagent found three"}]}}"#,
+        );
+
+        let opened = decided.opens.clone().expect("the message opened a turn");
+        match decided.changes.as_slice() {
+            [Change::AssistantMessage { turn_id, text, .. }] => {
+                assert_eq!(turn_id, &opened);
+                assert_eq!(text, "the subagent found three");
+            }
+            other => panic!("expected one message, got {other:?}"),
         }
     }
 
@@ -1827,8 +1965,9 @@ mod tests {
         );
         assert_eq!(kinds(&decided), vec!["context-window.updated"]);
 
-        // And on a line that does give up early: a delta with no turn behind it,
-        // arriving after a reading that has moved.
+        // And on a line that does give up early: an acknowledgement with no turn
+        // behind it, arriving after a reading that has moved. (A delta stood here
+        // until assistant text stopped giving up — see [`unprompted`].)
         let mut driving = driver(None);
         let mut folding = SessionState::new();
         folding.token_usage = Some(TokenUsage {
@@ -1842,7 +1981,7 @@ mod tests {
         let decided = decide(
             &mut folding,
             &mut driving,
-            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}"#,
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"interrupt-1","error":"No active turn"}}"#,
         );
         assert_eq!(
             kinds(&decided),

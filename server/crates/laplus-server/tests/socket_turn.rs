@@ -1162,6 +1162,128 @@ async fn a_background_subagent_gets_its_own_row_and_stays_out_of_the_transcript(
     server.stop().await;
 }
 
+/// The case `22-background-subagent` does not contain, and the one a developer
+/// actually hit.
+///
+/// In that recording the subagent finishes before any `result`, so the agent's
+/// report lands in the turn that is still running. When the subagent takes longer
+/// than the reply — which is the *point* of `run_in_background` — the order
+/// inverts: the turn settles, and the report arrives at a session with nothing in
+/// flight. Every word of it used to be discarded, so the developer watched the
+/// work log tick along and was then told nothing, and asking again was the only
+/// way to get the answer out.
+///
+/// Written rather than recorded because the timing is the whole scenario and a
+/// capture cannot be made to have it on demand. Each line is a shape taken from
+/// the recording: the `task_updated`/`task_notification` pair is lines 49 and 50
+/// of it, bare one first.
+#[tokio::test]
+async fn a_subagent_that_finishes_after_the_turn_still_gets_its_report_to_the_developer() {
+    let agent = ScriptedAgent::emitting(&[
+        r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count the variants","subagent_type":"Explore"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Launched it in the background."}]}}"#,
+        // The turn ends here, with the subagent still working.
+        r#"{"type":"result","subtype":"success","duration_ms":5600,"num_turns":1}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"eleven variants"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The subagent found eleven variants."}]}}"#,
+        r#"{"type":"result","subtype":"success","duration_ms":66000,"num_turns":1}"#,
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count the variants in the background"),
+        )
+        .await
+        .expect_success();
+
+    // Read past the *first* settle, which is where a reader of one turn stops.
+    // The second is the turn the report opened, and its arrival is half of what
+    // this test is about: a turn that opened and never settled would leave the
+    // composer working forever, which is a worse bug than the one being fixed.
+    let settles = std::cell::Cell::new(0usize);
+    let events = client
+        .values_until(&subscription, |item| {
+            let settled = |status: Option<&str>| {
+                matches!(status, Some("ready") | Some("error") | Some("stopped"))
+            };
+            let done = match item["kind"].as_str() {
+                Some("event") => {
+                    item["event"]["type"] == "thread.session-set"
+                        && settled(item["event"]["payload"]["session"]["status"].as_str())
+                }
+                Some("snapshot") => {
+                    settled(item["snapshot"]["thread"]["session"]["status"].as_str())
+                }
+                _ => false,
+            };
+            if done {
+                settles.set(settles.get() + 1);
+            }
+            settles.get() >= 2
+        })
+        .await;
+
+    let activities: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .collect();
+    let endings = activities
+        .iter()
+        .filter(|activity| activity["kind"] == "turn.completed")
+        .count();
+    assert_eq!(
+        endings, 2,
+        "two turns ran — the one the developer asked for and the one the report \
+         opened: {activities:#?}"
+    );
+
+    // The thing the developer was owed and was not given.
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await;
+    let said: Vec<String> = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["text"].as_str())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        said.iter()
+            .any(|text| text.contains("The subagent found eleven variants")),
+        "the report never reached the conversation: {said:#?}"
+    );
+
+    // And it is attributed to a turn of its own rather than to the settled one,
+    // so the transcript reads in the order it happened.
+    let turns: Vec<&str> = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| {
+            message["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("eleven variants") || text.contains("Launched it"))
+        })
+        .filter_map(|message| message["turnId"].as_str())
+        .collect();
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    assert_ne!(turns[0], turns[1], "both replies landed in the same turn");
+
+    client.close().await;
+    server.stop().await;
+}
+
 /// Nothing here may reach the developer's own agent, and the way one could is a
 /// test that forgot to configure a stand-in: the default `binaryPath` is a bare
 /// name, which resolves on `PATH` to whatever is installed.

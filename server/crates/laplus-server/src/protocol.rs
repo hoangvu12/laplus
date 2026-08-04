@@ -535,6 +535,11 @@ struct Subagent {
     /// From `task_started`/`task_progress`, which are the only events carrying it.
     kind: Option<String>,
     finished: bool,
+    /// An ending carrying the subagent's report has been published.
+    ///
+    /// Separate from `finished` because the two arrive on different events and in
+    /// that order — see [`SessionState::subagent_moved`].
+    reported: bool,
 }
 
 /// What a subagent's row is told to say.
@@ -1389,26 +1394,43 @@ impl SessionState {
         Self::default()
     }
 
-    /// One subagent moved: remember what it is, and report its ending once.
+    /// One subagent moved: remember what it is, and never let its row lose what it
+    /// already said.
     ///
     /// Everything about a subagent goes through here so that the row a developer
     /// watches stays the same row. A terminal event carries no `subagent_type`, so
     /// the name is taken from what an earlier event said — without which a row
-    /// reading "Subagent claude" is renamed "Subagent task" by finishing. And an
-    /// ending arrives twice, as `task_updated` and again as `task_notification`;
-    /// the second is dropped, except that a notification carries the `summary` the
-    /// update lacks, so a *later* ending with a report still gets through.
+    /// reading "Subagent Explore" is renamed "Subagent task" by finishing.
+    ///
+    /// **An ending arrives twice, and the bare one comes first.** Lines 49 and 50
+    /// of `fixtures/claude-cli/22-background-subagent.ndjson` are the evidence: a
+    /// `task_updated` whose patch is `{"status": "completed"}` and nothing else,
+    /// then a `task_notification` a millisecond later carrying the `tool_use_id`
+    /// and the report. So the rule cannot be "drop the second" — that drops the
+    /// only event that knows what the subagent found. It is **drop anything that
+    /// would tell the row less than it has already been told**:
+    ///
+    /// - once a report has been published, no later ending can improve on it;
+    /// - a repeat ending with no report adds nothing either.
+    ///
+    /// Both endings are published in the order above, which is one redundant row
+    /// per subagent — they share a collapse key, so the client folds them into one
+    /// and the report lands last. Withholding the bare one instead would be
+    /// tidier and is not worth it: it assumes the notification always follows,
+    /// and a subagent whose notification never came would then have a row that
+    /// reads as still running forever.
     fn subagent_moved(&mut self, task: SubagentTask) -> Folded {
         let record = self.subagents.entry(task.task_id.clone()).or_default();
         if let Some(kind) = &task.subagent_type {
             record.kind = Some(kind.clone());
         }
         let ending = task.status != "running";
-        if ending && record.finished && task.summary.is_none() {
+        if ending && (record.reported || (record.finished && task.summary.is_none())) {
             return Folded::Nothing;
         }
         if ending {
             record.finished = true;
+            record.reported |= task.summary.is_some();
         }
         Folded::SubagentProgress(SubagentTask {
             subagent_type: task.subagent_type.or_else(|| record.kind.clone()),
@@ -1953,6 +1975,36 @@ mod tests {
             );
         }
         assert_eq!(progress[2].summary.as_deref(), Some("done"));
+    }
+
+    /// The rows share a collapse key, so the *last* ending is the one a developer
+    /// is left looking at. The recording's order puts the report last and the
+    /// bare `task_updated` first, which means the ordering is what makes the row
+    /// readable — and nothing about the protocol promises it.
+    ///
+    /// So the rule is not about order: an ending that would tell the row less than
+    /// it has already been told is dropped. Reverse the two events and the report
+    /// still stands, where a guard that only counted endings would have blanked it.
+    #[test]
+    fn an_ending_never_replaces_a_report_with_silence() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","subagent_type":"Explore","description":"Read"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"eleven variants"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        ]);
+
+        assert!(
+            matches!(outcomes[2], Folded::Nothing),
+            "the bare ending would have wiped the report: {:?}",
+            outcomes[2]
+        );
+        match &outcomes[1] {
+            Folded::SubagentProgress(task) => {
+                assert_eq!(task.summary.as_deref(), Some("eleven variants"));
+                assert_eq!(task.subagent_type.as_deref(), Some("Explore"));
+            }
+            other => panic!("expected the report, got {other:?}"),
+        }
     }
 
     #[test]
