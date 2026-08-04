@@ -529,6 +529,14 @@ fn terminal_task_status(status: &str) -> Option<&'static str> {
     }
 }
 
+/// What this reducer remembers about one subagent between its events.
+#[derive(Debug, Default)]
+struct Subagent {
+    /// From `task_started`/`task_progress`, which are the only events carrying it.
+    kind: Option<String>,
+    finished: bool,
+}
+
 /// What a subagent's row is told to say.
 ///
 /// One of these per `task_*` event, carrying the identity the row collapses on
@@ -1158,6 +1166,18 @@ pub struct SessionState {
     #[serde(skip)]
     pub(crate) completion_reported: bool,
 
+    /// What each subagent is, by `task_id`, and whether it has been reported
+    /// finished.
+    ///
+    /// Both halves were found by driving a real background subagent rather than
+    /// by reading. Only `task_started` and `task_progress` carry
+    /// `subagent_type`, so a terminal event alone would rename a row that had
+    /// been reading "Subagent claude" to "Subagent task" at the moment it
+    /// finished. And a subagent ending emits `task_updated` *and*
+    /// `task_notification`, so its ending was published twice, 2ms apart.
+    #[serde(skip)]
+    subagents: BTreeMap<String, Subagent>,
+
     /// Completed turns, in order.
     pub transcript: Vec<Turn>,
     /// Text accumulated from `content_block_delta` for the in-flight turn.
@@ -1369,6 +1389,33 @@ impl SessionState {
         Self::default()
     }
 
+    /// One subagent moved: remember what it is, and report its ending once.
+    ///
+    /// Everything about a subagent goes through here so that the row a developer
+    /// watches stays the same row. A terminal event carries no `subagent_type`, so
+    /// the name is taken from what an earlier event said — without which a row
+    /// reading "Subagent claude" is renamed "Subagent task" by finishing. And an
+    /// ending arrives twice, as `task_updated` and again as `task_notification`;
+    /// the second is dropped, except that a notification carries the `summary` the
+    /// update lacks, so a *later* ending with a report still gets through.
+    fn subagent_moved(&mut self, task: SubagentTask) -> Folded {
+        let record = self.subagents.entry(task.task_id.clone()).or_default();
+        if let Some(kind) = &task.subagent_type {
+            record.kind = Some(kind.clone());
+        }
+        let ending = task.status != "running";
+        if ending && record.finished && task.summary.is_none() {
+            return Folded::Nothing;
+        }
+        if ending {
+            record.finished = true;
+        }
+        Folded::SubagentProgress(SubagentTask {
+            subagent_type: task.subagent_type.or_else(|| record.kind.clone()),
+            ..task
+        })
+    }
+
     /// Visible to the driver so it can count a line it recognised but chose not
     /// to act on — see the second trailing `result` in [`crate::turn`].
     pub(crate) fn bump(&mut self, key: &str) {
@@ -1445,11 +1492,11 @@ impl SessionState {
             }
             Event::System(SystemEvent::TaskStarted(task)) => {
                 self.bump("system/task_started");
-                Folded::SubagentProgress(task.progress("running"))
+                self.subagent_moved(task.progress("running"))
             }
             Event::System(SystemEvent::TaskProgress(task)) => {
                 self.bump("system/task_progress");
-                Folded::SubagentProgress(task.progress("running"))
+                self.subagent_moved(task.progress("running"))
             }
             // A status in a patch and nothing else, so a subagent that ended
             // without a notification still stops reading as running. Anything
@@ -1458,7 +1505,7 @@ impl SessionState {
             Event::System(SystemEvent::TaskUpdated(update)) => {
                 self.bump("system/task_updated");
                 match update.patch.status.as_deref().map(terminal_task_status) {
-                    Some(Some(status)) => Folded::SubagentProgress(SubagentTask {
+                    Some(Some(status)) => self.subagent_moved(SubagentTask {
                         task_id: update.task_id.clone(),
                         tool_use_id: None,
                         status: status.to_string(),
@@ -1476,7 +1523,7 @@ impl SessionState {
                     .as_deref()
                     .and_then(terminal_task_status)
                     .unwrap_or("completed");
-                Folded::SubagentProgress(task.progress(status))
+                self.subagent_moved(task.progress(status))
             }
             Event::System(SystemEvent::Other) => {
                 self.bump("system/other");
@@ -1868,6 +1915,44 @@ mod tests {
         // Counted rather than passed over, so the day this shape changes there is
         // a number saying how often it arrived.
         assert_eq!((state.unknown_events, state.parse_errors), (0, 0));
+    }
+
+    /// Both found by driving a real background subagent through the window, and
+    /// neither visible in the fixture: a subagent ends *twice* (`task_updated`
+    /// then `task_notification`, 2ms apart in the recording), and only the
+    /// non-terminal events carry `subagent_type`, so the row a developer had been
+    /// watching as "Subagent claude" was renamed by finishing.
+    #[test]
+    fn a_subagent_keeps_its_name_and_ends_once() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","subagent_type":"claude","description":"Sleep"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        ]);
+
+        let progress: Vec<&SubagentTask> = outcomes
+            .iter()
+            .filter_map(|folded| match folded {
+                Folded::SubagentProgress(task) => Some(task),
+                _ => None,
+            })
+            .collect();
+
+        // Started, ended, and the notification that carries the report — but not
+        // the fourth, which is an ending already published with nothing new.
+        assert_eq!(progress.len(), 3, "{outcomes:?}");
+        assert!(matches!(outcomes[3], Folded::Nothing), "{:?}", outcomes[3]);
+
+        // The name survives every one of them, though only the first carried it.
+        for task in &progress {
+            assert_eq!(
+                task.subagent_type.as_deref(),
+                Some("claude"),
+                "the row was renamed by finishing: {task:?}"
+            );
+        }
+        assert_eq!(progress[2].summary.as_deref(), Some("done"));
     }
 
     #[test]
