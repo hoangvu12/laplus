@@ -47,7 +47,7 @@ mod harness;
 
 use harness::agent::{ScriptedAgent, AWAIT_QUESTION, PAUSE, WORKING_DIRECTORY_MARKER};
 use harness::conversation::{
-    activity, assistant_sends, create_project, follow_up, kinds, start_turn,
+    activity, assistant_sends, create_project, follow_up, kinds, last_session, start_turn,
 };
 use harness::workspace::Workspace;
 use harness::TestServer;
@@ -423,6 +423,171 @@ async fn the_reply_is_readable_before_the_turn_has_finished() {
     assert_eq!(
         assistant_sends(&rest).last(),
         Some(&("thinking out loud, and done".to_string(), false))
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// A prompt sent while the agent is working goes in the queue **quietly**: the
+/// conversation is still running the turn the developer is watching, and nothing
+/// about accepting the next one is allowed to say otherwise.
+///
+/// The bug this pins was one event. The fresh-turn path published
+/// `Session { status: Starting, activeTurnId: <the queued turn> }`
+/// unconditionally, and the window then showed three wrong things at once from
+/// that single publish:
+///
+/// - **"connecting"**, because `starting` is what `derivePhase` maps to it
+///   (`apps/web/src/session-logic.ts`) — a conversation mid-turn reporting that
+///   it has no agent yet.
+/// - the running turn losing its working row, because `MessagesTimeline` takes
+///   `runningTurnId` from `status === "running" ? activeTurnId : null`
+///   (`apps/web/src/components/ChatView.tsx`).
+/// - the running turn **settling mid-turn** at its next buffered message,
+///   because the client's guard against exactly that is
+///   `status === "running" && activeTurnId === turnId`
+///   (`packages/client-runtime/src/state/threadReducer.ts`), and this event
+///   falsified both halves of it.
+///
+/// Upstream guards the same publish the same way —
+/// `ProviderCommandReactor.ts`'s
+/// `if (options?.pendingTurnStart === true && thread.session?.status !== "running")`.
+/// `.scratch/prompt-queueing/upstream-research.md` has the reading.
+///
+/// Driven against an agent that stops mid-turn, because that is the only way the
+/// prompt can arrive while the first turn is genuinely in flight — the same
+/// device `the_reply_is_readable_before_the_turn_has_finished` above uses, and
+/// for the same reason.
+#[tokio::test]
+async fn a_prompt_sent_while_the_agent_is_working_is_queued_without_leaving_running() {
+    let agent = ScriptedAgent::per_turn(&[
+        vec![
+            r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5","cwd":".","permissionMode":"bypassPermissions","tools":[]}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"working on it"}}}"#,
+            PAUSE,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on it, and done"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","duration_ms":1100,"total_cost_usd":0.01}"#,
+        ],
+        vec![
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"and the second thing too"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","duration_ms":900,"total_cost_usd":0.01}"#,
+        ],
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "the first thing"),
+        )
+        .await
+        .expect_success();
+
+    // Far enough in that the agent has streamed something and is now sitting in
+    // its pause. Everything the session has said so far — the `starting` this
+    // turn is owed and the `running` that followed it — is consumed here, so
+    // what the next read holds is only what the *follow-up* caused.
+    let opening = client.events_until_streaming(&subscription).await;
+    let first_turn = last_session(&opening, "the first turn")["payload"]["session"]
+        ["activeTurnId"]
+        .as_str()
+        .expect("the first turn was named")
+        .to_string();
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("thread-1", "message-2", "the second thing"),
+        )
+        .await
+        .expect_success();
+
+    // The rest of the *first* turn, up to and including the buffered message it
+    // ends with. That message is the assertion's whole point: it is the event
+    // the client's `turnStillRunning` guard is consulted on, so the window
+    // between the queued prompt being accepted and this arriving is exactly
+    // where a wrong session event does its damage.
+    let queued = client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.message-sent"
+                && item["event"]["payload"]["role"] == "assistant"
+                && item["event"]["payload"]["streaming"] == json!(false)
+        })
+        .await;
+    let said: Vec<(&str, Option<&str>)> = queued
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.session-set")
+        .map(|event| {
+            (
+                event["payload"]["session"]["status"].as_str().unwrap_or(""),
+                event["payload"]["session"]["activeTurnId"].as_str(),
+            )
+        })
+        .collect();
+    assert!(
+        !said.iter().any(|(status, _)| *status == "starting"),
+        "the queued prompt took the conversation out of `running`, so the pane \
+         said `connecting` while the agent was working: {said:?}"
+    );
+    assert!(
+        said.iter()
+            .all(|(_, turn)| *turn == Some(first_turn.as_str()) || turn.is_none()),
+        "a session event named the queued turn while the first one was still \
+         running, which is what settles the running turn mid-turn: {said:?}"
+    );
+    assert_eq!(
+        assistant_sends(&queued).last(),
+        Some(&("working on it, and done".to_string(), false)),
+        "the first turn's reply is not what this window ended on: {said:?}"
+    );
+
+    // The developer's second message is in the transcript straight away — it is
+    // *queued*, not refused — and it carries a turn of its own, because laplus
+    // queues where OpenCode steers.
+    let queued_message = queued
+        .iter()
+        .map(|item| &item["event"])
+        .find(|event| {
+            event["type"] == "thread.message-sent"
+                && event["payload"]["messageId"] == json!("message-2")
+        })
+        .expect("the queued prompt reached the transcript");
+    assert_ne!(
+        queued_message["payload"]["turnId"].as_str(),
+        Some(first_turn.as_str()),
+        "the queued prompt joined the running turn, which is steering rather \
+         than queueing"
+    );
+
+    // And it then runs, on the same agent, as its own turn.
+    let second = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        assistant_sends(&second).last(),
+        Some(&("and the second thing too".to_string(), false))
+    );
+    assert_eq!(agent.starts(), 1, "the queued turn reached a second process");
+
+    let snapshot = server.connect().await.into_thread_snapshot("thread-1").await;
+    let transcript: Vec<&str> = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| message["text"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        transcript,
+        vec![
+            "the first thing",
+            "working on it, and done",
+            "the second thing",
+            "and the second thing too",
+        ]
     );
 
     client.close().await;

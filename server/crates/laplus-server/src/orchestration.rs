@@ -1452,7 +1452,7 @@ impl Shell {
                 },
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;
-        let (_, thread) = self
+        let (requested, thread) = self
             .inner
             .threads
             .apply_and_read(
@@ -1477,20 +1477,59 @@ impl Shell {
             prepared,
         );
 
-        let sequence = self
-            .inner
-            .threads
-            .apply(
-                &start.thread_id,
-                Change::Session(Session {
-                    status: SessionStatus::Starting,
-                    runtime_mode: starting.runtime_mode.clone(),
-                    active_turn_id: Some(turn_id.clone()),
-                    last_error: None,
-                    updated_at: now_iso(),
-                }),
-            )
-            .ok_or_else(|| self.not_open(&start.thread_id))?;
+        // **Only when nothing is already working.** This publish exists for the
+        // *first* turn — it is what lets the composer answer before the baseline
+        // `git add -A` below, and the reasoning for that is at
+        // `session::run`'s `running(…)` call. A turn queued behind a running one
+        // needs none of it, and publishing it anyway breaks the pane three ways,
+        // all from this one event:
+        //
+        // - `Starting` is drawn as **"connecting"** (`session-logic.ts`,
+        //   `derivePhase`), so a conversation that is working says it is not.
+        // - `activeTurnId` names the *queued* turn, so `MessagesTimeline`'s
+        //   `runningTurnId` goes null and the running turn loses the row that
+        //   says it is running (`ChatView.tsx`).
+        // - The client's `turnStillRunning` guard reads
+        //   `status === "running" && activeTurnId === turnId`
+        //   (`threadReducer.ts`) — both false now, so the next buffered
+        //   assistant message **settles the running turn mid-turn**. That is
+        //   precisely the settle the `running(…)` comment says the reducer
+        //   exists to avoid, arriving from the other side.
+        //
+        // Upstream guards the same publish the same way, and additionally never
+        // names a turn on it at all: `ProviderCommandReactor.ts`'s
+        // `if (options?.pendingTurnStart === true && thread.session?.status !== "running")`,
+        // with `activeTurnId: null`. `starting` upstream means the *process* is
+        // coming up — it is produced from a provider session that is
+        // `connecting` — which is what the client's word for it says.
+        // `.scratch/prompt-queueing/upstream-research.md` has the citations.
+        //
+        // [`SessionStatus::is_working`] rather than `== Running`, because two
+        // prompts sent in quick succession leave the second one arriving while
+        // the session is still `Starting` for the first, and a turn queued
+        // behind a turn that has not begun is no more this event's business
+        // than one queued behind a turn that has.
+        let working = thread
+            .session
+            .as_ref()
+            .is_some_and(|session| session.status.is_working() && session.active_turn_id.is_some());
+        let sequence = if working {
+            requested
+        } else {
+            self.inner
+                .threads
+                .apply(
+                    &start.thread_id,
+                    Change::Session(Session {
+                        status: SessionStatus::Starting,
+                        runtime_mode: starting.runtime_mode.clone(),
+                        active_turn_id: Some(turn_id.clone()),
+                        last_error: None,
+                        updated_at: now_iso(),
+                    }),
+                )
+                .ok_or_else(|| self.not_open(&start.thread_id))?
+        };
 
         if let Err(why) = crate::session::send(
             &self.inner.threads,

@@ -1888,6 +1888,31 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
     if threads.active_turn(&start.thread_id) != settles.turn_id {
         return;
     }
+    // And the same question asked of the *thread* rather than of the session,
+    // which is the half the session cannot answer any more.
+    //
+    // A prompt sent while the agent is working is queued, and queueing it now
+    // publishes no session at all — it used to publish `starting` naming the
+    // queued turn, which is what moved `activeTurnId` above and, incidentally,
+    // suppressed this. That publish was drawn as **"connecting"** on a
+    // conversation that was working, so it went; see `orchestration.rs`'s
+    // `start_turn`. What it was doing here has to be said on purpose instead.
+    //
+    // The thing being protected is the client, not this server. `TurnRequested`
+    // moves the reducer's `latestTurn` to the queued turn immediately, so a
+    // session settle arriving afterwards would settle *that* turn — the
+    // developer's correction announced as finished before the agent had been
+    // handed it, which is
+    // `a_correction_sent_while_the_old_turn_winds_down_is_not_settled_with_it`.
+    // The queued turn publishes its own `running` a moment later and the pane
+    // never leaves it.
+    //
+    // Only when the ending names a turn. An ending that names none is one that
+    // arrived with nothing in flight, and the latest turn is then some earlier
+    // turn that has long since finished — see [`Settles::turn_id`].
+    if settles.turn_id.is_some() && threads.latest_turn(&start.thread_id) != settles.turn_id {
+        return;
+    }
 
     threads.apply(
         &start.thread_id,

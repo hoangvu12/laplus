@@ -1289,6 +1289,32 @@ impl Threads {
             .clone()
     }
 
+    /// The last turn the developer *asked for*, which is not always the one the
+    /// session says it is working on.
+    ///
+    /// [`Threads::active_turn`]'s companion, and the one that answers the same
+    /// question without needing the session to have been republished. A turn
+    /// dispatched while another is in flight is queued rather than sent
+    /// ([`crate::session::PROMPT_QUEUE`]), so nothing moves the session — but
+    /// `Change::TurnRequested` has already moved this, under the same lock as
+    /// the command that queued it. That is what makes it the safe thing to ask:
+    /// the answer cannot depend on whether the driver reached the old turn's
+    /// ending before or after the loop dequeued the new prompt.
+    ///
+    /// Read for the same reason the other one is — see [`crate::session::spend`],
+    /// where a session settle published against a turn the client has already
+    /// moved past would announce the *queued* turn as over before the agent had
+    /// been handed it.
+    pub fn latest_turn(&self, thread_id: &str) -> Option<String> {
+        let entry = self.find(thread_id)?;
+        let state = lock(&entry.state);
+        state
+            .as_ref()?
+            .latest_turn
+            .as_ref()
+            .map(|latest| latest.turn_id.clone())
+    }
+
     /// Called by the driver when its agent has gone, so the next turn starts a
     /// new one rather than writing into a closed pipe.
     ///
