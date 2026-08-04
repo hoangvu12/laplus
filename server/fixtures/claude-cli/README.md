@@ -51,6 +51,7 @@ sent, and then abort a turn nobody had stopped.
 | `19-context-usage.ndjson`                  | Recorded, ticket 76    | The CLI answering how full its own window is, twice — as the session announces itself and as the turn ends — around a turn that uses a tool                                                                     |
 | `20-modes-changed-mid-conversation.ndjson` | Recorded, ticket 11    | A runtime mode and a model pushed to a _running_ child between two turns: the first turn writes a file unasked, the second is stopped for permission, and the model on it is the one that was pushed            |
 | `21-modes-refused.ndjson`                  | Recorded, ticket 11    | The same two requests refused — an unnameable mode and an unrecognised model — which is the first `control_response` with `"subtype": "error"` in this directory                                                |
+| `22-background-subagent.ndjson`            | Recorded               | A background subagent: its `task_*` events, its own messages tagged with the `Agent` call that owns them, and the two `result` lines one invocation ends with                                                   |
 
 The raw STEP 1 originals these two were curated from lived in `.scratch/` and
 were deleted on 2026-07-29; the committed, test-facing copies here are now the
