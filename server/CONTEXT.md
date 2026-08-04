@@ -69,15 +69,16 @@ which already means a terminal output subscription in this context.
 with no session is normal — after a restart, every thread has none.
 
 **Driver** — what runs one agent behind a session: it owns the process, speaks
-that agent's protocol, and answers with the changes a conversation is owed. A
+the selected protocol, and answers with the changes a conversation is owed. A
 trait, `crate::session::Driver`, and its surface is the I/O verbs only — open a
 session, take the next event, send a prompt, interrupt, answer what the agent
 stopped for, ask how full the window is, retune, say there will be no more
 turns, reap. Everything a session does _around_ those is `crate::session`'s and
 is written once: baselines, checkpoints, epochs, settling, and every session
-event the client reads. Per-agent by construction — ADR-0001 is why an encoder
-belongs to a driver and the decoder does not. `crate::turn` drives the `claude`
-CLI and `crate::codex` drives Codex app-server.
+event the client reads. A proprietary protocol may have one dedicated driver;
+a standard protocol may have one driver shared by many conforming agents.
+ADR-0001 is why an encoder belongs to a driver and the decoder does not.
+`crate::turn` drives the `claude` CLI and `crate::codex` drives Codex app-server.
 
 Selected through `crate::provider`'s configured-instance resolver: a provider
 instance id is the routing key a conversation records, while the driver slug
@@ -93,6 +94,17 @@ The durable Claude and Codex defaults are ordinary entries in
 only at the settings boundary and normalized there. Snapshots, refreshes and
 sessions never fall back to the legacy shape.
 _Avoid_: Provider, when the distinction affects routing or configuration.
+
+**ACP agent instance** — a provider instance whose agent speaks the Agent
+Client Protocol. Conforming agent harnesses share the ACP driver; their command,
+environment and compatibility policy distinguish instances without creating a
+new protocol implementation.
+_Avoid_: ACP provider, when it implies a separate driver for every agent.
+
+**ACP runtime** — the shared Agent Client Protocol boundary used by every ACP
+agent instance. Agent-specific compatibility policy may amend the boundary but
+does not create another ACP runtime.
+_Avoid_: Cursor runtime, generic provider.
 
 **App-server** - Codex's JSON-RPC mode, started as `codex app-server` and spoken
 to over newline-delimited JSON on stdio. Responses omit `jsonrpc`, may arrive out
