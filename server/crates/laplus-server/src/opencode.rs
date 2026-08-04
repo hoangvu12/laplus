@@ -416,6 +416,30 @@ pub async fn rollback(
     result
 }
 
+/// The tool OpenCode spawns a subagent with. `explore` and `general` are its
+/// stock ones (`GET /agent`, `"mode": "subagent"`), and a project may configure
+/// more; the tool is the same either way, and which agent ran is `subagent_type`
+/// in its input.
+const TASK_TOOL: &str = "task";
+
+/// What is known about one subagent, accumulated across the events that mention
+/// it.
+///
+/// Held because no single event carries the whole row: the `task` part knows
+/// which agent was asked for and what for, the child session knows what it is
+/// saying, and the ending knows the answer. Each arrives without the others.
+#[derive(Default)]
+struct SubagentRow {
+    /// Which subagent — `explore`, `general`, or a project's own.
+    kind: Option<String>,
+    /// What it was asked for, as the parent described it.
+    description: Option<String>,
+    /// The last thing it said, from its own session.
+    said: Option<String>,
+    /// Its `task` call has reported, so nothing may reopen the row.
+    finished: bool,
+}
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL: Duration = Duration::from_millis(50);
 const EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -569,6 +593,17 @@ pub(crate) struct OpenCode {
     assistant_text: String,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
     pending_questions: HashMap<String, crate::approval::ApprovalRequest>,
+    /// One row per subagent, by the id of the `task` call that owns it.
+    subagent_rows: HashMap<String, SubagentRow>,
+    /// Which `task` call a child session belongs to.
+    ///
+    /// OpenCode runs a subagent as a *session of its own* — `session.created`
+    /// with a `parentID` — and every event it produces arrives on the same
+    /// stream as its parent's. Without this they are simply discarded as
+    /// belonging to another conversation, which is true and is also why a
+    /// subagent used to be a row that said nothing from the moment it started
+    /// until the moment it finished.
+    subagent_sessions: HashMap<String, String>,
 }
 
 fn context_windows(providers: &Value) -> HashMap<String, u64> {
@@ -966,6 +1001,184 @@ impl OpenCode {
             });
     }
 
+    /// The `task` tool is a subagent, so it gets a subagent's row.
+    ///
+    /// Returns `None` for every other tool, which is what leaves the ordinary
+    /// [`tool_activity`] to handle them — and what stops a subagent being drawn
+    /// twice, once as itself and once as a tool called `task`.
+    ///
+    /// The row is [`crate::worklog::subagent`], the same builder the Claude driver
+    /// uses, so a subagent looks like a subagent whichever agent is running. That
+    /// is worth the small translation here: the two protocols disagree about
+    /// almost everything else, and this is the one place where what the developer
+    /// is being told is identical.
+    ///
+    /// **Keyed on the call rather than on the child session.** The session id
+    /// arrives in `metadata` only once the subagent has actually started, so a row
+    /// keyed on it would be a second row appearing a beat after the first. The
+    /// call id is there from the `pending` part onwards and lasts exactly as long
+    /// as the subagent does, because OpenCode's `task` tool does not return early.
+    fn subagent_row(
+        &mut self,
+        part: &Value,
+        driving: &crate::session::Driving,
+    ) -> Option<crate::threads::Activity> {
+        if part.get("type").and_then(Value::as_str) != Some("tool")
+            || part.get("tool").and_then(Value::as_str) != Some(TASK_TOOL)
+        {
+            return None;
+        }
+        let call = part.get("callID").and_then(Value::as_str)?.to_string();
+        let state = part.get("state")?;
+        let status = state
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        let field = |object: Option<&Value>, name: &str| {
+            object
+                .and_then(|object| object.get(name))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let input = state.get("input");
+
+        // The join, recorded as soon as the subagent names itself: from here its
+        // own events can find this row instead of being dropped.
+        if let Some(child) = field(state.get("metadata"), "sessionId") {
+            self.subagent_sessions.insert(child, call.clone());
+        }
+
+        let row = self.subagent_rows.entry(call.clone()).or_default();
+        if let Some(kind) = field(input, "subagent_type") {
+            row.kind = Some(kind);
+        }
+        if let Some(description) = field(input, "description") {
+            row.description = Some(description);
+        }
+        row.finished |= matches!(status, "completed" | "error");
+        let said = row.said.clone();
+        let (kind, description) = (row.kind.clone(), row.description.clone());
+
+        // OpenCode announces the call before it knows what it is: the first
+        // `task` part is `pending` with an empty state, and the input naming the
+        // agent arrives with `running`. Publishing that first one would put a row
+        // reading "Subagent task" on screen and rename it a beat later, which is
+        // the defect the Claude driver has a whole record to avoid. So the row
+        // waits until the subagent can be named — unless the call is already over,
+        // because an unnamed subagent that failed still has to be reported.
+        if kind.is_none() && !matches!(status, "completed" | "error") {
+            return None;
+        }
+
+        Some(crate::worklog::subagent(
+            &crate::protocol::SubagentTask {
+                task_id: call.clone(),
+                tool_use_id: Some(call),
+                status: match status {
+                    "completed" => "completed",
+                    "error" => "failed",
+                    _ => "running",
+                }
+                .to_string(),
+                description,
+                subagent_type: kind,
+                summary: match status {
+                    "completed" => field(Some(state), "output"),
+                    "error" => field(Some(state), "error"),
+                    _ => None,
+                },
+                said,
+            },
+            driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+        ))
+    }
+
+    /// Something happened in a subagent's own session. Put it on that subagent's
+    /// row, or say nothing.
+    ///
+    /// Only two of the child's events are worth anything to a row: which of its
+    /// messages are the subagent's own, and what those messages say. Its tool
+    /// calls, its permissions and its token accounting are the child's business —
+    /// a row is one line, and the subagent's prose is the best thing to spend it
+    /// on. The `task` part that owns the row is what ends it, so nothing here
+    /// needs to notice the child going idle.
+    fn child_session_event(
+        &mut self,
+        envelope: &crate::opencode_protocol::EventEnvelope,
+        driving: &crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) {
+        let properties = &envelope.properties;
+        match envelope.kind.as_str() {
+            // Recorded so the parts below can tell the subagent's own words from
+            // the prompt it was handed, which arrives as a text part too.
+            "message.updated" => {
+                let info = properties.get("info").unwrap_or(properties);
+                if let (Some(id), Some(role)) = (
+                    info.get("id").and_then(Value::as_str),
+                    info.get("role").and_then(Value::as_str),
+                ) {
+                    self.roles.insert(id.to_string(), role.to_string());
+                }
+            }
+            "message.part.updated" => {
+                let part = properties.get("part").unwrap_or(properties);
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    return;
+                }
+                let is_the_subagent = part
+                    .get("messageID")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.roles.get(id))
+                    .is_some_and(|role| role == "assistant");
+                if !is_the_subagent {
+                    return;
+                }
+                let Some(said) = part.get("text").and_then(Value::as_str) else {
+                    return;
+                };
+                if said.trim().is_empty() {
+                    return;
+                }
+                let Some(call) = properties
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    .and_then(|session| self.subagent_sessions.get(session))
+                    .cloned()
+                else {
+                    return;
+                };
+                let Some(row) = self.subagent_rows.get_mut(&call) else {
+                    return;
+                };
+                // A subagent that has already reported does not speak again: the
+                // `task` part has published its output, and reopening the row
+                // would replace the answer with whatever was said on the way to
+                // it.
+                if row.finished {
+                    return;
+                }
+                row.said = Some(said.to_string());
+                let task = crate::protocol::SubagentTask {
+                    task_id: call.clone(),
+                    tool_use_id: Some(call),
+                    status: "running".to_string(),
+                    description: row.description.clone(),
+                    subagent_type: row.kind.clone(),
+                    summary: None,
+                    said: row.said.clone(),
+                };
+                decided
+                    .changes
+                    .push(crate::threads::Change::Activity(crate::worklog::subagent(
+                        &task,
+                        driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+                    )));
+            }
+            _ => {}
+        }
+    }
+
     fn normalize_part(
         &mut self,
         part: &Value,
@@ -1205,6 +1418,8 @@ impl crate::session::Driver for OpenCode {
                 assistant_text: String::new(),
                 pending_permissions: HashMap::new(),
                 pending_questions: HashMap::new(),
+                subagent_rows: HashMap::new(),
+                subagent_sessions: HashMap::new(),
             },
             decided: crate::session::Decided {
                 provider_resume_cursor: Some(cursor(start, &session.id)),
@@ -1223,8 +1438,23 @@ impl crate::session::Driver for OpenCode {
         };
         let unknown = event.is_unknown();
         let envelope = event.envelope();
+        // Another conversation's event — almost always. The exception is a
+        // subagent, which OpenCode runs as a session of its own whose events
+        // arrive here: those belong to a row in *this* conversation, so they are
+        // offered to it before the rest are dropped.
         if event_session(&envelope.properties).is_some_and(|id| id != self.session_id) {
-            return Some(Default::default());
+            let mut decided = crate::session::Decided::default();
+            // Known children only. The `task` part reaches `running` carrying the
+            // child's session id before the child produces anything — event 4 of
+            // the capture, against event 5 — so nothing is missed by requiring
+            // the introduction first, and every other conversation on the stream
+            // stays out of this one's bookkeeping.
+            if event_session(&envelope.properties)
+                .is_some_and(|id| self.subagent_sessions.contains_key(id))
+            {
+                self.child_session_event(envelope, driving, &mut decided);
+            }
+            return Some(decided);
         }
         let mut decided = crate::session::Decided::default();
         match envelope.kind.as_str() {
@@ -1275,7 +1505,13 @@ impl crate::session::Driver for OpenCode {
                     .properties
                     .get("part")
                     .unwrap_or(&envelope.properties);
-                if let Some(activity) = tool_activity(
+                // A subagent before a tool, because `task` is both and only one of
+                // them is what the developer wants to read.
+                if let Some(activity) = self.subagent_row(part, driving) {
+                    decided
+                        .changes
+                        .push(crate::threads::Change::Activity(activity));
+                } else if let Some(activity) = tool_activity(
                     part,
                     &serde_json::to_value(envelope).unwrap_or(Value::Null),
                     driving.turn.as_ref().map(|turn| turn.turn_id.clone()),

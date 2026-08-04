@@ -50,6 +50,9 @@ enum Startup {
     Exit,
     NeverReady,
     McpFailure,
+    /// A turn that spawns a subagent, which OpenCode runs as a session of its
+    /// own — see [`a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing`].
+    Subagent,
 }
 
 impl FakeOpenCode {
@@ -67,6 +70,10 @@ impl FakeOpenCode {
 
     fn busy() -> Self {
         Self::scripted(Startup::Gated)
+    }
+
+    fn spawning_a_subagent() -> Self {
+        Self::scripted(Startup::Subagent)
     }
 
     fn never_ready() -> Self {
@@ -92,11 +99,13 @@ impl FakeOpenCode {
             (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::McpFailure, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_MCP_FAIL=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Subagent, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_SUBAGENT=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Healthy, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=false exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::McpFailure, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_MCP_FAIL=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Subagent, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_SUBAGENT=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
         };
         let serve = serve
             .replace("{log}", &log.display().to_string())
@@ -540,6 +549,8 @@ struct PeerState {
     creates: Arc<AtomicUsize>,
     rollback_probe: Option<PathBuf>,
     rollback_fails: bool,
+    /// Script the turn that spawns a subagent rather than the plain one.
+    subagent: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -807,6 +818,35 @@ async fn prompt(
     ] {
         sender.send(Ok(event.to_string())).await.expect("send scripted SSE event");
     }
+    // A subagent, in the order a real one arrives: the `task` call is announced
+    // before it knows which session it will run in, the child's own session then
+    // produces its messages, and the call carries the answer. Shapes and ordering
+    // are from a driven OpenCode 1.18.10 — the metadata reaches the parent (here,
+    // the second `task` part) before the child says anything, which is what lets
+    // the driver require an introduction before listening to a child.
+    if state.subagent {
+        for event in [
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_owned_1","part":{"id":"prt-task","messageID":"message-1","sessionID":"ses_owned_1","type":"tool","callID":"call_task_1","tool":"task","state":{"status":"pending"}}}}"#,
+            r#"data: {"type":"session.created","properties":{"sessionID":"ses_child_1","info":{"id":"ses_child_1","parentID":"ses_owned_1","agent":"explore","title":"Count files (@explore subagent)"}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_owned_1","part":{"id":"prt-task","messageID":"message-1","sessionID":"ses_owned_1","type":"tool","callID":"call_task_1","tool":"task","state":{"status":"running","input":{"description":"Count the files","subagent_type":"explore","prompt":"how many files"},"metadata":{"parentSessionId":"ses_owned_1","sessionId":"ses_child_1"}}}}}"#,
+            // The prompt it was handed. A text part like any other, and not the
+            // subagent talking.
+            r#"data: {"type":"message.updated","properties":{"sessionID":"ses_child_1","info":{"id":"child-message-1","sessionID":"ses_child_1","role":"user"}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-1","messageID":"child-message-1","sessionID":"ses_child_1","type":"text","text":"how many files"}}}"#,
+            // The subagent itself.
+            r#"data: {"type":"message.updated","properties":{"sessionID":"ses_child_1","info":{"id":"child-message-2","sessionID":"ses_child_1","role":"assistant"}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-2","messageID":"child-message-2","sessionID":"ses_child_1","type":"text","text":"looking through the directory"}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_owned_1","part":{"id":"prt-task","messageID":"message-1","sessionID":"ses_owned_1","type":"tool","callID":"call_task_1","tool":"task","state":{"status":"completed","output":"eleven files","input":{"description":"Count the files","subagent_type":"explore"},"metadata":{"parentSessionId":"ses_owned_1","sessionId":"ses_child_1"}}}}}"#,
+            // After the answer. Must not reopen the row.
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-3","messageID":"child-message-2","sessionID":"ses_child_1","type":"text","text":"anything else?"}}}"#,
+        ] {
+            sender
+                .send(Ok(format!("{event}\n\n")))
+                .await
+                .expect("send scripted subagent SSE event");
+        }
+    }
+
     let gated = state.idle_release.is_some();
     let finish = async move {
         if let Some(release) = &state.idle_release {
@@ -1875,6 +1915,7 @@ async fn opencode_peer_child() {
         mcp_failed: std::env::var("OPENCODE_TEST_MCP_FAIL").as_deref() == Ok("true"),
         idle_release: (std::env::var("OPENCODE_TEST_GATED").as_deref() == Ok("true"))
             .then(|| Arc::new(Notify::new())),
+        subagent: std::env::var("OPENCODE_TEST_SUBAGENT").as_deref() == Ok("true"),
         ..Default::default()
     };
     let app = Router::new()
@@ -1894,6 +1935,93 @@ async fn opencode_peer_child() {
     axum::serve(listener, app)
         .await
         .expect("serve scripted OpenCode peer");
+}
+
+/// OpenCode runs a subagent as a **session of its own**, whose events arrive on
+/// the same stream as its parent's. They used to be discarded — correctly, as
+/// another conversation's — which left a subagent as a row that said nothing
+/// between starting and finishing, however long that was.
+///
+/// The row is the same one the Claude driver builds, from the same
+/// `SubagentTask`, so a subagent reads the same way whichever agent is running.
+/// What differs is only where the pieces come from: the `task` call names the
+/// agent and carries the answer, and the child session is what it says meanwhile.
+#[tokio::test]
+async fn a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing() {
+    let SocketTurn {
+        // Bound, not discarded: the fake owns a `TempDir` holding the peer's
+        // request log, and dropping it deletes the directory out from under the
+        // running child.
+        opencode: _opencode,
+        server,
+        mut client,
+        subscription,
+        ..
+    } = start_socket_turn(
+        FakeOpenCode::spawning_a_subagent(),
+        "project-1",
+        "thread-open",
+    )
+    .await;
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let rows: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .filter(|activity| activity["payload"]["data"]["toolCallId"] == "subagent:call_task_1")
+        .collect();
+    assert!(!rows.is_empty(), "the subagent was invisible");
+
+    // It is a subagent rather than a tool called `task`, and it is named.
+    assert_eq!(rows[0]["payload"]["itemType"], "collab_agent_tool_call");
+    assert_eq!(rows[0]["payload"]["title"], "Subagent explore");
+    assert!(
+        rows.iter()
+            .all(|row| row["payload"]["title"] == "Subagent explore"),
+        "the row was renamed part-way: {rows:#?}"
+    );
+
+    // And it said what it was doing while it did it, which is the whole point.
+    let details: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["payload"]["detail"].as_str())
+        .collect();
+    assert!(
+        details.contains(&"looking through the directory"),
+        "the subagent's own words never reached its row: {details:?}"
+    );
+
+    // Its answer is the last thing the row says, and nothing it said afterwards
+    // replaced it.
+    let last = rows.last().expect("a subagent row");
+    assert_eq!(last["kind"], "tool.completed");
+    assert_eq!(last["payload"]["status"], "completed");
+    assert_eq!(last["payload"]["detail"], "eleven files");
+
+    // The subagent's session is not the developer's conversation.
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-open")
+        .await;
+    let said: Vec<String> = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["text"].as_str())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !said
+            .iter()
+            .any(|text| text.contains("looking through the directory")),
+        "a subagent's words reached the transcript: {said:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]

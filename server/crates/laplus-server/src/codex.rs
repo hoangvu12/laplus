@@ -680,7 +680,17 @@ fn collaboration_agent_row(
         "interrupted" | "shutdown" => "stopped",
         _ => "failed",
     };
-    let title = format!("Subagent {}", short_agent_id(&agent.thread_id));
+    // Named where Codex says the name, and identified where it does not. The
+    // other two drivers title this row with the agent that ran — "Subagent
+    // Explore", "Subagent explore" — and a developer reading a work log should
+    // not have to know which agent they are talking to in order to read it.
+    // Codex's own name for a subagent is the last segment of its `agentPath`;
+    // the thread id is what is left when there is no path, and it is an
+    // identifier rather than a name, so it is used only as a fallback.
+    let title = match agent.path.as_deref().and_then(agent_name) {
+        Some(name) => format!("Subagent {name}"),
+        None => format!("Subagent {}", short_agent_id(&agent.thread_id)),
+    };
     let shown_detail = agent.message.as_deref().or(detail);
     let mut payload = serde_json::json!({
         "itemType": "collab_agent_tool_call",
@@ -724,6 +734,18 @@ fn subagent_activity_row(activity: &SubagentActivity, turn_id: Option<String>) -
     let mut row = collaboration_agent_row(&agent, Some(&activity.agent_path), turn_id);
     row.payload["data"]["activity"] = activity.raw.clone();
     row
+}
+
+/// The agent's own name, out of the path Codex identifies it by.
+///
+/// `"/root/compute_sum"` is `compute_sum` — the capture in
+/// `fixtures/codex-app-server/09-subagent-spawn.jsonl` is where that shape comes
+/// from. Trailing separators are tolerated rather than trusted, and a path with
+/// no segment in it at all is `None` so the caller can fall back to the id.
+fn agent_name(path: &str) -> Option<&str> {
+    path.rsplit('/')
+        .find(|segment| !segment.trim().is_empty())
+        .map(str::trim)
 }
 
 fn short_agent_id(thread_id: &str) -> &str {
@@ -1305,6 +1327,52 @@ mod tests {
         assert_eq!(agent.kind, "tool.updated");
         assert_eq!(agent.payload["status"], "inProgress");
         assert_eq!(agent.payload["data"]["toolCallId"], "agent:child-thread");
+    }
+
+    /// A subagent row says which agent ran, the way it does under the other two
+    /// drivers — `Subagent reviewer` rather than `Subagent 019fc927`. The name is
+    /// the last segment of the `agentPath` Codex identifies it by, and the
+    /// truncated thread id is what is left when there is no path: an identifier,
+    /// and only a fallback.
+    #[test]
+    fn a_subagent_row_is_named_after_the_agent_that_ran() {
+        let named = collaboration_agent_row(
+            &CollaborationAgent {
+                thread_id: "019fc9277b067c43af761ab6f2126876".to_string(),
+                status: "running".to_string(),
+                message: None,
+                path: Some("/root/compute_sum".to_string()),
+            },
+            None,
+            None,
+        );
+        assert_eq!(named.payload["title"], "Subagent compute_sum");
+
+        let anonymous = collaboration_agent_row(
+            &CollaborationAgent {
+                thread_id: "019fc9277b067c43af761ab6f2126876".to_string(),
+                status: "running".to_string(),
+                message: None,
+                path: None,
+            },
+            None,
+            None,
+        );
+        assert_eq!(anonymous.payload["title"], "Subagent 019fc927");
+
+        // A path that names nothing falls back rather than titling the row
+        // "Subagent ".
+        let empty = collaboration_agent_row(
+            &CollaborationAgent {
+                thread_id: "019fc9277b067c43af761ab6f2126876".to_string(),
+                status: "running".to_string(),
+                message: None,
+                path: Some("/".to_string()),
+            },
+            None,
+            None,
+        );
+        assert_eq!(empty.payload["title"], "Subagent 019fc927");
     }
 
     #[test]
