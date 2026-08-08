@@ -1120,7 +1120,7 @@ if ($next.method -eq 'thread/start' -or $next.method -eq 'thread/resume') {
       Send-Json '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
     } else {
       if (Test-Path (Join-Path $root 'close-input-after-turn')) {
-        [Console]::In.Close()
+        [Console]::OpenStandardInput().Close()
       }
       [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-terminal')))
       [Console]::Out.Flush()
