@@ -621,9 +621,21 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for package in staged/@laplus/*; do
-            npm publish "./$package" --access public --provenance --tag latest
+            name=$(node -p "require('./$package/package.json').name")
+            version=$(node -p "require('./$package/package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published; keeping it."
+            else
+              npm publish "./$package" --access public --provenance --tag latest
+            fi
           done
-          npm publish ./apps/cli --access public --provenance --tag latest
+          name=$(node -p "require('./apps/cli/package.json').name")
+          version=$(node -p "require('./apps/cli/package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already published; keeping it."
+          else
+            npm publish ./apps/cli --access public --provenance --tag latest
+          fi
 
       # What a dispatch produces instead of a publish: the six tarballs, exactly
       # as they would have gone up, left on the run to be downloaded and

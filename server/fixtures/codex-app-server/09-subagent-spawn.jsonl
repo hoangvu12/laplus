@@ -1,4 +1,4 @@
-{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "laplus/client", "title": "laplus", "version": "0.1.1"}, "capabilities": {}}}}
+{"dir": "send", "msg": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "laplus/client", "title": "laplus", "version": "0.1.2"}, "capabilities": {}}}}
 {"dir": "recv", "msg": {"id": 1, "result": {"userAgent": "laplus/client/0.146.0 (Ubuntu 20.4.0; aarch64) unknown (laplus/client; 0.1.1)", "codexHome": "/fixture/codex-home", "platformFamily": "unix", "platformOs": "linux"}}}
 {"dir": "send", "msg": {"jsonrpc": "2.0", "method": "initialized"}}
 {"dir": "send", "msg": {"jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": {"cwd": "<workspace>", "approvalPolicy": "never", "sandbox": "read-only"}}}
