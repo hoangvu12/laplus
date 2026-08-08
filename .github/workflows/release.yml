@@ -199,9 +199,13 @@ jobs:
       # release on a flake teaches everybody to re-run the job until it is green,
       # which is the same as not having the gate. `ci.yml` covers that half on
       # `main`.
+      #
+      # The socket integration binaries share fake provider processes and become
+      # unreliable when a loaded Windows runner drives their tests concurrently.
+      # Serializing each binary is the test suite's documented load-control lever.
       - name: Test
         working-directory: server
-        run: cargo test --no-fail-fast
+        run: cargo test --no-fail-fast -- --test-threads=1
 
       # Not a workspace dependency and cannot be one, so it has to be installed —
       # but not *compiled*. `cargo install` has no notion of a prebuilt binary
