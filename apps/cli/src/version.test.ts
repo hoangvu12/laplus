@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Covers release tooling, which is `node` and a filesystem.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 

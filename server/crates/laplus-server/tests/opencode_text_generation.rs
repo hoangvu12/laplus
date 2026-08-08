@@ -204,7 +204,7 @@ impl FakeLocal {
         let log = directory.path().join("requests.jsonl");
         let executable = std::env::current_exe().unwrap();
         let launch = if cfg!(windows) {
-            format!("@echo off\r\nset T17_PORT=%3\r\nset T17_LOG={}\r\n\"{}\" --exact local_generation_peer_child --ignored --nocapture\r\n", log.display(), executable.display())
+            format!("@echo off\r\nset T17_PORT=%~3\r\nset T17_LOG={}\r\n\"{}\" --exact local_generation_peer_child --ignored --nocapture\r\n", log.display(), executable.display())
         } else {
             format!("#!/bin/sh\nT17_PORT=\"$3\" T17_LOG='{}' exec '{}' --exact local_generation_peer_child --ignored --nocapture\n", log.display(), executable.display())
         };

@@ -94,12 +94,12 @@ impl FakeOpenCode {
         let serve = match (startup, cfg!(windows)) {
             (Startup::Exit, true) => "exit /b 23",
             (Startup::Exit, false) => "exit 23",
-            (Startup::Healthy, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
-            (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
-            (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
-            (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
-            (Startup::McpFailure, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_MCP_FAIL=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
-            (Startup::Subagent, true) => "set OPENCODE_TEST_PORT=%3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_SUBAGENT=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Healthy, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::McpFailure, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_MCP_FAIL=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Subagent, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_SUBAGENT=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Healthy, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
@@ -2169,6 +2169,11 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
         "the stop command did not reap the owned OpenCode server",
     )
     .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while server.live_mcp_sessions() != 0 { tokio::task::yield_now().await; }
+    })
+    .await
+    .expect("the owned MCP session is released with its server");
     assert_eq!(server.live_mcp_sessions(), 0);
     client.close().await;
     server.stop().await;
@@ -2224,6 +2229,7 @@ async fn stopping_busy_owned_opencode_aborts_and_reaps_its_server() {
 #[tokio::test]
 async fn an_owned_server_that_exits_during_startup_becomes_a_visible_session_failure() {
     let SocketTurn {
+        opencode: _opencode,
         server,
         mut client,
         subscription,
@@ -2263,16 +2269,12 @@ async fn owned_mcp_registration_failure_is_visible_and_releases_the_grant() {
 #[tokio::test]
 async fn an_owned_server_readiness_timeout_becomes_a_visible_session_failure() {
     let SocketTurn {
+        opencode: _opencode,
         server,
         mut client,
         subscription,
         ..
-    } = start_socket_turn(
-        FakeOpenCode::never_ready(),
-        "project-timeout",
-        "thread-timeout",
-    )
-    .await;
+    } = start_socket_turn(FakeOpenCode::never_ready(), "project-timeout", "thread-timeout").await;
     let events = client.events_through_the_turn(&subscription).await;
     let failed = events
         .iter()

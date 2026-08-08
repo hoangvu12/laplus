@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "laplus-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "clap",
@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "laplus-shell"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "laplus-server",
  "serde_json",
@@ -5481,7 +5481,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "yasna"

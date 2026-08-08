@@ -360,7 +360,11 @@ mod tests {
             ),
         ];
         for (relative, command, lock) in cases {
-            let path = installation(root.path(), relative);
+            // Windows has no executable bit: the extension is what names a
+            // program, so the fixture binary has to wear the one a real
+            // installation would.
+            let relative = if cfg!(windows) { format!("{relative}.exe") } else { relative.to_string() };
+            let path = installation(root.path(), &relative);
             let action = opencode_action(&path.to_string_lossy(), &search)
                 .unwrap_or_else(|| panic!("strategy for {}", path.display()));
             assert_eq!(action.display(), command, "{}", path.display());
