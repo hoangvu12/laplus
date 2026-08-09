@@ -1404,10 +1404,23 @@ async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(Stri
     let client = crate::opencode::OpenCodeClient::new(
         &settings.server_url, ".", (!settings.server_password.is_empty()).then(|| settings.server_password.clone()),
     ).map_err(|error| error.to_string())?;
-    let health = client.health().await.map_err(|error| error.to_string())?;
+    let discover = || async {
+        let health = client.health().await?;
+        let providers = client.providers().await?;
+        let agents = client.agents().await?;
+        Ok::<_, crate::opencode::OpenCodeError>((health, providers, agents))
+    };
+    // Discovery is GET-only. A fresh connection can fail transiently while a
+    // loaded Windows host recycles loopback ports, so retry the inventory once.
+    let discovered = match discover().await {
+        Err(crate::opencode::OpenCodeError::Transport(_)) => {
+            tokio::task::yield_now().await;
+            discover().await
+        }
+        result => result,
+    };
+    let (health, providers, agents) = discovered.map_err(|error| error.to_string())?;
     if !health.healthy { return Err("the server reported unhealthy".to_string()); }
-    let providers = client.providers().await.map_err(|error| error.to_string())?;
-    let agents = client.agents().await.map_err(|error| error.to_string())?;
     Ok((health.version, opencode_models(&providers, &agents)?))
 }
 

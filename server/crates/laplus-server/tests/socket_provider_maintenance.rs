@@ -57,7 +57,7 @@ impl CommandRunner for FakeCommand {
     }
 }
 
-async fn external(version: &'static str) -> String {
+async fn external(version: &'static str, drop_first_connection: bool) -> String {
     let app = Router::new()
         .route(
             "/global/health",
@@ -71,6 +71,10 @@ async fn external(version: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
+        if drop_first_connection {
+            let (connection, _) = listener.accept().await.unwrap();
+            drop(connection);
+        }
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{address}")
@@ -118,7 +122,7 @@ async fn explicit_update_reports_an_unchanged_external_snapshot() {
         seen: Mutex::new(Vec::new()),
     });
     let server = TestServer::start_with_maintenance(
-        configured(external("1.20.0").await, &binary_path),
+        configured(external("1.20.0", false).await, &binary_path),
         ProviderMaintenance::with_runner(runner.clone()),
     )
     .await;
@@ -159,7 +163,7 @@ async fn failed_command_is_reported_after_refresh_and_routing_is_instance_strict
         seen: Mutex::new(Vec::new()),
     });
     let server = TestServer::start_with_maintenance(
-        configured(external("1.21.0").await, &binary_path),
+        configured(external("1.21.0", true).await, &binary_path),
         ProviderMaintenance::with_runner(runner),
     )
     .await;
@@ -213,7 +217,7 @@ async fn overlapping_requests_are_serialized_by_instance_and_package_manager() {
         active: AtomicUsize::new(0),
         max_active: AtomicUsize::new(0),
     });
-    let endpoint = external("1.22.0").await;
+    let endpoint = external("1.22.0", false).await;
     let mut config = configured(endpoint.clone(), &binary_path);
     let mut second = config.settings.provider_instances["openExternal"].clone();
     second["displayName"] = json!("External OpenCode Two");
