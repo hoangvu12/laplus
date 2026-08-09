@@ -113,12 +113,16 @@ export function poll(fn, timeoutMs, everyMs = 100) {
 /** Every socket frame, in order, decoded far enough to be readable. */
 export function frameLog(session) {
   const frames = [];
+  const frameText = (response) =>
+    response.opcode === 2
+      ? Buffer.from(response.payloadData, "base64").toString("utf8")
+      : response.payloadData;
   session.on((message) => {
     if (message.method === "Network.webSocketFrameSent") {
-      frames.push({ dir: "→", text: message.params.response.payloadData });
+      frames.push({ dir: "→", text: frameText(message.params.response) });
     }
     if (message.method === "Network.webSocketFrameReceived") {
-      frames.push({ dir: "←", text: message.params.response.payloadData });
+      frames.push({ dir: "←", text: frameText(message.params.response) });
     }
     if (message.method === "Network.webSocketCreated") {
       frames.push({ dir: "**", text: `created ${message.params.url}` });
