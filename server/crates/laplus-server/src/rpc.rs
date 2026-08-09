@@ -319,7 +319,7 @@ fn dispatch_scoped(
             let call = usage::UsageScan::from_payload(payload).map_err(DispatchError::Declared)?;
             let current = services.config.current();
             let settings = current.settings.clone();
-            let host_id = current.environment.environment_id.clone();
+            let host_id = crate::config::machine_slug();
             let preferences = current.preferences.clone();
             Ok(Answer::Deferred(Deferred::new(move || {
                 call.run(settings, host_id, preferences)

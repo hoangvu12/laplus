@@ -10,7 +10,7 @@ mod pricing;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use chrono::NaiveDate;
@@ -24,7 +24,8 @@ pub const GET_SUMMARY: &str = "server.getUsageSummary";
 pub const CONTRACT_VERSION: u8 = 3;
 const PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
-static PRICING_CACHES: OnceLock<Mutex<BTreeMap<PathBuf, pricing::PricingCache>>> = OnceLock::new();
+static PRICING_CACHES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<pricing::PricingCache>>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct UsageScan {
@@ -59,7 +60,7 @@ impl UsageScan {
         Ok(Self {
             since_day,
             until_day,
-            time_zone: zone.name().to_string(),
+            time_zone: requested_zone.to_string(),
             zone,
         })
     }
@@ -84,13 +85,27 @@ impl UsageScan {
         let mut sources = Vec::new();
         if let Some(instance) = claude.filter(|instance| instance.settings.enabled) {
             let home = crate::catalogue::config_dir(&instance.settings);
-            let (source, mut parsed) = scan_claude(&home, self.zone, since, &host_id, &mut cache);
+            let (source, mut parsed) = scan_claude(
+                &home,
+                self.zone,
+                since,
+                &self.until_day,
+                &host_id,
+                &mut cache,
+            );
             sources.push(source);
             records.append(&mut parsed);
         }
         if let Some(instance) = codex.filter(|instance| instance.settings.enabled) {
             let home = codex_home(&instance.settings.home_path);
-            let (source, mut parsed) = scan_codex(&home, self.zone, since, &host_id, &mut cache);
+            let (source, mut parsed) = scan_codex(
+                &home,
+                self.zone,
+                since,
+                &self.until_day,
+                &host_id,
+                &mut cache,
+            );
             sources.push(source);
             records.append(&mut parsed);
         }
@@ -136,11 +151,12 @@ fn scan_claude(
     home: &Path,
     zone: Tz,
     since: NaiveDate,
+    until_day: &str,
     host_id: &str,
     cache: &mut ScanCache,
 ) -> (Value, Vec<Record>) {
     let root = claude_projects(home);
-    let Ok(files) = transcript_files(&root) else {
+    let Ok((files, walk_skipped)) = transcript_files(&root) else {
         return (
             failed_source(
                 host_id,
@@ -166,7 +182,7 @@ fn scan_claude(
     let mut records = Vec::new();
     let mut dedupe = HashSet::new();
     let mut malformed = 0_u64;
-    let mut skipped = 0_u64;
+    let mut skipped = walk_skipped;
     let mut scanned = 0_u64;
     let mut sessions = HashSet::new();
     let cache_provider = format!("claude@{}", zone.name());
@@ -218,7 +234,10 @@ fn scan_claude(
             {
                 continue;
             }
-            if !record.session.is_empty() {
+            if record.day >= since.format("%Y-%m-%d").to_string()
+                && record.day.as_str() <= until_day
+                && !record.session.is_empty()
+            {
                 sessions.insert(record.session.clone());
             }
             records.push(record);
@@ -245,11 +264,12 @@ fn scan_codex(
     home: &Path,
     zone: Tz,
     since: NaiveDate,
+    until_day: &str,
     host_id: &str,
     cache: &mut ScanCache,
 ) -> (Value, Vec<Record>) {
     let root = home.join("sessions");
-    let Ok(files) = transcript_files(&root) else {
+    let Ok((files, walk_skipped)) = transcript_files(&root) else {
         return (
             failed_source(
                 host_id,
@@ -273,7 +293,7 @@ fn scan_codex(
     }
     let mut records = Vec::new();
     let mut malformed = 0_u64;
-    let mut skipped = 0_u64;
+    let mut skipped = walk_skipped;
     let mut scanned = 0_u64;
     let mut sessions = HashSet::new();
     let cache_provider = format!("codex@{}", zone.name());
@@ -314,7 +334,10 @@ fn scan_codex(
         };
         scanned += 1;
         for record in parsed {
-            if !record.session.is_empty() {
+            if record.day >= since.format("%Y-%m-%d").to_string()
+                && record.day.as_str() <= until_day
+                && !record.session.is_empty()
+            {
                 sessions.insert(record.session.clone());
             }
             records.push(record);
@@ -361,25 +384,39 @@ fn codex_home(configured: &str) -> PathBuf {
     PathBuf::from(".codex")
 }
 
-fn transcript_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn transcript_files(root: &Path) -> std::io::Result<(Vec<PathBuf>, u64)> {
     let mut found = Vec::new();
+    let mut skipped = 0;
     if root.exists() {
-        collect_jsonl(root, &mut found)?;
+        let entries = fs::read_dir(root)?;
+        collect_jsonl(entries, &mut found, &mut skipped);
     }
     found.sort();
-    Ok(found)
+    Ok((found, skipped))
 }
 
-fn collect_jsonl(root: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_jsonl(&path, found)?;
-        } else if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+fn collect_jsonl(entries: fs::ReadDir, found: &mut Vec<PathBuf>, skipped: &mut u64) {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            *skipped += 1;
+            continue;
+        };
+        let Ok(kind) = entry.file_type() else {
+            *skipped += 1;
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            match fs::read_dir(&path) {
+                Ok(children) => collect_jsonl(children, found, skipped),
+                Err(_) => *skipped += 1,
+            }
+        } else if kind.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+        {
             found.push(path);
         }
     }
-    Ok(())
 }
 
 fn day(value: &str) -> Result<NaiveDate, Value> {
@@ -394,10 +431,19 @@ fn read_error(reason: &str, detail: impl Into<String>) -> Value {
 fn pricing(path: &Path) -> (pricing::RateTable, &'static str, Option<String>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let caches = PRICING_CACHES.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut caches = caches
+    let cache = {
+        let mut caches = caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            caches
+                .entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(pricing::PricingCache::default()))),
+        )
+    };
+    let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let cache = caches.entry(path.to_path_buf()).or_default();
     cache.ensure(path, now_ms, fetch_pricing_document);
     let fetched_at = cache.fetched_at_ms().and_then(|stamp| {
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(stamp)
@@ -714,5 +760,51 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error["reason"], "invalidWindow");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_discovery_does_not_follow_directory_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("a temporary transcript root");
+        fs::write(root.path().join("one.jsonl"), "{}\n").expect("a transcript is written");
+        symlink(root.path(), root.path().join("cycle")).expect("a cycle is linked");
+
+        let (files, skipped) = transcript_files(root.path()).expect("the root is readable");
+        assert_eq!(files, vec![root.path().join("one.jsonl")]);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn persisted_scan_cache_invalidates_changed_removed_and_corrupt_entries() {
+        let directory = tempfile::tempdir().expect("a temporary cache directory");
+        let transcript = directory.path().join("history.jsonl");
+        let cache_path = directory.path().join("usage-scan-cache.json");
+        fs::write(&transcript, "one\n").expect("a transcript is written");
+        let (original, key) = file_identity(&transcript).expect("the file has identity");
+        let mut cache = ScanCache::default();
+        cache.replace(key.clone(), "claude@UTC", original, Vec::new(), 2);
+        cache.save(&cache_path);
+        assert_eq!(
+            ScanCache::load(&cache_path)
+                .reuse(&key, "claude@UTC", original)
+                .map(|(_, malformed)| malformed),
+            Some(2)
+        );
+
+        fs::write(&transcript, "longer\n").expect("the transcript is appended or rewritten");
+        let (changed, _) = file_identity(&transcript).expect("the changed file has identity");
+        assert_ne!(changed, original);
+        assert!(ScanCache::load(&cache_path)
+            .reuse(&key, "claude@UTC", changed)
+            .is_none());
+
+        fs::remove_file(&transcript).expect("the transcript is removed");
+        let mut loaded = ScanCache::load(&cache_path);
+        loaded.prune();
+        assert!(loaded.files.is_empty());
+        fs::write(&cache_path, "{not json").expect("the cache is corrupted");
+        assert!(ScanCache::load(&cache_path).files.is_empty());
     }
 }

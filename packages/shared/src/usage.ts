@@ -60,7 +60,9 @@ export interface MergedUsageSummary extends UsageSummary {
   readonly totals: UsageMetricTotals;
   readonly distinctSessions: number;
   readonly byProvider: ReadonlyArray<UsageBreakdown & { readonly provider: UsageProviderKind }>;
-  readonly byModel: ReadonlyArray<UsageBreakdown & { readonly model: string }>;
+  readonly byModel: ReadonlyArray<
+    UsageBreakdown & { readonly provider: UsageProviderKind; readonly model: string }
+  >;
   readonly byDay: ReadonlyArray<UsageBreakdown & { readonly day: string }>;
 }
 
@@ -116,13 +118,8 @@ function addTokens(left: UsageTokenTotals, right: UsageTokenTotals): UsageTokenT
   };
 }
 
-function weakestCostSource(left: UsageCostSource, right: UsageCostSource): UsageCostSource {
-  const rank: Record<UsageCostSource, number> = {
-    providerReported: 0,
-    modelPriced: 1,
-    unpriced: 2,
-  };
-  return rank[left] >= rank[right] ? left : right;
+function mergedCostSource(left: UsageCostSource, right: UsageCostSource): UsageCostSource {
+  return left === right ? left : "modelPriced";
 }
 
 function mergeBucket(left: UsageBucket, right: UsageBucket): UsageBucket {
@@ -131,7 +128,7 @@ function mergeBucket(left: UsageBucket, right: UsageBucket): UsageBucket {
     totals: addTokens(left.totals, right.totals),
     costUsd: left.costUsd + right.costUsd,
     cacheSavingsUsd: left.cacheSavingsUsd + right.cacheSavingsUsd,
-    costSource: weakestCostSource(left.costSource, right.costSource),
+    costSource: mergedCostSource(left.costSource, right.costSource),
     records: left.records + right.records,
     unpricedRecords: left.unpricedRecords + right.unpricedRecords,
     sessions: left.sessions + right.sessions,
@@ -223,25 +220,45 @@ export function mergeUsageEnvironments(
     }
   }
 
-  const seenSources = new Map<string, string>();
+  compatible.sort((left, right) => left.environmentId.localeCompare(right.environmentId));
+  const sourceRank = { ok: 0, partial: 1, failed: 2 } as const;
+  const sourceOwners = new Map<string, { environmentId: string; label: string; rank: number }>();
+  for (const environment of compatible) {
+    for (const source of environment.summary.sources) {
+      if (source.status === "missing") continue;
+      const key = fingerprintKey(source);
+      const candidate = {
+        environmentId: environment.environmentId,
+        label: environment.label,
+        rank: sourceRank[source.status],
+      };
+      const owner = sourceOwners.get(key);
+      if (
+        owner === undefined ||
+        candidate.rank < owner.rank ||
+        (candidate.rank === owner.rank && candidate.environmentId < owner.environmentId)
+      ) {
+        sourceOwners.set(key, candidate);
+      }
+    }
+  }
   const sources: UsageSource[] = [];
   const buckets = new Map<string, UsageBucket>();
   for (const environment of compatible) {
     const acceptedProviders = new Set<UsageProviderKind>();
     for (const source of environment.summary.sources) {
       const key = fingerprintKey(source);
-      const owner = seenSources.get(key);
-      if (owner !== undefined) {
+      const owner = source.status === "missing" ? undefined : sourceOwners.get(key);
+      const isOwner = owner?.environmentId === environment.environmentId;
+      if (owner !== undefined && !isOwner) {
         notices.push({
           kind: "duplicate",
           label: environment.label,
-          message: boundedMessage(`${source.fingerprint.provider} source duplicates ${owner}.`),
+          message: boundedMessage(
+            `${source.fingerprint.provider} source duplicates ${owner.label}.`,
+          ),
         });
-        continue;
       }
-      seenSources.set(key, environment.label);
-      sources.push(safeSource(source));
-      acceptedProviders.add(source.fingerprint.provider);
       if (source.status === "missing" || source.status === "partial") {
         notices.push({
           kind: source.status,
@@ -255,6 +272,9 @@ export function mergeUsageEnvironments(
           message: `${source.fingerprint.provider} usage source failed.`,
         });
       }
+      if (source.status === "missing" || !isOwner) continue;
+      sources.push(safeSource(source));
+      acceptedProviders.add(source.fingerprint.provider);
     }
     for (const bucket of environment.summary.buckets) {
       if (!acceptedProviders.has(bucket.provider)) continue;
@@ -282,10 +302,14 @@ export function mergeUsageEnvironments(
       provider: entry.key as UsageProviderKind,
     }),
   );
-  const byModel = breakdown(orderedBuckets, (bucket) => bucket.model, totals).map((entry) => ({
-    ...entry,
-    model: entry.key,
-  }));
+  const byModel = breakdown(
+    orderedBuckets,
+    (bucket) => JSON.stringify([bucket.provider, bucket.model]),
+    totals,
+  ).map((entry) => {
+    const [provider, model] = JSON.parse(entry.key) as [UsageProviderKind, string];
+    return { ...entry, provider, model };
+  });
   const byDay = breakdown(orderedBuckets, (bucket) => bucket.day, totals).map((entry) => ({
     ...entry,
     day: entry.key,

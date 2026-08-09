@@ -34,6 +34,7 @@ pub(crate) struct ParseOutcome {
 struct TokenUsage {
     input: u64,
     cached_input: u64,
+    cache_write_input: u64,
     output: u64,
     reasoning: u64,
 }
@@ -65,7 +66,11 @@ pub(crate) fn parse_rollout(text: &str, zone: Tz, fallback_session: &str) -> Par
 
         match kind {
             "session_meta" => {
-                if let Some(id) = payload.get("id").and_then(non_empty_text) {
+                if let Some(id) = payload
+                    .get("id")
+                    .or_else(|| payload.get("session_id"))
+                    .and_then(non_empty_text)
+                {
                     session = id.to_string();
                 }
             }
@@ -97,6 +102,9 @@ pub(crate) fn parse_rollout(text: &str, zone: Tz, fallback_session: &str) -> Par
                     outcome.malformed_records += 1;
                     continue;
                 };
+                if usage.input == 0 && usage.output == 0 {
+                    continue;
+                }
                 if previous_eligible.as_ref() == Some(&usage) {
                     continue;
                 }
@@ -106,9 +114,12 @@ pub(crate) fn parse_rollout(text: &str, zone: Tz, fallback_session: &str) -> Par
                     model: active_model.clone(),
                     session: session.clone(),
                     totals: Totals {
-                        uncached_input_tokens: usage.input.saturating_sub(usage.cached_input),
+                        uncached_input_tokens: usage
+                            .input
+                            .saturating_sub(usage.cached_input)
+                            .saturating_sub(usage.cache_write_input),
                         cached_input_tokens: usage.cached_input,
-                        cache_creation_tokens: 0,
+                        cache_creation_tokens: usage.cache_write_input,
                         output_tokens: usage.output,
                         reasoning_tokens: usage.reasoning,
                     },
@@ -133,10 +144,13 @@ fn parse_usage(value: &Value) -> Option<TokenUsage> {
     let usage = TokenUsage {
         input: count("input_tokens")?,
         cached_input: count("cached_input_tokens").unwrap_or(0),
+        cache_write_input: count("cache_write_input_tokens").unwrap_or(0),
         output: count("output_tokens")?,
         reasoning: count("reasoning_output_tokens").unwrap_or(0),
     };
-    (usage.cached_input <= usage.input && usage.reasoning <= usage.output).then_some(usage)
+    (usage.cached_input.saturating_add(usage.cache_write_input) <= usage.input
+        && usage.reasoning <= usage.output)
+        .then_some(usage)
 }
 
 #[cfg(test)]
@@ -234,6 +248,34 @@ mod tests {
         .join("\n");
         let parsed = parse_rollout(&text, "UTC".parse().unwrap(), "rollout-b");
         assert_eq!(parsed.records[0].session, "rollout-b");
+    }
+
+    #[test]
+    fn accepts_session_alias_maps_cache_writes_and_drops_zero_usage() {
+        let meta = serde_json::json!({
+            "type":"session_meta", "payload":{"session_id":"session-alias"}
+        })
+        .to_string();
+        let zero = usage("2026-08-09T11:00:00Z", 0, 0, 0, 0);
+        let with_write = serde_json::json!({
+            "timestamp":"2026-08-09T12:00:00Z", "type":"event_msg",
+            "payload":{"type":"token_count","info":{"last_token_usage":{
+                "input_tokens":20,"cached_input_tokens":7,"cache_write_input_tokens":3,
+                "output_tokens":4,"reasoning_output_tokens":1
+            }}}
+        })
+        .to_string();
+        let parsed = parse_rollout(
+            &[meta, context("gpt-5"), zero, with_write].join("\n"),
+            chrono_tz::UTC,
+            "fallback",
+        );
+
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].session, "session-alias");
+        assert_eq!(parsed.records[0].totals.uncached_input_tokens, 10);
+        assert_eq!(parsed.records[0].totals.cached_input_tokens, 7);
+        assert_eq!(parsed.records[0].totals.cache_creation_tokens, 3);
     }
 
     #[test]

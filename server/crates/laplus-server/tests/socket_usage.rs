@@ -157,6 +157,46 @@ async fn claude_and_codex_history_join_one_aggregate_without_content() {
 }
 
 #[tokio::test]
+async fn two_servers_on_one_machine_fingerprint_the_same_physical_home_identically() {
+    let claude_home = tempfile::tempdir().expect("a temporary Claude home");
+    write_one_claude_record(claude_home.path());
+    let first = TestServer::start_with(configured_claude_home(claude_home.path())).await;
+    let second = TestServer::start_with(configured_claude_home(claude_home.path())).await;
+    let mut first_client = first.connect().await;
+    let mut second_client = second.connect().await;
+
+    let first_config = first_client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let second_config = second_client
+        .call("server.getConfig", json!({}))
+        .await
+        .expect_success();
+    let first_summary = first_client
+        .call("server.getUsageSummary", input())
+        .await
+        .expect_success();
+    let second_summary = second_client
+        .call("server.getUsageSummary", input())
+        .await
+        .expect_success();
+    assert_ne!(
+        first_config["environment"]["environmentId"],
+        second_config["environment"]["environmentId"]
+    );
+    assert_eq!(
+        first_summary["sources"][0]["fingerprint"],
+        second_summary["sources"][0]["fingerprint"]
+    );
+
+    first_client.close().await;
+    second_client.close().await;
+    first.stop().await;
+    second.stop().await;
+}
+
+#[tokio::test]
 async fn provider_reported_model_priced_and_unknown_records_share_one_summary() {
     std::env::set_var("LAPLUS_USAGE_PRICING_URL", "disabled");
     let claude_home = tempfile::tempdir().expect("a temporary Claude home");
@@ -364,7 +404,7 @@ async fn an_unknown_caller_zone_degrades_to_utc_without_losing_usage() {
         .await
         .expect_success();
 
-    assert_eq!(summary["timeZone"], "UTC");
+    assert_eq!(summary["timeZone"], "Not/A_Real_Zone");
     assert_eq!(summary["buckets"].as_array().map(Vec::len), Some(1));
 
     client.close().await;

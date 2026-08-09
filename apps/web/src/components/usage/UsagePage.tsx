@@ -1,4 +1,4 @@
-import type { UsageSource, UsageSummaryInput } from "@t3tools/contracts";
+import type { UsageProviderKind, UsageSource, UsageSummaryInput } from "@t3tools/contracts";
 import type { MergedUsageSummary } from "@t3tools/shared/usage";
 import { useCanGoBack, useNavigate, useRouter } from "@tanstack/react-router";
 import { ArrowLeftIcon, CheckIcon, RefreshCwIcon, XIcon } from "lucide-react";
@@ -8,6 +8,7 @@ import { makeUsageWindow, useUsageSummary } from "../../state/usage";
 import { Skeleton } from "../ui/skeleton";
 import { SidebarInset } from "../ui/sidebar";
 import { UsageChartLegend, UsageProviderChart } from "./UsageProviderChart";
+import { PROVIDER_MARK } from "./usageProviders";
 
 type Metric = "cost" | "tokens";
 type Breakdown = "model" | "day";
@@ -136,14 +137,12 @@ function ProviderRows({
       <div className="mt-4 space-y-5">
         {providers.map((provider) => {
           const share = metric === "cost" ? provider.costShare : provider.tokenShare;
+          const Mark = PROVIDER_MARK[provider.provider];
           return (
             <div key={provider.provider}>
               <div className="flex items-center justify-between gap-4">
                 <span className="flex items-center gap-2">
-                  <span
-                    className="size-2.5 rounded-full"
-                    style={{ backgroundColor: providerColor(provider.provider) }}
-                  />
+                  <Mark className="size-4" style={{ color: providerColor(provider.provider) }} />
                   {providerName(provider.provider)}
                 </span>
                 <strong className="tabular-nums">
@@ -222,7 +221,12 @@ function BreakdownTable({
   const models = useMemo(() => {
     const grouped = new Map<
       string,
-      { provider: string; model: string; costUsd: number; processedTokens: number }
+      {
+        provider: UsageProviderKind;
+        model: string;
+        costUsd: number;
+        processedTokens: number;
+      }
     >();
     for (const bucket of summary.buckets) {
       const key = `${bucket.provider}:${bucket.model}`;
@@ -279,24 +283,27 @@ function BreakdownTable({
               </td>
             </tr>
           ) : breakdown === "model" ? (
-            models.map((model) => (
-              <tr key={`${model.provider}:${model.model}`} className="border-t border-border">
-                <td className="p-3">
-                  <span
-                    className="mr-2 inline-block size-2 rounded-full"
-                    style={{ backgroundColor: providerColor(model.provider) }}
-                  />
-                  {model.model}
-                </td>
-                <td>{cost(model.costUsd)}</td>
-                <td>
-                  {summary.totals.costUsd === 0
-                    ? "—"
-                    : `${Math.round((model.costUsd / summary.totals.costUsd) * 100)}%`}
-                </td>
-                <td>{tokens(model.processedTokens)}</td>
-              </tr>
-            ))
+            models.map((model) => {
+              const Mark = PROVIDER_MARK[model.provider];
+              return (
+                <tr key={`${model.provider}:${model.model}`} className="border-t border-border">
+                  <td className="p-3">
+                    <Mark
+                      className="mr-2 inline-block size-4"
+                      style={{ color: providerColor(model.provider) }}
+                    />
+                    {model.model}
+                  </td>
+                  <td>{cost(model.costUsd)}</td>
+                  <td>
+                    {summary.totals.costUsd === 0
+                      ? "—"
+                      : `${Math.round((model.costUsd / summary.totals.costUsd) * 100)}%`}
+                  </td>
+                  <td>{tokens(model.processedTokens)}</td>
+                </tr>
+              );
+            })
           ) : (
             days.map((day) => {
               const buckets = summary.buckets.filter((bucket) => bucket.day === day.day);
@@ -346,7 +353,7 @@ export function UsageReport({ view }: { readonly view: UsageReportView }) {
           <div>
             <h1 className="text-2xl font-semibold">Usage</h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              {formatDay(view.input.sinceDay)} to {formatDay(view.input.untilDay)}
+              {formatDay(view.input.sinceDay, false)} to {formatDay(view.input.untilDay, false)}
             </p>
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2">

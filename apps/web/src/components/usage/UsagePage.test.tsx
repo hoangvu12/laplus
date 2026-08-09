@@ -39,7 +39,7 @@ describe("Usage route", () => {
   it.each([1280, 375])("renders the inclusive range and processed total at %ipx", async (width) => {
     renderReport(width);
     expect(await screen.findByRole("heading", { name: "Usage" })).toBeTruthy();
-    expect(screen.getByText("Aug 3, 2026 to Aug 9, 2026")).toBeTruthy();
+    expect(screen.getByText("Aug 3 to Aug 9")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "TOKENS" }));
     expect(screen.getByText("50")).toBeTruthy();
     expect(screen.getByText("Processed tokens")).toBeTruthy();

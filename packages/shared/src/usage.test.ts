@@ -131,6 +131,29 @@ describe("mergeUsageEnvironments", () => {
     expect(result.notices.filter((notice) => notice.kind === "duplicate")).toHaveLength(1);
   });
 
+  it("prefers a healthy duplicate source regardless of environment order", () => {
+    const shared = source("claude");
+    const unhealthy = success(
+      "Unavailable first",
+      summary({ sources: [{ ...shared, status: "failed", message: "scan failed" }] }),
+    );
+    const healthy = success(
+      "Healthy second",
+      summary({ sources: [shared], buckets: [bucket("claude", "sonnet")] }),
+    );
+
+    for (const environments of [
+      [unhealthy, healthy],
+      [healthy, unhealthy],
+    ]) {
+      const result = mergeUsageEnvironments(environments);
+      expect(result.summary?.totals.processedTokens).toBe(100);
+      expect(result.summary?.sources).toEqual([shared]);
+      expect(result.notices.some((notice) => notice.kind === "failed")).toBe(true);
+      expect(result.notices.some((notice) => notice.kind === "duplicate")).toBe(true);
+    }
+  });
+
   it("merges stable day/provider/model buckets and preserves every arithmetic category", () => {
     const result = mergeUsageEnvironments([
       success(
@@ -228,7 +251,10 @@ describe("mergeUsageEnvironments", () => {
     expect(result.summary?.byProvider.map(({ provider }) => provider)).toEqual(["claude", "codex"]);
     expect(result.summary?.byProvider[0]?.tokenShare).toBeCloseTo(100 / 1_100);
     expect(result.summary?.byProvider[1]?.costShare).toBeCloseTo(1 / 4);
-    expect(result.summary?.byModel.map(({ model }) => model)).toEqual(["gpt", "sonnet"]);
+    expect(result.summary?.byModel.map(({ provider, model }) => `${provider}:${model}`)).toEqual([
+      "claude:sonnet",
+      "codex:gpt",
+    ]);
     expect(result.summary?.byDay).toHaveLength(1);
     expect(result.summary?.byDay[0]?.tokenShare).toBe(1);
   });

@@ -52,10 +52,12 @@
 // `probe-open-thread.mjs` carries the same warning for the same reason. The
 // selectors it depends on are named in `SELECTORS` below so there is one place
 // to fix.
-import { launch, consoleLog, crossOriginLines, poll, wireLog } from "./cdp.mjs";
+import { launch, consoleLog, crossOriginLines, frameLog, poll, wireLog } from "./cdp.mjs";
 
 const page = process.argv[2] ?? "http://127.0.0.1:5773/";
 const pairs = process.argv.slice(3);
+const expectedUsageTokens = process.env.VERIFY_USAGE_TOKENS ?? null;
+const usagePrivacySentinel = process.env.VERIFY_USAGE_PRIVACY_SENTINEL ?? null;
 if (pairs.length === 0 || pairs.length % 2 !== 0) {
   console.error(
     "usage: add-remote-environment.mjs <page-url> <remote-url> <pairing-code> [<remote-url> <pairing-code> …]",
@@ -94,6 +96,7 @@ const SELECTORS = {
 const session = await launch({ url: page });
 const logs = consoleLog(session);
 const wire = wireLog(session);
+const frames = frameLog(session);
 
 const loaded = await poll(
   () => session.evaluate(`return document.readyState === "complete" ? "yes" : null;`),
@@ -234,6 +237,25 @@ if (corsErrors.length) {
   console.log(corsErrors.join("\n"));
 }
 
+let usageFailure = null;
+if (expectedUsageTokens) {
+  await session.evaluate(`location.assign("/usage"); return 1;`);
+  const usageText = await poll(async () => {
+    const text = await session.evaluate(`return document.body?.innerText ?? "";`);
+    return text.includes("Processed tokens") && text.includes(expectedUsageTokens) ? text : null;
+  }, 20_000);
+  const usageCalls = frames.filter((frame) => frame.text.includes("server.getUsageSummary"));
+  if (!usageText) usageFailure = "the multi-environment Usage report did not settle";
+  else if (!usageText.includes("source duplicates")) {
+    usageFailure = "the duplicate physical source was not reported";
+  } else if (usagePrivacySentinel && usageText.includes(usagePrivacySentinel)) {
+    usageFailure = "raw transcript content reached the multi-environment page";
+  }
+  console.log(`usage settled:  ${usageText ? "yes" : "no"}`);
+  console.log(`usage total:    ${expectedUsageTokens}`);
+  console.log(`usage calls:    ${usageCalls.length}`);
+}
+
 await session.close();
 
 const why = [
@@ -258,6 +280,7 @@ const why = [
         `after adding ${seen.url} the list held ${seen.rows} rows, expected ${seen.expected}`,
     ),
   ...corsErrors,
+  usageFailure,
 ].filter(Boolean);
 if (why.length) {
   console.error(`\nFAILED:\n  ${why.join("\n  ")}`);

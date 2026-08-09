@@ -3,7 +3,7 @@
 //
 // CHROME=/path/to/chromium node tools/ui-driver/probe-usage.mjs \
 //   'http://127.0.0.1:4789/#token=…' sidebar 60 \
-//   'Jul 11, 2026 to Aug 9, 2026' RAW_PRIVATE_SENTINEL
+//   'Jul 11 to Aug 9' RAW_PRIVATE_SENTINEL
 //
 // Use `direct` with a `/usage#token=…` URL to verify Back's root fallback.
 import { consoleLog, frameLog, launch, poll } from "./cdp.mjs";
@@ -88,6 +88,44 @@ try {
       "Codex",
     ]) {
       if (!text.includes(label)) throw new Error(`${label} missing at ${width}px`);
+    }
+    const usageReply = frames
+      .toReversed()
+      .map((frame) => {
+        try {
+          return JSON.parse(frame.text);
+        } catch {
+          return null;
+        }
+      })
+      .find((frame) => Array.isArray(frame?.exit?.value?.buckets));
+    if (!usageReply) throw new Error(`Usage aggregate absent from wire at ${width}px`);
+    const buckets = usageReply.exit.value.buckets;
+    const processed = (bucket) =>
+      bucket.totals.uncachedInputTokens +
+      bucket.totals.cachedInputTokens +
+      bucket.totals.cacheCreationTokens +
+      bucket.totals.outputTokens;
+    const wireTotal = buckets.reduce((total, bucket) => total + processed(bucket), 0);
+    if (`${wireTotal}` !== expectedTokens) {
+      throw new Error(
+        `render expectation ${expectedTokens} disagrees with wire total ${wireTotal}`,
+      );
+    }
+    for (const provider of ["claude", "codex"]) {
+      const providerTotal = buckets
+        .filter((bucket) => bucket.provider === provider)
+        .reduce((total, bucket) => total + processed(bucket), 0);
+      if (!text.includes(`${providerTotal}`)) {
+        throw new Error(`${provider} wire total ${providerTotal} missing at ${width}px`);
+      }
+    }
+    for (const bucket of buckets) {
+      if (!text.includes(bucket.model)) throw new Error(`${bucket.model} missing at ${width}px`);
+    }
+    const unpriced = buckets.reduce((total, bucket) => total + bucket.unpricedRecords, 0);
+    if (unpriced > 0 && !text.includes(`${unpriced} usage record is unpriced.`)) {
+      throw new Error(`unpriced wire coverage missing at ${width}px`);
     }
     if (evidenceDirectory) {
       await mkdir(evidenceDirectory, { recursive: true });
