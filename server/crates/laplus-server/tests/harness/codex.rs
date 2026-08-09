@@ -1015,6 +1015,17 @@ while ($true) { Start-Sleep -Seconds 1 }
             r#"$root = $PSScriptRoot
 $allRequests = Join-Path $root 'requests'
 $conversationRequests = Join-Path $root 'conversation-requests'
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class StandardInputHandle {
+  [DllImport("kernel32.dll")]
+  public static extern IntPtr GetStdHandle(int handle);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool CloseHandle(IntPtr handle);
+}
+'@
 [IO.File]::WriteAllText($allRequests, '')
 [IO.File]::WriteAllText((Join-Path $root 'arguments'), ($args -join ' '))
 [IO.File]::WriteAllText((Join-Path $root 'codex-home'), $env:CODEX_HOME)
@@ -1120,7 +1131,9 @@ if ($next.method -eq 'thread/start' -or $next.method -eq 'thread/resume') {
       Send-Json '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
     } else {
       if (Test-Path (Join-Path $root 'close-input-after-turn')) {
-        [Console]::OpenStandardInput().Close()
+        if (-not [StandardInputHandle]::CloseHandle([StandardInputHandle]::GetStdHandle(-10))) {
+          exit 5
+        }
       }
       [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $root 'turn-terminal')))
       [Console]::Out.Flush()

@@ -399,10 +399,11 @@ async fn an_empty_archive_describes_itself_from_the_registry() {
 
     a_conversation(&mut client, &workspace).await;
 
+    let working = server.connect().await.into_shell_snapshot().await;
     let snapshot = archived_snapshot(&server).await;
     assert_eq!(snapshot["threads"], json!([]), "{snapshot:#?}");
     assert_eq!(
-        snapshot["updatedAt"], snapshot["projects"][0]["updatedAt"],
+        snapshot["updatedAt"], working["updatedAt"],
         "an empty archive borrowed a moment from the project list: {snapshot:#?}"
     );
 
