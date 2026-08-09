@@ -86,5 +86,9 @@ export function useUsageSummary(input: UsageSummaryInput) {
         ? "Usage could not be loaded from any connected environment."
         : null,
     refresh,
+    environmentProgress: environments.map((environment) => ({
+      label: environment.label,
+      state: environment.state,
+    })),
   };
 }

@@ -40,8 +40,114 @@ describe("Usage route", () => {
     renderReport(width);
     expect(await screen.findByRole("heading", { name: "Usage" })).toBeTruthy();
     expect(screen.getByText("Aug 3, 2026 to Aug 9, 2026")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "TOKENS" }));
     expect(screen.getByText("50")).toBeTruthy();
     expect(screen.getByText("Processed tokens")).toBeTruthy();
+  });
+
+  it("moves from API-equivalent headline through providers, metrics, chart and breakdowns", async () => {
+    renderReport(1280, {
+      ...view,
+      summary: {
+        contractVersion: 3,
+        readAt: "2026-08-09T12:00:00Z",
+        timeZone: "UTC",
+        sinceDay: view.input.sinceDay,
+        untilDay: view.input.untilDay,
+        buckets: [
+          {
+            day: "2026-08-09",
+            provider: "claude",
+            model: "claude-fixture",
+            totals: {
+              uncachedInputTokens: 10,
+              cachedInputTokens: 20,
+              cacheCreationTokens: 5,
+              outputTokens: 15,
+              reasoningTokens: 3,
+            },
+            costUsd: 1.25,
+            cacheSavingsUsd: 0.5,
+            costSource: "providerReported",
+            records: 1,
+            unpricedRecords: 0,
+            sessions: 1,
+          },
+        ],
+        sources: [],
+        pricing: {
+          status: "fresh",
+          source: "LiteLLM",
+          fetchedAt: "2026-08-09T12:00:00Z",
+          knownModels: 1,
+        },
+        scanDurationMs: 1,
+        totals: {
+          uncachedInputTokens: 10,
+          cachedInputTokens: 20,
+          cacheCreationTokens: 5,
+          outputTokens: 15,
+          reasoningTokens: 3,
+          processedTokens: 50,
+          costUsd: 1.25,
+          cacheSavingsUsd: 0.5,
+          records: 1,
+          unpricedRecords: 0,
+        },
+        distinctSessions: 1,
+        byProvider: [
+          {
+            key: "claude",
+            provider: "claude",
+            totals: {
+              uncachedInputTokens: 10,
+              cachedInputTokens: 20,
+              cacheCreationTokens: 5,
+              outputTokens: 15,
+              reasoningTokens: 3,
+              processedTokens: 50,
+              costUsd: 1.25,
+              cacheSavingsUsd: 0.5,
+              records: 1,
+              unpricedRecords: 0,
+            },
+            tokenShare: 1,
+            costShare: 1,
+          },
+        ],
+        byModel: [],
+        byDay: [
+          {
+            key: "2026-08-09",
+            day: "2026-08-09",
+            totals: {
+              uncachedInputTokens: 10,
+              cachedInputTokens: 20,
+              cacheCreationTokens: 5,
+              outputTokens: 15,
+              reasoningTokens: 3,
+              processedTokens: 50,
+              costUsd: 1.25,
+              cacheSavingsUsd: 0.5,
+              records: 1,
+              unpricedRecords: 0,
+            },
+            tokenShare: 1,
+            costShare: 1,
+          },
+        ],
+      } as never,
+    });
+    expect(await screen.findByText("Raw token cost")).toBeTruthy();
+    expect(screen.getByText("* if billed at full API rate")).toBeTruthy();
+    expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0);
+    expect(screen.getByText("Cached input")).toBeTruthy();
+    expect(screen.getByRole("img", { name: "Daily cost by provider" })).toBeTruthy();
+    expect(screen.getByText("claude-fixture")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "DAY" }));
+    expect(screen.getByRole("columnheader", { name: "Day" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "TOKENS" }));
+    expect(screen.getByRole("img", { name: "Daily processed tokens by provider" })).toBeTruthy();
   });
 
   it("returns a direct route to the main application", async () => {
