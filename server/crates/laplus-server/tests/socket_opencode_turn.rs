@@ -149,6 +149,10 @@ impl FakeOpenCode {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&self.log) {
+                    if !contents.is_empty() && !contents.ends_with('\n') {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
                     let values = contents
                         .lines()
                         .map(|line| serde_json::from_str(line).expect("logged JSON request"))
