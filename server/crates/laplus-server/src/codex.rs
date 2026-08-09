@@ -38,6 +38,7 @@ use crate::settling::SessionStatus;
 use crate::threads::{Activity, Change};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 const OUTPUT_QUEUE: usize = 256;
 const EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -1015,9 +1016,14 @@ impl AppServer {
 
     async fn request(&mut self, request: Request) -> Result<Value, String> {
         let method = request.method();
+        let timeout = if matches!(&request, Request::Initialize) {
+            STARTUP_RESPONSE_TIMEOUT
+        } else {
+            RESPONSE_TIMEOUT
+        };
         let id = self.send_request(request).await?;
         loop {
-            let line = tokio::time::timeout(RESPONSE_TIMEOUT, self.output.recv())
+            let line = tokio::time::timeout(timeout, self.output.recv())
                 .await
                 .map_err(|_| format!("Codex stopped answering {method}"))?
                 .ok_or_else(|| format!("Codex stopped before answering {method}"))?;
