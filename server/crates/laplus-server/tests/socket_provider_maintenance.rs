@@ -78,7 +78,11 @@ async fn external(version: &'static str) -> String {
 
 fn native_installation() -> (tempfile::TempDir, String) {
     let root = tempfile::tempdir().unwrap();
-    let path = root.path().join(".opencode/bin/opencode");
+    let path = root.path().join(if cfg!(windows) {
+        ".opencode/bin/opencode.exe"
+    } else {
+        ".opencode/bin/opencode"
+    });
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "").unwrap();
     #[cfg(not(windows))]

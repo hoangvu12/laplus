@@ -1949,6 +1949,7 @@ async fn opencode_peer_child() {
 #[tokio::test]
 async fn a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing() {
     let SocketTurn {
+        _workspace,
         // Bound, not discarded: the fake owns a `TempDir` holding the peer's
         // request log, and dropping it deletes the directory out from under the
         // running child.
@@ -2040,6 +2041,7 @@ async fn a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing() {
 #[tokio::test]
 async fn a_subagent_is_not_also_drawn_as_a_tool_called_task() {
     let SocketTurn {
+        _workspace,
         opencode: _opencode,
         server,
         mut client,
@@ -2080,6 +2082,7 @@ async fn a_subagent_is_not_also_drawn_as_a_tool_called_task() {
 #[tokio::test]
 async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
     let SocketTurn {
+        _workspace,
         opencode,
         server,
         mut client,
@@ -2188,6 +2191,7 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
 #[tokio::test]
 async fn stopping_busy_owned_opencode_aborts_and_reaps_its_server() {
     let SocketTurn {
+        _workspace,
         opencode,
         server,
         mut client,
@@ -2229,6 +2233,7 @@ async fn stopping_busy_owned_opencode_aborts_and_reaps_its_server() {
 #[tokio::test]
 async fn an_owned_server_that_exits_during_startup_becomes_a_visible_session_failure() {
     let SocketTurn {
+        _workspace,
         opencode: _opencode,
         server,
         mut client,
@@ -2251,7 +2256,7 @@ async fn an_owned_server_that_exits_during_startup_becomes_a_visible_session_fai
 
 #[tokio::test]
 async fn owned_mcp_registration_failure_is_visible_and_releases_the_grant() {
-    let SocketTurn { opencode, server, mut client, subscription, .. } =
+    let SocketTurn { _workspace, opencode, server, mut client, subscription, .. } =
         start_socket_turn(FakeOpenCode::mcp_failure(), "project-mcp-failed", "thread-mcp-failed").await;
     let events = client.events_through_the_turn(&subscription).await;
     let failed = events.iter().rfind(|item| item["event"]["type"] == "thread.session-set")
@@ -2269,6 +2274,7 @@ async fn owned_mcp_registration_failure_is_visible_and_releases_the_grant() {
 #[tokio::test]
 async fn an_owned_server_readiness_timeout_becomes_a_visible_session_failure() {
     let SocketTurn {
+        _workspace,
         opencode: _opencode,
         server,
         mut client,
@@ -2292,6 +2298,7 @@ async fn an_owned_server_readiness_timeout_becomes_a_visible_session_failure() {
 #[tokio::test]
 async fn server_shutdown_reaps_a_live_owned_opencode_server() {
     let SocketTurn {
+        _workspace,
         opencode,
         server,
         mut client,
@@ -2317,6 +2324,7 @@ async fn server_shutdown_reaps_a_live_owned_opencode_server() {
 #[tokio::test]
 async fn project_closure_reaps_its_threads_live_owned_opencode_server() {
     let SocketTurn {
+        _workspace,
         opencode,
         server,
         mut client,

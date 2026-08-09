@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Stdio;
 
 use serde_json::Value;
@@ -606,6 +607,8 @@ impl ScriptedCodex {
         let codex = ScriptedCodex {
             directory: tempfile::tempdir().expect("a temporary directory"),
         };
+        std::fs::write(codex.directory.path().join("requests"), "")
+            .expect("initializes the request log");
         for (index, line) in received.iter().enumerate() {
             std::fs::write(
                 codex.directory.path().join(format!("response-{index}")),
@@ -616,7 +619,11 @@ impl ScriptedCodex {
         std::fs::write(codex.app_server_path(), codex.app_server_script())
             .expect("writes the app-server");
         #[cfg(windows)]
-        std::fs::write(codex.path(), codex.launcher_script()).expect("writes the cmd launcher");
+        std::fs::write(
+            codex.directory.path().join("codex.cmd"),
+            codex.launcher_script(),
+        )
+        .expect("writes the PATH fallback launcher");
         #[cfg(not(windows))]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -921,17 +928,15 @@ impl ScriptedCodex {
     }
 
     fn path(&self) -> PathBuf {
-        self.directory
-            .path()
-            .join(if cfg!(windows) { "codex.cmd" } else { "codex" })
+        self.directory.path().join(if cfg!(windows) {
+            "codex-app-server.ps1"
+        } else {
+            "codex"
+        })
     }
 
     fn app_server_path(&self) -> PathBuf {
-        if cfg!(windows) {
-            self.directory.path().join("codex-app-server.ps1")
-        } else {
-            self.path()
-        }
+        self.path()
     }
 
     #[cfg(windows)]
@@ -942,7 +947,6 @@ impl ScriptedCodex {
     fn app_server_script(&self) -> String {
         if cfg!(windows) {
             r#"$requests = Join-Path $PSScriptRoot 'requests'
-[IO.File]::WriteAllText($requests, '')
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'arguments'), ($args -join ' '))
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'codex-home'), $env:CODEX_HOME)
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'app-server-pid'), [string]$PID)
@@ -977,7 +981,6 @@ while ($true) { Start-Sleep -Seconds 1 }
             "#!/bin/sh\n\
              printf '%s\\n' \"$$\" > \"$(dirname \"$0\")/app-server-pid\"\n\
              requests=\"$(dirname \"$0\")/requests\"\n\
-             : > \"$requests\"\n\
              read_request() {\n\
                IFS= read -r line || exit 2\n\
                printf '%s\\n' \"$line\" >> \"$requests\"\n\
@@ -1013,28 +1016,27 @@ while ($true) { Start-Sleep -Seconds 1 }
     fn conversation_script(&self) -> String {
         if cfg!(windows) {
             r#"$root = $PSScriptRoot
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $allRequests = Join-Path $root 'requests'
 $conversationRequests = Join-Path $root 'conversation-requests'
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class StandardInputHandle {
-  [DllImport("kernel32.dll")]
-  public static extern IntPtr GetStdHandle(int handle);
-  [DllImport("kernel32.dll", SetLastError = true)]
-  [return: MarshalAs(UnmanagedType.Bool)]
-  public static extern bool CloseHandle(IntPtr handle);
+$fixtureMutex = [Threading.Mutex]::new($false, 'Local\laplus-codex-fixture-' + ($root -replace '[^A-Za-z0-9]', '_'))
+
+function With-FixtureLock([scriptblock]$operation) {
+  $null = $fixtureMutex.WaitOne()
+  try { & $operation } finally { $fixtureMutex.ReleaseMutex() }
 }
-'@
-[IO.File]::WriteAllText($allRequests, '')
-[IO.File]::WriteAllText((Join-Path $root 'arguments'), ($args -join ' '))
-[IO.File]::WriteAllText((Join-Path $root 'codex-home'), $env:CODEX_HOME)
-[IO.File]::WriteAllText((Join-Path $root 'app-server-pid'), [string]$PID)
+
+With-FixtureLock {
+  [IO.File]::WriteAllText((Join-Path $root 'arguments'), ($args -join ' '))
+  [IO.File]::WriteAllText((Join-Path $root 'codex-home'), $env:CODEX_HOME)
+  [IO.File]::WriteAllText((Join-Path $root 'app-server-pid'), [string]$PID)
+}
 
 function Read-Request {
   $line = [Console]::In.ReadLine()
   if ($null -eq $line) { exit 2 }
-  [IO.File]::AppendAllText($allRequests, $line + [Environment]::NewLine)
+  With-FixtureLock { [IO.File]::AppendAllText($allRequests, $line + [Environment]::NewLine) }
   return $line
 }
 function Send-File([int]$index) {
@@ -1131,6 +1133,17 @@ if ($next.method -eq 'thread/start' -or $next.method -eq 'thread/resume') {
       Send-Json '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"fixture turn failed"},"durationMs":5750}}}'
     } else {
       if (Test-Path (Join-Path $root 'close-input-after-turn')) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class StandardInputHandle {
+  [DllImport("kernel32.dll")]
+  public static extern IntPtr GetStdHandle(int handle);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool CloseHandle(IntPtr handle);
+}
+'@
         if (-not [StandardInputHandle]::CloseHandle([StandardInputHandle]::GetStdHandle(-10))) {
           exit 5
         }
@@ -1158,7 +1171,6 @@ while ($true) { Start-Sleep -Seconds 1 }
 root="$(dirname "$0")"
 requests="$root/requests"
 conversation_requests="$root/conversation-requests"
-: > "$requests"
 printf '%s\n' "$*" > "$root/arguments"
 printf '%s\n' "$CODEX_HOME" > "$root/codex-home"
 printf '%s\n' "$$" > "$root/app-server-pid"

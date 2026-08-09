@@ -42,6 +42,39 @@ const CANCELLATION_POLL: Duration = Duration::from_millis(25);
 const OUTPUT_QUEUE: usize = 256;
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 const EXIT_POLL: Duration = Duration::from_millis(20);
+
+// Invoke configured PowerShell scripts without a cmd.exe shim holding duplicate
+// protocol handles between laplus and the app-server.
+fn command_for(binary: &Path) -> Command {
+    #[cfg(windows)]
+    if binary
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+    {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(binary);
+        return command;
+    }
+    Command::new(binary)
+}
+
+fn async_command_for(binary: &Path) -> AsyncCommand {
+    #[cfg(windows)]
+    if binary
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+    {
+        let mut command = AsyncCommand::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(binary);
+        return command;
+    }
+    AsyncCommand::new(binary)
+}
+
 pub struct Snapshot {
     pub version: Option<String>,
     pub auth: ProviderAuth,
@@ -922,7 +955,7 @@ impl AppServer {
         let launch_args = shell_words::split(&settings.launch_args).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
         })?;
-        let mut command = AsyncCommand::new(binary);
+        let mut command = async_command_for(binary);
         command
             .arg("app-server")
             .args(launch_args)
@@ -1148,7 +1181,7 @@ impl Client {
     ) -> Result<Client, String> {
         let launch_args = shell_words::split(&settings.launch_args)
             .map_err(|error| format!("Codex launch arguments could not be read: {error}"))?;
-        let mut command = Command::new(binary);
+        let mut command = command_for(binary);
         command
             .arg("app-server")
             .args(launch_args)

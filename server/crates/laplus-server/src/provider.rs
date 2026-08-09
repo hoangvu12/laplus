@@ -455,7 +455,23 @@ pub fn resolve(configured: &str, search: &Search) -> Located {
 }
 
 pub(crate) fn resolve_codex(configured: &str, search: &Search) -> Located {
-    resolve_named(configured, "codex", search)
+    let located = resolve_named(configured, "codex", search);
+    #[cfg(windows)]
+    // `codex` knows how to invoke this script type directly through PowerShell;
+    // it remains non-executable to every other provider resolver.
+    if let Located::NotExecutable { configured } = &located {
+        if configured.is_file()
+            && configured
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+        {
+            return Located::Binary {
+                path: configured.clone(),
+                source: Source::Configured,
+            };
+        }
+    }
+    located
 }
 
 pub(crate) fn resolve_named(configured: &str, default_name: &str, search: &Search) -> Located {
@@ -1834,6 +1850,35 @@ mod tests {
             Located::Binary {
                 path: configured.path(),
                 source: Source::Configured,
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_accepts_an_explicit_powershell_script_without_making_it_a_generic_program() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let script = directory.path().join("codex.ps1");
+        std::fs::write(&script, "").expect("writes the PowerShell script");
+        let script_named_directory = directory.path().join("not-a-script.ps1");
+        std::fs::create_dir(&script_named_directory).expect("creates the script-named directory");
+        let search = Search::over(&[]);
+
+        assert_eq!(
+            resolve_codex(&script.to_string_lossy(), &search),
+            Located::Binary {
+                path: script.clone(),
+                source: Source::Configured,
+            }
+        );
+        assert_eq!(
+            resolve(&script.to_string_lossy(), &search),
+            Located::NotExecutable { configured: script }
+        );
+        assert_eq!(
+            resolve_codex(&script_named_directory.to_string_lossy(), &search),
+            Located::NotExecutable {
+                configured: script_named_directory,
             }
         );
     }
