@@ -73,6 +73,8 @@ pub const SERVER_GET_CONFIG: &str = "server.getConfig";
 /// holds it, and [`crate::refusals`] repeats it where the refusal used to live.
 pub const SERVER_PROBE: &str = "server.probe";
 
+const ORCHESTRATION_READ_SCOPE: &str = "orchestration:read";
+
 /// The configuration subscription — the simplest of the eight the UI opens,
 /// and the one ticket 04 proves the streaming mechanism on.
 pub const SUBSCRIBE_SERVER_CONFIG: &str = "subscribeServerConfig";
@@ -307,11 +309,11 @@ fn dispatch_scoped(
         SERVER_GET_CONFIG => Ok(Answer::Value(services.config.current().to_value())),
         SERVER_PROBE => Ok(Answer::Value(serde_json::json!({}))),
         usage::GET_SUMMARY => {
-            if !scopes.iter().any(|scope| scope == "orchestration:read") {
+            if !scopes.iter().any(|scope| scope == ORCHESTRATION_READ_SCOPE) {
                 return Err(DispatchError::Declared(serde_json::json!({
                     "_tag": "EnvironmentAuthorizationError",
                     "message": "This method requires orchestration:read access.",
-                    "requiredScope": "orchestration:read"
+                    "requiredScope": ORCHESTRATION_READ_SCOPE
                 })));
             }
             let call = usage::UsageScan::from_payload(payload).map_err(DispatchError::Declared)?;
