@@ -121,6 +121,7 @@ pub mod threads;
 pub mod transcripts;
 pub mod turn;
 pub mod ui;
+pub mod usage;
 pub mod version;
 pub mod watcher;
 pub mod wire;

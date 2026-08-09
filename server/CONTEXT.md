@@ -718,6 +718,11 @@ as the CLI reports it: allowed, close to the limit, or refused.
 `crate::protocol::RateLimit`. Agent-protocol vocabulary with no contract
 equivalent, so it reaches the developer as an activity rather than as a field.
 
+**Usage report** — the historical provider consumption attributed to calendar
+days, models and provider kinds. It is distinct from a conversation's context
+window and from the account's current **standing**.
+_Avoid_: Usage, when the distinction is not already clear.
+
 **Reconciliation** — assistant text arrives twice, as deltas and again as a
 buffered message. The deltas drive live rendering; the buffered message is
 authoritative and replaces the accumulation. Whether the two agreed is recorded.

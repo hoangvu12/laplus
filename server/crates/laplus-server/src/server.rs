@@ -46,7 +46,7 @@ use axum::{middleware, Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch, Notify};
 
-use crate::auth::{self, AuthInvalidBody, Credential, Rejection, UpgradeRequest};
+use crate::auth::{self, AuthInvalidBody, Rejection, UpgradeRequest};
 use crate::config::ServerConfig;
 use crate::config_store::ConfigStore;
 use crate::filesystem::Index;
@@ -3723,9 +3723,8 @@ async fn upgrade(
     // spent anything, which is what lets a client retry with a fresh ticket
     // rather than having to re-pair.
     match authorized(&state, query.as_deref(), &headers) {
-        Ok((presented, _grant)) => {
-            let credential = presented.shape;
-            ws.on_upgrade(move |socket| connection(socket, state, credential))
+        Ok((_presented, grant)) => {
+            ws.on_upgrade(move |socket| connection(socket, state, grant))
         }
         // `Access-Control-Allow-Origin` is not added here, unlike before ticket
         // 73. The reference server sets it on this refusal so that a browser
@@ -3783,15 +3782,21 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
 /// every frame needs from travelling as three arguments.
 struct Connection {
     state: Arc<ServerState>,
+    grant: pairing::Grant,
     subscriptions: Subscriptions,
     frames: mpsc::Sender<String>,
 }
 
 impl Connection {
-    fn new(state: Arc<ServerState>, frames: mpsc::Sender<String>) -> Connection {
+    fn new(
+        state: Arc<ServerState>,
+        frames: mpsc::Sender<String>,
+        grant: pairing::Grant,
+    ) -> Connection {
         let subscriptions = Subscriptions::new(state.subscription_gauge(), frames.clone());
         Connection {
             state,
+            grant,
             subscriptions,
             frames,
         }
@@ -3811,7 +3816,12 @@ impl Connection {
 
         match message {
             ClientMessage::Request { id, tag, payload } => {
-                match rpc::dispatch(&self.state.services, &tag, &payload) {
+                match rpc::dispatch_with_scopes(
+                    &self.state.services,
+                    &self.grant.scopes,
+                    &tag,
+                    &payload,
+                ) {
                     Ok(Answer::Value(value)) => self.send(ServerMessage::success(id, value)).await,
                     // A subscription's first chunk comes from its own task, so
                     // there is nothing to write here. The `Request` is answered
@@ -3923,9 +3933,8 @@ impl Connection {
     }
 }
 
-async fn connection(socket: WebSocket, state: Arc<ServerState>, credential: Credential) {
+async fn connection(socket: WebSocket, state: Arc<ServerState>, grant: pairing::Grant) {
     let _live = LiveConnection::open(&state);
-    let _ = credential; // recorded at the upgrade; nothing verifies it in v1.
 
     let mut shutdown = state.shutdown.clone();
     let (mut outgoing, mut incoming) = socket.split();
@@ -3946,7 +3955,7 @@ async fn connection(socket: WebSocket, state: Arc<ServerState>, credential: Cred
         let _ = outgoing.send(Message::Close(None)).await;
     });
 
-    let mut connection = Connection::new(Arc::clone(&state), frames);
+    let mut connection = Connection::new(Arc::clone(&state), frames, grant);
 
     loop {
         let frame = tokio::select! {
@@ -4117,7 +4126,15 @@ mod tests {
             ));
             let (frames, queued) = mpsc::channel(FRAME_QUEUE);
             Loopback {
-                connection: Connection::new(state, frames),
+                connection: Connection::new(
+                    state,
+                    frames,
+                    pairing::Grant {
+                        subject: "loopback".to_string(),
+                        scopes: vec!["orchestration:read".to_string()],
+                        label: None,
+                    },
+                ),
                 queued,
             }
         }

@@ -19,14 +19,14 @@ The counts below are cheap to reproduce. Reproduce them.
 
 | Surface                              | Declared | Answered |
 | ------------------------------------ | -------- | -------- |
-| RPC methods (`Rpc.make` in `rpc.ts`) | 60       | **36**   |
+| RPC methods (`Rpc.make` in `rpc.ts`) | 61       | **37**   |
 | Dispatchable orchestration commands  | 20       | **20**   |
 | `/api/access/cloudflare` HTTP routes | 18       | **18**   |
 
 `projects.list`, `projects.add` and `projects.remove` appear in `WS_METHODS` but
-have no `Rpc.make`, so 63 strings resolve to 60 real methods. This is not a
+have no `Rpc.make`, so 64 strings resolve to 61 real methods. This is not a
 discovery — `orchestration.rs:4` already documents them as dead — but it is part
-of why the denominator is 60. The other part is
+of why the denominator is 61. The other part is
 [`orchestration.replayEvents`](#orchestrationreplayevents-should-be-deleted-not-implemented-done),
 which was 61's last member and has since left the contract.
 
@@ -94,9 +94,9 @@ to `DEFAULT_RUNTIME_MODE` (`full-access`) or `DEFAULT_PROVIDER_INTERACTION_MODE`
 the identical `model_selection` degradation that already sits in the same
 function. Low priority, behind everything in Gap 2.
 
-## Gap 2 — RPC methods: 36 of 60
+## Gap 2 — RPC methods: 37 of 61
 
-Twenty-four refused. `refusals.rs` enumerates all sixty and the error tag a
+Twenty-four refused. `refusals.rs` enumerates all sixty-one and the error tag a
 refusal carries, so it is the place to read what a client sees.
 
 **Two of the twenty-seven this file first counted are gone**, in the two commits
@@ -321,7 +321,7 @@ walks straight into the removed surface.
 ## What the clusters cost
 
 Non-test TypeScript under `apps/server/src/`, as a rough sizing signal only —
-laplus does not reimplement upstream line for line, and 36 of 60 methods already
+laplus does not reimplement upstream line for line, and 37 of 61 methods already
 fit in 54k lines of `crates/laplus-server/src` (`find . -name '*.rs' | xargs wc -l`,
 so comments and unit tests included; `cargo xtask release` reports the
 production-code figure separately).
@@ -337,10 +337,10 @@ production-code figure separately).
 
 ## Suggested order
 
-Target is **60 of 60**; `replayEvents` has left the contract, so that is the
-denominator now. Ordered by when value lands; each line is independently
-shippable. The first two are done and are kept here so the order still reads as
-one sequence.
+Target is **61 of 61**; `replayEvents` has left the contract and the Usage report
+has since added one declared-and-answered method. Ordered by when value lands;
+each line is independently shippable. The first two are done and are kept here
+so the order still reads as one sequence.
 
 1. ~~`server.probe` + `capabilities.connectionProbe`, one commit.~~ **Done.**
    One line of Rust, and it shortens every liveness check.
@@ -458,18 +458,18 @@ Stated so a later reader does not over-trust it:
 Reproduce with `gh` for the upstream half; there is no upstream checkout and no
 upstream remote.
 
-**Declared RPC methods — 60.**
+**Declared RPC methods — 61.**
 
 ```sh
 grep -c 'Rpc.make' packages/contracts/src/rpc.ts
 ```
 
-All sixty `Rpc.make` calls live in `rpc.ts`, including the orchestration ones,
+All sixty-one `Rpc.make` calls live in `rpc.ts`, including the orchestration ones,
 which resolve against the `as const` map in
-`packages/contracts/src/orchestration.ts:25`. The two maps hold 57 and 6 keys;
-`projects.{list,add,remove}` have no `Rpc.make`, so 63 strings are 60 methods.
+`packages/contracts/src/orchestration.ts:25`. The two maps hold 58 and 6 keys;
+`projects.{list,add,remove}` have no `Rpc.make`, so 64 strings are 61 methods.
 
-**Answered RPC methods — 36.** The arms of the `match tag` in
+**Answered RPC methods — 37.** The arms of the `match tag` in
 `server/crates/laplus-server/src/rpc.rs`, with each `pub const … &str` resolved.
 Bounded by the function rather than by line numbers, which is the correction this
 file's first version needed: it hardcoded `NR>=262 && NR<=470`, and `dispatch`
@@ -488,7 +488,7 @@ list to drift:
 awk '/const REFUSALS: &\[\(&str, Tag\)\] = &\[/,/^\];/' \
   server/crates/laplus-server/src/refusals.rs \
   | grep -oE '^\s+\("[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' | sort > /tmp/declared.txt
-# resolve the 36 arms above to their wire strings into /tmp/implemented.txt, then
+# resolve the 37 arms above to their wire strings into /tmp/implemented.txt, then
 comm -23 /tmp/declared.txt /tmp/implemented.txt
 ```
 

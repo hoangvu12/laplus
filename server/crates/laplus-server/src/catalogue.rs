@@ -382,7 +382,7 @@ fn unquoted(value: &str) -> &str {
 /// It has to agree with what the agent reads or this scans a directory nobody
 /// loads skills from — upstream's `resolveClaudeConfigDirPath` makes the same
 /// point about the same three.
-fn config_dir(settings: &ClaudeSettings) -> PathBuf {
+pub(crate) fn config_dir(settings: &ClaudeSettings) -> PathBuf {
     let configured = settings.home_path.trim();
     if !configured.is_empty() {
         return PathBuf::from(configured);

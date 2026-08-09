@@ -10,6 +10,8 @@ workspace = true
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true

@@ -151,6 +151,9 @@ const REFUSALS: &[(&str, Tag)] = &[
     ("server.getTraceDiagnostics", Tag::EnvironmentAuthorization),
     ("server.getProcessDiagnostics", Tag::EnvironmentAuthorization),
     ("server.getProcessResourceHistory", Tag::EnvironmentAuthorization),
+    // Implemented and method-scoped: ADR-0054 requires orchestration read
+    // access before transcript-derived aggregates are dispatched.
+    ("server.getUsageSummary", Tag::EnvironmentAuthorization),
     ("server.signalProcess", Tag::EnvironmentAuthorization),
     ("projects.searchEntries", Tag::EnvironmentAuthorization),
     ("projects.listEntries", Tag::EnvironmentAuthorization),
@@ -353,4 +356,3 @@ mod tests {
         );
     }
 }
-

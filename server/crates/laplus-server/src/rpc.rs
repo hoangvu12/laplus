@@ -51,6 +51,7 @@ use crate::settings;
 use crate::subscriptions::EventSource;
 use crate::terminal::{self, Attach, Clear, Close, Resize, Restart, Terminals, WriteInput};
 use crate::threads::{self, Watch};
+use crate::usage;
 
 /// The tag the UI sends first, and the tag it re-sends as a liveness probe
 /// when the server does not advertise `connectionProbe`.
@@ -280,9 +281,32 @@ pub fn resume_cursor(payload: &Value) -> Option<i64> {
 
 /// Answer one call.
 pub fn dispatch(services: &Services, tag: &str, payload: &Value) -> Result<Answer, DispatchError> {
+    dispatch_with_scopes(services, &[], tag, payload)
+}
+
+pub fn dispatch_with_scopes(
+    services: &Services,
+    scopes: &[String],
+    tag: &str,
+    payload: &Value,
+) -> Result<Answer, DispatchError> {
     match tag {
         SERVER_GET_CONFIG => Ok(Answer::Value(services.config.current().to_value())),
         SERVER_PROBE => Ok(Answer::Value(serde_json::json!({}))),
+        usage::GET_SUMMARY => {
+            if !scopes.iter().any(|scope| scope == "orchestration:read") {
+                return Err(DispatchError::Declared(serde_json::json!({
+                    "_tag": "EnvironmentAuthorizationError",
+                    "message": "This method requires orchestration:read access.",
+                    "requiredScope": "orchestration:read"
+                })));
+            }
+            let call = usage::ReadSummary::read(payload).map_err(DispatchError::Declared)?;
+            let current = services.config.current();
+            let settings = current.settings.clone();
+            let host_id = current.environment.environment_id.clone();
+            Ok(Answer::Deferred(Deferred::new(move || call.run(settings, host_id))))
+        }
         // The payload is an empty struct in the contract, so there is nothing
         // to read out of it and nothing that can be wrong with it.
         SUBSCRIBE_SERVER_CONFIG => Ok(Answer::Stream(services.config.subscribe())),
