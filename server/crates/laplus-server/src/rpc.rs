@@ -320,7 +320,10 @@ fn dispatch_scoped(
             let current = services.config.current();
             let settings = current.settings.clone();
             let host_id = current.environment.environment_id.clone();
-            Ok(Answer::Deferred(Deferred::new(move || call.run(settings, host_id))))
+            let preferences = current.preferences.clone();
+            Ok(Answer::Deferred(Deferred::new(move || {
+                call.run(settings, host_id, preferences)
+            })))
         }
         // The payload is an empty struct in the contract, so there is nothing
         // to read out of it and nothing that can be wrong with it.

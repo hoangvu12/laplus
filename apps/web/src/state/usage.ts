@@ -1,4 +1,4 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId, UsageDay, UsageSummary, UsageSummaryInput } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -34,11 +34,14 @@ export function useUsageSummary(input: UsageSummaryInput) {
     () => ({ environmentId: (environmentId ?? "missing-primary") as EnvironmentId, input }),
     [environmentId, input],
   );
-  const result = useAtomValue(serverEnvironment.usageSummary(target));
+  const atom = serverEnvironment.usageSummary(target);
+  const result = useAtomValue(atom);
+  const refresh = useAtomRefresh(atom);
   const summary = Option.getOrNull(AsyncResult.value(result));
   return {
     summary,
     isPending: environmentId !== null && result.waiting,
     error: result._tag === "Failure" ? "Usage could not be loaded." : null,
+    refresh,
   };
 }

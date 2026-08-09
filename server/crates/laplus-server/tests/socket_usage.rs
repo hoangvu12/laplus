@@ -32,6 +32,19 @@ fn configured_claude_home(home: &std::path::Path) -> ServerConfig {
     config
 }
 
+fn configured_provider_homes(claude: &std::path::Path, codex: &std::path::Path) -> ServerConfig {
+    let mut config = configured_claude_home(claude);
+    let codex = codex.display().to_string();
+    config.settings.providers.codex.enabled = true;
+    config.settings.providers.codex.binary_path = "unused-codex-fixture".to_string();
+    config.settings.providers.codex.home_path = codex.clone();
+    config.settings.provider_instances["codex"]["enabled"] = json!(true);
+    config.settings.provider_instances["codex"]["config"]["binaryPath"] =
+        json!("unused-codex-fixture");
+    config.settings.provider_instances["codex"]["config"]["homePath"] = json!(codex);
+    config
+}
+
 fn write_one_claude_record(home: &std::path::Path) {
     let project = home.join("projects").join("-tmp-usage-fixture");
     fs::create_dir_all(&project).expect("the fixture project directory is created");
@@ -79,6 +92,64 @@ fn write_one_claude_record(home: &std::path::Path) {
             .join("\n"),
     )
     .expect("the fixture transcript is written");
+}
+
+fn write_one_codex_rollout(home: &std::path::Path) {
+    let sessions = home.join("sessions").join("2026").join("08").join("09");
+    fs::create_dir_all(&sessions).expect("the Codex session directory is created");
+    let rows = [
+        json!({"timestamp":"2026-08-09T11:00:00Z","type":"session_meta","payload":{"id":"codex-session-1"}}),
+        json!({"timestamp":"2026-08-09T11:00:01Z","type":"turn_context","payload":{"model":"gpt-usage-fixture"}}),
+        json!({"timestamp":"2026-08-09T11:00:02Z","type":"response_item","payload":{"text":PRIVATE_REPLY}}),
+        json!({"timestamp":"2026-08-09T11:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":23,"cached_input_tokens":7,"output_tokens":11,"reasoning_output_tokens":5}}}}),
+    ];
+    fs::write(
+        sessions.join("rollout-usage.jsonl"),
+        rows.into_iter()
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("the Codex rollout is written");
+}
+
+#[tokio::test]
+async fn claude_and_codex_history_join_one_aggregate_without_content() {
+    let claude_home = tempfile::tempdir().expect("a temporary Claude home");
+    let codex_home = tempfile::tempdir().expect("a temporary Codex home");
+    write_one_claude_record(claude_home.path());
+    write_one_codex_rollout(codex_home.path());
+    let server = TestServer::start_with(configured_provider_homes(
+        claude_home.path(),
+        codex_home.path(),
+    ))
+    .await;
+    let mut client = server.connect().await;
+
+    let summary = client
+        .call("server.getUsageSummary", input())
+        .await
+        .expect_success();
+    assert_eq!(summary["sources"].as_array().map(Vec::len), Some(2));
+    let codex = summary["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|bucket| bucket["provider"] == "codex")
+        .expect("a Codex bucket");
+    assert_eq!(codex["model"], "gpt-usage-fixture");
+    assert_eq!(
+        codex["totals"],
+        json!({
+            "uncachedInputTokens":16,"cachedInputTokens":7,"cacheCreationTokens":0,
+            "outputTokens":11,"reasoningTokens":5
+        })
+    );
+    let wire = summary.to_string();
+    assert!(!wire.contains(PRIVATE_REPLY));
+
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -207,6 +278,66 @@ async fn a_usage_scan_does_not_hold_the_socket_read_loop() {
         client.await_outcome(&usage).await,
         Outcome::Success(_)
     ));
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_unknown_caller_zone_degrades_to_utc_without_losing_usage() {
+    let claude_home = tempfile::tempdir().expect("a temporary Claude home");
+    write_one_claude_record(claude_home.path());
+    let server = TestServer::start_with(configured_claude_home(claude_home.path())).await;
+    let mut client = server.connect().await;
+
+    let summary = client
+        .call(
+            "server.getUsageSummary",
+            json!({
+                "sinceDay": "2026-08-09",
+                "untilDay": "2026-08-09",
+                "timeZone": "Not/A_Real_Zone",
+            }),
+        )
+        .await
+        .expect_success();
+
+    assert_eq!(summary["timeZone"], "UTC");
+    assert_eq!(summary["buckets"].as_array().map(Vec::len), Some(1));
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_warm_cache_rebuckets_records_when_the_caller_zone_changes() {
+    let claude_home = tempfile::tempdir().expect("a temporary Claude home");
+    write_one_claude_record(claude_home.path());
+    let transcript = claude_home
+        .path()
+        .join("projects/-tmp-usage-fixture/usage-session-1.jsonl");
+    let text = fs::read_to_string(&transcript)
+        .unwrap()
+        .replace("2026-08-09T12:00:01.000Z", "2026-08-09T23:30:01.000Z");
+    fs::write(&transcript, text).unwrap();
+    let server = TestServer::start_with(configured_claude_home(claude_home.path())).await;
+    let mut client = server.connect().await;
+
+    client
+        .call("server.getUsageSummary", input())
+        .await
+        .expect_success();
+    let summary = client
+        .call(
+            "server.getUsageSummary",
+            json!({
+                "sinceDay":"2026-08-10", "untilDay":"2026-08-10", "timeZone":"Asia/Tokyo"
+            }),
+        )
+        .await
+        .expect_success();
+    assert_eq!(summary["buckets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(summary["buckets"][0]["day"], "2026-08-10");
 
     client.close().await;
     server.stop().await;

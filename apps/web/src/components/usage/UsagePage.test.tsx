@@ -20,13 +20,13 @@ const view: UsageReportView = {
 
 afterEach(cleanup);
 
-function renderReport(width: number) {
+function renderReport(width: number, reportView = view) {
   Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
   const root = createRootRoute();
   const route = createRoute({
     getParentRoute: () => root,
     path: "/usage",
-    component: () => <UsageReport view={view} />,
+    component: () => <UsageReport view={reportView} />,
   });
   const router = createRouter({
     routeTree: root.addChildren([route]),
@@ -48,5 +48,41 @@ describe("Usage route", () => {
     const { container } = renderReport(1280);
     fireEvent.click(await screen.findByRole("button", { name: "Back" }));
     expect(container.ownerDocument.location.pathname).toBe("/");
+  });
+
+  it("offers every reporting range, refresh, and provider coverage", async () => {
+    let selected = 0;
+    let refreshes = 0;
+    renderReport(1280, {
+      ...view,
+      rangeDays: 30,
+      onRangeChange: (days) => {
+        selected = days;
+      },
+      onRefresh: () => {
+        refreshes += 1;
+      },
+      sources: [
+        {
+          fingerprint: {
+            hostId: "host",
+            provider: "claude",
+            resolvedHomePath: "/fixture",
+            volumeId: "1:2",
+          },
+          status: "partial",
+          scannedFiles: 1,
+          skippedFiles: 1,
+          malformedRecords: 0,
+          distinctSessions: 1,
+          message: "Some rows were skipped",
+        },
+      ],
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "7 days" }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh usage" }));
+    expect(selected).toBe(7);
+    expect(refreshes).toBe(1);
+    expect(screen.getByText("Claude: partial")).toBeTruthy();
   });
 });
