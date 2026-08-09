@@ -1349,7 +1349,7 @@ async fn approving_a_codex_request_answers_its_json_rpc_id_and_releases_the_turn
     let rest = asked.client.events_through_the_turn(&asked.subscription).await;
 
     assert_eq!(
-        codex.approval_answers(),
+        codex.approval_answers_through(1).await,
         vec![json!({"jsonrpc": "2.0", "id": 0, "result": {"decision": "accept"}})]
     );
     assert_eq!(
@@ -1387,7 +1387,10 @@ async fn declining_when_codex_offers_it_returns_control_without_stopping_the_tur
         })
         .await;
 
-    assert_eq!(codex.approval_answers()[0]["result"]["decision"], "decline");
+    assert_eq!(
+        codex.approval_answers_through(1).await[0]["result"]["decision"],
+        "decline"
+    );
     assert!(!rest
         .iter()
         .any(|item| item["event"]["type"] == "thread.turn-interrupt-requested"));
@@ -1429,7 +1432,10 @@ async fn cancelling_a_codex_request_interrupts_the_turn() {
         })
         .await;
 
-    assert_eq!(codex.approval_answers()[0]["result"]["decision"], "cancel");
+    assert_eq!(
+        codex.approval_answers_through(1).await[0]["result"]["decision"],
+        "cancel"
+    );
     let stopped = rest
         .iter()
         .find(|item| item["event"]["type"] == "thread.turn-interrupt-requested")
@@ -1596,8 +1602,8 @@ async fn a_codex_turn_streams_settles_reuses_its_process_and_is_reaped() {
     assert_eq!(codex.conversation_starts(), 1);
     assert_eq!(codex.turn_requests(), 2);
     assert_eq!(
-        codex.conversation_cwd(),
-        workspace.path().display().to_string()
+        std::fs::canonicalize(codex.conversation_cwd()).expect("the recorded conversation cwd"),
+        std::fs::canonicalize(workspace.path()).expect("the workspace path")
     );
 
     client

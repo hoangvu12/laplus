@@ -769,6 +769,20 @@ impl ScriptedCodex {
             .collect()
     }
 
+    pub async fn approval_answers_through(&self, count: usize) -> Vec<Value> {
+        tokio::time::timeout(super::READ_TIMEOUT, async {
+            loop {
+                let answers = self.approval_answers();
+                if answers.len() >= count {
+                    return answers;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Codex reads the approval answer within READ_TIMEOUT")
+    }
+
     pub fn unsupported_answers(&self) -> Vec<Value> {
         self.requests()
             .into_iter()
@@ -946,16 +960,27 @@ impl ScriptedCodex {
 
     fn app_server_script(&self) -> String {
         if cfg!(windows) {
-            r#"$requests = Join-Path $PSScriptRoot 'requests'
-[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'arguments'), ($args -join ' '))
-[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'codex-home'), $env:CODEX_HOME)
-[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'app-server-pid'), [string]$PID)
+            r#"$root = $PSScriptRoot
+$requests = Join-Path $root 'requests'
+$launchArguments = $args -join ' '
+$fixtureMutex = [Threading.Mutex]::new($false, 'Local\laplus-codex-fixture-' + ($root -replace '[^A-Za-z0-9]', '_'))
+
+function With-FixtureLock([scriptblock]$operation) {
+  try { $null = $fixtureMutex.WaitOne() } catch [Threading.AbandonedMutexException] {}
+  try { & $operation } finally { $fixtureMutex.ReleaseMutex() }
+}
+
+With-FixtureLock {
+  [IO.File]::AppendAllText((Join-Path $root 'arguments'), $launchArguments + [Environment]::NewLine)
+  [IO.File]::WriteAllText((Join-Path $root 'codex-home'), $env:CODEX_HOME)
+  [IO.File]::WriteAllText((Join-Path $root 'app-server-pid'), [string]$PID)
+}
 [Console]::Error.WriteLine('ERROR optional sandbox dependency is unavailable')
 
 function Read-Request {
   $line = [Console]::In.ReadLine()
   if ($null -eq $line) { exit 2 }
-  [IO.File]::AppendAllText($requests, $line + [Environment]::NewLine)
+  With-FixtureLock { [IO.File]::AppendAllText($requests, $line + [Environment]::NewLine) }
 }
 function Send-Response([int]$index) {
   [Console]::Out.Write([IO.File]::ReadAllText((Join-Path $PSScriptRoot "response-$index")))
@@ -1020,15 +1045,16 @@ while ($true) { Start-Sleep -Seconds 1 }
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $allRequests = Join-Path $root 'requests'
 $conversationRequests = Join-Path $root 'conversation-requests'
+$launchArguments = $args -join ' '
 $fixtureMutex = [Threading.Mutex]::new($false, 'Local\laplus-codex-fixture-' + ($root -replace '[^A-Za-z0-9]', '_'))
 
 function With-FixtureLock([scriptblock]$operation) {
-  $null = $fixtureMutex.WaitOne()
+  try { $null = $fixtureMutex.WaitOne() } catch [Threading.AbandonedMutexException] {}
   try { & $operation } finally { $fixtureMutex.ReleaseMutex() }
 }
 
 With-FixtureLock {
-  [IO.File]::WriteAllText((Join-Path $root 'arguments'), ($args -join ' '))
+  [IO.File]::AppendAllText((Join-Path $root 'arguments'), $launchArguments + [Environment]::NewLine)
   [IO.File]::WriteAllText((Join-Path $root 'codex-home'), $env:CODEX_HOME)
   [IO.File]::WriteAllText((Join-Path $root 'app-server-pid'), [string]$PID)
 }

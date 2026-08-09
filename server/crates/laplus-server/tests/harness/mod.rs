@@ -51,7 +51,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{client_async, MaybeTlsStream, WebSocketStream};
 
 /// How long any single read may take before the test fails instead of hanging.
 ///
@@ -72,6 +72,14 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 /// the cost of being too tight is paid on every busy machine, forever. If the
 /// suite is uncomfortably slow, `--test-threads` is the lever — not this.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn retryable_loopback_connect(error: &std::io::Error) -> bool {
+    cfg!(windows)
+        && matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::TimedOut
+        )
+}
 
 /// A server bound to a free loopback port, with the sockets it hands out.
 pub struct TestServer {
@@ -827,7 +835,8 @@ impl TestServer {
             }
         }
 
-        match connect_async(request).await {
+        let stream = MaybeTlsStream::Plain(self.connect_loopback().await);
+        match client_async(request, stream).await {
             Ok((socket, _response)) => Ok(SocketClient {
                 socket,
                 next_id: 0,
@@ -847,6 +856,24 @@ impl TestServer {
             }
             Err(error) => panic!("connecting failed for a non-http reason: {error}"),
         }
+    }
+
+    async fn connect_loopback(&self) -> TcpStream {
+        tokio::time::timeout(READ_TIMEOUT, async {
+            loop {
+                match TcpStream::connect(self.addr()).await {
+                    // A long Windows suite can transiently collide with a loopback
+                    // source port in TIME_WAIT. Let the OS choose again.
+                    Err(error) if retryable_loopback_connect(&error) => {
+                        tokio::task::yield_now().await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .expect("no connection within READ_TIMEOUT — wedged, not merely slow")
+        .expect("connects to the listener")
     }
 
     /// A plain `GET` presenting nothing. Raw HTTP rather than a client library,
@@ -1003,9 +1030,7 @@ impl TestServer {
     }
 
     async fn raw_exchange(&self, request_head: &str, stop: StopAt) -> String {
-        let mut stream = TcpStream::connect(self.addr())
-            .await
-            .expect("connects to the listener");
+        let mut stream = self.connect_loopback().await;
         stream
             .write_all(request_head.as_bytes())
             .await
