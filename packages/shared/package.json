@@ -122,6 +122,10 @@
     "./devProxy": {
       "types": "./src/devProxy.ts",
       "import": "./src/devProxy.ts"
+    },
+    "./usage": {
+      "types": "./src/usage.ts",
+      "import": "./src/usage.ts"
     }
   },
   "scripts": {

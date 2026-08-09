@@ -4,7 +4,7 @@ import { ArrowLeftIcon, RefreshCwIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { SidebarInset } from "../ui/sidebar";
-import { makeUsageWindow, processedTokenTotal, useUsageSummary } from "../../state/usage";
+import { makeUsageWindow, useUsageSummary } from "../../state/usage";
 
 export interface UsageReportView {
   readonly input: UsageSummaryInput;
@@ -15,6 +15,7 @@ export interface UsageReportView {
   readonly rangeDays?: 7 | 30 | 90;
   readonly onRangeChange?: (days: 7 | 30 | 90) => void;
   readonly onRefresh?: () => void;
+  readonly coverageNotices?: ReadonlyArray<{ readonly label: string; readonly message: string }>;
 }
 
 function formatDay(day: string): string {
@@ -95,6 +96,18 @@ export function UsageReport({ view }: { readonly view: UsageReportView }) {
             ))}
           </section>
         ) : null}
+        {view.coverageNotices?.length ? (
+          <section
+            aria-label="Usage coverage notices"
+            className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm"
+          >
+            {view.coverageNotices.map((notice) => (
+              <p key={`${notice.label}:${notice.message}`}>
+                <strong>{notice.label}:</strong> {notice.message}
+              </p>
+            ))}
+          </section>
+        ) : null}
         <section className="rounded-xl border border-border bg-card p-5 sm:p-6">
           <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
             Processed tokens
@@ -123,12 +136,13 @@ export function UsagePage() {
   const view: UsageReportView = {
     input,
     state: usage.error ? "error" : usage.summary ? "success" : "loading",
-    processedTokens: usage.summary ? processedTokenTotal(usage.summary) : 0,
+    processedTokens: usage.summary?.totals.processedTokens ?? 0,
     error: usage.error,
     ...(usage.summary ? { sources: usage.summary.sources } : {}),
     rangeDays,
     onRangeChange: setRangeDays,
     onRefresh: usage.refresh,
+    coverageNotices: usage.notices,
   };
   return <UsageReport view={view} />;
 }

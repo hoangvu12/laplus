@@ -1,11 +1,12 @@
-import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
-import type { EnvironmentId, UsageDay, UsageSummary, UsageSummaryInput } from "@t3tools/contracts";
+import { RegistryContext, useAtomValue } from "@effect/atom-react";
+import type { EnvironmentId, UsageDay, UsageSummaryInput } from "@t3tools/contracts";
+import { mergeUsageEnvironments, type EnvironmentUsageResult } from "@t3tools/shared/usage";
 import * as Option from "effect/Option";
-import { AsyncResult } from "effect/unstable/reactivity";
-import { useMemo } from "react";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { useCallback, useContext, useMemo } from "react";
 
+import { useEnvironments } from "./environments";
 import { serverEnvironment } from "./server";
-import { usePrimaryEnvironmentId } from "./environments";
 
 export function makeUsageWindow(days = 30, now = new Date()): UsageSummaryInput {
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -16,32 +17,74 @@ export function makeUsageWindow(days = 30, now = new Date()): UsageSummaryInput 
   return { sinceDay: day(since), untilDay: day(until), timeZone };
 }
 
-export function processedTokenTotal(summary: UsageSummary): number {
-  return summary.buckets.reduce(
-    (total, bucket) =>
-      total +
-      bucket.totals.uncachedInputTokens +
-      bucket.totals.cachedInputTokens +
-      bucket.totals.cacheCreationTokens +
-      bucket.totals.outputTokens,
-    0,
-  );
+interface UsageTarget {
+  readonly environmentId: EnvironmentId;
+  readonly label: string;
+  readonly phase: string;
 }
 
 export function useUsageSummary(input: UsageSummaryInput) {
-  const environmentId = usePrimaryEnvironmentId();
-  const target = useMemo(
-    () => ({ environmentId: (environmentId ?? "missing-primary") as EnvironmentId, input }),
-    [environmentId, input],
+  const catalog = useEnvironments();
+  const targets = useMemo<ReadonlyArray<UsageTarget>>(
+    () =>
+      catalog.environments.map((environment) => ({
+        environmentId: environment.environmentId,
+        label: environment.label,
+        phase: environment.connection.phase,
+      })),
+    [catalog.environments],
   );
-  const atom = serverEnvironment.usageSummary(target);
-  const result = useAtomValue(atom);
-  const refresh = useAtomRefresh(atom);
-  const summary = Option.getOrNull(AsyncResult.value(result));
+  const targetsKey = targets
+    .map((target) => `${target.environmentId}:${target.label}:${target.phase}`)
+    .join("|");
+  const registry = useContext(RegistryContext);
+  const queries = useMemo(
+    () =>
+      targets.map((target) => ({
+        target,
+        atom: serverEnvironment.usageSummary({ environmentId: target.environmentId, input }),
+      })),
+    [input, targetsKey],
+  );
+  const aggregateAtom = useMemo(
+    () =>
+      Atom.make((get) => queries.map(({ target, atom }) => ({ target, result: get(atom) }))).pipe(
+        Atom.withLabel(`web-usage-environments:${targetsKey}`),
+      ),
+    [queries, targetsKey],
+  );
+  const queried = useAtomValue(aggregateAtom);
+  const refresh = useCallback(() => {
+    for (const query of queries) registry.refresh(query.atom);
+  }, [queries, registry]);
+  const environments: ReadonlyArray<EnvironmentUsageResult> = queried.map(({ target, result }) => {
+    if (target.phase === "offline" || target.phase === "error") {
+      return { environmentId: target.environmentId, label: target.label, state: "failed" };
+    }
+    const summary = Option.getOrNull(AsyncResult.value(result));
+    if (summary !== null) {
+      return {
+        environmentId: target.environmentId,
+        label: target.label,
+        state: "success",
+        summary,
+      };
+    }
+    if (result._tag === "Failure") {
+      return { environmentId: target.environmentId, label: target.label, state: "failed" };
+    }
+    return { environmentId: target.environmentId, label: target.label, state: "pending" };
+  });
+  const merged = mergeUsageEnvironments(environments);
+  const awaitingCatalog = !catalog.isReady || targets.length === 0;
   return {
-    summary,
-    isPending: environmentId !== null && result.waiting,
-    error: result._tag === "Failure" ? "Usage could not be loaded." : null,
+    summary: merged.summary,
+    notices: merged.notices,
+    isPending: awaitingCatalog || merged.isPending,
+    error:
+      !awaitingCatalog && !merged.isPending && merged.summary === null
+        ? "Usage could not be loaded from any connected environment."
+        : null,
     refresh,
   };
 }

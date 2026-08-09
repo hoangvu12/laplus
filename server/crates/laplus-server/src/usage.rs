@@ -5,10 +5,12 @@
 
 mod claude;
 mod codex;
+mod pricing;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use chrono::NaiveDate;
@@ -20,6 +22,9 @@ use crate::config::Settings;
 
 pub const GET_SUMMARY: &str = "server.getUsageSummary";
 pub const CONTRACT_VERSION: u8 = 3;
+const PRICING_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+static PRICING_CACHES: OnceLock<Mutex<BTreeMap<PathBuf, pricing::PricingCache>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct UsageScan {
@@ -69,6 +74,8 @@ impl UsageScan {
         let since = day(&self.since_day).expect("the reporting day was validated");
         let cache_path = preferences.join("usage-scan-cache.json");
         let mut cache = ScanCache::load(&cache_path);
+        let pricing_path = preferences.join("usage-model-rates.json");
+        let (rates, pricing_status, pricing_fetched_at) = pricing(&pricing_path);
         let claude =
             crate::provider::claude_instance(&settings, crate::provider::CLAUDE_INSTANCE_ID);
         let codex = crate::provider::codex_instance(&settings, crate::provider::CODEX_INSTANCE_ID);
@@ -101,7 +108,7 @@ impl UsageScan {
             buckets
                 .entry(key)
                 .or_insert_with(|| Bucket::new(&record))
-                .add(record);
+                .add(record, &rates);
         }
 
         cache.prune();
@@ -114,7 +121,12 @@ impl UsageScan {
             "untilDay": self.until_day,
             "buckets": buckets.into_values().collect::<Vec<_>>(),
             "sources": sources,
-            "pricing": {"status":"unavailable", "source":"LiteLLM pricing unavailable", "fetchedAt":null, "knownModels":0},
+            "pricing": {
+                "status": pricing_status,
+                "source": PRICING_URL,
+                "fetchedAt": pricing_fetched_at,
+                "knownModels": rates.len()
+            },
             "scanDurationMs": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }))
     }
@@ -379,6 +391,45 @@ fn read_error(reason: &str, detail: impl Into<String>) -> Value {
     json!({"_tag":"UsageReadError", "reason":reason, "detail":detail.into()})
 }
 
+fn pricing(path: &Path) -> (pricing::RateTable, &'static str, Option<String>) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let caches = PRICING_CACHES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut caches = caches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = caches.entry(path.to_path_buf()).or_default();
+    cache.ensure(path, now_ms, fetch_pricing_document);
+    let fetched_at = cache.fetched_at_ms().and_then(|stamp| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(stamp)
+            .map(|stamp| stamp.to_rfc3339())
+    });
+    (cache.rates().clone(), cache.status().as_str(), fetched_at)
+}
+
+fn fetch_pricing_document() -> Result<Value, ()> {
+    let url = std::env::var("LAPLUS_USAGE_PRICING_URL").unwrap_or_else(|_| PRICING_URL.to_string());
+    if url == "disabled" {
+        return Err(());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| ())?;
+    runtime.block_on(async move {
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| ())?
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| ())?
+            .error_for_status()
+            .map_err(|_| ())?;
+        response.json::<Value>().await.map_err(|_| ())
+    })
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ScanCache {
     #[serde(default)]
@@ -554,6 +605,12 @@ struct Bucket {
     sessions: usize,
     #[serde(skip)]
     session_ids: HashSet<String>,
+    #[serde(skip)]
+    has_reported: bool,
+    #[serde(skip)]
+    has_model_priced: bool,
+    #[serde(skip)]
+    has_unpriced: bool,
 }
 impl Bucket {
     fn new(record: &Record) -> Self {
@@ -569,16 +626,45 @@ impl Bucket {
             unpriced_records: 0,
             sessions: 0,
             session_ids: HashSet::new(),
+            has_reported: false,
+            has_model_priced: false,
+            has_unpriced: false,
         }
     }
-    fn add(&mut self, record: Record) {
+    fn add(&mut self, record: Record, rates: &pricing::RateTable) {
+        let priced = pricing::price_usage(
+            rates,
+            &record.model,
+            record.totals.uncached_input_tokens,
+            record.totals.cached_input_tokens,
+            record.totals.cache_creation_tokens,
+            record.totals.output_tokens,
+            record.reported_cost_usd,
+        );
+        self.cost_usd += priced.cost_usd;
+        self.cache_savings_usd +=
+            pricing::cache_savings_usd(rates, &record.model, record.totals.cached_input_tokens);
+        match priced.source {
+            pricing::CostSource::ProviderReported => self.has_reported = true,
+            pricing::CostSource::ModelPriced => self.has_model_priced = true,
+            pricing::CostSource::Unpriced => {
+                self.has_unpriced = true;
+                self.unpriced_records += 1;
+            }
+        }
+        self.cost_source = if self.has_model_priced || (self.has_reported && self.has_unpriced) {
+            "modelPriced"
+        } else if self.has_reported {
+            "providerReported"
+        } else {
+            "unpriced"
+        };
         self.totals.uncached_input_tokens += record.totals.uncached_input_tokens;
         self.totals.cached_input_tokens += record.totals.cached_input_tokens;
         self.totals.cache_creation_tokens += record.totals.cache_creation_tokens;
         self.totals.output_tokens += record.totals.output_tokens;
         self.totals.reasoning_tokens += record.totals.reasoning_tokens;
         self.records += 1;
-        self.unpriced_records += 1;
         if !record.session.is_empty() {
             self.session_ids.insert(record.session);
         }

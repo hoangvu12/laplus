@@ -435,10 +435,20 @@ impl TestServer {
         assets: Assets,
     ) -> TestServer {
         let preferences = tempfile::tempdir().expect("a temporary directory");
+        let pricing_fixture = config.as_ref().and_then(|config| {
+            std::fs::read(config.preferences.join("usage-model-rates.json")).ok()
+        });
         let mut config = config
             .unwrap_or_else(ServerConfig::detect)
             .with_remote_access(RemoteAccess::none());
         config.preferences = preferences.path().to_path_buf();
+        if let Some(pricing_fixture) = pricing_fixture {
+            std::fs::write(
+                config.preferences.join("usage-model-rates.json"),
+                pricing_fixture,
+            )
+            .expect("the deterministic Usage pricing fixture is installed");
+        }
         somewhere_that_is_not_the_developers(&mut config);
 
         let server = Server::bind_with(0, config, database, assets)

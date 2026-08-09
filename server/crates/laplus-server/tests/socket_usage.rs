@@ -25,6 +25,7 @@ fn input() -> Value {
 }
 
 fn configured_claude_home(home: &std::path::Path) -> ServerConfig {
+    std::env::set_var("LAPLUS_USAGE_PRICING_URL", "disabled");
     let mut config = ServerConfig::detect();
     let home = home.display().to_string();
     config.settings.providers.claude_agent.home_path = home.clone();
@@ -81,7 +82,8 @@ fn write_one_claude_record(home: &std::path::Path) {
             "session_id": "usage-session-1",
             "uuid": "usage-assistant-1",
             "timestamp": "2026-08-09T12:00:01.000Z",
-            "request_id": "req_usage_fixture"
+            "request_id": "req_usage_fixture",
+            "costUSD": 1.25
         }),
     ];
     fs::write(
@@ -102,6 +104,8 @@ fn write_one_codex_rollout(home: &std::path::Path) {
         json!({"timestamp":"2026-08-09T11:00:01Z","type":"turn_context","payload":{"model":"gpt-usage-fixture"}}),
         json!({"timestamp":"2026-08-09T11:00:02Z","type":"response_item","payload":{"text":PRIVATE_REPLY}}),
         json!({"timestamp":"2026-08-09T11:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":23,"cached_input_tokens":7,"output_tokens":11,"reasoning_output_tokens":5}}}}),
+        json!({"timestamp":"2026-08-09T11:00:04Z","type":"turn_context","payload":{"model":"unknown-usage-fixture"}}),
+        json!({"timestamp":"2026-08-09T11:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":3,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1}}}}),
     ];
     fs::write(
         sessions.join("rollout-usage.jsonl"),
@@ -153,6 +157,64 @@ async fn claude_and_codex_history_join_one_aggregate_without_content() {
 }
 
 #[tokio::test]
+async fn provider_reported_model_priced_and_unknown_records_share_one_summary() {
+    std::env::set_var("LAPLUS_USAGE_PRICING_URL", "disabled");
+    let claude_home = tempfile::tempdir().expect("a temporary Claude home");
+    let codex_home = tempfile::tempdir().expect("a temporary Codex home");
+    let pricing_home = tempfile::tempdir().expect("temporary server preferences");
+    write_one_claude_record(claude_home.path());
+    write_one_codex_rollout(codex_home.path());
+    let fetched_at = chrono::Utc::now().timestamp_millis();
+    fs::write(
+        pricing_home.path().join("usage-model-rates.json"),
+        json!({
+            "fetchedAtMs": fetched_at,
+            "document": {
+                "openai/gpt-usage-fixture": {
+                    "input_cost_per_token": 0.01,
+                    "output_cost_per_token": 0.02,
+                    "cache_read_input_token_cost": 0.001
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut config = configured_provider_homes(claude_home.path(), codex_home.path());
+    config.preferences = pricing_home.path().to_path_buf();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+
+    let summary = client
+        .call("server.getUsageSummary", input())
+        .await
+        .expect_success();
+    assert_eq!(summary["pricing"]["status"], "fresh");
+    let buckets = summary["buckets"].as_array().unwrap();
+    let claude = buckets
+        .iter()
+        .find(|bucket| bucket["provider"] == "claude")
+        .unwrap();
+    assert_eq!(claude["costSource"], "providerReported");
+    assert_eq!(claude["costUsd"], 1.25);
+    let priced = buckets
+        .iter()
+        .find(|bucket| bucket["model"] == "gpt-usage-fixture")
+        .unwrap();
+    assert_eq!(priced["costSource"], "modelPriced");
+    assert_eq!(priced["unpricedRecords"], 0);
+    let unknown = buckets
+        .iter()
+        .find(|bucket| bucket["model"] == "unknown-usage-fixture")
+        .unwrap();
+    assert_eq!(unknown["costSource"], "unpriced");
+    assert_eq!(unknown["unpricedRecords"], 1);
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn an_authorized_claude_record_reaches_the_usage_summary_without_its_content() {
     let claude_home = tempfile::tempdir().expect("a temporary Claude home");
     write_one_claude_record(claude_home.path());
@@ -181,11 +243,11 @@ async fn an_authorized_claude_record_reaches_the_usage_summary_without_its_conte
                 "outputTokens": 19,
                 "reasoningTokens": 0
             },
-            "costUsd": 0.0,
+            "costUsd": 1.25,
             "cacheSavingsUsd": 0.0,
-            "costSource": "unpriced",
+            "costSource": "providerReported",
             "records": 1,
-            "unpricedRecords": 1,
+            "unpricedRecords": 0,
             "sessions": 1
         }])
     );
