@@ -57,6 +57,7 @@ jobs:
           # `laplus-server` and `xtask`.
           - os: windows-latest
             scope: ""
+            test-args: -- --test-threads=1
           # The platform that runs headless. `-p laplus-server` rather than the
           # default set, because `xtask` exists to build and measure a Windows
           # installer — running its tests on Linux would be a second opinion
@@ -67,6 +68,7 @@ jobs:
           # not — see `server/docs/running-headless.md`.
           - os: ubuntu-latest
             scope: -p laplus-server
+            test-args: ""
 
     # `server/` is the Cargo workspace root — `Cargo.toml`, `.cargo/config.toml`
     # and `target/` are there rather than at the repository root, so every cargo
@@ -119,8 +121,15 @@ jobs:
       # which is what `default-members` is for: `laplus-shell` needs a pnpm
       # build of `apps/web/dist` and is asked for by name or not at all. It is
       # Tauri, it would need WebKitGTK, and it is not built on either runner.
+      #
+      # Only Windows serializes tests. The socket binaries drive `.cmd` provider
+      # doubles through anonymous pipes; under concurrent runner load a control
+      # response can be accepted by the server while the double never resumes,
+      # leaving an otherwise healthy test waiting for its terminal frame. The
+      # release gate uses the same load-control lever. Linux has native shell
+      # doubles and keeps the faster default parallelism.
       - name: Test
-        run: cargo test ${{ matrix.scope }} --no-fail-fast
+        run: cargo test ${{ matrix.scope }} --no-fail-fast ${{ matrix.test-args }}
 
       # Reports, does not gate. One pre-existing `result_large_err` in
       # `server.rs` would make `-D warnings` red on arrival, and a check that is

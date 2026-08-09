@@ -148,17 +148,21 @@ one that passes when it should not.
 
 ### In CI
 
-`.github/workflows/rust.yml` runs `cargo test --no-fail-fast` for any change
-under `server/`, on **two runners**:
+`.github/workflows/rust.yml` runs the suite for any change under `server/`, on
+**two runners**:
 
-- **`windows-latest`**, the whole default set — `laplus-server` and `xtask`.
+- **`windows-latest`**, the whole default set — `laplus-server` and `xtask` —
+  with `cargo test --no-fail-fast -- --test-threads=1`. The `.cmd` provider
+  doubles use anonymous pipes and become unreliable under concurrent runner
+  load, so this uses the same documented load-control lever as the release gate.
   This is the platform laplus installs on, and the only one that exercises the
   crate's `cfg(windows)` blocks or the ConPTY behind `portable-pty`.
 - **`ubuntu-latest`**, `-p laplus-server` only. Added by ticket 05 of the
-  headless-Linux effort, because every `#[cfg(not(windows))]` twin in the crate
-  had been written and never compiled. `xtask` is left out on purpose: it builds
-  and measures a Windows installer, so its tests on Linux would be a second
-  opinion about string constants.
+  headless-Linux effort, with the default parallel test runner because its shell
+  doubles do not have the Windows failure mode. Every `#[cfg(not(windows))]`
+  twin in the crate had been written and never compiled. `xtask` is left out on
+  purpose: it builds and measures a Windows installer, so its tests on Linux
+  would be a second opinion about string constants.
 
 `fail-fast: false`, so one platform going red still leaves the other's answer.
 It gates on the build and the suite only: clippy reports without `-D warnings`,
