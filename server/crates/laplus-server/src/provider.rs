@@ -50,7 +50,7 @@
 //!   states are reported explicitly.
 
 use std::path::{Path, PathBuf};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -342,6 +342,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the probe looks to see whether the child has finished.
 const PROBE_POLL: Duration = Duration::from_millis(20);
 
+/// Linux's `ETXTBSY`, returned while an executable is still open for writing.
+#[cfg(target_os = "linux")]
+const PROBE_BUSY_ERROR: i32 = 26;
+
+/// How many times Linux may briefly refuse an executable that is being replaced.
+#[cfg(target_os = "linux")]
+const PROBE_BUSY_RETRIES: usize = 5;
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -568,11 +576,20 @@ fn probe(path: &Path, patience: Duration) -> Probed {
         .stderr(Stdio::piped());
     crate::process::without_a_console(&mut command);
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return Probed::Unstartable {
-                error: error.to_string(),
+    #[cfg(target_os = "linux")]
+    let mut busy_retries = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            #[cfg(target_os = "linux")]
+            Err(error) if error.raw_os_error() == Some(PROBE_BUSY_ERROR) && busy_retries < PROBE_BUSY_RETRIES => {
+                busy_retries += 1;
+                std::thread::sleep(PROBE_POLL);
+            }
+            Err(error) => {
+                return Probed::Unstartable {
+                    error: error.to_string(),
+                }
             }
         }
     };
@@ -1739,12 +1756,16 @@ mod tests {
                 directory: tempfile::tempdir().expect("a temporary directory"),
             };
             let path = fake.path();
-            if cfg!(windows) {
-                std::fs::write(&path, format!("@echo off\r\n{script}\r\n"))
-                    .expect("writes the batch file");
+            let contents = if cfg!(windows) {
+                format!("@echo off\r\n{script}\r\n")
             } else {
-                std::fs::write(&path, format!("#!/bin/sh\n{script}\n"))
-                    .expect("writes the shell script");
+                format!("#!/bin/sh\n{script}\n")
+            };
+            let mut file = std::fs::File::create(&path).expect("creates the fake binary");
+            file.write_all(contents.as_bytes()).expect("writes the fake binary");
+            file.flush().expect("flushes the fake binary");
+            drop(file);
+            if !cfg!(windows) {
                 #[cfg(not(windows))]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -2019,6 +2040,30 @@ mod tests {
             Probed::Failed { code, .. } => assert_eq!(code, Some(3)),
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    /// Linux refuses to execute an inode while another process still has it
+    /// open for writing. Package managers replace executables this way during
+    /// updates, so a probe tolerates that short handoff instead of reporting a
+    /// working binary as permanently unstartable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_binary_briefly_busy_for_writing_is_retried() {
+        let reporting = Fake::reporting("2.1.220");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(reporting.path())
+            .expect("opens the executable for writing");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(PROBE_POLL * 2);
+            drop(writer);
+        });
+
+        assert_eq!(
+            probe(&reporting.path(), PROBE_TIMEOUT),
+            Probed::Version("2.1.220".to_string())
+        );
+        release.join().expect("the writer is released");
     }
 
     /// The parse is deliberately loose, so the cases worth pinning are the ones
