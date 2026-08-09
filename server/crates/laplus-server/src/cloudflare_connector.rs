@@ -28,6 +28,17 @@ const MAX_RESTARTS: u8 = 3;
 const CONNECTOR_OWNERSHIP: &str = "laplus";
 const READY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Build every cloudflared child with the platform process policy laplus uses.
+///
+/// In particular, a GUI application must opt out of Windows allocating a
+/// console for a console-subsystem child. Keeping that decision here prevents
+/// the long-running connector and the short account commands from diverging.
+pub(crate) fn command(executable: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(executable);
+    crate::process::without_a_console(command.as_std_mut());
+    command
+}
+
 crate::public_exposure::closed_vocabulary! {
     /// Whether laplus should be running this connector.
     ///
@@ -853,7 +864,7 @@ impl Manager {
                 arguments.push(token_file.to_string_lossy().into_owned());
             }
             arguments.extend(["--metrics".to_string(), metrics.clone(), "run".into()]);
-            let mut command = tokio::process::Command::new(&configuration.executable_path);
+            let mut command = command(&configuration.executable_path);
             command
                 .args(&arguments)
                 .stdin(Stdio::null())
@@ -1229,6 +1240,7 @@ async fn terminate_group(process_group: Option<u32>) {
     #[cfg(windows)]
     if let Some(pid) = process_group {
         let mut command = tokio::process::Command::new("taskkill.exe");
+        crate::process::without_a_console(command.as_std_mut());
         command
             .args(["/PID", &pid.to_string(), "/T"])
             .stdin(Stdio::null())
@@ -1268,7 +1280,7 @@ pub(crate) async fn compatible_version(executable: &Path) -> Result<String, Refu
 }
 
 async fn detect_version(executable: &Path) -> Result<String, String> {
-    let output = tokio::process::Command::new(executable)
+    let output = command(executable)
         .arg("--version")
         .stdin(Stdio::null())
         .output()

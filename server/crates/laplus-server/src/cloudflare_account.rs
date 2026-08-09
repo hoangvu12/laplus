@@ -313,7 +313,7 @@ impl Account {
         // No `--origincert`: where the certificate is written is cloudflared's
         // decision, and redirecting it would mean managing a file laplus does
         // not own.
-        let mut command = tokio::process::Command::new(&executable);
+        let mut command = crate::cloudflare_connector::command(&executable);
         command
             .args(["tunnel", "login"])
             .stdin(Stdio::null())
@@ -489,7 +489,7 @@ impl Account {
     /// simply run again.
     pub async fn list_tunnels(&self, executable: &Path) -> Result<(), Refusal> {
         let (executable, certificate) = self.consented_command(executable).await?;
-        let output = tokio::process::Command::new(&executable)
+        let output = crate::cloudflare_connector::command(&executable)
             .args([
                 "tunnel",
                 "--origincert",
@@ -644,7 +644,7 @@ impl Account {
         if let Some(parent) = credential_file.parent() {
             crate::cloudflare_connector::private_directory(parent)?;
         }
-        let output = tokio::process::Command::new(&executable)
+        let output = crate::cloudflare_connector::command(&executable)
             .args([
                 "tunnel",
                 "--origincert",
@@ -733,7 +733,7 @@ impl Account {
             crate::cloudflare_connector::private_directory(parent)
                 .map_err(FailedAllocation::without_a_tunnel)?;
         }
-        let output = tokio::process::Command::new(&executable)
+        let output = crate::cloudflare_connector::command(&executable)
             .args([
                 "tunnel",
                 "--origincert",
@@ -827,7 +827,7 @@ impl Account {
         hostname: &str,
     ) -> Result<(), Refusal> {
         let (executable, certificate) = self.consented_command(executable).await?;
-        let output = tokio::process::Command::new(&executable)
+        let output = crate::cloudflare_connector::command(&executable)
             .args([
                 "tunnel",
                 "--origincert",
@@ -875,7 +875,7 @@ impl Account {
     /// no `route dns delete`. See [`crate::cloudflare_dns`].
     pub async fn delete_tunnel(&self, executable: &Path, tunnel_id: &str) -> Result<(), Refusal> {
         let (executable, certificate) = self.consented_command(executable).await?;
-        let output = tokio::process::Command::new(&executable)
+        let output = crate::cloudflare_connector::command(&executable)
             .args([
                 "tunnel",
                 "--origincert",
