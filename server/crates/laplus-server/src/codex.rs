@@ -1014,12 +1014,13 @@ impl AppServer {
     }
 
     async fn request(&mut self, request: Request) -> Result<Value, String> {
+        let method = request.method();
         let id = self.send_request(request).await?;
         loop {
             let line = tokio::time::timeout(RESPONSE_TIMEOUT, self.output.recv())
                 .await
-                .map_err(|_| "Codex stopped answering a request".to_string())?
-                .ok_or_else(|| "Codex stopped before answering a request".to_string())?;
+                .map_err(|_| format!("Codex stopped answering {method}"))?
+                .ok_or_else(|| format!("Codex stopped before answering {method}"))?;
             match protocol::decode_incoming(&line) {
                 Ok(Incoming::Request { id, method, .. }) => {
                     self.write(&protocol::unsupported_request(&id, &method)).await?;

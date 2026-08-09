@@ -12,6 +12,20 @@ pub struct ScriptedCodex {
     directory: tempfile::TempDir,
 }
 
+fn fixture_directory() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(target).expect("creates the Cargo test temp directory");
+        return tempfile::Builder::new()
+            .prefix("laplus-codex-")
+            .tempdir_in(target)
+            .expect("a temporary Codex directory under Cargo's target");
+    }
+    #[cfg(not(windows))]
+    tempfile::tempdir().expect("a temporary directory")
+}
+
 fn rewrite_conversation_ids(value: &mut Value) {
     match value {
         Value::String(text) if text == "codex-thread-1" => {
@@ -605,7 +619,7 @@ impl ScriptedCodex {
             .collect();
 
         let codex = ScriptedCodex {
-            directory: tempfile::tempdir().expect("a temporary directory"),
+            directory: fixture_directory(),
         };
         std::fs::write(codex.directory.path().join("requests"), "")
             .expect("initializes the request log");
