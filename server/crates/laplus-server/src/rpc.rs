@@ -280,11 +280,24 @@ pub fn resume_cursor(payload: &Value) -> Option<i64> {
 }
 
 /// Answer one call.
-pub fn dispatch(services: &Services, tag: &str, payload: &Value) -> Result<Answer, DispatchError> {
-    dispatch_with_scopes(services, &[], tag, payload)
+pub fn dispatch_without_grant(
+    services: &Services,
+    tag: &str,
+    payload: &Value,
+) -> Result<Answer, DispatchError> {
+    dispatch_scoped(services, &[], tag, payload)
 }
 
-pub fn dispatch_with_scopes(
+pub fn dispatch(
+    services: &Services,
+    grant: &crate::pairing::Grant,
+    tag: &str,
+    payload: &Value,
+) -> Result<Answer, DispatchError> {
+    dispatch_scoped(services, &grant.scopes, tag, payload)
+}
+
+fn dispatch_scoped(
     services: &Services,
     scopes: &[String],
     tag: &str,
@@ -301,7 +314,7 @@ pub fn dispatch_with_scopes(
                     "requiredScope": "orchestration:read"
                 })));
             }
-            let call = usage::ReadSummary::read(payload).map_err(DispatchError::Declared)?;
+            let call = usage::UsageScan::from_payload(payload).map_err(DispatchError::Declared)?;
             let current = services.config.current();
             let settings = current.settings.clone();
             let host_id = current.environment.environment_id.clone();
@@ -668,7 +681,7 @@ mod tests {
     #[test]
     fn get_config_returns_the_config() {
         let services = services();
-        let answer = dispatch(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
+        let answer = dispatch_without_grant(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
         assert_eq!(value(answer), services.config.current().to_value());
     }
 
@@ -677,8 +690,8 @@ mod tests {
     #[test]
     fn get_config_is_repeatable() {
         let services = services();
-        let first = dispatch(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
-        let second = dispatch(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
+        let first = dispatch_without_grant(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
+        let second = dispatch_without_grant(&services, SERVER_GET_CONFIG, &json!({})).expect("dispatches");
         assert_eq!(value(first), value(second));
     }
 
@@ -690,7 +703,7 @@ mod tests {
     fn probe_answers_empty_every_time() {
         let services = services();
         for _ in 0..3 {
-            let answer = dispatch(&services, SERVER_PROBE, &json!({})).expect("dispatches");
+            let answer = dispatch_without_grant(&services, SERVER_PROBE, &json!({})).expect("dispatches");
             assert_eq!(value(answer), json!({}));
         }
     }
@@ -716,7 +729,7 @@ mod tests {
             (threads::SUBSCRIBE_THREAD, json!({"threadId": "thread-1"})),
             (terminal::SUBSCRIBE_METADATA, json!({})),
         ] {
-            let answer = dispatch(&services, tag, &payload).expect("dispatches");
+            let answer = dispatch_without_grant(&services, tag, &payload).expect("dispatches");
             assert!(matches!(answer, Answer::Stream(_)), "{tag} does not stream");
         }
     }
@@ -754,7 +767,7 @@ mod tests {
                 "OrchestrationGetSnapshotError",
             ),
         ] {
-            let error = dispatch(&services, tag, &payload).expect_err("a refusal");
+            let error = dispatch_without_grant(&services, tag, &payload).expect_err("a refusal");
 
             assert!(matches!(error, DispatchError::Declared(_)), "{tag}");
             assert_eq!(error.to_error()["_tag"], expected, "{tag}");
@@ -783,7 +796,7 @@ mod tests {
                 payload["terminalId"] = json!("term-1");
                 payload
             };
-            let error = dispatch(&services, tag, &payload).expect_err("a refusal");
+            let error = dispatch_without_grant(&services, tag, &payload).expect_err("a refusal");
 
             assert!(matches!(error, DispatchError::Declared(_)), "{tag}");
             let error = error.to_error();
@@ -807,7 +820,7 @@ mod tests {
             (filesystem::BROWSE, json!({"partialPath": path})),
             (filesystem::LIST_ENTRIES, json!({"cwd": path})),
         ] {
-            let answer = dispatch(&services, tag, &payload).expect("dispatches");
+            let answer = dispatch_without_grant(&services, tag, &payload).expect("dispatches");
             match answer {
                 Answer::Deferred(work) => {
                     work.run().unwrap_or_else(|error| panic!("{tag}: {error}"));
@@ -834,7 +847,7 @@ mod tests {
         });
 
         for tag in [terminal::CLOSE, terminal::RESTART] {
-            let answer = dispatch(&services, tag, &named).expect("dispatches");
+            let answer = dispatch_without_grant(&services, tag, &named).expect("dispatches");
             assert!(
                 matches!(answer, Answer::Deferred(_)),
                 "{tag} answered inline"
@@ -843,7 +856,7 @@ mod tests {
 
         // …and clearing does not, because it is arithmetic on a string the
         // registry already holds.
-        let answer = dispatch(&services, terminal::CLEAR, &named);
+        let answer = dispatch_without_grant(&services, terminal::CLEAR, &named);
         assert!(
             matches!(answer, Err(DispatchError::Declared(_))),
             "a clear of a terminal that is not there is answered where it is asked"
@@ -860,7 +873,7 @@ mod tests {
     #[test]
     fn an_unknown_tag_becomes_a_typed_error_naming_the_method() {
         let services = services();
-        let error = dispatch(&services, "no.such.method", &json!({})).expect_err("not implemented");
+        let error = dispatch_without_grant(&services, "no.such.method", &json!({})).expect_err("not implemented");
         assert_eq!(
             error,
             DispatchError::UnknownMethod("no.such.method".to_string())
@@ -895,7 +908,7 @@ mod tests {
         let mut refused = std::collections::BTreeSet::new();
 
         for (method, union) in &declared {
-            let Err(DispatchError::UnknownMethod(_)) = dispatch(&services, method, &json!({}))
+            let Err(DispatchError::UnknownMethod(_)) = dispatch_without_grant(&services, method, &json!({}))
             else {
                 continue;
             };
@@ -942,7 +955,7 @@ mod tests {
             checkpoints::GET_TURN_DIFF,
             checkpoints::GET_FULL_THREAD_DIFF,
         ] {
-            let answer = dispatch(&services, tag, &asked).expect("dispatches");
+            let answer = dispatch_without_grant(&services, tag, &asked).expect("dispatches");
             assert!(
                 matches!(answer, Answer::Deferred(_)),
                 "{tag} answered inline"
@@ -970,7 +983,7 @@ mod tests {
                 "OrchestrationGetFullThreadDiffError",
             ),
         ] {
-            let answer = dispatch(&services, tag, &asked).expect("dispatches");
+            let answer = dispatch_without_grant(&services, tag, &asked).expect("dispatches");
             let Answer::Deferred(work) = answer else {
                 panic!("{tag} answered inline");
             };

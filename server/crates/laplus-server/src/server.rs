@@ -3816,9 +3816,9 @@ impl Connection {
 
         match message {
             ClientMessage::Request { id, tag, payload } => {
-                match rpc::dispatch_with_scopes(
+                match rpc::dispatch(
                     &self.state.services,
-                    &self.grant.scopes,
+                    &self.grant,
                     &tag,
                     &payload,
                 ) {

@@ -19,14 +19,15 @@ pub const GET_SUMMARY: &str = "server.getUsageSummary";
 pub const CONTRACT_VERSION: u8 = 3;
 
 #[derive(Debug, Clone)]
-pub struct ReadSummary {
+pub struct UsageScan {
     since_day: String,
     until_day: String,
     time_zone: String,
+    zone: Tz,
 }
 
-impl ReadSummary {
-    pub fn read(payload: &Value) -> Result<Self, Value> {
+impl UsageScan {
+    pub fn from_payload(payload: &Value) -> Result<Self, Value> {
         let field = |name: &str| {
             payload.get(name).and_then(Value::as_str).map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -40,8 +41,8 @@ impl ReadSummary {
         if since > until {
             return Err(read_error("invalidWindow", "sinceDay must not be after untilDay"));
         }
-        time_zone.parse::<Tz>().map_err(|_| read_error("invalidWindow", "timeZone is not a known IANA time zone"))?;
-        Ok(Self { since_day, until_day, time_zone })
+        let zone = time_zone.parse::<Tz>().map_err(|_| read_error("invalidWindow", "timeZone is not a known IANA time zone"))?;
+        Ok(Self { since_day, until_day, time_zone, zone })
     }
 
     pub fn run(self, settings: Settings, host_id: String) -> Result<Value, Value> {
@@ -50,9 +51,6 @@ impl ReadSummary {
             .ok_or_else(|| read_error("scanFailed", "the Claude provider configuration is unavailable"))?;
         let home = crate::catalogue::config_dir(&claude.settings);
         let projects = home.join("projects");
-        let zone = self.time_zone.parse::<Tz>()
-            .map_err(|_| read_error("invalidWindow", "timeZone is not a known IANA time zone"))?;
-
         let mut files = Vec::new();
         let missing = !projects.exists();
         if !missing {
@@ -70,7 +68,7 @@ impl ReadSummary {
                 Err(_) => { skipped_files += 1; continue; }
             };
             for line in text.lines() {
-                let Some(record) = parse_claude(line, zone) else {
+                let Some(record) = parse_claude(line, self.zone) else {
                     if line.contains("\"usage\"") { malformed += 1; }
                     continue;
                 };
@@ -184,7 +182,7 @@ mod tests {
     }
     #[test]
     fn refuses_an_inverted_window_as_the_declared_error() {
-        let error = ReadSummary::read(&json!({"sinceDay":"2026-08-10","untilDay":"2026-08-09","timeZone":"UTC"})).unwrap_err();
+        let error = UsageScan::from_payload(&json!({"sinceDay":"2026-08-10","untilDay":"2026-08-09","timeZone":"UTC"})).unwrap_err();
         assert_eq!(error["_tag"], "UsageReadError");
         assert_eq!(error["reason"], "invalidWindow");
     }

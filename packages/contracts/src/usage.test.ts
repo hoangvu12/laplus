@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { UsageReadError, UsageSummary } from "./usage.ts";
 
 const decodeUsageSummary = Schema.decodeUnknownSync(UsageSummary);
+const decodeUsageReadError = Schema.decodeUnknownSync(UsageReadError);
 
 const validSummary = {
   contractVersion: 3,
@@ -58,8 +59,13 @@ describe("Usage reporting contract", () => {
     expect(JSON.stringify(decoded)).not.toContain("prompt");
   });
 
-  it.each(["scanFailed", "invalidWindow"] as const)("declares %s as a read failure", (reason) => {
-    expect(new UsageReadError({ reason, detail: "bounded detail" }).reason).toBe(reason);
+  it.each(["scanFailed", "invalidWindow"] as const)("decodes %s from the wire", (reason) => {
+    const decoded = decodeUsageReadError({
+      _tag: "UsageReadError",
+      reason,
+      detail: "bounded detail",
+    });
+    expect(decoded.reason).toBe(reason);
   });
 
   it("rejects non-calendar day strings", () => {
