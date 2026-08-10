@@ -7,6 +7,7 @@ import type {
   UnifiedSettings,
 } from "@t3tools/contracts";
 import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
+import * as Equal from "effect/Equal";
 
 export function isProjectGroupingEnabled(mode: SidebarProjectGroupingMode): boolean {
   return mode !== "separate";
@@ -105,11 +106,25 @@ export function buildProviderInstanceUpdatePatch(input: {
     LegacyProviderSettings | undefined
   >;
   const legacyProviderDefault = input.isDefault ? legacyProviderDefaults[input.driver] : undefined;
+  const legacyProviderCurrent = (
+    input.settings.providers as Record<string, LegacyProviderSettings | undefined>
+  )[input.driver];
+  // The legacy bucket is reset because its value has just been promoted into
+  // `providerInstances` — so it is worth sending only when there is something
+  // there to reset. Two reasons not to send it otherwise, both of which broke
+  // this panel outright: a patch field is a change request, and every field of
+  // one is validated, so a bucket repeating its own defaults could still be
+  // refused for naming a driver or a field this server does not carry; and the
+  // whole `providers` map used to be spread in, which meant editing Claude asked
+  // to write Cursor, Grok and OpenCode too. Absent means unchanged.
+  const resetsLegacyProvider =
+    legacyProviderDefault !== undefined &&
+    legacyProviderCurrent !== undefined &&
+    !Equal.equals(legacyProviderCurrent, legacyProviderDefault);
   return {
-    ...(legacyProviderDefault !== undefined
+    ...(resetsLegacyProvider
       ? {
           providers: {
-            ...input.settings.providers,
             [input.driver]: legacyProviderDefault,
           } as ServerSettings["providers"],
         }

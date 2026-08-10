@@ -613,12 +613,20 @@ fn codex(mut codex: CodexSettings, patch: &Map<String, Value>) -> Result<CodexSe
             "homePath" => codex.home_path = text(field, value)?,
             "launchArgs" => codex.launch_args = text(field, value)?,
             "customModels" => codex.custom_models = models(value)?,
+            // Refused as a *change* and accepted as a mention, which is the rule
+            // `enableAssistantStreaming` follows and for the same reason: this
+            // server has no shadow home, so the empty string is the value in
+            // force, and the settings panel sends the whole bucket when it resets
+            // one. Refusing the repeat refused the patch around it, which is how
+            // every provider toggle came to do nothing.
             "shadowHomePath" => {
-                return Err(
-                    "'providers.codex.shadowHomePath' is an account-selection setting, and \
-                     this server runs one Codex account, so it cannot honour or store it."
-                        .to_string(),
-                )
+                if !text(field, value)?.is_empty() {
+                    return Err(
+                        "'providers.codex.shadowHomePath' is an account-selection setting, and \
+                         this server runs one Codex account, so it cannot honour or store it."
+                            .to_string(),
+                    );
+                }
             }
             unknown => return Err(unrecognised(&format!("providers.codex.{unknown}"))),
         }
@@ -1031,6 +1039,11 @@ mod tests {
             "enableAssistantStreaming": true,
             "providerInstances": {},
             "defaultThreadEnvMode": "local",
+            // The settings panel resets a legacy bucket by sending the whole
+            // thing, and this server's shadow home is the empty string. Refusing
+            // the repeat refused the patch around it, and every provider toggle
+            // in the window did nothing.
+            "providers": {"codex": {"shadowHomePath": ""}},
         }))
         .expect("a patch that changes nothing is not a change");
         assert_eq!(after, defaults());
