@@ -140,6 +140,13 @@ impl OpenCodeClient {
         self.request_json(Method::GET, "agent", Option::<&()>::None)
             .await
     }
+    /// Every skill this server would load, in the shape `opencode debug skill`
+    /// prints — the two are the same list read the same way, which is what lets
+    /// a local instance and an external one publish the same catalogue.
+    pub async fn skills(&self) -> Result<Value, OpenCodeError> {
+        self.request_json(Method::GET, "skill", Option::<&()>::None)
+            .await
+    }
     pub async fn register_mcp(&self, session: &crate::mcp::Session) -> Result<(), String> {
         let body = serde_json::json!({
             "name":"laplus",

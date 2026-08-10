@@ -58,6 +58,13 @@ async fn opencode_peer(include_connected: bool) -> String {
             {"name":"build","mode":"primary","hidden":false},
             {"name":"secret","mode":"primary","hidden":true},
             {"name":"helper","mode":"subagent","hidden":false}
+        ])) }))
+        .route("/skill", get(|| async { Json(json!([
+            {"name":"tdd","description":"Test-first","location":"/home/dev/.agents/skills/tdd/SKILL.md",
+             "content":"the whole body, which must not reach the client"},
+            {"name":"customize-opencode","description":"Configure OpenCode","location":"<built-in>","content":"body"},
+            {"name":"  ","description":"nameless","location":"/nowhere"},
+            {"name":"tdd","description":"a second helping","location":"/elsewhere/SKILL.md"}
         ])) }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -316,6 +323,18 @@ async fn external_opencode_instances_discover_independently_and_keep_custom_fall
     // `Schema.optional` decodes.
     assert_eq!(good["models"][0]["subProvider"], "Anthropic", "{good}");
     assert!(good["models"][1].get("subProvider").is_none(), "{good}");
+    // The skills the `$` menu draws: sorted, deduplicated by name, the nameless
+    // entry dropped, and every body left behind — `content` is tens of kilobytes
+    // per skill and the menu needs a name and a sentence.
+    assert_eq!(skill_names(&good), vec!["customize-opencode", "tdd"]);
+    assert_eq!(good["skills"][0]["scope"], "built-in", "{good}");
+    assert_eq!(good["skills"][0]["path"], "<built-in>", "{good}");
+    assert_eq!(good["skills"][1]["path"], "/home/dev/.agents/skills/tdd/SKILL.md", "{good}");
+    assert_eq!(good["skills"][1]["description"], "Test-first", "{good}");
+    // A path this server cannot place is left unlabelled rather than called
+    // `user`, which would be a scope that lies.
+    assert!(good["skills"][1].get("scope").is_none(), "{good}");
+    assert!(good["skills"][1].get("content").is_none(), "{good}");
     assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][0]["id"], "agent");
     assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
     assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][1]["id"], "variant");
@@ -343,9 +362,9 @@ async fn external_opencode_refuses_inventory_that_does_not_name_connected_provid
 #[tokio::test]
 async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions() {
     let current = FakeAgent::saying(if cfg!(windows) {
-        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& echo openrouter/anthropic/claude:latest& echo {\"id\":\"anthropic/claude:latest\",\"name\":\"Nested Claude\",\"variants\":{}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo compaction ^(primary^)& echo   []& echo summary ^(primary^)& echo   []& echo title ^(primary^)& echo   []& echo helper ^(subagent^)& exit /b 0\r\nexit /b 2"
+        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& echo openrouter/anthropic/claude:latest& echo {\"id\":\"anthropic/claude:latest\",\"name\":\"Nested Claude\",\"variants\":{}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo compaction ^(primary^)& echo   []& echo summary ^(primary^)& echo   []& echo title ^(primary^)& echo   []& echo helper ^(subagent^)& exit /b 0\r\nif \"%1\"==\"debug\" echo [{\"name\":\"tdd\",\"description\":\"Test-first\",\"location\":\"C:\\\\dev\\\\.agents\\\\skills\\\\tdd\\\\SKILL.md\",\"content\":\"body\"}]& exit /b 0\r\nexit /b 2"
     } else {
-        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' 'openrouter/anthropic/claude:latest' '{' '  \"id\": \"anthropic/claude:latest\",' '  \"name\": \"Nested Claude\",' '  \"variants\": {}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'compaction (primary)' '  []' 'summary (primary)' '  []' 'title (primary)' '  []' 'helper (subagent)' ;;\n*) exit 2;;\nesac"
+        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' 'openrouter/anthropic/claude:latest' '{' '  \"id\": \"anthropic/claude:latest\",' '  \"name\": \"Nested Claude\",' '  \"variants\": {}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'compaction (primary)' '  []' 'summary (primary)' '  []' 'title (primary)' '  []' 'helper (subagent)' ;;\ndebug) printf '%s\\n' '[{\"name\":\"tdd\",\"description\":\"Test-first\",\"location\":\"/home/dev/.agents/skills/tdd/SKILL.md\",\"content\":\"body\"}]' ;;\n*) exit 2;;\nesac"
     });
     let old = FakeAgent::saying("echo 1.14.18");
     let server = TestServer::start().await;
@@ -369,6 +388,12 @@ async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions(
     // unless it is named as hidden here.
     assert_eq!(local["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
     assert_eq!(local["models"][0]["capabilities"]["optionDescriptors"][0]["options"][0]["id"], "build", "{local}");
+    // `debug skill` is the only CLI that reports skills, and a local instance
+    // publishes the same shape an external one does.
+    assert_eq!(skill_names(&local), vec!["tdd"], "{local}");
+    assert_eq!(local["skills"][0]["description"], "Test-first", "{local}");
+    assert_eq!(local["skills"][0]["enabled"], true, "{local}");
+    assert!(local["skills"][0]["path"].as_str().is_some_and(|path| path.ends_with("SKILL.md")), "{local}");
     assert_eq!(old["status"], "error", "{old}");
     assert!(message(&old).contains("1.14.19 or newer"), "{old}");
     server.stop().await;
@@ -483,6 +508,17 @@ fn message(provider: &Value) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("a diagnostic: {provider}"))
         .to_string()
+}
+
+/// The skill names a provider is offering, in the order the `$` menu will draw
+/// them.
+fn skill_names(provider: &Value) -> Vec<String> {
+    provider["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an array of skills: {provider}"))
+        .iter()
+        .map(|skill| skill["name"].as_str().expect("a name").to_string())
+        .collect()
 }
 
 /// The model slugs a provider is offering, in the order it offers them — the

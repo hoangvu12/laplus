@@ -1390,48 +1390,49 @@ fn describe_opencode(instance: &OpenCodeInstance, search: &Search) -> Provider {
     let settings = &instance.settings;
     if !settings.enabled {
         return opencode_snapshot(instance, None, Installed::No, ProviderState::Disabled,
-            Some("The OpenCode provider is switched off in settings.".to_string()), custom_models(&settings.custom_models));
+            Some("The OpenCode provider is switched off in settings.".to_string()), custom_models(&settings.custom_models), Vec::new());
     }
     if !settings.server_url.is_empty() {
         return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => match runtime.block_on(tokio::time::timeout(PROBE_TIMEOUT, discover_external_opencode(settings))) {
-                Ok(Ok((version, models))) => opencode_snapshot(instance, Some(version), Installed::Yes,
-                    ProviderState::Ready, None, merge_custom(models, &settings.custom_models)),
+                Ok(Ok((version, models, skills))) => opencode_snapshot(instance, Some(version), Installed::Yes,
+                    ProviderState::Ready, None, merge_custom(models, &settings.custom_models), skills),
                 Ok(Err(error)) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-                    Some(format!("OpenCode server discovery failed: {error}.")), custom_models(&settings.custom_models)),
+                    Some(format!("OpenCode server discovery failed: {error}.")), custom_models(&settings.custom_models), Vec::new()),
                 Err(_) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
                     Some(format!("OpenCode server discovery did not finish within {} seconds.", PROBE_TIMEOUT.as_secs())),
-                    custom_models(&settings.custom_models)),
+                    custom_models(&settings.custom_models), Vec::new()),
             },
             Err(error) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-                Some(format!("OpenCode server discovery could not start: {error}.")), custom_models(&settings.custom_models)),
+                Some(format!("OpenCode server discovery could not start: {error}.")), custom_models(&settings.custom_models), Vec::new()),
         };
     }
     let (path, _) = match resolve_named(&settings.binary_path, "opencode", search)
         .startable_for("OpenCode CLI") {
         Ok(found) => found,
         Err(why) => return opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-            Some(why), custom_models(&settings.custom_models)),
+            Some(why), custom_models(&settings.custom_models), Vec::new()),
     };
     let version = match probe(&path, PROBE_TIMEOUT) {
         Probed::Version(version) => version,
         other => return opencode_snapshot(instance, None, Installed::Yes, ProviderState::Error,
-            Some(format!("OpenCode version probe failed: {other:?}.")), custom_models(&settings.custom_models)),
+            Some(format!("OpenCode version probe failed: {other:?}.")), custom_models(&settings.custom_models), Vec::new()),
     };
     if parse_version(&version).is_none_or(|found| found < MINIMUM_OPENCODE_VERSION) {
         return opencode_snapshot(instance, Some(version.clone()), Installed::Yes, ProviderState::Error,
             Some(format!("OpenCode {version} is unsupported; version 1.14.19 or newer is required.")),
-            custom_models(&settings.custom_models));
+            custom_models(&settings.custom_models), Vec::new());
     }
     match discover_local_opencode(&path) {
-        Ok(models) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Ready,
-            None, merge_custom(models, &settings.custom_models)),
+        Ok((models, skills)) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Ready,
+            None, merge_custom(models, &settings.custom_models), skills),
         Err(error) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Error,
-            Some(format!("OpenCode catalogue discovery failed: {error}.")), custom_models(&settings.custom_models)),
+            Some(format!("OpenCode catalogue discovery failed: {error}.")), custom_models(&settings.custom_models), Vec::new()),
     }
 }
 
-async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(String, Vec<ProviderModel>), String> {
+async fn discover_external_opencode(settings: &OpenCodeSettings)
+    -> Result<(String, Vec<ProviderModel>, Vec<serde_json::Value>), String> {
     let client = crate::opencode::OpenCodeClient::new(
         &settings.server_url, ".", (!settings.server_password.is_empty()).then(|| settings.server_password.clone()),
     ).map_err(|error| error.to_string())?;
@@ -1439,7 +1440,12 @@ async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(Stri
         let health = client.health().await?;
         let providers = client.providers().await?;
         let agents = client.agents().await?;
-        Ok::<_, crate::opencode::OpenCodeError>((health, providers, agents))
+        // Best-effort, unlike its three neighbours: a server that cannot answer
+        // for its skills still has models to offer, and refusing the provider
+        // over a menu would cost the developer the thing they came for. Older
+        // OpenCode servers have no `/skill` at all.
+        let skills = client.skills().await.unwrap_or(serde_json::Value::Null);
+        Ok::<_, crate::opencode::OpenCodeError>((health, providers, agents, skills))
     };
     // Discovery is GET-only. A fresh connection can fail transiently while a
     // loaded host starts or replaces the external server, so retry transport
@@ -1454,15 +1460,67 @@ async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(Stri
             result => break result,
         }
     };
-    let (health, providers, agents) = discovered.map_err(|error| error.to_string())?;
+    let (health, providers, agents, skills) = discovered.map_err(|error| error.to_string())?;
     if !health.healthy { return Err("the server reported unhealthy".to_string()); }
-    Ok((health.version, opencode_models(&providers, &agents)?))
+    Ok((health.version, opencode_models(&providers, &agents)?, opencode_skills(&skills)))
 }
 
-fn discover_local_opencode(path: &Path) -> Result<Vec<ProviderModel>, String> {
+fn discover_local_opencode(path: &Path) -> Result<(Vec<ProviderModel>, Vec<serde_json::Value>), String> {
     let models = bounded_command(path, &["models", "--verbose"], PROBE_TIMEOUT)?;
     let agents = bounded_command(path, &["agent", "list"], PROBE_TIMEOUT)?;
-    Ok(local_models(&models, &local_agents(&agents)))
+    // `debug skill` prints exactly what `GET /skill` answers, and it is the only
+    // CLI that reports skills at all — there is no `opencode skill list`. Its
+    // failure is not the catalogue's: a `?` here would trade every model for a
+    // menu, so the skills go missing on their own.
+    let skills = bounded_command(path, &["debug", "skill"], PROBE_TIMEOUT)
+        .ok()
+        .and_then(|listed| serde_json::from_str::<serde_json::Value>(listed.trim()).ok())
+        .unwrap_or(serde_json::Value::Null);
+    Ok((local_models(&models, &local_agents(&agents)), opencode_skills(&skills)))
+}
+
+/// OpenCode's skill list as `ServerProviderSkill`s.
+///
+/// Both discovery paths land here because both read the same list — `GET /skill`
+/// and `opencode debug skill` answer the same four fields, and the shape the UI
+/// is handed must not depend on which one this instance was reached by.
+///
+/// `content` is deliberately dropped. It is the whole body of every skill, tens
+/// of kilobytes of it on an ordinary machine, and the `$` menu needs a name and
+/// a sentence — the agent reads the body itself.
+///
+/// **`scope` is set only where it can be told honestly.** Claude's scan knows
+/// the directory it read, so it can say `user` or `project`; OpenCode reports an
+/// absolute path it resolved by its own rules, and calling a project skill
+/// `user` because this server cannot tell would be a label that lies. Built-ins
+/// name themselves, and they are the one case that is certain.
+fn opencode_skills(skills: &serde_json::Value) -> Vec<serde_json::Value> {
+    const BUILT_IN: &str = "<built-in>";
+    let mut found: Vec<serde_json::Value> = Vec::new();
+    for skill in skills.as_array().into_iter().flatten() {
+        let Some(name) = skill.get("name").and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|name| !name.is_empty()) else { continue };
+        if found.iter().any(|seen| seen["name"] == name) { continue; }
+        let location = skill.get("location").and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|location| !location.is_empty()).unwrap_or(BUILT_IN);
+        let mut record = serde_json::json!({
+            "name": name,
+            "path": location,
+            "enabled": true,
+        });
+        if location == BUILT_IN {
+            record["scope"] = serde_json::Value::String("built-in".to_string());
+        }
+        if let Some(description) = skill.get("description").and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|description| !description.is_empty()) {
+            record["description"] = serde_json::Value::String(description.to_string());
+        }
+        found.push(record);
+    }
+    // Sorted for the reason [`crate::catalogue`] sorts: this list is a menu, and
+    // rows that moved between refreshes would be rows nobody could learn.
+    found.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    found
 }
 
 pub(crate) struct OpenCodeCatalogueModel {
@@ -1644,7 +1702,8 @@ fn merge_custom(mut discovered: Vec<ProviderModel>, configured: &[String]) -> Ve
 }
 
 fn opencode_snapshot(instance: &OpenCodeInstance, version: Option<String>, installed: Installed,
-    status: ProviderState, message: Option<String>, models: Vec<ProviderModel>) -> Provider {
+    status: ProviderState, message: Option<String>, models: Vec<ProviderModel>,
+    skills: Vec<serde_json::Value>) -> Provider {
     let version_advisory = crate::provider_maintenance::opencode_action(
         &instance.settings.binary_path,
         &Search::from_environment(),
@@ -1657,7 +1716,12 @@ fn opencode_snapshot(instance: &OpenCodeInstance, version: Option<String>, insta
     Provider { instance_id: instance.identity.instance_id.clone(), driver: OPENCODE_DRIVER.to_string(),
         display_name: instance.display_name.clone(), enabled: instance.settings.enabled,
         installed: installed == Installed::Yes, version, status, message, auth: unknown_auth(),
-        checked_at: now_iso(), models, slash_commands: Vec::new(), skills: Vec::new(),
+        // No slash commands. OpenCode has them — `GET /command` answers 37 on an
+        // ordinary machine — but there is no CLI that lists them, so a local
+        // instance could not answer and an external one would be the only kind
+        // with a `/` menu. One catalogue that depends on how the instance was
+        // reached is worse than one this server does not claim yet.
+        checked_at: now_iso(), models, slash_commands: Vec::new(), skills,
         version_advisory, update_state: None }
 }
 

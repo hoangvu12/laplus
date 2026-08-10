@@ -288,10 +288,27 @@ skills from disk; Codex answers `skills/list` for the registered workspaces in
 the same app-server probe that supplies its account and models.
 
 OpenCode's catalogue is its connected upstream models plus its visible primary
-agents and model variants. A local instance reads them from `opencode models
---verbose` and `opencode agent list`; an external instance asks its HTTP API.
-Only connected upstream providers contribute discovered models, while custom
-configured models remain available as fallback entries.
+agents, model variants and skills. A local instance reads them from `opencode
+models --verbose`, `opencode agent list` and `opencode debug skill`; an external
+instance asks its HTTP API. Only connected upstream providers contribute
+discovered models, while custom configured models remain available as fallback
+entries.
+
+**OpenCode reports its own skills; this server does not scan for them.** `GET
+/skill` and `opencode debug skill` answer the same four fields, so both discovery
+paths publish the same list — which is the point, because OpenCode resolves its
+own search paths, its own precedence and its own built-ins, and a scan here would
+be a second opinion about another tool's rules. Two consequences: the skill body
+is dropped, being tens of kilobytes the `$` menu has no use for; and `scope` is
+set only for a built-in, because an absolute path OpenCode resolved is one this
+server cannot place as `user` or `project` without guessing. Failing to read them
+costs the skills and not the models — a provider refused over a menu would lose
+the developer the thing they came for.
+
+**OpenCode contributes no slash commands**, though it has them: `GET /command`
+answers on an external instance and no CLI lists them at all, so a local instance
+could not answer. One catalogue whose contents depend on how the instance was
+reached is worse than one this server does not claim yet.
 
 **Sub-provider** — the upstream a discovered model belongs to, carried on every
 OpenCode model in the snapshot. OpenCode is a front for other providers, so one
