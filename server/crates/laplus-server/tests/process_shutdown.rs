@@ -124,8 +124,11 @@ async fn sigterm_stops_the_connector_laplus_started() {
     );
     assert!(fake.launches() >= 1, "the connector was never started");
     // Running, and not yet stopped — otherwise the assertion below would pass
-    // for a connector that had merely crashed.
-    assert!(!fake.stopped_gracefully());
+    // for a connector that had merely crashed. Count the event rather than
+    // requiring it to remain the last trace line: startup's independent
+    // version probe may finish after shutdown and append its own invocation.
+    let graceful_stops_before = fake.graceful_stops();
+    assert_eq!(graceful_stops_before, 0);
 
     server.terminate();
     let status = server.wait();
@@ -135,7 +138,7 @@ async fn sigterm_stops_the_connector_laplus_started() {
     // handler this line never appears: the server dies where it stands and the
     // connector, in its own process group, keeps serving the public hostname.
     settles(
-        || fake.stopped_gracefully(),
+        || fake.graceful_stops() > graceful_stops_before,
         "the connector outlived the server it was started by",
     );
     assert!(status.success(), "a requested shutdown is not a failure: {status:?}");
