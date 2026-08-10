@@ -371,6 +371,17 @@ pub struct ProviderModel {
     pub slug: String,
     pub name: String,
     pub is_custom: bool,
+    /// Who serves this model behind the driver, when the driver is a front for
+    /// somebody else. OpenCode is: `openai/gpt-5` and `siliconflow/Qwen/Qwen3.5-27B`
+    /// arrive from the same instance and the picker has nothing but this to tell
+    /// them apart — two upstreams routinely name the same model identically, and
+    /// the model search indexes this field rather than the slug. Absent for the
+    /// drivers that answer for themselves.
+    ///
+    /// **Omitted rather than null when there is none**: the contract types it
+    /// `Schema.optional`, where absent decodes and null does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_default: Option<bool>,
     /// The reasoning-effort, fast-mode and context-window toggles the composer

@@ -46,7 +46,7 @@ async fn opencode_peer(include_connected: bool) -> String {
     use axum::{routing::get, Json, Router};
     let mut inventory = json!({
         "providers": [
-            {"id":"anthropic","models":{"claude-sonnet":{"id":"claude-sonnet","name":"Claude Sonnet","variants":{"fast":{},"max":{}}}}},
+            {"id":"anthropic","name":"Anthropic","models":{"claude-sonnet":{"id":"claude-sonnet","name":"Claude Sonnet","variants":{"fast":{},"max":{}}}}},
             {"id":"offline","models":{"ghost":{"id":"ghost"}}}
         ]
     });
@@ -310,6 +310,12 @@ async fn external_opencode_instances_discover_independently_and_keep_custom_fall
     assert_eq!(good["status"], "ready", "{good}");
     assert_eq!(good["version"], "1.18.10", "{good}");
     assert_eq!(slugs(&good), vec!["anthropic/claude-sonnet", "ollama/qwen3"]);
+    // The inventory's own display name where it has one. An authored fallback is
+    // the developer's slug and nothing else, so it names no upstream at all —
+    // and the field is absent rather than null, which is what the contract's
+    // `Schema.optional` decodes.
+    assert_eq!(good["models"][0]["subProvider"], "Anthropic", "{good}");
+    assert!(good["models"][1].get("subProvider").is_none(), "{good}");
     assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][0]["id"], "agent");
     assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
     assert_eq!(good["models"][0]["capabilities"]["optionDescriptors"][1]["id"], "variant");
@@ -337,9 +343,9 @@ async fn external_opencode_refuses_inventory_that_does_not_name_connected_provid
 #[tokio::test]
 async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions() {
     let current = FakeAgent::saying(if cfg!(windows) {
-        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& echo openrouter/anthropic/claude:latest& echo {\"id\":\"anthropic/claude:latest\",\"name\":\"Nested Claude\",\"variants\":{}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo helper ^(subagent^)& exit /b 0\r\nexit /b 2"
+        "if \"%1\"==\"--version\" echo 1.18.10 & exit /b 0\r\nif \"%1\"==\"models\" echo openai/gpt-5& echo {\"id\":\"gpt-5\",\"name\":\"GPT 5\",\"variants\":{\"fast\":{}}}& echo openrouter/anthropic/claude:latest& echo {\"id\":\"anthropic/claude:latest\",\"name\":\"Nested Claude\",\"variants\":{}}& exit /b 0\r\nif \"%1\"==\"agent\" echo build ^(primary^)& echo   [{\"permission\":\"*\"}]& echo compaction ^(primary^)& echo   []& echo summary ^(primary^)& echo   []& echo title ^(primary^)& echo   []& echo helper ^(subagent^)& exit /b 0\r\nexit /b 2"
     } else {
-        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' 'openrouter/anthropic/claude:latest' '{' '  \"id\": \"anthropic/claude:latest\",' '  \"name\": \"Nested Claude\",' '  \"variants\": {}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'helper (subagent)' ;;\n*) exit 2;;\nesac"
+        "case \"$1\" in\n--version) echo 1.18.10;;\nmodels) printf '%s\\n' 'openai/gpt-5' '{' '  \"id\": \"gpt-5\",' '  \"name\": \"GPT 5\",' '  \"variants\": {\"fast\": {}}' '}' 'openrouter/anthropic/claude:latest' '{' '  \"id\": \"anthropic/claude:latest\",' '  \"name\": \"Nested Claude\",' '  \"variants\": {}' '}' ;;\nagent) printf '%s\\n' 'build (primary)' '  [' '    {\"permission\":\"*\"}' '  ]' 'compaction (primary)' '  []' 'summary (primary)' '  []' 'title (primary)' '  []' 'helper (subagent)' ;;\n*) exit 2;;\nesac"
     });
     let old = FakeAgent::saying("echo 1.14.18");
     let server = TestServer::start().await;
@@ -353,7 +359,16 @@ async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions(
     assert_eq!(local["status"], "ready", "{local}");
     assert_eq!(slugs(&local), vec!["openai/gpt-5", "openrouter/anthropic/claude:latest"]);
     assert_eq!(local["models"][0]["name"], "GPT 5");
+    // The upstream behind the driver, which the CLI reports only as the slug's
+    // first segment. Two upstreams naming the same model identically is routine,
+    // and this is what tells their rows apart in the picker.
+    assert_eq!(local["models"][0]["subProvider"], "openai", "{local}");
+    assert_eq!(local["models"][1]["subProvider"], "openrouter", "{local}");
+    // `agent list` says `compaction (primary)` and carries no `hidden` flag, so
+    // OpenCode's own summariser is offered as something to run a turn with
+    // unless it is named as hidden here.
     assert_eq!(local["models"][0]["capabilities"]["optionDescriptors"][0]["options"].as_array().unwrap().len(), 1);
+    assert_eq!(local["models"][0]["capabilities"]["optionDescriptors"][0]["options"][0]["id"], "build", "{local}");
     assert_eq!(old["status"], "error", "{old}");
     assert!(message(&old).contains("1.14.19 or newer"), "{old}");
     server.stop().await;

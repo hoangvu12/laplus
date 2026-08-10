@@ -814,6 +814,7 @@ fn models(version: Option<&str>, custom: &[String]) -> Vec<ProviderModel> {
             slug: model.slug.to_string(),
             name: model.name.to_string(),
             is_custom: false,
+            sub_provider: None,
             is_default: None,
             capabilities: None,
         })
@@ -834,6 +835,7 @@ fn models(version: Option<&str>, custom: &[String]) -> Vec<ProviderModel> {
             // write.
             name: slug.trim().to_string(),
             is_custom: true,
+            sub_provider: None,
             is_default: None,
             capabilities: None,
         }
@@ -1466,6 +1468,11 @@ fn discover_local_opencode(path: &Path) -> Result<Vec<ProviderModel>, String> {
 pub(crate) struct OpenCodeCatalogueModel {
     pub(crate) slug: String,
     name: String,
+    /// The upstream's own display name — `SiliconFlow` for `siliconflow`,
+    /// `OpenCode Zen` for `opencode`. Its provider id when the inventory names
+    /// no better, which is every model the CLI reports: `models --verbose`
+    /// carries a `providerID` and no display name for it.
+    sub_provider: String,
     variants: Vec<String>,
     pub(crate) context_window: Option<u64>,
 }
@@ -1484,6 +1491,8 @@ pub(crate) fn opencode_catalogue_models(
         let Some(provider_id) = provider.get("id").and_then(serde_json::Value::as_str) else { continue };
         if !connected.iter().any(|id| id == provider_id) { continue; }
         let Some(entries) = provider.get("models").and_then(serde_json::Value::as_object) else { continue };
+        let sub_provider = provider.get("name").and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|name| !name.is_empty()).unwrap_or(provider_id);
         for (key, model) in entries {
             let model_id = model.get("id").and_then(serde_json::Value::as_str).unwrap_or(key);
             let name = model.get("name").and_then(serde_json::Value::as_str).unwrap_or(model_id);
@@ -1492,6 +1501,7 @@ pub(crate) fn opencode_catalogue_models(
             models.push(OpenCodeCatalogueModel {
                 slug: format!("{provider_id}/{model_id}"),
                 name: name.to_string(),
+                sub_provider: sub_provider.to_string(),
                 variants,
                 context_window: model.pointer("/limit/context").and_then(serde_json::Value::as_u64),
             });
@@ -1507,13 +1517,26 @@ fn opencode_models(providers: &serde_json::Value, agents: &serde_json::Value) ->
     }).filter_map(|agent| agent.get("name").and_then(serde_json::Value::as_str).map(str::to_string))
       .collect::<Vec<_>>();
     Ok(opencode_catalogue_models(providers)?.into_iter().map(|model| {
-        opencode_model(&model.slug, &model.name, &model.variants, &visible_agents)
+        opencode_model(&model.slug, &model.name, &model.sub_provider, &model.variants, &visible_agents)
     }).collect())
 }
+
+/// The agents OpenCode hides from a picker but `agent list` reports as primary
+/// anyway.
+///
+/// `GET /agent` carries a `hidden` flag and [`opencode_models`] filters on it;
+/// the CLI prints `compaction (primary)` and says nothing about it, so a local
+/// instance offered OpenCode's own summariser as something to run a turn with.
+/// Named here for the same reason upstream names them in
+/// `apps/server/src/provider/opencodeRuntime.ts` — the CLI gives nothing else to
+/// go on, and the list is short because these three are OpenCode's own
+/// machinery rather than a category a project can add to.
+const KNOWN_HIDDEN_OPENCODE_AGENTS: [&str; 3] = ["compaction", "summary", "title"];
 
 fn local_agents(output: &str) -> Vec<String> {
     output.lines().filter(|line| !line.chars().next().is_some_and(char::is_whitespace))
         .filter_map(|line| line.trim().strip_suffix(" (primary)").or_else(|| line.trim().strip_suffix(" (all)")))
+        .filter(|name| !KNOWN_HIDDEN_OPENCODE_AGENTS.contains(name))
         .map(str::to_string).collect()
 }
 
@@ -1543,7 +1566,13 @@ fn local_models(output: &str, agents: &[String]) -> Vec<ProviderModel> {
         let name = detail.get("name").and_then(serde_json::Value::as_str).unwrap_or(slug);
         let variants = detail.get("variants").and_then(serde_json::Value::as_object)
             .map(|value| value.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-        models.push(opencode_model(slug, name, &variants, agents));
+        // The provider id, which is all the CLI has: `providerID` where the
+        // model JSON carries one, and the slug's own first segment otherwise —
+        // `valid_model_slug` has already established there is one.
+        let sub_provider = detail.get("providerID").and_then(serde_json::Value::as_str)
+            .map(str::trim).filter(|id| !id.is_empty())
+            .unwrap_or_else(|| slug.split_once('/').map(|(provider, _)| provider).unwrap_or(slug));
+        models.push(opencode_model(slug, name, sub_provider, &variants, agents));
     }
     models
 }
@@ -1589,19 +1618,22 @@ fn bounded_command(path: &Path, arguments: &[&str], patience: Duration) -> Resul
     Ok(text)
 }
 
-fn opencode_model(slug: &str, name: &str, variants: &[String], agents: &[String]) -> ProviderModel {
+fn opencode_model(slug: &str, name: &str, sub_provider: &str, variants: &[String], agents: &[String]) -> ProviderModel {
     let mut descriptors = Vec::new();
     if !agents.is_empty() { descriptors.push(serde_json::json!({"id":"agent","label":"Agent","type":"select",
         "options": agents.iter().map(|id| serde_json::json!({"id":id,"label":id})).collect::<Vec<_>>() })); }
     if !variants.is_empty() { descriptors.push(serde_json::json!({"id":"variant","label":"Variant","type":"select",
         "options": variants.iter().map(|id| serde_json::json!({"id":id,"label":id})).collect::<Vec<_>>() })); }
-    ProviderModel { slug: slug.to_string(), name: name.to_string(), is_custom: false, is_default: None,
+    ProviderModel { slug: slug.to_string(), name: name.to_string(), is_custom: false,
+        sub_provider: Some(sub_provider.to_string()).filter(|name| !name.is_empty()), is_default: None,
         capabilities: Some(serde_json::json!({"optionDescriptors": descriptors})) }
 }
 
 fn custom_models(models: &[String]) -> Vec<ProviderModel> {
+    // No `subProvider`: a developer's authored slug is theirs, and naming an
+    // upstream for it would be this server guessing on their behalf.
     models.iter().map(|slug| ProviderModel { slug: slug.clone(), name: slug.clone(), is_custom: true,
-        is_default: None, capabilities: Some(serde_json::json!({"optionDescriptors": []})) }).collect()
+        sub_provider: None, is_default: None, capabilities: Some(serde_json::json!({"optionDescriptors": []})) }).collect()
 }
 
 fn merge_custom(mut discovered: Vec<ProviderModel>, configured: &[String]) -> Vec<ProviderModel> {

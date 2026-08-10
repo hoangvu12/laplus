@@ -1098,6 +1098,7 @@ pub(crate) fn decode_models(response: Value) -> Result<ModelPage, String> {
             slug,
             name,
             is_custom: false,
+            sub_provider: None,
             is_default: model.is_default.then_some(true),
             capabilities: Some(json!({
                 "optionDescriptors": [{
@@ -1132,6 +1133,7 @@ pub(crate) fn append_custom_models(models: &mut Vec<ProviderModel>, custom: &[St
             slug: slug.to_string(),
             name: slug.to_string(),
             is_custom: true,
+            sub_provider: None,
             is_default: None,
             capabilities: None,
         });

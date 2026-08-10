@@ -95,6 +95,37 @@ describe("buildProviderInstanceUpdatePatch", () => {
 
     expect(patch.providerInstances?.[instanceId]).toEqual(nextInstance);
     expect(patch.providers?.codex).toEqual(DEFAULT_SERVER_SETTINGS.providers.codex);
+    // Only the driver being edited. The whole map used to be spread in, so
+    // turning Codex off also asked to write Cursor, Grok and OpenCode — and a
+    // server that carries neither refused the patch over a driver the developer
+    // had not touched.
+    expect(Object.keys(patch.providers ?? {})).toEqual(["codex"]);
+  });
+
+  it("omits the legacy reset when the legacy bucket is already at its default", () => {
+    // A default slot with nothing promoted out of it — every OpenCode slot on a
+    // server that has no legacy OpenCode bucket, and every untouched slot. There
+    // is nothing to reset, and a patch field is a change request: sending one
+    // asked the server to accept a bucket it may refuse by name, which is what
+    // left the toggle doing nothing.
+    const instanceId = ProviderInstanceId.make("codex");
+    const nextInstance = {
+      driver: ProviderDriverKind.make("codex"),
+      displayName: "Codex",
+      enabled: false,
+      config: { binaryPath: "codex" },
+    } satisfies ProviderInstanceConfig;
+
+    const patch = buildProviderInstanceUpdatePatch({
+      settings: DEFAULT_SERVER_SETTINGS,
+      instanceId,
+      instance: nextInstance,
+      driver: ProviderDriverKind.make("codex"),
+      isDefault: true,
+    });
+
+    expect(patch.providerInstances?.[instanceId]).toEqual(nextInstance);
+    expect(patch.providers).toBeUndefined();
   });
 
   it("updates custom instances without touching legacy provider settings", () => {

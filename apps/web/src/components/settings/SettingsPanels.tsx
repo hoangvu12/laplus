@@ -1033,12 +1033,21 @@ export function ProviderSettingsPanel() {
     const explicitInstance = settings.providerInstances?.[defaultInstanceId];
     const legacyConfig = legacyProviders[providerSettings.provider]!;
     const defaultLegacyConfig = defaultLegacyProviders[providerSettings.provider]!;
+    // A default slot the server has no envelope for is still shown, so the
+    // driver can be turned on from here. What it is shown *as* has to be a
+    // writable envelope: `displayName` is required, and `enabled` belongs beside
+    // `config` rather than inside it — the legacy bucket keeps it inside, and a
+    // server that validates the config strictly refuses the whole patch over it.
+    // Without both, every write from this panel was refused and the toggle sprang
+    // back with nothing said.
+    const { enabled: legacyEnabled, ...legacyInstanceConfig } = legacyConfig;
     const effectiveInstance: ProviderInstanceConfig =
       explicitInstance ??
       ({
         driver,
-        enabled: legacyConfig.enabled,
-        config: legacyConfig,
+        displayName: getDriverOption(driver)?.label ?? String(driver),
+        enabled: legacyEnabled,
+        config: legacyInstanceConfig,
       } satisfies ProviderInstanceConfig);
     const isDirty =
       explicitInstance !== undefined || !Equal.equals(legacyConfig, defaultLegacyConfig);
