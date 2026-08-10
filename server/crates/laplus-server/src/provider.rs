@@ -576,20 +576,11 @@ fn probe(path: &Path, patience: Duration) -> Probed {
         .stderr(Stdio::piped());
     crate::process::without_a_console(&mut command);
 
-    #[cfg(target_os = "linux")]
-    let mut busy_retries = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            #[cfg(target_os = "linux")]
-            Err(error) if error.raw_os_error() == Some(PROBE_BUSY_ERROR) && busy_retries < PROBE_BUSY_RETRIES => {
-                busy_retries += 1;
-                std::thread::sleep(PROBE_POLL);
-            }
-            Err(error) => {
-                return Probed::Unstartable {
-                    error: error.to_string(),
-                }
+    let mut child = match spawn_probe(&mut command) {
+        Ok(child) => child,
+        Err(error) => {
+            return Probed::Unstartable {
+                error: error.to_string(),
             }
         }
     };
@@ -656,6 +647,25 @@ fn probe(path: &Path, patience: Duration) -> Probed {
             output: text,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_probe(command: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut busy_retries = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(PROBE_BUSY_ERROR) && busy_retries < PROBE_BUSY_RETRIES => {
+                busy_retries += 1;
+                std::thread::sleep(PROBE_POLL);
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_probe(command: &mut Command) -> std::io::Result<std::process::Child> {
+    command.spawn()
 }
 
 /// The first three-part number in the output.
