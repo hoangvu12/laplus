@@ -25,9 +25,12 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   archiveThread,
   createProject,
+  pinThread,
   rejectThreadUserInput,
+  reorderPinnedThread,
   settleThread,
   stopThreadSession,
+  unpinThread,
   unsettleThread,
 } from "./commands.ts";
 
@@ -185,6 +188,52 @@ describe("environment commands", () => {
           commandId: "unsettle-command",
           threadId: "thread-1",
           reason: "user",
+        },
+      ]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect("dispatches pin lifecycle commands with an initial and reordered key", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      const provideSupervisor = Effect.provideService(
+        EnvironmentSupervisor.EnvironmentSupervisor,
+        supervisor,
+      );
+
+      yield* pinThread({
+        commandId: CommandId.make("pin-command"),
+        threadId: ThreadId.make("thread-1"),
+        orderKey: "m",
+      }).pipe(provideSupervisor);
+      yield* reorderPinnedThread({
+        commandId: CommandId.make("reorder-command"),
+        threadId: ThreadId.make("thread-1"),
+        orderKey: "g",
+      }).pipe(provideSupervisor);
+      yield* unpinThread({
+        commandId: CommandId.make("unpin-command"),
+        threadId: ThreadId.make("thread-1"),
+      }).pipe(provideSupervisor);
+
+      expect(dispatched).toEqual([
+        {
+          type: "thread.pin",
+          commandId: "pin-command",
+          threadId: "thread-1",
+          orderKey: "m",
+        },
+        {
+          type: "thread.pin.reorder",
+          commandId: "reorder-command",
+          threadId: "thread-1",
+          orderKey: "g",
+        },
+        {
+          type: "thread.unpin",
+          commandId: "unpin-command",
+          threadId: "thread-1",
         },
       ]);
     }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),

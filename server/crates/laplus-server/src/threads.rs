@@ -1537,13 +1537,15 @@ pub(crate) mod tests {
     }
 
     /// The six keys [`Lifecycle`] writes, as the contract spells them.
-    const LIFECYCLE_KEYS: [&str; 6] = [
+    const LIFECYCLE_KEYS: [&str; 8] = [
         "archivedAt",
         "settledOverride",
         "settledAt",
         "snoozedUntil",
         "snoozedAt",
         "deletedAt",
+        "pinnedAt",
+        "pinOrderKey",
     ];
 
     /// The transcript as the server holds it, which is what a client arriving
@@ -2267,6 +2269,8 @@ pub(crate) mod tests {
             snoozed_until: Some("2026-07-31T09:00:00.000Z".to_string()),
             snoozed_at: Some("2026-07-30T09:02:00.000Z".to_string()),
             deleted_at: Some("2026-07-30T09:03:00.000Z".to_string()),
+            pinned_at: Some("2026-07-30T09:04:00.000Z".to_string()),
+            pin_order_key: Some("middle".to_string()),
         };
         threads.create(thread).expect("created");
         let thread = threads.get("thread-1").expect("the thread");
@@ -2347,6 +2351,50 @@ pub(crate) mod tests {
         let again = threads.get("thread-1").expect("the thread");
         assert_eq!(again.lifecycle, pinned.lifecycle);
         assert_eq!(again.updated_at, pinned.updated_at);
+    }
+
+    #[test]
+    fn shelf_pin_invariants_are_folded_atomically() {
+        let (threads, _shell) = threads();
+        threads.create(a_thread("thread-1")).expect("created");
+        threads.apply("thread-1", Change::Settled).expect("settled");
+        threads.apply("thread-1", Change::Snoozed { until: "2027-01-01T00:00:00.000Z".to_string() }).expect("snoozed before pin");
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Pinned {
+                    order_key: Some("a0".to_string()),
+                },
+            )
+            .expect("pinned");
+        let pinned = threads.get("thread-1").expect("thread");
+        assert!(pinned.lifecycle.pinned_at.is_some());
+        assert_eq!(pinned.lifecycle.pin_order_key.as_deref(), Some("a0"));
+        assert_eq!(pinned.lifecycle.settled_override, Some(ACTIVE));
+        assert_eq!(pinned.lifecycle.settled_at, None);
+        assert_eq!(pinned.lifecycle.snoozed_until, None);
+        assert_eq!(pinned.lifecycle.snoozed_at, None);
+
+        threads
+            .apply(
+                "thread-1",
+                Change::Snoozed {
+                    until: "2027-01-01T00:00:00.000Z".to_string(),
+                },
+            )
+            .expect("snoozed");
+        let snoozed = threads.get("thread-1").expect("thread");
+        assert_eq!(snoozed.lifecycle.pinned_at, pinned.lifecycle.pinned_at);
+        assert_eq!(
+            snoozed.lifecycle.pin_order_key,
+            pinned.lifecycle.pin_order_key
+        );
+
+        threads.apply("thread-1", Change::Settled).expect("settled");
+        let settled = threads.get("thread-1").expect("thread");
+        assert_eq!(settled.lifecycle.pinned_at, None);
+        assert_eq!(settled.lifecycle.pin_order_key, None);
     }
 
     /// A settle after something else touched the conversation keeps the moment it

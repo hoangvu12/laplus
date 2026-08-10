@@ -214,13 +214,15 @@ import {
   useThreadProposedPlans,
   useThreadRefs,
   useThreadShell,
+  useThreadShells,
 } from "../state/entities";
+import { keyBeforeAllPinned } from "../pinnedThreadOrdering";
 import { environmentShell } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
-import { ChatHeader } from "./chat/ChatHeader";
+import { ChatHeader, type ChatHeaderThreadAction } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { NoActiveThreadState } from "./NoActiveThreadState";
@@ -1138,6 +1140,9 @@ function ChatViewContent(props: ChatViewProps) {
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
   const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
+  const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
+  const settleThreadCommand = useAtomCommand(threadEnvironment.settle, { reportFailure: false });
+  const snoozeThreadCommand = useAtomCommand(threadEnvironment.snooze, { reportFailure: false });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -3737,6 +3742,45 @@ function ChatViewContent(props: ChatViewProps) {
   });
   const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
   const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
+  const supportsPinning = serverConfig?.environment.capabilities.threadPinning === true;
+  const allThreadShells = useThreadShells();
+  const activeThreadPinned = activeThreadShell?.pinnedAt != null;
+  const pinThreadMutation = useAtomCommand(threadEnvironment.pin, { reportFailure: false });
+  const unpinThreadMutation = useAtomCommand(threadEnvironment.unpin, { reportFailure: false });
+  const handleTogglePinActiveThread = useCallback(async () => {
+    if (!activeThreadRef || !supportsPinning) return;
+    const result = activeThreadPinned
+      ? await unpinThreadMutation({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId },
+        })
+      : await pinThreadMutation({
+          environmentId: activeThreadRef.environmentId,
+          input: {
+            threadId: activeThreadRef.threadId,
+            orderKey: keyBeforeAllPinned(
+              allThreadShells.filter((thread) => thread.pinnedAt != null),
+            ),
+          },
+        });
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: activeThreadPinned ? "Failed to unpin thread" : "Failed to pin thread",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        }),
+      );
+    }
+  }, [
+    activeThreadPinned,
+    activeThreadRef,
+    allThreadShells,
+    pinThreadMutation,
+    supportsPinning,
+    unpinThreadMutation,
+  ]);
   const nowMinute = useNowMinute();
   const activeThreadSnoozed =
     activeThreadShell !== null &&
@@ -3827,6 +3871,68 @@ function ChatViewContent(props: ChatViewProps) {
       setUnsnoozingThreadKey((current) => (current === threadKey ? null : current));
     }
   }, [activeThreadRef, unsnoozeThreadMutation]);
+  const handleHeaderThreadAction = useCallback(
+    async (action: ChatHeaderThreadAction) => {
+      if (!activeThreadRef) return;
+      if (action === "copy") {
+        await navigator.clipboard.writeText(window.location.href);
+        return;
+      }
+      if (action === "rename") {
+        const title = window.prompt("Rename thread", activeThread?.title ?? "")?.trim();
+        if (title) {
+          await updateThreadMetadata({
+            environmentId: activeThreadRef.environmentId,
+            input: { threadId: activeThreadRef.threadId, title },
+          });
+        }
+        return;
+      }
+      if (action === "unsettle") return void handleUnsettleActiveThread();
+      if (action === "unsnooze") return void handleUnsnoozeActiveThread();
+      if (action === "settle") {
+        await settleThreadCommand({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId },
+        });
+        return;
+      }
+      if (action === "snooze") {
+        await snoozeThreadCommand({
+          environmentId: activeThreadRef.environmentId,
+          input: {
+            threadId: activeThreadRef.threadId,
+            snoozedUntil: new Date(Date.now() + 86_400_000).toISOString(),
+          },
+        });
+        return;
+      }
+      if (action === "archive") {
+        await archiveThread({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId },
+        });
+        return;
+      }
+      if (window.confirm(`Delete thread "${activeThread?.title ?? "this thread"}"?`)) {
+        await deleteThread({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId },
+        });
+      }
+    },
+    [
+      activeThread?.title,
+      activeThreadRef,
+      archiveThread,
+      deleteThread,
+      handleUnsnoozeActiveThread,
+      handleUnsettleActiveThread,
+      settleThreadCommand,
+      snoozeThreadCommand,
+      updateThreadMetadata,
+    ],
+  );
   const [isRestoringThreadBranch, setIsRestoringThreadBranch] = useState(false);
   const [branchRestoreConfirmOpen, setBranchRestoreConfirmOpen] = useState(false);
   // Once revealed for a given mismatch, the banner stays mounted until the
@@ -5559,6 +5665,14 @@ function ChatViewContent(props: ChatViewProps) {
             keybindings={keybindings}
             availableEditors={availableEditors}
             rightPanelOpen={rightPanelOpen}
+            pinningSupported={supportsPinning}
+            pinned={activeThreadPinned}
+            settled={activeThreadSettled}
+            snoozed={activeThreadSnoozed}
+            settlementSupported={supportsSettlement}
+            snoozeSupported={supportsSnooze}
+            onTogglePin={handleTogglePinActiveThread}
+            onThreadAction={handleHeaderThreadAction}
             onNewThreadInProject={handleNewThreadInActiveProject}
             onRunProjectScript={runProjectScript}
             onAddProjectScript={saveProjectScript}

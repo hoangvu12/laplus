@@ -76,6 +76,8 @@ export function applyThreadDetailEvent(
           settledAt: null,
           snoozedUntil: null,
           snoozedAt: null,
+          pinnedAt: null,
+          pinOrderKey: null,
           deletedAt: null,
           messages: [],
           proposedPlans: [],
@@ -111,6 +113,8 @@ export function applyThreadDetailEvent(
           ...thread,
           settledOverride: "settled",
           settledAt: event.payload.settledAt,
+          pinnedAt: null,
+          pinOrderKey: null,
           updatedAt: event.payload.updatedAt,
         },
       };
@@ -144,6 +148,48 @@ export function applyThreadDetailEvent(
           ...thread,
           snoozedUntil: null,
           snoozedAt: null,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.pinned":
+      if (thread.pinnedAt != null) {
+        return {
+          kind: "updated",
+          thread: { ...thread, updatedAt: event.payload.updatedAt },
+        };
+      }
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          pinnedAt: event.payload.pinnedAt,
+          pinOrderKey: event.payload.pinOrderKey ?? null,
+          settledOverride: "active",
+          settledAt: null,
+          snoozedUntil: null,
+          snoozedAt: null,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.unpinned":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          pinnedAt: null,
+          pinOrderKey: null,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.pin-reordered":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          pinOrderKey: event.payload.orderKey,
           updatedAt: event.payload.updatedAt,
         },
       };

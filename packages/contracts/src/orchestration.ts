@@ -366,6 +366,8 @@ export const OrchestrationThread = Schema.Struct({
   // Optional so payloads from pre-snooze servers still decode.
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
   snoozedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinnedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   deletedAt: Schema.NullOr(IsoDateTime),
   messages: Schema.Array(OrchestrationMessage),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
@@ -418,6 +420,8 @@ export const OrchestrationThreadShell = Schema.Struct({
   settledAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
   snoozedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinnedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  pinOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   session: Schema.NullOr(OrchestrationSession),
   latestUserMessageAt: Schema.NullOr(IsoDateTime),
   hasPendingApprovals: Schema.Boolean,
@@ -611,6 +615,26 @@ const ThreadUnsnoozeCommand = Schema.Struct({
   reason: Schema.Literal("user"),
 });
 
+const ThreadPinCommand = Schema.Struct({
+  type: Schema.Literal("thread.pin"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  orderKey: Schema.optional(TrimmedNonEmptyString),
+});
+
+const ThreadUnpinCommand = Schema.Struct({
+  type: Schema.Literal("thread.unpin"),
+  commandId: CommandId,
+  threadId: ThreadId,
+});
+
+const ThreadPinReorderCommand = Schema.Struct({
+  type: Schema.Literal("thread.pin.reorder"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  orderKey: TrimmedNonEmptyString,
+});
+
 const ThreadMetaUpdateCommand = Schema.Struct({
   type: Schema.Literal("thread.meta.update"),
   commandId: CommandId,
@@ -765,6 +789,9 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUnsettleCommand,
   ThreadSnoozeCommand,
   ThreadUnsnoozeCommand,
+  ThreadPinCommand,
+  ThreadUnpinCommand,
+  ThreadPinReorderCommand,
   ThreadMetaUpdateCommand,
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
@@ -791,6 +818,9 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUnsettleCommand,
   ThreadSnoozeCommand,
   ThreadUnsnoozeCommand,
+  ThreadPinCommand,
+  ThreadUnpinCommand,
+  ThreadPinReorderCommand,
   ThreadMetaUpdateCommand,
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
@@ -898,6 +928,9 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.unsettled",
   "thread.snoozed",
   "thread.unsnoozed",
+  "thread.pinned",
+  "thread.unpinned",
+  "thread.pin-reordered",
   "thread.meta-updated",
   "thread.runtime-mode-set",
   "thread.interaction-mode-set",
@@ -1003,6 +1036,24 @@ export const ThreadUnsnoozedPayload = Schema.Struct({
   // thread.unsettled's activity resets. Timer wakes emit no event: clients
   // derive them from snoozedUntil passing.
   reason: Schema.Literals(["user", "activity"]),
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadPinnedPayload = Schema.Struct({
+  threadId: ThreadId,
+  pinnedAt: IsoDateTime,
+  pinOrderKey: Schema.optional(TrimmedNonEmptyString),
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadUnpinnedPayload = Schema.Struct({
+  threadId: ThreadId,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadPinReorderedPayload = Schema.Struct({
+  threadId: ThreadId,
+  orderKey: TrimmedNonEmptyString,
   updatedAt: IsoDateTime,
 });
 
@@ -1192,6 +1243,21 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.unsnoozed"),
     payload: ThreadUnsnoozedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.pinned"),
+    payload: ThreadPinnedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.unpinned"),
+    payload: ThreadUnpinnedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.pin-reordered"),
+    payload: ThreadPinReorderedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

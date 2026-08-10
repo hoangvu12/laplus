@@ -29,13 +29,15 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 /// The six keys, as the contract spells them.
-const LIFECYCLE_KEYS: [&str; 6] = [
+const LIFECYCLE_KEYS: [&str; 8] = [
     "archivedAt",
     "settledOverride",
     "settledAt",
     "snoozedUntil",
     "snoozedAt",
     "deletedAt",
+    "pinnedAt",
+    "pinOrderKey",
 ];
 
 /// A conversation whose lifecycle fields are set, and each to a *different*
@@ -60,6 +62,8 @@ fn a_curated_lifecycle() -> Lifecycle {
         snoozed_until: Some("2026-07-27T03:00:00.000Z".to_string()),
         snoozed_at: Some("2026-07-26T04:00:00.000Z".to_string()),
         deleted_at: None,
+        pinned_at: Some("2026-07-26T05:00:00.000Z".to_string()),
+        pin_order_key: Some("middle".to_string()),
     }
 }
 
@@ -72,6 +76,8 @@ fn on_the_wire() -> Value {
         "snoozedUntil": "2026-07-27T03:00:00.000Z",
         "snoozedAt": "2026-07-26T04:00:00.000Z",
         "deletedAt": Value::Null,
+        "pinnedAt": "2026-07-26T05:00:00.000Z",
+        "pinOrderKey": "middle",
     })
 }
 
@@ -112,12 +118,7 @@ async fn a_conversation(client: &mut SocketClient, workspace: &Workspace) {
 
 /// The conversation as a subscriber that arrives afterwards is handed it.
 async fn as_a_fresh_subscriber_sees_it(server: &TestServer, thread_id: &str) -> Value {
-    server
-        .connect()
-        .await
-        .into_thread_snapshot(thread_id)
-        .await["thread"]
-        .clone()
+    server.connect().await.into_thread_snapshot(thread_id).await["thread"].clone()
 }
 
 /// The conversation's summary on the project list.

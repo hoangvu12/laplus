@@ -110,6 +110,10 @@ pub struct Lifecycle {
     /// When the conversation comes back to the inbox on its own.
     pub snoozed_until: Option<String>,
     pub snoozed_at: Option<String>,
+    /// When the developer placed this conversation on the pinned shelf.
+    pub pinned_at: Option<String>,
+    /// The client's opaque, lexically sortable position on that shelf.
+    pub pin_order_key: Option<String>,
     /// Deleting is soft: the row, its transcript and its checkpoints stay, and
     /// this is the whole of what makes the thread deleted.
     pub deleted_at: Option<String>,
@@ -147,6 +151,8 @@ impl Lifecycle {
             ("settledAt", json!(self.settled_at)),
             ("snoozedUntil", json!(self.snoozed_until)),
             ("snoozedAt", json!(self.snoozed_at)),
+            ("pinnedAt", json!(self.pinned_at)),
+            ("pinOrderKey", json!(self.pin_order_key)),
             ("deletedAt", json!(self.deleted_at)),
         ] {
             fields.insert(key.to_string(), value);
@@ -1192,6 +1198,12 @@ pub enum Change {
     /// thing as when a conversation stopped being archived — it either is or it
     /// is not.
     Unarchived,
+    /// Place the conversation on the pinned shelf, optionally at its initial position.
+    Pinned { order_key: Option<String> },
+    /// Remove it from the pinned shelf and discard its shelf position.
+    Unpinned,
+    /// Move an already-pinned conversation on the shelf.
+    PinReordered { order_key: String },
     /// The developer decided a conversation is finished with. `thread.settled`.
     ///
     /// **Not [`crate::settling`]**, which reads a session status as how a *turn*
@@ -1478,6 +1490,11 @@ impl Change {
             // [`Lifecycle::asleep_until`], which both this and [`fold`] ask so
             // that a repeat cannot be a repeat to one of them and not the other.
             Change::Snoozed { until } => thread.lifecycle.asleep_until(until),
+            Change::Pinned { .. } => thread.lifecycle.pinned_at.is_some(),
+            Change::Unpinned => thread.lifecycle.pinned_at.is_none(),
+            Change::PinReordered { order_key } => {
+                thread.lifecycle.pin_order_key.as_ref() == Some(order_key)
+            }
             // Waking has one destination whoever asked for it, so any wake of a
             // conversation nobody snoozed is the repeat — there is no second
             // state for a reason to land in, which is where this parts company
@@ -1714,6 +1731,48 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 "updatedAt": at,
             })
         }
+        Change::Pinned { order_key } => {
+            let fresh = thread.lifecycle.pinned_at.is_none();
+            let pinned_at = thread
+                .lifecycle
+                .pinned_at
+                .clone()
+                .unwrap_or_else(|| at.to_string());
+            thread.lifecycle.pinned_at = Some(pinned_at.clone());
+            if fresh && order_key.is_some() {
+                thread.lifecycle.pin_order_key = order_key.clone();
+            }
+            thread.lifecycle.settled_override = Some(ACTIVE);
+            thread.lifecycle.settled_at = None;
+            if fresh {
+                thread.lifecycle.snoozed_until = None;
+                thread.lifecycle.snoozed_at = None;
+            }
+            let mut payload = json!({
+                "threadId": thread.id,
+                "pinnedAt": pinned_at,
+                "updatedAt": at,
+            });
+            if fresh {
+                if let Some(order_key) = order_key {
+                payload["pinOrderKey"] = json!(order_key);
+                }
+            }
+            payload
+        }
+        Change::Unpinned => {
+            thread.lifecycle.pinned_at = None;
+            thread.lifecycle.pin_order_key = None;
+            json!({"threadId": thread.id, "updatedAt": at})
+        }
+        Change::PinReordered { order_key } => {
+            thread.lifecycle.pin_order_key = Some(order_key.clone());
+            json!({
+                "threadId": thread.id,
+                "orderKey": order_key,
+                "updatedAt": at,
+            })
+        }
         // The client's reducer, mirrored: the override goes to `settled` and
         // the payload's `settledAt` is written straight onto the thread
         // (`threadReducer.ts`, `case "thread.settled"`).
@@ -1732,6 +1791,8 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 .unwrap_or_else(|| at.to_string());
             thread.lifecycle.settled_override = Some(SETTLED);
             thread.lifecycle.settled_at = Some(settled_at.clone());
+            thread.lifecycle.pinned_at = None;
+            thread.lifecycle.pin_order_key = None;
             json!({
                 "threadId": thread.id,
                 "settledAt": settled_at,
@@ -2124,6 +2185,9 @@ impl Change {
             Change::MetaUpdated(_) => "thread.meta-updated",
             Change::Archived => "thread.archived",
             Change::Unarchived => "thread.unarchived",
+            Change::Pinned { .. } => "thread.pinned",
+            Change::Unpinned => "thread.unpinned",
+            Change::PinReordered { .. } => "thread.pin-reordered",
             Change::Settled => "thread.settled",
             Change::Unsettled { .. } => "thread.unsettled",
             Change::Snoozed { .. } => "thread.snoozed",

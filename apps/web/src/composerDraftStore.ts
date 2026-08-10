@@ -277,6 +277,22 @@ export interface ComposerThreadDraftState {
   interactionMode: ProviderInteractionMode | null;
 }
 
+/** Whether a draft contains user-authored work worth surfacing and preserving. */
+export function composerDraftHasUserContent(
+  draft: ComposerThreadDraftState | null | undefined,
+): boolean {
+  return (
+    !!draft &&
+    (draft.prompt.trim().length > 0 ||
+      draft.images.length > 0 ||
+      draft.persistedAttachments.length > 0 ||
+      draft.terminalContexts.length > 0 ||
+      draft.elementContexts.length > 0 ||
+      draft.previewAnnotations.length > 0 ||
+      draft.reviewComments.length > 0)
+  );
+}
+
 /**
  * Mutable routing and execution context for a pre-thread draft session.
  *
@@ -2299,7 +2315,10 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 nextLogicalProjectDraftThreadKeyByLogicalProjectKey,
                 previousThreadKeyForLogicalProject,
               ) &&
-              !isDraftThreadPromoting(previousDraftThread)
+              !isDraftThreadPromoting(previousDraftThread) &&
+              !composerDraftHasUserContent(
+                state.draftsByThreadKey[previousThreadKeyForLogicalProject],
+              )
             ) {
               delete nextDraftThreadsByThreadKey[previousThreadKeyForLogicalProject];
               if (state.draftsByThreadKey[previousThreadKeyForLogicalProject] !== undefined) {
@@ -2412,15 +2431,26 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
         },
         clearProjectDraftThreadId: (projectRef) => {
           set((state) => {
-            const matchingThreadEntry = Object.entries(state.draftThreadsByThreadKey).find(
-              ([, draftThread]) =>
-                draftThread.projectId === projectRef.projectId &&
-                draftThread.environmentId === projectRef.environmentId,
-            );
-            if (!matchingThreadEntry) {
+            const matchingThreadKeys = Object.entries(state.draftThreadsByThreadKey)
+              .filter(
+                ([, draftThread]) =>
+                  draftThread.projectId === projectRef.projectId &&
+                  draftThread.environmentId === projectRef.environmentId,
+              )
+              .map(([threadKey]) => threadKey);
+            if (matchingThreadKeys.length === 0) {
               return state;
             }
-            return removeDraftThreadReferences(state, matchingThreadEntry[0]);
+            let nextState = {
+              draftsByThreadKey: state.draftsByThreadKey,
+              draftThreadsByThreadKey: state.draftThreadsByThreadKey,
+              logicalProjectDraftThreadKeyByLogicalProjectKey:
+                state.logicalProjectDraftThreadKeyByLogicalProjectKey,
+            };
+            for (const threadKey of matchingThreadKeys) {
+              nextState = removeDraftThreadReferences(nextState, threadKey);
+            }
+            return nextState;
           });
         },
         clearProjectDraftThreadById: (projectRef, threadRef) => {

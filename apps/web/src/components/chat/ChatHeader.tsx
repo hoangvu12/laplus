@@ -15,6 +15,9 @@ import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { cn } from "~/lib/utils";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
+import { ArchiveIcon, CopyIcon, PencilIcon, PinIcon, PinOffIcon, Trash2Icon } from "lucide-react";
+import { threadActionPolicy } from "../../threadActionPolicy";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -27,6 +30,14 @@ interface ChatHeaderProps {
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
   rightPanelOpen: boolean;
+  pinningSupported: boolean;
+  pinned: boolean;
+  settled: boolean;
+  snoozed: boolean;
+  settlementSupported: boolean;
+  snoozeSupported: boolean;
+  onTogglePin: () => void;
+  onThreadAction: (action: ChatHeaderThreadAction) => void;
   onNewThreadInProject: () => void;
   onRunProjectScript: (script: ProjectScript) => void;
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
@@ -35,6 +46,29 @@ interface ChatHeaderProps {
     input: NewProjectScriptInput,
   ) => Promise<ProjectScriptActionResult>;
   onDeleteProjectScript: (scriptId: string) => Promise<ProjectScriptActionResult>;
+}
+
+export type ChatHeaderThreadAction =
+  | "rename"
+  | "copy"
+  | "settle"
+  | "unsettle"
+  | "snooze"
+  | "unsnooze"
+  | "archive"
+  | "delete";
+
+export const chatHeaderActionTriggerLabel = (title: string) => `${title} actions`;
+
+export function resolveChatHeaderThreadActions(input: Parameters<typeof threadActionPolicy>[0]) {
+  const policy = threadActionPolicy(input);
+  return [
+    ...(policy.rename ? ["rename" as const] : []),
+    ...(policy.copy ? ["copy" as const] : []),
+    ...(policy.pinAction ? [policy.pinAction.id] : []),
+    ...policy.lifecycleActions.map((action) => action.id),
+    policy.destructiveAction.id,
+  ];
 }
 
 export function shouldShowOpenInPicker(input: {
@@ -60,6 +94,14 @@ export const ChatHeader = memo(function ChatHeader({
   keybindings,
   availableEditors,
   rightPanelOpen,
+  pinningSupported,
+  pinned,
+  settled,
+  snoozed,
+  settlementSupported,
+  snoozeSupported,
+  onTogglePin,
+  onThreadAction,
   onNewThreadInProject,
   onRunProjectScript,
   onAddProjectScript,
@@ -75,6 +117,14 @@ export const ChatHeader = memo(function ChatHeader({
     activeProjectName,
     activeThreadEnvironmentId,
     primaryEnvironmentId,
+  });
+  const actionPolicy = threadActionPolicy({
+    pinningSupported,
+    pinned,
+    settled,
+    snoozed,
+    settlementSupported,
+    snoozeSupported,
   });
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
@@ -109,19 +159,58 @@ export const ChatHeader = memo(function ChatHeader({
             </span>
           </span>
         ) : null}
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <h2
-                aria-label={activeThreadTitle}
-                className="min-w-0 flex-1 truncate text-sm font-medium text-foreground"
-              >
-                {activeThreadTitle}
-              </h2>
-            }
-          />
-          <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>
-        </Tooltip>
+        <Menu>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <MenuTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label={chatHeaderActionTriggerLabel(activeThreadTitle)}
+                      className="min-w-0 flex-1 cursor-pointer truncate rounded-sm text-left text-sm font-medium text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                    />
+                  }
+                />
+              }
+            >
+              {activeThreadTitle}
+            </TooltipTrigger>
+            <TooltipPopup side="top">Thread actions</TooltipPopup>
+          </Tooltip>
+          <MenuPopup align="start">
+            {actionPolicy.rename ? (
+              <MenuItem onClick={() => onThreadAction("rename")}>
+                <PencilIcon />
+                Rename thread
+              </MenuItem>
+            ) : null}
+            {actionPolicy.copy ? (
+              <MenuItem onClick={() => onThreadAction("copy")}>
+                <CopyIcon />
+                Copy thread link
+              </MenuItem>
+            ) : null}
+            {actionPolicy.pinAction ? (
+              <MenuItem onClick={onTogglePin}>
+                {pinned ? <PinOffIcon /> : <PinIcon />}
+                {pinned ? "Unpin thread" : "Pin thread"}
+              </MenuItem>
+            ) : null}
+            {actionPolicy.lifecycleActions.map((action) => (
+              <MenuItem key={action.id} onClick={() => onThreadAction(action.id)}>
+                {action.label}
+              </MenuItem>
+            ))}
+            <MenuItem
+              onClick={() => onThreadAction(actionPolicy.destructiveAction.id)}
+              variant={actionPolicy.destructiveAction.id === "delete" ? "destructive" : "default"}
+            >
+              {actionPolicy.destructiveAction.id === "delete" ? <Trash2Icon /> : <ArchiveIcon />}
+              {actionPolicy.destructiveAction.label}
+            </MenuItem>
+          </MenuPopup>
+        </Menu>
       </div>
       <div
         data-chat-header-actions

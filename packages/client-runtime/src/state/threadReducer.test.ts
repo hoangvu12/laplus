@@ -45,6 +45,106 @@ const baseThread: OrchestrationThread = {
 };
 
 describe("applyThreadDetailEvent", () => {
+  describe("pin lifecycle", () => {
+    it("fresh pin activates and wakes a settled, snoozed thread", () => {
+      const result = applyThreadDetailEvent(
+        {
+          ...baseThread,
+          settledOverride: "settled",
+          settledAt: "2026-04-01T00:30:00.000Z",
+          snoozedUntil: "2026-04-02T00:00:00.000Z",
+          snoozedAt: "2026-04-01T00:15:00.000Z",
+        },
+        {
+          ...baseEventFields,
+          sequence: 1,
+          occurredAt: "2026-04-01T01:00:00.000Z",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.pinned",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            pinnedAt: "2026-04-01T01:00:00.000Z",
+            pinOrderKey: "m",
+            updatedAt: "2026-04-01T01:00:00.000Z",
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "updated",
+        thread: {
+          pinnedAt: "2026-04-01T01:00:00.000Z",
+          pinOrderKey: "m",
+          settledOverride: "active",
+          settledAt: null,
+          snoozedUntil: null,
+          snoozedAt: null,
+        },
+      });
+    });
+
+    it("repeat pin preserves lifecycle and existing order", () => {
+      const result = applyThreadDetailEvent(
+        {
+          ...baseThread,
+          pinnedAt: "2026-04-01T00:10:00.000Z",
+          pinOrderKey: "m",
+          settledOverride: "active",
+          snoozedUntil: "2026-04-02T00:00:00.000Z",
+          snoozedAt: "2026-04-01T00:15:00.000Z",
+        },
+        {
+          ...baseEventFields,
+          sequence: 2,
+          occurredAt: "2026-04-01T01:00:00.000Z",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.pinned",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            pinnedAt: "2026-04-01T01:00:00.000Z",
+            pinOrderKey: "a",
+            updatedAt: "2026-04-01T01:00:00.000Z",
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "updated",
+        thread: {
+          pinnedAt: "2026-04-01T00:10:00.000Z",
+          pinOrderKey: "m",
+          settledOverride: "active",
+          snoozedUntil: "2026-04-02T00:00:00.000Z",
+          snoozedAt: "2026-04-01T00:15:00.000Z",
+          updatedAt: "2026-04-01T01:00:00.000Z",
+        },
+      });
+    });
+
+    it("clears pin state when settling", () => {
+      const result = applyThreadDetailEvent(
+        { ...baseThread, pinnedAt: "2026-04-01T00:30:00.000Z", pinOrderKey: "m" },
+        {
+          ...baseEventFields,
+          sequence: 1,
+          occurredAt: "2026-04-01T01:00:00.000Z",
+          aggregateKind: "thread",
+          aggregateId: ThreadId.make("thread-1"),
+          type: "thread.settled",
+          payload: {
+            threadId: ThreadId.make("thread-1"),
+            settledAt: "2026-04-01T01:00:00.000Z",
+            updatedAt: "2026-04-01T01:00:00.000Z",
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "updated",
+        thread: { pinnedAt: null, pinOrderKey: null },
+      });
+    });
+  });
+
   describe("project events", () => {
     it("returns unchanged for project.created", () => {
       const result = applyThreadDetailEvent(baseThread, {

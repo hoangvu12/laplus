@@ -117,6 +117,11 @@ export function useThreadActions() {
   const unsnoozeThreadMutation = useAtomCommand(threadEnvironment.unsnooze, {
     reportFailure: false,
   });
+  const pinThreadMutation = useAtomCommand(threadEnvironment.pin, { reportFailure: false });
+  const unpinThreadMutation = useAtomCommand(threadEnvironment.unpin, { reportFailure: false });
+  const reorderPinnedThreadMutation = useAtomCommand(threadEnvironment.reorderPin, {
+    reportFailure: false,
+  });
   const stopThreadSession = useAtomCommand(threadEnvironment.stopSession);
   const removeWorktree = useAtomCommand(vcsEnvironment.removeWorktree, {
     reportFailure: false,
@@ -555,6 +560,31 @@ export function useThreadActions() {
     [confirmThreadDelete, deleteThread, resolveThreadTarget],
   );
 
+  const pinThread = useCallback(
+    (target: ScopedThreadRef, orderKey?: string) =>
+      pinThreadMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId, orderKey },
+      }),
+    [pinThreadMutation],
+  );
+  const unpinThread = useCallback(
+    (target: ScopedThreadRef) =>
+      unpinThreadMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId },
+      }),
+    [unpinThreadMutation],
+  );
+  const reorderPinnedThread = useCallback(
+    (target: ScopedThreadRef, orderKey: string) =>
+      reorderPinnedThreadMutation({
+        environmentId: target.environmentId,
+        input: { threadId: target.threadId, orderKey },
+      }),
+    [reorderPinnedThreadMutation],
+  );
+
   return useMemo(
     () => ({
       archiveThread,
@@ -565,6 +595,9 @@ export function useThreadActions() {
       unsettleThread,
       snoozeThread,
       unsnoozeThread,
+      pinThread,
+      unpinThread,
+      reorderPinnedThread,
     }),
     [
       archiveThread,
@@ -575,6 +608,9 @@ export function useThreadActions() {
       unarchiveThread,
       unsettleThread,
       unsnoozeThread,
+      pinThread,
+      unpinThread,
+      reorderPinnedThread,
     ],
   );
 }

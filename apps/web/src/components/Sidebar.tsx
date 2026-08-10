@@ -98,7 +98,7 @@ import {
 import { isModelPickerOpen } from "../modelPickerVisibility";
 import { useShortcutModifierState } from "../shortcutModifierState";
 import { readLocalApi } from "../localApi";
-import { useComposerDraftStore } from "../composerDraftStore";
+import { DraftId, useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
 
@@ -178,6 +178,7 @@ import {
 } from "./Sidebar.logic";
 import { sortThreads } from "../lib/threadSort";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
+import { SavedDraftShelf } from "./sidebar/SavedDraftShelf";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { useIsMobile } from "~/hooks/useMediaQuery";
 import { CommandDialogTrigger } from "./ui/command";
@@ -2925,6 +2926,21 @@ export default function Sidebar() {
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
   const navigate = useNavigate();
+  const savedDraftProjectNames = useMemo(
+    () =>
+      new Map(projects.map((project) => [`${project.environmentId}:${project.id}`, project.title])),
+    [projects],
+  );
+  const savedDraftProjectCwds = useMemo(
+    () =>
+      new Map(
+        projects.map((project) => [
+          `${project.environmentId}:${project.id}`,
+          project.workspaceRoot,
+        ]),
+      ),
+    [projects],
+  );
   const pathname = useLocation({ select: (loc) => loc.pathname });
   const isOnSettings = pathname.startsWith("/settings");
   const sidebarThreadSortOrder = useClientSettings((s) => s.sidebarThreadSortOrder);
@@ -2966,6 +2982,14 @@ export default function Sidebar() {
   const suppressProjectClickForContextMenuRef = useRef(false);
   const desktopUpdateState = useDesktopUpdateState();
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
+  const navigateToSavedDraft = useCallback(
+    (draftId: DraftId) => {
+      clearSelection();
+      if (isMobile) setOpenMobile(false);
+      void navigate({ to: "/draft/$draftId", params: { draftId } });
+    },
+    [clearSelection, isMobile, navigate, setOpenMobile],
+  );
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const platform = navigator.platform;
   const shortcutModifiers = useShortcutModifierState();
@@ -3529,6 +3553,16 @@ export default function Sidebar() {
         <SettingsSidebarNav pathname={pathname} />
       ) : (
         <>
+          <SidebarGroup className="px-2 py-1">
+            <ul role="list" className="flex flex-col gap-px">
+              <SavedDraftShelf
+                activeDraftId={routeTarget?.kind === "draft" ? routeTarget.draftId : null}
+                projectDisplayNameByKey={savedDraftProjectNames}
+                projectCwdByKey={savedDraftProjectCwds}
+                onNavigate={navigateToSavedDraft}
+              />
+            </ul>
+          </SidebarGroup>
           <SidebarProjectsContent
             showArm64IntelBuildWarning={showArm64IntelBuildWarning}
             arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}

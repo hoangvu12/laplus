@@ -1,7 +1,11 @@
 import { EnvironmentId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { shouldShowOpenInPicker } from "./ChatHeader";
+import {
+  chatHeaderActionTriggerLabel,
+  resolveChatHeaderThreadActions,
+  shouldShowOpenInPicker,
+} from "./ChatHeader";
 
 describe("shouldShowOpenInPicker", () => {
   const primaryEnvironmentId = EnvironmentId.make("environment-primary");
@@ -44,5 +48,34 @@ describe("shouldShowOpenInPicker", () => {
         primaryEnvironmentId,
       }),
     ).toBe(false);
+  });
+});
+
+describe("resolveChatHeaderThreadActions", () => {
+  it("exposes an accessible title-menu label", () => {
+    expect(chatHeaderActionTriggerLabel("Fix release")).toBe("Fix release actions");
+  });
+  it("uses the shared policy for the complete supported action menu", () => {
+    expect(
+      resolveChatHeaderThreadActions({
+        pinningSupported: true,
+        pinned: false,
+        settled: false,
+        snoozed: false,
+        settlementSupported: true,
+        snoozeSupported: false,
+      }),
+    ).toEqual(["rename", "copy", "pin", "settle", "archive"]);
+  });
+
+  it("hides unsupported pinning and reflects wake/unpin state", () => {
+    expect(
+      resolveChatHeaderThreadActions({
+        pinningSupported: false,
+        pinned: true,
+        snoozed: true,
+        snoozeSupported: true,
+      }),
+    ).toEqual(["rename", "copy", "unsnooze", "archive"]);
   });
 });

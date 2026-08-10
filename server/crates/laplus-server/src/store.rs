@@ -471,6 +471,12 @@ const MIGRATIONS: &[&str] = &[
         settled_at TEXT
     ) STRICT;
     "#,
+    // Pinned shelf state. Appended so every existing user_version advances
+    // through it; nullable columns keep historical rows valid and unpinned.
+    r#"
+    ALTER TABLE threads ADD COLUMN pinned_at TEXT;
+    ALTER TABLE threads ADD COLUMN pin_order_key TEXT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -665,7 +671,7 @@ const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mo
      latest_user_message_at, created_at, updated_at, archived_at, settled_override, \
      settled_at, snoozed_until, snoozed_at, deleted_at, provider_instance_id, \
      provider_driver, provider_resume_cursor, cursor_provider_instance_id, \
-     cursor_provider_driver";
+     cursor_provider_driver, pinned_at, pin_order_key";
 
 /// The registry's durable half.
 #[derive(Debug)]
@@ -2329,9 +2335,9 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 latest_user_message_at, created_at, updated_at, archived_at, \
                 settled_override, settled_at, snoozed_until, snoozed_at, deleted_at, \
                 provider_instance_id, provider_driver, provider_resume_cursor, \
-                cursor_provider_instance_id, cursor_provider_driver) \
+                cursor_provider_instance_id, cursor_provider_driver, pinned_at, pin_order_key) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) \
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) \
              ON CONFLICT (id) DO UPDATE SET \
                 project_id = excluded.project_id, \
                 title = excluded.title, \
@@ -2354,7 +2360,9 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 provider_driver = excluded.provider_driver, \
                 provider_resume_cursor = excluded.provider_resume_cursor, \
                 cursor_provider_instance_id = excluded.cursor_provider_instance_id, \
-                cursor_provider_driver = excluded.cursor_provider_driver",
+                cursor_provider_driver = excluded.cursor_provider_driver, \
+                pinned_at = excluded.pinned_at, \
+                pin_order_key = excluded.pin_order_key",
             rusqlite::params![
                 thread.id,
                 thread.project_id,
@@ -2384,6 +2392,8 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 thread.provider_resume_cursor.as_ref().map(|cursor| cursor.value.to_string()),
                 thread.provider_resume_cursor.as_ref().map(|cursor| &cursor.provider.instance_id),
                 thread.provider_resume_cursor.as_ref().map(|cursor| &cursor.provider.driver),
+                thread.lifecycle.pinned_at,
+                thread.lifecycle.pin_order_key,
             ],
         )
         .map_err(StorageError::while_("store the conversation"))?;
@@ -2577,6 +2587,8 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
             snoozed_until: row.get(16)?,
             snoozed_at: row.get(17)?,
             deleted_at: row.get(18)?,
+            pinned_at: row.get(24)?,
+            pin_order_key: row.get(25)?,
         },
     })
 }
@@ -2700,6 +2712,13 @@ fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Checkpoint)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_columns_are_the_newest_forward_migration() {
+        let newest = MIGRATIONS.last().expect("a newest migration");
+        assert!(newest.contains("ADD COLUMN pinned_at"));
+        assert!(newest.contains("ADD COLUMN pin_order_key"));
+    }
 
     /// A real directory to register, a database to register it in, and the
     /// counter the writes take their sequence from — which is the arrangement a
@@ -3399,6 +3418,8 @@ mod tests {
             snoozed_until: Some("2026-07-27T03:00:00.000Z".to_string()),
             snoozed_at: Some("2026-07-26T04:00:00.000Z".to_string()),
             deleted_at: Some("2026-07-26T05:00:00.000Z".to_string()),
+            pinned_at: Some("2026-07-26T06:00:00.000Z".to_string()),
+            pin_order_key: Some("middle".to_string()),
         };
 
         let messages = vec![

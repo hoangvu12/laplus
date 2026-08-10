@@ -66,6 +66,41 @@ it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
   }),
 );
 
+it.effect("decodes pin commands and events", () =>
+  Effect.gen(function* () {
+    const pin = yield* decodeOrchestrationCommand({
+      type: "thread.pin",
+      commandId: "pin-command",
+      threadId: "thread-1",
+      orderKey: "m",
+    });
+    if (pin.type !== "thread.pin") throw new Error(`Unexpected command: ${pin.type}`);
+    assert.strictEqual(pin.orderKey, "m");
+
+    const reordered = yield* decodeOrchestrationEvent({
+      sequence: 1,
+      eventId: "event-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      occurredAt: "2026-08-10T00:00:00.000Z",
+      commandId: "reorder-command",
+      causationEventId: null,
+      correlationId: "reorder-command",
+      metadata: { actorKind: "client" },
+      type: "thread.pin-reordered",
+      payload: {
+        threadId: "thread-1",
+        orderKey: "g",
+        updatedAt: "2026-08-10T00:00:00.000Z",
+      },
+    });
+    if (reordered.type !== "thread.pin-reordered") {
+      throw new Error(`Unexpected event: ${reordered.type}`);
+    }
+    assert.strictEqual(reordered.payload.orderKey, "g");
+  }),
+);
+
 it.effect("parses turn diff input with whitespace ignoring enabled", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeTurnDiffInput({

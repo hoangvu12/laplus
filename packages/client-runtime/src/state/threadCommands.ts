@@ -20,6 +20,9 @@ import {
   type UnarchiveThreadInput,
   type UnsettleThreadInput,
   type UnsnoozeThreadInput,
+  type PinThreadInput,
+  type UnpinThreadInput,
+  type ReorderPinnedThreadInput,
   type UpdateThreadMetadataInput,
   archiveThread,
   createThread,
@@ -38,6 +41,9 @@ import {
   unarchiveThread,
   unsettleThread,
   unsnoozeThread,
+  pinThread,
+  unpinThread,
+  reorderPinnedThread,
   updateThreadMetadata,
 } from "../operations/commands.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -60,6 +66,9 @@ export type {
   UnarchiveThreadInput,
   UnsettleThreadInput,
   UnsnoozeThreadInput,
+  PinThreadInput,
+  UnpinThreadInput,
+  ReorderPinnedThreadInput,
   UpdateThreadMetadataInput,
 } from "../operations/commands.ts";
 
@@ -118,6 +127,24 @@ export function createThreadEnvironmentAtoms<R, E>(
     unsnooze: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:unsnooze",
       execute: (input: UnsnoozeThreadInput) => unsnoozeThread(input),
+      scheduler,
+      concurrency,
+    }),
+    pin: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:pin",
+      execute: (input: PinThreadInput) => pinThread(input),
+      scheduler,
+      concurrency,
+    }),
+    unpin: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:unpin",
+      execute: (input: UnpinThreadInput) => unpinThread(input),
+      scheduler,
+      concurrency,
+    }),
+    reorderPin: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:reorder-pin",
+      execute: (input: ReorderPinnedThreadInput) => reorderPinnedThread(input),
       scheduler,
       concurrency,
     }),

@@ -217,17 +217,48 @@ struct Inner {
 #[derive(Debug, Clone, PartialEq)]
 enum Command {
     CreateProject(CreateProject),
-    RenameProject { project_id: String, title: String },
-    DeleteProject { project_id: String },
+    RenameProject {
+        project_id: String,
+        title: String,
+    },
+    DeleteProject {
+        project_id: String,
+    },
     CreateThread(CreateThread),
     UpdateThreadMeta(UpdateThreadMetaPayload),
-    Archive { thread_id: String },
-    Unarchive { thread_id: String },
-    Settle { thread_id: String },
-    Unsettle { thread_id: String },
-    Snooze { thread_id: String, until: String },
-    Unsnooze { thread_id: String },
-    Delete { thread_id: String },
+    Archive {
+        thread_id: String,
+    },
+    Unarchive {
+        thread_id: String,
+    },
+    Pin {
+        thread_id: String,
+        order_key: Option<String>,
+    },
+    Unpin {
+        thread_id: String,
+    },
+    ReorderPin {
+        thread_id: String,
+        order_key: String,
+    },
+    Settle {
+        thread_id: String,
+    },
+    Unsettle {
+        thread_id: String,
+    },
+    Snooze {
+        thread_id: String,
+        until: String,
+    },
+    Unsnooze {
+        thread_id: String,
+    },
+    Delete {
+        thread_id: String,
+    },
     StartTurn(Box<StartTurn>),
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -235,7 +266,9 @@ enum Command {
     SetRuntimeMode(SetRuntimeModePayload),
     SetInteractionMode(SetInteractionModePayload),
     RevertCheckpoint(RevertCheckpointPayload),
-    StopSession { thread_id: String },
+    StopSession {
+        thread_id: String,
+    },
 }
 
 /// Everything a diff of a conversation needs that is not about git.
@@ -524,6 +557,15 @@ impl Shell {
             Command::UpdateThreadMeta(update) => self.update_thread_meta(update)?,
             Command::Archive { thread_id } => self.set_archived(&thread_id, Shelf::Archived)?,
             Command::Unarchive { thread_id } => self.set_archived(&thread_id, Shelf::Working)?,
+            Command::Pin {
+                thread_id,
+                order_key,
+            } => self.pin(&thread_id, order_key)?,
+            Command::Unpin { thread_id } => self.unpin(&thread_id)?,
+            Command::ReorderPin {
+                thread_id,
+                order_key,
+            } => self.reorder_pin(&thread_id, order_key)?,
             Command::Settle { thread_id } => self.settle(&thread_id)?,
             Command::Unsettle { thread_id } => self.unsettle(&thread_id)?,
             Command::Snooze { thread_id, until } => self.snooze(&thread_id, until)?,
@@ -994,6 +1036,51 @@ impl Shell {
                 Change::Unsettled {
                     reason: threads::BY_THE_USER,
                 },
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    fn pin(&self, thread_id: &str, order_key: Option<String>) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| Shelf::Archived.holds(thread).then(|| format!("Conversation '{thread_id}' is archived, so it cannot be pinned.")),
+                Change::Pinned { order_key },
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    fn unpin(&self, thread_id: &str) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| Shelf::Archived.holds(thread).then(|| format!("Conversation '{thread_id}' is archived, so it cannot be unpinned.")),
+                Change::Unpinned,
+            )
+            .ok_or_else(|| self.not_open(thread_id))?
+            .map_err(CommandError::new)
+    }
+
+    fn reorder_pin(&self, thread_id: &str, order_key: String) -> Result<i64, CommandError> {
+        self.inner
+            .threads
+            .apply_unless(
+                thread_id,
+                |thread| {
+                    if Shelf::Archived.holds(thread) {
+                        return Some(format!("Conversation '{thread_id}' is archived, so its pin cannot be reordered."));
+                    }
+                    thread.lifecycle.pinned_at.is_none().then(|| {
+                        format!(
+                            "Conversation '{thread_id}' is not pinned, so it cannot be reordered."
+                        )
+                    })
+                },
+                Change::PinReordered { order_key },
             )
             .ok_or_else(|| self.not_open(thread_id))?
             .map_err(CommandError::new)
@@ -2377,6 +2464,22 @@ struct AboutAThread {
     thread_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PinPayload {
+    #[serde(flatten)]
+    about: AboutAThread,
+    order_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReorderPinPayload {
+    #[serde(flatten)]
+    about: AboutAThread,
+    order_key: String,
+}
+
 /// `thread.unsettle` and `thread.unsnooze` — [`AboutAThread`] and the one thing
 /// that makes the two of them their own payload.
 ///
@@ -2626,6 +2729,29 @@ impl Command {
                 Ok(match kind {
                     "thread.archive" => Command::Archive { thread_id },
                     _ => Command::Unarchive { thread_id },
+                })
+            }
+            "thread.pin" => {
+                let pin: PinPayload = read_about_a_thread(payload, kind)?;
+                Ok(Command::Pin {
+                    thread_id: non_blank(pin.about.thread_id, "threadId", kind)?,
+                    order_key: pin
+                        .order_key
+                        .map(|key| non_blank(key, "orderKey", kind))
+                        .transpose()?,
+                })
+            }
+            "thread.unpin" => {
+                let about: AboutAThread = read_about_a_thread(payload, kind)?;
+                Ok(Command::Unpin {
+                    thread_id: non_blank(about.thread_id, "threadId", kind)?,
+                })
+            }
+            "thread.pin.reorder" => {
+                let reorder: ReorderPinPayload = read_about_a_thread(payload, kind)?;
+                Ok(Command::ReorderPin {
+                    thread_id: non_blank(reorder.about.thread_id, "threadId", kind)?,
+                    order_key: non_blank(reorder.order_key, "orderKey", kind)?,
                 })
             }
             // A conversation and nothing else, as the archive commands are.
@@ -2889,6 +3015,9 @@ impl Command {
             Command::UpdateThreadMeta(update) => Some(&update.thread_id),
             Command::Archive { thread_id }
             | Command::Unarchive { thread_id }
+            | Command::Pin { thread_id, .. }
+            | Command::Unpin { thread_id }
+            | Command::ReorderPin { thread_id, .. }
             | Command::Settle { thread_id }
             | Command::Unsettle { thread_id }
             | Command::Snooze { thread_id, .. }

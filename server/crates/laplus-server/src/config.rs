@@ -178,6 +178,12 @@ pub struct Capabilities {
     /// a snooze expires by being read, so nothing has to happen for one to end.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_snooze: Option<bool>,
+    /// `thread.pin` and `thread.unpin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_pinning: Option<bool>,
+    /// Manual ordering through `thread.pin.reorder`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_pin_reorder: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -657,6 +663,8 @@ impl ServerConfig {
                     connection_probe: Some(true),
                     thread_settlement: Some(true),
                     thread_snooze: Some(true),
+                    thread_pinning: Some(true),
+                    thread_pin_reorder: Some(true),
                 },
             },
             auth: AuthDescriptor {
@@ -1195,6 +1203,8 @@ mod tests {
         assert_eq!(capabilities.thread_settlement, Some(true));
         // `thread.snooze` and `thread.unsnooze`, ticket 09.
         assert_eq!(capabilities.thread_snooze, Some(true));
+        assert_eq!(capabilities.thread_pinning, Some(true));
+        assert_eq!(capabilities.thread_pin_reorder, Some(true));
     }
 
     #[test]
@@ -1214,6 +1224,8 @@ mod tests {
         // against, rather than any other truthy shape.
         assert_eq!(capabilities["threadSettlement"], serde_json::json!(true));
         assert_eq!(capabilities["threadSnooze"], serde_json::json!(true));
+        assert_eq!(capabilities["threadPinning"], serde_json::json!(true));
+        assert_eq!(capabilities["threadPinReorder"], serde_json::json!(true));
     }
 
     /// Whatever this platform answers, the label is a name rather than an empty
