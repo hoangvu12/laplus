@@ -293,6 +293,22 @@ agents and model variants. A local instance reads them from `opencode models
 Only connected upstream providers contribute discovered models, while custom
 configured models remain available as fallback entries.
 
+**Sub-provider** — the upstream a discovered model belongs to, carried on every
+OpenCode model in the snapshot. OpenCode is a front for other providers, so one
+instance offers `openai/gpt-5` beside `siliconflow/Qwen/Qwen3.5-27B`, and two
+upstreams routinely name the same model identically — this is what tells those
+rows apart, and what the model search matches when somebody types a provider's
+id. The HTTP inventory's display name where it has one, the provider id
+otherwise, which is all `models --verbose` reports. Authored fallbacks have
+none: a developer's slug is theirs and naming an upstream for it would be a
+guess.
+
+**Visible** agents excludes three the CLI does not admit to hiding. `GET /agent`
+carries a `hidden` flag; `agent list` prints `compaction (primary)` and says
+nothing, so `compaction`, `summary` and `title` — OpenCode's own machinery — are
+named as hidden in `crate::provider` the way upstream names them. Without that a
+local instance offered its summariser as something to run a turn with.
+
 **Text generation** — short, structured provider work used to name commits,
 pull requests, branches and threads outside a conversation. OpenCode runs each
 request in a temporary deny-all session; local instances share a separate

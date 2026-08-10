@@ -68,6 +68,43 @@ describe("scoreModelPickerSearch", () => {
     expect(exactScore!).toBeLessThan(fuzzyScore!);
   });
 
+  it("matches an upstream provider id that only the slug carries", () => {
+    // OpenCode fronts a provider per slug segment, and the id there is the one
+    // thing a person reads off `opencode auth list`. Before the slug was
+    // indexed, typing it found nothing while the provider's whole catalogue sat
+    // in the list.
+    const model = {
+      driverKind: "opencode",
+      providerDisplayName: "OpenCode",
+      name: "Qwen3.5 27B",
+      slug: "siliconflow/Qwen/Qwen3.5-27B",
+    };
+
+    expect(scoreModelPickerSearch(model, "siliconflow")).not.toBeNull();
+    expect(scoreModelPickerSearch(model, "siliconflow qwen3.5")).not.toBeNull();
+    expect(scoreModelPickerSearch(model, "dashscope")).toBeNull();
+  });
+
+  it("ranks a name match ahead of the same query matching only a slug", () => {
+    const byName = scoreModelPickerSearch(
+      { driverKind: "opencode", providerDisplayName: "OpenCode", name: "Qwen3.5 27B", slug: "x/y" },
+      "qwen3.5",
+    );
+    const bySlug = scoreModelPickerSearch(
+      {
+        driverKind: "opencode",
+        providerDisplayName: "OpenCode",
+        name: "Some Other Model",
+        slug: "siliconflow/Qwen/Qwen3.5-27B",
+      },
+      "qwen3.5",
+    );
+
+    expect(byName).not.toBeNull();
+    expect(bySlug).not.toBeNull();
+    expect(byName!).toBeLessThan(bySlug!);
+  });
+
   it("gives favorite models a strong enough ranking boost for partial queries", () => {
     const favoriteScore = scoreModelPickerSearch(
       {

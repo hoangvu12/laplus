@@ -4,6 +4,13 @@ type ModelPickerSearchableModel = {
   /** Driver kind — indexed so "codex" still matches a Codex Personal instance. */
   driverKind: string;
   /**
+   * The model id itself, e.g. `siliconflow/Qwen/Qwen3.5-27B`. Indexed last of
+   * the identifying fields because a name is what a person reads, but indexed:
+   * the slug is the only place an OpenCode upstream's *id* appears, so without
+   * it "siliconflow" matches nothing while 49 of its models sit in the list.
+   */
+  slug?: string;
+  /**
    * Instance display name (e.g. "Codex Personal"). Indexed as a search
    * field so typing the custom instance's user-authored name matches its
    * models directly instead of just the driver kind.
@@ -24,6 +31,7 @@ function getModelPickerSearchFields(model: ModelPickerSearchableModel): string[]
     ...(model.subProvider ? [normalizeSearchQuery(model.subProvider)] : []),
     normalizeSearchQuery(model.driverKind),
     normalizeSearchQuery(model.providerDisplayName),
+    ...(model.slug ? [normalizeSearchQuery(model.slug)] : []),
     buildModelPickerSearchText(model),
   ];
 }
