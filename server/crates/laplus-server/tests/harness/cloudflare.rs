@@ -281,8 +281,8 @@ impl FakeCloudflared {
 
     /// Whether the last thing a connector did was shut down gracefully.
     ///
-    /// The `stopped` line is written from the fake's `finally`, so it appears
-    /// only when the process was asked to stop and had the chance to answer —
+    /// The `stopped` line is written synchronously by the fake's SIGTERM
+    /// handler, so it appears only when the process was asked to stop —
     /// which is what ADR-0048's "shut down gracefully with the owner" means and
     /// what a `SIGKILL`, or a laplus that never handled `SIGTERM` at all, does
     /// not produce.
@@ -497,14 +497,14 @@ class Ready(http.server.BaseHTTPRequestHandler):
 
 host, port = metrics.rsplit(':', 1)
 server = http.server.HTTPServer((host, int(port)), Ready)
-try:
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    with open(TRACE, 'a') as f:
-        f.write('ready-to-stop\n')
-    server.serve_forever()
-finally:
+def stop(*_):
     with open(TRACE, 'a') as f:
         f.write('stopped\n')
+    os._exit(0)
+signal.signal(signal.SIGTERM, stop)
+with open(TRACE, 'a') as f:
+    f.write('ready-to-stop\n')
+server.serve_forever()
 "#,
             trace = self.trace.display().to_string(),
             mode = self.mode.display().to_string(),
