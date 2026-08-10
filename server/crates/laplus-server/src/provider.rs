@@ -50,7 +50,7 @@
 //!   states are reported explicitly.
 
 use std::path::{Path, PathBuf};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -1371,6 +1371,8 @@ fn codex_snapshot(
 }
 
 const MINIMUM_OPENCODE_VERSION: (u64, u64, u64) = (1, 14, 19);
+const EXTERNAL_DISCOVERY_RETRIES: usize = 2;
+const EXTERNAL_DISCOVERY_BACKOFF: Duration = Duration::from_millis(20);
 
 fn describe_opencode(instance: &OpenCodeInstance, search: &Search) -> Provider {
     let settings = &instance.settings;
@@ -1428,13 +1430,17 @@ async fn discover_external_opencode(settings: &OpenCodeSettings) -> Result<(Stri
         Ok::<_, crate::opencode::OpenCodeError>((health, providers, agents))
     };
     // Discovery is GET-only. A fresh connection can fail transiently while a
-    // loaded Windows host recycles loopback ports, so retry the inventory once.
-    let discovered = match discover().await {
-        Err(crate::opencode::OpenCodeError::Transport(_)) => {
-            tokio::task::yield_now().await;
-            discover().await
+    // loaded host starts or replaces the external server, so retry transport
+    // failures after a short bounded backoff.
+    let mut retries = 0;
+    let discovered = loop {
+        match discover().await {
+            Err(crate::opencode::OpenCodeError::Transport(_)) if retries < EXTERNAL_DISCOVERY_RETRIES => {
+                retries += 1;
+                tokio::time::sleep(EXTERNAL_DISCOVERY_BACKOFF).await;
+            }
+            result => break result,
         }
-        result => result,
     };
     let (health, providers, agents) = discovered.map_err(|error| error.to_string())?;
     if !health.healthy { return Err("the server reported unhealthy".to_string()); }
@@ -1737,6 +1743,7 @@ fn publish_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// A stand-in for the agent: a file this platform agrees is a program, which
     /// answers `--version` however the test needs it answered.

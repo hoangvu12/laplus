@@ -65,6 +65,19 @@ async fn opencode_peer(include_connected: bool) -> String {
     format!("http://{address}")
 }
 
+/// An endpoint that deterministically refuses HTTP without releasing its port
+/// for another parallel test server to claim.
+async fn unavailable_opencode_peer() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((connection, _)) = listener.accept().await {
+            drop(connection);
+        }
+    });
+    format!("http://{address}")
+}
+
 /// A server configuration whose provider settings are the test's.
 ///
 /// The `binaryPath` setting is the seam the spec names for injecting a stand-in
@@ -282,14 +295,14 @@ async fn a_targeted_refresh_accepts_a_configured_codex_instance() {
 #[tokio::test]
 async fn external_opencode_instances_discover_independently_and_keep_custom_fallbacks() {
     let endpoint = opencode_peer(true).await;
-    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let unavailable = unavailable_opencode_peer().await;
     let server = TestServer::start().await;
     let mut client = server.connect().await;
     client.call("server.updateSettings", json!({"patch":{"providerInstances":{
         "openGood":{"driver":"opencode","displayName":"OpenCode Good","config":{
             "serverUrl":endpoint,"serverPassword":"secret","customModels":["ollama/qwen3"]}},
         "openBad":{"driver":"opencode","displayName":"OpenCode Bad","config":{
-            "serverUrl":format!("http://{unavailable}")}}
+            "serverUrl":unavailable}}
     }}})).await.expect_success();
 
     let good = provider_named(&server, "openGood").await;
