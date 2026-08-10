@@ -118,7 +118,11 @@ async fn sigterm_stops_the_connector_laplus_started() {
     std::fs::write(&token, harness::cloudflare::CONNECTOR_TOKEN).expect("the token file");
 
     let mut server = HeadlessServer::start(&fake, &token);
-    settles(|| fake.launches() >= 1, "the connector was never started");
+    settles(
+        || fake.ready_to_stop(),
+        "the connector never installed its termination handler",
+    );
+    assert!(fake.launches() >= 1, "the connector was never started");
     // Running, and not yet stopped — otherwise the assertion below would pass
     // for a connector that had merely crashed.
     assert!(!fake.stopped_gracefully());

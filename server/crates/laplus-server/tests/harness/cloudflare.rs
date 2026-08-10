@@ -273,6 +273,12 @@ impl FakeCloudflared {
         self.lines().filter(|line| line.starts_with('[')).count()
     }
 
+    /// Whether the connector has installed its termination handler inside the
+    /// `try` whose `finally` records a graceful stop.
+    pub fn ready_to_stop(&self) -> bool {
+        self.lines().any(|line| line == "ready-to-stop")
+    }
+
     /// Whether the last thing a connector did was shut down gracefully.
     ///
     /// The `stopped` line is written from the fake's `finally`, so it appears
@@ -491,8 +497,10 @@ class Ready(http.server.BaseHTTPRequestHandler):
 
 host, port = metrics.rsplit(':', 1)
 server = http.server.HTTPServer((host, int(port)), Ready)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 try:
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    with open(TRACE, 'a') as f:
+        f.write('ready-to-stop\n')
     server.serve_forever()
 finally:
     with open(TRACE, 'a') as f:
