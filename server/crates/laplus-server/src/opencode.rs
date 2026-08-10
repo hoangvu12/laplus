@@ -493,6 +493,7 @@ impl OwnedServer {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
+        crate::process::without_a_console(command.as_std_mut());
         let child = command.spawn().map_err(|error| {
             format!(
                 "The OpenCode binary {} could not be started in {directory}: {error}",
