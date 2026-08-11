@@ -201,6 +201,9 @@ export function applyThreadDetailEvent(
         thread: {
           ...thread,
           ...(event.payload.title !== undefined ? { title: event.payload.title } : {}),
+          ...(event.payload.titleRegeneration !== undefined
+            ? { titleRegeneration: event.payload.titleRegeneration }
+            : {}),
           ...(event.payload.modelSelection !== undefined
             ? { modelSelection: event.payload.modelSelection }
             : {}),

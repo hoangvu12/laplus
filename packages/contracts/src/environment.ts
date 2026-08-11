@@ -51,6 +51,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   threadPinning: Schema.optionalKey(Schema.Boolean),
   /** Server understands thread.pin.reorder commands independently of pinning. */
   threadPinReorder: Schema.optionalKey(Schema.Boolean),
+  /** Server understands shared, server-authored thread title regeneration. */
+  threadTitleRegeneration: Schema.optionalKey(Schema.Boolean),
   /** The update path clients should offer for this server. Absent on
       servers that must be relaunched manually (dev checkouts, Windows
       foreground runs, pre-update servers). */

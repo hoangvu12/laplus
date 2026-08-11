@@ -365,6 +365,31 @@ it.effect("decodes thread.meta-updated payloads with explicit provider", () =>
   }),
 );
 
+it.effect("decodes title regeneration intent and shared pending state", () =>
+  Effect.gen(function* () {
+    const command = yield* decodeOrchestrationCommand({
+      type: "thread.meta.update",
+      commandId: "regenerate-title",
+      threadId: "thread-1",
+      regenerateTitle: true,
+    });
+    assert.strictEqual(command.type, "thread.meta.update");
+    if (command.type === "thread.meta.update") assert.strictEqual(command.regenerateTitle, true);
+
+    const payload = yield* decodeThreadMetaUpdatedPayload({
+      threadId: "thread-1",
+      regenerateTitle: true,
+      previousTitle: "Current title",
+      titleRegeneration: {
+        requestId: "regenerate-title",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      },
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(payload.titleRegeneration?.requestId, "regenerate-title");
+  }),
+);
+
 it.effect("decodes thread archive and unarchive commands", () =>
   Effect.gen(function* () {
     const archive = yield* decodeOrchestrationCommand({

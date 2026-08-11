@@ -183,6 +183,19 @@ const MISSING: &[Declared] = &[
 /// is why `AGENT_VERSION` is current.
 const ADDED: &[Declared] = &[
     Declared {
+        path: "/environment/capabilities/threadPinReorder",
+        because: "thread pinning ticket 01 advertises that pinned threads can be reordered",
+    },
+    Declared {
+        path: "/environment/capabilities/threadPinning",
+        because: "thread pinning ticket 01 advertises the supported pin and unpin commands",
+    },
+    Declared {
+        path: "/environment/capabilities/threadTitleRegeneration",
+        because:
+            "rename-thread ticket 02 advertises the supported explicit title-regeneration command",
+    },
+    Declared {
         path: "/settings/providerInstances/claudeAgent",
         because: "OpenCode registry ticket 03 makes the durable Claude default an ordinary \
                   configured provider instance",

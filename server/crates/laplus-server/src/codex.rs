@@ -500,6 +500,9 @@ fn decide(folded: ConversationFold, driving: &mut Driving, drift: Drift) -> Deci
         ConversationFold::TitleUpdated { title } => {
             decided.changes.push(Change::MetaUpdated(crate::threads::MetaUpdate {
                 title: Some(title),
+                title_regeneration: Some(None),
+                regenerate_title: false,
+                previous_title: None,
                 model_selection: None,
                 branch: None,
                 worktree_path: None,

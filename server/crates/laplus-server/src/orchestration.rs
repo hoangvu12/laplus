@@ -107,6 +107,7 @@ use crate::settling::SessionStatus;
 use crate::text_generation::{Operation as TextOperation, ResultText, Service as TextGeneration};
 use crate::threads::{
     self, Adoption, Attention, Busy, Change, Given, MetaUpdate, Session, Shelf, Thread,
+    TitleRegeneration,
     Threads,
 };
 use crate::transcripts::Transcripts;
@@ -555,7 +556,7 @@ impl Shell {
             }
             Command::DeleteProject { project_id } => self.delete_project(&project_id, index)?,
             Command::CreateThread(create) => self.create_thread(&create, config)?,
-            Command::UpdateThreadMeta(update) => self.update_thread_meta(update)?,
+            Command::UpdateThreadMeta(update) => self.update_thread_meta(update, config)?,
             Command::Archive { thread_id } => self.set_archived(&thread_id, Shelf::Archived)?,
             Command::Unarchive { thread_id } => self.set_archived(&thread_id, Shelf::Working)?,
             Command::Pin {
@@ -858,10 +859,16 @@ impl Shell {
     /// An unknown thread is refused by [`Threads::apply`]'s own `None`, again as
     /// [`Shell::set_mode`] does it and for the same reason — a pre-check would
     /// clone a whole transcript to ask a question the write answers anyway.
-    fn update_thread_meta(&self, update: UpdateThreadMetaPayload) -> Result<i64, CommandError> {
+    fn update_thread_meta(
+        &self,
+        update: UpdateThreadMetaPayload,
+        config: &ServerConfig,
+    ) -> Result<i64, CommandError> {
         let UpdateThreadMetaPayload {
             thread_id,
             title,
+            regenerate_title,
+            command_id,
             model_selection,
             branch,
             worktree_path,
@@ -870,18 +877,128 @@ impl Shell {
             let thread = self.open_thread(&thread_id)?;
             selection_for(&thread, selection)?;
         }
+        if regenerate_title {
+            return self.regenerate_title(&thread_id, &command_id, config);
+        }
+        let title_regeneration = title.as_ref().map(|_| None);
         self.inner
             .threads
             .apply(
                 &thread_id,
                 Change::MetaUpdated(MetaUpdate {
                     title,
+                    title_regeneration,
+                    regenerate_title: false,
+                    previous_title: None,
                     model_selection,
                     branch,
                     worktree_path,
                 }),
             )
             .ok_or_else(|| self.not_open(&thread_id))
+    }
+
+    fn regenerate_title(
+        &self,
+        thread_id: &str,
+        request_id: &str,
+        config: &ServerConfig,
+    ) -> Result<i64, CommandError> {
+        let thread = self.open_thread(thread_id)?;
+        let project = self.project(&thread.project_id)?;
+        let selection = &config.settings.text_generation_model_selection;
+        let instance_id = selection
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CommandError::new("No text-generation provider is configured."))?;
+        let instance = crate::provider::resolve_instance(&config.settings, instance_id, None)
+            .map_err(|_| CommandError::new(format!(
+                "Text-generation provider '{instance_id}' is unavailable."
+            )))?;
+        let model = selection.get("model").and_then(Value::as_str).map(str::to_string);
+        let context = format!(
+            "Current title: {}\n\nConversation:\n{}",
+            thread.title,
+            thread
+                .messages
+                .iter()
+                .filter(|message| !message.text.trim().is_empty())
+                .map(|message| format!("{}: {}", message.role, message.text))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+        let previous_title = thread.title.clone();
+        let directory = where_the_work_happens(&thread, &project);
+        let request_id = request_id.to_string();
+        let sequence = self
+            .inner
+            .threads
+            .apply(
+                thread_id,
+                Change::MetaUpdated(MetaUpdate {
+                    title: None,
+                    title_regeneration: Some(Some(TitleRegeneration {
+                        request_id: request_id.clone(),
+                        started_at: now_iso(),
+                    })),
+                    regenerate_title: true,
+                    previous_title: Some(previous_title.clone()),
+                    model_selection: None,
+                    branch: None,
+                    worktree_path: None,
+                }),
+            )
+            .ok_or_else(|| self.not_open(thread_id))?;
+
+        let shell = self.clone();
+        let thread_id = thread_id.to_string();
+        tokio::spawn(async move {
+            let generated = TextGeneration::new()
+                .generate(
+                    &instance,
+                    &directory,
+                    model.as_deref(),
+                    TextOperation::ThreadTitle { context },
+                )
+                .await;
+            let (title, failure) = match generated {
+                Ok(ResultText::ThreadTitle(title)) if !title.trim().is_empty() => {
+                    (Some(title.trim().to_string()), None)
+                }
+                Ok(_) => (None, Some("The title generator returned a blank title.".to_string())),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let completion = shell.inner.threads.apply_unless(
+                &thread_id,
+                |thread| {
+                    (thread.title_regeneration.as_ref().map(|pending| pending.request_id.as_str())
+                        != Some(request_id.as_str())
+                        || thread.title != previous_title)
+                        .then(|| "the title generation was superseded".to_string())
+                },
+                Change::MetaUpdated(MetaUpdate {
+                    title,
+                    title_regeneration: Some(None),
+                    regenerate_title: false,
+                    previous_title: None,
+                    model_selection: None,
+                    branch: None,
+                    worktree_path: None,
+                }),
+            );
+            if completion.as_ref().is_some_and(|result| result.is_ok()) {
+                if let Some(failure) = failure {
+                    let _ = shell.inner.threads.apply(
+                        &thread_id,
+                        Change::Activity(crate::threads::Activity::failed(
+                            "thread.title-regeneration.failed",
+                            &format!("Failed to regenerate title: {failure}"),
+                        )),
+                    );
+                }
+            }
+        });
+        Ok(sequence)
     }
 
     /// Put a finished conversation away, or take it back out.
@@ -1713,10 +1830,15 @@ impl Shell {
             }
             let _ = shell.inner.threads.apply_unless(
                 &thread_id,
-                |thread| (thread.title != expected)
-                    .then(|| "the provisional title was superseded".to_string()),
+                |thread| {
+                    (thread.title != expected || thread.title_regeneration.is_some())
+                        .then(|| "the provisional title was superseded".to_string())
+                },
                 Change::MetaUpdated(MetaUpdate {
                     title: Some(title.to_string()),
+                    title_regeneration: None,
+                    regenerate_title: false,
+                    previous_title: None,
                     model_selection: None,
                     branch: None,
                     worktree_path: None,
@@ -2215,6 +2337,7 @@ impl CreateThread {
             id: self.thread_id.clone(),
             project_id: self.thread.project_id.clone(),
             title,
+            title_regeneration: None,
             provider: identity,
             model_selection: self.thread.model_selection.clone(),
             runtime_mode: self.thread.runtime_mode.clone(),
@@ -2400,14 +2523,15 @@ const UNSTORED_PROJECT_FIELDS: [&str; 3] = ["workspaceRoot", "defaultModelSelect
 /// `thread.meta.update` — the conversation's own description, as the client keeps
 /// it.
 ///
-/// Four fields, every one optional, and only the ones that arrived are applied —
-/// see [`MetaUpdate`], which is the same shape one step further in. All four are
-/// already columns on the thread and already published, so this command needs no
-/// migration and no new read-model shape.
+/// The four durable metadata fields are optional and only the ones that arrived
+/// are applied — see [`MetaUpdate`], which is the same shape one step further
+/// in. `regenerateTitle` is a fifth, transient intent: it starts background work
+/// and publishes [`TitleRegeneration`] instead of becoming a database column.
 ///
-/// `commandId` and `expectedBranch` are in the contract and deliberately absent.
-/// The first is unread everywhere on this wire — see the module documentation.
-/// The second is a compare-and-swap on the branch that **nothing in this
+/// `commandId` supplies the regeneration request identity, so overlapping work
+/// can be settled by newest request rather than completion order. It remains
+/// otherwise unread, as described in the module documentation. `expectedBranch`
+/// is a compare-and-swap on the branch that **nothing in this
 /// repository sends**: no call site in `apps/web` or `packages/client-runtime`
 /// builds one. Honouring it would mean inventing the semantics of a guard no
 /// client asks for, and refusing a payload that carried one would refuse a client
@@ -2418,7 +2542,11 @@ const UNSTORED_PROJECT_FIELDS: [&str; 3] = ["workspaceRoot", "defaultModelSelect
 struct UpdateThreadMetaPayload {
     thread_id: String,
     #[serde(default)]
+    command_id: String,
+    #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    regenerate_title: bool,
     #[serde(default)]
     model_selection: Option<Value>,
     #[serde(default, deserialize_with = "given")]
@@ -2742,6 +2870,8 @@ impl Command {
                 let UpdateThreadMetaPayload {
                     thread_id,
                     title,
+                    regenerate_title,
+                    command_id,
                     model_selection,
                     branch,
                     worktree_path,
@@ -2750,6 +2880,11 @@ impl Command {
                 // name — the same order the two mode commands take, and for the
                 // same reason.
                 let thread_id = non_blank(thread_id, "threadId", kind)?;
+                if regenerate_title && title.is_some() {
+                    return Err(CommandError::new(format!(
+                        "{kind} cannot rename thread '{thread_id}' and regenerate its title in the same command."
+                    )));
+                }
                 // A command carrying none of the four is refused, because the
                 // event describing it would name nothing: a `thread.meta-updated`
                 // whose payload is a `threadId` and a timestamp says a
@@ -2757,6 +2892,7 @@ impl Command {
                 // The client folds that as an update, so it would be an event
                 // asserting a change nobody could point at.
                 if title.is_none()
+                    && !regenerate_title
                     && model_selection.is_none()
                     && branch.is_none()
                     && worktree_path.is_none()
@@ -2791,6 +2927,8 @@ impl Command {
                         .map(|title| a_title(title, "thread", &thread_id))
                         .transpose()?,
                     model_selection,
+                    regenerate_title,
+                    command_id,
                     branch: cleared_or_named(branch, "branch", &thread_id)?,
                     worktree_path: cleared_or_named(worktree_path, "worktree path", &thread_id)?,
                     thread_id,

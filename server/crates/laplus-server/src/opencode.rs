@@ -1647,6 +1647,9 @@ impl crate::session::Driver for OpenCode {
                     decided.changes.push(crate::threads::Change::MetaUpdated(
                         crate::threads::MetaUpdate {
                             title: Some(title.to_string()),
+                            title_regeneration: Some(None),
+                            regenerate_title: false,
+                            previous_title: None,
                             model_selection: None,
                             branch: None,
                             worktree_path: None,

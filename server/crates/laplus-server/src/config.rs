@@ -184,6 +184,8 @@ pub struct Capabilities {
     /// Manual ordering through `thread.pin.reorder`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_pin_reorder: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_title_regeneration: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -665,6 +667,7 @@ impl ServerConfig {
                     thread_snooze: Some(true),
                     thread_pinning: Some(true),
                     thread_pin_reorder: Some(true),
+                    thread_title_regeneration: Some(true),
                 },
             },
             auth: AuthDescriptor {

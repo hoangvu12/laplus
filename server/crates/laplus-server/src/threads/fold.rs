@@ -42,6 +42,7 @@ pub struct Thread {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    pub title_regeneration: Option<TitleRegeneration>,
     /// The provider instance this conversation was created under and its
     /// registered driver. Durable so a later model choice cannot silently
     /// change which agent owns the thread.
@@ -71,6 +72,18 @@ pub struct Thread {
     /// Where this conversation sits in the developer's inbox — see
     /// [`Lifecycle`].
     pub lifecycle: Lifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleRegeneration {
+    pub request_id: String,
+    pub started_at: String,
+}
+
+impl TitleRegeneration {
+    fn to_value(&self) -> Value {
+        json!({"requestId": self.request_id, "startedAt": self.started_at})
+    }
 }
 
 /// **Inbox state**: whether a conversation belongs in the developer's working
@@ -671,6 +684,7 @@ impl Thread {
             "id": self.id,
             "projectId": self.project_id,
             "title": self.title,
+            "titleRegeneration": self.title_regeneration.as_ref().map(TitleRegeneration::to_value),
             "modelSelection": self.model_selection,
             "runtimeMode": self.runtime_mode,
             "interactionMode": self.interaction_mode,
@@ -715,6 +729,7 @@ impl Thread {
             "id": self.id,
             "projectId": self.project_id,
             "title": self.title,
+            "titleRegeneration": self.title_regeneration.as_ref().map(TitleRegeneration::to_value),
             "modelSelection": self.model_selection,
             "runtimeMode": self.runtime_mode,
             "interactionMode": self.interaction_mode,
@@ -938,6 +953,7 @@ impl Thread {
             id: row.id,
             project_id: row.project_id,
             title: row.title,
+            title_regeneration: None,
             provider: row.provider,
             model_selection: row.model_selection,
             runtime_mode: row.runtime_mode,
@@ -1137,6 +1153,9 @@ pub type Given<T> = Option<Option<T>>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetaUpdate {
     pub title: Option<String>,
+    pub title_regeneration: Given<TitleRegeneration>,
+    pub regenerate_title: bool,
+    pub previous_title: Option<String>,
     pub model_selection: Option<Value>,
     pub branch: Given<String>,
     pub worktree_path: Given<String>,
@@ -1695,6 +1714,19 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             if let Some(title) = &update.title {
                 thread.title = title.clone();
                 described.insert("title".to_string(), json!(title));
+            }
+            if let Some(regeneration) = &update.title_regeneration {
+                thread.title_regeneration = regeneration.clone();
+                described.insert(
+                    "titleRegeneration".to_string(),
+                    thread.title_regeneration.as_ref().map(TitleRegeneration::to_value).into(),
+                );
+            }
+            if update.regenerate_title {
+                described.insert("regenerateTitle".to_string(), json!(true));
+            }
+            if let Some(previous_title) = &update.previous_title {
+                described.insert("previousTitle".to_string(), json!(previous_title));
             }
             if let Some(selection) = &update.model_selection {
                 thread.model_selection = selection.clone();
@@ -2439,6 +2471,7 @@ pub(crate) mod tests {
             id: id.to_string(),
             project_id: "project-1".to_string(),
             title: "A conversation".to_string(),
+            title_regeneration: None,
             provider: crate::provider::registration(crate::provider::CLAUDE_DRIVER)
                 .expect("the Claude driver is registered")
                 .identity(crate::provider::CLAUDE_INSTANCE_ID),

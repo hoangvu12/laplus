@@ -36,6 +36,8 @@ interface ChatHeaderProps {
   snoozed: boolean;
   settlementSupported: boolean;
   snoozeSupported: boolean;
+  titleRegenerationSupported: boolean;
+  titleRegenerationPending: boolean;
   onTogglePin: () => void;
   onThreadAction: (action: ChatHeaderThreadAction) => void;
   onNewThreadInProject: () => void;
@@ -50,6 +52,7 @@ interface ChatHeaderProps {
 
 export type ChatHeaderThreadAction =
   | "rename"
+  | "regenerate-title"
   | "copy"
   | "settle"
   | "unsettle"
@@ -64,6 +67,7 @@ export function resolveChatHeaderThreadActions(input: Parameters<typeof threadAc
   const policy = threadActionPolicy(input);
   return [
     ...(policy.rename ? ["rename" as const] : []),
+    ...(policy.regenerateTitle ? [policy.regenerateTitle.id] : []),
     ...(policy.copy ? ["copy" as const] : []),
     ...(policy.pinAction ? [policy.pinAction.id] : []),
     ...policy.lifecycleActions.map((action) => action.id),
@@ -100,6 +104,8 @@ export const ChatHeader = memo(function ChatHeader({
   snoozed,
   settlementSupported,
   snoozeSupported,
+  titleRegenerationSupported,
+  titleRegenerationPending,
   onTogglePin,
   onThreadAction,
   onNewThreadInProject,
@@ -125,6 +131,8 @@ export const ChatHeader = memo(function ChatHeader({
     snoozed,
     settlementSupported,
     snoozeSupported,
+    titleRegenerationSupported,
+    titleRegenerationPending,
   });
   return (
     <div className="@container/header-actions flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
@@ -183,6 +191,14 @@ export const ChatHeader = memo(function ChatHeader({
               <MenuItem onClick={() => onThreadAction("rename")}>
                 <PencilIcon />
                 Rename thread
+              </MenuItem>
+            ) : null}
+            {actionPolicy.regenerateTitle ? (
+              <MenuItem
+                disabled={actionPolicy.regenerateTitle.disabled}
+                onClick={() => onThreadAction("regenerate-title")}
+              >
+                {actionPolicy.regenerateTitle.label}
               </MenuItem>
             ) : null}
             {actionPolicy.copy ? (

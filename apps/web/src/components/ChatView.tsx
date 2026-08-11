@@ -3743,6 +3743,8 @@ function ChatViewContent(props: ChatViewProps) {
   const supportsSettlement = serverConfig?.environment.capabilities.threadSettlement === true;
   const supportsSnooze = serverConfig?.environment.capabilities.threadSnooze === true;
   const supportsPinning = serverConfig?.environment.capabilities.threadPinning === true;
+  const supportsTitleRegeneration =
+    serverConfig?.environment.capabilities.threadTitleRegeneration === true;
   const allThreadShells = useThreadShells();
   const activeThreadPinned = activeThreadShell?.pinnedAt != null;
   const pinThreadMutation = useAtomCommand(threadEnvironment.pin, { reportFailure: false });
@@ -3885,6 +3887,24 @@ function ChatViewContent(props: ChatViewProps) {
             environmentId: activeThreadRef.environmentId,
             input: { threadId: activeThreadRef.threadId, title },
           });
+        }
+        return;
+      }
+      if (action === "regenerate-title") {
+        if (activeThread?.titleRegeneration != null) return;
+        const result = await updateThreadMetadata({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId, regenerateTitle: true },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Failed to regenerate thread title",
+              description: error instanceof Error ? error.message : "An error occurred.",
+            }),
+          );
         }
         return;
       }
@@ -5671,6 +5691,8 @@ function ChatViewContent(props: ChatViewProps) {
             snoozed={activeThreadSnoozed}
             settlementSupported={supportsSettlement}
             snoozeSupported={supportsSnooze}
+            titleRegenerationSupported={supportsTitleRegeneration}
+            titleRegenerationPending={activeThread.titleRegeneration != null}
             onTogglePin={handleTogglePinActiveThread}
             onThreadAction={handleHeaderThreadAction}
             onNewThreadInProject={handleNewThreadInActiveProject}

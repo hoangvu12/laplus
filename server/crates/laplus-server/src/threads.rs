@@ -204,7 +204,7 @@ pub mod fold;
 pub use fold::{
     checkpoint_status, fresh_activity_id, fresh_message_id, fresh_turn_id, settled_override, tone,
     Activity, Adoption, Attention, Busy, Change, Checkpoint, Conversation, Given, LatestTurn,
-    Lifecycle, Woken,
+    Lifecycle, TitleRegeneration, Woken,
     Message, MetaUpdate, Reconciled, Rendered, Session, Shelf, Thread, ThreadRow, TurnState, ACTIVE,
     BY_ACTIVITY, BY_THE_USER, SETTLED,
 };
@@ -2420,6 +2420,9 @@ pub(crate) mod tests {
                 "thread-1",
                 Change::MetaUpdated(MetaUpdate {
                     title: Some("Renamed".to_string()),
+                    title_regeneration: None,
+                    regenerate_title: false,
+                    previous_title: None,
                     model_selection: None,
                     branch: None,
                     worktree_path: None,

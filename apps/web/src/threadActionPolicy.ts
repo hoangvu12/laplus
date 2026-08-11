@@ -8,11 +8,18 @@ export interface ThreadActionPolicyInput {
   readonly archived?: boolean;
   readonly canCopy?: boolean;
   readonly allowArchive?: boolean;
+  readonly titleRegenerationSupported?: boolean;
+  readonly titleRegenerationPending?: boolean;
 }
 
 export interface ThreadActionPolicy {
   readonly pinAction: { readonly id: "pin" | "unpin"; readonly label: string } | null;
   readonly rename: boolean;
+  readonly regenerateTitle: {
+    readonly id: "regenerate-title";
+    readonly label: string;
+    readonly disabled: boolean;
+  } | null;
   readonly copy: boolean;
   readonly lifecycleAction: {
     readonly id: "settle" | "unsettle" | "snooze" | "unsnooze";
@@ -52,6 +59,14 @@ export function threadActionPolicy(input: ThreadActionPolicyInput): ThreadAction
   return {
     pinAction,
     rename: !input.archived,
+    regenerateTitle:
+      input.titleRegenerationSupported && !input.archived
+        ? {
+            id: "regenerate-title",
+            label: input.titleRegenerationPending ? "Regenerating…" : "Regenerate title",
+            disabled: input.titleRegenerationPending === true,
+          }
+        : null,
     copy: input.canCopy ?? true,
     lifecycleAction,
     lifecycleActions,

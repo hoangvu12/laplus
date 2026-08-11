@@ -2240,6 +2240,9 @@ export default function SidebarV2() {
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true;
         const supportsPinning =
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadPinning === true;
+        const supportsTitleRegeneration =
+          serverConfigs.get(thread.environmentId)?.environment.capabilities
+            .threadTitleRegeneration === true;
         const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
         const actionPolicy = threadActionPolicy({
@@ -2252,6 +2255,8 @@ export default function SidebarV2() {
           archived: thread.archivedAt != null,
           canCopy: thread.branch != null,
           allowArchive: false,
+          titleRegenerationSupported: supportsTitleRegeneration,
+          titleRegenerationPending: thread.titleRegeneration != null,
         });
         const pinAction = actionPolicy.pinAction;
         // Presets resolve at menu-open time (same as the popover).
@@ -2291,6 +2296,7 @@ export default function SidebarV2() {
                   ]
                 : []),
               ...(actionPolicy.rename ? [{ id: "rename", label: "Rename thread" }] : []),
+              ...(actionPolicy.regenerateTitle ? [actionPolicy.regenerateTitle] : []),
               { id: "mark-unread", label: "Mark unread" },
               {
                 id: actionPolicy.destructiveAction.id,
@@ -2339,6 +2345,23 @@ export default function SidebarV2() {
             return;
           case "unsettle":
             attemptUnsettle(threadRef);
+            return;
+          case "regenerate-title":
+            if (thread.titleRegeneration != null) return;
+            const regeneration = await updateThreadMetadata({
+              environmentId: thread.environmentId,
+              input: { threadId: thread.id, regenerateTitle: true },
+            });
+            if (regeneration._tag === "Failure" && !isAtomCommandInterrupted(regeneration)) {
+              const error = squashAtomCommandFailure(regeneration);
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Failed to regenerate thread title",
+                  description: error instanceof Error ? error.message : "An error occurred.",
+                }),
+              );
+            }
             return;
           case "unsnooze":
             attemptUnsnooze(threadRef);
@@ -2399,6 +2422,7 @@ export default function SidebarV2() {
       markThreadUnread,
       serverConfigs,
       startThreadRename,
+      updateThreadMetadata,
     ],
   );
 

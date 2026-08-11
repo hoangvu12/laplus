@@ -1999,6 +1999,7 @@ mod continuation_tests {
             id: "thread-1".to_string(),
             project_id: "project-1".to_string(),
             title: "Cursor test".to_string(),
+            title_regeneration: None,
             provider,
             model_selection: json!({"instanceId": "claudeAgent", "model": "claude-opus-5"}),
             runtime_mode: "full-access".to_string(),

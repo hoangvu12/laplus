@@ -339,12 +339,18 @@ export const OrchestrationLatestTurn = Schema.Struct({
   assistantMessageId: Schema.NullOr(MessageId),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
 });
+
+export const ThreadTitleRegeneration = Schema.Struct({
+  requestId: CommandId,
+  startedAt: IsoDateTime,
+});
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
 export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -403,6 +409,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -640,11 +647,18 @@ const ThreadMetaUpdateCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   title: Schema.optional(TrimmedNonEmptyString),
+  regenerateTitle: Schema.optional(Schema.Literal(true)),
   modelSelection: Schema.optional(ModelSelection),
   branch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
-});
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      !(input.title !== undefined && input.regenerateTitle === true) ||
+      "title and regenerateTitle cannot be specified together",
+  ),
+);
 
 const ThreadRuntimeModeSetCommand = Schema.Struct({
   type: Schema.Literal("thread.runtime-mode.set"),
@@ -1060,6 +1074,9 @@ export const ThreadPinReorderedPayload = Schema.Struct({
 export const ThreadMetaUpdatedPayload = Schema.Struct({
   threadId: ThreadId,
   title: Schema.optional(TrimmedNonEmptyString),
+  regenerateTitle: Schema.optional(Schema.Literal(true)),
+  previousTitle: Schema.optional(TrimmedNonEmptyString),
+  titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   modelSelection: Schema.optional(ModelSelection),
   branch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
