@@ -104,6 +104,7 @@ use crate::store::{
 };
 use crate::subscriptions::{EventSource, BACKLOG};
 use crate::settling::SessionStatus;
+use crate::text_generation::{Operation as TextOperation, ResultText, Service as TextGeneration};
 use crate::threads::{
     self, Adoption, Attention, Busy, Change, Given, MetaUpdate, Session, Shelf, Thread,
     Threads,
@@ -1528,9 +1529,9 @@ impl Shell {
         let turn_id = threads::fresh_turn_id();
         // The developer's own message first, so it is in the transcript before
         // anything the agent says about it can be.
-        self.inner
+        let (_, after_message) = self.inner
             .threads
-            .apply(
+            .apply_and_read(
                 &start.thread_id,
                 Change::UserMessage {
                     message_id: start.message.message_id.clone(),
@@ -1539,6 +1540,12 @@ impl Shell {
                 },
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;
+        let is_first_user_turn = after_message
+            .messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .count()
+            == 1;
         let (requested, thread) = self
             .inner
             .threads
@@ -1642,7 +1649,80 @@ impl Shell {
             return Err(CommandError::new(why));
         }
 
+        if is_first_user_turn {
+            let title_context = if start.message.text.trim().is_empty()
+                && !start.message.attachments.is_empty()
+            {
+                format!("Attachments:\n{}", Value::Array(start.message.attachments.clone()))
+            } else {
+                start.message.text.clone()
+            };
+            self.generate_first_turn_title(
+                &start.thread_id,
+                &thread.title,
+                &title_context,
+                &where_the_work_happens(&thread, &project),
+                config,
+            );
+        }
+
         Ok(sequence)
+    }
+
+    /// Improve a new conversation's provisional seed without joining its fate
+    /// to the agent turn. The compare and write happen under the thread fold's
+    /// lock, so a manual or provider-native rename that lands while generation
+    /// is running owns the title thereafter.
+    fn generate_first_turn_title(
+        &self,
+        thread_id: &str,
+        provisional_title: &str,
+        message: &str,
+        directory: &str,
+        config: &ServerConfig,
+    ) {
+        let selection = &config.settings.text_generation_model_selection;
+        let Some(instance_id) = selection.get("instanceId").and_then(Value::as_str) else {
+            return;
+        };
+        let Ok(instance) = crate::provider::resolve_instance(&config.settings, instance_id, None)
+        else {
+            return;
+        };
+        let model = selection.get("model").and_then(Value::as_str).map(str::to_string);
+        let shell = self.clone();
+        let thread_id = thread_id.to_string();
+        let expected = provisional_title.to_string();
+        let context = message.to_string();
+        let directory = directory.to_string();
+        tokio::spawn(async move {
+            let generated = TextGeneration::new()
+                .generate(
+                    &instance,
+                    &directory,
+                    model.as_deref(),
+                    TextOperation::ThreadTitle { context },
+                )
+                .await;
+            let Ok(ResultText::ThreadTitle(title)) = generated else {
+                return;
+            };
+            let title = title.trim();
+            if title.is_empty() {
+                return;
+            }
+            let _ = shell.inner.threads.apply_unless(
+                &thread_id,
+                |thread| (thread.title != expected)
+                    .then(|| "the provisional title was superseded".to_string()),
+                Change::MetaUpdated(MetaUpdate {
+                    title: Some(title.to_string()),
+                    model_selection: None,
+                    branch: None,
+                    worktree_path: None,
+                }),
+            );
+        });
     }
 
     /// A thread that was there a statement ago and is not now. Unreachable while

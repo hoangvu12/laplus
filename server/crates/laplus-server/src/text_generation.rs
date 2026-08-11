@@ -10,8 +10,10 @@ use serde_json::{json, Value};
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
+    config::ClaudeSettings,
     opencode::{OpenCodeClient, OwnedServer},
-    provider::{ConfiguredInstance, OpenCodeInstance},
+    process::Search,
+    provider::{ClaudeInstance, ConfiguredInstance, OpenCodeInstance},
 };
 
 const IDLE: Duration = Duration::from_secs(30);
@@ -108,14 +110,51 @@ impl Service {
         model: Option<&str>,
         operation: Operation,
     ) -> Result<ResultText, Error> {
-        let ConfiguredInstance::OpenCode(instance) = instance else {
-            return Err(Error(format!(
+        match instance {
+            ConfiguredInstance::Claude(instance) => {
+                self.generate_claude(instance, directory, model, operation)
+                    .await
+            }
+            ConfiguredInstance::OpenCode(instance) => {
+                self.generate_opencode(instance, directory, model, operation)
+                    .await
+            }
+            ConfiguredInstance::Codex(_) => Err(Error(format!(
                 "Provider {} has no registered text-generation adapter.",
                 instance.identity().instance_id
-            )));
-        };
-        self.generate_opencode(instance, directory, model, operation)
-            .await
+            ))),
+        }
+    }
+
+    async fn generate_claude(
+        &self,
+        instance: &ClaudeInstance,
+        directory: &str,
+        model: Option<&str>,
+        operation: Operation,
+    ) -> Result<ResultText, Error> {
+        if !matches!(operation, Operation::ThreadTitle { .. }) {
+            return Err(Error(
+                "Claude only supports thread-title text generation in this build.".into(),
+            ));
+        }
+        let binary = crate::provider::resolve_named(
+            &instance.settings.binary_path,
+            "claude",
+            &Search::from_environment(),
+        )
+        .startable_for("Claude CLI")
+        .map_err(Error)?
+        .0;
+        generate_with_claude(
+            &binary,
+            &instance.settings,
+            directory,
+            model,
+            operation,
+            self.request_timeout,
+        )
+        .await
     }
 
     async fn generate_opencode(
@@ -218,6 +257,58 @@ impl Service {
     }
 }
 
+async fn generate_with_claude(
+    binary: &std::path::Path,
+    settings: &ClaudeSettings,
+    directory: &str,
+    model: Option<&str>,
+    operation: Operation,
+    timeout: Duration,
+) -> Result<ResultText, Error> {
+    let schema = json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false});
+    let launch_args = shell_words::split(&settings.launch_args)
+        .map_err(|error| Error(format!("Claude launch arguments are invalid: {error}")))?;
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(launch_args)
+        .arg("-p")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--json-schema")
+        .arg(schema.to_string())
+        .arg("--dangerously-skip-permissions")
+        .current_dir(directory)
+        .kill_on_drop(true);
+    if !settings.home_path.trim().is_empty() {
+        command.env(
+            "CLAUDE_CONFIG_DIR",
+            crate::projects::expand_home(settings.home_path.trim()),
+        );
+    }
+    if let Some(model) = model {
+        command.arg("--model").arg(model);
+    }
+    command.arg(prompt(&operation));
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| Error("Claude text generation timed out.".into()))?
+        .map_err(|error| Error(format!("Claude text generation could not start: {error}")))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error(if detail.is_empty() {
+            format!("Claude text generation exited with {}.", output.status)
+        } else {
+            format!("Claude text generation failed: {detail}")
+        }));
+    }
+    let envelope: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| Error("Claude returned malformed JSON output.".into()))?;
+    let structured = envelope
+        .get("structured_output")
+        .ok_or_else(|| Error("Claude output has no structured_output value.".into()))?;
+    parse_value(operation, structured)
+}
+
 async fn generate_with(
     client: &OpenCodeClient,
     model: Option<&str>,
@@ -278,7 +369,13 @@ fn prompt(operation: &Operation) -> String {
         Operation::BranchName { context } => (r#"{"branchName":"..."}"#, context),
         Operation::ThreadTitle { context } => (r#"{"title":"..."}"#, context),
     };
-    format!("Return only one JSON object matching {schema}. Do not use tools. Source:\n{context}")
+    let instruction = match operation {
+        Operation::ThreadTitle { .. } => {
+            "Write a concise descriptive title for this conversation. Do not answer the request."
+        }
+        _ => "Summarize the source for the requested destination.",
+    };
+    format!("{instruction} Return only one JSON object matching {schema}. Do not use tools. Source:\n{context}")
 }
 
 fn parse(operation: Operation, answer: &Value) -> Result<ResultText, Error> {
@@ -300,6 +397,10 @@ fn parse(operation: Operation, answer: &Value) -> Result<ResultText, Error> {
         .collect::<String>();
     let value: Value = serde_json::from_str(raw.trim())
         .map_err(|_| Error("OpenCode returned malformed structured text.".into()))?;
+    parse_value(operation, &value)
+}
+
+fn parse_value(operation: Operation, value: &Value) -> Result<ResultText, Error> {
     match operation {
         Operation::CommitMessage { .. } => {
             let subject = line(field(&value, "subject")?, 72)?;
@@ -327,7 +428,7 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str, Error> {
     value
         .get(name)
         .and_then(Value::as_str)
-        .ok_or_else(|| Error(format!("OpenCode structured text is missing {name}.")))
+        .ok_or_else(|| Error(format!("Structured text is missing {name}.")))
 }
 fn clean_block(value: &str) -> String {
     value.replace("\r\n", "\n").trim().to_string()
