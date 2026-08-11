@@ -88,6 +88,102 @@ fn aggregates(events: &[Value]) -> Vec<String> {
     ids
 }
 
+async fn open_shell(client: &mut SocketClient) -> String {
+    let subscription = client
+        .subscribe("orchestration.subscribeShell", json!({}))
+        .await;
+    client.next_chunk(&subscription).await;
+    client.ack(&subscription).await;
+    subscription
+}
+
+fn title_on_shell(snapshot: &Value, thread_id: &str) -> String {
+    snapshot["threads"]
+        .as_array()
+        .expect("the shell carries threads")
+        .iter()
+        .find(|thread| thread["id"] == thread_id)
+        .unwrap_or_else(|| panic!("{thread_id} is absent from the shell: {snapshot:#?}"))["title"]
+        .as_str()
+        .expect("the thread has a title")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_native_codex_name_updates_every_title_projection_and_survives_restart() {
+    let codex = ScriptedCodex::plain_conversation();
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config.clone()).await;
+    let mut author = server.connect().await;
+    author
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    author
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+
+    let mut watcher = server.connect().await;
+    let thread = watcher.watch_conversation("codex-thread").await;
+    let shell = open_shell(&mut watcher).await;
+    author
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Give this conversation a useful name."),
+        )
+        .await
+        .expect_success();
+
+    let events = watcher.events_through_the_turn(&thread).await;
+    let title_events: Vec<&Value> = events
+        .iter()
+        .filter(|item| item["event"]["type"] == "thread.meta-updated")
+        .collect();
+    assert_eq!(title_events.len(), 1, "foreign or blank names leaked: {events:#?}");
+    assert_eq!(
+        title_events[0]["event"]["payload"]["title"],
+        "A native Codex title"
+    );
+    watcher
+        .values_until(&shell, |item| {
+            item["kind"] == "thread-upserted"
+                && item["thread"]["title"] == "A native Codex title"
+        })
+        .await;
+
+    let fresh_thread = server
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await;
+    assert_eq!(fresh_thread["thread"]["title"], "A native Codex title");
+    let fresh_shell = server.connect().await.into_shell_snapshot().await;
+    assert_eq!(title_on_shell(&fresh_shell, "codex-thread"), "A native Codex title");
+    author.close().await;
+    watcher.close().await;
+    server.stop().await;
+
+    let restarted = TestServer::start_at_with_config(&database, config).await;
+    let restored_thread = restarted
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await;
+    assert_eq!(restored_thread["thread"]["title"], "A native Codex title");
+    let restored_shell = restarted.connect().await.into_shell_snapshot().await;
+    assert_eq!(title_on_shell(&restored_shell, "codex-thread"), "A native Codex title");
+    restarted.stop().await;
+    codex.assert_conversation_reaped();
+}
+
 async fn complete_first_codex_turn(
     codex: &ScriptedCodex,
     database: &std::path::Path,

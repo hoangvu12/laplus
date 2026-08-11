@@ -31,6 +31,9 @@ assistant deltas, authoritative completed message, and the recorded order where
 idle arrives immediately before `turn/completed`. The socket stand-in reads this
 fixture, rewrites response ids to the requests it actually received, and replays
 the received half; the adjacent expected file is its fresh conversation fold.
+The fixture also carries the real `thread/name/updated` notification shape: an
+owned non-empty name, a blank follow-up, and a notification for another thread.
+Together they pin native-title acceptance and the ownership boundary.
 
 `02-command-execution.jsonl` reduces
 `.scratch/codex-driver/captures/02-command-execution.jsonl`. It preserves the

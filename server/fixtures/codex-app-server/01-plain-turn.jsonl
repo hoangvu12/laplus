@@ -5,6 +5,9 @@
 {"dir":"recv","msg":{"id":2,"result":{"thread":{"id":"codex-thread-1"},"cwd":"<workspace>"}}}
 {"dir":"send","msg":{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"codex-thread-1","input":[{"type":"text","text":"Reply with exactly one short sentence saying hello. Do not use any tools."}]}}}
 {"dir":"recv","msg":{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress","error":null}}}}
+{"dir":"recv","msg":{"method":"thread/name/updated","params":{"threadId":"codex-thread-other","name":"Another conversation"}}}
+{"dir":"recv","msg":{"method":"thread/name/updated","params":{"threadId":"codex-thread-1","name":"  A native Codex title  "}}}
+{"dir":"recv","msg":{"method":"thread/name/updated","params":{"threadId":"codex-thread-1","name":"   "}}}
 {"dir":"recv","msg":{"method":"thread/status/changed","params":{"threadId":"codex-thread-1","status":{"type":"active","activeFlags":[]}}}}
 {"dir":"recv","msg":{"method":"item/started","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"reasoning","id":"reasoning-1","summary":[],"content":[]}}}}
 {"dir":"recv","msg":{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"reasoning","id":"reasoning-1","summary":[],"content":[]}}}}

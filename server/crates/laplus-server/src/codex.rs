@@ -263,7 +263,7 @@ impl Driver for Codex {
         Ok(Opened {
             driver: Codex {
                 app_server,
-                folding: ConversationState::new(),
+                folding: ConversationState::for_thread(thread_id.clone()),
                 thread_id: thread_id.clone(),
                 active_turn_id: None,
                 turn_id_unavailable: false,
@@ -497,6 +497,14 @@ fn decide(folded: ConversationFold, driving: &mut Driving, drift: Drift) -> Deci
         ConversationFold::Nothing
         | ConversationFold::ThreadStarted { .. }
         | ConversationFold::TurnStarted { .. } => {}
+        ConversationFold::TitleUpdated { title } => {
+            decided.changes.push(Change::MetaUpdated(crate::threads::MetaUpdate {
+                title: Some(title),
+                model_selection: None,
+                branch: None,
+                worktree_path: None,
+            }));
+        }
         ConversationFold::ThreadStatus { .. } => {}
         ConversationFold::ReasoningStarted { .. } => {
             let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());

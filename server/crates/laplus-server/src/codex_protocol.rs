@@ -135,6 +135,7 @@ pub enum ConversationFold {
     Nothing,
     ThreadStarted { thread_id: String },
     TurnStarted { turn_id: String },
+    TitleUpdated { title: String },
     ThreadStatus { status: String },
     ReasoningStarted { item_id: String },
     ReasoningDelta { item_id: String, text: String },
@@ -191,6 +192,13 @@ pub struct Completion {
 impl ConversationState {
     pub fn new() -> ConversationState {
         ConversationState::default()
+    }
+
+    pub(crate) fn for_thread(thread_id: String) -> ConversationState {
+        ConversationState {
+            thread_id: Some(thread_id),
+            ..ConversationState::default()
+        }
     }
 
     pub fn fold_line(&mut self, line: &str) -> ConversationFold {
@@ -286,6 +294,18 @@ impl ConversationState {
             }
         }
         match method {
+            "thread/name/updated" => {
+                let Some(title) = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                else {
+                    return ConversationFold::Nothing;
+                };
+                ConversationFold::TitleUpdated {
+                    title: title.trim().to_string(),
+                }
+            }
             "thread/status/changed" => {
                 let Some(status) = params
                     .get("status")
