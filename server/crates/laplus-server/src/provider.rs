@@ -1383,6 +1383,12 @@ fn codex_snapshot(
 }
 
 const MINIMUM_OPENCODE_VERSION: (u64, u64, u64) = (1, 14, 19);
+// `models --verbose` initializes OpenCode's full provider catalogue. Current
+// releases take roughly six seconds warm on this host and can exceed the
+// shared ten-second executable-probe budget during cold start or under load.
+// Catalogue discovery is user-requested/startup work, so give it enough room
+// without weakening the bound on lightweight provider probes.
+const OPENCODE_CATALOGUE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXTERNAL_DISCOVERY_RETRIES: usize = 2;
 const EXTERNAL_DISCOVERY_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -1466,13 +1472,13 @@ async fn discover_external_opencode(settings: &OpenCodeSettings)
 }
 
 fn discover_local_opencode(path: &Path) -> Result<(Vec<ProviderModel>, Vec<serde_json::Value>), String> {
-    let models = bounded_command(path, &["models", "--verbose"], PROBE_TIMEOUT)?;
-    let agents = bounded_command(path, &["agent", "list"], PROBE_TIMEOUT)?;
+    let models = bounded_command(path, &["models", "--verbose"], OPENCODE_CATALOGUE_TIMEOUT)?;
+    let agents = bounded_command(path, &["agent", "list"], OPENCODE_CATALOGUE_TIMEOUT)?;
     // `debug skill` prints exactly what `GET /skill` answers, and it is the only
     // CLI that reports skills at all — there is no `opencode skill list`. Its
     // failure is not the catalogue's: a `?` here would trade every model for a
     // menu, so the skills go missing on their own.
-    let skills = bounded_command(path, &["debug", "skill"], PROBE_TIMEOUT)
+    let skills = bounded_command(path, &["debug", "skill"], OPENCODE_CATALOGUE_TIMEOUT)
         .ok()
         .and_then(|listed| serde_json::from_str::<serde_json::Value>(listed.trim()).ok())
         .unwrap_or(serde_json::Value::Null);
