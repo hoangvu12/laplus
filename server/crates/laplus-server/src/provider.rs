@@ -1431,7 +1431,9 @@ fn describe_opencode(instance: &OpenCodeInstance, search: &Search, preferences: 
     }
     if !settings.server_url.is_empty() {
         return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(runtime) => match runtime.block_on(tokio::time::timeout(PROBE_TIMEOUT, discover_external_opencode(settings))) {
+            Ok(runtime) => match runtime.block_on(async {
+                tokio::time::timeout(PROBE_TIMEOUT, discover_external_opencode(settings)).await
+            }) {
                 Ok(Ok((version, models, skills))) => authoritative_opencode(instance, preferences, Some(version), models, skills),
                 Ok(Err(error)) if error.transient => failed_opencode(instance, preferences, Installed::Yes,
                     format!("OpenCode server discovery failed: {}.", error.message)),
@@ -2449,6 +2451,40 @@ mod tests {
         assert_eq!(providers[0].version.as_deref(), Some("2.1.220"));
         assert_eq!(providers[0].status, ProviderState::Ready);
         assert_eq!(providers[1].instance_id, CODEX_INSTANCE_ID);
+    }
+
+    /// Application startup refreshes providers from scoped OS threads. An
+    /// external OpenCode instance therefore has to create and enter its own
+    /// Tokio runtime before constructing timer-backed discovery futures.
+    #[test]
+    fn an_external_opencode_refresh_runs_without_an_ambient_tokio_runtime() {
+        let mut config = crate::config::ServerConfig::detect();
+        config.settings.provider_instances = serde_json::Map::from_iter([(
+            "openExternal".to_string(),
+            serde_json::json!({
+                "driver": "opencode",
+                "displayName": "External OpenCode",
+                "enabled": true,
+                "config": {
+                    "binaryPath": "",
+                    "serverUrl": "http://127.0.0.1:9",
+                    "serverPassword": "",
+                    "customModels": []
+                }
+            }),
+        )]);
+        let store = ConfigStore::new(config);
+
+        refresh(&store, &Search::over(&[]), &[]);
+
+        let provider = store
+            .current()
+            .providers
+            .iter()
+            .find(|provider| provider.instance_id == "openExternal")
+            .cloned()
+            .expect("the external OpenCode snapshot");
+        assert_eq!(provider.status, ProviderState::Error);
     }
 
     #[test]

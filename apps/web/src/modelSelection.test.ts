@@ -278,6 +278,25 @@ describe("instance-scoped model selection", () => {
     ).toBe("claude-sonnet-4-6");
   });
 
+  it("preserves a disappeared OpenCode selection so the server can refuse it", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("opencode"),
+        instanceId: "openAcceptance",
+        models: ["anthropic/replacement"],
+      }),
+    ];
+
+    expect(
+      resolveAppModelSelectionForInstance(
+        ProviderInstanceId.make("openAcceptance"),
+        settingsWithProviderInstances(),
+        providers,
+        "anthropic/removed",
+      ),
+    ).toBe("anthropic/removed");
+  });
+
   it("preserves custom provider instances in settings model selection", () => {
     const providers = [
       provider({

@@ -247,6 +247,19 @@ export function resolveAppModelSelectionForInstance(
   );
   if (!entry) return null;
   const options = getAppModelOptionsForInstance(settings, entry);
+  const normalizedSelectedModel = normalizeCustomModelSlug(selectedModel);
+  if (
+    entry.driverKind === ProviderDriverKind.make("opencode") &&
+    normalizedSelectedModel !== null &&
+    !entry.models.some((model) => model.slug === normalizedSelectedModel) &&
+    !options.some((option) => option.slug === normalizedSelectedModel)
+  ) {
+    // A successful OpenCode refresh is authoritative, but replacing a draft's
+    // disappeared selection with the first remaining model would turn that
+    // authority into a silent provider choice. Keep the stale slug through
+    // dispatch so the server's unavailable-model guard can refuse it clearly.
+    return normalizedSelectedModel;
+  }
   return (
     resolveSelectableModel(entry.driverKind, selectedModel, options) ??
     options.find((option) => option.isDefault)?.slug ??
