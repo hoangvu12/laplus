@@ -5,7 +5,7 @@ and failure behavior in a rebuilt running Laplus application.
 
 **Blocked by:** 02 — Fast and resilient local OpenCode discovery.
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Run focused Rust, contract, client, and UI verification for tickets 01–02.
 - [x] Drive first launch with a remembered catalogue and observe the checking
