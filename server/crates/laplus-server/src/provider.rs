@@ -1391,6 +1391,7 @@ const MINIMUM_OPENCODE_VERSION: (u64, u64, u64) = (1, 14, 19);
 // Catalogue discovery is user-requested/startup work, so give it enough room
 // without weakening the bound on lightweight provider probes.
 const OPENCODE_CATALOGUE_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCAL_DISCOVERY_BACKOFF: Duration = Duration::from_secs(1);
 const EXTERNAL_DISCOVERY_RETRIES: usize = 2;
 const EXTERNAL_DISCOVERY_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -1540,17 +1541,38 @@ async fn discover_external_opencode(settings: &OpenCodeSettings)
 }
 
 fn discover_local_opencode(path: &Path) -> Result<(Vec<ProviderModel>, Vec<serde_json::Value>), String> {
-    let models = bounded_command(path, &["models", "--verbose"], OPENCODE_CATALOGUE_TIMEOUT)?;
-    let agents = bounded_command(path, &["agent", "list"], OPENCODE_CATALOGUE_TIMEOUT)?;
+    let (models, agents, skills) = std::thread::scope(|scope| {
+        let models = scope.spawn(|| local_catalogue_command(path, &["models", "--verbose"]));
+        let agents = scope.spawn(|| local_catalogue_command(path, &["agent", "list"]));
+        let skills = scope.spawn(|| local_catalogue_command(path, &["debug", "skill"]));
+        (
+            models.join().expect("model discovery thread"),
+            agents.join().expect("agent discovery thread"),
+            skills.join().expect("skill discovery thread"),
+        )
+    });
+    let models = models?;
+    // Agent and skill rows enrich the model catalogue. Exhausting either call
+    // must not hide models that OpenCode itself reported successfully.
+    let agents = agents.unwrap_or_default();
     // `debug skill` prints exactly what `GET /skill` answers, and it is the only
-    // CLI that reports skills at all — there is no `opencode skill list`. Its
-    // failure is not the catalogue's: a `?` here would trade every model for a
-    // menu, so the skills go missing on their own.
-    let skills = bounded_command(path, &["debug", "skill"], OPENCODE_CATALOGUE_TIMEOUT)
-        .ok()
+    // CLI that reports skills at all — there is no `opencode skill list`.
+    let skills = skills.ok()
         .and_then(|listed| serde_json::from_str::<serde_json::Value>(listed.trim()).ok())
         .unwrap_or(serde_json::Value::Null);
     Ok((local_models(&models, &local_agents(&agents)), opencode_skills(&skills)))
+}
+
+fn local_catalogue_command(path: &Path, arguments: &[&str]) -> Result<String, String> {
+    match bounded_catalogue_command(path, arguments, OPENCODE_CATALOGUE_TIMEOUT) {
+        Ok(output) => Ok(output),
+        Err(BoundedCommandFailure::Permanent(error)) => Err(error),
+        Err(BoundedCommandFailure::Transient(_)) => {
+            std::thread::sleep(LOCAL_DISCOVERY_BACKOFF);
+            bounded_catalogue_command(path, arguments, OPENCODE_CATALOGUE_TIMEOUT)
+                .map_err(BoundedCommandFailure::into_message)
+        }
+    }
 }
 
 /// OpenCode's skill list as `ServerProviderSkill`s.
@@ -1716,11 +1738,34 @@ fn valid_model_slug(slug: &str) -> bool {
         && !model.chars().any(char::is_whitespace)
 }
 
-fn bounded_command(path: &Path, arguments: &[&str], patience: Duration) -> Result<String, String> {
+enum BoundedCommandFailure {
+    /// The executable could not be launched, so repeating the same invocation
+    /// cannot observe a different process outcome.
+    Permanent(String),
+    /// A launched process timed out, could not be waited for, or exited with an
+    /// error. Local CLIs expose no finer failure taxonomy; one fresh process may
+    /// recover, and its second answer is the diagnostic the caller receives.
+    Transient(String),
+}
+
+impl BoundedCommandFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Permanent(message) | Self::Transient(message) => message,
+        }
+    }
+}
+
+fn bounded_catalogue_command(
+    path: &Path,
+    arguments: &[&str],
+    patience: Duration,
+) -> Result<String, BoundedCommandFailure> {
     let mut command = Command::new(path);
     command.args(arguments).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::process::without_a_console(&mut command);
-    let mut child = command.spawn().map_err(|error| format!("{} could not start: {error}", arguments.join(" ")))?;
+    let mut child = command.spawn().map_err(|error| BoundedCommandFailure::Permanent(
+        format!("{} could not start: {error}", arguments.join(" "))))?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout.take(u64::MAX).read_to_end(&mut bytes); bytes });
@@ -1732,21 +1777,21 @@ fn bounded_command(path: &Path, arguments: &[&str], patience: Duration) -> Resul
             Ok(None) if Instant::now() >= deadline => {
                 crate::process::terminate_tree_and_wait(&mut child);
                 let _ = stdout.join(); let _ = stderr.join();
-                return Err(format!("{} did not finish within {} seconds", arguments.join(" "), patience.as_secs()));
+                return Err(BoundedCommandFailure::Transient(format!("{} did not finish within {} seconds", arguments.join(" "), patience.as_secs())));
             }
             Ok(None) => std::thread::sleep(PROBE_POLL),
             Err(error) => {
                 crate::process::terminate_tree_and_wait(&mut child);
                 let _ = stdout.join();
                 let _ = stderr.join();
-                return Err(format!("{} could not be waited for: {error}", arguments.join(" ")));
+                return Err(BoundedCommandFailure::Transient(format!("{} could not be waited for: {error}", arguments.join(" "))));
             }
         }
     };
     let stdout = stdout.join().unwrap_or_default();
     let stderr = stderr.join().unwrap_or_default();
     let text = format!("{}\n{}", String::from_utf8_lossy(&stdout).trim(), String::from_utf8_lossy(&stderr).trim()).trim().to_string();
-    if !status.success() { return Err(format!("{} exited with {}: {}", arguments.join(" "), status, first_line(&text))); }
+    if !status.success() { return Err(BoundedCommandFailure::Transient(format!("{} exited with {}: {}", arguments.join(" "), status, first_line(&text)))); }
     Ok(text)
 }
 

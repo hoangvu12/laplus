@@ -125,6 +125,13 @@ async fn provider_over_the_socket(server: &TestServer) -> Value {
         .expect("the Claude provider")
 }
 
+fn command_calls(agent: &FakeAgent, name: &str) -> usize {
+    std::fs::read_to_string(agent.path().parent().unwrap().join(name))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
 async fn provider_named(server: &TestServer, instance_id: &str) -> Value {
     providers_over_the_socket(server)
         .await
@@ -461,6 +468,95 @@ async fn local_opencode_uses_short_lived_cli_inventory_and_rejects_old_versions(
     assert!(local["skills"][0]["path"].as_str().is_some_and(|path| path.ends_with("SKILL.md")), "{local}");
     assert_eq!(old["status"], "error", "{old}");
     assert!(message(&old).contains("1.14.19 or newer"), "{old}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn local_opencode_catalogue_commands_overlap_and_only_failed_enrichment_retries() {
+    let opencode = FakeAgent::saying(if cfg!(windows) {
+        r#"if "%1"=="--version" echo 1.18.10& exit /b 0
+if "%1"=="models" echo model>>"%~dp0models.calls"& type nul >"%~dp0models.started"& goto wait_agents
+if "%1"=="agent" echo agent>>"%~dp0agents.calls"& type nul >"%~dp0agents.started"& goto wait_models
+if "%1"=="debug" echo skill>>"%~dp0skills.calls"& exit /b 19
+exit /b 2
+:wait_agents
+if not exist "%~dp0agents.started" goto wait_agents
+echo openai/gpt-5
+echo {"id":"gpt-5","name":"GPT 5","variants":{}}
+exit /b 0
+:wait_models
+if not exist "%~dp0models.started" goto wait_models
+exit /b 17"#
+    } else {
+        r#"root=$(dirname "$0")
+case "$1" in
+--version) echo 1.18.10;;
+models)
+  echo model >> "$root/models.calls"
+  touch "$root/models.started"
+  while [ ! -f "$root/agents.started" ]; do sleep 0.02; done
+  printf '%s\n' 'openai/gpt-5' '{"id":"gpt-5","name":"GPT 5","variants":{}}';;
+agent)
+  echo agent >> "$root/agents.calls"
+  touch "$root/agents.started"
+  while [ ! -f "$root/models.started" ]; do sleep 0.02; done
+  exit 17;;
+debug)
+  echo skill >> "$root/skills.calls"
+  exit 19;;
+*) exit 2;;
+esac"#
+    });
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openLocal":{"driver":"opencode","displayName":"OpenCode Local","config":{"binaryPath":opencode.configured()}}
+    }}})).await.expect_success();
+
+    let provider = provider_named(&server, "openLocal").await;
+    assert_eq!(provider["status"], "ready", "{provider}");
+    assert_eq!(slugs(&provider), vec!["openai/gpt-5"]);
+    assert!(
+        provider["skills"].as_array().is_some_and(Vec::is_empty),
+        "{provider}"
+    );
+    assert_eq!(command_calls(&opencode, "models.calls"), 1, "successful model discovery is not retried");
+    assert_eq!(command_calls(&opencode, "agents.calls"), 2, "failed agent enrichment is retried once");
+    assert_eq!(command_calls(&opencode, "skills.calls"), 2, "failed skill enrichment is retried once");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn persistent_local_model_failure_is_authoritative_after_one_retry() {
+    let opencode = FakeAgent::saying(if cfg!(windows) {
+        r#"if "%1"=="--version" echo 1.18.10& exit /b 0
+if "%1"=="models" echo model>>"%~dp0models.calls"& echo inventory unavailable 1>&2& exit /b 23
+if "%1"=="agent" echo agent>>"%~dp0agents.calls"& echo build (primary)& exit /b 0
+if "%1"=="debug" echo skill>>"%~dp0skills.calls"& echo []& exit /b 0
+exit /b 2"#
+    } else {
+        r#"root=$(dirname "$0")
+case "$1" in
+--version) echo 1.18.10;;
+models) echo model >> "$root/models.calls"; echo 'inventory unavailable' >&2; exit 23;;
+agent) echo agent >> "$root/agents.calls"; echo 'build (primary)';;
+debug) echo skill >> "$root/skills.calls"; echo '[]';;
+*) exit 2;;
+esac"#
+    });
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openLocal":{"driver":"opencode","displayName":"OpenCode Local","config":{"binaryPath":opencode.configured()}}
+    }}})).await.expect_success();
+
+    let provider = provider_named(&server, "openLocal").await;
+    assert_eq!(provider["status"], "error", "{provider}");
+    assert!(message(&provider).contains("inventory unavailable"), "{provider}");
+    assert!(slugs(&provider).is_empty(), "{provider}");
+    assert_eq!(command_calls(&opencode, "models.calls"), 2, "failed model discovery is retried once");
+    assert_eq!(command_calls(&opencode, "agents.calls"), 1, "successful agent discovery is not retried");
+    assert_eq!(command_calls(&opencode, "skills.calls"), 1, "successful skill discovery is not retried");
     server.stop().await;
 }
 
