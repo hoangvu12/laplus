@@ -46,7 +46,10 @@ impl ScriptedCodex {
     }
 
     pub fn conversation_paused_after_first_delta() -> ScriptedCodex {
-        let codex = ScriptedCodex::conversation_from_fixture("01-plain-turn", Some(5));
+        let codex = ScriptedCodex::conversation_from_fixture(
+            "01-plain-turn",
+            Some("item/agentMessage/delta"),
+        );
         std::fs::write(codex.directory.path().join("pause-turn"), "")
             .expect("marks the first turn as paused");
         codex
@@ -419,6 +422,17 @@ impl ScriptedCodex {
             fresh.to_string(),
         )
         .expect("writes the fallback thread result");
+        for name in [
+            "turn-events-before-pause",
+            "turn-events-after-pause",
+            "turn-terminal",
+        ] {
+            let path = codex.directory.path().join(name);
+            let events = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reads {name}: {error}"));
+            std::fs::write(path, events.replace("codex-thread-1", "codex-thread-fresh"))
+                .unwrap_or_else(|error| panic!("writes {name}: {error}"));
+        }
         codex
     }
 
@@ -495,7 +509,7 @@ impl ScriptedCodex {
         codex
     }
 
-    fn conversation_from_fixture(fixture: &str, pause_after: Option<usize>) -> ScriptedCodex {
+    fn conversation_from_fixture(fixture: &str, pause_after: Option<&str>) -> ScriptedCodex {
         let codex = ScriptedCodex::provider_probe();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../fixtures/codex-app-server/{fixture}.jsonl"));
@@ -566,7 +580,16 @@ impl ScriptedCodex {
                     .is_some_and(|method| method.ends_with("/requestApproval"))
             })
             .map(|index| index + 1);
-        let pause_after = approval_pause.or(pause_after).unwrap_or(events.len() - 1);
+        let requested_pause = pause_after.map(|method| {
+            events
+                .iter()
+                .position(|record| record["msg"]["method"] == method)
+                .map(|index| index + 1)
+                .unwrap_or_else(|| panic!("the {} fixture has a {method} event", fixture.display()))
+        });
+        let pause_after = approval_pause
+            .or(requested_pause)
+            .unwrap_or(events.len() - 1);
         if approval_pause.is_some() {
             std::fs::write(codex.directory.path().join("await-approval"), "")
                 .expect("marks the fixture approval stop");

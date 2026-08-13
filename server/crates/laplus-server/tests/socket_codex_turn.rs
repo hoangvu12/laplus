@@ -576,12 +576,14 @@ async fn the_captured_missing_rollout_starts_fresh_and_tells_the_developer() {
 #[tokio::test]
 async fn an_unclassified_resume_error_takes_the_same_recoverable_fallback() {
     const REFUSAL: &str = "history service refused this account";
-    let codex = ScriptedCodex::arbitrary_resume_failure_conversation(REFUSAL);
     let data = tempfile::tempdir().expect("a temporary data directory");
     let database = data.path().join("registry.db");
     let workspace = Workspace::with(&["src/main.rs"]);
-    complete_first_codex_turn(&codex, &database, &workspace).await;
+    let initial = ScriptedCodex::plain_conversation();
+    complete_first_codex_turn(&initial, &database, &workspace).await;
+    initial.assert_conversation_reaped();
 
+    let codex = ScriptedCodex::arbitrary_resume_failure_conversation(REFUSAL);
     let mut config = ServerConfig::detect();
     config.settings.providers.codex.binary_path = codex.configured();
     let server = TestServer::start_at_with_config(&database, config).await;
@@ -607,7 +609,6 @@ async fn an_unclassified_resume_error_takes_the_same_recoverable_fallback() {
     let methods: Vec<String> = codex
         .thread_requests()
         .into_iter()
-        .skip(1)
         .filter_map(|request| request["method"].as_str().map(str::to_string))
         .collect();
     assert_eq!(methods, vec!["thread/resume", "thread/start"]);

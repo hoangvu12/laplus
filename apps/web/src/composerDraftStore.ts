@@ -2233,18 +2233,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           return get().getDraftSessionByProjectRef(projectRef);
         },
         getDraftSessionByProjectRef: (projectRef) => {
-          for (const [draftId, draftThread] of Object.entries(get().draftThreadsByThreadKey)) {
-            if (isDraftThreadPromoting(draftThread)) {
-              continue;
-            }
-            if (
-              draftThread.projectId === projectRef.projectId &&
-              draftThread.environmentId === projectRef.environmentId
-            ) {
-              return toProjectDraftSession(DraftId.make(draftId), draftThread);
-            }
-          }
-          return null;
+          return get().getDraftSessionByLogicalProjectKey(projectDraftKey(projectRef));
         },
         getDraftSession: (draftId) => get().draftThreadsByThreadKey[draftId] ?? null,
         getDraftSessionByRef: (threadRef) => {
