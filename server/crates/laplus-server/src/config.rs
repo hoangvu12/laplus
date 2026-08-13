@@ -292,6 +292,8 @@ pub struct Provider {
     pub message: Option<String>,
     pub auth: ProviderAuth,
     pub checked_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalogue_state: Option<ProviderCatalogueState>,
     pub models: Vec<ProviderModel>,
     pub slash_commands: Vec<serde_json::Value>,
     pub skills: Vec<serde_json::Value>,
@@ -300,6 +302,10 @@ pub struct Provider {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_state: Option<ProviderUpdateState>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderCatalogueState { Checking, Verified, Stale }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,7 +378,7 @@ pub enum AuthStatus {
 }
 
 /// One model the UI may offer for this provider.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
     /// What the CLI is given as `--model`.

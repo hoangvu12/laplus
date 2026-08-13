@@ -35,6 +35,13 @@ export function getProviderSummary(provider: ServerProvider | undefined) {
       detail: "Waiting for the server to report installation and authentication details.",
     };
   }
+  if (provider.catalogueState === "checking") {
+    return {
+      headline: `Checking ${provider.displayName}…`,
+      detail:
+        provider.message ?? "Remembered models remain available while the server checks them.",
+    };
+  }
   if (!provider.enabled) {
     return {
       headline: "Disabled",

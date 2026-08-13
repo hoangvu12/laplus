@@ -41,6 +41,7 @@ use harness::TestServer;
 use laplus_server::config::{ClaudeSettings, CodexSettings, ProviderState, ServerConfig};
 use laplus_server::process::Search;
 use serde_json::{json, Value};
+use laplus_server::provider_catalogue_cache::{self, Entry};
 
 async fn opencode_peer(include_connected: bool) -> String {
     use axum::{routing::get, Json, Router};
@@ -341,6 +342,70 @@ async fn external_opencode_instances_discover_independently_and_keep_custom_fall
     assert_eq!(bad["status"], "error", "{bad}");
     assert!(message(&bad).contains("transport failed"), "{bad}");
     server.stop().await;
+}
+
+#[tokio::test]
+async fn remembered_opencode_models_are_in_the_first_socket_snapshot_and_survive_a_transient_refresh() {
+    let preferences = tempfile::tempdir().unwrap();
+    let endpoint = unavailable_opencode_peer().await;
+    let first = TestServer::start_configured_in(preferences.path()).await;
+    let mut client = first.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openRemembered":{"driver":"opencode","displayName":"Remembered OpenCode","config":{
+            "serverUrl":endpoint,"serverPassword":"do-not-cache","customModels":["local/current"]}}
+    }}})).await.expect_success();
+    first.stop().await;
+
+    provider_catalogue_cache::store(preferences.path(), Entry {
+        instance_id: "openRemembered".into(), driver: "opencode".into(),
+        identity_fingerprint: provider_catalogue_cache::external_identity(&endpoint).unwrap(),
+        version: Some("1.18.10".into()), checked_at: "2026-08-13T00:00:00Z".into(),
+        models: vec![laplus_server::config::ProviderModel {
+            slug: "anthropic/remembered".into(), name: "Remembered".into(), is_custom: false,
+            sub_provider: Some("Anthropic".into()), is_default: None,
+            capabilities: Some(json!({"optionDescriptors":[{"id":"variant","label":"Variant","type":"select","options":[{"id":"fast","label":"fast"}]}]})),
+        }],
+    }).unwrap();
+
+    let restarted = TestServer::start_configured_in(preferences.path()).await;
+    let initial = provider_named(&restarted, "openRemembered").await;
+    assert_eq!(initial["catalogueState"], "checking", "{initial}");
+    assert_eq!(slugs(&initial), vec!["anthropic/remembered", "local/current"]);
+    assert!(!std::fs::read_to_string(preferences.path().join("provider-catalogues.json")).unwrap().contains("do-not-cache"));
+
+    let mut client = restarted.connect().await;
+    let refreshed = client.call("server.refreshProviders", json!({"instanceId":"openRemembered"})).await.expect_success();
+    let provider = refreshed["providers"].as_array().unwrap().iter().find(|provider| provider["instanceId"] == "openRemembered").unwrap();
+    assert_eq!(provider["catalogueState"], "stale", "{provider}");
+    assert_eq!(provider["status"], "warning", "{provider}");
+    assert_eq!(slugs(provider), vec!["anthropic/remembered", "local/current"]);
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn remembered_opencode_models_converge_exactly_to_a_successful_live_inventory() {
+    let preferences = tempfile::tempdir().unwrap();
+    let endpoint = opencode_peer(true).await;
+    let first = TestServer::start_configured_in(preferences.path()).await;
+    let mut client = first.connect().await;
+    client.call("server.updateSettings", json!({"patch":{"providerInstances":{
+        "openRemembered":{"driver":"opencode","displayName":"Remembered OpenCode","config":{"serverUrl":endpoint}}
+    }}})).await.expect_success();
+    first.stop().await;
+    provider_catalogue_cache::store(preferences.path(), Entry {
+        instance_id:"openRemembered".into(), driver:"opencode".into(),
+        identity_fingerprint:provider_catalogue_cache::external_identity(&endpoint).unwrap(),
+        version:Some("1.17.0".into()), checked_at:"2026-08-13T00:00:00Z".into(),
+        models:vec![laplus_server::config::ProviderModel { slug:"old/removed".into(), name:"Removed".into(), is_custom:false, sub_provider:None, is_default:None, capabilities:Some(json!({"optionDescriptors":[]})) }],
+    }).unwrap();
+    let restarted = TestServer::start_configured_in(preferences.path()).await;
+    assert_eq!(slugs(&provider_named(&restarted, "openRemembered").await), vec!["old/removed"]);
+    let mut client = restarted.connect().await;
+    let refreshed = client.call("server.refreshProviders", json!({"instanceId":"openRemembered"})).await.expect_success();
+    let provider = refreshed["providers"].as_array().unwrap().iter().find(|provider| provider["instanceId"] == "openRemembered").unwrap();
+    assert_eq!(provider["catalogueState"], "verified", "{provider}");
+    assert_eq!(slugs(provider), vec!["anthropic/claude-sonnet"]);
+    restarted.stop().await;
 }
 
 

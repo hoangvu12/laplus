@@ -97,6 +97,7 @@ pub mod orchestration;
 pub mod pairing;
 pub mod process;
 pub mod public_exposure;
+pub mod provider_catalogue_cache;
 pub mod project_favicon;
 pub mod projects;
 pub mod protocol;

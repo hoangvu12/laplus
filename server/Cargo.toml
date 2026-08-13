@@ -26,6 +26,7 @@ edition = "2021"
 publish = false
 
 [workspace.dependencies]
+atomic-write-file = "0.3.1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

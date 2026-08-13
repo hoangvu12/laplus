@@ -42,6 +42,7 @@ const ServerConfigIssues = Schema.Array(ServerConfigIssue);
 
 export const ServerProviderState = Schema.Literals(["ready", "warning", "error", "disabled"]);
 export type ServerProviderState = typeof ServerProviderState.Type;
+export const ServerProviderCatalogueState = Schema.Literals(["checking", "verified", "stale"]);
 
 export const ServerProviderAuthStatus = Schema.Literals([
   "authenticated",
@@ -177,6 +178,7 @@ export const ServerProvider = Schema.Struct({
   status: ServerProviderState,
   auth: ServerProviderAuth,
   checkedAt: IsoDateTime,
+  catalogueState: Schema.optional(ServerProviderCatalogueState),
   message: Schema.optional(TrimmedNonEmptyString),
   // Optional for back-compat: every legacy producer omits this field and
   // an absent value is interpreted as `"available"` by consumers (see

@@ -575,6 +575,12 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
               showSidebar && "border-l",
             )}
           >
+            {props.instanceEntries.find((entry) => entry.instanceId === selectedInstanceId)
+              ?.snapshot.catalogueState === "checking" && (
+              <div className="px-4 pt-2 text-xs text-muted-foreground" role="status">
+                Checking OpenCode… Remembered models remain available.
+              </div>
+            )}
             {/* Search bar */}
             <div className="px-4 pt-2.5">
               <div className="-translate-y-px border-b border-border/70 pb-2.5 transition-colors focus-within:border-ring">

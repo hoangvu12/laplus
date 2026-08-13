@@ -76,6 +76,8 @@ export interface ProviderInstanceEntry {
 export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
   const hasUsableCatalogue =
     entry.status === "ready" ||
+    entry.snapshot.catalogueState === "checking" ||
+    entry.snapshot.catalogueState === "stale" ||
     (entry.status === "error" && entry.snapshot.auth.status === "unauthenticated");
   return entry.enabled && entry.isAvailable && hasUsableCatalogue;
 }

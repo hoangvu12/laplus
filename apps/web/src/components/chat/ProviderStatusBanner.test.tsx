@@ -34,6 +34,15 @@ describe("ProviderStatusBanner", () => {
     expect(shouldShowProviderStatusBanner(status, getProviderStatusBannerKey(status))).toBe(false);
   });
 
+  it("does not turn provisional remembered models into an availability warning", () => {
+    const status = { ...warningProvider(), catalogueState: "checking" as const };
+
+    expect(getProviderStatusBannerKey(status)).toBe(null);
+    expect(
+      renderToStaticMarkup(<ProviderStatusBanner status={status} onDismiss={() => {}} />),
+    ).toBe("");
+  });
+
   it("renders an accessible dismiss control for provider warnings", () => {
     const markup = renderToStaticMarkup(
       <ProviderStatusBanner status={warningProvider()} onDismiss={() => {}} />,

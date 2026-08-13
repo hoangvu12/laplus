@@ -1599,6 +1599,8 @@ impl Shell {
         if let Some(selection) = &start.model_selection {
             selection_for(&thread, selection)?;
         }
+        let effective_selection = start.model_selection.as_ref().unwrap_or(&thread.model_selection);
+        refuse_unavailable_opencode_model(&thread.provider.driver, &thread.provider.instance_id, effective_selection, config)?;
         let prepared = crate::session::prepare(
             &thread,
             &config.settings,
@@ -2384,6 +2386,20 @@ fn selection_for(thread: &Thread, selection: &Value) -> Result<(), CommandError>
          provider instance '{selected}'. Start a new conversation to use another provider.",
         thread.id, thread.provider.instance_id
     )))
+}
+
+fn refuse_unavailable_opencode_model(driver: &str, instance_id: &str, selection: &Value, config: &ServerConfig) -> Result<(), CommandError> {
+    if driver != "opencode" { return Ok(()); }
+    let Some(model) = selection.get("model").and_then(Value::as_str) else { return Ok(()) };
+    let Some(provider) = config.providers.iter().find(|provider| provider.instance_id == instance_id) else { return Ok(()) };
+    if provider.catalogue_state == Some(crate::config::ProviderCatalogueState::Verified)
+        && !crate::provider::catalogue_contains(provider, model) {
+        return Err(CommandError::new(format!(
+            "OpenCode model '{model}' is no longer available for provider instance '{}'. Choose an available model; Laplus did not substitute another one.",
+            instance_id
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -6135,5 +6151,23 @@ mod tests {
             fixture.snapshot()["snapshot"]["snapshotSequence"],
             json!(later)
         );
+    }
+
+    #[test]
+    fn an_authoritatively_removed_opencode_model_is_refused_without_substitution() {
+        let mut config = ServerConfig::detect();
+        config.providers = vec![crate::config::Provider {
+            instance_id: "openWork".into(), driver: "opencode".into(), display_name: "OpenCode".into(),
+            enabled: true, installed: true, version: Some("1.18.10".into()), status: crate::config::ProviderState::Ready,
+            message: None, auth: crate::config::ProviderAuth { status: crate::config::AuthStatus::Unknown, r#type: None, label: None, email: None },
+            checked_at: "2026-08-13T00:00:00Z".into(), catalogue_state: Some(crate::config::ProviderCatalogueState::Verified),
+            models: vec![crate::config::ProviderModel { slug:"live/model".into(), name:"Live".into(), is_custom:false, sub_provider:None, is_default:None, capabilities:None }],
+            slash_commands:vec![], skills:vec![], version_advisory:None, update_state:None,
+        }];
+        let refusal = refuse_unavailable_opencode_model("opencode", "openWork",
+            &json!({"instanceId":"openWork","model":"old/removed"}), &config)
+            .expect_err("the removed remembered model is refused");
+        assert!(refusal.message().contains("old/removed"));
+        assert!(refusal.message().contains("did not substitute"));
     }
 }

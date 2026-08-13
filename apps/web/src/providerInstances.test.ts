@@ -20,6 +20,7 @@ function provider(input: {
   status?: ServerProvider["status"];
   authStatus?: ServerProvider["auth"]["status"];
   models?: ServerProvider["models"];
+  catalogueState?: ServerProvider["catalogueState"];
 }): ServerProvider {
   return {
     instanceId: ProviderInstanceId.make(input.instanceId),
@@ -32,6 +33,7 @@ function provider(input: {
     ...(input.availability ? { availability: input.availability } : {}),
     auth: { status: input.authStatus ?? "authenticated" },
     checkedAt: "2026-01-01T00:00:00.000Z",
+    ...(input.catalogueState ? { catalogueState: input.catalogueState } : {}),
     models: input.models ?? [],
     slashCommands: [],
     skills: [],
@@ -80,6 +82,21 @@ describe("isProviderInstancePickerReady", () => {
     ]);
 
     expect(entry && isProviderInstancePickerReady(entry)).toBe(true);
+  });
+
+  it("keeps remembered models selectable while checking and after a transient failure", () => {
+    for (const catalogueState of ["checking", "stale"] as const) {
+      const [entry] = deriveProviderInstanceEntries([
+        provider({
+          provider: ProviderDriverKind.make("opencode"),
+          instanceId: "openWork",
+          status: "warning",
+          catalogueState,
+          models: [model("anthropic/remembered")],
+        }),
+      ]);
+      expect(entry && isProviderInstancePickerReady(entry)).toBe(true);
+    }
   });
 });
 

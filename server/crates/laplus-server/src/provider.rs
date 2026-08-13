@@ -1171,6 +1171,7 @@ fn snapshot(
         message,
         auth: unknown_auth(),
         checked_at: now_iso(),
+        catalogue_state: None,
         slash_commands: catalogue.slash_commands,
         skills: catalogue.skills,
         version_advisory: None,
@@ -1374,6 +1375,7 @@ fn codex_snapshot(
         message,
         auth,
         checked_at: now_iso(),
+        catalogue_state: None,
         models,
         slash_commands: Vec::new(),
         skills,
@@ -1392,56 +1394,117 @@ const OPENCODE_CATALOGUE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXTERNAL_DISCOVERY_RETRIES: usize = 2;
 const EXTERNAL_DISCOVERY_BACKOFF: Duration = Duration::from_millis(20);
 
-fn describe_opencode(instance: &OpenCodeInstance, search: &Search) -> Provider {
+fn opencode_cache_identity(instance: &OpenCodeInstance, search: &Search) -> Option<String> {
+    if !instance.settings.server_url.is_empty() {
+        return crate::provider_catalogue_cache::external_identity(&instance.settings.server_url);
+    }
+    resolve_named(&instance.settings.binary_path, "opencode", search).startable_for("OpenCode CLI")
+        .ok().map(|(path, _)| crate::provider_catalogue_cache::executable_identity(&path))
+}
+
+pub(crate) fn hydrate_remembered_opencode(config: &mut crate::config::ServerConfig, search: &Search) {
+    let settings = config.settings.clone();
+    let mut remembered = Vec::new();
+    for instance_id in settings.provider_instances.keys() {
+        let Some(ConfiguredInstance::OpenCode(instance)) = configured_instance(&settings, instance_id) else { continue };
+        if !instance.settings.enabled { continue; }
+        let Some(identity) = opencode_cache_identity(&instance, search) else { continue };
+        let Some(entry) = crate::provider_catalogue_cache::load(&config.preferences, instance_id, OPENCODE_DRIVER, &identity) else { continue };
+        let mut provider = opencode_snapshot(&instance, entry.version, Installed::Yes, ProviderState::Warning,
+            Some("Checking OpenCode… Remembered models are available while discovery runs.".to_string()),
+            merge_custom(entry.models, &instance.settings.custom_models), Vec::new());
+        provider.checked_at = entry.checked_at;
+        provider.catalogue_state = Some(crate::config::ProviderCatalogueState::Checking);
+        remembered.push(provider);
+    }
+    remembered.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    config.providers.extend(remembered);
+}
+
+fn describe_opencode(instance: &OpenCodeInstance, search: &Search, preferences: &Path) -> Provider {
     let settings = &instance.settings;
     if !settings.enabled {
+        let _ = crate::provider_catalogue_cache::remove(preferences, &instance.identity.instance_id);
         return opencode_snapshot(instance, None, Installed::No, ProviderState::Disabled,
             Some("The OpenCode provider is switched off in settings.".to_string()), custom_models(&settings.custom_models), Vec::new());
     }
     if !settings.server_url.is_empty() {
         return match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => match runtime.block_on(tokio::time::timeout(PROBE_TIMEOUT, discover_external_opencode(settings))) {
-                Ok(Ok((version, models, skills))) => opencode_snapshot(instance, Some(version), Installed::Yes,
-                    ProviderState::Ready, None, merge_custom(models, &settings.custom_models), skills),
-                Ok(Err(error)) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-                    Some(format!("OpenCode server discovery failed: {error}.")), custom_models(&settings.custom_models), Vec::new()),
-                Err(_) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-                    Some(format!("OpenCode server discovery did not finish within {} seconds.", PROBE_TIMEOUT.as_secs())),
-                    custom_models(&settings.custom_models), Vec::new()),
+                Ok(Ok((version, models, skills))) => authoritative_opencode(instance, preferences, Some(version), models, skills),
+                Ok(Err(error)) if error.transient => failed_opencode(instance, preferences, Installed::Yes,
+                    format!("OpenCode server discovery failed: {}.", error.message)),
+                Ok(Err(error)) => authoritative_opencode_failure(instance, preferences,
+                    format!("OpenCode server discovery failed: {}.", error.message)),
+                Err(_) => failed_opencode(instance, preferences, Installed::Yes,
+                    format!("OpenCode server discovery did not finish within {} seconds.", PROBE_TIMEOUT.as_secs())),
             },
-            Err(error) => opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-                Some(format!("OpenCode server discovery could not start: {error}.")), custom_models(&settings.custom_models), Vec::new()),
+            Err(error) => failed_opencode(instance, preferences, Installed::Yes,
+                format!("OpenCode server discovery could not start: {error}.")),
         };
     }
     let (path, _) = match resolve_named(&settings.binary_path, "opencode", search)
         .startable_for("OpenCode CLI") {
         Ok(found) => found,
-        Err(why) => return opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
-            Some(why), custom_models(&settings.custom_models), Vec::new()),
+        Err(why) => { let _ = crate::provider_catalogue_cache::remove(preferences, &instance.identity.instance_id);
+            return opencode_snapshot(instance, None, Installed::No, ProviderState::Error,
+            Some(why), custom_models(&settings.custom_models), Vec::new()) },
     };
     let version = match probe(&path, PROBE_TIMEOUT) {
         Probed::Version(version) => version,
-        other => return opencode_snapshot(instance, None, Installed::Yes, ProviderState::Error,
-            Some(format!("OpenCode version probe failed: {other:?}.")), custom_models(&settings.custom_models), Vec::new()),
+        other => return failed_opencode(instance, preferences, Installed::Yes,
+            format!("OpenCode version probe failed: {other:?}.")),
     };
     if parse_version(&version).is_none_or(|found| found < MINIMUM_OPENCODE_VERSION) {
+        let _ = crate::provider_catalogue_cache::remove(preferences, &instance.identity.instance_id);
         return opencode_snapshot(instance, Some(version.clone()), Installed::Yes, ProviderState::Error,
             Some(format!("OpenCode {version} is unsupported; version 1.14.19 or newer is required.")),
             custom_models(&settings.custom_models), Vec::new());
     }
     match discover_local_opencode(&path) {
-        Ok((models, skills)) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Ready,
-            None, merge_custom(models, &settings.custom_models), skills),
-        Err(error) => opencode_snapshot(instance, Some(version), Installed::Yes, ProviderState::Error,
-            Some(format!("OpenCode catalogue discovery failed: {error}.")), custom_models(&settings.custom_models), Vec::new()),
+        Ok((models, skills)) => authoritative_opencode(instance, preferences, Some(version), models, skills),
+        Err(error) => failed_opencode(instance, preferences, Installed::Yes,
+            format!("OpenCode catalogue discovery failed: {error}.")),
     }
 }
 
+fn authoritative_opencode(instance: &OpenCodeInstance, preferences: &Path, version: Option<String>, models: Vec<ProviderModel>, skills: Vec<serde_json::Value>) -> Provider {
+    let checked_at = now_iso();
+    if let Some(identity) = opencode_cache_identity(instance, &Search::from_environment()) {
+        let entry = crate::provider_catalogue_cache::Entry { instance_id: instance.identity.instance_id.clone(), driver: OPENCODE_DRIVER.into(), identity_fingerprint: identity, version: version.clone(), checked_at: checked_at.clone(), models: models.clone() };
+        if let Err(error) = crate::provider_catalogue_cache::store(preferences, entry) { eprintln!("laplus: could not remember OpenCode catalogue: {error}"); }
+    }
+    let mut provider = opencode_snapshot(instance, version, Installed::Yes, ProviderState::Ready, None, merge_custom(models, &instance.settings.custom_models), skills);
+    provider.checked_at = checked_at;
+    provider
+}
+
+fn failed_opencode(instance: &OpenCodeInstance, preferences: &Path, installed: Installed, message: String) -> Provider {
+    if let Some(identity) = opencode_cache_identity(instance, &Search::from_environment()) {
+        if let Some(entry) = crate::provider_catalogue_cache::load(preferences, &instance.identity.instance_id, OPENCODE_DRIVER, &identity) {
+            let mut provider = opencode_snapshot(instance, entry.version, installed, ProviderState::Warning,
+                Some(format!("{message} Remembered models remain available; retry provider discovery.")),
+                merge_custom(entry.models, &instance.settings.custom_models), Vec::new());
+            provider.checked_at = entry.checked_at;
+            provider.catalogue_state = Some(crate::config::ProviderCatalogueState::Stale);
+            return provider;
+        }
+    }
+    opencode_snapshot(instance, None, installed, ProviderState::Error, Some(message), custom_models(&instance.settings.custom_models), Vec::new())
+}
+
+fn authoritative_opencode_failure(instance: &OpenCodeInstance, preferences: &Path, message: String) -> Provider {
+    let _ = crate::provider_catalogue_cache::remove(preferences, &instance.identity.instance_id);
+    opencode_snapshot(instance, None, Installed::Yes, ProviderState::Error, Some(message), custom_models(&instance.settings.custom_models), Vec::new())
+}
+
+struct OpenCodeDiscoveryFailure { message: String, transient: bool }
+
 async fn discover_external_opencode(settings: &OpenCodeSettings)
-    -> Result<(String, Vec<ProviderModel>, Vec<serde_json::Value>), String> {
+    -> Result<(String, Vec<ProviderModel>, Vec<serde_json::Value>), OpenCodeDiscoveryFailure> {
     let client = crate::opencode::OpenCodeClient::new(
         &settings.server_url, ".", (!settings.server_password.is_empty()).then(|| settings.server_password.clone()),
-    ).map_err(|error| error.to_string())?;
+    ).map_err(|error| OpenCodeDiscoveryFailure { message: error.to_string(), transient: false })?;
     let discover = || async {
         let health = client.health().await?;
         let providers = client.providers().await?;
@@ -1466,9 +1529,14 @@ async fn discover_external_opencode(settings: &OpenCodeSettings)
             result => break result,
         }
     };
-    let (health, providers, agents, skills) = discovered.map_err(|error| error.to_string())?;
-    if !health.healthy { return Err("the server reported unhealthy".to_string()); }
-    Ok((health.version, opencode_models(&providers, &agents)?, opencode_skills(&skills)))
+    let (health, providers, agents, skills) = discovered.map_err(|error| OpenCodeDiscoveryFailure {
+        transient: matches!(error, crate::opencode::OpenCodeError::Transport(_)),
+        message: error.to_string(),
+    })?;
+    if !health.healthy { return Err(OpenCodeDiscoveryFailure { message: "the server reported unhealthy".into(), transient: true }); }
+    let models = opencode_models(&providers, &agents)
+        .map_err(|message| OpenCodeDiscoveryFailure { message, transient: false })?;
+    Ok((health.version, models, opencode_skills(&skills)))
 }
 
 fn discover_local_opencode(path: &Path) -> Result<(Vec<ProviderModel>, Vec<serde_json::Value>), String> {
@@ -1707,6 +1775,10 @@ fn merge_custom(mut discovered: Vec<ProviderModel>, configured: &[String]) -> Ve
     discovered
 }
 
+pub(crate) fn catalogue_contains(provider: &Provider, model: &str) -> bool {
+    provider.models.iter().any(|available| available.slug == model)
+}
+
 fn opencode_snapshot(instance: &OpenCodeInstance, version: Option<String>, installed: Installed,
     status: ProviderState, message: Option<String>, models: Vec<ProviderModel>,
     skills: Vec<serde_json::Value>) -> Provider {
@@ -1727,7 +1799,7 @@ fn opencode_snapshot(instance: &OpenCodeInstance, version: Option<String>, insta
         // instance could not answer and an external one would be the only kind
         // with a `/` menu. One catalogue that depends on how the instance was
         // reached is worse than one this server does not claim yet.
-        checked_at: now_iso(), models, slash_commands: Vec::new(), skills,
+        checked_at: now_iso(), catalogue_state: Some(crate::config::ProviderCatalogueState::Verified), models, slash_commands: Vec::new(), skills,
         version_advisory, update_state: None }
 }
 
@@ -1790,7 +1862,7 @@ fn refresh_instance_reserved(
             let lifetime = config.provider_process_lifetime();
             describe_codex(&instance, search, roots, &lifetime)
         }
-        Some(ConfiguredInstance::OpenCode(instance)) => describe_opencode(&instance, search),
+        Some(ConfiguredInstance::OpenCode(instance)) => describe_opencode(&instance, search, &config.current().preferences),
         None => return,
     };
     if let Some(message) = &provider.message {

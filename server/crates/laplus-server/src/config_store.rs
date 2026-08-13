@@ -224,6 +224,7 @@ impl ConfigStore {
         let keybindings = crate::keybindings::load(&config.preferences);
 
         config.settings = crate::settings::load(&config.preferences, config.settings.clone());
+        crate::provider::hydrate_remembered_opencode(&mut config, &crate::process::Search::from_environment());
         config.keybindings = keybindings.keybindings;
         // Only the keybindings file can put a row here — `ServerConfigIssue` has
         // no member for a settings problem, and one invented for it would fail
@@ -516,6 +517,7 @@ mod tests {
                 email: None,
             },
             checked_at: "2026-07-31T00:00:00.000Z".to_string(),
+            catalogue_state: None,
             models: Vec::new(),
             slash_commands: Vec::new(),
             skills: Vec::new(),
