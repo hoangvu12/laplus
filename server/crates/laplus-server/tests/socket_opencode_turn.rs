@@ -757,6 +757,11 @@ async fn session_messages(
     ]))
 }
 
+async fn session_statuses(State(state): State<PeerState>) -> Json<Value> {
+    append(&state.log, json!({"operation":"status"}));
+    Json(json!({}))
+}
+
 async fn revert_session(
     AxumPath(session_id): AxumPath<String>,
     State(state): State<PeerState>,
@@ -790,9 +795,6 @@ async fn prompt(
     );
     let prompt_number = state.prompts.fetch_add(1, Ordering::SeqCst) + 1;
     if prompt_number > 1 {
-        if let Some(release) = &state.idle_release {
-            release.notify_one();
-        }
         return StatusCode::NO_CONTENT;
     }
     let sender = state
@@ -895,9 +897,6 @@ async fn abort(
         &state.log,
         json!({"operation":"abort","sessionId":session_id}),
     );
-    if let Some(release) = &state.idle_release {
-        release.notify_one();
-    }
     Json(json!(true))
 }
 
@@ -1063,6 +1062,7 @@ impl ExternalOpenCode {
             .route("/session/{id}", get(get_session).patch(update_session))
             .route("/session/{id}/fork", post(fork_session))
             .route("/session/{id}/message", get(session_messages))
+            .route("/session/status", get(session_statuses))
             .route("/session/{id}/revert", post(revert_session))
             .route("/experimental/control-plane/move-session", post(move_session))
             .route("/session/{id}/prompt_async", post(prompt))
@@ -1211,7 +1211,7 @@ async fn opencode_prompt_resolves_stored_attachments_and_omits_missing_reference
 #[tokio::test]
 async fn interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate_idle() {
     let idle_release = Arc::new(Notify::new());
-    let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release)).await;
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(Arc::clone(&idle_release))).await;
     let workspace = Workspace::with(&["src/"]);
     let server = TestServer::start_with(peer.config(None)).await;
     let mut client = server.connect().await;
@@ -1248,6 +1248,7 @@ async fn interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate
         )
         .await
         .expect_success();
+    idle_release.notify_one();
     let after = client.events_through_the_turn(&subscription).await;
     let requests = peer.requests_through(3).await;
     assert!(requests
@@ -1283,6 +1284,46 @@ async fn interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate
     client.close().await;
     server.stop().await;
     peer.task.abort();
+}
+
+#[tokio::test]
+async fn missing_opencode_idle_reconciles_and_late_idle_cannot_settle_queued_work() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(Arc::clone(&release))).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("reconcile-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("reconcile-project", "reconcile-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("reconcile-thread").await;
+    let mut first = start_turn("reconcile-thread", "message-a", "A");
+    first["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", first).await.expect_success();
+    let events = client.events_until_streaming(&subscription).await;
+    let a = last_session(&events, "running A")["payload"]["session"]["activeTurnId"].as_str().unwrap().to_string();
+    client.call("orchestration.dispatchCommand", interrupt_turn("reconcile-thread", Some(&a))).await.expect_success();
+    client.call("orchestration.dispatchCommand", follow_up("reconcile-thread", "message-b", "B")).await.expect_success();
+    client.call("orchestration.dispatchCommand", follow_up("reconcile-thread", "message-c", "C")).await.expect_success();
+    let before = server.connect().await.into_thread_snapshot("reconcile-thread").await;
+    let b = before["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "message-b").unwrap()["turnId"].as_str().unwrap().to_string();
+    let c = before["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "message-c").unwrap()["turnId"].as_str().unwrap().to_string();
+    assert_ne!(a, b);
+    assert_eq!(b, c);
+    client.values_until(&subscription, |item| item["event"]["type"] == "thread.turn-start-requested").await;
+    let requests = peer.requests_through(7).await;
+    assert!(requests.iter().any(|request| request["operation"] == "get"));
+    assert!(requests.iter().any(|request| request["operation"] == "messages"));
+    let queued_prompt = requests.iter().filter(|request| request["operation"] == "prompt").last().unwrap();
+    let queued_text = queued_prompt["body"]["parts"].as_array().unwrap().iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
+    assert!(queued_text.find('B') < queued_text.find('C'));
+    release.notify_one();
+    for _ in 0..10 { tokio::task::yield_now().await; }
+    let after = server.connect().await.into_thread_snapshot("reconcile-thread").await;
+    assert_eq!(after["thread"]["session"]["activeTurnId"], b);
+    assert_eq!(after["thread"]["session"]["status"], "running");
+    client.close().await; server.stop().await; peer.task.abort();
 }
 
 #[tokio::test]

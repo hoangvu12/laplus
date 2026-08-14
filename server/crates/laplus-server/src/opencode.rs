@@ -136,6 +136,10 @@ impl OpenCodeClient {
         self.request_json(Method::GET, "config", Option::<&()>::None)
             .await
     }
+    pub async fn session_statuses(&self) -> Result<Value, OpenCodeError> {
+        self.request_json(Method::GET, "session/status", Option::<&()>::None)
+            .await
+    }
     pub async fn agents(&self) -> Result<Value, OpenCodeError> {
         self.request_json(Method::GET, "agent", Option::<&()>::None)
             .await
@@ -682,6 +686,7 @@ pub(crate) struct OpenCode {
     pending_deltas: HashMap<String, String>,
     emitted_parts: HashMap<String, String>,
     assistant_text: String,
+    ignore_idle_until_busy: bool,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
     pending_questions: HashMap<String, crate::approval::ApprovalRequest>,
     /// One row per subagent, by the id of the `task` call that owns it.
@@ -1366,6 +1371,7 @@ impl OpenCode {
         };
         let interrupted = finished.was_stopped();
         self.settled = true;
+        self.ignore_idle_until_busy = true;
         let mut changes = Vec::new();
         if !self.assistant_text.is_empty() {
             let message_id = finished
@@ -1438,6 +1444,7 @@ impl crate::session::Driver for OpenCode {
     const COALESCES_QUEUED_PROMPTS: bool = true;
     const APPROVAL_RESOLVED_BY_EVENT: bool = true;
     const USER_INPUT_RESOLVED_BY_EVENT: bool = true;
+    const INTERRUPT_RECONCILIATION_AFTER: Option<std::time::Duration> = Some(std::time::Duration::from_secs(2));
 
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
         // Cursor validation precedes launching an owned process or making any
@@ -1520,6 +1527,7 @@ impl crate::session::Driver for OpenCode {
                 pending_deltas: HashMap::new(),
                 emitted_parts: HashMap::new(),
                 assistant_text: String::new(),
+                ignore_idle_until_busy: false,
                 pending_permissions: HashMap::new(),
                 pending_questions: HashMap::new(),
                 subagent_rows: HashMap::new(),
@@ -1726,6 +1734,7 @@ impl crate::session::Driver for OpenCode {
                 }
             }
             "session.idle" => {
+                if self.ignore_idle_until_busy { return Some(decided); }
                 return Some(self.settle(driving, crate::settling::SessionStatus::Ready, None))
             }
             "session.status"
@@ -1735,6 +1744,7 @@ impl crate::session::Driver for OpenCode {
                     .and_then(Value::as_str)
                     == Some("idle") =>
             {
+                if self.ignore_idle_until_busy { return Some(decided); }
                 return Some(self.settle(driving, crate::settling::SessionStatus::Ready, None));
             }
             "session.status" => match envelope
@@ -1745,7 +1755,7 @@ impl crate::session::Driver for OpenCode {
                 // Dispatching the prompt already published the shared running
                 // session. Re-publishing it here through the settlement seam
                 // would clear activeTurnId, so busy is an idempotent confirmation.
-                Some("busy") => {}
+                Some("busy") => self.ignore_idle_until_busy = false,
                 Some("retry") => {
                     let status = &envelope.properties["status"];
                     let message = status
@@ -1769,6 +1779,7 @@ impl crate::session::Driver for OpenCode {
                 _ => {}
             },
             "session.error" => {
+                if self.ignore_idle_until_busy { return Some(decided); }
                 let error = envelope
                     .properties
                     .get("error")
@@ -1817,6 +1828,24 @@ impl crate::session::Driver for OpenCode {
             .await
             .map(|_| ())
             .map_err(std::io::Error::other)
+    }
+    async fn reconcile_interrupt(&mut self, driving: &mut crate::session::Driving) -> Result<crate::session::Decided, String> {
+        self.client.session(&self.session_id).await.map_err(|error| error.to_string())?;
+        let messages = self.client.messages(&self.session_id).await.map_err(|error| error.to_string())?;
+        let statuses = self.client.session_statuses().await.map_err(|error| error.to_string())?;
+        if statuses.get(&self.session_id).and_then(|status| status.get("type")).and_then(Value::as_str).is_some_and(|status| status != "idle") {
+            return Err("OpenCode still reports the interrupted session as busy".to_string());
+        }
+        if let Some(text) = messages.as_array()
+            .and_then(|messages| messages.iter().rev().find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")))
+            .and_then(|message| message.get("parts")).and_then(Value::as_array)
+            .map(|parts| parts.iter().filter(|part| part.get("type").and_then(Value::as_str) == Some("text")).filter_map(|part| part.get("text").and_then(Value::as_str)).collect::<String>())
+            .filter(|text| text.starts_with(&self.assistant_text))
+        {
+            self.assistant_text = text;
+        }
+        self.ignore_idle_until_busy = true;
+        Ok(self.settle(driving, crate::settling::SessionStatus::Interrupted, None))
     }
     async fn answer(
         &mut self,

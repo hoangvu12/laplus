@@ -211,6 +211,7 @@ pub(crate) trait Driver: Send + Sized {
     const COALESCES_QUEUED_PROMPTS: bool = false;
     const APPROVAL_RESOLVED_BY_EVENT: bool = false;
     const USER_INPUT_RESOLVED_BY_EVENT: bool = false;
+    const INTERRUPT_RECONCILIATION_AFTER: Option<std::time::Duration> = None;
 
     /// Start the agent for this session, or say why not in a sentence the
     /// developer will read in the conversation.
@@ -237,6 +238,9 @@ pub(crate) trait Driver: Send + Sized {
     /// [`Driver::next`] like everything else, and `request_id` is what matches
     /// the answer to it.
     fn interrupt(&mut self, request_id: &str) -> impl Future<Output = std::io::Result<()>> + Send;
+    fn reconcile_interrupt(&mut self, _driving: &mut Driving) -> impl Future<Output = Result<Decided, String>> + Send {
+        async { Err("this provider cannot reconcile an interrupted turn".to_string()) }
+    }
 
     /// Answer something the agent has stopped for.
     ///
@@ -560,6 +564,7 @@ async fn drive<D: Driver>(
     // reaping so the shared ending reports the error without pretending the
     // agent had started work or asking either driver to duplicate this policy.
     let mut send_failure = None;
+    let mut interrupt_reconciliation = None;
 
     'session: loop {
         // Anything already owed to the turn that just ended is dealt with before
@@ -704,6 +709,7 @@ async fn drive<D: Driver>(
             event = driver.next(&mut driving) => Next::Event(event),
             signal = signals.recv(), if listening => Next::Signal(signal),
             prompt = prompts.recv(), if accepting && waiting.is_none() => Next::Prompt(prompt),
+            _ = async { tokio::time::sleep_until(interrupt_reconciliation.expect("guarded interrupt deadline")).await }, if interrupt_reconciliation.is_some() => Next::ReconcileInterrupt,
         };
 
         match next {
@@ -796,7 +802,21 @@ async fn drive<D: Driver>(
                 accepting = false;
                 driver.close_input();
             }
+            Next::ReconcileInterrupt => match driver.reconcile_interrupt(&mut driving).await {
+                Ok(decided) => {
+                    spend(&threads, &start, decided);
+                    if let Some(finished) = driving.finished.take() { checkpoint(&threads, &start, &finished).await; }
+                }
+                Err(error) => {
+                    send_failure = Some(format!("The interrupted turn could not be reconciled with the provider: {error}"));
+                    break;
+                }
+            },
         }
+        interrupt_reconciliation = match driving.turn.as_ref() {
+            Some(turn) if turn.stopped.is_some() => interrupt_reconciliation.or_else(|| D::INTERRUPT_RECONCILIATION_AFTER.map(|after| tokio::time::Instant::now() + after)),
+            _ => None,
+        };
     }
 
     // A reply that streamed and will never be buffered, because the agent went
@@ -1096,6 +1116,7 @@ enum Next {
     Event(Option<Decided>),
     Prompt(Option<Prompt>),
     Signal(Option<Signal>),
+    ReconcileInterrupt,
 }
 
 /// What the session and its driver both need, and neither could hold alone.
