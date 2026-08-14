@@ -57,8 +57,15 @@ thread-lifecycle tracker, ticket 03.
 the agent does before it goes quiet. Has an id the client mints.
 
 **Steer** — an additional developer prompt incorporated into the OpenCode turn
-already running, retaining that turn's id. _Avoid_: Queued turn, which starts a
-new exchange only after the active one settles.
+already running, retaining that turn's id. This is an OpenCode capability, not
+the behavior of a developer message sent while Laplus is working. _Avoid_:
+Queued turn.
+
+**Queued turn** — one or more developer prompts accepted while another turn is
+running or settling. The prompts stay separate in the transcript but start one
+new exchange after settlement. The new exchange retains the preceding reply,
+including a partial interrupted reply, as conversation history. _Avoid_: Steer,
+follow-up message.
 
 **Chat attachment** — a file stored by laplus and included with a developer
 prompt. OpenCode receives its resolved local `file://` URL; an external server

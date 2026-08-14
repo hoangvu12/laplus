@@ -206,6 +206,9 @@ pub(crate) trait Driver: Send + Sized {
     /// Whether a prompt received during a running turn belongs to that same
     /// turn instead of waiting to begin another one.
     const STEERS_ACTIVE_TURN: bool = false;
+    /// Whether prompts accepted at one settlement boundary are delivered as a
+    /// single provider turn while retaining separate transcript messages.
+    const COALESCES_QUEUED_PROMPTS: bool = false;
     const APPROVAL_RESOLVED_BY_EVENT: bool = false;
     const USER_INPUT_RESOLVED_BY_EVENT: bool = false;
 
@@ -600,7 +603,25 @@ async fn drive<D: Driver>(
 
         // Whatever is waiting goes next, as soon as the turn before it is done.
         if accepting && driving.turn.is_none() {
-            if let Some(prompt) = waiting.take() {
+            if let Some(mut prompt) = waiting.take() {
+                let mut deferred = None;
+                if D::COALESCES_QUEUED_PROMPTS {
+                    while let Ok(next) = prompts.try_recv() {
+                        if next.turn_id != prompt.turn_id {
+                            deferred = Some(next);
+                            break;
+                        }
+                        if !prompt.text.is_empty() && !next.text.is_empty() {
+                            prompt.text.push_str("\n\n");
+                        }
+                        prompt.text.push_str(&next.text);
+                        prompt.attachments.extend(next.attachments);
+                        // One provider request has one effective model and
+                        // runtime mode. The first message created the queued
+                        // turn, so its captured selection remains authoritative
+                        // for every later message accepted into that turn.
+                    }
+                }
                 // Before anything this turn publishes and before the turn itself
                 // reaches the agent, which is what makes the mode this turn is
                 // *requested* under the mode it is *answered* under. It moves
@@ -660,6 +681,7 @@ async fn drive<D: Driver>(
                     tools: HashMap::new(),
                     stopped: None,
                 });
+                waiting = deferred;
                 continue;
             }
         }

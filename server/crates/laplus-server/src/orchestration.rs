@@ -1608,36 +1608,6 @@ impl Shell {
         ).map_err(CommandError::new)?;
         let attachments = crate::attachments::resolve_all(&start.message.attachments, &start.message.message_id);
 
-        // OpenCode's native busy-session prompt is a steer, not a queued new
-        // turn. Keep the active turn id at both public boundaries: the user
-        // message in the transcript and the prompt handed to the live driver.
-        // Other drivers continue through the ordinary fresh-turn path below.
-        if thread.provider.driver == "opencode" {
-            if let Some(turn_id) = self.inner.threads.active_turn(&start.thread_id) {
-                let sequence = self.inner.threads.apply(
-                    &start.thread_id,
-                    Change::UserMessage {
-                        message_id: start.message.message_id.clone(),
-                        text: start.message.text.clone(),
-                        turn_id: turn_id.clone(),
-                    },
-                ).ok_or_else(|| self.not_open(&start.thread_id))?;
-                let starting = crate::session::starting(
-                    &thread,
-                    &where_the_work_happens(&thread, &project),
-                    prepared,
-                );
-                crate::session::send(
-                    &self.inner.threads,
-                    &starting,
-                    turn_id,
-                    start.message.text.clone(),
-                    attachments,
-                ).map_err(CommandError::new)?;
-                return Ok(sequence);
-            }
-        }
-
         if let Some(thread) = pending {
             self.inner
                 .threads
@@ -1645,7 +1615,20 @@ impl Shell {
                 .map_err(CommandError::new)?;
         }
 
-        let turn_id = threads::fresh_turn_id();
+        // OpenCode accepts every message that arrives before the active turn's
+        // settlement as one queued turn. The messages remain distinct rows,
+        // but share the queued turn identity so the session can deliver them
+        // together at that boundary.
+        let active_turn = self.inner.threads.active_turn(&start.thread_id);
+        let latest_turn = self.inner.threads.latest_turn(&start.thread_id);
+        let turn_id = if thread.provider.driver == "opencode"
+            && active_turn.is_some()
+            && latest_turn != active_turn
+        {
+            latest_turn.expect("a queued OpenCode turn has a latest turn")
+        } else {
+            threads::fresh_turn_id()
+        };
         // The developer's own message first, so it is in the transcript before
         // anything the agent says about it can be.
         let (_, after_message) = self.inner

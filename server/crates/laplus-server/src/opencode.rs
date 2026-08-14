@@ -1436,7 +1436,7 @@ fn structured_event_error(error: &Value) -> String {
 }
 
 impl crate::session::Driver for OpenCode {
-    const STEERS_ACTIVE_TURN: bool = true;
+    const COALESCES_QUEUED_PROMPTS: bool = true;
     const APPROVAL_RESOLVED_BY_EVENT: bool = true;
     const USER_INPUT_RESOLVED_BY_EVENT: bool = true;
 

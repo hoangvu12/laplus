@@ -1287,9 +1287,9 @@ async fn interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate
 }
 
 #[tokio::test]
-async fn a_busy_opencode_prompt_steers_the_active_turn_and_a_later_prompt_starts_another() {
+async fn a_busy_opencode_prompt_is_durable_and_starts_after_the_active_turn_settles() {
     let idle_release = Arc::new(Notify::new());
-    let peer = ExternalOpenCode::start_with_idle_release(None, Some(idle_release)).await;
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(Arc::clone(&idle_release))).await;
     let workspace = Workspace::with(&["src/"]);
     let server = TestServer::start_with(peer.config(None)).await;
     let mut client = server.connect().await;
@@ -1325,37 +1325,29 @@ async fn a_busy_opencode_prompt_steers_the_active_turn_and_a_later_prompt_starts
         )
         .await
         .expect_success();
-    let requests = peer.requests_through(3).await;
+    tokio::task::yield_now().await;
+    let requests = peer.requests().await;
     assert_eq!(
         requests
             .iter()
             .filter(|request| request["operation"] == "prompt")
             .count(),
-        2
+        1,
+        "the queued message was sent to the busy OpenCode session"
     );
-    let settled = client.events_through_the_turn(&subscription).await;
-    assert!(!settled
-        .iter()
-        .any(|item| item["event"]["type"] == "thread.turn-start-requested"));
     let snapshot = server
         .connect()
         .await
         .into_thread_snapshot("steer-thread")
         .await;
-    let steer = snapshot["thread"]["messages"]
+    let queued = snapshot["thread"]["messages"]
         .as_array()
         .unwrap()
         .iter()
         .find(|message| message["id"] == "message-2")
         .unwrap();
-    assert_eq!(steer["turnId"], active);
-    client
-        .call(
-            "orchestration.dispatchCommand",
-            follow_up("steer-thread", "message-3", "new turn"),
-        )
-        .await
-        .expect_success();
+    assert_ne!(queued["turnId"], active);
+    idle_release.notify_one();
     let later = client
         .values_until(&subscription, |item| {
             item["event"]["type"] == "thread.turn-start-requested"
@@ -1366,6 +1358,63 @@ async fn a_busy_opencode_prompt_steers_the_active_turn_and_a_later_prompt_starts
         .find(|item| item["event"]["type"] == "thread.turn-start-requested")
         .unwrap();
     assert_ne!(new_turn["event"]["payload"]["turnId"], active);
+    let requests = peer.requests_through(3).await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["operation"] == "prompt")
+            .count(),
+        2
+    );
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(Arc::clone(&idle_release))).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("queue-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("queue-project", "queue-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("queue-thread").await;
+    let mut first = start_turn("queue-thread", "message-1", "A");
+    first["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", first).await.expect_success();
+    client.events_until_streaming(&subscription).await;
+    for (message_id, text) in [("message-2", "B"), ("message-3", "C")] {
+        client.call("orchestration.dispatchCommand", follow_up("queue-thread", message_id, text)).await.expect_success();
+    }
+    let snapshot = server.connect().await.into_thread_snapshot("queue-thread").await;
+    let queued = snapshot["thread"]["messages"].as_array().unwrap().iter()
+        .filter(|message| message["id"] == "message-2" || message["id"] == "message-3")
+        .collect::<Vec<_>>();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0]["text"], "B");
+    assert_eq!(queued[1]["text"], "C");
+    assert_eq!(queued[0]["turnId"], queued[1]["turnId"]);
+    let messages = snapshot["thread"]["messages"].as_array().unwrap();
+    let reply = messages.iter().position(|message| {
+        message["role"] == "assistant"
+            && message["text"].as_str().unwrap_or("").contains("hello")
+    }).expect("A's completed reply is durable before the queued messages");
+    let first_queued = messages.iter().position(|message| message["id"] == "message-2").unwrap();
+    assert!(reply < first_queued);
+    idle_release.notify_one();
+    let requests = peer.requests_through(3).await;
+    let prompts = requests.iter().filter(|request| request["operation"] == "prompt").collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2, "B and C opened more than one queued turn");
+    assert_eq!(prompts[0]["sessionId"], prompts[1]["sessionId"], "the queued turn lost A's provider history");
+    let parts = prompts[1]["body"]["parts"].as_array().unwrap();
+    let queued_text = parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
+    assert!(queued_text.contains('B'));
+    assert!(queued_text.contains('C'));
+    assert!(queued_text.find('B') < queued_text.find('C'));
     client.close().await;
     server.stop().await;
     peer.task.abort();
