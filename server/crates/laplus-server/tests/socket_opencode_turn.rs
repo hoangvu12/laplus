@@ -45,6 +45,7 @@ struct FakeOpenCode {
 #[derive(Clone, Copy)]
 enum Startup {
     Healthy,
+    DelayedCatalogue,
     Gated,
     ResistsStop,
     Exit,
@@ -64,12 +65,16 @@ impl FakeOpenCode {
         Self::scripted(Startup::Exit)
     }
 
-    fn resisting_stop() -> Self {
-        Self::scripted(Startup::ResistsStop)
-    }
-
     fn busy() -> Self {
         Self::scripted(Startup::Gated)
+    }
+
+    fn delayed_catalogue() -> Self {
+        Self::scripted(Startup::DelayedCatalogue)
+    }
+
+    fn resisting_stop() -> Self {
+        Self::scripted(Startup::ResistsStop)
     }
 
     fn spawning_a_subagent() -> Self {
@@ -95,14 +100,16 @@ impl FakeOpenCode {
             (Startup::Exit, true) => "exit /b 23",
             (Startup::Exit, false) => "exit 23",
             (Startup::Healthy, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
-            (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::DelayedCatalogue, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_DELAY_CATALOGUE=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::McpFailure, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_MCP_FAIL=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Subagent, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_SUBAGENT=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Healthy, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
-            (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
+            (Startup::DelayedCatalogue, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_DELAY_CATALOGUE=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=false exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::McpFailure, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_MCP_FAIL=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::Subagent, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_SUBAGENT=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
@@ -546,6 +553,8 @@ struct PeerState {
     authorization: Option<String>,
     idle_release: Option<Arc<Notify>>,
     prompts: Arc<AtomicUsize>,
+    catalogue_requests: Arc<AtomicUsize>,
+    delayed_catalogue: bool,
     permissions: bool,
     questions: bool,
     resume: ResumeBehavior,
@@ -634,7 +643,12 @@ async fn events(State(state): State<PeerState>, headers: HeaderMap) -> Response 
         .unwrap()
 }
 
-async fn providers() -> Json<Value> {
+async fn providers(State(state): State<PeerState>) -> Json<Value> {
+    if state.delayed_catalogue
+        && state.catalogue_requests.fetch_add(1, Ordering::SeqCst) < 2
+    {
+        return Json(json!({"providers": [], "connected": []}));
+    }
     Json(json!({
         "providers": [{
             "id": "openai",
@@ -810,7 +824,7 @@ async fn prompt(
     }
     for event in [
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"reason-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"check the stream\"}}}\n\n",
-        "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\",\"model\":{\"providerID\":\"openai\",\"modelID\":\"gpt-5\"},\"tokens\":{\"input\":12000,\"output\":500,\"reasoning\":300,\"cache\":{\"read\":9000,\"write\":100}}}}}\n\n",
+        "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\",\"providerID\":\"openai\",\"modelID\":\"gpt-5\",\"tokens\":{\"input\":12000,\"output\":500,\"reasoning\":300,\"cache\":{\"read\":9000,\"write\":100}}}}}\n\n",
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
         "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"busy\"}}}\n\n",
         "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"text-1\",\"field\":\"text\",\"delta\":\"hello \"}}\n\n",
@@ -1453,6 +1467,12 @@ async fn assert_external_turn(password: Option<&str>) {
         assistant_sends(&events).last().unwrap().0,
         "hello from OpenCode"
     );
+    assert_eq!(
+        activity(&events, "context-window.updated")["payload"]["activity"]["payload"]
+            ["maxTokens"],
+        200_000,
+        "an external endpoint uses the same authoritative catalogue limit"
+    );
     let requests = peer.requests().await;
     assert_eq!(
         requests[0]["directory"],
@@ -1920,6 +1940,8 @@ async fn opencode_peer_child() {
         idle_release: (std::env::var("OPENCODE_TEST_GATED").as_deref() == Ok("true"))
             .then(|| Arc::new(Notify::new())),
         subagent: std::env::var("OPENCODE_TEST_SUBAGENT").as_deref() == Ok("true"),
+        delayed_catalogue: std::env::var("OPENCODE_TEST_DELAY_CATALOGUE").as_deref()
+            == Ok("true"),
         ..Default::default()
     };
     let app = Router::new()
@@ -2190,6 +2212,33 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
             .is_err(),
         "stopping Laplus reaps the owned OpenCode server"
     );
+}
+
+#[tokio::test]
+async fn an_owned_turn_waits_for_a_catalogue_that_populates_after_health_is_ready() {
+    let SocketTurn {
+        _workspace,
+        opencode: _opencode,
+        server,
+        mut client,
+        subscription,
+    } = start_socket_turn(
+        FakeOpenCode::delayed_catalogue(),
+        "delayed-catalogue-project",
+        "delayed-catalogue-thread",
+    )
+    .await;
+
+    let events = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        activity(&events, "context-window.updated")["payload"]["activity"]["payload"]
+            ["maxTokens"],
+        200_000,
+        "the first two empty catalogues are retried before the turn opens"
+    );
+
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]

@@ -470,6 +470,13 @@ struct SubagentRow {
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL: Duration = Duration::from_millis(50);
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+// OpenCode's `/global/health` answers `healthy: true` before its provider
+// catalogue finishes initialising. The catalogue wait below is what turns
+// `/global/health` answering green into "every subsequent `client.providers()`
+// call returns a populated inventory". Six seconds warm, longer cold, never
+// longer than this on a healthy install.
+const CATALOGUE_TIMEOUT: Duration = Duration::from_secs(30);
+const CATALOGUE_POLL: Duration = Duration::from_millis(250);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// One loopback OpenCode server owned by a conversation.
@@ -529,7 +536,10 @@ impl OwnedServer {
         })
         .await;
         match ready {
-            Ok(Ok(())) => Ok((owned, client)),
+            Ok(Ok(())) => {
+                wait_for_catalogue(&client, &mut owned).await;
+                Ok((owned, client))
+            }
             Ok(Err(error)) => {
                 owned.stop().await;
                 Err(error)
@@ -602,6 +612,59 @@ async fn terminate_owned_group(pid: u32, force: bool) {
     }
 }
 
+/// Block until OpenCode's `/provider` inventory has at least one connected
+/// provider and one populated provider entry, or the timeout elapses. The
+/// health endpoint answers green before the catalogue finishes initialising,
+/// and `client.providers()` in `OpenCode::open` silently caches whatever it
+/// sees at that moment — empty `connected`, empty `all`, no `maxTokens` rows
+/// for the rest of the conversation. This wait turns "health is green" into
+/// "every later `client.providers()` call sees a populated inventory".
+///
+/// **Non-fatal**: if the catalogue does not populate in time, or opencode exits
+/// during the wait, log a warning and proceed with an empty `context_windows`
+/// map — the rest of the conversation still works, the context meter just
+/// shows only the token count with no percentage. Failing the session open
+/// here was a regression because laplus spawns its owned opencode with
+/// `OPENCODE_CONFIG_CONTENT = "{}"`, which yields an empty catalogue on
+/// builds whose bundled opencode doesn't repopulate it post-startup.
+async fn wait_for_catalogue(
+    client: &OpenCodeClient,
+    owned: &mut OwnedServer,
+) {
+    let polled = tokio::time::timeout(CATALOGUE_TIMEOUT, async {
+        loop {
+            if let Ok(Some(status)) = owned.child.try_wait() {
+                eprintln!(
+                    "laplus: OpenCode exited before its catalogue populated ({status}); \
+                     context meter will show token count without a window for this conversation."
+                );
+                return;
+            }
+            if let Ok(value) = client.providers().await {
+                let connected = value
+                    .get("connected")
+                    .and_then(Value::as_array)
+                    .map(|list| !list.is_empty())
+                    .unwrap_or(false);
+                let populated = crate::provider::opencode_catalogue_models(&value)
+                    .is_ok_and(|models| !models.is_empty());
+                if connected && populated {
+                    return;
+                }
+            }
+            tokio::time::sleep(CATALOGUE_POLL).await;
+        }
+    })
+    .await;
+    if let Err(_) = polled {
+        eprintln!(
+            "laplus: OpenCode catalogue did not populate within {} seconds; \
+             context meter will show token count without a window for this conversation.",
+            CATALOGUE_TIMEOUT.as_secs()
+        );
+    }
+}
+
 pub(crate) struct OpenCode {
     client: OpenCodeClient,
     events: EventStream,
@@ -660,13 +723,19 @@ fn message_token_usage(
     if used_tokens == 0 {
         return None;
     }
-    let model = info.get("model");
-    let slug = model
-        .and_then(|model| Some(format!(
-            "{}/{}",
-            model.get("providerID")?.as_str()?,
-            model.get("modelID")?.as_str()?
-        )));
+    // OpenCode puts `providerID`/`modelID` at the top level of an assistant
+    // message's `info`, but nests them under `info.model` on a user message.
+    // Token usage arrives on assistant messages, so the top-level form is the
+    // one that matters — read it first, fall back to the nested form.
+    let slug = info
+        .get("providerID")
+        .and_then(Value::as_str)
+        .zip(info.get("modelID").and_then(Value::as_str))
+        .or_else(|| {
+            let model = info.get("model")?;
+            Some((model.get("providerID")?.as_str()?, model.get("modelID")?.as_str()?))
+        })
+        .map(|(provider_id, model_id)| format!("{provider_id}/{model_id}"));
     Some(crate::protocol::TokenUsage {
         used_tokens,
         total_processed_tokens: None,
@@ -1980,5 +2049,91 @@ impl Drop for EventStream {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn windows() -> HashMap<String, u64> {
+        [("opencode/deepseek-v4-flash-free".to_string(), 128_000)]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn token_usage_reads_model_from_top_level_assistant_info() {
+        let info = serde_json::json!({
+            "id": "msg_1",
+            "role": "assistant",
+            "modelID": "deepseek-v4-flash-free",
+            "providerID": "opencode",
+            "tokens": {"input": 10, "output": 20, "total": 30, "cache": {"read": 0, "write": 0}}
+        });
+        let usage = message_token_usage(&info, &windows(), None).expect("a usage");
+        assert_eq!(usage.max_tokens, Some(128_000));
+        assert_eq!(usage.used_tokens, 30);
+    }
+
+    #[test]
+    fn token_usage_reads_model_from_nested_user_info() {
+        let info = serde_json::json!({
+            "id": "msg_2",
+            "role": "user",
+            "model": {"providerID": "opencode", "modelID": "deepseek-v4-flash-free"},
+            "tokens": {"input": 10, "output": 0, "total": 10, "cache": {"read": 0, "write": 0}}
+        });
+        let usage = message_token_usage(&info, &windows(), None).expect("a usage");
+        assert_eq!(usage.max_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn context_window_flows_from_real_catalogue_to_real_message_shape() {
+        // The `/provider` inventory as opencode reports it: `connected` names
+        // the provider, `all` carries it, and each model exposes its window at
+        // `/limit/context` (there is no `contextWindow` field). The assistant
+        // message `info` carries `providerID`/`modelID` at the top level, not
+        // nested under `model`. Both quirks are from a live owned server.
+        let inventory = serde_json::json!({
+            "connected": ["opencode"],
+            "all": [{
+                "id": "opencode",
+                "name": "OpenCode Zen",
+                "models": {
+                    "deepseek-v4-flash-free": {
+                        "id": "deepseek-v4-flash-free",
+                        "providerID": "opencode",
+                        "name": "DeepSeek V4 Flash Free",
+                        "limit": {"context": 200_000, "output": 128_000}
+                    }
+                }
+            }]
+        });
+        let windows = context_windows(&inventory);
+        assert_eq!(windows.get("opencode/deepseek-v4-flash-free"), Some(&200_000));
+        let info = serde_json::json!({
+            "id": "msg_4",
+            "role": "assistant",
+            "modelID": "deepseek-v4-flash-free",
+            "providerID": "opencode",
+            "tokens": {"input": 1000, "output": 500, "total": 1500, "cache": {"read": 0, "write": 0}}
+        });
+        let usage = message_token_usage(&info, &windows, None).expect("a usage");
+        assert_eq!(usage.max_tokens, Some(200_000));
+        assert_eq!(usage.used_tokens, 1500);
+    }
+
+    #[test]
+    fn token_usage_yields_no_max_when_slug_is_unknown() {
+        let info = serde_json::json!({
+            "id": "msg_3",
+            "role": "assistant",
+            "modelID": "some-other-model",
+            "providerID": "opencode",
+            "tokens": {"input": 10, "output": 20, "total": 30, "cache": {"read": 0, "write": 0}}
+        });
+        let usage = message_token_usage(&info, &windows(), None).expect("a usage");
+        assert_eq!(usage.max_tokens, None);
     }
 }
