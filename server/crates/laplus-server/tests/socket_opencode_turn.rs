@@ -26,7 +26,7 @@ use axum::{
 use futures_util::stream;
 use harness::{
     conversation::{
-        activity, assistant_sends, create_project, create_thread, follow_up, interrupt_turn, last_session,
+        activity, assistant_sends, create_project, create_thread, follow_up, follow_up_in, interrupt_turn, last_session,
         revert_checkpoint,
         respond_to_approval, respond_to_user_input, start_turn, start_turn_in,
     },
@@ -652,11 +652,10 @@ async fn providers(State(state): State<PeerState>) -> Json<Value> {
     Json(json!({
         "providers": [{
             "id": "openai",
-            "models": {"gpt-5": {
-                "id": "gpt-5",
-                "name": "GPT 5",
-                "limit": {"context": 200_000}
-            }}
+            "models": {
+                "gpt-5": {"id": "gpt-5", "name": "GPT 5", "limit": {"context": 200_000}},
+                "gpt-alt": {"id": "gpt-alt", "name": "GPT Alt", "limit": {"context": 100_000}}
+            }
         }],
         "connected": ["openai"]
     }))
@@ -1093,7 +1092,7 @@ impl ExternalOpenCode {
             "openExternal".into(),
             json!({"driver":"opencode","displayName":"OpenCode External","config":{
                 "binaryPath":"this-binary-must-never-be-started","serverUrl":self.endpoint,
-                "serverPassword":password.unwrap_or_default(),"customModels":["openai/gpt-5"]
+                "serverPassword":password.unwrap_or_default(),"customModels":["openai/gpt-5", "openai/gpt-alt"]
             }}),
         );
         config
@@ -1387,9 +1386,16 @@ async fn busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order
     first["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", first).await.expect_success();
     client.events_until_streaming(&subscription).await;
-    for (message_id, text) in [("message-2", "B"), ("message-3", "C")] {
-        client.call("orchestration.dispatchCommand", follow_up("queue-thread", message_id, text)).await.expect_success();
-    }
+    let mut second = follow_up_in("queue-thread", "message-2", "B", "approval-required");
+    second["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-alt"});
+    second["message"]["attachments"] = json!([{
+        "type":"image", "name":"queued.png", "mimeType":"image/png",
+        "sizeBytes":2, "dataUrl":"data:image/png;base64,aGk="
+    }]);
+    client.call("orchestration.dispatchCommand", second).await.expect_success();
+    let mut third = follow_up_in("queue-thread", "message-3", "C", "full-access");
+    third["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", third).await.expect_success();
     let snapshot = server.connect().await.into_thread_snapshot("queue-thread").await;
     let queued = snapshot["thread"]["messages"].as_array().unwrap().iter()
         .filter(|message| message["id"] == "message-2" || message["id"] == "message-3")
@@ -1406,15 +1412,18 @@ async fn busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order
     let first_queued = messages.iter().position(|message| message["id"] == "message-2").unwrap();
     assert!(reply < first_queued);
     idle_release.notify_one();
-    let requests = peer.requests_through(3).await;
+    let requests = peer.requests_through(4).await;
     let prompts = requests.iter().filter(|request| request["operation"] == "prompt").collect::<Vec<_>>();
     assert_eq!(prompts.len(), 2, "B and C opened more than one queued turn");
     assert_eq!(prompts[0]["sessionId"], prompts[1]["sessionId"], "the queued turn lost A's provider history");
+    assert_eq!(prompts[1]["body"]["model"], json!({"providerID":"openai","modelID":"gpt-alt"}));
     let parts = prompts[1]["body"]["parts"].as_array().unwrap();
     let queued_text = parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
     assert!(queued_text.contains('B'));
     assert!(queued_text.contains('C'));
     assert!(queued_text.find('B') < queued_text.find('C'));
+    assert!(parts.iter().any(|part| part["type"] == "file" && part["filename"] == "queued.png"));
+    assert!(requests.iter().any(|request| request["operation"] == "update"), "B's captured approval-required mode was not applied");
     client.close().await;
     server.stop().await;
     peer.task.abort();
