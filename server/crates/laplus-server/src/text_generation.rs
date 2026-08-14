@@ -289,6 +289,7 @@ async fn generate_with_claude(
         command.arg("--model").arg(model);
     }
     command.arg(prompt(&operation));
+    crate::process::without_a_console(command.as_std_mut());
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| Error("Claude text generation timed out.".into()))?
@@ -318,7 +319,6 @@ async fn generate_with(
     let session = tokio::time::timeout(
         timeout,
         client.create_session(&json!({
-            "title": "Laplus text generation",
             "permission": [{"permission":"*","pattern":"*","action":"deny"}]
         })),
     )

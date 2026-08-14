@@ -284,6 +284,18 @@ async fn local_handler(State(peer): State<LocalPeer>, request: Request<Body>) ->
         json!({"healthy":true,"version":"1.18.10"})
     } else if path == "/session" {
         json!({"id":id})
+    } else if path == "/provider" {
+        json!({
+            "all": [{
+                "id": "stub",
+                "name": "Stub",
+                "models": {
+                    "stub-model": {"id": "stub-model", "limit": {"context": 200000, "output": 8192}}
+                }
+            }],
+            "default": {"stub": "stub-model"},
+            "connected": ["stub"]
+        })
     } else if path.ends_with("/message") {
         json!({"parts":[{"type":"text","text":"{\"title\":\"Shared server\"}"}]})
     } else {

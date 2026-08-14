@@ -65,14 +65,14 @@
 //! in WebView2 for the same family of reasons. The topbars carry
 //! `data-tauri-drag-region` as well, which Tauri's own injected script acts on.
 
-// A released laplus is a window, so it is not also a console: without this
-// Windows gives the process one, and the developer gets a black rectangle
-// beside their application for the life of it. A debug build keeps its console
-// on purpose — that is where `println!` goes, and where a developer running the
-// shell by hand is looking. What the released build loses by it is anything
-// this process says before a window exists, which is why [`fail`] also writes
-// to a file.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Laplus is a window, not a console: without this Windows gives the process
+// one, and the developer gets a black rectangle beside their application for
+// the life of it. This applies to every build, debug and release alike — the
+// alternative was a debug-only console that nothing read, and the flash on
+// every first-prompt Claude text-generation spawn that a console window
+// brings with it. What is lost by it is anything this process says before a
+// window exists, which is why [`fail`] also writes to a file.
+#![windows_subsystem = "windows"]
 
 use std::io::Write as _;
 use std::process::ExitCode;

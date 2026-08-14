@@ -959,7 +959,6 @@ async fn create_session(
 ) -> Result<Session, String> {
     client
         .create_session(&serde_json::json!({
-            "title": "Laplus conversation",
             "permission": permission_rules(&start.runtime_mode)
         }))
         .await
