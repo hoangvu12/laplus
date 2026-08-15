@@ -1,0 +1,98 @@
+name: Build timings
+
+on:
+  workflow_dispatch:
+    inputs:
+      cold:
+        description: Skip Cargo caches
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: Shell (${{ matrix.label }}, cold=${{ inputs.cold }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: fat LTO, 1 unit
+            profile: release
+            output: release
+          - label: thin LTO, 8 units
+            profile: release-thin-8
+            output: release-thin-8
+          - label: thin LTO, 16 units
+            profile: release-thin-16
+            output: release-thin-16
+    steps:
+      - uses: actions/checkout@v6
+      - name: Exclude build directories from Defender
+        continue-on-error: true
+        shell: powershell
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}\server\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:web
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        if: ${{ !inputs.cold }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: profile-benchmark-${{ matrix.profile }}
+          cache-on-failure: true
+      - name: Build and measure
+        id: measure
+        shell: powershell
+        working-directory: server
+        run: |
+          $started = Get-Date
+          cargo build -p laplus-shell --profile "${{ matrix.profile }}" --timings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $elapsed = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+          $binary = "target/${{ matrix.output }}/laplus.exe"
+          $bytes = (Get-Item $binary).Length
+          $mib = [math]::Round($bytes / 1MB, 2)
+          "seconds=$elapsed" >> $env:GITHUB_OUTPUT
+          "bytes=$bytes" >> $env:GITHUB_OUTPUT
+          "mib=$mib" >> $env:GITHUB_OUTPUT
+          @"
+          ### ${{ matrix.label }}
+          | Measurement | Result |
+          | --- | ---: |
+          | Build time | ${elapsed}s |
+          | Executable | ${mib} MiB ($bytes bytes) |
+          "@ >> $env:GITHUB_STEP_SUMMARY
+      - name: Save measurement
+        shell: powershell
+        run: |
+          @{
+            profile = "${{ matrix.profile }}"
+            seconds = ${{ steps.measure.outputs.seconds }}
+            bytes = ${{ steps.measure.outputs.bytes }}
+            commit = "${{ github.sha }}"
+            cold = "${{ inputs.cold }}"
+          } | ConvertTo-Json | Set-Content "measurement-${{ matrix.profile }}.json"
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-benchmark-${{ matrix.profile }}-cold-${{ inputs.cold }}
+          path: |
+            measurement-${{ matrix.profile }}.json
+            server/target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14

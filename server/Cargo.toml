@@ -116,6 +116,16 @@ strip = true
 lto = true
 codegen-units = 1
 opt-level = "z"
+
+[profile.release-thin-8]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+
+[profile.release-thin-16]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
 # `panic = "abort"` is the one setting from that spike deliberately *not* kept,
 # and it is the expensive omission: measured, it costs **1.95 MB** — 24.16 MB
 # against 22.21 MB with it — which is most of what tuning this profile buys back.
