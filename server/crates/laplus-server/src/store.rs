@@ -2669,7 +2669,10 @@ fn latest_turn_from_json(stored: &str) -> Option<LatestTurn> {
         started_at: text("startedAt"),
         completed_at: text("completedAt"),
         assistant_message_id: text("assistantMessageId"),
-        source_proposed_plan: turn.get("sourceProposedPlan").cloned(),
+        source_proposed_plan: turn
+            .get("sourceProposedPlan")
+            .filter(|value| !value.is_null())
+            .cloned(),
     })
 }
 
@@ -3426,6 +3429,7 @@ mod tests {
             started_at: Some("2026-07-26T00:23:05.100Z".to_string()),
             completed_at: Some("2026-07-26T00:23:07.108Z".to_string()),
             assistant_message_id: Some("assistant-1".to_string()),
+            source_proposed_plan: None,
         });
         thread.latest_user_message_at = Some("2026-07-26T00:23:05.000Z".to_string());
         thread.provider_resume_cursor = Some(crate::provider::ResumeCursor {

@@ -2928,6 +2928,7 @@ pub(crate) mod tests {
                 started_at: None,
                 completed_at: None,
                 assistant_message_id: None,
+                source_proposed_plan: None,
             }),
             ..with_a_queued_message(-1_000)
         };

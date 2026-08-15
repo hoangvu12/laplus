@@ -1820,6 +1820,8 @@ pub(crate) mod tests {
                 model_selection: None,
                 runtime_mode: None,
                 interaction_mode: None,
+                title_seed: None,
+                source_proposed_plan: None,
             },
         );
 
@@ -2975,6 +2977,8 @@ pub(crate) mod tests {
             model_selection: None,
             runtime_mode: None,
             interaction_mode: None,
+            title_seed: None,
+            source_proposed_plan: None,
         }
     }
 
@@ -3481,6 +3485,7 @@ pub(crate) mod tests {
             started_at: Some("2026-07-26T00:23:04.909Z".to_string()),
             completed_at: None,
             assistant_message_id: None,
+            source_proposed_plan: None,
         });
         row.updated_at = "2026-07-26T00:23:09.000Z".to_string();
 
