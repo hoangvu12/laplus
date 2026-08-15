@@ -429,6 +429,15 @@ impl DriverStart {
 /// against [`Driver`], so a second agent adds an arm here rather than another
 /// session loop.
 pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, attachments: Vec<crate::threads::PromptAttachment>) -> Result<(), String> {
+    send_prompt(threads, start, Prompt {
+        turn_id,
+        text,
+        attachments,
+        wanted: Retune { runtime_mode: start.runtime_mode.clone(), model: start.model.clone() },
+    })
+}
+
+pub fn send_prompt(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
     let driving = threads.clone();
     let starting = start.clone();
     let prompts = match &start.driver {
@@ -461,16 +470,6 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, att
     // and the driver's guard makes it the no-op it should be; what this is for is
     // every turn after the first, where the launch flags were the only place they
     // had ever reached the child.
-    let prompt = Prompt {
-        turn_id,
-        text,
-        attachments,
-        wanted: Retune {
-            runtime_mode: start.runtime_mode.clone(),
-            model: start.model.clone(),
-        },
-    };
-
     prompts.try_send(prompt).map_err(|error| match error {
         tokio::sync::mpsc::error::TrySendError::Full(_) => {
             "The agent has not read the turns already sent to it, so this one was not queued."
@@ -480,6 +479,25 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, att
             "The agent session has ended and could not be sent this turn.".to_string()
         }
     })
+}
+
+pub fn send_prompts(
+    threads: &Threads,
+    start: &Start,
+    mut prompts: Vec<Prompt>,
+) -> Result<(), String> {
+    let mut prompt = prompts
+        .drain(..1)
+        .next()
+        .ok_or_else(|| "The queued turn had no prompts to retry.".to_string())?;
+    for next in prompts {
+        if !prompt.text.is_empty() && !next.text.is_empty() {
+            prompt.text.push_str("\n\n");
+        }
+        prompt.text.push_str(&next.text);
+        prompt.attachments.extend(next.attachments);
+    }
+    send_prompt(threads, start, prompt)
 }
 
 /// The session: start an agent, feed it turns and decisions, publish what it
@@ -680,6 +698,7 @@ async fn drive<D: Driver>(
                     ));
                     break;
                 }
+                threads.pending_submitted(&start.thread_id, &prompt.turn_id);
                 driving.turn = Some(InFlight {
                     turn_id: prompt.turn_id.clone(),
                     assistant_message_id: None,
@@ -937,6 +956,9 @@ async fn drive<D: Driver>(
     // failure is only its consequence, so it must not replace the driver's
     // provider-specific continuation explanation on the session.
     let failure = refused.or(send_failure).or(death);
+    if asked_to_stop || failure.is_some() {
+        threads.pending_retryable(&start.thread_id);
+    }
     if ours {
         threads.apply(
             &start.thread_id,
@@ -2054,6 +2076,7 @@ mod continuation_tests {
             messages: Vec::new(),
             activities: Vec::new(),
             checkpoints: Vec::new(),
+            pending_turn: None,
             session: None,
             latest_turn: None,
             latest_user_message_at: None,

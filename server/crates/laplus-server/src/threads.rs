@@ -90,6 +90,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -317,7 +318,7 @@ pub struct Reconciliation {
 /// for everything it publishes afterwards, and it is minted by the dispatch that
 /// answered the client — which is what makes the sequence the client was given
 /// and the events that follow describe the same turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Prompt {
     pub turn_id: String,
     pub text: String,
@@ -327,7 +328,7 @@ pub struct Prompt {
     pub wanted: Retune,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PromptAttachment {
     pub mime: String,
     pub filename: String,
@@ -352,10 +353,24 @@ pub struct PromptAttachment {
 /// The model is optional because a selection may name none, and there is no
 /// request that means "go back to the default model" — so `None` leaves the
 /// child on whatever it has, which is honest about what can be asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Retune {
     pub runtime_mode: String,
     pub model: Option<String>,
+}
+
+/// OpenCode work accepted while another turn owns the session, until a provider
+/// has accepted it. It survives independently of the live prompt channel.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PendingTurn {
+    pub turn_id: String,
+    pub prompts: Vec<Prompt>,
+    pub message_ids: Vec<String>,
+    pub model_selection: Value,
+    pub interaction_mode: String,
+    pub title_seed: Option<String>,
+    pub source_proposed_plan: Option<Value>,
+    pub retryable: bool,
 }
 
 /// Something owed to the turn the agent is working on right now.
@@ -1313,6 +1328,101 @@ impl Threads {
             .latest_turn
             .as_ref()
             .map(|latest| latest.turn_id.clone())
+    }
+
+    pub fn queue_prompt(
+        &self,
+        thread_id: &str,
+        prompt: Prompt,
+        message_id: String,
+        model_selection: Value,
+        interaction_mode: String,
+        title_seed: Option<String>,
+        source_proposed_plan: Option<Value>,
+    ) -> Result<(), String> {
+        let turn_id = prompt.turn_id.clone();
+        self.apply_unless(
+            thread_id,
+            |thread| {
+                thread
+                    .pending_turn
+                    .as_ref()
+                    .filter(|pending| pending.turn_id != turn_id)
+                    .map(|_| {
+                        "Another queued turn is already waiting for this conversation."
+                            .to_string()
+                    })
+            },
+            Change::PromptQueued {
+                prompt,
+                message_id,
+                model_selection,
+                interaction_mode,
+                title_seed,
+                source_proposed_plan,
+            },
+        )
+        .ok_or_else(unknown(thread_id))??;
+        Ok(())
+    }
+
+    pub fn pending_turn(&self, thread_id: &str) -> Option<PendingTurn> {
+        let entry = self.find(thread_id)?;
+        let pending = lock(&entry.state).as_ref()?.pending_turn.clone();
+        pending
+    }
+
+    pub fn pending_retryable(&self, thread_id: &str) {
+        let Some(pending) = self.pending_turn(thread_id) else {
+            return;
+        };
+        self.apply(
+            thread_id,
+            Change::TurnDeliveryStateChanged {
+                turn_id: pending.turn_id,
+                state: crate::threads::fold::TurnDeliveryState::Retryable,
+            },
+        );
+    }
+
+    pub fn claim_pending_retry(&self, thread_id: &str) -> Result<(PendingTurn, Thread), String> {
+        let entry = self.find(thread_id).ok_or_else(unknown(thread_id))?;
+        let turn_id = lock(&entry.state)
+            .as_ref()
+            .and_then(|thread| thread.pending_turn.as_ref())
+            .map(|pending| pending.turn_id.clone())
+            .ok_or_else(|| "This conversation has no queued turn waiting for Retry.".to_string())?;
+        let change = Change::TurnDeliveryStateChanged {
+            turn_id,
+            state: crate::threads::fold::TurnDeliveryState::Queued,
+        };
+        self.commit(
+            &entry,
+            |thread| match thread.pending_turn.as_ref() {
+                Some(pending) if pending.retryable => None,
+                _ => Some("This conversation has no queued turn waiting for Retry.".to_string()),
+            },
+            &change,
+            |thread| (thread.pending_turn.clone().expect("claimed pending turn"), thread.clone()),
+        )
+        .expect("the thread was found")
+        .map(|(_, claimed)| claimed)
+    }
+
+    pub fn pending_submitted(&self, thread_id: &str, turn_id: &str) {
+        if self
+            .pending_turn(thread_id)
+            .as_ref()
+            .is_some_and(|pending| pending.turn_id == turn_id)
+        {
+            self.apply(
+                thread_id,
+                Change::TurnDeliveryStateChanged {
+                    turn_id: turn_id.to_string(),
+                    state: crate::threads::fold::TurnDeliveryState::Delivered,
+                },
+            );
+        }
     }
 
     /// Called by the driver when its agent has gone, so the next turn starts a

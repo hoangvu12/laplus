@@ -349,6 +349,69 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 
+  describe("thread.turn-delivery-state-changed", () => {
+    it("marks every message in the queued turn retryable and clears the marker after delivery", () => {
+      const turnId = TurnId.make("turn-queued");
+      const thread = {
+        ...baseThread,
+        messages: [
+          {
+            id: MessageId.make("msg-b"),
+            role: "user" as const,
+            text: "B",
+            turnId,
+            streaming: false,
+            createdAt: "2026-04-01T01:00:00.000Z",
+            updatedAt: "2026-04-01T01:00:00.000Z",
+          },
+          {
+            id: MessageId.make("msg-c"),
+            role: "user" as const,
+            text: "C",
+            turnId,
+            streaming: false,
+            createdAt: "2026-04-01T01:00:01.000Z",
+            updatedAt: "2026-04-01T01:00:01.000Z",
+          },
+        ],
+      } satisfies OrchestrationThread;
+      const event = {
+        ...baseEventFields,
+        sequence: 2,
+        occurredAt: "2026-04-01T02:00:00.000Z",
+        aggregateKind: "thread" as const,
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.turn-delivery-state-changed" as const,
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          turnId,
+          deliveryState: "retryable" as const,
+          updatedAt: "2026-04-01T02:00:00.000Z",
+        },
+      };
+
+      const retryable = applyThreadDetailEvent(thread, event);
+      expect(retryable.kind).toBe("updated");
+      if (retryable.kind !== "updated") return;
+      expect(retryable.thread.messages.map((message) => message.deliveryState)).toEqual([
+        "retryable",
+        "retryable",
+      ]);
+
+      const delivered = applyThreadDetailEvent(retryable.thread, {
+        ...event,
+        sequence: 3,
+        payload: { ...event.payload, deliveryState: "delivered" },
+      });
+      expect(delivered.kind).toBe("updated");
+      if (delivered.kind === "updated") {
+        expect(
+          delivered.thread.messages.every((message) => message.deliveryState === undefined),
+        ).toBe(true);
+      }
+    });
+  });
+
   describe("thread.message-sent", () => {
     it("appends a new message", () => {
       const result = applyThreadDetailEvent(baseThread, {

@@ -262,6 +262,7 @@ enum Command {
         thread_id: String,
     },
     StartTurn(Box<StartTurn>),
+    RetryTurn { thread_id: String },
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
     RespondToUserInput(RespondToUserInput),
@@ -574,6 +575,7 @@ impl Shell {
             Command::Unsnooze { thread_id } => self.unsnooze(&thread_id)?,
             Command::Delete { thread_id } => self.delete(&thread_id)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
+            Command::RetryTurn { thread_id } => self.retry_turn(&thread_id, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
             Command::RespondToUserInput(respond) => self.respond_to_user_input(&respond)?,
@@ -1659,6 +1661,8 @@ impl Shell {
                     model_selection: start.model_selection.clone(),
                     runtime_mode: start.runtime_mode.clone(),
                     interaction_mode: start.interaction_mode.clone(),
+                    title_seed: start.title_seed.clone(),
+                    source_proposed_plan: start.source_proposed_plan.clone(),
                 },
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;
@@ -1727,13 +1731,42 @@ impl Shell {
                 .ok_or_else(|| self.not_open(&start.thread_id))?
         };
 
-        if let Err(why) = crate::session::send(
-            &self.inner.threads,
-            &starting,
-            turn_id,
-            start.message.text.clone(),
+        let prompt = crate::threads::Prompt {
+            turn_id: turn_id.clone(),
+            text: start.message.text.clone(),
             attachments,
-        ) {
+            wanted: crate::threads::Retune {
+                runtime_mode: starting.runtime_mode.clone(),
+                model: starting.model.clone(),
+            },
+        };
+        let queued = thread.provider.driver == "opencode" && active_turn.is_some();
+        if queued {
+            self.inner
+                .threads
+                .queue_prompt(
+                    &start.thread_id,
+                    prompt.clone(),
+                    start.message.message_id.clone(),
+                    thread.model_selection.clone(),
+                    thread.interaction_mode.clone(),
+                    start.title_seed.clone(),
+                    start.source_proposed_plan.clone(),
+                )
+                .map_err(CommandError::new)?;
+        }
+        if let Err(why) = crate::session::send_prompt(&self.inner.threads, &starting, prompt) {
+            if queued {
+                self.inner.threads.pending_retryable(&start.thread_id);
+                self.inner.threads.apply(
+                    &start.thread_id,
+                    Change::Activity(crate::threads::Activity::failed(
+                        "turn.delivery-failed",
+                        &format!("The queued turn was kept but could not be delivered: {why}"),
+                    )),
+                );
+                return Ok(sequence);
+            }
             // The prompt is already in the transcript and the turn is already
             // marked running, so the refusal has to end them as well as being
             // returned — otherwise the conversation sits waiting for a turn that
@@ -1768,6 +1801,60 @@ impl Shell {
             );
         }
 
+        Ok(sequence)
+    }
+
+    fn retry_turn(&self, thread_id: &str, config: &ServerConfig) -> Result<i64, CommandError> {
+        let thread = self.open_thread(thread_id)?;
+        if thread.provider.driver != "opencode" {
+            return Err(CommandError::new("Only OpenCode queued turns can be retried."));
+        }
+        let project = self.project(&thread.project_id)?;
+        let (pending, mut thread) = self
+            .inner
+            .threads
+            .claim_pending_retry(thread_id)
+            .map_err(CommandError::new)?;
+        thread.model_selection = pending.model_selection.clone();
+        thread.interaction_mode = pending.interaction_mode.clone();
+        let prepared = match crate::session::prepare(
+            &thread,
+            &config.settings,
+            Arc::clone(&self.inner.mcp),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.inner.threads.pending_retryable(thread_id);
+                return Err(CommandError::new(error));
+            }
+        };
+        let starting = crate::session::starting(
+            &thread,
+            &where_the_work_happens(&thread, &project),
+            prepared,
+        );
+        let sequence = self
+            .inner
+            .threads
+            .apply(
+                thread_id,
+                Change::Session(Session {
+                    status: SessionStatus::Starting,
+                    runtime_mode: starting.runtime_mode.clone(),
+                    active_turn_id: Some(pending.turn_id.clone()),
+                    last_error: None,
+                    updated_at: now_iso(),
+                }),
+            )
+            .ok_or_else(|| self.not_open(thread_id))?;
+        if let Err(error) = crate::session::send_prompts(
+            &self.inner.threads,
+            &starting,
+            pending.prompts,
+        ) {
+            self.inner.threads.pending_retryable(thread_id);
+            return Err(CommandError::new(error));
+        }
         Ok(sequence)
     }
 
@@ -2334,6 +2421,7 @@ impl CreateThread {
             messages: Vec::new(),
             activities: Vec::new(),
             checkpoints: Vec::new(),
+            pending_turn: None,
             session: None,
             latest_turn: None,
             latest_user_message_at: None,
@@ -2409,6 +2497,10 @@ struct StartTurn {
     runtime_mode: Option<String>,
     #[serde(default)]
     interaction_mode: Option<String>,
+    #[serde(default)]
+    title_seed: Option<String>,
+    #[serde(default)]
+    source_proposed_plan: Option<Value>,
     #[serde(default)]
     bootstrap: Option<Bootstrap>,
 }
@@ -3098,6 +3190,13 @@ impl Command {
                         .transpose()?,
                 }))
             }
+            "thread.turn.retry" => Ok(Command::RetryTurn {
+                thread_id: non_blank(
+                    read_about_a_thread::<AboutAThread>(payload, kind)?.thread_id,
+                    "threadId",
+                    kind,
+                )?,
+            }),
             "thread.approval.respond" => {
                 let respond: RespondToApproval = read(payload, kind)?;
                 Ok(Command::RespondToApproval(RespondToApproval {
@@ -3241,6 +3340,7 @@ impl Command {
             | Command::Unsnooze { thread_id }
             | Command::StopSession { thread_id } => Some(thread_id),
             Command::StartTurn(start) => Some(&start.thread_id),
+            Command::RetryTurn { thread_id } => Some(thread_id),
             Command::InterruptTurn(interrupt) => Some(&interrupt.thread_id),
             Command::RespondToApproval(respond) => Some(&respond.thread_id),
             Command::RespondToUserInput(respond) => Some(&respond.thread_id),

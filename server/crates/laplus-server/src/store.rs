@@ -477,6 +477,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE threads ADD COLUMN pinned_at TEXT;
     ALTER TABLE threads ADD COLUMN pin_order_key TEXT;
     "#,
+    // OpenCode queued work that has not yet been accepted by its provider.
+    r#"
+    ALTER TABLE threads ADD COLUMN pending_turn TEXT;
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -671,7 +675,7 @@ const THREAD_COLUMNS: &str = "id, project_id, title, model_selection, runtime_mo
      latest_user_message_at, created_at, updated_at, archived_at, settled_override, \
      settled_at, snoozed_until, snoozed_at, deleted_at, provider_instance_id, \
      provider_driver, provider_resume_cursor, cursor_provider_instance_id, \
-     cursor_provider_driver, pinned_at, pin_order_key";
+     cursor_provider_driver, pinned_at, pin_order_key, pending_turn";
 
 /// The registry's durable half.
 #[derive(Debug)]
@@ -2335,9 +2339,9 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 latest_user_message_at, created_at, updated_at, archived_at, \
                 settled_override, settled_at, snoozed_until, snoozed_at, deleted_at, \
                 provider_instance_id, provider_driver, provider_resume_cursor, \
-                cursor_provider_instance_id, cursor_provider_driver, pinned_at, pin_order_key) \
+                cursor_provider_instance_id, cursor_provider_driver, pinned_at, pin_order_key, pending_turn) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26) \
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27) \
              ON CONFLICT (id) DO UPDATE SET \
                 project_id = excluded.project_id, \
                 title = excluded.title, \
@@ -2362,7 +2366,8 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 cursor_provider_instance_id = excluded.cursor_provider_instance_id, \
                 cursor_provider_driver = excluded.cursor_provider_driver, \
                 pinned_at = excluded.pinned_at, \
-                pin_order_key = excluded.pin_order_key",
+                pin_order_key = excluded.pin_order_key, \
+                pending_turn = excluded.pending_turn",
             rusqlite::params![
                 thread.id,
                 thread.project_id,
@@ -2394,6 +2399,7 @@ fn upsert_thread(transaction: &Transaction<'_>, thread: &ThreadRow) -> Result<()
                 thread.provider_resume_cursor.as_ref().map(|cursor| &cursor.provider.driver),
                 thread.lifecycle.pinned_at,
                 thread.lifecycle.pin_order_key,
+                thread.pending_turn.as_ref().map(|pending| serde_json::to_string(pending).expect("pending turns serialize")),
             ],
         )
         .map_err(StorageError::while_("store the conversation"))?;
@@ -2541,6 +2547,18 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
     let cursor_json: Option<String> = row.get(21)?;
     let cursor_instance: Option<String> = row.get(22)?;
     let cursor_driver: Option<String> = row.get(23)?;
+    let pending_turn: Option<String> = row.get(26)?;
+    let pending_turn = pending_turn
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    26,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     let provider = crate::provider::ProviderIdentity {
         instance_id: row.get(19)?,
         driver: row.get(20)?,
@@ -2575,6 +2593,7 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<ThreadRow> {
         worktree_path: row.get(7)?,
         provider_resume_cursor,
         latest_turn: latest_turn.as_deref().and_then(latest_turn_from_json),
+        pending_turn,
         latest_user_message_at: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
@@ -2650,6 +2669,7 @@ fn latest_turn_from_json(stored: &str) -> Option<LatestTurn> {
         started_at: text("startedAt"),
         completed_at: text("completedAt"),
         assistant_message_id: text("assistantMessageId"),
+        source_proposed_plan: turn.get("sourceProposedPlan").cloned(),
     })
 }
 
@@ -2714,10 +2734,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pin_columns_are_the_newest_forward_migration() {
+    fn queued_turn_storage_follows_the_pin_forward_migration() {
         let newest = MIGRATIONS.last().expect("a newest migration");
-        assert!(newest.contains("ADD COLUMN pinned_at"));
-        assert!(newest.contains("ADD COLUMN pin_order_key"));
+        assert!(newest.contains("ADD COLUMN pending_turn"));
+        let pins = MIGRATIONS.get(MIGRATIONS.len() - 2).expect("the pin migration");
+        assert!(pins.contains("ADD COLUMN pinned_at"));
+        assert!(pins.contains("ADD COLUMN pin_order_key"));
     }
 
     /// A real directory to register, a database to register it in, and the
@@ -3380,6 +3402,7 @@ mod tests {
             provider_resume_cursor: None,
             latest_turn: None,
             latest_user_message_at: None,
+            pending_turn: None,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),
             updated_at: "2026-07-26T00:23:04.909Z".to_string(),
             lifecycle: crate::threads::Lifecycle::default(),

@@ -64,6 +64,7 @@ pub struct Thread {
     pub checkpoints: Vec<Checkpoint>,
     pub session: Option<Session>,
     pub latest_turn: Option<LatestTurn>,
+    pub pending_turn: Option<crate::threads::PendingTurn>,
     /// When the developer last said something. On the shell summary rather than
     /// derived by the client, so the thread list can sort without the messages.
     pub latest_user_message_at: Option<String>,
@@ -494,6 +495,7 @@ pub struct ThreadRow {
     pub worktree_path: Option<String>,
     pub provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     pub latest_turn: Option<LatestTurn>,
+    pub pending_turn: Option<crate::threads::PendingTurn>,
     pub latest_user_message_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -671,6 +673,7 @@ pub struct LatestTurn {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub assistant_message_id: Option<String>,
+    pub source_proposed_plan: Option<Value>,
 }
 
 impl Thread {
@@ -693,7 +696,23 @@ impl Thread {
             "latestTurn": self.latest_turn.as_ref().map(LatestTurn::to_value),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "messages": self.messages.iter().map(Message::to_value).collect::<Vec<Value>>(),
+            "messages": self.messages.iter().map(|message| {
+                let mut value = message.to_value();
+                if self.pending_turn.as_ref().is_some_and(|pending| {
+                    message.turn_id.as_deref() == Some(&pending.turn_id)
+                }) {
+                    value["deliveryState"] = json!(if self
+                        .pending_turn
+                        .as_ref()
+                        .is_some_and(|pending| pending.retryable)
+                    {
+                        "retryable"
+                    } else {
+                        "queued"
+                    });
+                }
+                value
+            }).collect::<Vec<Value>>(),
             "proposedPlans": [],
             "activities": self.activities.iter().map(Activity::to_value).collect::<Vec<Value>>(),
             "checkpoints": self
@@ -919,6 +938,7 @@ impl Thread {
             worktree_path: self.worktree_path.clone(),
             provider_resume_cursor: self.provider_resume_cursor.clone(),
             latest_turn: self.latest_turn.clone(),
+            pending_turn: self.pending_turn.clone(),
             latest_user_message_at: self.latest_user_message_at.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
@@ -972,6 +992,7 @@ impl Thread {
             checkpoints: stored.checkpoints,
             session: None,
             latest_turn,
+            pending_turn: row.pending_turn,
             latest_user_message_at: row.latest_user_message_at,
             provider_resume_cursor: row.provider_resume_cursor,
             // Kept for the same reason the checkpoints are: an archived or
@@ -1120,6 +1141,7 @@ impl LatestTurn {
             "startedAt": self.started_at,
             "completedAt": self.completed_at,
             "assistantMessageId": self.assistant_message_id,
+            "sourceProposedPlan": self.source_proposed_plan,
         })
     }
 }
@@ -1138,6 +1160,23 @@ impl LatestTurn {
 /// whatever worktree it was in (`ChatView.logic.ts`,
 /// `resolveThreadMetadataUpdateForNextTurn`).
 pub type Given<T> = Option<Option<T>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnDeliveryState {
+    Queued,
+    Retryable,
+    Delivered,
+}
+
+impl TurnDeliveryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Retryable => "retryable",
+            Self::Delivered => "delivered",
+        }
+    }
+}
 
 /// What a `thread.meta.update` asked to change about a conversation.
 ///
@@ -1175,6 +1214,20 @@ pub enum Change {
         text: String,
         turn_id: String,
     },
+    /// A prompt was durably added to the queued OpenCode turn.
+    PromptQueued {
+        prompt: crate::threads::Prompt,
+        message_id: String,
+        model_selection: Value,
+        interaction_mode: String,
+        title_seed: Option<String>,
+        source_proposed_plan: Option<Value>,
+    },
+    /// A queued OpenCode turn changed whether the provider has accepted it.
+    TurnDeliveryStateChanged {
+        turn_id: String,
+        state: TurnDeliveryState,
+    },
     /// A turn was asked for. `thread.turn-start-requested`.
     ///
     /// The three optional fields are what the composer had selected when the
@@ -1189,6 +1242,8 @@ pub enum Change {
         model_selection: Option<Value>,
         runtime_mode: Option<String>,
         interaction_mode: Option<String>,
+        title_seed: Option<String>,
+        source_proposed_plan: Option<Value>,
     },
     /// The conversation's own description changed. `thread.meta-updated`.
     ///
@@ -1699,6 +1754,58 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             reconciled = verdict;
             payload
         }
+        Change::PromptQueued {
+            prompt,
+            message_id,
+            model_selection,
+            interaction_mode,
+            title_seed,
+            source_proposed_plan,
+        } => {
+            match thread.pending_turn.as_mut() {
+                Some(pending) => {
+                    pending.prompts.push(prompt.clone());
+                    pending.message_ids.push(message_id.clone());
+                }
+                None => thread.pending_turn = Some(crate::threads::PendingTurn {
+                    turn_id: prompt.turn_id.clone(),
+                    prompts: vec![prompt.clone()],
+                    message_ids: vec![message_id.clone()],
+                    model_selection: model_selection.clone(),
+                    interaction_mode: interaction_mode.clone(),
+                    title_seed: title_seed.clone(),
+                    source_proposed_plan: source_proposed_plan.clone(),
+                    retryable: false,
+                }),
+            }
+            json!({
+                "threadId": thread.id,
+                "turnId": prompt.turn_id,
+                "deliveryState": "queued",
+                "updatedAt": at,
+            })
+        }
+        Change::TurnDeliveryStateChanged { turn_id, state } => {
+            match state {
+                TurnDeliveryState::Retryable => {
+                    if let Some(pending) = thread.pending_turn.as_mut() {
+                        pending.retryable = true;
+                    }
+                }
+                TurnDeliveryState::Queued => {
+                    if let Some(pending) = thread.pending_turn.as_mut() {
+                        pending.retryable = false;
+                    }
+                }
+                TurnDeliveryState::Delivered => thread.pending_turn = None,
+            }
+            json!({
+                "threadId": thread.id,
+                "turnId": turn_id,
+                "deliveryState": state.as_str(),
+                "updatedAt": at,
+            })
+        }
         // The client's reducer, mirrored twice over: each field is applied
         // only if it was sent, and the payload carries only the fields that
         // were — so a subscriber folding this event moves exactly what the
@@ -1930,6 +2037,8 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             model_selection,
             runtime_mode,
             interaction_mode,
+            title_seed,
+            source_proposed_plan,
         } => {
             if let Some(selection) = model_selection {
                 thread.model_selection = selection.clone();
@@ -1940,6 +2049,11 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             if let Some(mode) = interaction_mode {
                 thread.interaction_mode = mode.clone();
             }
+            let preserved_source = thread
+                .latest_turn
+                .as_ref()
+                .filter(|latest| latest.turn_id == *turn_id)
+                .and_then(|latest| latest.source_proposed_plan.clone());
             thread.latest_turn = Some(LatestTurn {
                 turn_id: turn_id.clone(),
                 state: TurnState::Running,
@@ -1947,15 +2061,23 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 started_at: None,
                 completed_at: None,
                 assistant_message_id: None,
+                source_proposed_plan: source_proposed_plan.clone().or(preserved_source),
             });
-            json!({
+            let mut payload = json!({
                 "threadId": thread.id,
                 "messageId": message_id,
                 "modelSelection": thread.model_selection,
                 "runtimeMode": thread.runtime_mode,
                 "interactionMode": thread.interaction_mode,
                 "createdAt": at,
-            })
+            });
+            if let Some(title_seed) = title_seed {
+                payload["titleSeed"] = json!(title_seed);
+            }
+            if let Some(source) = source_proposed_plan {
+                payload["sourceProposedPlan"] = source.clone();
+            }
+            payload
         }
         // The client's reducer, mirrored: the latest turn moves to
         // `interrupted` and keeps whatever `completedAt` it already had, and
@@ -2214,6 +2336,7 @@ impl Change {
             Change::UserMessage { .. }
             | Change::AssistantDelta { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
+            Change::PromptQueued { .. } | Change::TurnDeliveryStateChanged { .. } => "thread.turn-delivery-state-changed",
             Change::MetaUpdated(_) => "thread.meta-updated",
             Change::Archived => "thread.archived",
             Change::Unarchived => "thread.unarchived",
@@ -2360,6 +2483,7 @@ fn bind_assistant_message(
             false => previous.and_then(|turn| turn.completed_at.clone()),
         },
         assistant_message_id: Some(message_id.to_string()),
+        source_proposed_plan: previous.and_then(|turn| turn.source_proposed_plan.clone()),
     })
 }
 
@@ -2383,6 +2507,7 @@ fn settle(latest: Option<LatestTurn>, session: &Session) -> Option<LatestTurn> {
                     .or_else(|| Some(session.updated_at.clone())),
                 completed_at: None,
                 assistant_message_id: previous.and_then(|turn| turn.assistant_message_id.clone()),
+                source_proposed_plan: previous.and_then(|turn| turn.source_proposed_plan.clone()),
             });
         }
     }
@@ -2485,6 +2610,7 @@ pub(crate) mod tests {
             messages: Vec::new(),
             activities: Vec::new(),
             checkpoints: Vec::new(),
+            pending_turn: None,
             session: None,
             latest_turn: None,
             latest_user_message_at: None,

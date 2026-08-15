@@ -370,6 +370,21 @@ export function applyThreadDetailEvent(
         },
       };
     }
+    case "thread.turn-delivery-state-changed":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          messages: Arr.map(thread.messages, (message) =>
+            message.turnId !== event.payload.turnId
+              ? message
+              : event.payload.deliveryState === "delivered"
+                ? (({ deliveryState: _, ...rest }) => rest)(message)
+                : { ...message, deliveryState: event.payload.deliveryState },
+          ),
+          updatedAt: event.payload.updatedAt,
+        },
+      };
 
     // ── Session ─────────────────────────────────────────────────────
     case "thread.session-set": {

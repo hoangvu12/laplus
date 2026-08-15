@@ -347,6 +347,7 @@ mod tests {
             provider_resume_cursor: None,
             latest_turn: None,
             latest_user_message_at: None,
+            pending_turn: None,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),
             updated_at: "2026-07-26T00:23:04.909Z".to_string(),
             lifecycle: crate::threads::Lifecycle::default(),

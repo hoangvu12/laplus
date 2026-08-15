@@ -223,6 +223,29 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("keeps an unsent queued message visible with an explicit Retry action", () => {
+    const entry = buildUserTimelineEntry("Please keep this work");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          {
+            ...entry,
+            message: {
+              ...entry.message,
+              turnId: TurnId.make("turn-retryable"),
+              deliveryState: "retryable" as const,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Please keep this work");
+    expect(markup).toContain("Not sent");
+    expect(markup).toContain(">Retry</button>");
+  });
+
   it("uses the larger leading inset only when the top fade is enabled", () => {
     const timelineEntries = [buildUserTimelineEntry("Hello")];
 

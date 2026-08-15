@@ -131,6 +131,8 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onRetryQueuedTurn: () => void;
+  retryMessageId: MessageId | null;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -168,6 +170,7 @@ interface MessagesTimelineProps {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onRetryQueuedTurn?: () => void;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
@@ -203,6 +206,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
+  onRetryQueuedTurn = () => {},
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
@@ -223,6 +227,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(new Set());
   const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
+  const retryMessageId = useMemo(() => {
+    const entry = timelineEntries.find(
+      (entry) => entry.kind === "message" && entry.message.deliveryState === "retryable",
+    );
+    return entry?.kind === "message" ? entry.message.id : null;
+  }, [timelineEntries]);
 
   const onToggleTurnFold = useCallback((turnId: TurnId) => {
     setExpandedTurnIds((existing) => {
@@ -426,6 +436,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onRetryQueuedTurn,
+      retryMessageId,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -440,6 +452,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onRetryQueuedTurn,
+      retryMessageId,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -948,6 +962,16 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           markdownCwd={ctx.markdownCwd}
         />
       </div>
+      {row.message.deliveryState ? (
+        <div className="flex max-w-[80%] items-center gap-2 pe-1 text-xs text-muted-foreground">
+          <span>{row.message.deliveryState === "retryable" ? "Not sent" : "Queued"}</span>
+          {row.message.deliveryState === "retryable" && row.message.id === ctx.retryMessageId ? (
+            <Button type="button" size="xs" variant="outline" onClick={ctx.onRetryQueuedTurn}>
+              Retry
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100">
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip>

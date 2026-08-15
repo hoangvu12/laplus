@@ -564,6 +564,8 @@ struct PeerState {
     rollback_fails: bool,
     /// Script the turn that spawns a subagent rather than the plain one.
     subagent: bool,
+    fail_reconciliation: bool,
+    fail_followup_prompt: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -749,17 +751,24 @@ async fn move_session(
 async fn session_messages(
     AxumPath(session_id): AxumPath<String>,
     State(state): State<PeerState>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
     append(&state.log, json!({"operation":"messages","sessionId":session_id}));
-    Json(json!([
+    if state.fail_reconciliation {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    Ok(Json(json!([
         {"info":{"id":"assistant-1","role":"assistant"},"parts":[]},
         {"info":{"id":"assistant-2","role":"assistant"},"parts":[]}
-    ]))
+    ])))
 }
 
-async fn session_statuses(State(state): State<PeerState>) -> Json<Value> {
+async fn session_statuses(State(state): State<PeerState>) -> Result<Json<Value>, StatusCode> {
     append(&state.log, json!({"operation":"status"}));
-    Json(json!({}))
+    if state.fail_reconciliation {
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    } else {
+        Ok(Json(json!({})))
+    }
 }
 
 async fn revert_session(
@@ -795,7 +804,11 @@ async fn prompt(
     );
     let prompt_number = state.prompts.fetch_add(1, Ordering::SeqCst) + 1;
     if prompt_number > 1 {
-        return StatusCode::NO_CONTENT;
+        return if state.fail_followup_prompt {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::NO_CONTENT
+        };
     }
     let sender = state
         .subscriber
@@ -964,7 +977,10 @@ impl ExternalOpenCode {
     }
 
     async fn with_questions() -> Self {
-        Self::start_configured_with_rollback(None, None, false, ResumeBehavior::Normal, None, false, true).await
+        Self::start_configured_with_rollback(
+            None, None, false, ResumeBehavior::Normal, None, false, true, false, false,
+        )
+        .await
     }
 
     async fn for_resume(resume: ResumeBehavior) -> Self {
@@ -980,6 +996,8 @@ impl ExternalOpenCode {
             Some(probe),
             fails,
             false,
+            false,
+            false,
         )
         .await
     }
@@ -989,6 +1007,36 @@ impl ExternalOpenCode {
         idle_release: Option<Arc<Notify>>,
     ) -> Self {
         Self::start_configured(password, idle_release, false).await
+    }
+
+    async fn with_reconciliation_failure(idle_release: Arc<Notify>) -> Self {
+        Self::start_configured_with_rollback(
+            None,
+            Some(idle_release),
+            false,
+            ResumeBehavior::Normal,
+            None,
+            false,
+            false,
+            true,
+            false,
+        )
+        .await
+    }
+
+    async fn with_followup_delivery_failure(idle_release: Arc<Notify>) -> Self {
+        Self::start_configured_with_rollback(
+            None,
+            Some(idle_release),
+            false,
+            ResumeBehavior::Normal,
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
     }
 
     async fn start_configured(
@@ -1019,6 +1067,8 @@ impl ExternalOpenCode {
             None,
             false,
             false,
+            false,
+            false,
         )
         .await
     }
@@ -1031,6 +1081,8 @@ impl ExternalOpenCode {
         rollback_probe: Option<PathBuf>,
         rollback_fails: bool,
         questions: bool,
+        fail_reconciliation: bool,
+        fail_followup_prompt: bool,
     ) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
@@ -1050,6 +1102,8 @@ impl ExternalOpenCode {
             resume,
             rollback_probe,
             rollback_fails,
+            fail_reconciliation,
+            fail_followup_prompt,
             ..Default::default()
         };
         let prompts = state.prompts.clone();
@@ -1511,6 +1565,111 @@ async fn stopping_busy_opencode_aborts_before_releasing_the_external_session() {
     );
     client.close().await;
     server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn failed_queued_delivery_keeps_the_message_retryable() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::with_followup_delivery_failure(Arc::clone(&release)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("delivery-failure-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("delivery-failure-project", "delivery-failure-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("delivery-failure-thread").await;
+    let mut a = start_turn("delivery-failure-thread", "delivery-failure-a", "A");
+    a["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", a).await.expect_success();
+    client.events_until_streaming(&subscription).await;
+    client.call("orchestration.dispatchCommand", follow_up("delivery-failure-thread", "delivery-failure-b", "B")).await.expect_success();
+    release.notify_one();
+    client.values_until(&subscription, |item| item["event"]["payload"]["deliveryState"] == "retryable").await;
+    let snapshot = server.connect().await.into_thread_snapshot("delivery-failure-thread").await;
+    let message = snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "delivery-failure-b").unwrap();
+    assert_eq!(message["deliveryState"], "retryable");
+    assert_ne!(snapshot["thread"]["session"]["status"], "running");
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn failed_interrupt_reconciliation_settles_work_and_keeps_retry() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::with_reconciliation_failure(release).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("reconcile-failure-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("reconcile-failure-project", "reconcile-failure-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("reconcile-failure-thread").await;
+    let mut a = start_turn("reconcile-failure-thread", "reconcile-failure-a", "A");
+    a["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", a).await.expect_success();
+    let events = client.events_until_streaming(&subscription).await;
+    let active = last_session(&events, "running before failed reconciliation")["payload"]["session"]["activeTurnId"].as_str().unwrap();
+    client.call("orchestration.dispatchCommand", interrupt_turn("reconcile-failure-thread", Some(active))).await.expect_success();
+    client.call("orchestration.dispatchCommand", follow_up("reconcile-failure-thread", "reconcile-failure-b", "B")).await.expect_success();
+    tokio::time::timeout(std::time::Duration::from_secs(5), client.values_until(&subscription, |item| item["event"]["payload"]["deliveryState"] == "retryable")).await.expect("bounded reconciliation failure");
+    let snapshot = server.connect().await.into_thread_snapshot("reconcile-failure-thread").await;
+    assert_eq!(snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "reconcile-failure-b").unwrap()["deliveryState"], "retryable");
+    assert_ne!(snapshot["thread"]["session"]["status"], "running");
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn stopped_queued_opencode_work_survives_restart_and_retries_once_in_order() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::start_with_idle_release(None, Some(release)).await;
+    let data = tempfile::tempdir().unwrap();
+    let database = data.path().join("registry.sqlite");
+    let workspace = Workspace::with(&["src/"]);
+    let first = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let mut client = first.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("unsent-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("unsent-project", "unsent-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("unsent-thread").await;
+    let mut a = start_turn("unsent-thread", "unsent-a", "A");
+    a["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", a).await.expect_success();
+    client.events_until_streaming(&subscription).await;
+    let mut b = follow_up("unsent-thread", "unsent-b", "B");
+    b["titleSeed"] = json!("preserved queued title seed");
+    b["sourceProposedPlan"] = json!({"threadId":"source-thread","planId":"source-plan"});
+    client.call("orchestration.dispatchCommand", b).await.expect_success();
+    client.call("orchestration.dispatchCommand", follow_up("unsent-thread", "unsent-c", "C")).await.expect_success();
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.session.stop","commandId":"test:stop:unsent","threadId":"unsent-thread","createdAt":"2026-08-15T00:00:00.000Z"})).await.expect_success();
+    client.values_until(&subscription, |item| item["event"]["payload"]["session"]["status"] == "stopped").await;
+    let stopped = first.connect().await.into_thread_snapshot("unsent-thread").await;
+    for id in ["unsent-b", "unsent-c"] {
+        assert_eq!(stopped["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == id).unwrap()["deliveryState"], "retryable");
+    }
+    assert_eq!(peer.requests().await.iter().filter(|request| request["operation"] == "prompt").count(), 1);
+    client.close().await;
+    first.stop().await;
+
+    let restarted = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let snapshot = restarted.connect().await.into_thread_snapshot("unsent-thread").await;
+    assert_eq!(snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "unsent-b").unwrap()["deliveryState"], "retryable");
+    assert_eq!(snapshot["thread"]["latestTurn"]["sourceProposedPlan"], json!({"threadId":"source-thread","planId":"source-plan"}));
+    assert_eq!(peer.requests().await.iter().filter(|request| request["operation"] == "prompt").count(), 1, "restart submitted unsent work");
+    let mut client = restarted.connect().await;
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.turn.retry","commandId":"test:retry:unsent","threadId":"unsent-thread","createdAt":"2026-08-15T00:00:01.000Z"})).await.expect_success();
+    let requests = peer.requests_through(6).await;
+    let retry = requests.iter().filter(|request| request["operation"] == "prompt").last().unwrap();
+    let text = retry["body"]["parts"].as_array().unwrap().iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
+    assert!(text.find('B') < text.find('C'));
+    client.close().await;
+    restarted.stop().await;
     peer.task.abort();
 }
 
