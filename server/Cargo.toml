@@ -131,6 +131,35 @@ opt-level = "z"
 # close call. It also keeps `cargo test --release` possible, since the test
 # harness needs to unwind.
 
+# A release-shaped shell for local validation, never for distribution. The
+# production profile above deliberately exchanges compiler parallelism and link
+# speed for the smallest installer. Thin LTO and more codegen units retain an
+# optimized build while shortening the loop when the question is merely
+# whether an optimized shell still compiles and opens.
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+
+# Benchmark-only candidates for `.github/workflows/build-timings.yml`. Keeping
+# these named profiles beside the production profile makes the comparison
+# reproducible without changing what `cargo xtask release` ships.
+[profile.release-thin-8]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+
+[profile.release-thin-16]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
+[profile.release-no-lto]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [workspace.lints.rust]
 # The server shells out, spawns children and drives a socket; none of that needs
 # `unsafe`. Forbidding it here keeps that true as the workspace grows.

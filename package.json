@@ -9,6 +9,7 @@
     "app": "cargo run --manifest-path server/Cargo.toml -p laplus-shell",
     "build": "vp run --filter './apps/*' --filter './packages/*' --filter './oxlint-plugin-t3code' build",
     "build:web": "vp run --filter @t3tools/web build",
+    "build:shell:fast": "pnpm build:web && cargo build --manifest-path server/Cargo.toml -p laplus-shell --profile release-fast",
     "typecheck": "vp run -r --concurrency-limit 2 typecheck",
     "tc": "vp run -r --concurrency-limit 2 typecheck",
     "test": "vp run -r test",

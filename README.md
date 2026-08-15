@@ -33,10 +33,20 @@ baked into it:
 pnpm install
 pnpm build:web                  # produces apps/web/dist
 pnpm app                        # cargo run -p laplus-shell — the window
+pnpm build:shell:fast           # optimized local shell; not a release artifact
 ```
 
 `cargo build -p laplus-shell` will not build the UI for you; it embeds
 `apps/web/dist` from a fixed path and says so if it is missing.
+
+`build:shell:fast` uses the non-shipping `release-fast` Cargo profile. Real
+installers still use the size-tuned release profile through `cargo xtask
+release`; the fast profile must not be published or used for size measurements.
+
+To compare release compiler settings on Windows without changing what ships,
+run `gh workflow run build-timings.yml`. The three parallel jobs report build
+time and executable size for the production profile and both Thin-LTO
+candidates; `-f cold=true` bypasses Cargo caches for a cold-build comparison.
 
 ## Working on it
 

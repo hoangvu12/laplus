@@ -1,15 +1,4 @@
-# The Rust server's test suite. Ticket 36, and ticket 05 of the headless-Linux
-# effort for the second platform.
-#
-# **Two runners, because there are now two things being shipped.** Windows is
-# what laplus *installs* on — the crate's `cfg(windows)` blocks, the ConPTY
-# behind `portable-pty`, and the `panic = "abort"` reasoning in the workspace
-# manifest, which is argued entirely from Windows not reaping orphaned children,
-# are all code only that runner exercises. Linux is where `laplus-server` is now
-# meant to *run* headless, driven from a phone or another machine, and nothing
-# had ever compiled it there: every `#[cfg(not(windows))]` twin in the crate was
-# written and never built. A platform nobody compiles is a platform that works
-# by assertion.
+# Rust server verification on the two supported runtime platforms.
 name: Rust
 
 on:
@@ -24,8 +13,6 @@ on:
       - server/**
       - .github/workflows/rust.yml
 
-# A second push to a PR makes the first run pointless. Named per ref so `main`
-# and each PR cancel only themselves.
 concurrency:
   group: rust-${{ github.ref }}
   cancel-in-progress: true
@@ -33,46 +20,81 @@ concurrency:
 permissions:
   contents: read
 
-# See `release.yml` for the argument. It applies harder here, because this
-# workflow runs on every push and pull request touching `server/` rather than
-# once per tag.
 env:
+  # Incremental artifacts cost more to save and restore than they return on an
+  # ephemeral runner. The Cargo cache still retains reusable dependencies.
   CARGO_INCREMENTAL: 0
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
     strategy:
-      # Each platform's answer is worth having on its own. Cancelling Linux
-      # because Windows went red — or the reverse — would hide exactly the
-      # divergence this matrix exists to find, and turn one platform's failure
-      # into no information about the other.
       fail-fast: false
       matrix:
         include:
-          # The platform that ships, and the whole default set with it:
-          # `laplus-server` and `xtask`.
-          - os: windows-latest
-            scope: ""
-            test-args: -- --test-threads=1
-          # The platform that runs headless. `-p laplus-server` rather than the
-          # default set, because `xtask` exists to build and measure a Windows
-          # installer — running its tests on Linux would be a second opinion
-          # about string constants, not evidence about this platform.
-          #
-          # `ubuntu-latest` already carries a C toolchain, which `rusqlite`'s
-          # `bundled` feature needs to compile SQLite. A bare Linux box does
-          # not — see `server/docs/running-headless.md`.
-          - os: ubuntu-latest
-            scope: -p laplus-server
-            test-args: ""
+          # Linux's process doubles tolerate Cargo's normal parallel test
+          # runner, so one job remains the cheapest and fastest arrangement.
+          - name: ubuntu-latest
+            os: ubuntu-latest
+            command: cargo test -p laplus-server --no-fail-fast
 
-    # `server/` is the Cargo workspace root — `Cargo.toml`, `.cargo/config.toml`
-    # and `target/` are there rather than at the repository root, so every cargo
-    # command has to run from it.
+          # Windows provider doubles become unreliable when tests inside one
+          # binary run concurrently. Keep that proven constraint, but run
+          # independent integration binaries in four CI jobs so one slow
+          # binary no longer blocks every binary behind it.
+          - name: windows unit and HTTP
+            os: windows-latest
+            command: >-
+              cargo test -p laplus-server --lib --bins
+              --test claude_text_generation --test cli --test http_boot
+              --test http_cloudflare_account --test http_cloudflare_adoption
+              --test http_cloudflare_cleanup --test http_cloudflare_connector
+              --test http_cloudflare_creation --test http_cloudflare_install
+              --test http_cors --test http_mcp --test http_orchestration
+              --test http_pairing --test http_public_exposure --test http_ui
+              --test network_public_exposure --test opencode_protocol
+              --test opencode_text_generation --test process_shutdown
+              --test protocol_golden --no-fail-fast -- --test-threads=1
+
+          - name: windows Codex and core socket
+            os: windows-latest
+            command: >-
+              cargo test -p laplus-server
+              --test socket_activity_resets --test socket_archiving
+              --test socket_assets --test socket_branches
+              --test socket_codex_turn --test socket_concurrency
+              --test socket_conformance --test socket_continuity
+              --test socket_deleting --test socket_diffs --test socket_files
+              --test socket_filesystem --no-fail-fast -- --test-threads=1
+
+          - name: windows OpenCode socket
+            os: windows-latest
+            command: >-
+              cargo test -p laplus-server
+              --test socket_first_turn_titles --test socket_git
+              --test socket_handshake --test socket_interrupt
+              --test socket_lifecycle_fields --test socket_managing_worktrees
+              --test socket_opencode_turn --no-fail-fast -- --test-threads=1
+
+          - name: windows remaining socket and xtask
+            os: windows-latest
+            command: >-
+              cargo test -p laplus-server
+              --test socket_permissions --test socket_pinning
+              --test socket_projects --test socket_provider
+              --test socket_provider_maintenance --test socket_renaming
+              --test socket_resilience --test socket_revert
+              --test socket_session_stop --test socket_settings
+              --test socket_settling --test socket_snoozing
+              --test socket_streaming --test socket_terminal
+              --test socket_terminal_lifecycle --test socket_thread_modes
+              --test socket_tools --test socket_turn --test socket_usage
+              --test socket_user_input --test socket_watch
+              --test socket_worktrees --no-fail-fast -- --test-threads=1
+
     defaults:
       run:
         working-directory: server
@@ -81,12 +103,61 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # See `release.yml`. The reasoning is the same and the runner is the same;
-      # this is the workflow that pays it most often.
-      #
-      # `working-directory: server` is set for the job, so `${{ github.workspace }}`
-      # rather than a relative path: this step is PowerShell talking to Defender,
-      # not cargo, and it wants the absolute location.
+      - name: Exclude the build directories from Defender
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: powershell
+        run: |
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}\server\target"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          cache-on-failure: true
+
+      - name: Test
+        run: ${{ matrix.command }}
+
+      # xtask is Windows release machinery, but it has its own unit tests and
+      # is deliberately a default workspace member. Keep it explicit because
+      # the sharded server commands above select only laplus-server.
+      - name: Test xtask
+        if: matrix.name == 'windows remaining socket and xtask'
+        run: cargo test -p xtask --no-fail-fast -- --test-threads=1
+
+      - name: Test documentation
+        if: matrix.name == 'windows unit and HTTP'
+        run: cargo test -p laplus-server --doc --no-fail-fast -- --test-threads=1
+
+  # Clippy does not depend on test execution, so putting it after the suite made
+  # every successful run wait another minute for no additional evidence.
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            scope: -p laplus-server
+          # Preserve the old Windows default-member coverage, including xtask.
+          - os: windows-latest
+            scope: ""
+
+    defaults:
+      run:
+        working-directory: server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Exclude the build directories from Defender
         if: runner.os == 'Windows'
         continue-on-error: true
@@ -100,44 +171,10 @@ jobs:
         with:
           components: clippy
 
-      # Keyed per job by the action, so the two platforms do not share a cache.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
 
-      # Separate from the test step so a platform that cannot *compile* says so
-      # in one line, rather than in whichever test binary happened to be built
-      # first. This is the step ticket 05 was really about.
-      - name: Build
-        run: cargo build ${{ matrix.scope }}
-
-      # `--no-fail-fast` because cargo otherwise stops at the first failing
-      # binary, so one failing lib test means no integration binary runs at all
-      # — and the summary then reads like a suite that lost two hundred tests
-      # rather than one that never started them. Ticket 29 is that lesson.
-      #
-      # `cargo test` with an empty scope covers `laplus-server` and `xtask`,
-      # which is what `default-members` is for: `laplus-shell` needs a pnpm
-      # build of `apps/web/dist` and is asked for by name or not at all. It is
-      # Tauri, it would need WebKitGTK, and it is not built on either runner.
-      #
-      # Only Windows serializes tests. The socket binaries drive `.cmd` provider
-      # doubles through anonymous pipes; under concurrent runner load a control
-      # response can be accepted by the server while the double never resumes,
-      # leaving an otherwise healthy test waiting for its terminal frame. The
-      # release gate uses the same load-control lever. Linux has native shell
-      # doubles and keeps the faster default parallelism.
-      - name: Test
-        run: cargo test ${{ matrix.scope }} --no-fail-fast ${{ matrix.test-args }}
-
-      # Reports, does not gate. One pre-existing `result_large_err` in
-      # `server.rs` would make `-D warnings` red on arrival, and a check that is
-      # red for reasons unrelated to the change under review is one everybody
-      # learns to ignore. Turn it into a gate once that is dealt with.
-      #
-      # `cargo fmt --check` is deliberately absent: this tree has never been
-      # rustfmt-formatted and fails on all 29 files, so adding it here would be
-      # a reformat of the whole server disguised as a CI change.
       - name: Clippy
         run: cargo clippy ${{ matrix.scope }} --all-targets

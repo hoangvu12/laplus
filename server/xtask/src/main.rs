@@ -47,6 +47,7 @@ mod tree;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Instant;
 
 use report::Measurements;
 
@@ -86,55 +87,104 @@ fn main() -> ExitCode {
 }
 
 fn release(measure_install: bool) -> Result<String, String> {
+    let started = Instant::now();
+    let result = release_inner(measure_install);
+    print_timing("total", started);
+    result
+}
+
+fn release_inner(measure_install: bool) -> Result<String, String> {
     let root = repo_root()?;
 
     // Before the build rather than after it: a licence problem is a reason not
     // to distribute the thing, so finding out once it exists is finding out too
     // late.
-    let config = read(&root.join(SHELL).join("tauri.conf.json"))?;
-    let text = read(&root.join(notice::NOTICE))?;
-    notice::retained(&config, &text)
-        .map_err(|missing| format!("upstream's licence is not in the artifact: {missing:?}"))?;
+    timed("preflight checks", || {
+        let config = read(&root.join(SHELL).join("tauri.conf.json"))?;
+        let text = read(&root.join(notice::NOTICE))?;
+        notice::retained(&config, &text)
+            .map_err(|missing| format!("upstream's licence is not in the artifact: {missing:?}"))?;
 
-    // The same argument, for the same reason. An installer that writes over a
-    // developer's database is a reason not to hand it to anyone, and this is
-    // three seconds against the three minutes of finding out afterwards.
-    let template = read(&root.join(SHELL).join(install::TEMPLATE))?;
-    install::redirected(&config, &template).map_err(|astray| {
-        format!("this build would install on top of the developer's data (ticket 30): {astray:?}")
+        // The same argument, for the same reason. An installer that writes over
+        // a developer's database is a reason not to hand it to anyone.
+        let template = read(&root.join(SHELL).join(install::TEMPLATE))?;
+        install::redirected(&config, &template).map_err(|astray| {
+            format!(
+                "this build would install on top of the developer's data (ticket 30): {astray:?}"
+            )
+        })
     })?;
 
-    let mut build = Command::new("cargo");
-    build.arg("tauri").arg("build");
-    if let Ok(version) = std::env::var("LAPLUS_VERSION") {
-        let version = version.trim();
-        if !version.is_empty() {
-            build.arg("--config").arg(format!(r#"{{"version":"{version}"}}"#));
+    timed("Tauri compile and bundle", || {
+        let mut build = Command::new("cargo");
+        build.arg("tauri").arg("build");
+        if let Ok(version) = std::env::var("LAPLUS_VERSION") {
+            let version = version.trim();
+            if !version.is_empty() {
+                build
+                    .arg("--config")
+                    .arg(format!(r#"{{"version":"{version}"}}"#));
+            }
         }
-    }
-    run(build.current_dir(root.join(SHELL)))?;
+        run(build.current_dir(root.join(SHELL)))
+    })?;
 
-    let installer = installer_path(&root)?;
-    let binary = root.join("target/release/laplus.exe");
+    let (installer, binary, installer_bytes, binary_bytes) = timed("artifact discovery", || {
+        let installer = installer_path(&root)?;
+        let binary = root.join("target/release/laplus.exe");
+        let installer_bytes = weigh(&installer)?;
+        let binary_bytes = weigh(&binary)?;
+        Ok((installer, binary, installer_bytes, binary_bytes))
+    })?;
+
+    let installed = timed(
+        if measure_install {
+            "install and uninstall audit"
+        } else {
+            "payload measurement"
+        },
+        || {
+            if measure_install {
+                install::measure(&installer)
+            } else {
+                install::payload(&root, &binary)
+            }
+        },
+    )?;
+
+    let server = timed("source measurement", || {
+        loc::breakdown_tree(&root.join(SERVER_SOURCE))
+            .map_err(|error| format!("cannot read {SERVER_SOURCE}: {error}"))
+    })?;
 
     let measured = Measurements {
-        installer: weigh(&installer)?,
-        binary: weigh(&binary)?,
-        installed: if measure_install {
-            install::measure(&installer)?
-        } else {
-            install::payload(&root, &binary)?
-        },
-        server: loc::breakdown_tree(&root.join(SERVER_SOURCE))
-            .map_err(|error| format!("cannot read {SERVER_SOURCE}: {error}"))?,
+        installer: installer_bytes,
+        binary: binary_bytes,
+        installed,
+        server,
     };
 
-    let written = report::render(&measured);
-    let destination = root.join(REPORT);
-    fs::write(&destination, &written)
-        .map_err(|error| format!("cannot write {}: {error}", destination.display()))?;
+    timed("report writing", || {
+        let written = report::render(&measured);
+        let destination = root.join(REPORT);
+        fs::write(&destination, &written)
+            .map_err(|error| format!("cannot write {}: {error}", destination.display()))?;
+        Ok(written)
+    })
+}
 
-    Ok(written)
+fn timed<T>(label: &str, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let started = Instant::now();
+    let result = operation();
+    print_timing(label, started);
+    result
+}
+
+fn print_timing(label: &str, started: Instant) {
+    eprintln!(
+        "xtask timing: {label}: {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// The repository root, from this crate's own location rather than from the

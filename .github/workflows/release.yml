@@ -54,6 +54,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: write
 
 # Incremental compilation is a bet that the next build shares state with this
@@ -190,9 +191,42 @@ jobs:
           workspaces: server
           cache-on-failure: true
 
-      # A tag can point at any commit, and neither `ci.yml` nor `rust.yml` fires
-      # on one — their triggers are pull requests and pushes to `main`. So the
-      # suite runs here, or a release ships code no check has seen.
+      # A tag often lands beside a push of the same commit to main. Re-running
+      # the slow Windows suite here then proves the exact same tree twice. Reuse
+      # a successful Rust workflow for this immutable commit; if none exists,
+      # failed, or cannot be queried, the next step keeps the safe fallback.
+      - name: Find Rust verification for this commit
+        id: rust-ci
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reuse=false
+          api="repos/${GITHUB_REPOSITORY}/actions/workflows/rust.yml/runs?head_sha=${GITHUB_SHA}&event=push&per_page=20"
+          runs=$(gh api "$api" --jq '.workflow_runs[] | [.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)
+
+          # Wait only when an exact-commit run actually exists. A tag may point
+          # at a commit that did not touch server/, in which case rust.yml was
+          # correctly filtered out and this release must test for itself.
+          if printf '%s\n' "$runs" | grep -Eq '^(queued|in_progress|waiting|requested|pending)'; then
+            deadline=$((SECONDS + 1500))
+            while (( SECONDS < deadline )); do
+              sleep 30
+              runs=$(gh api "$api" --jq '.workflow_runs[] | [.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)
+              if ! printf '%s\n' "$runs" | grep -Eq '^(queued|in_progress|waiting|requested|pending)'; then
+                break
+              fi
+            done
+          fi
+
+          if printf '%s\n' "$runs" | grep -q $'^completed\tsuccess$'; then
+            reuse=true
+            echo "The exact commit already passed the Rust workflow."
+          else
+            echo "No successful completed Rust workflow for the exact commit; testing here."
+          fi
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
+
       #
       # The TypeScript suite is deliberately absent: its one known-red test is a
       # 15-second timeout under parallel load that passes alone, and gating every
@@ -204,6 +238,7 @@ jobs:
       # unreliable when a loaded Windows runner drives their tests concurrently.
       # Serializing each binary is the test suite's documented load-control lever.
       - name: Test
+        if: steps.rust-ci.outputs.reuse != 'true'
         working-directory: server
         run: cargo test --no-fail-fast -- --test-threads=1
 
