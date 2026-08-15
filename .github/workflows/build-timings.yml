@@ -25,15 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: fat LTO, 1 unit
-            profile: release
-            output: release
-          - label: thin LTO, 8 units
-            profile: release-thin-8
-            output: release-thin-8
-          - label: thin LTO, 16 units
-            profile: release-thin-16
-            output: release-thin-16
+          - label: no LTO, 16 units
+            profile: release-no-lto
+            output: release-no-lto
     steps:
       - uses: actions/checkout@v6
       - name: Exclude build directories from Defender
