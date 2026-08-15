@@ -1,6 +1,9 @@
 name: Build timings
 
 on:
+  push:
+    branches:
+      - codex/build-profile-benchmark-20260815
   workflow_dispatch:
     inputs:
       cold:
