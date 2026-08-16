@@ -1659,7 +1659,19 @@ pub(crate) fn opencode_catalogue_models(
                 name: name.to_string(),
                 sub_provider: sub_provider.to_string(),
                 variants,
-                context_window: model.pointer("/limit/context").and_then(serde_json::Value::as_u64),
+                // Zero is OpenCode's word for "nobody said" rather than a
+                // window of no tokens: a model declared in `opencode.json`
+                // without a `limit` block, and absent from models.dev, is
+                // filled in as `context: 0` (`provider/provider.ts`, the
+                // `?? 0` at the end of the limit merge). Every custom
+                // OpenAI-compatible provider reaches here that way. Carried as
+                // a limit it would be a maximum the meter must then special-case
+                // downstream; carried as absence it takes the same
+                // used-tokens-only path as a catalogue that never loaded.
+                context_window: model
+                    .pointer("/limit/context")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|context| *context > 0),
             });
         }
     }

@@ -566,6 +566,10 @@ struct PeerState {
     subagent: bool,
     fail_reconciliation: bool,
     fail_followup_prompt: bool,
+    /// Accept the abort and never answer it. An OpenCode wedged on a stalled
+    /// provider socket does exactly this: the port is open, the request is
+    /// read, and no response is ever written.
+    unanswered_abort: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -910,6 +914,11 @@ async fn abort(
         &state.log,
         json!({"operation":"abort","sessionId":session_id}),
     );
+    // Logged first, so a test can prove laplus *asked* and then prove what it
+    // did about never being answered.
+    if state.unanswered_abort {
+        std::future::pending::<()>().await;
+    }
     Json(json!(true))
 }
 
@@ -1106,6 +1115,26 @@ impl ExternalOpenCode {
             fail_followup_prompt,
             ..Default::default()
         };
+        Self::serving(directory, log, state).await
+    }
+
+    /// An external peer whose `abort` is accepted and never answered.
+    async fn with_unanswered_abort(idle_release: Arc<Notify>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(idle_release),
+            unanswered_abort: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// The routes and the listener, once. Every constructor above differs only
+    /// in the [`PeerState`] it hands over.
+    async fn serving(directory: tempfile::TempDir, log: PathBuf, state: PeerState) -> Self {
         let prompts = state.prompts.clone();
         let app = Router::new()
             .route("/global/health", get(health))
@@ -1563,6 +1592,115 @@ async fn stopping_busy_opencode_aborts_before_releasing_the_external_session() {
             .is_ok(),
         "external endpoint remains operator-owned"
     );
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// An OpenCode that accepts the abort and never answers it.
+///
+/// This is the ordinary failure of an OpenAI-compatible proxy rather than an
+/// exotic one: the provider stream stalls with no `chunkTimeout` above it
+/// (opencode#37580), and the server that is blocked draining it stops answering
+/// its own HTTP port. The socket is open and the request is read, so nothing
+/// below the transport ever errors.
+///
+/// `reqwest::Client::new()` has no request timeout, and the session loop awaits
+/// [`Driver::interrupt`] *before* its `select!` — so an unanswered abort used to
+/// stop the loop reading its own signals. Stop did nothing, no event was
+/// normalized, and the conversation showed Working for as long as the process
+/// lived. The same unbounded await sat in front of the reap in `Driver::stop`,
+/// which is how one machine accumulated 64 orphaned `opencode serve` processes
+/// over three days.
+///
+/// What is asserted is that the loop keeps reading, not how long it took to get
+/// there: the refusal is reported, and a session stop sent afterwards is still
+/// heard. Neither is reachable if the interrupt never returns.
+#[tokio::test]
+async fn an_unanswered_abort_is_reported_and_leaves_the_session_loop_reading() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::with_unanswered_abort(Arc::clone(&idle_release)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("deaf-abort-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("deaf-abort-project", "deaf-abort-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("deaf-abort-thread").await;
+    let mut command = start_turn("deaf-abort-thread", "deaf-abort-message", "begin");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "running OpenCode turn")["payload"]["session"]
+        ["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("deaf-abort-thread", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+
+    // The peer logged the abort, so laplus asked. This row is what it did about
+    // never being answered — and it cannot be published by a loop still waiting.
+    // Three: the session create, the prompt, and the abort. Waiting for the
+    // count is what makes this the abort rather than whichever two had already
+    // arrived.
+    let requests = peer.requests_through(3).await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["operation"] == "abort"),
+        "laplus never asked OpenCode to stop: {requests:#?}"
+    );
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "turn.interrupt-failed"
+        })
+        .await;
+
+    // The claim that matters. A loop parked in an unbounded request reads no
+    // further signal, so a stop arriving afterwards is the proof it recovered.
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type":"thread.session.stop",
+                "commandId":"test:stop:deaf-abort",
+                "threadId":"deaf-abort-thread",
+                "createdAt":"2026-08-17T00:00:00.000Z"
+            }),
+        )
+        .await
+        .expect_success();
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("deaf-abort-thread")
+        .await;
+    assert_ne!(
+        snapshot["thread"]["session"]["status"], "running",
+        "the conversation is still showing work nothing is doing: {:#?}",
+        snapshot["thread"]["session"]
+    );
+
     client.close().await;
     server.stop().await;
     peer.task.abort();

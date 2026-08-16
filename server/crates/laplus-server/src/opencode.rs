@@ -214,6 +214,7 @@ impl OpenCodeClient {
                 &format!("session/{id}/prompt_async"),
                 Some(body),
             )
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(OpenCodeError::Transport)?;
@@ -332,6 +333,7 @@ impl OpenCodeClient {
     ) -> Result<T, OpenCodeError> {
         let response = self
             .request(method, path, body)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(OpenCodeError::Transport)?;
@@ -474,6 +476,33 @@ struct SubagentRow {
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL: Duration = Duration::from_millis(50);
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How long one OpenCode request may take before it is a failure rather than a
+/// wait.
+///
+/// `reqwest::Client::new()` has **no** request timeout, and every call this
+/// client makes used to inherit that. An OpenCode wedged on a stalled provider
+/// socket — which is the ordinary failure of an OpenAI-compatible proxy, and
+/// has no default `chunkTimeout` above it (opencode#37580) — answers its HTTP
+/// port never rather than slowly, and two of these calls are awaited in places
+/// where "never" is fatal to more than the call:
+///
+/// - [`OpenCode::send`] is awaited by the session loop *before* its `select!`,
+///   so a hung prompt stops the loop reading its own signals. The developer's
+///   Stop does nothing, no event is normalized, and the conversation shows
+///   Working for as long as the process lives.
+/// - [`OpenCode::stop`] aborts the remote session before reaping the child, so
+///   a hung abort meant the owned server was never killed. This machine had 64
+///   `opencode serve` processes and 5.35 GB of them, three days deep.
+///
+/// Applied per request rather than on the client, because
+/// [`OpenCodeClient::subscribe`] is a stream that is *supposed* to stay open
+/// and a client-wide timeout would end it here.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The bound on asking OpenCode to stop its own work while laplus is reaping
+/// it. Shorter than [`REQUEST_TIMEOUT`], because nothing downstream of this
+/// call needs its answer: what follows is killing the process either way, and
+/// the only thing a longer wait buys is a longer leak.
+const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 // OpenCode's `/global/health` answers `healthy: true` before its provider
 // catalogue finishes initialising. The catalogue wait below is what turns
 // `/global/health` answering green into "every subsequent `client.providers()`
@@ -1822,12 +1851,19 @@ impl crate::session::Driver for OpenCode {
             .map_err(std::io::Error::other)
     }
 
+    /// Bounded at [`ABORT_TIMEOUT`] rather than [`REQUEST_TIMEOUT`], because the
+    /// session loop awaits this *before* its `select!` and reads nothing while
+    /// it runs. Every second spent here is a second the developer's Stop has
+    /// visibly done nothing, and the interrupt reconciliation two seconds later
+    /// is what establishes the real outcome anyway — so failing fast here loses
+    /// no information and returns the loop to its signals.
     async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
-        self.client
-            .abort(&self.session_id)
-            .await
-            .map(|_| ())
-            .map_err(std::io::Error::other)
+        match tokio::time::timeout(ABORT_TIMEOUT, self.client.abort(&self.session_id)).await {
+            Ok(outcome) => outcome.map(|_| ()).map_err(std::io::Error::other),
+            Err(_) => Err(std::io::Error::other(
+                "OpenCode did not answer the request to stop the turn.",
+            )),
+        }
     }
     async fn reconcile_interrupt(&mut self, driving: &mut crate::session::Driving) -> Result<crate::session::Decided, String> {
         self.client.session(&self.session_id).await.map_err(|error| error.to_string())?;
@@ -1925,14 +1961,22 @@ impl crate::session::Driver for OpenCode {
         driving: &mut crate::session::Driving,
         asked_to_stop: bool,
     ) -> crate::session::Reaped {
+        // Bounded twice over — [`REQUEST_TIMEOUT`] on the call and
+        // [`ABORT_TIMEOUT`] around it — because everything below reaps the
+        // child, and an OpenCode that has stopped answering its own port is
+        // exactly the OpenCode that most needs reaping. Sequencing the kill
+        // behind an unbounded request to the process being killed is how this
+        // machine accumulated three days of orphaned servers.
         let abort_failure = if asked_to_stop && driving.turn.is_some() {
-            self.client
-                .abort(&self.session_id)
-                .await
-                .err()
-                .map(|error| {
+            match tokio::time::timeout(ABORT_TIMEOUT, self.client.abort(&self.session_id)).await {
+                Ok(outcome) => outcome.err().map(|error| {
                     format!("OpenCode could not abort its active work while stopping: {error}")
-                })
+                }),
+                Err(_) => Some(
+                    "OpenCode did not answer the request to abort its active work while stopping."
+                        .to_string(),
+                ),
+            }
         } else {
             None
         };
@@ -2150,6 +2194,49 @@ mod tests {
         let usage = message_token_usage(&info, &windows, None).expect("a usage");
         assert_eq!(usage.max_tokens, Some(200_000));
         assert_eq!(usage.used_tokens, 1500);
+    }
+
+    /// A custom provider declared in `opencode.json` with no `limit` block.
+    /// OpenCode fills the gap with `context: 0` rather than omitting the field,
+    /// so a catalogue that knows nothing about the model still answers with one
+    /// — this is every OpenAI-compatible proxy, captured verbatim from a live
+    /// owned server (`iroha/MiniMax-M3`, `source: "config"`).
+    ///
+    /// Nought is not a window. Carried as `Some(0)` it is a maximum the meter
+    /// would have to divide by; carried as absence it takes the same path as a
+    /// catalogue that never loaded, which is the used-tokens-only fallback the
+    /// meter already draws.
+    #[test]
+    fn a_model_declared_without_a_limit_has_no_window_rather_than_a_window_of_nought() {
+        let inventory = serde_json::json!({
+            "connected": ["iroha"],
+            "all": [{
+                "id": "iroha",
+                "name": "Iroha",
+                "source": "config",
+                "models": {
+                    "MiniMax-M3": {
+                        "id": "MiniMax-M3",
+                        "providerID": "iroha",
+                        "name": "MiniMax-M3",
+                        "limit": {"context": 0, "output": 0}
+                    }
+                }
+            }]
+        });
+        let windows = context_windows(&inventory);
+        assert_eq!(windows.get("iroha/MiniMax-M3"), None);
+
+        let info = serde_json::json!({
+            "id": "msg_5",
+            "role": "assistant",
+            "modelID": "MiniMax-M3",
+            "providerID": "iroha",
+            "tokens": {"input": 1000, "output": 500, "total": 1500, "cache": {"read": 0, "write": 0}}
+        });
+        let usage = message_token_usage(&info, &windows, None).expect("a usage");
+        assert_eq!(usage.max_tokens, None);
+        assert_eq!(usage.used_tokens, 1500, "the token count survives the missing window");
     }
 
     #[test]
