@@ -2,7 +2,7 @@ Status: ready-for-human
 
 # 05 — Bound requests to an OpenCode that stopped answering
 
-Shipped in v0.1.6. Recorded here because it was found while scoping the stream
+Shipped in v0.1.7. Recorded here because it was found while scoping the stream
 supervisor and it is _not_ that: no stream is lost in this failure, and the
 supervisor would not have caught it.
 
