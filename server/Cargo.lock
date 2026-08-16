@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "laplus-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "atomic-write-file",
  "axum",
@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "laplus-shell"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "laplus-server",
  "serde_json",
@@ -5534,7 +5534,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.5"
+version = "0.1.6"
 
 [[package]]
 name = "yasna"
