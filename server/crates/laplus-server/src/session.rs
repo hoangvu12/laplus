@@ -1373,6 +1373,7 @@ async fn answer<D: Driver>(
                 ),
             )),
         );
+        undelivered(threads, start, &asked);
     }
 
     // Published either way, and after the write either way. This is what closes
@@ -1395,6 +1396,37 @@ async fn answer<D: Driver>(
     if let Some(turn_id) = cancelled {
         stopped(threads, start, &turn_id, &asked.request_id);
     }
+}
+
+/// A decision the developer made that never reached the child that asked for it.
+///
+/// **This exists so the two halves cannot say different things.** When a send
+/// fails, [`answer`] still publishes the resolution into the conversation — the
+/// panel has to clear, or the developer is left with a request they can never
+/// answer — beside a `session.failed` row saying it could not be sent. Without
+/// this, a *child's* blocker would be left reading "still waiting" in its own
+/// stream while the conversation showed it resolved, and the child's history is
+/// exactly where the pause has to be explained.
+///
+/// The child stays [`crate::subagents::State::Blocked`], because it is: nothing
+/// reached it, and no later event will. That is not a disagreement with the
+/// cleared panel — the panel records what the *developer* did, and the stream
+/// records what the *child* was told, which here is nothing.
+///
+/// A request the provider did not attribute to a child does nothing here, which
+/// is the root behaviour every driver keeps.
+fn undelivered(threads: &Threads, start: &Start, asked: &ApprovalRequest) {
+    let Some((child_id, blocker)) = crate::subagents::Blocker::waiting_on(asked) else {
+        return;
+    };
+    threads.subagents().record(
+        &start.thread_id,
+        crate::subagents::Update::for_child(child_id)
+            .in_state(crate::subagents::State::Blocked)
+            .with(crate::subagents::NewEntry::blocked(
+                &blocker.resolved(crate::subagents::Resolution::Undelivered),
+            )),
+    );
 }
 
 /// Tell the agent what the developer answered, and say so in the conversation.
@@ -1453,6 +1485,7 @@ async fn answer_user_input<D: Driver>(
                 ),
             )),
         );
+        undelivered(threads, start, &asked);
     }
 
     if !D::USER_INPUT_RESOLVED_BY_EVENT || sent.is_err() {

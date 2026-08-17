@@ -1,5 +1,6 @@
 import { memo } from "react";
 import { type PendingApproval } from "../../session-logic";
+import { WaitingSubagentLabel } from "./WaitingSubagentLabel";
 
 interface ComposerPendingApprovalPanelProps {
   approval: PendingApproval;
@@ -28,6 +29,7 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
       <div className="flex flex-wrap items-center gap-2">
         <span className="uppercase text-sm tracking-[0.2em]">PENDING APPROVAL</span>
         <span className="text-sm font-medium">{approvalSummary}</span>
+        <WaitingSubagentLabel subagent={approval.subagent} />
         {pendingCount > 1 ? (
           <span className="text-xs text-muted-foreground">1/{pendingCount}</span>
         ) : null}

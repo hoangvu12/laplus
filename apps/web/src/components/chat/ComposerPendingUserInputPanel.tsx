@@ -6,6 +6,7 @@ import {
   type PendingUserInputDraftAnswer,
 } from "../../pendingUserInput";
 import { CheckIcon } from "lucide-react";
+import { WaitingSubagentLabel } from "./WaitingSubagentLabel";
 import { cn } from "~/lib/utils";
 
 interface PendingUserInputPanelProps {
@@ -163,6 +164,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         <span className="text-[11px] font-semibold tracking-widest text-muted-foreground/55 uppercase">
           {activeQuestion.header}
         </span>
+        <WaitingSubagentLabel subagent={prompt.subagent} />
         {prompt.questions.length > 1 ? (
           <span className="flex h-5 items-center rounded-md bg-muted/60 px-1.5 text-[10px] font-medium tabular-nums text-muted-foreground/60">
             {questionIndex + 1}/{prompt.questions.length}

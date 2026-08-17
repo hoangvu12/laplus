@@ -5641,6 +5641,7 @@ function ChatViewContent(props: ChatViewProps) {
         childId={activeRightPanelSurface.resourceId}
         threadRef={activeThreadRef}
         markdownCwd={gitCwd ?? undefined}
+        workspaceRoot={activeWorkspaceRoot ?? undefined}
       />
     ) : activeRightPanelSurface?.kind === "plan" ? (
       <PlanSidebar

@@ -118,6 +118,7 @@ impl ApprovalRequest {
             suggestions: Vec::new(),
             available_decisions: Some(self.available_decisions.clone()),
             provider_request_id: Some(self.server_request_id.clone()),
+            subagent: None,
         }
     }
 

@@ -420,13 +420,54 @@ already said. `crate::subagents::Head`.
 **Stream entry** — one thing that happened in a subagent's session, with a
 stable id, a position, a kind and a payload. Upserted by id and ordered by
 position, which is what lets a client's replay and its live continuation meet
-without losing or repeating one. `crate::subagents::Entry`.
+without losing or repeating one — and what lets a tool call that runs and then
+finishes be one entry that moves rather than two that repeat.
+`crate::subagents::Entry`.
+
+**Entry kind** — what a stream entry _is_, in one vocabulary all three providers
+fill: the child's prose, a command, a read or search, an edit, another tool call,
+a warning or error, a blocker, and the terminal outcome. The kind decides the
+payload and the row the client draws, so a child's command reads as a command
+and its edit as a file change. A provider tool laplus cannot place is a generic
+tool call rather than a guess at which specific kind it resembles.
+`crate::subagents::EntryKind`.
+
+**Child work** — one piece of what a subagent did, carried in the _client's_
+work-log vocabulary rather than any provider's: a title, a lifecycle status, and
+whatever the protocol exposed of the command, the files, the pattern and the
+output. Translated once, in the adapter, so the child's surface can reuse the
+main agent's work rows unchanged. `crate::subagents::Work`.
+
+**Blocker** — a permission or question a subagent stopped for. It lives in three
+places at once and deliberately: the child's stream records that it waited and
+what it was told, the main conversation gets the ordinary actionable request row
+naming the child, and the provider's own request id is what routes the answer
+back to the descendant. Asking and answering are one entry under one key, so a
+child's history explains the pause rather than leaving two rows to be paired.
+`crate::subagents::Blocker`, `crate::approval::Waiting`.
+
+**Resolution** — how a blocker ended, as an identity rather than a sentence:
+approved, approved for the session, declined, cancelled, answered, rejected, or
+**undelivered** — the developer decided and the decision could not be sent. The
+last is why this is not simply the developer's decision: a child that was never
+told stays blocked, and its stream has to be able to say so while the
+conversation records both the decision and the failure to deliver it.
+`crate::subagents::Resolution`.
 
 **Child outcome** — how a subagent's work ended: a result, a failure, an
 interruption, or **empty** — completed with nothing to return. Four rather than
 three, because a child that finished and said nothing has concluded, and
 presenting the last thing it happened to say as its answer would be a guess.
 `crate::subagents::Outcome`.
+
+**Latest meaningful activity** — the one line a compact child row shows while its
+subagent runs: the most recent thing the child did that tells the developer
+something. Announced-but-empty tool parts, blank text parts and status
+heartbeats are not it. When the child becomes terminal this is replaced
+atomically by a bounded preview of what came back — including for a child that
+returned nothing, which says so rather than reverting to what it was doing.
+`crate::worklog::subagent`, from the `said` field of
+`crate::protocol::SubagentTask`.
 
 ## Lifecycle
 

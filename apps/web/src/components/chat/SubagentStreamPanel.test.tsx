@@ -8,11 +8,18 @@
  * carries no composer and no identity/task header even though the stream it is
  * given carries a name and an assignment to build one from.
  *
- * Ticket 01 records two entry kinds, `message` and `outcome`, so representative
- * coverage is those plus the four outcome shapes. Commands, reads, edits, tool
- * calls and blockers are ticket 02's, and its worker extends this file.
+ * Representative coverage is one entry of every kind the contract declares —
+ * prose, commands, reads, edits, other tool calls, warnings, blockers and the
+ * four outcome shapes — because the claim under test is that a child's work is
+ * drawn in the main agent's language rather than as a raw event log, and that is
+ * a claim about each kind separately.
  */
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationSubagentResolution,
+  ScopedThreadRef,
+  ThreadId,
+} from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -80,9 +87,45 @@ function outcome(kind: string, text: string | null) {
   };
 }
 
+function work(
+  id: string,
+  sequence: number,
+  kind: "command" | "read" | "edit" | "tool",
+  payload: Partial<{
+    title: string;
+    status: "inProgress" | "completed" | "failed";
+    detail: string | null;
+    command: string | null;
+    paths: ReadonlyArray<string>;
+    query: string | null;
+  }>,
+) {
+  return {
+    id,
+    sequence,
+    kind,
+    payload: {
+      title: "tool",
+      status: "completed" as const,
+      detail: null,
+      command: null,
+      paths: [],
+      query: null,
+      ...payload,
+    },
+    createdAt: "2026-08-17T00:00:02.000Z",
+  };
+}
+
+const THREAD_REF = {
+  environmentId: ENVIRONMENT_ID,
+  threadId: THREAD_ID,
+} as unknown as ScopedThreadRef;
+
 function render(
   data: { stream: ReturnType<typeof stream> | null; entries: ReadonlyArray<unknown> } | null,
   error: string | null = null,
+  extra: { threadRef?: ScopedThreadRef } = {},
 ): string {
   view.current = { data, error, isPending: false, refresh: () => {} };
   return renderToStaticMarkup(
@@ -90,6 +133,7 @@ function render(
       environmentId={ENVIRONMENT_ID}
       threadId={THREAD_ID}
       childId="call_task_1"
+      threadRef={extra.threadRef}
     />,
   );
 }
@@ -176,7 +220,9 @@ describe("the subagent work stream surface", () => {
   /**
    * The two negative claims. The surface is observational: it cannot steer a
    * provider that has no way to receive a message for one child, so it offers
-   * nothing that looks like it could.
+   * nothing that looks like it could. The file and diff affordances proved
+   * below are the only clickable things it has, and what they do is open a
+   * workspace tab — nothing on this surface can reach a provider.
    */
   it("offers no composer and no way to send anything to the child", () => {
     const markup = render({
@@ -209,6 +255,150 @@ describe("the subagent work stream surface", () => {
     expect(markup).not.toContain(CHILD_ASSIGNMENT);
     expect(markup).not.toContain("call_task_1");
     expect(markup).not.toMatch(/<h[1-6][ >]/);
+  });
+
+  /**
+   * The heart of ticket 02: a child's command reads as a command, its edit as a
+   * file change, its failed call as a failed call. The indicators asserted here
+   * are the shared row's own and nothing in this file could produce them, which
+   * is what makes their presence evidence that the two agree rather than that
+   * this surface reimplemented them.
+   */
+  it("draws the child's work in the main agent's work-entry language", () => {
+    const markup = render({
+      stream: stream(),
+      entries: [
+        work("c", 1, "command", {
+          title: "ls -1 src | wc -l",
+          command: "ls -1 src | wc -l",
+          detail: "11",
+        }),
+        work("r", 2, "read", { title: "src/main.rs", paths: ["src/main.rs"] }),
+        work("g", 3, "read", { title: "grep fn main", query: "fn main" }),
+        work("e", 4, "edit", { title: "src/counted.rs", paths: ["src/counted.rs"] }),
+        work("t", 5, "tool", { title: "webfetch", status: "failed", detail: "no such host" }),
+      ],
+    });
+
+    expect(markup).toContain('data-subagent-entry="command"');
+    expect(markup).toContain('data-subagent-entry="read"');
+    expect(markup).toContain('data-subagent-entry="edit"');
+    expect(markup).toContain('data-subagent-entry="tool"');
+    // Capitalised, because the shared row runs every heading through the main
+    // agent's own `capitalizePhrase`. That the child's command comes out the
+    // same way is the reuse this test is for.
+    expect(markup).toContain("Ls -1 src | wc -l");
+    expect(markup).toContain("Src/counted.rs");
+    // The shared row's own failure affordance, on the call that failed.
+    expect(markup).toContain('aria-label="Tool call failed"');
+    // A raw event log would leak the wire's own words. This does not.
+    expect(markup).not.toContain("inProgress");
+  });
+
+  /**
+   * Chronology is the thing a child tab preserves, so the entries are drawn in
+   * the order the child produced them rather than grouped by kind.
+   */
+  it("keeps the child's work in the order it happened", () => {
+    const markup = render({
+      stream: stream(),
+      entries: [
+        message("a", 1, "counting"),
+        work("c", 2, "command", { title: "wc -l", command: "wc -l" }),
+        message("b", 3, "eleven so far"),
+        outcome("completed", "eleven files"),
+      ],
+    });
+
+    const order = ["counting", "Wc -l", "eleven so far", "Result"].map((needle) =>
+      markup.indexOf(needle),
+    );
+    expect(order.every((at) => at >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((left, right) => left - right));
+  });
+
+  /**
+   * A warning is a warning and an error is an error, in their place in the work
+   * rather than lifted out of it.
+   */
+  it("draws a child's warning in chronological context", () => {
+    const markup = render({
+      stream: stream(),
+      entries: [
+        {
+          id: "n",
+          sequence: 1,
+          kind: "notice" as const,
+          payload: { level: "warning", text: "Retrying the child's request" },
+          createdAt: "2026-08-17T00:00:01.000Z",
+        },
+      ],
+    });
+
+    expect(markup).toContain('data-subagent-entry="notice"');
+    expect(markup).toContain("Retrying the child&#x27;s request");
+  });
+
+  /**
+   * The child's history explains why it stopped — and, on the same row, what it
+   * was eventually told. The actionable response is not here: it stays in the
+   * main conversation, which is what stops a blocker hiding inside a tab.
+   */
+  it("says why a child waited and how it resolved, on one row", () => {
+    const blocker = (resolution: OrchestrationSubagentResolution | null) => ({
+      id: "b",
+      sequence: 1,
+      kind: "blocker" as const,
+      payload: {
+        requestId: "child-per-1",
+        blocker: "permission" as const,
+        title: "bash",
+        detail: "rm -rf build",
+        resolution,
+      },
+      createdAt: "2026-08-17T00:00:01.000Z",
+    });
+
+    const waiting = render({ stream: stream({ state: "blocked" }), entries: [blocker(null)] });
+    expect(waiting).toContain('data-subagent-state="blocked"');
+    expect(waiting).toContain("Waiting for permission");
+    expect(waiting).toContain("bash");
+
+    const answered = render({ stream: stream(), entries: [blocker("approved")] });
+    expect(answered).toContain("Approved");
+    expect(answered).not.toContain("Waiting for permission");
+
+    // A decision that never reached the child is neither "waiting" nor
+    // "approved" — the child is still stopped and nothing will now answer it.
+    const undelivered = render({
+      stream: stream({ state: "blocked" }),
+      entries: [blocker("undelivered")],
+    });
+    expect(undelivered).toContain("Your decision could not be delivered");
+    expect(undelivered).not.toContain("Waiting for permission");
+  });
+
+  /**
+   * A file the child read or changed opens a *neighbouring* workspace tab. The
+   * affordance exists only when there is a workspace to open it in; what it does
+   * to the workspace is `subagentFileActions.test.ts`.
+   */
+  it("offers file and diff navigation from the files a child touched", () => {
+    const entries = [
+      work("r", 1, "read", { title: "src/main.rs", paths: ["src/main.rs"] }),
+      work("e", 2, "edit", { title: "src/counted.rs", paths: ["src/counted.rs"] }),
+    ];
+
+    const wired = render({ stream: stream(), entries }, null, { threadRef: THREAD_REF });
+    expect(wired).toContain('data-subagent-open-file="src/main.rs"');
+    expect(wired).toContain('data-subagent-open-file="src/counted.rs"');
+    // Only the edit offers a diff: reading a file changes nothing to compare.
+    expect(wired.match(/data-subagent-open-diff/g)?.length).toBe(1);
+
+    // No workspace to open anything in, so nothing pretends there is.
+    const unwired = render({ stream: stream(), entries });
+    expect(unwired).not.toContain("data-subagent-open-file");
+    expect(unwired).not.toContain("data-subagent-open-diff");
   });
 
   it("distinguishes loading, a child that has done nothing, and one that is gone", () => {

@@ -175,7 +175,22 @@ function basenameOfPath(path: string): string {
   return separatorIndex >= 0 ? path.slice(separatorIndex + 1) : path;
 }
 
-function workspaceRelativePath(path: string, workspaceRoot: string | undefined): string | null {
+/**
+ * The path as the right panel's file surface is addressed by, or `null` when
+ * this path is not inside the workspace at all.
+ *
+ * `null` is load-bearing rather than a fallback: `useRightPanelStore.openFile`
+ * takes a **workspace-relative** path, so handing it an absolute one — or one
+ * outside the root — opens a tab on a file the panel cannot resolve. Callers
+ * must treat `null` as "there is nowhere to open this" and offer no affordance.
+ *
+ * Exported for the subagent surface, which faces the same problem with the paths
+ * a delegated child reports (`subagentFileActions.ts`).
+ */
+export function workspaceRelativePath(
+  path: string,
+  workspaceRoot: string | undefined,
+): string | null {
   if (!workspaceRoot) return null;
   const normalizedPath = normalizeWindowsDrivePath(path.replaceAll("\\", "/"));
   const normalizedRoot = normalizeWindowsDrivePath(workspaceRoot.replaceAll("\\", "/")).replace(

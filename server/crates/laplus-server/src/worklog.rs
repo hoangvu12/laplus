@@ -486,20 +486,32 @@ pub fn subagent(
         Some(kind) if !kind.trim().is_empty() => format!("Subagent {kind}"),
         _ => "Subagent task".to_string(),
     };
-    // Three things could label the row, and they are ranked by how much they
-    // were worth waiting for. The summary is the subagent's final report and only
-    // a notification carries one. `said` is the subagent's own prose, forwarded
-    // while it works — better than the description, because the description is
-    // the CLI saying "Running Bash" and this is the subagent saying what it
-    // found. The description is what is left when the flag is off.
-    let detail = task
+    // **A terminal row describes what came back, and nothing else.** Once the
+    // subagent has reported, its own last words are stale activity, and a row
+    // that went on showing them would present the thing said on the way to an
+    // answer as the answer — the defect the spec names as "terminal state
+    // replaces stale activity". A completion with no report is *still* a
+    // conclusion, so it says so rather than falling through to whatever the
+    // child happened to be doing a moment earlier.
+    //
+    // While it runs, the three candidates are ranked by how much they were worth
+    // waiting for. `said` is the latest meaningful thing the child did, from its
+    // own session — better than the description, because the description is the
+    // parent saying what it asked for and this is the child saying what it
+    // found. The description is what is left when there is nothing yet.
+    let reported = task
         .summary
         .as_deref()
-        .filter(|summary| !summary.trim().is_empty())
-        .or(task.said.as_deref())
-        .filter(|said| !said.trim().is_empty())
-        .or(task.description.as_deref())
-        .filter(|detail| !detail.trim().is_empty());
+        .filter(|summary| !summary.trim().is_empty());
+    let detail = if ended {
+        reported.or(Some(concluded_without_a_report(&task.status)))
+    } else {
+        task.said
+            .as_deref()
+            .filter(|said| !said.trim().is_empty())
+            .or(task.description.as_deref())
+            .filter(|detail| !detail.trim().is_empty())
+    };
     let mut payload = json!({
         "itemType": "collab_agent_tool_call",
         "status": task.status,
@@ -527,6 +539,20 @@ pub fn subagent(
         payload,
         turn_id,
     )
+}
+
+/// What a finished subagent row says when the child returned no text.
+///
+/// A conclusion rather than a gap, which is the same distinction
+/// [`crate::subagents::OutcomeKind::Empty`] exists for: the row has to be able
+/// to say "this is over and there is nothing to read" without either going
+/// blank or reverting to the last thing the child was doing.
+fn concluded_without_a_report(status: &str) -> &'static str {
+    match status {
+        "failed" => "Failed with no reported reason",
+        "interrupted" => "Interrupted",
+        _ => "Completed with no result",
+    }
 }
 
 pub fn unanswered(activities: &[Activity]) -> Vec<&str> {
@@ -590,6 +616,20 @@ impl Decision {
         }
     }
 
+    /// This decision as a child's own stream records it.
+    ///
+    /// A value rather than a sentence, so the child's history and the
+    /// conversation's row carry the same *identity* and the wording stays the
+    /// client's — see [`crate::subagents::Resolution`].
+    pub fn resolution(self) -> crate::subagents::Resolution {
+        match self {
+            Decision::Accept => crate::subagents::Resolution::Approved,
+            Decision::AcceptForSession => crate::subagents::Resolution::ApprovedForSession,
+            Decision::Decline => crate::subagents::Resolution::Declined,
+            Decision::Cancel => crate::subagents::Resolution::Cancelled,
+        }
+    }
+
     /// This decision as the agent has to be told it.
     ///
     /// Two things are worth naming. The input is handed back **unedited**:
@@ -645,6 +685,31 @@ impl Decision {
     }
 }
 
+/// Who is waiting, when it is not the root agent.
+///
+/// Put on the request row as its own field rather than folded into the detail,
+/// because the developer has to know *before deciding* which worker will receive
+/// the answer, and a sentence buried in a command preview is not that. `None`
+/// leaves the payload exactly as it was, which is the root behaviour every
+/// provider without child attribution keeps.
+const SUBAGENT: &str = "subagent";
+
+fn waiting_child(request: &ApprovalRequest) -> Option<Value> {
+    let waiting = request.subagent.as_ref()?;
+    Some(json!({"childId": waiting.child_id, "name": waiting.name}))
+}
+
+/// How a request names the child that raised it, in a sentence.
+fn asked_by(request: &ApprovalRequest) -> String {
+    match request.subagent.as_ref() {
+        Some(waiting) => match waiting.name.as_deref().filter(|name| !name.trim().is_empty()) {
+            Some(name) => format!("Subagent {name}: "),
+            None => "A subagent: ".to_string(),
+        },
+        None => String::new(),
+    }
+}
+
 /// The agent asking, as the pending-approval panel will read it.
 pub fn requested(request: &ApprovalRequest, turn_id: Option<String>) -> Activity {
     let mut payload = json!({
@@ -660,9 +725,16 @@ pub fn requested(request: &ApprovalRequest, turn_id: Option<String>) -> Activity
     if let Some(decisions) = &request.available_decisions {
         payload["availableDecisions"] = json!(decisions);
     }
+    if let Some(waiting) = waiting_child(request) {
+        payload[SUBAGENT] = waiting;
+    }
     Activity::approval(
         REQUESTED,
-        &format!("{} needs permission", request.tool_name),
+        &format!(
+            "{}{} needs permission",
+            asked_by(request),
+            request.tool_name
+        ),
         payload,
         turn_id,
     )
@@ -677,8 +749,9 @@ pub fn resolved(
     Activity::approval(
         RESOLVED,
         &format!(
-            "{}: {}",
+            "{}: {}{}",
             decision.outcome(decision.remembers(request)),
+            asked_by(request),
             request.tool_name
         ),
         json!({
@@ -866,12 +939,11 @@ pub fn user_input_requested(
     questions: Vec<Value>,
     turn_id: Option<String>,
 ) -> Activity {
-    Activity::info(
-        USER_INPUT_REQUESTED,
-        "User input requested",
-        json!({ REQUEST_ID: request.request_id, "questions": questions }),
-        turn_id,
-    )
+    let mut payload = json!({ REQUEST_ID: request.request_id, "questions": questions });
+    if let Some(waiting) = waiting_child(request) {
+        payload[SUBAGENT] = waiting;
+    }
+    Activity::info(USER_INPUT_REQUESTED, "User input requested", payload, turn_id)
 }
 
 /// The developer having answered, which is what closes the header.
@@ -1093,6 +1165,104 @@ mod tests {
             ..task("completed", Some("eleven"))
         };
         assert_eq!(subagent(&reported, None, None).payload["detail"], json!("eleven"));
+    }
+
+    /// Once a subagent has reported, the row describes what came back and
+    /// nothing else.
+    ///
+    /// The stale-activity defect in one test: a child that says "reading the
+    /// third file" and then finishes with nothing to report must not leave a row
+    /// claiming it is reading the third file. Each terminal status has a
+    /// sentence of its own, because "it ended and returned nothing" and "it
+    /// failed and said why" are not the same news.
+    #[test]
+    fn a_terminal_row_replaces_stale_activity_with_what_came_back() {
+        let mid_flight = crate::protocol::SubagentTask {
+            said: Some("reading the third file".to_string()),
+            ..task("running", None)
+        };
+        assert_eq!(
+            subagent(&mid_flight, None, None).payload["detail"],
+            json!("reading the third file")
+        );
+
+        let silent = crate::protocol::SubagentTask {
+            said: Some("reading the third file".to_string()),
+            ..task("completed", None)
+        };
+        assert_eq!(
+            subagent(&silent, None, None).payload["detail"],
+            json!("Completed with no result"),
+            "a finished child's row still showed what it was doing before it finished"
+        );
+
+        let failed = crate::protocol::SubagentTask {
+            said: Some("reading the third file".to_string()),
+            ..task("failed", None)
+        };
+        assert_eq!(
+            subagent(&failed, None, None).payload["detail"],
+            json!("Failed with no reported reason")
+        );
+
+        let reported = crate::protocol::SubagentTask {
+            said: Some("reading the third file".to_string()),
+            ..task("failed", Some("the tool exited 1"))
+        };
+        assert_eq!(
+            subagent(&reported, None, None).payload["detail"],
+            json!("the tool exited 1"),
+            "a reason the child gave outranks the wording for having given none"
+        );
+    }
+
+    /// A request a delegated child raised says so — in the payload the panel
+    /// reads and in the sentence the developer reads — and one the root agent
+    /// raised is untouched.
+    #[test]
+    fn a_request_names_the_child_that_is_waiting_when_there_is_one() {
+        let root = asking("Bash", json!({"command": "ls"}));
+        let row = requested(&root, None);
+        assert_eq!(row.payload.get("subagent"), None);
+        assert_eq!(row.summary, "Bash needs permission");
+
+        let delegated = ApprovalRequest {
+            subagent: Some(crate::approval::Waiting {
+                child_id: "call_task_1".to_string(),
+                name: Some("explore".to_string()),
+            }),
+            ..asking("Bash", json!({"command": "ls"}))
+        };
+        let row = requested(&delegated, None);
+        assert_eq!(row.payload["subagent"]["childId"], "call_task_1");
+        assert_eq!(row.payload["subagent"]["name"], "explore");
+        assert_eq!(row.summary, "Subagent explore: Bash needs permission");
+        assert_eq!(
+            resolved(&delegated, Decision::Accept, None).summary,
+            "Approved: Subagent explore: Bash"
+        );
+    }
+
+    /// The developer's four decisions reach a child's stream as four distinct
+    /// resolutions. Distinctness is the property: a mapping that collapsed two
+    /// of them would leave a child's history unable to say which of them
+    /// happened, and nothing downstream could recover it.
+    #[test]
+    fn each_decision_reaches_a_childs_stream_as_a_resolution_of_its_own() {
+        let recorded: Vec<&str> = [
+            Decision::Accept,
+            Decision::AcceptForSession,
+            Decision::Decline,
+            Decision::Cancel,
+        ]
+        .into_iter()
+        .map(|decision| decision.resolution().as_str())
+        .collect();
+
+        assert_eq!(
+            recorded,
+            vec!["approved", "approvedForSession", "declined", "cancelled"]
+        );
     }
 
     /// The collapse key is the subagent's, not the spawning call's. A background
@@ -1358,6 +1528,7 @@ mod tests {
             suggestions: Vec::new(),
             available_decisions: None,
             provider_request_id: None,
+            subagent: None,
         }
     }
 

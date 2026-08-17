@@ -91,6 +91,52 @@ describe("derivePendingApprovals", () => {
     ]);
   });
 
+  /**
+   * A blocker a delegated child raised. Which child is waiting has to reach the
+   * panel the developer answers in, because approving a command a worker asked
+   * for is not the same act as approving one the agent you are talking to asked
+   * for — and the panel is the only place that difference can be seen.
+   */
+  it("carries the waiting child through to the approval panel", () => {
+    const [pending] = derivePendingApprovals([
+      makeActivity({
+        id: "approval-from-child",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "approval.requested",
+        summary: "Subagent explore: bash needs permission",
+        tone: "approval",
+        payload: {
+          requestId: "child-per-1",
+          requestKind: "command",
+          detail: "rm -rf build",
+          subagent: { childId: "call_task_1", name: "explore" },
+        },
+      }),
+    ]);
+
+    expect(pending?.subagent).toEqual({ childId: "call_task_1", name: "explore" });
+  });
+
+  /**
+   * And a request the provider did not attribute to a child keeps the root
+   * behaviour exactly: no child, rather than an invented one.
+   */
+  it("leaves a root agent's request unattributed", () => {
+    const [pending] = derivePendingApprovals([
+      makeActivity({
+        id: "approval-from-root",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "approval.requested",
+        summary: "bash needs permission",
+        tone: "approval",
+        payload: { requestId: "req-1", requestKind: "command" },
+      }),
+    ]);
+
+    expect(pending?.subagent).toBeUndefined();
+    expect(pending).not.toHaveProperty("subagent");
+  });
+
   it("maps canonical requestType payloads into pending approvals", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

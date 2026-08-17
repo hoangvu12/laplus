@@ -107,6 +107,7 @@ impl PermissionRequest {
             suggestions: self.suggestions,
             available_decisions: None,
             provider_request_id: None,
+            subagent: None,
         }
     }
 }

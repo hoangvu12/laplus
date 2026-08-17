@@ -571,6 +571,17 @@ struct PeerState {
     rollback_fails: bool,
     /// Script the turn that spawns a subagent rather than the plain one.
     subagent: bool,
+    /// Script the same subagent doing the *whole* of what OpenCode exposes — a
+    /// command, a read, a search, an edit, another tool, a retry warning — plus
+    /// one event kind this build has never heard of.
+    child_work: bool,
+    /// Script a blocker raised by the subagent's own session: `"permission"`,
+    /// `"question"`, or `"legacy"` — the session-scoped pre-`permission.asked`
+    /// envelope, whose reply route needs the *child's* session id.
+    child_blocker: Option<&'static str>,
+    /// Refuse the reply route, so the developer's decision never reaches the
+    /// child that is waiting for it.
+    child_reply_fails: bool,
     fail_reconciliation: bool,
     fail_followup_prompt: bool,
     /// Accept the abort and never answer it. An OpenCode wedged on a stalled
@@ -896,10 +907,72 @@ async fn prompt(
         }
     }
 
+    // Everything OpenCode exposes about a child's work, in the shapes a driven
+    // 1.18.10 emits them: a `tool` part per call, announced `pending` with an
+    // empty state and then carrying its input, its title and finally its output
+    // or its error. Interleaved with the child's prose, because that is how it
+    // arrives and because chronology is the thing the child tab preserves.
+    //
+    // The last two are deliberate awkwardness rather than coverage: a retry
+    // warning on the child's own session, and an event kind no build of laplus
+    // has ever seen. Neither may break the parent turn or the child's stream.
+    if state.child_work {
+        for event in [
+            r#"data: {"type":"message.updated","properties":{"sessionID":"ses_child_1","info":{"id":"child-message-2","sessionID":"ses_child_1","role":"assistant"}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-say","messageID":"child-message-2","sessionID":"ses_child_1","type":"text","text":"counting them"}}}"#,
+            // Announced before it knows what it is. Nothing to draw yet.
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-bash","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_bash","tool":"bash","state":{"status":"pending"}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-bash","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_bash","tool":"bash","state":{"status":"running","input":{"command":"ls -1 src | wc -l","description":"Count the files"}}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-read","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_read","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"title":"src/main.rs","output":"fn main() {}"}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-grep","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_grep","tool":"grep","state":{"status":"completed","input":{"pattern":"fn main","path":"src"},"title":"grep fn main","output":"src/main.rs:1"}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-edit","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_edit","tool":"edit","state":{"status":"completed","input":{"filePath":"src/counted.rs"},"title":"src/counted.rs","output":"1 addition"}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-fetch","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_fetch","tool":"webfetch","state":{"status":"error","input":{"url":"https://example.invalid"},"error":"could not resolve host"}}}}"#,
+            r#"data: {"type":"session.status","properties":{"sessionID":"ses_child_1","status":{"type":"retry","message":"Retrying the child's request"}}}"#,
+            r#"data: {"type":"child.future.event","properties":{"sessionID":"ses_child_1","whatever":{"nested":true}}}"#,
+        ] {
+            sender
+                .send(Ok(format!("{event}\n\n")))
+                .await
+                .expect("send scripted child work SSE event");
+        }
+    }
+
+    // A blocker raised by the descendant rather than by the conversation: the
+    // request carries the *child's* session id, which is the whole difference
+    // and the whole of what has to be routed correctly.
+    if let Some(blocker) = state.child_blocker {
+        let event = if blocker == "legacy" {
+            // The pre-`permission.asked` envelope: `type` rather than
+            // `permission`, and answered on a *session-scoped* route.
+            r#"data: {"type":"permission.updated","properties":{"id":"child-legacy-1","sessionID":"ses_child_1","type":"bash","patterns":["rm -rf build"],"metadata":{"command":"rm -rf build"},"tool":{"messageID":"child-message-2","callID":"child_call_rm"}}}"#
+        } else if blocker == "question" {
+            r#"data: {"type":"question.asked","properties":{"id":"child-que-1","sessionID":"ses_child_1","questions":[{"header":"Scope","question":"Count tests too?","options":[{"label":"Yes","description":"Include tests"},{"label":"No","description":"Source only"}],"multiple":false}]}}"#
+        } else {
+            r#"data: {"type":"permission.asked","properties":{"id":"child-per-1","sessionID":"ses_child_1","permission":"bash","patterns":["rm -rf build"],"metadata":{"command":"rm -rf build"},"always":[],"tool":{"messageID":"child-message-2","callID":"child_call_rm"}}}"#
+        };
+        sender
+            .send(Ok(format!("{event}\n\n")))
+            .await
+            .expect("send scripted child blocker SSE event");
+    }
+
     let gated = state.idle_release.is_some();
     let finish = async move {
         if let Some(release) = &state.idle_release {
             release.notified().await;
+        }
+        // The same call, finishing. Behind the gate on purpose: a subscription
+        // opened while it was `running` has the entry already, so what arrives
+        // here has to be an *in-place* update of it — which is the only way a
+        // live reader learns a tool call succeeded.
+        if state.child_work {
+            sender
+                .send(Ok(concat!(
+                    r#"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child_1","part":{"id":"child-prt-bash","messageID":"child-message-2","sessionID":"ses_child_1","type":"tool","callID":"child_call_bash","tool":"bash","state":{"status":"completed","input":{"command":"ls -1 src | wc -l"},"title":"ls -1 src | wc -l","output":"11"}}}}"#,
+                    "\n\n"
+                ).to_string()))
+                .await
+                .expect("send scripted child work SSE event");
         }
         if state.subagent {
             for event in [
@@ -952,19 +1025,34 @@ async fn reply_permission(
     AxumPath(request_id): AxumPath<String>,
     State(state): State<PeerState>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
     append(
         &state.log,
         json!({"operation":"permission.reply","requestId":request_id,"body":body}),
     );
     let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    // A descendant's permission is replied to on the *child's* session, and the
+    // conversation does not go idle because of it: the child carries on working
+    // and its `task` call is still in flight.
+    if state.child_reply_fails {
+        // Read and refused: OpenCode took the decision and would not accept it,
+        // so nothing will ever tell the child.
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    if state.child_blocker == Some("permission") {
+        sender.send(Ok(format!(
+            "data: {{\"type\":\"permission.replied\",\"properties\":{{\"sessionID\":\"ses_child_1\",\"requestID\":\"{request_id}\",\"reply\":{}}}}}\n\n",
+            body["reply"]
+        ))).await.unwrap();
+        return Ok(Json(json!(true)));
+    }
     for event in [
         "data: {\"id\":\"evt-reply-1\",\"type\":\"permission.replied\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"requestID\":\"per-1\",\"reply\":\"once\"}}\n\n",
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"type\":\"tool\",\"callID\":\"call-bash\",\"tool\":\"Bash\",\"state\":{\"status\":\"error\",\"input\":{},\"error\":\"denied\",\"time\":{\"start\":1,\"end\":2}}}}\n\n",
         "data: {\"id\":\"evt-tool-2\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"part-tool-1\",\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"type\":\"tool\",\"callID\":\"call-1\",\"tool\":\"mystery\",\"state\":{\"status\":\"completed\",\"input\":{\"secret\":42},\"output\":\"done\",\"title\":\"Mystery\",\"metadata\":{},\"time\":{\"start\":1,\"end\":2}}}}}\n\n",
         "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
     ] { sender.send(Ok(event.to_string())).await.unwrap(); }
-    Json(json!(true))
+    Ok(Json(json!(true)))
 }
 
 async fn reply_legacy_permission(
@@ -974,6 +1062,13 @@ async fn reply_legacy_permission(
 ) -> Json<Value> {
     append(&state.log, json!({"operation":"permission.reply.legacy","sessionId":session_id,"requestId":request_id,"body":body}));
     let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    if state.child_blocker == Some("legacy") {
+        sender.send(Ok(format!(
+            "data: {{\"type\":\"permission.replied\",\"properties\":{{\"sessionID\":\"ses_child_1\",\"requestID\":\"{request_id}\",\"reply\":{}}}}}\n\n",
+            body["response"]
+        ))).await.unwrap();
+        return Json(json!(true));
+    }
     sender.send(Ok("data: {\"type\":\"permission.replied\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"permissionID\":\"legacy-1\",\"response\":\"once\"}}\n\n".to_string())).await.unwrap();
     Json(json!(true))
 }
@@ -981,6 +1076,12 @@ async fn reply_legacy_permission(
 async fn reply_question(AxumPath(request_id): AxumPath<String>, State(state): State<PeerState>, Json(body): Json<Value>) -> Json<Value> {
     append(&state.log, json!({"operation":"question.reply","requestId":request_id,"body":body}));
     let sender = state.subscriber.lock().unwrap().clone().unwrap();
+    // See `reply_permission`: a descendant's question resolves on the child's
+    // session, and does not settle the conversation.
+    if state.child_blocker == Some("question") {
+        sender.send(Ok(format!("data: {{\"type\":\"question.replied\",\"properties\":{{\"sessionID\":\"ses_child_1\",\"requestID\":\"{request_id}\",\"answers\":{}}}}}\n\n", body["answers"]))).await.unwrap();
+        return Json(json!(true));
+    }
     sender.send(Ok(format!("data: {{\"type\":\"question.replied\",\"properties\":{{\"sessionID\":\"ses_owned_1\",\"requestID\":\"{request_id}\",\"answers\":{}}}}}\n\n", body["answers"]))).await.unwrap();
     sender.send(Ok("data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n".to_string())).await.unwrap();
     Json(json!(true))
@@ -1158,6 +1259,52 @@ impl ExternalOpenCode {
             healthy: true,
             idle_release: Some(release),
             subagent: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// The same subagent, doing everything OpenCode exposes about a child's
+    /// work rather than only talking.
+    async fn spawning_a_working_subagent(release: Arc<Notify>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(release),
+            subagent: true,
+            child_work: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// A subagent that stops for the developer: `"permission"`, `"question"`, or
+    /// `"legacy"`.
+    async fn spawning_a_blocked_subagent(release: Arc<Notify>, blocker: &'static str) -> Self {
+        Self::blocked_subagent(release, blocker, false).await
+    }
+
+    /// The same, with a reply route that refuses the developer's decision.
+    async fn refusing_the_decision(release: Arc<Notify>) -> Self {
+        Self::blocked_subagent(release, "permission", true).await
+    }
+
+    async fn blocked_subagent(
+        release: Arc<Notify>,
+        blocker: &'static str,
+        child_reply_fails: bool,
+    ) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(release),
+            subagent: true,
+            child_blocker: Some(blocker),
+            child_reply_fails,
             ..Default::default()
         };
         Self::serving(directory, log, state).await
@@ -2864,6 +3011,781 @@ async fn an_opencode_child_work_stream_replays_and_then_continues_live() {
         "the thread snapshot grew a child-stream field: {thread:#?}"
     );
 
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// A conversation with a delegated child under way, and the compact row that
+/// launches it already on the wire.
+///
+/// The four child tests below differ only in what their peer scripts, so the
+/// eleven lines that get one delegated are here once. What each of them does
+/// with the returned client is the test.
+async fn a_delegating_turn(
+    peer: &ExternalOpenCode,
+    suffix: &str,
+) -> (Workspace, TestServer, SocketClient, String, String) {
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    let project = format!("child-{suffix}-project");
+    let thread = format!("child-{suffix}-thread");
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project(&project, workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread(&project, &thread);
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation(&thread).await;
+    let mut command = start_turn(&thread, &format!("child-{suffix}-message"), "count the files");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+    (workspace, server, client, subscription, thread)
+}
+
+/// Every entry of one child's stream, in order, as a client folds them.
+fn folded_entries(snapshot: &Value, live: &[Value]) -> Vec<Value> {
+    let mut folded: Vec<Value> = snapshot["entries"]
+        .as_array()
+        .expect("the snapshot carries the entries so far")
+        .clone();
+    for item in live {
+        let Some(entry) = item.get("entry").filter(|entry| entry.is_object()) else {
+            continue;
+        };
+        match folded.iter().position(|held| held["id"] == entry["id"]) {
+            Some(index) => folded[index] = entry.clone(),
+            None => folded.push(entry.clone()),
+        }
+    }
+    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
+    folded
+}
+
+/// The whole of what OpenCode exposes about a child's work, in the order it
+/// happened, read back through the subscription a tab opens.
+///
+/// The stream is what "enter the child's work" *means*, so this asserts the
+/// shape a client renders from rather than that some events arrived: a command
+/// with its command line and its output, a read and a search with the file and
+/// the pattern, an edit with the file it changed, a tool call that failed with
+/// its error, a warning in its chronological place, and prose between them.
+///
+/// It also asserts two silences. The `pending` `tool` part OpenCode opens every
+/// call with produces **no** entry — it carries nothing but an id, and a row
+/// that appeared nameless to be renamed a beat later is the partial state the
+/// spec asks to be left out. And an event kind this build has never seen
+/// produces no entry and breaks neither the child's stream nor the parent's
+/// turn, which is the drift policy applied to a descendant.
+#[tokio::test]
+async fn a_child_stream_preserves_the_whole_of_what_the_child_did() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_working_subagent(release.clone()).await;
+    let (_workspace, server, mut client, subscription, _thread) =
+        a_delegating_turn(&peer, "work").await;
+
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "child-work-thread", "childId": "call_task_1"}),
+        )
+        .await;
+    let replayed = inspector.next_chunk(&stream).await;
+    inspector.ack(&stream).await;
+    let snapshot = replayed
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("a child stream opens with itself")["snapshot"]
+        .clone();
+
+    release.notify_one();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        inspector.values_until(&stream, |item| {
+            item["kind"] == "stream-updated" && item["stream"]["state"] == "completed"
+        }),
+    )
+    .await
+    .expect("the child's conclusion reaches its stream");
+    let folded = folded_entries(&snapshot, &replayed.iter().chain(live.iter()).cloned().collect::<Vec<_>>());
+
+    let read: Vec<(&str, &str)> = folded
+        .iter()
+        .map(|entry| {
+            (
+                entry["kind"].as_str().expect("a kind"),
+                entry["payload"]["text"]
+                    .as_str()
+                    .or_else(|| entry["payload"]["title"].as_str())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            ("message", "looking through the directory"),
+            ("message", "counting them"),
+            ("command", "ls -1 src | wc -l"),
+            ("read", "src/main.rs"),
+            ("read", "grep fn main"),
+            ("edit", "src/counted.rs"),
+            ("tool", "webfetch"),
+            ("notice", "Retrying the child's request"),
+            ("message", "eleven so far"),
+            ("outcome", "eleven files"),
+        ],
+        "the child's work was lost, reordered, or read as the wrong kind: {folded:#?}"
+    );
+
+    let at = |index: usize| folded[index]["payload"].clone();
+    assert_eq!(at(2)["command"], "ls -1 src | wc -l", "a command entry carries what was run");
+    assert_eq!(at(2)["detail"], "11", "a command entry carries its output");
+    assert_eq!(at(2)["status"], "completed");
+    assert_eq!(at(3)["paths"], json!(["src/main.rs"]), "a read names the file it examined");
+    assert_eq!(at(4)["query"], "fn main", "a search names what it looked for");
+    assert_eq!(
+        at(4)["paths"],
+        json!([]),
+        "a search's directory is not a file the developer can be offered to open"
+    );
+    assert_eq!(
+        at(5)["paths"],
+        json!(["src/counted.rs"]),
+        "an edit names the file it changed, which is what diff navigation is offered from"
+    );
+    assert_eq!(at(6)["status"], "failed", "a tool that errored says so");
+    assert_eq!(at(6)["detail"], "could not resolve host");
+    assert_eq!(at(7)["level"], "warning");
+    assert_eq!(folded[9]["payload"]["kind"], "completed");
+    assert_eq!(folded[9]["payload"]["text"], "eleven files");
+
+    // The `pending` part and the unknown event both produced nothing, and the
+    // parent's turn ended normally in spite of the second.
+    assert!(
+        folded.iter().all(|entry| entry["payload"]["status"] != "inProgress"),
+        "an announced-but-empty call was drawn: {folded:#?}"
+    );
+    client.events_through_the_turn(&subscription).await;
+
+    inspector.close().await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// The compact row is an index, not a log: it shows the latest meaningful thing
+/// the child did while it runs, and what came back once it has finished.
+///
+/// Both halves are one test because the second is only interesting given the
+/// first — a terminal row that happens to be blank would satisfy "no stale
+/// activity" while telling the developer nothing.
+#[tokio::test]
+async fn the_compact_row_follows_the_child_and_then_reports_it() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_working_subagent(release.clone()).await;
+    let (_workspace, server, mut client, subscription, _thread) =
+        a_delegating_turn(&peer, "row").await;
+    release.notify_one();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let rows: Vec<&Value> = events
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .filter(|activity| activity["payload"]["data"]["childId"] == "call_task_1")
+        .collect();
+    let details: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["payload"]["detail"].as_str())
+        .collect();
+
+    assert!(
+        details.contains(&"ls -1 src | wc -l"),
+        "the row never showed what the child ran: {details:#?}"
+    );
+    assert!(
+        details.contains(&"src/main.rs"),
+        "the row never showed what the child examined: {details:#?}"
+    );
+    // Transport noise and partial states never reach it. `bash` is what the row
+    // would have said had the announced-but-empty call been drawn, and `task` is
+    // the tool the whole subagent is.
+    assert!(
+        !details.iter().any(|detail| *detail == "bash" || *detail == "task"),
+        "an unhelpful partial state reached the compact row: {details:#?}"
+    );
+
+    // And the answer replaces all of it, atomically: the last row is the
+    // conclusion and nothing the child said on the way to it survives beside it.
+    let last = rows.last().expect("a subagent row");
+    assert_eq!(last["payload"]["status"], "completed");
+    assert_eq!(last["payload"]["detail"], "eleven files");
+
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// A subagent that stops for a permission it cannot grant itself.
+///
+/// The whole route, end to end and through the boundary a client actually uses:
+/// the child's own stream records that it waited, the **main conversation** gets
+/// the ordinary request row naming the child that raised it, the developer's
+/// decision is answered with no child surface open at all, OpenCode receives it
+/// on the descendant's own request identity, and the child's stream records how
+/// it resolved.
+///
+/// The tab is deliberately closed before the answer. A blocker that is only
+/// actionable while its child's tab is open is a blocker that hides.
+#[tokio::test]
+async fn a_descendant_permission_is_recorded_in_the_child_and_answered_from_the_conversation() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_blocked_subagent(release.clone(), "permission").await;
+    let (_workspace, server, mut client, subscription, thread) =
+        a_delegating_turn(&peer, "block").await;
+
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.requested"
+        }),
+    )
+    .await
+    .expect("a descendant's permission reaches the main conversation");
+    let request = activity(&asked, "approval.requested")["payload"]["activity"].clone();
+    let request_id = request["payload"]["requestId"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+    assert_eq!(request_id, "child-per-1");
+    assert_eq!(
+        request["payload"]["subagent"]["childId"], "call_task_1",
+        "the request did not say which child is waiting: {request:#?}"
+    );
+    assert_eq!(request["payload"]["subagent"]["name"], "explore");
+    assert!(
+        request["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("Subagent explore")),
+        "the request the developer reads does not name the waiting child: {request:#?}"
+    );
+
+    // Open the child's tab, see that it says it is waiting, and close it again.
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread, "childId": "call_task_1"}),
+        )
+        .await;
+    let opened = inspector.next_chunk(&stream).await;
+    let snapshot = opened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child opens")["snapshot"]
+        .clone();
+    assert_eq!(
+        snapshot["stream"]["state"], "blocked",
+        "a child waiting on the developer did not say so: {snapshot:#?}"
+    );
+    let waiting = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["kind"] == "blocker")
+        .expect("the child's history says why it waited")
+        .clone();
+    assert_eq!(waiting["payload"]["requestId"], "child-per-1");
+    assert_eq!(waiting["payload"]["blocker"], "permission");
+    assert_eq!(waiting["payload"]["resolution"], Value::Null);
+    inspector.interrupt(&stream).await;
+
+    // Answered with no child surface open anywhere.
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval(&thread, &request_id, "accept"),
+        )
+        .await
+        .expect_success();
+
+    let resolved = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.resolved"
+        }),
+    )
+    .await
+    .expect("the decision closes the request in the main conversation");
+    assert!(
+        activity(&resolved, "approval.resolved")["payload"]["activity"]["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("Subagent explore")),
+        "the resolution did not say whose request it answered"
+    );
+
+    // OpenCode received it on the descendant's own request identity.
+    let requests = peer.requests_through(3).await;
+    let reply = requests
+        .iter()
+        .find(|request| request["operation"] == "permission.reply")
+        .expect("the decision reached OpenCode");
+    assert_eq!(reply["requestId"], "child-per-1");
+    assert_eq!(reply["body"]["reply"], "once");
+
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+
+    // And the child's own history records how it resolved, on the same entry.
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread, "childId": "call_task_1"}),
+        )
+        .await;
+    let reopened = inspector.next_chunk(&stream).await;
+    let snapshot = reopened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child reopens")["snapshot"]
+        .clone();
+    let blockers: Vec<&Value> = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|entry| entry["kind"] == "blocker")
+        .collect();
+    assert_eq!(
+        blockers.len(),
+        1,
+        "asking and answering became two rows rather than one blocker: {blockers:#?}"
+    );
+    assert_eq!(blockers[0]["payload"]["resolution"], "approved");
+    assert_eq!(snapshot["stream"]["state"], "completed");
+
+    inspector.close().await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// An entry that changes **in place** reaches a client that is already watching.
+///
+/// The mechanism this guards is easy to get wrong and silent when it is. A tool
+/// call and a blocker are both one entry that *moves* — `inProgress` becomes
+/// `completed`, `resolution: null` becomes a decision — so what a live reader
+/// receives is an upsert of an entry it already holds rather than a new one. The
+/// stream head moves too, but `updatedAt` is millisecond-resolution, so two
+/// writes inside one millisecond stamp identically: a client that noticed
+/// changes by watching the head would miss both of these.
+///
+/// So this folds **only the `entry-upserted` frames** and throws every
+/// `stream-updated` away. What survives that is what a reader learns from the
+/// entries alone, which is the only thing it may depend on.
+#[tokio::test]
+async fn an_entry_that_changes_in_place_reaches_a_watching_client() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_working_subagent(release.clone()).await;
+    let (_workspace, server, mut client, subscription, thread) =
+        a_delegating_turn(&peer, "live").await;
+
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread, "childId": "call_task_1"}),
+        )
+        .await;
+    let opened = inspector.next_chunk(&stream).await;
+    inspector.ack(&stream).await;
+    let snapshot = opened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child opens")["snapshot"]
+        .clone();
+
+    // The call is in flight when the tab opens, which is what makes what follows
+    // an update rather than an arrival.
+    let running = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["kind"] == "command")
+        .expect("the child's command is already in the stream")
+        .clone();
+    assert_eq!(
+        running["payload"]["status"], "inProgress",
+        "the scripted call had already finished, so nothing here is an in-place update: {snapshot:#?}"
+    );
+
+    release.notify_one();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        inspector.values_until(&stream, |item| {
+            item["kind"] == "stream-updated" && item["stream"]["state"] == "completed"
+        }),
+    )
+    .await
+    .expect("the child's conclusion reaches its stream");
+
+    // Everything the wire carried as an entry, and nothing it carried as a head.
+    let upserted: Vec<&Value> = live
+        .iter()
+        .filter(|item| item["kind"] == "entry-upserted")
+        .map(|item| &item["entry"])
+        .collect();
+    let moved = upserted
+        .iter()
+        .find(|entry| entry["id"] == running["id"])
+        .unwrap_or_else(|| {
+            panic!(
+                "the call finished and no client watching it was told: {upserted:#?}"
+            )
+        });
+    assert_eq!(moved["payload"]["status"], "completed");
+    assert_eq!(moved["payload"]["detail"], "11", "the output never arrived");
+    assert_eq!(
+        moved["sequence"], running["sequence"],
+        "an in-place update moved the entry to the end of the child's history"
+    );
+
+    client.events_through_the_turn(&subscription).await;
+    inspector.close().await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// The same guarantee for a blocker's resolution, which is the other entry in
+/// this feature that changes under its own key — and the one whose staleness a
+/// developer would read as "the child is still waiting for me".
+#[tokio::test]
+async fn a_blockers_resolution_reaches_a_watching_client() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_blocked_subagent(release.clone(), "permission").await;
+    let (_workspace, server, mut client, subscription, thread) =
+        a_delegating_turn(&peer, "livefix").await;
+
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.requested"
+        }),
+    )
+    .await
+    .expect("the descendant's permission reaches the conversation");
+    let request_id = activity(&asked, "approval.requested")["payload"]["activity"]["payload"]
+        ["requestId"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+
+    // Watching throughout — the tab stays open across the answer, which is the
+    // case the close-and-reopen test cannot cover.
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread, "childId": "call_task_1"}),
+        )
+        .await;
+    let opened = inspector.next_chunk(&stream).await;
+    inspector.ack(&stream).await;
+    let waiting = opened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child opens")["snapshot"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["kind"] == "blocker")
+        .expect("the child says it is waiting")
+        .clone();
+    assert_eq!(waiting["payload"]["resolution"], Value::Null);
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval(&thread, &request_id, "accept"),
+        )
+        .await
+        .expect_success();
+
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        inspector.values_until(&stream, |item| {
+            item["kind"] == "entry-upserted" && item["entry"]["kind"] == "blocker"
+        }),
+    )
+    .await
+    .expect("the answer reaches the open tab");
+    let resolved = live
+        .iter()
+        .filter(|item| item["kind"] == "entry-upserted")
+        .map(|item| &item["entry"])
+        .find(|entry| entry["id"] == waiting["id"])
+        .expect("the blocker the developer answered moved")
+        .clone();
+    assert_eq!(resolved["payload"]["resolution"], "approved");
+
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+    inspector.close().await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// A decision the developer made that never reached the child.
+///
+/// The conversation and the child's stream have to agree, and the honest thing
+/// for both to say is "you decided, and it could not be delivered" — not that
+/// the child was told. So the panel clears (the developer has done all they
+/// can), the conversation carries the failure, and the child stays **blocked**
+/// with its blocker recording `undelivered`. A child left reading "still
+/// waiting" beside a conversation reading "approved" would be the two halves of
+/// one blocker disagreeing about what happened.
+#[tokio::test]
+async fn a_decision_that_could_not_be_delivered_says_so_in_both_places() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::refusing_the_decision(release.clone()).await;
+    let (_workspace, server, mut client, subscription, thread) =
+        a_delegating_turn(&peer, "undeliv").await;
+
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.requested"
+        }),
+    )
+    .await
+    .expect("the descendant's permission reaches the conversation");
+    let request_id = activity(&asked, "approval.requested")["payload"]["activity"]["payload"]
+        ["requestId"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval(&thread, &request_id, "accept"),
+        )
+        .await
+        .expect_success();
+
+    let after = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.resolved"
+        }),
+    )
+    .await
+    .expect("the panel clears even though the decision could not be sent");
+    // Both halves of the conversation's account: the developer decided, and the
+    // agent could not be told.
+    assert!(
+        harness::conversation::find_activity(&after, "session.failed").is_some(),
+        "the conversation never said the decision could not be sent: {:?}",
+        harness::conversation::kinds(&after)
+    );
+
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread, "childId": "call_task_1"}),
+        )
+        .await;
+    let reopened = inspector.next_chunk(&stream).await;
+    let snapshot = reopened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child opens")["snapshot"]
+        .clone();
+    let blocker = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["kind"] == "blocker")
+        .expect("the child's history explains the pause")
+        .clone();
+    assert_eq!(
+        blocker["payload"]["resolution"], "undelivered",
+        "the child's stream still reads as waiting for an answer that will never come: {snapshot:#?}"
+    );
+    assert_eq!(
+        snapshot["stream"]["state"], "blocked",
+        "a child nothing reached was reported as working again: {snapshot:#?}"
+    );
+
+    inspector.close().await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// The legacy permission route is **session-scoped**, and the session it needs
+/// is the child's.
+///
+/// This is the one place a descendant's identity is load-bearing beyond its
+/// request id: `POST /session/{id}/permissions/{id}` addressed at the
+/// conversation's own session is a reply to a request that session never made.
+/// The modern route carries the id alone and cannot show the mistake, so
+/// without this the `raised_in` lookup would be untested.
+#[tokio::test]
+async fn a_legacy_descendant_permission_is_answered_on_the_childs_session() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_blocked_subagent(release.clone(), "legacy").await;
+    let (_workspace, server, mut client, subscription, thread) =
+        a_delegating_turn(&peer, "legacy").await;
+
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.requested"
+        }),
+    )
+    .await
+    .expect("a legacy descendant permission reaches the conversation");
+    let request = activity(&asked, "approval.requested")["payload"]["activity"].clone();
+    assert_eq!(request["payload"]["subagent"]["childId"], "call_task_1");
+    let request_id = request["payload"]["requestId"]
+        .as_str()
+        .expect("a request id")
+        .to_string();
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_approval(&thread, &request_id, "accept"),
+        )
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "approval.resolved"
+        }),
+    )
+    .await
+    .expect("the decision closes the request");
+
+    let requests = peer.requests_through(3).await;
+    let reply = requests
+        .iter()
+        .find(|request| request["operation"] == "permission.reply.legacy")
+        .expect("the decision reached OpenCode's session-scoped route");
+    assert_eq!(
+        reply["sessionId"], "ses_child_1",
+        "the descendant's decision was addressed at the conversation's session: {reply}"
+    );
+    assert_eq!(reply["requestId"], "child-legacy-1");
+
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// The same route for a descendant's *question*, which OpenCode raises and
+/// answers on a different pair of endpoints entirely.
+#[tokio::test]
+async fn a_descendant_question_is_recorded_in_the_child_and_answered_from_the_conversation() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_blocked_subagent(release.clone(), "question").await;
+    let (_workspace, server, mut client, subscription, thread) =
+        a_delegating_turn(&peer, "ask").await;
+
+    let (asked, request_id) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.events_until_user_input(&subscription),
+    )
+    .await
+    .expect("a descendant's question reaches the main conversation");
+    let question = activity(&asked, "user-input.requested")["payload"]["activity"].clone();
+    assert_eq!(question["payload"]["subagent"]["childId"], "call_task_1");
+    assert_eq!(question["payload"]["subagent"]["name"], "explore");
+    assert_eq!(question["payload"]["questions"][0]["question"], "Count tests too?");
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            respond_to_user_input(
+                &thread,
+                &request_id,
+                json!({"question-0-scope": ["Yes"]}),
+            ),
+        )
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["kind"] == "user-input.resolved"
+        }),
+    )
+    .await
+    .expect("the answers close the question in the main conversation");
+
+    let requests = peer.requests_through(3).await;
+    let reply = requests
+        .iter()
+        .find(|request| request["operation"] == "question.reply")
+        .expect("the answers reached OpenCode");
+    assert_eq!(reply["requestId"], "child-que-1");
+    assert_eq!(reply["body"]["answers"], json!([["Yes"]]));
+
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread, "childId": "call_task_1"}),
+        )
+        .await;
+    let reopened = inspector.next_chunk(&stream).await;
+    let snapshot = reopened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child reopens")["snapshot"]
+        .clone();
+    let blocker = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["kind"] == "blocker")
+        .expect("the child's history says why it waited")
+        .clone();
+    assert_eq!(blocker["payload"]["blocker"], "question");
+    assert_eq!(blocker["payload"]["resolution"], "answered");
+
+    inspector.close().await;
+    client.close().await;
     server.stop().await;
     peer.task.abort();
 }

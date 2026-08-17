@@ -97,18 +97,47 @@ interface DerivedWorkLogEntry extends WorkLogEntry {
   toolCallId?: string;
 }
 
+/**
+ * The delegated child a request belongs to, when it is not the root agent.
+ *
+ * Present exactly when the provider proved which child stopped. The developer
+ * has to know *before deciding* whose work their answer will unblock, and a
+ * request that named nobody would be a decision made on somebody's behalf
+ * without saying whose.
+ */
+export interface RequestingSubagent {
+  childId: string;
+  name?: string;
+}
+
 export interface PendingApproval {
   requestId: ApprovalRequestId;
   requestKind: "command" | "file-read" | "file-change";
   createdAt: string;
   detail?: string;
   availableDecisions?: ReadonlyArray<ProviderApprovalDecision>;
+  subagent?: RequestingSubagent;
 }
 
 export interface PendingUserInput {
   requestId: ApprovalRequestId;
   createdAt: string;
   questions: ReadonlyArray<UserInputQuestion>;
+  subagent?: RequestingSubagent;
+}
+
+/**
+ * Which child raised this request, from an activity payload — or `undefined`,
+ * which is the root agent and every provider that does not attribute a request
+ * to a child.
+ */
+export function parseRequestingSubagent(payload: unknown): RequestingSubagent | undefined {
+  if (payload === null || typeof payload !== "object") return undefined;
+  const subagent = (payload as { subagent?: unknown }).subagent;
+  if (subagent === null || typeof subagent !== "object") return undefined;
+  const { childId, name } = subagent as { childId?: unknown; name?: unknown };
+  if (typeof childId !== "string" || childId.trim().length === 0) return undefined;
+  return typeof name === "string" && name.trim().length > 0 ? { childId, name } : { childId };
 }
 
 export interface ActivePlanState {
@@ -406,12 +435,14 @@ export function derivePendingApprovals(
     const availableDecisions = parseApprovalDecisions(payload?.availableDecisions);
 
     if (activity.kind === "approval.requested" && requestId && requestKind) {
+      const subagent = parseRequestingSubagent(payload);
       openByRequestId.set(requestId, {
         requestId,
         requestKind,
         createdAt: activity.createdAt,
         ...(detail ? { detail } : {}),
         ...(availableDecisions ? { availableDecisions } : {}),
+        ...(subagent ? { subagent } : {}),
       });
       continue;
     }
@@ -508,10 +539,12 @@ export function derivePendingUserInputs(
       if (!questions) {
         continue;
       }
+      const subagent = parseRequestingSubagent(payload);
       openByRequestId.set(requestId, {
         requestId,
         createdAt: activity.createdAt,
         questions,
+        ...(subagent ? { subagent } : {}),
       });
       continue;
     }

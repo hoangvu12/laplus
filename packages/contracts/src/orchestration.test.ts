@@ -1015,3 +1015,116 @@ it.effect("a subagent subscription names the thread and the child", () =>
     assert.strictEqual(blank._tag, "Failure");
   }),
 );
+
+/**
+ * The entry kind decides the payload, and saying so in the schema is what makes
+ * a client's rendering exhaustive rather than a cast that agrees with the server
+ * by convention. Each of the four work kinds carries the same shape, in the
+ * client's own work-log vocabulary.
+ */
+it.effect("a subagent entry's kind decides its payload", () =>
+  Effect.gen(function* () {
+    const ran = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "call_task_1:k:child_call_bash",
+        sequence: 4,
+        kind: "command",
+        payload: {
+          title: "ls -1 src | wc -l",
+          status: "completed",
+          detail: "11",
+          command: "ls -1 src | wc -l",
+          paths: [],
+          query: null,
+        },
+        createdAt: "2026-08-17T00:00:04.000Z",
+      },
+    });
+    assert.strictEqual(ran.kind, "entry-upserted");
+    if (ran.kind !== "entry-upserted" || ran.entry.kind !== "command") return;
+    assert.strictEqual(ran.entry.payload.command, "ls -1 src | wc -l");
+    assert.strictEqual(ran.entry.payload.status, "completed");
+
+    // An edit names the files it changed, which is what file and diff
+    // navigation from the child's tab is offered from.
+    const edited = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "call_task_1:k:child_call_edit",
+        sequence: 5,
+        kind: "edit",
+        payload: {
+          title: "src/counted.rs",
+          status: "completed",
+          detail: null,
+          command: null,
+          paths: ["src/counted.rs"],
+          query: null,
+        },
+        createdAt: "2026-08-17T00:00:05.000Z",
+      },
+    });
+    if (edited.kind !== "entry-upserted" || edited.entry.kind !== "edit") return;
+    assert.deepStrictEqual([...edited.entry.payload.paths], ["src/counted.rs"]);
+  }),
+);
+
+/**
+ * A blocker is one entry for the whole wait: `resolution` is `null` while the
+ * child is stopped and carries what the developer decided once they have, so a
+ * child's history explains the pause without two rows to pair by an id.
+ */
+it.effect("a subagent blocker is one entry, asked and answered", () =>
+  Effect.gen(function* () {
+    const waiting = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "call_task_1:k:blocker:child-per-1",
+        sequence: 6,
+        kind: "blocker",
+        payload: {
+          requestId: "child-per-1",
+          blocker: "permission",
+          title: "bash",
+          detail: "rm -rf build",
+          resolution: null,
+        },
+        createdAt: "2026-08-17T00:00:06.000Z",
+      },
+    });
+    if (waiting.kind !== "entry-upserted" || waiting.entry.kind !== "blocker") return;
+    assert.strictEqual(waiting.entry.payload.resolution, null);
+    assert.strictEqual(waiting.entry.payload.requestId, "child-per-1");
+
+    const answered = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: { ...waiting.entry, payload: { ...waiting.entry.payload, resolution: "approved" } },
+    });
+    if (answered.kind !== "entry-upserted" || answered.entry.kind !== "blocker") return;
+    assert.strictEqual(
+      answered.entry.id,
+      waiting.entry.id,
+      "the answer moved the entry it answers rather than following it",
+    );
+    assert.strictEqual(answered.entry.payload.resolution, "approved");
+  }),
+);
+
+/** A warning or an error keeps its place in the child's work. */
+it.effect("a subagent notice says whether it is a warning or an error", () =>
+  Effect.gen(function* () {
+    const noticed = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "call_task_1:n:8",
+        sequence: 8,
+        kind: "notice",
+        payload: { level: "warning", text: "Retrying the child's request" },
+        createdAt: "2026-08-17T00:00:08.000Z",
+      },
+    });
+    if (noticed.kind !== "entry-upserted" || noticed.entry.kind !== "notice") return;
+    assert.strictEqual(noticed.entry.payload.level, "warning");
+  }),
+);

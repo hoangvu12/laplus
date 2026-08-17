@@ -2700,6 +2700,7 @@ pub(crate) mod tests {
                 suggestions: Vec::new(),
                 available_decisions: None,
                 provider_request_id: None,
+                subagent: None,
             },
             Some("turn-1".to_string()),
         )
@@ -2742,6 +2743,7 @@ pub(crate) mod tests {
                     suggestions: Vec::new(),
                     available_decisions: None,
                     provider_request_id: None,
+                    subagent: None,
                 },
                 vec![json!({"id": "q", "question": "q", "options": []})],
                 Some("turn-1".to_string()),
