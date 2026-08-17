@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use harness::agent::ScriptedAgent;
+use harness::codex::ScriptedCodex;
 use harness::conversation::{create_project, follow_up, start_turn};
 use harness::workspace::Workspace;
 use harness::TestServer;
@@ -177,6 +178,91 @@ async fn a_first_turn_uses_the_configured_generator_and_persists_its_title() {
     assert_eq!(generator.prompts.load(Ordering::SeqCst), 1);
     resumed.close().await;
     restarted.stop().await;
+}
+
+#[tokio::test]
+async fn an_image_only_first_turn_gives_opencode_the_stored_image_not_upload_json() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let (endpoint, generator) = generator().await;
+    let server = TestServer::start_with(configured(&agent, &endpoint)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    let mut turn = start_turn("thread-1", "message-1", "");
+    turn["message"]["attachments"] = json!([{"type":"image","name":"subject.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="}]);
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    generator.started.notified().await;
+    let request = generator.requests.lock().unwrap()[0].clone();
+    let parts = request["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["type"], "text");
+    assert!(!parts[0]["text"].as_str().unwrap().contains("data:image"));
+    assert!(!parts[0]["text"].as_str().unwrap().contains("sizeBytes"));
+    assert_eq!(parts[1]["type"], "file");
+    assert_eq!(parts[1]["mime"], "image/png");
+    assert_eq!(parts[1]["filename"], "subject.png");
+    assert!(parts[1]["url"].as_str().unwrap().starts_with("file://"));
+    generator.release.notify_one();
+    wait_for_title(&server, "Focused socket titles").await;
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_image_only_first_turn_gives_codex_a_structured_image_input() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let codex = ScriptedCodex::title_generator();
+    let mut config = ServerConfig::detect();
+    config.settings.providers.claude_agent.binary_path = agent.configured();
+    config.settings.providers.codex.binary_path = codex.configured();
+    config.settings.provider_instances.insert("titleCodex".into(), json!({"driver":"codex","displayName":"Title Codex","enabled":true,"config":{"binaryPath":codex.configured(),"homePath":"","launchArgs":"","customModels":[]}}));
+    config.settings.text_generation_model_selection = json!({"instanceId":"titleCodex","model":"gpt-title"});
+    let server = TestServer::start_with(config).await;
+    let workspace = Workspace::with(&["src/"]);
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    let mut turn = start_turn("thread-1", "message-1", "");
+    turn["message"]["attachments"] = json!([{"type":"image","name":"subject.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="}]);
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    wait_for_title(&server, "Screenshot subject").await;
+    let title_turn = codex.turn_start_requests().into_iter().next().unwrap();
+    let input = title_turn["params"]["input"].as_array().unwrap();
+    assert_eq!(input[0]["type"], "text");
+    assert!(!input[0]["text"].as_str().unwrap().contains("data:image"));
+    assert!(!input[0]["text"].as_str().unwrap().contains("sizeBytes"));
+    assert_eq!(input[1], json!({"type":"image","url":"data:image/png;base64,aGk="}));
+    client.close().await;
+    server.stop().await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn an_image_only_first_turn_gives_claude_a_native_base64_image_block() {
+    use std::os::unix::fs::PermissionsExt;
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let title_cli = tempfile::tempdir().unwrap();
+    let binary = title_cli.path().join("claude-title");
+    std::fs::write(&binary, "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > title-prompt\nprintf '%s' '{\"structured_output\":{\"title\":\"Screenshot subject\"}}'\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = ServerConfig::detect();
+    config.settings.providers.claude_agent.binary_path = agent.configured();
+    config.settings.provider_instances.insert("titleClaude".into(), json!({"driver":"claudeAgent","displayName":"Title Claude","enabled":true,"config":{"binaryPath":binary.display().to_string(),"homePath":"","launchArgs":"","customModels":[]}}));
+    config.settings.text_generation_model_selection = json!({"instanceId":"titleClaude","model":"claude-title"});
+    let server = TestServer::start_with(config).await;
+    let workspace = Workspace::with(&["src/"]);
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    let mut turn = start_turn("thread-1", "message-1", "");
+    turn["message"]["attachments"] = json!([{"type":"image","name":"subject.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="}]);
+    client.call("orchestration.dispatchCommand", turn).await.expect_success();
+    wait_for_title(&server, "Screenshot subject").await;
+    let request: Value = serde_json::from_str(&std::fs::read_to_string(workspace.path().join("title-prompt")).unwrap()).unwrap();
+    let content = request["message"]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert!(!content[0]["text"].as_str().unwrap().contains("data:image"));
+    assert_eq!(content[1], json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}));
+    client.close().await;
+    server.stop().await;
 }
 
 #[tokio::test]

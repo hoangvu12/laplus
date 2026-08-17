@@ -41,6 +41,25 @@ fn rewrite_conversation_ids(value: &mut Value) {
 }
 
 impl ScriptedCodex {
+    pub fn title_generator() -> ScriptedCodex {
+        let codex = ScriptedCodex::plain_conversation();
+        for name in ["turn-events-before-pause", "turn-events-after-pause", "turn-terminal"] {
+            let path = codex.directory.path().join(name);
+            let rewritten = std::fs::read_to_string(&path).unwrap().lines().map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                if value["method"] == "item/completed" && value["params"]["item"]["type"] == "agentMessage" {
+                    value["params"]["item"]["text"] = Value::String("{\"title\":\"Screenshot subject\"}".into());
+                }
+                if value["method"] == "turn/completed" {
+                    value["params"]["turn"]["items"][0]["text"] = Value::String("{\"title\":\"Screenshot subject\"}".into());
+                }
+                value.to_string()
+            }).collect::<Vec<_>>().join("\n");
+            std::fs::write(path, format!("{rewritten}\n")).unwrap();
+        }
+        codex
+    }
+
     pub fn plain_conversation() -> ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("01-plain-turn", None)
     }

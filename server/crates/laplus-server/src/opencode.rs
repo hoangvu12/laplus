@@ -1469,6 +1469,17 @@ fn structured_event_error(error: &Value) -> String {
     }
 }
 
+pub(crate) fn prompt_parts(text: &str, attachments: &[crate::threads::PromptAttachment]) -> Vec<Value> {
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() { parts.push(serde_json::json!({"type":"text", "text":text})); }
+    parts.extend(attachments.iter().filter_map(|attachment| {
+        // External endpoints receive the same local file URL as owned servers.
+        let url = reqwest::Url::from_file_path(&attachment.path).ok()?;
+        Some(serde_json::json!({"type":"file","mime":attachment.mime,"filename":attachment.filename,"url":url.to_string()}))
+    }));
+    parts
+}
+
 impl crate::session::Driver for OpenCode {
     const COALESCES_QUEUED_PROMPTS: bool = true;
     const APPROVAL_RESOLVED_BY_EVENT: bool = true;
@@ -1828,15 +1839,7 @@ impl crate::session::Driver for OpenCode {
 
     async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
         self.settled = false;
-        let mut parts = Vec::new();
-        if !prompt.text.trim().is_empty() { parts.push(serde_json::json!({"type":"text", "text":prompt.text})); }
-        parts.extend(prompt.attachments.iter().filter_map(|attachment| {
-            // External endpoints receive the same local file URL as owned
-            // servers. This intentionally assumes a shared filesystem/path
-            // mapping; OpenCode has no attachment-upload operation here.
-            let url = reqwest::Url::from_file_path(&attachment.path).ok()?;
-            Some(serde_json::json!({"type":"file","mime":attachment.mime,"filename":attachment.filename,"url":url.to_string()}))
-        }));
+        let parts = prompt_parts(&prompt.text, &prompt.attachments);
         if parts.is_empty() { return Err(std::io::Error::other("OpenCode prompt has no resolvable text or attachments")); }
         let mut body = serde_json::json!({"parts": parts});
         if let Some(model) = self.model.as_deref() {

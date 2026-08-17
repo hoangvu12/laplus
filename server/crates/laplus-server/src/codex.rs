@@ -37,6 +37,44 @@ use crate::session::{
 use crate::settling::SessionStatus;
 use crate::threads::{Activity, Change};
 
+fn turn_input(text: &str, attachments: &[crate::threads::PromptAttachment]) -> Result<Vec<protocol::TurnInput>, String> {
+    let mut input = vec![protocol::TurnInput::Text { text: text.to_string() }];
+    for attachment in attachments {
+        input.push(protocol::TurnInput::Image { url: crate::attachments::data_url(attachment)? });
+    }
+    Ok(input)
+}
+
+pub(crate) async fn generate_title(instance: &crate::provider::CodexInstance, directory: &str, model: Option<&str>, prompt: String, attachments: &[crate::threads::PromptAttachment], timeout: Duration) -> Result<Value, String> {
+    let (binary, _) = crate::provider::resolve_codex(&instance.settings.binary_path, &crate::process::Search::from_environment()).startable_codex()?;
+    let mut server = AppServer::start(&binary, &instance.settings, Path::new(directory)).await.map_err(|error| error.to_string())?;
+    let generated = async {
+        protocol::decode_initialize(server.request(Request::Initialize).await?)?;
+        server.write(&protocol::initialized()).await?;
+        let access = Access::for_runtime_mode("full-access")?;
+        let thread = server.request(Request::ThreadStart { cwd: directory.to_string(), model: model.map(str::to_string), access }).await?;
+        let thread_id = protocol::decode_thread_start(thread)?;
+        let input = turn_input(&prompt, attachments)?;
+        server.send_request(Request::TurnStart { thread_id, input, model: model.map(str::to_string), access: Some(access) }).await?;
+        let mut answer = None;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let line = tokio::time::timeout_at(deadline, server.next_line()).await.map_err(|_| "Codex title generation timed out.".to_string())?.ok_or_else(|| "Codex stopped during title generation.".to_string())?;
+            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+            if value["method"] == "item/completed" && value["params"]["item"]["type"] == "agentMessage" {
+                answer = value["params"]["item"]["text"].as_str().map(str::to_string);
+            }
+            if value["method"] == "turn/completed" {
+                let terminal_answer = value["params"]["turn"]["items"].as_array().and_then(|items| items.iter().rev().find(|item| item["type"] == "agentMessage")).and_then(|item| item["text"].as_str()).map(str::to_string);
+                let raw = terminal_answer.or(answer).ok_or_else(|| "Codex title generation returned no message.".to_string())?;
+                return serde_json::from_str(&raw).map_err(|_| format!("Codex returned malformed structured title text: {raw}"));
+            }
+        }
+    }.await;
+    server.stop().await;
+    generated
+}
+
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCELLATION_POLL: Duration = Duration::from_millis(25);
@@ -391,12 +429,7 @@ impl Driver for Codex {
     }
 
     async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
-        let mut input = vec![crate::codex_protocol::TurnInput::Text { text: prompt.text.clone() }];
-        for attachment in &prompt.attachments {
-            input.push(crate::codex_protocol::TurnInput::Image {
-                url: crate::attachments::data_url(attachment).map_err(std::io::Error::other)?,
-            });
-        }
+        let input = turn_input(&prompt.text, &prompt.attachments).map_err(std::io::Error::other)?;
         self.turn_id_unavailable = false;
         let (model, access) = match self.explicit_turn_config {
             true => (self.model.clone(), Some(self.access)),

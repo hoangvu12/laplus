@@ -1752,6 +1752,7 @@ impl Shell {
                 model: starting.model.clone(),
             },
         };
+        let title_attachments = prompt.attachments.clone();
         let queued = thread.provider.driver == "opencode" && active_turn.is_some();
         if queued {
             self.inner
@@ -1797,17 +1798,11 @@ impl Shell {
         }
 
         if is_first_user_turn {
-            let title_context = if start.message.text.trim().is_empty()
-                && !start.message.attachments.is_empty()
-            {
-                format!("Attachments:\n{}", Value::Array(start.message.attachments.clone()))
-            } else {
-                start.message.text.clone()
-            };
             self.generate_first_turn_title(
                 &start.thread_id,
                 &thread.title,
-                &title_context,
+                &start.message.text,
+                title_attachments,
                 &where_the_work_happens(&thread, &project),
                 config,
             );
@@ -1879,6 +1874,7 @@ impl Shell {
         thread_id: &str,
         provisional_title: &str,
         message: &str,
+        attachments: Vec<crate::threads::PromptAttachment>,
         directory: &str,
         config: &ServerConfig,
     ) {
@@ -1898,11 +1894,12 @@ impl Shell {
         let directory = directory.to_string();
         tokio::spawn(async move {
             let generated = TextGeneration::new()
-                .generate(
+                .generate_with_attachments(
                     &instance,
                     &directory,
                     model.as_deref(),
                     TextOperation::ThreadTitle { context },
+                    &attachments,
                 )
                 .await;
             let Ok(ResultText::ThreadTitle(title)) = generated else {

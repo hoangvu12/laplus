@@ -14,6 +14,7 @@ use crate::{
     opencode::{OpenCodeClient, OwnedServer},
     process::Search,
     provider::{ClaudeInstance, ConfiguredInstance, OpenCodeInstance},
+    threads::PromptAttachment,
 };
 
 const IDLE: Duration = Duration::from_secs(30);
@@ -110,19 +111,28 @@ impl Service {
         model: Option<&str>,
         operation: Operation,
     ) -> Result<ResultText, Error> {
+        self.generate_with_attachments(instance, directory, model, operation, &[]).await
+    }
+
+    pub async fn generate_with_attachments(&self, instance: &ConfiguredInstance, directory: &str, model: Option<&str>, operation: Operation, attachments: &[PromptAttachment]) -> Result<ResultText, Error> {
         match instance {
             ConfiguredInstance::Claude(instance) => {
-                self.generate_claude(instance, directory, model, operation)
+                self.generate_claude(instance, directory, model, operation, attachments)
                     .await
             }
             ConfiguredInstance::OpenCode(instance) => {
-                self.generate_opencode(instance, directory, model, operation)
+                self.generate_opencode(instance, directory, model, operation, attachments)
                     .await
             }
-            ConfiguredInstance::Codex(_) => Err(Error(format!(
-                "Provider {} has no registered text-generation adapter.",
-                instance.identity().instance_id
-            ))),
+            ConfiguredInstance::Codex(instance) => {
+                if !matches!(operation, Operation::ThreadTitle { .. }) {
+                    return Err(Error("Codex only supports thread-title text generation in this build.".into()));
+                }
+                tokio::time::timeout(self.request_timeout, crate::codex::generate_title(instance, directory, model, prompt(&operation), attachments, self.request_timeout)).await
+                    .map_err(|_| Error("Codex title generation timed out.".into()))?
+                    .map_err(Error)
+                    .and_then(|value| parse_value(operation, &value))
+            }
         }
     }
 
@@ -132,6 +142,7 @@ impl Service {
         directory: &str,
         model: Option<&str>,
         operation: Operation,
+        attachments: &[PromptAttachment],
     ) -> Result<ResultText, Error> {
         if !matches!(operation, Operation::ThreadTitle { .. }) {
             return Err(Error(
@@ -152,6 +163,7 @@ impl Service {
             directory,
             model,
             operation,
+            attachments,
             self.request_timeout,
         )
         .await
@@ -163,13 +175,14 @@ impl Service {
         directory: &str,
         model: Option<&str>,
         operation: Operation,
+        attachments: &[PromptAttachment],
     ) -> Result<ResultText, Error> {
         if !instance.settings.server_url.is_empty() {
             let password = (!instance.settings.server_password.is_empty())
                 .then(|| instance.settings.server_password.clone());
             let client = OpenCodeClient::new(&instance.settings.server_url, directory, password)
                 .map_err(|error| Error(error.to_string()))?;
-            return generate_with(&client, model, operation, self.request_timeout).await;
+            return generate_with(&client, model, operation, attachments, self.request_timeout).await;
         }
 
         let binary = crate::provider::resolve_named(
@@ -210,7 +223,7 @@ impl Service {
             .client
             .clone();
         drop(pool);
-        let result = generate_with(&client, model, operation, self.request_timeout).await;
+        let result = generate_with(&client, model, operation, attachments, self.request_timeout).await;
         let mut pool = self.local.lock().await;
         if let Some(entry) = pool.get_mut(&instance.identity.instance_id) {
             entry.idle_since = Instant::now();
@@ -263,6 +276,7 @@ async fn generate_with_claude(
     directory: &str,
     model: Option<&str>,
     operation: Operation,
+    attachments: &[PromptAttachment],
     timeout: Duration,
 ) -> Result<ResultText, Error> {
     let schema = json!({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false});
@@ -277,6 +291,7 @@ async fn generate_with_claude(
         .arg("--json-schema")
         .arg(schema.to_string())
         .arg("--dangerously-skip-permissions")
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .current_dir(directory)
         .kill_on_drop(true);
     if !settings.home_path.trim().is_empty() {
@@ -288,9 +303,16 @@ async fn generate_with_claude(
     if let Some(model) = model {
         command.arg("--model").arg(model);
     }
-    command.arg(prompt(&operation));
+    if attachments.is_empty() { command.arg(prompt(&operation)); } else { command.arg("--input-format").arg("stream-json").stdin(std::process::Stdio::piped()); }
     crate::process::without_a_console(command.as_std_mut());
-    let output = tokio::time::timeout(timeout, command.output())
+    let mut child = command.spawn().map_err(|error| Error(format!("Claude text generation could not start: {error}")))?;
+    if !attachments.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        let content = crate::turn::prompt_content(&prompt(&operation), attachments).await.map_err(Error)?;
+        let mut input = child.stdin.take().ok_or_else(|| Error("Claude text generation has no stdin.".into()))?;
+        input.write_all(format!("{}\n", crate::protocol::user_message_line(&content)).as_bytes()).await.map_err(|error| Error(format!("Claude text generation input failed: {error}")))?;
+    }
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| Error("Claude text generation timed out.".into()))?
         .map_err(|error| Error(format!("Claude text generation could not start: {error}")))?;
@@ -314,6 +336,7 @@ async fn generate_with(
     client: &OpenCodeClient,
     model: Option<&str>,
     operation: Operation,
+    attachments: &[PromptAttachment],
     timeout: Duration,
 ) -> Result<ResultText, Error> {
     let session = tokio::time::timeout(
@@ -328,8 +351,9 @@ async fn generate_with(
     })?
     .map_err(|error| Error(error.to_string()))?;
     let generated = async {
+        let parts = crate::opencode::prompt_parts(&prompt(&operation), attachments);
         let mut body = json!({
-            "parts": [{"type":"text", "text": prompt(&operation)}],
+            "parts": parts,
             "tools": {}
         });
         if let Some(model) = model {
