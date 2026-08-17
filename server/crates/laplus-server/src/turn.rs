@@ -624,8 +624,8 @@ fn child_stream(moved: &crate::protocol::SubagentMoved) -> crate::subagents::Upd
     // an outcome on the bare one would spend it on a silence —
     // [`crate::subagents::Streams::record`] keeps the first outcome it is given —
     // and the answer arriving a millisecond later would be dropped.
-    let ended = moved.row.as_ref().filter(|row| row.status != "running");
-    update = match (ended, moved.reports) {
+    let ending = moved.row.as_ref().filter(|row| row.status != "running");
+    update = match (ending, moved.reports) {
         (None, _) => update.in_state(State::Working),
         (Some(row), true) => {
             let report = row
@@ -734,15 +734,27 @@ fn child_work(
 /// An `Agent` call is a **tool**, not a launcher. Claude gives a nested subagent
 /// no identity on this wire — see [`child_stream`] — and a row that offered to
 /// open a stream this server does not hold would be worse than the honest one.
+///
+/// **The needles are matched in an order, and the order is load-bearing.** A
+/// `NotebookEdit` is caught by `edit` and a `NotebookRead` by `read`, which is
+/// why neither is spelled out; spelling `notebook` into the edit branch — as
+/// this did until the review caught it — filed the read as a file change.
 fn child_entry_kind(tool: &str) -> crate::subagents::EntryKind {
     use crate::subagents::EntryKind;
     let name = tool.to_ascii_lowercase();
+    // `TodoWrite` is the agent's own scratchpad rather than the developer's
+    // files, and the `write` needle below would otherwise draw it as a file
+    // change. `child_entry_kind` in `opencode.rs` carves out the same tool for
+    // the same reason.
+    if name.starts_with("todo") {
+        return EntryKind::Tool;
+    }
     if ["bash", "command", "shell", "terminal"]
         .iter()
         .any(|needle| name.contains(needle))
     {
         EntryKind::Command
-    } else if ["edit", "write", "patch", "notebook"]
+    } else if ["edit", "write", "patch"]
         .iter()
         .any(|needle| name.contains(needle))
     {
@@ -1385,6 +1397,55 @@ fn human_duration(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four kinds a child's tools land on, and the three names whose answer
+    /// is decided by the *order* of the needles rather than by any one of them.
+    ///
+    /// `NotebookRead` is the case the review caught: with `notebook` spelled into
+    /// the edit branch it was filed as a file change, which is a claim the child
+    /// altered a file it only read.
+    #[test]
+    fn a_childs_tool_is_the_kind_of_work_it_actually_is() {
+        use crate::subagents::EntryKind;
+        let kinds: Vec<(&str, EntryKind)> = [
+            "Bash",
+            "BashOutput",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Read",
+            "NotebookRead",
+            "Grep",
+            "Glob",
+            "TodoWrite",
+            "Agent",
+            "WebFetch",
+        ]
+        .into_iter()
+        .map(|tool| (tool, child_entry_kind(tool)))
+        .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                ("Bash", EntryKind::Command),
+                ("BashOutput", EntryKind::Command),
+                ("Edit", EntryKind::Edit),
+                ("Write", EntryKind::Edit),
+                ("NotebookEdit", EntryKind::Edit),
+                ("Read", EntryKind::Read),
+                ("NotebookRead", EntryKind::Read),
+                ("Grep", EntryKind::Read),
+                ("Glob", EntryKind::Read),
+                // The agent's own scratchpad, not the developer's files.
+                ("TodoWrite", EntryKind::Tool),
+                // A nested subagent Claude gives no identity to, and everything
+                // laplus cannot place: the generic row rather than a guess.
+                ("Agent", EntryKind::Tool),
+                ("WebFetch", EntryKind::Tool),
+            ]
+        );
+    }
 
     fn result(
         is_error: bool,

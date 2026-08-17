@@ -469,6 +469,15 @@ returned nothing, which says so rather than reverting to what it was doing.
 `crate::worklog::subagent`, from the `said` field of
 `crate::protocol::SubagentTask`.
 
+**Subagent moved** — one provider line's news about one subagent, carrying both
+of the places a child is shown: the compact row's line, when that line tells the
+row anything, and the child's identity, assignment and own work for its stream.
+One value rather than two answers to two questions, because a row and a stream
+that disagreed about whether a child had finished would be two truths about one
+child. A line can move either or both — a forwarded message carrying only a tool
+call is the child's whole work and nothing the row can say in its one line.
+`crate::protocol::SubagentMoved`, `crate::protocol::SubagentDid`.
+
 ## Lifecycle
 
 **Session status** — what the agent process is doing. The contract's seven:

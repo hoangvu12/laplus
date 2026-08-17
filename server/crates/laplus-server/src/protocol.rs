@@ -1631,14 +1631,14 @@ impl SessionState {
         }
         let (name, assignment) = (record.kind.clone(), record.assignment.clone());
 
-        let child = message.role == "assistant";
+        let the_child_speaking = message.role == "assistant";
         let mut did = Vec::new();
         for block in &message.content {
             match block {
-                ContentBlock::Text { text } if child && !text.trim().is_empty() => {
+                ContentBlock::Text { text } if the_child_speaking && !text.trim().is_empty() => {
                     did.push(SubagentDid::Said(text.clone()));
                 }
-                ContentBlock::ToolUse { id, name, input } if child => {
+                ContentBlock::ToolUse { id, name, input } if the_child_speaking => {
                     self.subagent_tool_calls.insert(
                         id.clone(),
                         SubagentCall {
@@ -1657,19 +1657,21 @@ impl SessionState {
                     tool_use_id,
                     content,
                     is_error,
-                } if !child => {
+                } if !the_child_speaking => {
                     // What the call *was* lives on this side of the pair, exactly
                     // as it does for the root agent's tools. A result for a call
                     // this build never saw announced is still reported, under the
                     // same neutral name the root path uses for one.
-                    let call = self.subagent_tool_calls.remove(tool_use_id);
+                    let invocation = self.subagent_tool_calls.remove(tool_use_id);
                     did.push(SubagentDid::Called {
                         id: tool_use_id.clone(),
-                        name: call
+                        name: invocation
                             .as_ref()
-                            .map(|call| call.name.clone())
+                            .map(|invocation| invocation.name.clone())
                             .unwrap_or_else(|| "Tool".to_string()),
-                        input: call.map(|call| call.input).unwrap_or(Value::Null),
+                        input: invocation
+                            .map(|invocation| invocation.input)
+                            .unwrap_or(Value::Null),
                         returned: Some(SubagentReturn {
                             output: text_content(content),
                             failed: *is_error,
@@ -1682,7 +1684,7 @@ impl SessionState {
 
         // A `user` message's text is the prompt the child was handed, so it is
         // not the child talking and it is not this row's line.
-        let said = match child {
+        let said = match the_child_speaking {
             true => visible(message),
             false => String::new(),
         };

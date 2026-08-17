@@ -1447,6 +1447,41 @@ async fn a_background_subagent_gets_its_own_row_and_stays_out_of_the_transcript(
     server.stop().await;
 }
 
+/// One child's work stream as a client holds it, and everything the wire carried
+/// to get it there.
+///
+/// The fold is the client's own: entries are upserted by id onto the snapshot
+/// the subscription opened with, and ordered by sequence. The second half of the
+/// answer is what makes a claim about loss or duplication mean anything —
+/// **every entry id the wire carried, in the order it first appeared** — because
+/// the fold alone would be just as satisfied by a server that sent the same
+/// entry twice, an upsert applied twice landing on the state it already held.
+fn folded_child_stream<'a>(
+    snapshot: &Value,
+    frames: impl Iterator<Item = &'a Value>,
+) -> (Vec<Value>, Vec<String>) {
+    let mut folded: Vec<Value> = snapshot["entries"].as_array().expect("entries").clone();
+    let mut seen_ids: Vec<String> = folded
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an entry id").to_string())
+        .collect();
+    for item in frames {
+        let Some(entry) = item.get("entry") else {
+            continue;
+        };
+        let id = entry["id"].as_str().expect("an entry id").to_string();
+        if !seen_ids.contains(&id) {
+            seen_ids.push(id);
+        }
+        match folded.iter().position(|held| held["id"] == entry["id"]) {
+            Some(index) => folded[index] = entry.clone(),
+            None => folded.push(entry.clone()),
+        }
+    }
+    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
+    (folded, seen_ids)
+}
+
 /// Open the child of `fixtures/claude-cli/22-background-subagent.ndjson`, drive
 /// it, and read its work back through the socket.
 ///
@@ -1553,25 +1588,7 @@ async fn a_claude_child_work_stream_replays_and_then_continues_live() {
     .await
     .expect("the child's conclusion reaches its stream");
 
-    let mut folded: Vec<Value> = snapshot["entries"].as_array().expect("entries").clone();
-    let mut seen_ids: Vec<String> = folded
-        .iter()
-        .map(|entry| entry["id"].as_str().expect("an entry id").to_string())
-        .collect();
-    for item in replayed.iter().chain(live.iter()) {
-        let Some(entry) = item.get("entry") else {
-            continue;
-        };
-        let id = entry["id"].as_str().expect("an entry id").to_string();
-        if !seen_ids.contains(&id) {
-            seen_ids.push(id.clone());
-        }
-        match folded.iter().position(|held| held["id"] == entry["id"]) {
-            Some(index) => folded[index] = entry.clone(),
-            None => folded.push(entry.clone()),
-        }
-    }
-    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
+    let (folded, seen_ids) = folded_child_stream(&snapshot, replayed.iter().chain(live.iter()));
 
     // Everything the child did, in the order it did it: its prose, the three
     // commands it tried and what each of them came back with, its closing
@@ -1663,14 +1680,71 @@ async fn a_claude_child_work_stream_replays_and_then_continues_live() {
     // commands, spoke twice and finished inside it — and though the recording
     // ends with two `result` lines. A child boundary is not a turn boundary.
     let events = client.events_through_the_turn(&subscription).await;
-    let endings = opening
+    let conversation: Vec<&Value> = opening
         .iter()
         .chain(events.iter())
         .map(|item| &item["event"])
+        .collect();
+    let endings = conversation
+        .iter()
         .filter(|event| event["type"] == "thread.activity-appended")
         .filter(|event| event["payload"]["activity"]["kind"] == "turn.completed")
         .count();
     assert_eq!(endings, 1, "the turn ended {endings} times");
+
+    // **The compact row is the summary as well as the launcher**, and the
+    // recording is what proves the two halves of it. While the child worked the
+    // row showed what it was up to — the CLI's own account of it, and the
+    // child's own words — and when the child reported, that replaced them
+    // rather than being appended beside them.
+    let details: Vec<&str> = conversation
+        .iter()
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .map(|event| &event["payload"]["activity"])
+        .filter(|activity| activity["payload"]["data"]["childId"] == child)
+        .filter_map(|activity| activity["payload"]["detail"].as_str())
+        .collect();
+    assert!(
+        details.contains(&"Running Pause 3 seconds"),
+        "the row never said what the child was doing: {details:#?}"
+    );
+    assert!(
+        details.contains(&"1"),
+        "the row never said what the child itself said: {details:#?}"
+    );
+    let last = details.last().expect("a terminal row");
+    assert!(
+        last.contains("I counted to 3"),
+        "the row ended on stale activity rather than on what came back: {details:#?}"
+    );
+
+    // And the child's own words arrived **after the root had gone quiet**. In
+    // this recording the agent answers, stops, and only then does eleven lines
+    // of subagent reach the wire — which is the ordering a background child is
+    // for, read off the capture rather than scripted.
+    let said_first = conversation
+        .iter()
+        .position(|event| {
+            event["type"] == "thread.message-sent"
+                && event["payload"]["role"] == "assistant"
+                && event["payload"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("off counting to 3 in the background"))
+        })
+        .expect("the root's own reply");
+    let child_spoke = conversation
+        .iter()
+        .position(|event| {
+            event["type"] == "thread.activity-appended"
+                && event["payload"]["activity"]["payload"]["data"]["childId"] == child
+                && event["payload"]["activity"]["payload"]["detail"] == "1"
+        })
+        .expect("the child's first forwarded words");
+    assert!(
+        said_first < child_spoke,
+        "the child's work did not outlive the root's own reply: {said_first} then {child_spoke}"
+    );
+
     inspector.close().await;
     client.close().await;
 
@@ -1803,6 +1877,146 @@ async fn a_childs_prompt_is_not_one_of_the_things_the_child_said() {
 
     inspector.close().await;
     server.stop().await;
+}
+
+/// A Claude child's work stream comes back after the application is restarted.
+///
+/// Two processes over one database file, which is the only way to drive a real
+/// restart from a test — `socket_opencode_turn`'s
+/// `a_child_work_stream_replays_after_the_server_restarts` established the shape
+/// and `socket_continuity.rs` the rest of it.
+///
+/// **Driven for Claude rather than argued from OpenCode.** Storage is
+/// provider-neutral, and that is exactly the reasoning that lets a
+/// provider-specific persistence bug through: what a child stream is made *of*
+/// is this adapter's, and a work entry has more of it than the prose OpenCode's
+/// restart test carries — a command line, an output, a status, a call id that
+/// has to come back as the same entry rather than as a second one. So this
+/// asserts the whole stream, ids included.
+#[tokio::test]
+async fn a_claude_child_work_stream_replays_after_the_server_restarts() {
+    let agent = ScriptedAgent::replaying("22-background-subagent");
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let database = directory.path().join("state.sqlite");
+    let workspace = Workspace::with(&["src/"]);
+    let child = "ab80091070230889d";
+
+    {
+        let server = TestServer::start_at_with_agent(&database, &agent.configured()).await;
+        let mut client = server.connect().await;
+        let subscription = client.open_conversation(&workspace, "thread-1").await;
+        client
+            .call(
+                "orchestration.dispatchCommand",
+                start_turn("thread-1", "message-1", "count to three in the background"),
+            )
+            .await
+            .expect_success();
+        client.events_through_the_turn(&subscription).await;
+        client.close().await;
+        // Ends the agents and *then* waits for the transcript queue, which is
+        // what puts the child's last entry on the disk before the file is
+        // handed to the next process.
+        server.stop().await;
+    }
+
+    // A second process, which watched none of it.
+    let restarted = TestServer::start_at_with_agent(&database, &agent.configured()).await;
+    let mut reopened = restarted.connect().await;
+    let stream = reopened
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "thread-1", "childId": child}),
+        )
+        .await;
+    let snapshot = reopened
+        .next_chunk(&stream)
+        .await
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("a restored child replays")["snapshot"]
+        .clone();
+
+    assert_eq!(snapshot["stream"]["name"], "general-purpose");
+    assert_eq!(snapshot["stream"]["assignment"], "Count to three slowly");
+    assert_eq!(snapshot["stream"]["state"], "completed");
+    assert_eq!(snapshot["stream"]["outcome"]["kind"], "completed");
+    assert!(snapshot["stream"]["outcome"]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("1 2 3 — done")));
+
+    let read: Vec<(i64, &str, &str)> = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            (
+                entry["sequence"].as_i64().expect("a sequence"),
+                entry["kind"].as_str().expect("a kind"),
+                entry["id"].as_str().expect("an id"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (1, "message", format!("{child}:n:1").as_str()),
+            (
+                2,
+                "command",
+                format!("{child}:k:toolu_018P4BWzpkPTZVxuaZVhq1TL").as_str()
+            ),
+            (
+                3,
+                "command",
+                format!("{child}:k:toolu_012uWvvv3ZAJrL6Y3aXxRU1a").as_str()
+            ),
+            (
+                4,
+                "command",
+                format!("{child}:k:toolu_011MtuZgZ8pv9MccD3h1meMb").as_str()
+            ),
+            (5, "message", format!("{child}:n:5").as_str()),
+            (6, "outcome", format!("{child}:k:outcome").as_str()),
+        ],
+        "the restart did not bring the child's work back in order: {snapshot:#?}"
+    );
+
+    // And a work entry is the whole of what it was, rather than a row that
+    // survived with its prose and lost what it did.
+    let command = &snapshot["entries"][1]["payload"];
+    assert_eq!(command["title"], "Bash");
+    assert_eq!(command["status"], "failed");
+    assert_eq!(command["command"], "python3 -c \"import time; time.sleep(3)\"");
+    assert_eq!(command["detail"], "This command requires approval");
+
+    // The conversation it belongs to came back beside it, still carrying the
+    // compact row that launches this stream and none of the child's prose.
+    let thread = restarted
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await["thread"]
+        .clone();
+    assert!(
+        thread["activities"]
+            .as_array()
+            .expect("activities")
+            .iter()
+            .any(|activity| activity["payload"]["data"]["childId"] == child),
+        "the restored conversation lost the launcher: {thread:#?}"
+    );
+    assert!(
+        !thread["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .any(|message| message["text"].as_str() == Some("1")),
+        "the child's prose reached the restored transcript: {thread:#?}"
+    );
+
+    reopened.close().await;
+    restarted.stop().await;
 }
 
 /// The case `22-background-subagent` does not contain, and the one a developer
