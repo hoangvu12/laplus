@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as UsageRouteImport } from './routes/usage'
+import { Route as SubagentPrototypeRouteImport } from './routes/subagent-prototype'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as PairRouteImport } from './routes/pair'
 import { Route as ChatRouteImport } from './routes/_chat'
@@ -27,6 +28,11 @@ import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$e
 const UsageRoute = UsageRouteImport.update({
   id: '/usage',
   path: '/usage',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SubagentPrototypeRoute = SubagentPrototypeRouteImport.update({
+  id: '/subagent-prototype',
+  path: '/subagent-prototype',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsRoute = SettingsRouteImport.update({
@@ -99,6 +105,7 @@ export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
   '/pair': typeof PairRoute
   '/settings': typeof SettingsRouteWithChildren
+  '/subagent-prototype': typeof SubagentPrototypeRoute
   '/usage': typeof UsageRoute
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/beta': typeof SettingsBetaRoute
@@ -113,6 +120,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/pair': typeof PairRoute
   '/settings': typeof SettingsRouteWithChildren
+  '/subagent-prototype': typeof SubagentPrototypeRoute
   '/usage': typeof UsageRoute
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/beta': typeof SettingsBetaRoute
@@ -130,6 +138,7 @@ export interface FileRoutesById {
   '/_chat': typeof ChatRouteWithChildren
   '/pair': typeof PairRoute
   '/settings': typeof SettingsRouteWithChildren
+  '/subagent-prototype': typeof SubagentPrototypeRoute
   '/usage': typeof UsageRoute
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/beta': typeof SettingsBetaRoute
@@ -148,6 +157,7 @@ export interface FileRouteTypes {
     | '/'
     | '/pair'
     | '/settings'
+    | '/subagent-prototype'
     | '/usage'
     | '/settings/archived'
     | '/settings/beta'
@@ -162,6 +172,7 @@ export interface FileRouteTypes {
   to:
     | '/pair'
     | '/settings'
+    | '/subagent-prototype'
     | '/usage'
     | '/settings/archived'
     | '/settings/beta'
@@ -178,6 +189,7 @@ export interface FileRouteTypes {
     | '/_chat'
     | '/pair'
     | '/settings'
+    | '/subagent-prototype'
     | '/usage'
     | '/settings/archived'
     | '/settings/beta'
@@ -195,6 +207,7 @@ export interface RootRouteChildren {
   ChatRoute: typeof ChatRouteWithChildren
   PairRoute: typeof PairRoute
   SettingsRoute: typeof SettingsRouteWithChildren
+  SubagentPrototypeRoute: typeof SubagentPrototypeRoute
   UsageRoute: typeof UsageRoute
 }
 
@@ -205,6 +218,13 @@ declare module '@tanstack/react-router' {
       path: '/usage'
       fullPath: '/usage'
       preLoaderRoute: typeof UsageRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/subagent-prototype': {
+      id: '/subagent-prototype'
+      path: '/subagent-prototype'
+      fullPath: '/subagent-prototype'
+      preLoaderRoute: typeof SubagentPrototypeRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/settings': {
@@ -343,6 +363,7 @@ const rootRouteChildren: RootRouteChildren = {
   ChatRoute: ChatRouteWithChildren,
   PairRoute: PairRoute,
   SettingsRoute: SettingsRouteWithChildren,
+  SubagentPrototypeRoute: SubagentPrototypeRoute,
   UsageRoute: UsageRoute,
 }
 export const routeTree = rootRouteImport
