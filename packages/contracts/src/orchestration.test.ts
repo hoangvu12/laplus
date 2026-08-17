@@ -1099,7 +1099,7 @@ it.effect("a subagent blocker is one entry, asked and answered", () =>
 
     const answered = yield* decodeSubagentStreamItem({
       kind: "entry-upserted",
-      entry: { ...waiting.entry, payload: { ...waiting.entry.payload, resolution: "Approved" } },
+      entry: { ...waiting.entry, payload: { ...waiting.entry.payload, resolution: "approved" } },
     });
     if (answered.kind !== "entry-upserted" || answered.entry.kind !== "blocker") return;
     assert.strictEqual(
@@ -1107,7 +1107,7 @@ it.effect("a subagent blocker is one entry, asked and answered", () =>
       waiting.entry.id,
       "the answer moved the entry it answers rather than following it",
     );
-    assert.strictEqual(answered.entry.payload.resolution, "Approved");
+    assert.strictEqual(answered.entry.payload.resolution, "approved");
   }),
 );
 

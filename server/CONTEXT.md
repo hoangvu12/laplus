@@ -446,6 +446,14 @@ back to the descendant. Asking and answering are one entry under one key, so a
 child's history explains the pause rather than leaving two rows to be paired.
 `crate::subagents::Blocker`, `crate::approval::Waiting`.
 
+**Resolution** — how a blocker ended, as an identity rather than a sentence:
+approved, approved for the session, declined, cancelled, answered, rejected, or
+**undelivered** — the developer decided and the decision could not be sent. The
+last is why this is not simply the developer's decision: a child that was never
+told stays blocked, and its stream has to be able to say so while the
+conversation records both the decision and the failure to deliver it.
+`crate::subagents::Resolution`.
+
 **Child outcome** — how a subagent's work ended: a result, a failure, an
 interruption, or **empty** — completed with nothing to return. Four rather than
 three, because a child that finished and said nothing has concluded, and
@@ -458,6 +466,8 @@ something. Announced-but-empty tool parts, blank text parts and status
 heartbeats are not it. When the child becomes terminal this is replaced
 atomically by a bounded preview of what came back — including for a child that
 returned nothing, which says so rather than reverting to what it was doing.
+`crate::worklog::subagent`, from the `said` field of
+`crate::protocol::SubagentTask`.
 
 ## Lifecycle
 

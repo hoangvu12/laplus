@@ -6,7 +6,7 @@ import {
   type PendingUserInputDraftAnswer,
 } from "../../pendingUserInput";
 import { CheckIcon } from "lucide-react";
-import { WaitingSubagentLabel } from "./ComposerPendingApprovalPanel";
+import { WaitingSubagentLabel } from "./WaitingSubagentLabel";
 import { cn } from "~/lib/utils";
 
 interface PendingUserInputPanelProps {

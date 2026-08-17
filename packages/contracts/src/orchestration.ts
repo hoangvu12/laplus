@@ -647,13 +647,33 @@ export type OrchestrationSubagentNotice = typeof OrchestrationSubagentNotice.Typ
  * main conversation's existing request UI, which is what stops a blocker hiding
  * inside a tab nobody has open.
  */
+/**
+ * How a blocker ended.
+ *
+ * An identity rather than a sentence, so the wording stays the client's — the
+ * same rule `OrchestrationSubagentOutcomeKind` follows. `undelivered` is its own
+ * member because "nobody has answered yet" and "nobody can now" are different
+ * news: the developer decided and the decision could not be sent to the child,
+ * which leaves the child genuinely still blocked.
+ */
+export const OrchestrationSubagentResolution = Schema.Literals([
+  "approved",
+  "approvedForSession",
+  "declined",
+  "cancelled",
+  "answered",
+  "rejected",
+  "undelivered",
+]);
+export type OrchestrationSubagentResolution = typeof OrchestrationSubagentResolution.Type;
+
 export const OrchestrationSubagentBlocker = Schema.Struct({
   /** The provider's own request id: the identity a response is routed by. */
   requestId: TrimmedNonEmptyString,
   blocker: Schema.Literals(["permission", "question"]),
   title: Schema.String,
   detail: Schema.NullOr(Schema.String),
-  resolution: Schema.NullOr(Schema.String),
+  resolution: Schema.NullOr(OrchestrationSubagentResolution),
 });
 export type OrchestrationSubagentBlocker = typeof OrchestrationSubagentBlocker.Type;
 

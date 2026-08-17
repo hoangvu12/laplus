@@ -14,7 +14,12 @@
  * drawn in the main agent's language rather than as a raw event log, and that is
  * a claim about each kind separately.
  */
-import type { EnvironmentId, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationSubagentResolution,
+  ScopedThreadRef,
+  ThreadId,
+} from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -340,7 +345,7 @@ describe("the subagent work stream surface", () => {
    * main conversation, which is what stops a blocker hiding inside a tab.
    */
   it("says why a child waited and how it resolved, on one row", () => {
-    const blocker = (resolution: string | null) => ({
+    const blocker = (resolution: OrchestrationSubagentResolution | null) => ({
       id: "b",
       sequence: 1,
       kind: "blocker" as const,
@@ -359,9 +364,18 @@ describe("the subagent work stream surface", () => {
     expect(waiting).toContain("Waiting for permission");
     expect(waiting).toContain("bash");
 
-    const answered = render({ stream: stream(), entries: [blocker("Approved")] });
+    const answered = render({ stream: stream(), entries: [blocker("approved")] });
     expect(answered).toContain("Approved");
     expect(answered).not.toContain("Waiting for permission");
+
+    // A decision that never reached the child is neither "waiting" nor
+    // "approved" — the child is still stopped and nothing will now answer it.
+    const undelivered = render({
+      stream: stream({ state: "blocked" }),
+      entries: [blocker("undelivered")],
+    });
+    expect(undelivered).toContain("Your decision could not be delivered");
+    expect(undelivered).not.toContain("Waiting for permission");
   });
 
   /**

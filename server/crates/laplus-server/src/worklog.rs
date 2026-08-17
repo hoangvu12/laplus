@@ -616,29 +616,18 @@ impl Decision {
         }
     }
 
-    /// What a child's own stream records about having been answered.
+    /// This decision as a child's own stream records it.
     ///
-    /// The developer-facing wording rather than the wire's verb, because this is
-    /// read back months later as part of a child's history, and it is
-    /// [`Decision::from_resolution`]'s inverse so the two cannot drift apart.
-    pub fn answered(self) -> &'static str {
+    /// A value rather than a sentence, so the child's history and the
+    /// conversation's row carry the same *identity* and the wording stays the
+    /// client's — see [`crate::subagents::Resolution`].
+    pub fn resolution(self) -> crate::subagents::Resolution {
         match self {
-            Decision::Accept => "Approved",
-            Decision::AcceptForSession => "Approved for this session",
-            Decision::Decline => "Declined",
-            Decision::Cancel => "Cancelled",
+            Decision::Accept => crate::subagents::Resolution::Approved,
+            Decision::AcceptForSession => crate::subagents::Resolution::ApprovedForSession,
+            Decision::Decline => crate::subagents::Resolution::Declined,
+            Decision::Cancel => crate::subagents::Resolution::Cancelled,
         }
-    }
-
-    /// The decision behind a resolution [`Decision::answered`] wrote.
-    pub fn from_resolution(resolution: &str) -> Option<Decision> {
-        Some(match resolution {
-            "Approved" => Decision::Accept,
-            "Approved for this session" => Decision::AcceptForSession,
-            "Declined" => Decision::Decline,
-            "Cancelled" => Decision::Cancel,
-            _ => return None,
-        })
     }
 
     /// This decision as the agent has to be told it.
@@ -1254,25 +1243,26 @@ mod tests {
         );
     }
 
-    /// Naming a child is [`Decision::answered`]'s job in the child's stream and
-    /// [`Decision::from_resolution`]'s to read it back. The two are one fact, so
-    /// a wording changed on one side and not the other is caught here rather
-    /// than by a resolution that silently stops being recognised.
+    /// The developer's four decisions reach a child's stream as four distinct
+    /// resolutions. Distinctness is the property: a mapping that collapsed two
+    /// of them would leave a child's history unable to say which of them
+    /// happened, and nothing downstream could recover it.
     #[test]
-    fn every_decision_survives_the_round_trip_through_its_recorded_wording() {
-        for decision in [
+    fn each_decision_reaches_a_childs_stream_as_a_resolution_of_its_own() {
+        let recorded: Vec<&str> = [
             Decision::Accept,
             Decision::AcceptForSession,
             Decision::Decline,
             Decision::Cancel,
-        ] {
-            assert_eq!(
-                Decision::from_resolution(decision.answered()),
-                Some(decision),
-                "{} did not survive being written down", decision.as_str()
-            );
-        }
-        assert_eq!(Decision::from_resolution("Answered"), None);
+        ]
+        .into_iter()
+        .map(|decision| decision.resolution().as_str())
+        .collect();
+
+        assert_eq!(
+            recorded,
+            vec!["approved", "approvedForSession", "declined", "cancelled"]
+        );
     }
 
     /// The collapse key is the subagent's, not the spawning call's. A background

@@ -31,16 +31,18 @@ import type {
   EnvironmentId,
   OrchestrationSubagentEntry,
   OrchestrationSubagentOutcomeKind,
+  OrchestrationSubagentResolution,
   OrchestrationSubagentWork,
   ScopedThreadRef,
   ThreadId,
 } from "@t3tools/contracts";
 import { FileDiffIcon, Loader2 } from "lucide-react";
 
+import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 import type { WorkLogEntry } from "../../session-logic";
 import { useEnvironmentQuery } from "../../state/query";
 import { subagentEnvironment } from "../../state/subagents";
-import { openSubagentDiff, openSubagentFile } from "../../subagentFileActions";
+import { openSubagentDiff, openSubagentFile, subagentFileTarget } from "../../subagentFileActions";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import ChatMarkdown from "../ChatMarkdown";
 import { SimpleWorkEntryRow } from "./MessagesTimeline";
@@ -99,12 +101,20 @@ type WorkEntryKind = "command" | "read" | "edit" | "tool";
  * One piece of the child's work, as the row the main agent would draw for the
  * same thing.
  *
- * The `itemType` per kind is not a new taxonomy — it is the one
- * `opencode_item_type` already assigns to the same tools in the parent
- * transcript, so a child's `bash` and the root agent's `bash` are the same row.
- * An `edit`'s paths become `changedFiles`, which is what gives it the file-change
- * icon and the path preview the conversation uses; a read's do not, because a
- * read is not a change and drawing it as one would misreport what the child did.
+ * The `itemType` per kind is not a new taxonomy — it is the one the parent
+ * transcript already uses, so a child's command and the root agent's command
+ * are the same row, and a child's edit and the root agent's edit are the same
+ * row. An `edit`'s paths become `changedFiles`, which is what gives it the
+ * file-change icon and the path preview the conversation uses; a read's do not,
+ * because a read is not a change and drawing it as one would misreport what the
+ * child did.
+ *
+ * **Where the two part company:** the child stream's `read` and `tool` kinds are
+ * coarser than the parent's six `itemType`s, so a child's web fetch, MCP call or
+ * image view draws the generic tool row where the root agent's would draw a
+ * globe, a wrench or an eye. Same component, same language, less specific icon.
+ * `child_entry_kind` in `opencode.rs` carries why, and closing it is a decision
+ * about the shared entry vocabulary rather than about this renderer.
  */
 function workEntryForKind(
   kind: WorkEntryKind,
@@ -144,12 +154,22 @@ function workEntryForKind(
  * actionable panel, which is where it stays — so it is drawn as an ordinary
  * informational row saying what the child stopped for.
  */
+const RESOLUTION_LABELS: Record<OrchestrationSubagentResolution, string> = {
+  approved: "Approved",
+  approvedForSession: "Approved for this session",
+  declined: "Declined",
+  cancelled: "Cancelled",
+  answered: "Answered",
+  rejected: "Rejected",
+  undelivered: "Your decision could not be delivered",
+};
+
 function blockerWorkEntry(
   entry: Extract<OrchestrationSubagentEntry, { kind: "blocker" }>,
 ): WorkLogEntry {
   const { blocker, title, detail, resolution } = entry.payload;
   const label = resolution
-    ? `${resolution}: ${title}`
+    ? `${RESOLUTION_LABELS[resolution]}: ${title}`
     : blocker === "question"
       ? "Waiting for your answer"
       : `Waiting for permission: ${title}`;
@@ -180,10 +200,15 @@ function noticeWorkEntry(
 /**
  * The files a child entry names, as links into the workspace beside this tab.
  *
- * Rendered only when there is somewhere to open them — a surface with no thread
- * reference has no workspace to open a file in, and an affordance that did
- * nothing would be worse than none. The diff is offered for an edit only:
- * reading a file changes nothing, and there would be no diff to show.
+ * Rendered only where there is somewhere to open them. Three things can make
+ * that false, and all three end in no affordance rather than a broken one: no
+ * thread reference (no workspace at all), a path the file surface cannot be
+ * addressed by (`subagentFileTarget` — a child may legitimately read a file
+ * outside the workspace), and no paths on the entry. The diff is offered for an
+ * edit only: reading a file changes nothing, so there would be no diff to show.
+ *
+ * The label is the main agent's own path formatting, so a file a child touched
+ * reads the way the same file reads in the conversation.
  */
 function EntryFileActions(props: {
   paths: ReadonlyArray<string>;
@@ -191,20 +216,25 @@ function EntryFileActions(props: {
   workspaceRoot: string | undefined;
   diffable: boolean;
 }) {
-  if (!props.threadRef || props.paths.length === 0) return null;
   const threadRef = props.threadRef;
+  if (!threadRef) return null;
+  const openable = props.paths.flatMap((path) => {
+    const target = subagentFileTarget(path, props.workspaceRoot);
+    return target === null ? [] : [{ path, target }];
+  });
+  if (openable.length === 0) return null;
   return (
     <div className="mt-0.5 flex flex-wrap items-center gap-1 pl-6">
-      {props.paths.map((path) => (
+      {openable.map(({ path, target }) => (
         <button
           key={path}
           type="button"
           title={path}
-          data-subagent-open-file={path}
+          data-subagent-open-file={target}
           className="inline-flex max-w-64 items-center rounded-md border border-border/70 bg-background/45 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          onClick={() => openSubagentFile(threadRef, path)}
+          onClick={() => openSubagentFile(threadRef, target)}
         >
-          <span className="truncate">{displayPath(path, props.workspaceRoot)}</span>
+          <span className="truncate">{formatWorkspaceRelativePath(path, props.workspaceRoot)}</span>
         </button>
       ))}
       {props.diffable ? (
@@ -220,12 +250,6 @@ function EntryFileActions(props: {
       ) : null}
     </div>
   );
-}
-
-function displayPath(path: string, workspaceRoot: string | undefined): string {
-  if (!workspaceRoot) return path;
-  const prefix = workspaceRoot.endsWith("/") ? workspaceRoot : `${workspaceRoot}/`;
-  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }
 
 export function SubagentStreamPanel(props: SubagentStreamPanelProps) {

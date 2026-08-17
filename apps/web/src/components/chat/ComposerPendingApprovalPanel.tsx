@@ -1,26 +1,10 @@
 import { memo } from "react";
-import { type PendingApproval, type RequestingSubagent } from "../../session-logic";
+import { type PendingApproval } from "../../session-logic";
+import { WaitingSubagentLabel } from "./WaitingSubagentLabel";
 
 interface ComposerPendingApprovalPanelProps {
   approval: PendingApproval;
   pendingCount: number;
-}
-
-/**
- * Who is waiting, when it is not the root agent.
- *
- * Beside the summary rather than inside the detail, because it changes what the
- * decision *means*: approving a command a delegated worker asked for is not the
- * same act as approving one the agent you are talking to asked for, and the
- * developer has to be able to tell before they click.
- */
-export function WaitingSubagentLabel({ subagent }: { subagent: RequestingSubagent | undefined }) {
-  if (!subagent) return null;
-  return (
-    <span className="text-sm text-muted-foreground" data-waiting-subagent={subagent.childId}>
-      {subagent.name ? `from subagent ${subagent.name}` : "from a subagent"}
-    </span>
-  );
 }
 
 export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprovalPanel({

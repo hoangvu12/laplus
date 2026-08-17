@@ -273,21 +273,23 @@ impl EntryKind {
 /// components as the parent transcript, so a translation done here is a
 /// translation the client does not have to do twice.
 ///
-/// Every field but `title` and `status` is optional and an absent one is
-/// **omitted**, not defaulted. A provider that does not report a command's exit,
-/// or which file a search covered, leaves laplus with nothing to say about it,
-/// and saying nothing is the honest answer.
+/// Every field but `title` and `status` is optional, and an absent one crosses
+/// the wire as `null` rather than as a guess. A provider that does not report
+/// which file a search covered, or what a command printed, leaves laplus with
+/// nothing to say about it — and a client must read that `null` as absence
+/// rather than as emptiness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Work {
     /// What to call it — the tool's own name or the title it reported.
     pub title: String,
-    /// `inProgress`, `completed`, or `failed`.
     pub status: Progress,
     /// The output, the error, or the one-line summary the provider gave.
     pub detail: Option<String>,
     /// The command line, for [`EntryKind::Command`].
     pub command: Option<String>,
-    /// The files read or changed. What file and diff navigation is offered from.
+    /// The files read or changed. What file and diff navigation is offered from,
+    /// so only paths that name a file belong here — a search's *directory* does
+    /// not, because there is no file surface to open it in.
     pub paths: Vec<String>,
     /// The pattern, for a search.
     pub query: Option<String>,
@@ -312,39 +314,6 @@ impl Progress {
 }
 
 impl Work {
-    /// A piece of work with nothing known about it but what it is and how it is
-    /// going. Every other field is filled in by the adapter that can prove it.
-    pub fn new(title: impl Into<String>, status: Progress) -> Work {
-        Work {
-            title: title.into(),
-            status,
-            detail: None,
-            command: None,
-            paths: Vec::new(),
-            query: None,
-        }
-    }
-
-    pub fn detailed(mut self, detail: Option<String>) -> Work {
-        self.detail = detail.filter(|detail| !detail.trim().is_empty());
-        self
-    }
-
-    pub fn running(mut self, command: Option<String>) -> Work {
-        self.command = command.filter(|command| !command.trim().is_empty());
-        self
-    }
-
-    pub fn about(mut self, paths: Vec<String>) -> Work {
-        self.paths = paths;
-        self
-    }
-
-    pub fn matching(mut self, query: Option<String>) -> Work {
-        self.query = query.filter(|query| !query.trim().is_empty());
-        self
-    }
-
     fn to_value(&self) -> Value {
         json!({
             "title": self.title,
@@ -360,9 +329,23 @@ impl Work {
 /// A warning or an error the child hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
-    /// `warning` or `error`.
-    pub level: &'static str,
+    pub level: Level,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Warning,
+    Error,
+}
+
+impl Level {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Warning => "warning",
+            Level::Error => "error",
+        }
+    }
 }
 
 /// A permission or a question a child stopped for.
@@ -375,12 +358,99 @@ pub struct Notice {
 pub struct Blocker {
     /// The provider's own request id — the identity a response is routed by.
     pub request_id: String,
-    /// `permission` or `question`.
-    pub kind: &'static str,
+    pub kind: BlockerKind,
     pub title: String,
     pub detail: Option<String>,
-    /// What the developer decided, once they have. `None` is still waiting.
-    pub resolution: Option<String>,
+    /// How it ended, once it has. `None` is still waiting.
+    pub resolution: Option<Resolution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockerKind {
+    Permission,
+    Question,
+}
+
+impl BlockerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockerKind::Permission => "permission",
+            BlockerKind::Question => "question",
+        }
+    }
+}
+
+/// How a blocker ended.
+///
+/// An identity rather than a sentence. The wording belongs to the client, which
+/// already owns the wording of every other closed literal it is handed — see
+/// `OUTCOME_LABELS` in `SubagentStreamPanel.tsx`. Carrying prose here would put
+/// presentation in the contract and would make a resolution something a later
+/// build could only recognise by matching a string it did not write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    Approved,
+    ApprovedForSession,
+    Declined,
+    Cancelled,
+    /// A question the developer answered.
+    Answered,
+    /// A question the developer refused to answer.
+    Rejected,
+    /// The developer decided, and the decision could not be delivered.
+    ///
+    /// Its own member rather than an absent resolution, because the two are
+    /// different news: nobody has answered yet, against nobody *can* now. The
+    /// child stays [`State::Blocked`] either way — it is, and no answer reached
+    /// it — while the conversation records the decision and the failure to send
+    /// it. See [`crate::session`]'s `answer`.
+    Undelivered,
+}
+
+impl Resolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Resolution::Approved => "approved",
+            Resolution::ApprovedForSession => "approvedForSession",
+            Resolution::Declined => "declined",
+            Resolution::Cancelled => "cancelled",
+            Resolution::Answered => "answered",
+            Resolution::Rejected => "rejected",
+            Resolution::Undelivered => "undelivered",
+        }
+    }
+}
+
+impl Blocker {
+    /// What a child stopped for, read off the request itself.
+    ///
+    /// `None` when the request is not a child's — which is the root agent, and
+    /// every provider that does not attribute a request to one. Reading it from
+    /// the request rather than from the adapter's own bookkeeping is what stops
+    /// the question of "is this a permission or a question" being answered twice
+    /// and differently: [`crate::approval::ApprovalRequest`] already knows, and
+    /// it is the same value that reaches the conversation's row.
+    pub fn waiting_on(request: &crate::approval::ApprovalRequest) -> Option<(String, Blocker)> {
+        let waiting = request.subagent.as_ref()?;
+        Some((
+            waiting.child_id.clone(),
+            Blocker {
+                request_id: request.request_id.clone(),
+                kind: match request.tool_name.as_str() {
+                    crate::worklog::ASK_USER_QUESTION => BlockerKind::Question,
+                    _ => BlockerKind::Permission,
+                },
+                title: request.tool_name.clone(),
+                detail: request.description.clone(),
+                resolution: None,
+            },
+        ))
+    }
+
+    pub fn resolved(mut self, resolution: Resolution) -> Blocker {
+        self.resolution = Some(resolution);
+        self
+    }
 }
 
 /// One thing that happened in a child's session.
@@ -549,7 +619,7 @@ impl NewEntry {
         NewEntry {
             key,
             kind: EntryKind::Notice,
-            payload: json!({"level": notice.level, "text": notice.text}),
+            payload: json!({"level": notice.level.as_str(), "text": notice.text}),
         }
     }
 
@@ -561,10 +631,10 @@ impl NewEntry {
             kind: EntryKind::Blocker,
             payload: json!({
                 "requestId": blocker.request_id,
-                "blocker": blocker.kind,
+                "blocker": blocker.kind.as_str(),
                 "title": blocker.title,
                 "detail": blocker.detail,
-                "resolution": blocker.resolution,
+                "resolution": blocker.resolution.map(Resolution::as_str),
             }),
         }
     }

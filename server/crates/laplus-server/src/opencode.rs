@@ -554,6 +554,10 @@ struct ChildBlocker {
     call: String,
     /// The OpenCode session the request was raised in.
     session_id: String,
+    /// What was asked, exactly as the child's stream recorded it. Held rather
+    /// than re-derived when the answer arrives — see
+    /// [`OpenCode::child_answered`].
+    blocker: crate::subagents::Blocker,
 }
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -987,6 +991,11 @@ fn bounded(value: Option<&Value>) -> Option<String> {
         Value::Null => return None,
         other => other.to_string(),
     };
+    // A tool that reported an empty output said nothing, which is absence
+    // rather than an empty line to draw.
+    if text.trim().is_empty() {
+        return None;
+    }
     if text.chars().count() <= CHILD_OUTPUT {
         return Some(text);
     }
@@ -999,6 +1008,16 @@ fn bounded(value: Option<&Value>) -> Option<String> {
 /// and deliberately alongside it: a project may configure tools laplus has never
 /// heard of, and the honest answer for one of those is the generic tool row
 /// rather than a guess at which of the specific ones it resembles.
+///
+/// **Not the same question as its neighbour, and coarser on purpose.** That one
+/// picks the client's row `itemType` for the *parent* transcript and has six
+/// answers; this picks the provider-neutral [`crate::subagents::EntryKind`] that
+/// Claude and Codex fill too, and has four. So a child's `webfetch`, `mcp` or
+/// image tool lands on `Tool` where the same tool in the root transcript gets a
+/// `web_search`, `mcp_tool_call` or `image_view` row — the same work-entry
+/// component either way, but a hammer rather than a globe. Widening this
+/// vocabulary to close that gap is a decision about the shared model, not about
+/// OpenCode, so it is not taken here.
 fn child_entry_kind(tool: &str) -> crate::subagents::EntryKind {
     use crate::subagents::EntryKind;
     let name = tool.to_ascii_lowercase();
@@ -1049,7 +1068,6 @@ fn child_work(tool: &str, state: &Value) -> (crate::subagents::EntryKind, crate:
         "error" => bounded(state.get("error")),
         _ => None,
     };
-    let kind = child_entry_kind(tool);
     // Only the unambiguous file fields. `path` on a search is the directory it
     // covered rather than a file, and offering to open a directory as a file
     // would be a navigation that fails.
@@ -1058,18 +1076,24 @@ fn child_work(tool: &str, state: &Value) -> (crate::subagents::EntryKind, crate:
         .filter_map(|name| input?.get(name)?.as_str())
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let said = |name: &str| {
+        input
+            .and_then(|input| input.get(name))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
     (
-        kind,
-        Work::new(title, progress)
-            .detailed(detail)
-            .running(input.and_then(|input| input.get("command")).and_then(Value::as_str).map(str::to_string))
-            .about(paths)
-            .matching(
-                input
-                    .and_then(|input| input.get("pattern"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            ),
+        child_entry_kind(tool),
+        Work {
+            title,
+            status: progress,
+            detail,
+            command: said("command"),
+            paths,
+            query: said("pattern"),
+        },
     )
 }
 
@@ -1093,12 +1117,67 @@ fn compact_activity(work: &crate::subagents::Work) -> String {
 }
 
 /// One line describing a blocker, for the compact parent row.
+///
+/// **Its twin is `blockerWorkEntry` in `SubagentStreamPanel.tsx`**, which says
+/// the same thing on the child's own tab. The sentence is written twice on
+/// purpose: this one is a *server* value — it goes into the durable compact row
+/// alongside every other kind of latest activity — and the client's is
+/// presentation for a row it renders from the entry's fields. Sending this
+/// string over the wire to spare the repetition would put prose in the contract,
+/// which `AGENTS.md` keeps schema-only. Change one and read the other.
 fn blocker_activity(blocker: &crate::subagents::Blocker) -> String {
-    match &blocker.resolution {
-        Some(resolution) => format!("{resolution}: {}", blocker.title),
-        None if blocker.kind == "question" => "Waiting for your answer".to_string(),
-        None => format!("Waiting for permission: {}", blocker.title),
+    use crate::subagents::{BlockerKind, Resolution};
+    match (blocker.resolution, blocker.kind) {
+        (Some(Resolution::Undelivered), _) => {
+            format!("Your decision could not be delivered: {}", blocker.title)
+        }
+        (Some(_), _) => format!("Answered: {}", blocker.title),
+        (None, BlockerKind::Question) => "Waiting for your answer".to_string(),
+        (None, BlockerKind::Permission) => {
+            format!("Waiting for permission: {}", blocker.title)
+        }
     }
+}
+
+/// Which decision produced this resolution, for the conversation's own resolved
+/// row. `None` for the resolutions no permission decision stands behind.
+fn decision_behind(resolution: crate::subagents::Resolution) -> Option<crate::worklog::Decision> {
+    use crate::subagents::Resolution;
+    Some(match resolution {
+        Resolution::Approved => crate::worklog::Decision::Accept,
+        Resolution::ApprovedForSession => crate::worklog::Decision::AcceptForSession,
+        Resolution::Declined => crate::worklog::Decision::Decline,
+        Resolution::Cancelled => crate::worklog::Decision::Cancel,
+        // A question's outcome, and an undelivered decision — which the shared
+        // loop has already reported to the conversation itself.
+        Resolution::Answered | Resolution::Rejected | Resolution::Undelivered => return None,
+    })
+}
+
+/// The request id and the decision an OpenCode permission reply carries.
+///
+/// One reading rather than two: this event reaches the driver on the
+/// conversation's session *and* on a child's, and the two paths differing about
+/// which field holds the id — `requestID` on the modern envelope, `permissionID`
+/// on the legacy one — would be a reply that lands for a root agent and is
+/// silently dropped for a descendant.
+fn permission_reply(properties: &Value) -> (Option<String>, Option<crate::worklog::Decision>) {
+    let id = properties
+        .get("requestID")
+        .or_else(|| properties.get("permissionID"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let decision = match properties
+        .get("reply")
+        .or_else(|| properties.get("response"))
+        .and_then(Value::as_str)
+    {
+        Some("once") => Some(crate::worklog::Decision::Accept),
+        Some("always") => Some(crate::worklog::Decision::AcceptForSession),
+        Some("reject") => Some(crate::worklog::Decision::Decline),
+        _ => None,
+    };
+    (id, decision)
 }
 
 fn permission_request(
@@ -1538,47 +1617,38 @@ impl OpenCode {
                     _ => {}
                 }
             }
+            // Both attributions are settled by OpenCode's source, at commit
+            // `2cba7e2`: a tool permission request is tagged with the session
+            // executing the tool (`packages/opencode/src/session/tools.ts`
+            // L81-88) and the question tool emits `question.asked` carrying the
+            // child's `sessionID` (`packages/opencode/src/tool/question.ts`
+            // L14-41). `.scratch/subagent-ux/research.md` carries the
+            // permalinks. So a descendant's blocker reaching this arm is a
+            // protocol fact rather than an assumption.
             "permission.asked" | "permission.updated" => {
                 let legacy = envelope.kind == "permission.updated";
                 if let Some(request) = permission_request(properties, legacy) {
-                    self.child_asked(&call, &session, request, false, driving, decided);
+                    self.child_asked(&call, &session, request, driving, decided);
                 }
             }
             "question.asked" => {
                 if let Some(request) = question_request(properties) {
-                    self.child_asked(&call, &session, request, true, driving, decided);
+                    self.child_asked(&call, &session, request, driving, decided);
                 }
             }
             "permission.replied" => {
-                let id = properties
-                    .get("requestID")
-                    .or_else(|| properties.get("permissionID"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let decision = match properties
-                    .get("reply")
-                    .or_else(|| properties.get("response"))
-                    .and_then(Value::as_str)
-                {
-                    Some("once") => Some(crate::worklog::Decision::Accept),
-                    Some("always") => Some(crate::worklog::Decision::AcceptForSession),
-                    Some("reject") => Some(crate::worklog::Decision::Decline),
-                    _ => None,
-                };
-                if let (Some(id), Some(decision)) = (id, decision) {
-                    self.child_answered(&id, decision.answered(), driving, decided);
+                if let (Some(id), Some(decision)) = permission_reply(properties) {
+                    self.child_answered(&id, decision.resolution(), driving, decided);
                 }
             }
-            "question.replied" => {
+            "question.replied" | "question.rejected" => {
                 if let Some(id) = properties.get("requestID").and_then(Value::as_str) {
                     let id = id.to_string();
-                    self.child_answered(&id, "Answered", driving, decided);
-                }
-            }
-            "question.rejected" => {
-                if let Some(id) = properties.get("requestID").and_then(Value::as_str) {
-                    let id = id.to_string();
-                    self.child_answered(&id, "Rejected", driving, decided);
+                    let resolution = match envelope.kind.as_str() {
+                        "question.replied" => crate::subagents::Resolution::Answered,
+                        _ => crate::subagents::Resolution::Rejected,
+                    };
+                    self.child_answered(&id, resolution, driving, decided);
                 }
             }
             // A child's own failure, in its place in the child's work. It does
@@ -1590,7 +1660,7 @@ impl OpenCode {
                 self.child_noticed(
                     &call,
                     crate::subagents::Notice {
-                        level: "error",
+                        level: crate::subagents::Level::Error,
                         text: structured_event_error(error),
                     },
                     driving,
@@ -1609,7 +1679,7 @@ impl OpenCode {
                 self.child_noticed(
                     &call,
                     crate::subagents::Notice {
-                        level: "warning",
+                        level: crate::subagents::Level::Warning,
                         text: text.to_string(),
                     },
                     driving,
@@ -1743,7 +1813,6 @@ impl OpenCode {
         call: &str,
         session: &str,
         request: crate::approval::ApprovalRequest,
-        question: bool,
         driving: &mut crate::session::Driving,
         decided: &mut crate::session::Decided,
     ) {
@@ -1759,6 +1828,10 @@ impl OpenCode {
             return;
         }
         row.blocked = true;
+        // Attributed here and nowhere else. Everything below — the blocker in
+        // the child's stream, the row in the conversation, the route the answer
+        // takes — reads the child off the request, so there is one decision
+        // about whose blocker this is rather than three that could disagree.
         let request = crate::approval::ApprovalRequest {
             subagent: Some(crate::approval::Waiting {
                 child_id: call.to_string(),
@@ -1766,13 +1839,10 @@ impl OpenCode {
             }),
             ..request
         };
-        let blocker = crate::subagents::Blocker {
-            request_id: request.request_id.clone(),
-            kind: if question { "question" } else { "permission" },
-            title: request.tool_name.clone(),
-            detail: request.description.clone(),
-            resolution: None,
+        let Some((_, blocker)) = crate::subagents::Blocker::waiting_on(&request) else {
+            return;
         };
+        let question = blocker.kind == crate::subagents::BlockerKind::Question;
         let waiting = blocker_activity(&blocker);
         decided.child_streams.push(
             crate::subagents::Update::for_child(call.to_string())
@@ -1784,6 +1854,7 @@ impl OpenCode {
             ChildBlocker {
                 call: call.to_string(),
                 session_id: session.to_string(),
+                blocker,
             },
         );
         let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
@@ -1808,14 +1879,21 @@ impl OpenCode {
 
     /// The developer answered a descendant's blocker: record it on the same
     /// entry, and let the child go back to working.
+    ///
+    /// The answered entry is the **asked** entry with a resolution on it, held
+    /// since [`OpenCode::child_asked`] rather than rebuilt here. Rebuilding it
+    /// would let the two halves of one blocker disagree about what the child
+    /// stopped for — and it would strand the entry at "still waiting" in exactly
+    /// the case where the request has fallen out of this driver's maps, which is
+    /// the case a child's history most needs explained.
     fn child_answered(
         &mut self,
         request_id: &str,
-        resolution: &str,
+        resolution: crate::subagents::Resolution,
         driving: &mut crate::session::Driving,
         decided: &mut crate::session::Decided,
     ) {
-        let Some(blocker) = self.child_blockers.remove(request_id) else {
+        let Some(held) = self.child_blockers.remove(request_id) else {
             return;
         };
         let request = self
@@ -1824,26 +1902,12 @@ impl OpenCode {
             .or_else(|| self.pending_questions.remove(request_id))
             .or_else(|| driving.outstanding.get(request_id).cloned());
         driving.outstanding.remove(request_id);
-        let call = blocker.call;
-        if let Some(row) = self.subagent_rows.get_mut(&call) {
+        if let Some(row) = self.subagent_rows.get_mut(&held.call) {
             row.blocked = false;
         }
-        let Some(request) = request else {
-            return;
-        };
-        let recorded = crate::subagents::Blocker {
-            request_id: request_id.to_string(),
-            kind: if request.tool_name == crate::worklog::ASK_USER_QUESTION {
-                "question"
-            } else {
-                "permission"
-            },
-            title: request.tool_name.clone(),
-            detail: request.description.clone(),
-            resolution: Some(resolution.to_string()),
-        };
+        let recorded = held.blocker.resolved(resolution);
         decided.child_streams.push(
-            crate::subagents::Update::for_child(call.clone())
+            crate::subagents::Update::for_child(held.call.clone())
                 .in_state(crate::subagents::State::Working)
                 .with(crate::subagents::NewEntry::blocked(&recorded)),
         );
@@ -1851,20 +1915,25 @@ impl OpenCode {
         // composer's panel. The root path publishes exactly this on the same
         // event; a descendant's blocker is not a different kind of blocker.
         let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
-        if request.tool_name == crate::worklog::ASK_USER_QUESTION {
-            decided
-                .changes
-                .push(crate::threads::Change::Activity(
-                    crate::worklog::user_input_resolved(request_id, &Value::Null, turn_id),
-                ));
-        } else if let Some(decision) = crate::worklog::Decision::from_resolution(resolution) {
-            decided
-                .changes
-                .push(crate::threads::Change::Activity(crate::worklog::resolved(
-                    &request, decision, turn_id,
-                )));
+        if let Some(request) = request {
+            match recorded.kind {
+                crate::subagents::BlockerKind::Question => decided.changes.push(
+                    crate::threads::Change::Activity(crate::worklog::user_input_resolved(
+                        request_id,
+                        &Value::Null,
+                        turn_id,
+                    )),
+                ),
+                crate::subagents::BlockerKind::Permission => {
+                    if let Some(decision) = decision_behind(resolution) {
+                        decided.changes.push(crate::threads::Change::Activity(
+                            crate::worklog::resolved(&request, decision, turn_id),
+                        ));
+                    }
+                }
+            }
         }
-        self.child_did(&call, blocker_activity(&recorded), driving, decided);
+        self.child_did(&held.call, blocker_activity(&recorded), driving, decided);
     }
 
     /// Has this child already reported? A subagent that has published its answer
@@ -2313,22 +2382,25 @@ impl crate::session::Driver for OpenCode {
                     .or_else(|| envelope.properties.get("permissionID"))
                     .and_then(Value::as_str);
                 if let Some(id) = id {
-                    let decision = match envelope.properties.get("reply")
-                        .or_else(|| envelope.properties.get("response"))
-                        .and_then(Value::as_str) {
-                        Some("once") => Some(crate::worklog::Decision::Accept),
-                        Some("always") => Some(crate::worklog::Decision::AcceptForSession),
-                        Some("reject") => Some(crate::worklog::Decision::Decline),
-                        _ => None,
-                    };
+                    let (_, decision) = permission_reply(&envelope.properties);
                     // A descendant's blocker, replied to on the conversation's
-                    // own session. OpenCode raises the request on the child's
-                    // session; whether it says so again here is its business, and
-                    // the child's stream has to record the resolution either way.
+                    // own session.
+                    //
+                    // **Which session OpenCode publishes a reply on is not a
+                    // fact this repository establishes.** The *asking* side is
+                    // settled — see the citations on `child_session_event`'s
+                    // `permission.asked` arm — but nothing in the research note
+                    // and nothing in `fixtures/opencode-http-sse/` captures a
+                    // `permission.replied` envelope at all, so its `sessionID`
+                    // is unverified. This arm and the child one are therefore
+                    // deliberate breadth rather than two known cases: whichever
+                    // session it arrives on, the child's stream has to record
+                    // the resolution, and the id alone identifies the request.
+                    // Capture one and this hedge can go.
                     if self.child_blockers.contains_key(id) {
                         if let Some(decision) = decision {
                             let id = id.to_string();
-                            self.child_answered(&id, decision.answered(), driving, &mut decided);
+                            self.child_answered(&id, decision.resolution(), driving, &mut decided);
                         }
                         return Some(decided);
                     }
@@ -2362,7 +2434,10 @@ impl crate::session::Driver for OpenCode {
                     // in that child's stream wherever OpenCode chose to say so.
                     if self.child_blockers.contains_key(id) {
                         let id = id.to_string();
-                        let resolution = if envelope.kind == "question.replied" { "Answered" } else { "Rejected" };
+                        let resolution = match envelope.kind.as_str() {
+                            "question.replied" => crate::subagents::Resolution::Answered,
+                            _ => crate::subagents::Resolution::Rejected,
+                        };
                         self.child_answered(&id, resolution, driving, &mut decided);
                         return Some(decided);
                     }

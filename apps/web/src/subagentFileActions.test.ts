@@ -14,7 +14,7 @@ import { type EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import { selectThreadRightPanelState, useRightPanelStore } from "./rightPanelStore";
-import { openSubagentDiff, openSubagentFile } from "./subagentFileActions";
+import { openSubagentDiff, openSubagentFile, subagentFileTarget } from "./subagentFileActions";
 
 const ref = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"));
 
@@ -67,5 +67,47 @@ describe("file and diff actions from a child's work stream", () => {
     useRightPanelStore.getState().activateSurface(ref, "subagent:call_task_1");
     expect(active()).toBe("subagent:call_task_1");
     expect(surfaces()).toHaveLength(4);
+  });
+});
+
+/**
+ * The address a child's path has to be turned into before the file surface can
+ * be opened on it.
+ *
+ * A provider reports the path *it* used, and for OpenCode's `read` and `edit`
+ * that is what the model wrote — usually absolute. The right panel's file
+ * surface is addressed by a workspace-relative path, so handing the raw one
+ * through opens a tab on a file the panel cannot resolve: a surface that
+ * appears and is empty, which is worse than offering nothing.
+ */
+describe("addressing a file a child reported", () => {
+  const root = "/home/dev/project";
+
+  it("makes an absolute path inside the workspace relative", () => {
+    expect(subagentFileTarget(`${root}/src/main.rs`, root)).toBe("src/main.rs");
+  });
+
+  it("passes an already-relative path through", () => {
+    expect(subagentFileTarget("src/main.rs", root)).toBe("src/main.rs");
+    expect(subagentFileTarget("src/main.rs", undefined)).toBe("src/main.rs");
+  });
+
+  /**
+   * A child may legitimately read a file outside the workspace, and this window
+   * has no surface for one. `null` is what the caller renders no affordance
+   * from — the honest answer, rather than a link that opens nothing.
+   */
+  it("refuses a path it cannot address", () => {
+    expect(subagentFileTarget("/etc/hosts", root)).toBeNull();
+    expect(subagentFileTarget("/home/dev/other/src/main.rs", root)).toBeNull();
+    expect(subagentFileTarget("/home/dev/project/src/main.rs", undefined)).toBeNull();
+  });
+
+  it("opens the workspace-relative address rather than the reported path", () => {
+    const target = subagentFileTarget(`${root}/src/main.rs`, root);
+    expect(target).not.toBeNull();
+    openSubagentFile(ref, target!);
+
+    expect(surfaces()).toEqual(["subagent:call_task_1", "file:src/main.rs"]);
   });
 });

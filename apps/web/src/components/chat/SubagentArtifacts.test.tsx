@@ -60,7 +60,7 @@ function entry(id: string, kind: "read" | "edit", path: string) {
   };
 }
 
-function renderWork(entries: ReadonlyArray<unknown>) {
+function renderWork(entries: ReadonlyArray<unknown>, workspaceRoot?: string) {
   view.current = {
     data: {
       stream: {
@@ -86,6 +86,7 @@ function renderWork(entries: ReadonlyArray<unknown>) {
       threadId={ThreadId.make("thread-A")}
       childId="call_task_1"
       threadRef={threadRef}
+      workspaceRoot={workspaceRoot}
     />,
   );
 }
@@ -116,5 +117,29 @@ describe("opening an artifact from inside a child's work", () => {
     fireEvent.click(screen.getByText("Open diff"));
 
     expect(surfaces()).toEqual(["subagent:call_task_1", "diff"]);
+  });
+
+  /**
+   * OpenCode reports the path the model wrote, and for `read`/`edit` that is
+   * absolute. The tab has to open on the file the child touched, not on a
+   * surface addressed by a path the panel cannot resolve.
+   */
+  it("opens an absolute path the child reported as the workspace file it names", () => {
+    renderWork([entry("r", "read", "/home/dev/project/src/main.rs")], "/home/dev/project");
+
+    fireEvent.click(screen.getByTitle("/home/dev/project/src/main.rs"));
+
+    expect(surfaces()).toEqual(["subagent:call_task_1", "file:src/main.rs"]);
+  });
+
+  /**
+   * And a file outside the workspace has no surface in this window, so the
+   * child's entry is still drawn — it happened — with nothing to click.
+   */
+  it("offers no link for a file outside the workspace", () => {
+    renderWork([entry("r", "read", "/etc/hosts")], "/home/dev/project");
+
+    expect(screen.queryByTitle("/etc/hosts")).toBeNull();
+    expect(surfaces()).toEqual(["subagent:call_task_1"]);
   });
 });
