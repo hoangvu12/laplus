@@ -124,6 +124,7 @@ import {
   type RightPanelSurface,
   useRightPanelStore,
 } from "../rightPanelStore";
+import { resolveRightPanelSurfaceCleanup } from "../rightPanelCleanup";
 import {
   isPreviewSupportedInRuntime,
   setActivePreviewTab,
@@ -147,7 +148,6 @@ import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import {
   AlarmClockIcon,
   CheckCircle2Icon,
-  ChevronDownIcon,
   GitBranchIcon,
   TriangleAlertIcon,
   WifiOffIcon,
@@ -224,6 +224,8 @@ import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
 import { SubagentStreamPanel } from "./chat/SubagentStreamPanel";
+import { ScrollToEndButton } from "./chat/ScrollToEndButton";
+import { forgetSubagentScroll, subagentScrollKey } from "./chat/subagentScroll";
 import { ChatHeader, type ChatHeaderThreadAction } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -3099,28 +3101,33 @@ function ChatViewContent(props: ChatViewProps) {
   const cleanupRightPanelSurfaces = useCallback(
     (surfaces: readonly RightPanelSurface[]) => {
       if (!activeThreadRef) return;
-      if (surfaces.some((surface) => surface.kind === "plan")) {
+      // `resolveRightPanelSurfaceCleanup` is the whole of what a close may ask
+      // the server for, so a surface kind absent from its result — a child's
+      // work stream among them — provably reaches nothing.
+      const cleanup = resolveRightPanelSurfaceCleanup(surfaces);
+      if (cleanup.dismissPlanSidebar) {
         dismissPlanSidebarForCurrentTurn();
       }
 
-      for (const surface of surfaces) {
-        if (surface.kind === "preview" && surface.resourceId) {
-          void closePreviewSession({
-            closePreview,
-            snapshot: activePreviewState.sessions[surface.resourceId] ?? null,
-            tabId: surface.resourceId,
-            threadRef: activeThreadRef,
-          });
-        }
-        if (surface.kind === "terminal") {
-          for (const terminalId of surface.terminalIds) {
-            storeCloseTerminal(activeThreadRef, terminalId);
-            void closeTerminalMutation({
-              environmentId: activeThreadRef.environmentId,
-              input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
-            });
-          }
-        }
+      for (const tabId of cleanup.previewTabIds) {
+        void closePreviewSession({
+          closePreview,
+          snapshot: activePreviewState.sessions[tabId] ?? null,
+          tabId,
+          threadRef: activeThreadRef,
+        });
+      }
+      for (const terminalId of cleanup.terminalIds) {
+        storeCloseTerminal(activeThreadRef, terminalId);
+        void closeTerminalMutation({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
+        });
+      }
+      // Local, and the whole of what closing a subagent tab does: the reader's
+      // place belonged to an open surface, and this one is closing.
+      for (const childId of cleanup.forgottenSubagentChildIds) {
+        forgetSubagentScroll(subagentScrollKey(activeThreadRef, childId));
       }
     },
     [
@@ -5806,16 +5813,7 @@ function ChatViewContent(props: ChatViewProps) {
                   className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
                   style={{ bottom: composerOverlayHeight + 4 }}
                 >
-                  <button
-                    type="button"
-                    aria-label="Scroll to end"
-                    title="Scroll to end"
-                    onClick={() => scrollToEnd(true)}
-                    className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1 text-muted-foreground text-xs shadow-sm transition-colors hover:border-border hover:text-foreground hover:cursor-pointer"
-                  >
-                    <ChevronDownIcon className="size-3.5" />
-                    Scroll to end
-                  </button>
+                  <ScrollToEndButton onClick={() => scrollToEnd(true)} />
                 </div>
               )}
             </div>

@@ -26,6 +26,12 @@
  * The stream is fetched only while this is mounted. Closing the tab releases
  * the view and stops nothing: the server goes on recording the child, and
  * reopening the tab replays what it recorded meanwhile.
+ *
+ * **Where the reader is, and whether they are still watching, is not this
+ * file's.** `SubagentStreamScroller` is the shell around the entries below and
+ * owns following, suspending, jump-to-latest and this tab's remembered place.
+ * The two are separate because they change for different reasons: another kind
+ * of child entry is a change to what is read, not to how it is read.
  */
 import type {
   EnvironmentId,
@@ -36,6 +42,7 @@ import type {
   ScopedThreadRef,
   ThreadId,
 } from "@t3tools/contracts";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { FileDiffIcon, Loader2 } from "lucide-react";
 
 import { formatWorkspaceRelativePath } from "../../filePathDisplay";
@@ -43,9 +50,10 @@ import type { WorkLogEntry } from "../../session-logic";
 import { useEnvironmentQuery } from "../../state/query";
 import { subagentEnvironment } from "../../state/subagents";
 import { openSubagentDiff, openSubagentFile, subagentFileTarget } from "../../subagentFileActions";
-import { ScrollArea } from "~/components/ui/scroll-area";
 import ChatMarkdown from "../ChatMarkdown";
 import { SimpleWorkEntryRow } from "./MessagesTimeline";
+import { SubagentStreamScroller } from "./SubagentStreamScroller";
+import { subagentScrollKey } from "./subagentScroll";
 
 interface SubagentStreamPanelProps {
   readonly environmentId: EnvironmentId;
@@ -313,7 +321,13 @@ export function SubagentStreamPanel(props: SubagentStreamPanelProps) {
   }
 
   return (
-    <ScrollArea className="min-h-0 flex-1" data-subagent-state={state.stream.state}>
+    <SubagentStreamScroller
+      surfaceKey={subagentScrollKey(
+        scopeThreadRef(props.environmentId, props.threadId),
+        props.childId,
+      )}
+      streamState={state.stream.state}
+    >
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 px-3 py-3">
         {state.entries.map((entry) => (
           <SubagentStreamEntry
@@ -325,7 +339,7 @@ export function SubagentStreamPanel(props: SubagentStreamPanelProps) {
           />
         ))}
       </div>
-    </ScrollArea>
+    </SubagentStreamScroller>
   );
 }
 
