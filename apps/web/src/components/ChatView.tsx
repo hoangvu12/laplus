@@ -148,7 +148,6 @@ import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import {
   AlarmClockIcon,
   CheckCircle2Icon,
-  ChevronDownIcon,
   GitBranchIcon,
   TriangleAlertIcon,
   WifiOffIcon,
@@ -225,6 +224,8 @@ import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
 import { SubagentStreamPanel } from "./chat/SubagentStreamPanel";
+import { ScrollToEndButton } from "./chat/ScrollToEndButton";
+import { forgetSubagentScroll, subagentScrollKey } from "./chat/subagentScroll";
 import { ChatHeader, type ChatHeaderThreadAction } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -3123,6 +3124,11 @@ function ChatViewContent(props: ChatViewProps) {
           input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
         });
       }
+      // Local, and the whole of what closing a subagent tab does: the reader's
+      // place belonged to an open surface, and this one is closing.
+      for (const childId of cleanup.forgottenSubagentChildIds) {
+        forgetSubagentScroll(subagentScrollKey(activeThreadRef, childId));
+      }
     },
     [
       activeThreadRef,
@@ -5806,16 +5812,7 @@ function ChatViewContent(props: ChatViewProps) {
                   className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
                   style={{ bottom: composerOverlayHeight + 4 }}
                 >
-                  <button
-                    type="button"
-                    aria-label="Scroll to end"
-                    title="Scroll to end"
-                    onClick={() => scrollToEnd(true)}
-                    className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1 text-muted-foreground text-xs shadow-sm transition-colors hover:border-border hover:text-foreground hover:cursor-pointer"
-                  >
-                    <ChevronDownIcon className="size-3.5" />
-                    Scroll to end
-                  </button>
+                  <ScrollToEndButton onClick={() => scrollToEnd(true)} />
                 </div>
               )}
             </div>

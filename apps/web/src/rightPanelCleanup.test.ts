@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveRightPanelSurfaceCleanup } from "./rightPanelCleanup";
+import { cleanupReachesTheServer, resolveRightPanelSurfaceCleanup } from "./rightPanelCleanup";
 import type { RightPanelSurface } from "./rightPanelStore";
 
-const NOTHING = { dismissPlanSidebar: false, previewTabIds: [], terminalIds: [] };
+const NOTHING = {
+  dismissPlanSidebar: false,
+  previewTabIds: [],
+  terminalIds: [],
+  forgottenSubagentChildIds: [],
+};
 
 const subagent = (childId: string): RightPanelSurface => ({
   id: `subagent:${childId}`,
@@ -19,7 +24,7 @@ const terminal = (...terminalIds: [string, ...string[]]): RightPanelSurface => (
   activeTerminalId: terminalIds[0],
 });
 
-describe("what closing a right-panel surface asks the server for", () => {
+describe("what closing a right-panel surface entails", () => {
   it("stops the preview session behind a browser tab", () => {
     expect(
       resolveRightPanelSurfaceCleanup([
@@ -44,24 +49,40 @@ describe("what closing a right-panel surface asks the server for", () => {
   });
 
   /**
-   * The criterion, stated as the only thing this seam can say: closing a child
-   * tab asks for nothing. There is no interrupt, no cancellation, no
+   * The criterion, stated as the shape of this value rather than as an argument
+   * about the code: closing a subagent tab releases the reader's place in the
+   * stream and does nothing else. There is no interrupt, no cancellation, no
    * detachment and no provider call to make, because the complete set of calls
-   * a close can make is the three fields of this value and a child contributes
-   * to none of them.
+   * that leave this window is the three fields `cleanupReachesTheServer` reads
+   * and a subagent contributes to none of them.
    */
-  it("asks for nothing at all when a child tab is closed", () => {
-    expect(resolveRightPanelSurfaceCleanup([subagent("call_task_1")])).toEqual(NOTHING);
-    expect(
-      resolveRightPanelSurfaceCleanup([subagent("call_task_1"), subagent("call_task_2")]),
-    ).toEqual(NOTHING);
+  it("releases only the reader's place when a subagent tab is closed", () => {
+    const one = resolveRightPanelSurfaceCleanup([subagent("call_task_1")]);
+    expect(one).toEqual({ ...NOTHING, forgottenSubagentChildIds: ["call_task_1"] });
+    expect(cleanupReachesTheServer(one)).toBe(false);
+
+    const several = resolveRightPanelSurfaceCleanup([
+      subagent("call_task_1"),
+      subagent("call_task_2"),
+    ]);
+    expect(several.forgottenSubagentChildIds).toEqual(["call_task_1", "call_task_2"]);
+    expect(cleanupReachesTheServer(several)).toBe(false);
   });
 
-  it("closes a child beside a terminal without touching the child", () => {
-    expect(resolveRightPanelSurfaceCleanup([subagent("call_task_1"), terminal("term-1")])).toEqual({
+  it("closes a subagent beside a terminal without asking anything of the child", () => {
+    const cleanup = resolveRightPanelSurfaceCleanup([subagent("call_task_1"), terminal("term-1")]);
+
+    expect(cleanup).toEqual({
       ...NOTHING,
       terminalIds: ["term-1"],
+      forgottenSubagentChildIds: ["call_task_1"],
     });
+    // The terminal is what reaches the server here; the child contributed
+    // nothing to that.
+    expect(cleanupReachesTheServer(cleanup)).toBe(true);
+    expect(
+      cleanupReachesTheServer(resolveRightPanelSurfaceCleanup([subagent("call_task_1")])),
+    ).toBe(false);
   });
 
   it("asks for nothing when a file, an explorer or a diff tab is closed", () => {
@@ -81,6 +102,8 @@ describe("what closing a right-panel surface asks the server for", () => {
   });
 
   it("asks for nothing when nothing is closed", () => {
-    expect(resolveRightPanelSurfaceCleanup([])).toEqual(NOTHING);
+    const cleanup = resolveRightPanelSurfaceCleanup([]);
+    expect(cleanup).toEqual(NOTHING);
+    expect(cleanupReachesTheServer(cleanup)).toBe(false);
   });
 });

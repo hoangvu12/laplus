@@ -12,6 +12,7 @@
  * coverage is those plus the four outcome shapes. Commands, reads, edits, tool
  * calls and blockers are ticket 02's, and its worker extends this file.
  */
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -36,9 +37,27 @@ vi.mock("../../state/query", () => ({
 }));
 
 import { SubagentStreamPanel } from "./SubagentStreamPanel";
+import { SCROLL_TO_END_LABEL } from "./ScrollToEndButton";
+import {
+  rememberSubagentScroll,
+  resetSubagentScrollMemoryForTests,
+  subagentScrollKey,
+} from "./subagentScroll";
 
 const ENVIRONMENT_ID = "environment-local" as EnvironmentId;
 const THREAD_ID = "thread-1" as ThreadId;
+const SURFACE_KEY = subagentScrollKey(scopeThreadRef(ENVIRONMENT_ID, THREAD_ID), "call_task_1");
+
+/**
+ * Every control the surface renders, by the name a reader would hear. An
+ * unlabelled button comes back as its raw markup rather than being skipped, so
+ * this cannot quietly under-report what the surface offers.
+ */
+function controlsIn(markup: string): string[] {
+  return Array.from(markup.matchAll(/<button\b[^>]*>/g)).map(
+    (match) => /aria-label="([^"]*)"/.exec(match[0])?.[1] ?? match[0],
+  );
+}
 
 const CHILD_NAME = "explore";
 const CHILD_ASSIGNMENT = "Count the files in the workspace";
@@ -97,6 +116,7 @@ function render(
 describe("the subagent work stream surface", () => {
   beforeEach(() => {
     view.current = { data: null, error: null, isPending: false, refresh: () => {} };
+    resetSubagentScrollMemoryForTests();
   });
 
   it("renders the child's prose through the main agent's markdown language", () => {
@@ -177,6 +197,13 @@ describe("the subagent work stream surface", () => {
    * The two negative claims. The surface is observational: it cannot steer a
    * provider that has no way to receive a message for one child, so it offers
    * nothing that looks like it could.
+   *
+   * The claim is about the *complete* set of controls, and is stated in both
+   * follow states so that neither passes by accident. A surface opened at its
+   * live edge is following and renders no control at all; the test below is the
+   * same surface with following suspended, where the only control it can ever
+   * render appears — the shared jump-to-latest affordance, which moves the
+   * viewport and reaches no provider.
    */
   it("offers no composer and no way to send anything to the child", () => {
     const markup = render({
@@ -188,10 +215,30 @@ describe("the subagent work stream surface", () => {
     expect(markup).not.toContain("<input");
     expect(markup).not.toContain("<form");
     expect(markup).not.toContain("contenteditable");
-    expect(markup).not.toContain("<button");
     // Nothing in the surface is activatable either: the work-entry rows it
     // reuses are inert here, where in the conversation they expand or launch.
     expect(markup).not.toContain('role="button"');
+    expect(controlsIn(markup)).toEqual([]);
+  });
+
+  /**
+   * The same surface with its reader scrolled away from the live edge. This is
+   * the state in which the surface does render a control, so it is where the
+   * "no composer" claim above has to be made again to mean anything.
+   */
+  it("renders only the shared jump-to-latest control once following is suspended", () => {
+    rememberSubagentScroll(SURFACE_KEY, { offset: 120, following: false });
+
+    const markup = render({
+      stream: stream(),
+      entries: [message("a", 1, "counting"), outcome("completed", "eleven files")],
+    });
+
+    expect(controlsIn(markup)).toEqual([SCROLL_TO_END_LABEL]);
+    expect(markup).not.toContain("<textarea");
+    expect(markup).not.toContain("<input");
+    expect(markup).not.toContain("<form");
+    expect(markup).not.toContain("contenteditable");
   });
 
   /**

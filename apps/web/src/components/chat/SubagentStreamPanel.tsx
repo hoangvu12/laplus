@@ -32,6 +32,7 @@ import type {
   ScopedThreadRef,
   ThreadId,
 } from "@t3tools/contracts";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { Loader2 } from "lucide-react";
 
 import type { WorkLogEntry } from "../../session-logic";
@@ -146,14 +147,12 @@ export function SubagentStreamPanel(props: SubagentStreamPanelProps) {
     );
   }
 
-  // What the shell watches for a reason to follow: one more entry, or one more
-  // token appended to the last one, both of which move `updatedAt`.
-  const contentKey = `${state.entries.length}:${state.entries.at(-1)?.id ?? ""}:${state.stream.updatedAt}`;
-
   return (
     <SubagentStreamScroller
-      surfaceKey={subagentScrollKey(props.environmentId, props.threadId, props.childId)}
-      contentKey={contentKey}
+      surfaceKey={subagentScrollKey(
+        scopeThreadRef(props.environmentId, props.threadId),
+        props.childId,
+      )}
       streamState={state.stream.state}
     >
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 px-3 py-3">

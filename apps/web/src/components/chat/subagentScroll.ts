@@ -15,9 +15,11 @@
  *   surface, so every child tab keeps its own place across the switch.
  *
  * The memory is session state and is deliberately *not* persisted: after a
- * reload a restored child tab replays lazily and opens at its live edge, which
- * is where a reader who has just returned to a running child wants to be.
+ * reload a restored subagent tab replays lazily and opens at its live edge,
+ * which is where a reader who has just returned to a running child wants to be.
  */
+import { scopedThreadKey } from "@t3tools/client-runtime/environment";
+import type { ScopedThreadRef } from "@t3tools/contracts";
 
 /** The three numbers a scroll container reports, and all this module needs. */
 export interface ScrollMetrics {
@@ -53,17 +55,17 @@ export interface SubagentScrollPosition {
 }
 
 /**
- * The address of one child surface's scroll state.
+ * The address of one subagent surface's scroll state.
  *
  * The same child id in another thread is another surface, so the thread is part
  * of the key — the right-panel workspace is thread-scoped and its tabs are too.
+ * The thread half is `scopedThreadKey`, the same function `rightPanelStore` keys
+ * that workspace by, rather than a second spelling of it here: one place decides
+ * what "this thread's workspace" is called. Appending the child after a fixed
+ * thread prefix cannot collide, whatever a child id contains.
  */
-export function subagentScrollKey(
-  environmentId: string,
-  threadId: string,
-  childId: string,
-): string {
-  return `${environmentId}:${threadId}:${childId}`;
+export function subagentScrollKey(ref: ScopedThreadRef, childId: string): string {
+  return `${scopedThreadKey(ref)}:${childId}`;
 }
 
 /**
@@ -89,11 +91,20 @@ export function readSubagentScroll(key: string): SubagentScrollPosition | null {
   return positions.get(key) ?? null;
 }
 
+/**
+ * Drop a surface's place, because that surface is no longer open.
+ *
+ * The spec preserves scroll state "per open child surface", and closing a tab
+ * removes the surface. Without this, closing a suspended live child and
+ * reopening it from its inline row would drop the reader back at a stale offset
+ * with following still suspended — a tab that looks reopened but is showing
+ * where they were, not what the child has said since.
+ */
 export function forgetSubagentScroll(key: string): void {
   positions.delete(key);
 }
 
 /** Test seam: the memory outlives any one component, so a test must clear it. */
-export function resetSubagentScrollMemory(): void {
+export function resetSubagentScrollMemoryForTests(): void {
   positions.clear();
 }
