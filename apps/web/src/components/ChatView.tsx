@@ -117,6 +117,7 @@ import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
 import {
+  openSubagentSurface,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
@@ -3049,12 +3050,11 @@ function ChatViewContent(props: ChatViewProps) {
   );
   // Clicking an inline child row is the *only* thing that opens a child
   // surface. Nothing about a child starting, updating, blocking, completing or
-  // failing calls this, so delegated work cannot steal the panel.
-  const openSubagentSurface = useCallback(
-    (childId: string) => {
-      if (!activeThreadRef) return;
-      useRightPanelStore.getState().openSubagent(activeThreadRef, childId);
-    },
+  // failing calls this, so delegated work cannot steal the panel. What it does
+  // is `openSubagentSurface`'s, so that the wiring is somewhere a test can
+  // reach rather than inside this component.
+  const handleOpenSubagent = useCallback(
+    (childId: string) => openSubagentSurface(activeThreadRef, childId),
     [activeThreadRef],
   );
   const activateRightPanelSurface = useCallback(
@@ -5773,7 +5773,7 @@ function ChatViewContent(props: ChatViewProps) {
                 activeThreadEnvironmentId={activeThread.environmentId}
                 routeThreadKey={routeThreadKey}
                 onOpenTurnDiff={onOpenTurnDiff}
-                onOpenSubagent={openSubagentSurface}
+                onOpenSubagent={handleOpenSubagent}
                 revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                 onRevertUserMessage={onRevertUserMessage}
                 onRetryQueuedTurn={() => {

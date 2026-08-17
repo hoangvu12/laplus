@@ -582,6 +582,31 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
   ),
 );
 
+/**
+ * Open one delegated child's work stream, or activate the tab it already has.
+ *
+ * The whole of what activating an inline child row does to the workspace, in
+ * one place with a name. It used to live in a `useCallback` inside `ChatView`,
+ * where the only way to find out whether a row was wired to a surface at all
+ * was to run the application — which is precisely the link ticket 01's third
+ * and fifth criteria turn on.
+ *
+ * **A thread is required and `null` opens nothing.** A right-panel workspace is
+ * thread-scoped, so a row activated while no conversation is active has no
+ * workspace to open into; silently doing nothing is the honest answer and is
+ * the one decision this function makes that its caller would otherwise have to.
+ *
+ * Presentation only, in both directions: this cannot start, stop or steer a
+ * child, and closing the surface it opens does not reach the provider either.
+ */
+export function openSubagentSurface(
+  threadRef: ScopedThreadRef | null | undefined,
+  childId: string,
+): void {
+  if (!threadRef) return;
+  useRightPanelStore.getState().openSubagent(threadRef, childId);
+}
+
 export function selectThreadRightPanelState(
   byThreadKey: Record<string, ThreadRightPanelState>,
   ref: ScopedThreadRef | null | undefined,
