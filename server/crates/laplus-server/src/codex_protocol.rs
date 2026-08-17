@@ -62,6 +62,13 @@ pub struct ConversationState {
     pub command_executions: Vec<CommandExecution>,
     #[serde(skip)]
     subagent_paths: HashMap<String, String>,
+    /// A child's streamed prose, accumulated per item so that a delta can be
+    /// republished as the whole sentence so far under the same key. The root's
+    /// deltas are folded into `assistant_messages`; a child's belong to a
+    /// conversation this state does not otherwise track, so they are kept apart
+    /// and never shown as the parent's own words.
+    #[serde(skip)]
+    subagent_messages: HashMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub approval_requests: Vec<ApprovalRequest>,
     pub unknown_events: usize,
@@ -148,7 +155,19 @@ pub enum ConversationFold {
     CollaborationStarted(CollaborationCall),
     CollaborationCompleted(CollaborationCall),
     SubagentActivity(SubagentActivity),
+    /// The same activity, reported on a *descendant's* thread rather than the
+    /// root's — the agent that spawned it is the child whose thread said so.
+    ///
+    /// A variant of its own rather than a flag, because the two go different
+    /// places: this one identifies a nested agent and opens its stream, and it
+    /// deliberately does **not** put a row in the root transcript. A descendant
+    /// belongs in the work stream of the child that launched it, which is
+    /// ticket 06's placement to make; duplicating it into the conversation now
+    /// would be the thing the spec's own words rule out.
+    NestedSubagentActivity(SubagentActivity),
     SubagentObserved(CollaborationAgent),
+    /// Something a child thread said or did, for that child's own work stream.
+    SubagentWorked(ChildNotification),
     ApprovalRequested(ApprovalRequest),
     TokenUsage(crate::protocol::TokenUsage),
     TurnCompleted(Completion),
@@ -172,6 +191,42 @@ pub struct CollaborationAgent {
     pub status: String,
     pub message: Option<String>,
     pub path: Option<String>,
+}
+
+/// One notification from a child's own Codex thread.
+///
+/// Codex runs a subagent as a *thread*, so a child's work arrives as the same
+/// `item/*` and `turn/*` notifications the root's does, under the child's own
+/// `threadId`. That is why this carries the same [`CommandExecution`] the root
+/// path folds rather than a parallel copy of it: one shape, decoded once, and a
+/// child's command is a command.
+///
+/// **A protocol notification, not yet a stream entry.** `CONTEXT.md` reserves
+/// *stream entry* for [`crate::subagents::Entry`] and *child work* for
+/// [`crate::subagents::Work`], and this is neither: it is what the wire said,
+/// and [`crate::codex::Children`] decides which of these become entries and in
+/// what vocabulary. A child opening a turn produces one of these and no entry
+/// at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildNotification {
+    /// The child's Codex thread id — its identity, and the id its work stream is
+    /// keyed by.
+    pub thread_id: String,
+    /// The canonical agent path, when a `subAgentActivity` has already named it.
+    pub path: Option<String>,
+    pub event: ChildEvent,
+}
+
+/// What one of those notifications said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildEvent {
+    /// The child opened a turn: it is working, whatever it says next.
+    Working,
+    /// The child's own prose. `text` is everything it has said in this item so
+    /// far, and `item_id` is the key that makes the next revision an edit.
+    Said { item_id: String, text: String },
+    /// A command the child ran.
+    Ran(CommandExecution),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,8 +345,8 @@ impl ConversationState {
                 // arms below and report the parent thread idle while its
                 // subagent is still working — which settles the turn outright
                 // once `idle_is_terminal` holds.
-                let path = self.subagent_paths.get(event_thread_id);
-                return child_notification(method, params, event_thread_id, path);
+                let thread_id = event_thread_id.to_string();
+                return self.child_notification(method, params, &thread_id);
             }
         }
         match method {
@@ -535,6 +590,157 @@ impl ConversationState {
         }
     }
 
+    /// What another thread's notification is worth to this conversation.
+    ///
+    /// A child's `turn/completed` is still the only thing that ends it — it is
+    /// the one signal Codex 0.146.0 actually carries a subagent's outcome on,
+    /// because the `agentsStates` map on a collaboration call arrives empty. What
+    /// changed is that its prose, its commands and its turn boundary are no
+    /// longer dropped: they are the child's own work, and they belong to the
+    /// child's stream rather than to the root's transcript. Nothing here folds
+    /// into the parent conversation, which is the whole point of routing them
+    /// apart — a descendant's turn boundary must never settle the root's.
+    ///
+    /// `path` is absent until a `subAgentActivity` names the agent, and stays
+    /// absent rather than being guessed at from the thread id.
+    fn child_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+        thread_id: &str,
+    ) -> ConversationFold {
+        let path = self.subagent_paths.get(thread_id).cloned();
+        // An item id is unique within its own thread, so the accumulator is
+        // keyed by both. Two children streaming at once is the ordinary case.
+        let said_key = |item_id: &str| format!("{thread_id}\u{1f}{item_id}");
+        let worked = |event: ChildEvent| {
+            ConversationFold::SubagentWorked(ChildNotification {
+                thread_id: thread_id.to_string(),
+                path: path.clone(),
+                event,
+            })
+        };
+        match method {
+            "turn/started" => worked(ChildEvent::Working),
+            "item/agentMessage/delta" => {
+                let (Some(item_id), Some(delta)) =
+                    (params["itemId"].as_str(), params["delta"].as_str())
+                else {
+                    return ConversationFold::Nothing;
+                };
+                let said = self.subagent_messages.entry(said_key(item_id)).or_default();
+                said.push_str(delta);
+                let text = said.clone();
+                match text.trim().is_empty() {
+                    true => ConversationFold::Nothing,
+                    false => worked(ChildEvent::Said {
+                        item_id: item_id.to_string(),
+                        text,
+                    }),
+                }
+            }
+            "item/started" | "item/completed" => {
+                let item = &params["item"];
+                match item["type"].as_str() {
+                    Some("agentMessage") => {
+                        let Some(item_id) = item["id"].as_str() else {
+                            return ConversationFold::Nothing;
+                        };
+                        // An item opens empty and is filled by deltas, so an
+                        // empty one says only that the child is about to speak.
+                        // The completed item is authoritative over whatever the
+                        // deltas accumulated.
+                        let text = item["text"].as_str().unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            self.subagent_messages
+                                .insert(said_key(item_id), text.to_string());
+                        }
+                        let said = self
+                            .subagent_messages
+                            .get(&said_key(item_id))
+                            .cloned()
+                            .unwrap_or_default();
+                        match said.trim().is_empty() {
+                            true => ConversationFold::Nothing,
+                            false => worked(ChildEvent::Said {
+                                item_id: item_id.to_string(),
+                                text: said,
+                            }),
+                        }
+                    }
+                    Some("commandExecution") => match command_execution(item) {
+                        Some(command) => worked(ChildEvent::Ran(command)),
+                        None => ConversationFold::Nothing,
+                    },
+                    // A nested agent, announced by the child that launched it.
+                    // Its path is recorded here so the hierarchy it proves is
+                    // available to every later event about it.
+                    Some("subAgentActivity") => match subagent_activity(item) {
+                        Some(activity) => {
+                            self.subagent_paths.insert(
+                                activity.agent_thread_id.clone(),
+                                activity.agent_path.clone(),
+                            );
+                            ConversationFold::NestedSubagentActivity(activity)
+                        }
+                        None => ConversationFold::Nothing,
+                    },
+                    // `fileChange`, `mcpToolCall`, `webSearch`, `reasoning` and
+                    // the rest are **known** item kinds this build does not read
+                    // the body of — the root path folds them to nothing too. A
+                    // child's edit could be an `EntryKind::Edit` carrying the
+                    // file it changed, and that is the one thing that would give
+                    // a Codex child tab file and diff navigation; there is no
+                    // capture of one, and guessing which field holds the path is
+                    // the fabrication the honesty rule exists to prevent.
+                    // Record one, and this arm is where it lands.
+                    _ => ConversationFold::Nothing,
+                }
+            }
+            "turn/completed" => {
+                let turn = params.get("turn").unwrap_or(&Value::Null);
+                let status = match turn.get("status").and_then(Value::as_str).unwrap_or("failed") {
+                    "completed" => "completed",
+                    "interrupted" | "cancelled" => "interrupted",
+                    _ => "errored",
+                };
+                let message = turn
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+                    .and_then(|item| item.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| error_message(turn.get("error")));
+                ConversationFold::SubagentObserved(CollaborationAgent {
+                    thread_id: thread_id.to_string(),
+                    status: status.to_string(),
+                    message,
+                    path: path.clone(),
+                })
+            }
+            // A child's statuses, token accounting and everything else are that
+            // conversation's business. Unfolded rather than counted as drift:
+            // they are known traffic about a thread this state does not track.
+            _ => ConversationFold::Nothing,
+        }
+    }
+
+    /// An app-server request: an approval this conversation has to answer.
+    ///
+    /// **Codex attributes these to a thread and laplus does not read it yet.**
+    /// `params.threadId` is on every one of them — see
+    /// `fixtures/codex-app-server/03-write-approval.jsonl` — so a permission a
+    /// *subagent* asked for is distinguishable from the root's, and
+    /// [`crate::approval::ApprovalRequest::subagent`] is the field that would
+    /// carry it. Until that is wired, a child's approval is folded as the root's:
+    /// truthful about the request, silent about who is waiting, and never
+    /// attributed to a child on a guess. The child's stream therefore records no
+    /// blocker, which is the honest degradation rather than the intended end
+    /// state.
     fn fold_request(&mut self, method: &str, id: &Value, params: &Value) -> ConversationFold {
         let (request_kind, tool_name, input) = match method {
             "item/commandExecution/requestApproval" => (
@@ -686,48 +892,6 @@ fn subagent_activity(item: &Value) -> Option<SubagentActivity> {
         agent_thread_id: item.get("agentThreadId")?.as_str()?.to_string(),
         agent_path: item.get("agentPath")?.as_str()?.to_string(),
         raw: item.clone(),
-    })
-}
-
-/// What another thread's notification is worth to this conversation.
-///
-/// Only a child's `turn/completed` says anything laplus can render — it is the
-/// one signal Codex 0.146.0 actually carries a subagent's outcome on, because
-/// the `agentsStates` map on a collaboration call arrives empty. Everything
-/// else about a child thread is deliberately dropped rather than folded into
-/// the root: its statuses, turns and items belong to a conversation this state
-/// is not tracking. `path` is absent until a `subAgentActivity` names the agent.
-fn child_notification(
-    method: &str,
-    params: &Value,
-    thread_id: &str,
-    path: Option<&String>,
-) -> ConversationFold {
-    if method != "turn/completed" {
-        return ConversationFold::Nothing;
-    }
-    let turn = params.get("turn").unwrap_or(&Value::Null);
-    let status = match turn.get("status").and_then(Value::as_str).unwrap_or("failed") {
-        "completed" => "completed",
-        "interrupted" | "cancelled" => "interrupted",
-        _ => "errored",
-    };
-    let message = turn
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
-        .and_then(|item| item.get("text"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| error_message(turn.get("error")));
-    ConversationFold::SubagentObserved(CollaborationAgent {
-        thread_id: thread_id.to_string(),
-        status: status.to_string(),
-        message,
-        path: path.cloned(),
     })
 }
 
@@ -1621,6 +1785,105 @@ mod tests {
         );
         assert_eq!(state.thread_status.as_deref(), Some("active"));
         assert_eq!(state.unknown_events, 0);
+    }
+
+    /// A child's own items are that child's work, not the parent's. Prose is
+    /// coalesced under its item id so a stream of deltas is one sentence being
+    /// written rather than four paragraphs, and none of it reaches the root's
+    /// messages, commands or turn.
+    #[test]
+    fn a_childs_items_fold_into_that_childs_work_and_nothing_else() {
+        let mut state = ConversationState::new();
+        state.fold_message(json!({"result": {"thread": {"id": "parent-thread"}}}));
+        state.fold_message(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "parent-thread",
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "activity-1",
+                    "kind": "started",
+                    "agentThreadId": "child-thread",
+                    "agentPath": "/root/reviewer"
+                }
+            }
+        }));
+
+        let opened = state.fold_message(json!({
+            "method": "item/started",
+            "params": {"threadId": "child-thread", "item": {"type": "agentMessage", "id": "m-1", "text": ""}}
+        }));
+        assert!(
+            matches!(opened, ConversationFold::Nothing),
+            "an empty item says only that the child is about to speak: {opened:?}"
+        );
+        let first = state.fold_message(json!({
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "child-thread", "itemId": "m-1", "delta": "Reading "}
+        }));
+        let second = state.fold_message(json!({
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "child-thread", "itemId": "m-1", "delta": "the decoder."}
+        }));
+        let said = |folded: ConversationFold| match folded {
+            ConversationFold::SubagentWorked(ChildNotification {
+                thread_id,
+                path,
+                event: ChildEvent::Said { item_id, text },
+            }) => (thread_id, path, item_id, text),
+            other => panic!("the child's prose was not the child's: {other:?}"),
+        };
+        assert_eq!(
+            said(first),
+            (
+                "child-thread".to_string(),
+                Some("/root/reviewer".to_string()),
+                "m-1".to_string(),
+                "Reading ".to_string()
+            )
+        );
+        assert_eq!(said(second).3, "Reading the decoder.", "the sentence so far");
+
+        let ran = state.fold_message(json!({
+            "method": "item/completed",
+            "params": {"threadId": "child-thread", "item": {
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": "ls src",
+                "cwd": "/work",
+                "status": "completed",
+                "aggregatedOutput": "decoder.rs\n",
+                "exitCode": 0
+            }}
+        }));
+        let ConversationFold::SubagentWorked(ChildNotification { event: ChildEvent::Ran(command), .. }) = ran
+        else {
+            panic!("the child's command was not folded as one");
+        };
+        assert_eq!(command.command, "ls src");
+
+        // A nested agent the child announced on its own thread: identified, and
+        // deliberately not a row in the root transcript.
+        let nested = state.fold_message(json!({
+            "method": "item/completed",
+            "params": {"threadId": "child-thread", "item": {
+                "type": "subAgentActivity",
+                "id": "activity-2",
+                "kind": "started",
+                "agentThreadId": "grandchild-thread",
+                "agentPath": "/root/reviewer/helper"
+            }}
+        }));
+        let ConversationFold::NestedSubagentActivity(activity) = nested else {
+            panic!("a descendant's activity was folded as the root's");
+        };
+        assert_eq!(activity.agent_thread_id, "grandchild-thread");
+
+        assert!(state.assistant_messages.is_empty(), "the child spoke, not the parent");
+        assert!(state.command_executions.is_empty(), "the child ran it, not the parent");
+        assert_eq!(state.turn_status, None);
+        assert_eq!(state.unknown_events, 0);
+        assert_eq!(state.parse_errors, 0);
     }
 
     #[test]

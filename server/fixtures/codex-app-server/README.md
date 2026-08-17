@@ -129,3 +129,28 @@ thread snapshots keep only the fields the decoder reads. Its fold shows
 this driver does not handle, because it takes the turn id from the `turn/start`
 response instead. That is real, pre-existing drift on every turn, recorded here
 rather than hidden.
+
+`10-subagent-work.jsonl` is **composed, not recorded** — and it is composed only
+out of message shapes that _are_ recorded, so that what it adds is the situation
+rather than the protocol. Its prologue is capture 09's verbatim. Its
+`collabAgentToolCall`, `subAgentActivity` and `agentsStates` shapes are 09's; its
+`commandExecution` items and `item/agentMessage/delta` notifications are
+`02-command-execution`'s and `01-plain-turn`'s, moved onto a child thread — which
+is not an invention, because Codex runs a subagent _as a thread_ and 09 records a
+child emitting the same `item/*` and `turn/*` notifications the root does.
+
+It exists because 09 is one small real turn and cannot show any of this: a
+`spawnAgent` that completes while its child keeps working, a child that runs a
+command, a child that streams its prose in deltas, a `wait` naming two receivers,
+a canonical `agentPath` three segments deep (`/root/reviewer/helper`, whose
+parent laplus resolves to the reviewer's own thread), `subAgentActivity` items
+whose `kind` is `interacted` and `interrupted`, and the five terminal
+`agentsStates` — `completed`, `interrupted`, `errored`, `notFound` and
+`shutdown` — that 09's always-empty map could not carry. **A field this file invents would be worse than a field it omits**, so
+it adds no key that is absent from the recordings above; where the protocol says
+nothing, the fixture says nothing.
+
+Its fold carries the same deliberate `unknownEvents: 1` from the root's
+`turn/started`, and nothing else: the child's five messages, its command and its
+turn boundaries appear nowhere in the root conversation's state, which is what
+that golden is asserting about them.

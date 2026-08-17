@@ -2268,3 +2268,547 @@ async fn codex_and_claude_conversations_run_concurrently_without_crossing() {
     server.stop().await;
     codex.assert_conversation_reaped();
 }
+
+/// The compact child rows a Codex turn published, by the child each one launches.
+fn child_rows(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| event["event"]["type"] == "thread.activity-appended")
+        .map(|event| event["event"]["payload"]["activity"].clone())
+        .filter(|activity| activity["payload"]["data"]["childId"].is_string())
+        .collect()
+}
+
+/// One child's work stream, as the tab that opens it reads it.
+async fn child_stream(server: &TestServer, thread_id: &str, child_id: &str) -> Value {
+    let mut inspector = server.connect().await;
+    let subscription = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": thread_id, "childId": child_id}),
+        )
+        .await;
+    let replayed = inspector.next_chunk(&subscription).await;
+    let snapshot = replayed
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .unwrap_or_else(|| panic!("no stream for {child_id}: {replayed:#?}"))["snapshot"]
+        .clone();
+    inspector.close().await;
+    snapshot
+}
+
+/// A stream's entries as a client renders them: what kind of thing happened, and
+/// the one line that says which.
+fn read(snapshot: &Value) -> Vec<(String, String)> {
+    snapshot["entries"]
+        .as_array()
+        .expect("the snapshot carries its entries")
+        .iter()
+        .map(|entry| {
+            let payload = &entry["payload"];
+            let kind = entry["kind"].as_str().expect("an entry kind");
+            // An outcome is read by how it ended; everything else by what it
+            // said or what it was called.
+            let said = match kind {
+                "outcome" => payload["kind"].as_str(),
+                _ => payload["text"].as_str().or_else(|| payload["title"].as_str()),
+            };
+            (kind.to_string(), said.unwrap_or_default().to_string())
+        })
+        .collect()
+}
+
+/// Replay and live continuation folded the way a client folds them: upsert by
+/// entry id, order by sequence.
+fn folded_entries(snapshot: &Value, live: &[Value]) -> Vec<Value> {
+    let mut folded: Vec<Value> = snapshot["entries"]
+        .as_array()
+        .expect("the snapshot carries the entries so far")
+        .clone();
+    for item in live {
+        let Some(entry) = item.get("entry").filter(|entry| entry.is_object()) else {
+            continue;
+        };
+        match folded.iter().position(|held| held["id"] == entry["id"]) {
+            Some(index) => folded[index] = entry.clone(),
+            None => folded.push(entry.clone()),
+        }
+    }
+    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
+    folded
+}
+
+/// The recorded Codex collaboration capture, driven through the socket a client
+/// speaks.
+///
+/// `09-subagent-spawn` is the only recording of what this traffic actually looks
+/// like, and everything asserted here is read off it rather than off a
+/// hand-written idea of Codex: the child's identity is the Codex thread it runs
+/// as, its name is the last segment of the canonical `agentPath`, its prose is
+/// the message its own thread completed, and its outcome is its own
+/// `turn/completed` — which arrives while the root's turn is still open and must
+/// not end it.
+#[tokio::test]
+async fn the_recorded_codex_collaboration_opens_the_childs_own_work_stream() {
+    let codex = ScriptedCodex::recorded_subagent_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Delegate the sum."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    // The row a developer clicks: named after the agent, carrying the canonical
+    // path Codex proves and the stream reference the tab opens.
+    let rows = child_rows(&events);
+    assert!(
+        rows.iter().any(|row| {
+            row["payload"]["title"] == "Subagent compute_sum"
+                && row["payload"]["data"]["agentPath"] == "/root/compute_sum"
+                && row["payload"]["data"]["childId"] == "codex-thread-2"
+        }),
+        "no launcher for the recorded child: {rows:#?}"
+    );
+    // And the operation beside it, which is not the child and offers no stream.
+    let operations: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"]["type"] == "thread.activity-appended")
+        .map(|event| &event["event"]["payload"]["activity"])
+        .filter(|activity| activity["payload"]["data"]["operation"].is_string())
+        .collect();
+    assert!(
+        operations.iter().any(|operation| {
+            operation["payload"]["data"]["operation"] == "wait"
+                && operation["payload"]["data"]["toolCallId"] == "collab-1"
+                && operation["payload"]["data"]["childId"] == Value::Null
+        }),
+        "the wait must stay an operation rather than a child: {operations:#?}"
+    );
+
+    let stream = child_stream(&server, "codex-thread", "codex-thread-2").await;
+    assert_eq!(stream["stream"]["childId"], "codex-thread-2");
+    assert_eq!(stream["stream"]["name"], "compute_sum");
+    // The recorded spawn carries no prompt — Codex emitted no spawn call at all —
+    // so the assignment stays absent rather than being invented from the parent's
+    // own words.
+    assert_eq!(stream["stream"]["assignment"], Value::Null);
+    // `/root/compute_sum` is a child of the conversation, not of another child.
+    assert_eq!(stream["stream"]["parentChildId"], Value::Null);
+    assert_eq!(stream["stream"]["state"], "completed");
+    assert_eq!(stream["stream"]["outcome"]["kind"], "completed");
+    assert_eq!(stream["stream"]["outcome"]["text"], "4");
+    assert_eq!(
+        read(&stream),
+        vec![
+            ("tool".to_string(), "Subagent started".to_string()),
+            ("message".to_string(), "4".to_string()),
+            ("outcome".to_string(), "completed".to_string()),
+        ],
+        "the recorded child's own history: {stream:#?}"
+    );
+
+    // The child's turn ended in the middle of the root's, and the root's own
+    // ending is still the only thing that settled it.
+    assert_eq!(
+        last_session(&events, "the recorded collaboration turn")["payload"]["session"]["status"],
+        "ready"
+    );
+    let thread = server
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await["thread"]
+        .clone();
+    let said: Vec<&str> = thread["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["text"].as_str())
+        .collect();
+    assert!(
+        !said.contains(&"4"),
+        "the child's prose belongs to its own stream, not the conversation: {said:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
+
+/// One `wait`, five agents, five different endings — and a nested agent whose
+/// parent is the child that launched it.
+///
+/// The fixture is composed rather than recorded (its README says which shapes it
+/// reuses and why), and it exists for the parts of Codex's collaboration model
+/// the one real capture does not contain: a spawn that completes while its child
+/// keeps working, a child that runs a command, a child that a `subAgentActivity`
+/// interrupts, a canonical path three segments deep, and the five terminal agent
+/// states the recorded `agentsStates` map arrived too empty to carry.
+#[tokio::test]
+async fn codex_children_of_one_collaboration_keep_separate_identities_and_endings() {
+    let codex = ScriptedCodex::subagent_work_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let data = tempfile::tempdir().expect("a temporary data directory");
+    let database = data.path().join("registry.db");
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_at_with_config(&database, config.clone()).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Delegate both jobs."),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    // Every child got its own launcher, and no two of them share one.
+    let mut launched: Vec<String> = child_rows(&events)
+        .iter()
+        .filter_map(|row| row["payload"]["data"]["childId"].as_str().map(str::to_string))
+        .collect();
+    launched.sort();
+    launched.dedup();
+    assert_eq!(
+        launched,
+        vec![
+            "child-alpha-1111",
+            "child-beta-2222",
+            "child-delta-4444",
+            "child-epsilon-5555",
+            "child-gamma-3333",
+        ],
+        "one launcher per child"
+    );
+
+    // The reviewer: named from its path, assigned by the spawn that started it,
+    // and carrying the whole of what it did in the order it did it.
+    let reviewer = child_stream(&server, "codex-thread", "child-alpha-1111").await;
+    assert_eq!(reviewer["stream"]["name"], "reviewer");
+    assert_eq!(reviewer["stream"]["assignment"], "Review the decoder.");
+    assert_eq!(reviewer["stream"]["parentChildId"], Value::Null);
+    assert_eq!(reviewer["stream"]["state"], "completed");
+    assert_eq!(reviewer["stream"]["outcome"]["kind"], "completed");
+    assert_eq!(
+        reviewer["stream"]["outcome"]["text"],
+        "The decoder looks correct."
+    );
+    assert_eq!(
+        read(&reviewer),
+        vec![
+            ("tool".to_string(), "Spawned subagent".to_string()),
+            ("tool".to_string(), "Subagent started".to_string()),
+            ("tool".to_string(), "Waited for subagents".to_string()),
+            ("message".to_string(), "Reading the decoder.".to_string()),
+            ("command".to_string(), "Command".to_string()),
+            (
+                "message".to_string(),
+                "The decoder looks correct.".to_string()
+            ),
+            ("outcome".to_string(), "completed".to_string()),
+        ],
+        "the reviewer's history: {reviewer:#?}"
+    );
+    let command = reviewer["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["kind"] == "command")
+        .expect("the command it ran");
+    assert_eq!(command["payload"]["command"], "/bin/bash -lc ls src");
+    assert_eq!(command["payload"]["status"], "completed");
+    assert_eq!(command["payload"]["detail"], "decoder.rs\nmain.rs\n");
+
+    // The tester: the same `wait`, a different history, a different ending.
+    let tester = child_stream(&server, "codex-thread", "child-beta-2222").await;
+    assert_eq!(tester["stream"]["name"], "tester");
+    assert_eq!(tester["stream"]["assignment"], "Check the tests.");
+    assert_eq!(tester["stream"]["state"], "interrupted");
+    assert_eq!(tester["stream"]["outcome"]["kind"], "interrupted");
+    assert_eq!(
+        read(&tester),
+        vec![
+            ("tool".to_string(), "Spawned subagent".to_string()),
+            ("tool".to_string(), "Subagent started".to_string()),
+            ("tool".to_string(), "Waited for subagents".to_string()),
+            ("message".to_string(), "Running the tests.".to_string()),
+            ("tool".to_string(), "Input sent to the subagent".to_string()),
+            ("tool".to_string(), "Subagent interrupted".to_string()),
+            ("outcome".to_string(), "interrupted".to_string()),
+        ],
+        "the tester's history: {tester:#?}"
+    );
+
+    // What the compact row says, which is the other half of an honest ending.
+    // While a child runs, the row carries the latest meaningful thing *it* did —
+    // not the parent's input to it, and not its path. Once it is over, the row
+    // carries what came back and stops carrying anything else.
+    let row_detail = |child: &str, status: &str| {
+        child_rows(&events)
+            .into_iter()
+            .filter(|row| {
+                row["payload"]["data"]["childId"] == child
+                    && row["payload"]["data"]["agentStatus"] == status
+            })
+            .map(|row| row["payload"]["detail"].clone())
+            .next_back()
+            .unwrap_or_else(|| panic!("no {status} row for {child}"))
+    };
+    assert_eq!(
+        row_detail("child-beta-2222", "running"),
+        "Running the tests.",
+        "a running row must show the child's own latest activity"
+    );
+    assert_eq!(
+        row_detail("child-beta-2222", "interrupted"),
+        "Codex reported this subagent as interrupted.",
+        "a terminal row must replace stale activity with what came back"
+    );
+    assert_eq!(
+        row_detail("child-epsilon-5555", "shutdown"),
+        "Codex shut this subagent down."
+    );
+    assert_eq!(
+        row_detail("child-alpha-1111", "completed"),
+        "The decoder looks correct."
+    );
+
+    // The nested agent: `/root/reviewer/helper` proves the reviewer launched it,
+    // so its parent is the reviewer's child id rather than the conversation.
+    let helper = child_stream(&server, "codex-thread", "child-gamma-3333").await;
+    assert_eq!(helper["stream"]["name"], "helper");
+    assert_eq!(helper["stream"]["parentChildId"], "child-alpha-1111");
+    assert_eq!(helper["stream"]["outcome"]["kind"], "failed");
+    assert_eq!(
+        helper["stream"]["outcome"]["text"],
+        "Codex could not find this subagent's thread."
+    );
+
+    // Two more endings the shared four-way vocabulary folds in pairs. The kind
+    // is what a client renders; the text is what keeps `errored` apart from
+    // `notFound` and `shutdown` apart from `interrupted`.
+    let errored = child_stream(&server, "codex-thread", "child-delta-4444").await;
+    assert_eq!(errored["stream"]["name"], Value::Null, "no path, no name");
+    assert_eq!(errored["stream"]["outcome"]["kind"], "failed");
+    assert_eq!(errored["stream"]["outcome"]["text"], "The model call failed.");
+    let shut_down = child_stream(&server, "codex-thread", "child-epsilon-5555").await;
+    assert_eq!(shut_down["stream"]["state"], "interrupted");
+    assert_eq!(shut_down["stream"]["outcome"]["kind"], "interrupted");
+    assert_eq!(
+        shut_down["stream"]["outcome"]["text"],
+        "Codex shut this subagent down."
+    );
+
+    // Two children's turns ended inside the root's, and one of them was
+    // interrupted. The root turn is settled by its own completion, once.
+    let settled: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"]["type"] == "thread.session-set")
+        .filter(|event| {
+            matches!(
+                event["event"]["payload"]["session"]["status"].as_str(),
+                Some("ready" | "error" | "stopped" | "interrupted")
+            )
+        })
+        .collect();
+    assert_eq!(settled.len(), 1, "a child's turn settled the root's: {settled:#?}");
+    assert_eq!(settled[0]["event"]["payload"]["session"]["status"], "ready");
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+
+    // A restart. The streams come back off disk as the same histories, in the
+    // same order, under the same ids — a historical row still opens the work it
+    // launched.
+    let restarted = TestServer::start_at_with_config(&database, config).await;
+    let reloaded = child_stream(&restarted, "codex-thread", "child-alpha-1111").await;
+    assert_eq!(
+        reloaded["entries"], reviewer["entries"],
+        "the reviewer's history did not survive the restart intact"
+    );
+    assert_eq!(reloaded["stream"], reviewer["stream"]);
+    let reloaded_helper = child_stream(&restarted, "codex-thread", "child-gamma-3333").await;
+    assert_eq!(
+        reloaded_helper["stream"]["parentChildId"], "child-alpha-1111",
+        "the proven hierarchy did not survive the restart"
+    );
+    restarted.stop().await;
+}
+
+/// Opening a child's tab while it is still working, and following it to the end.
+///
+/// Two criteria meet here. The first is that a completed *operation* is not a
+/// completed *child*: the `spawnAgent` that started this reviewer finished
+/// before it had said a word, and the tab opened on it reads a completed spawn
+/// inside a stream that is still open. The second is that replay and live
+/// continuation meet without losing or duplicating an entry — the snapshot the
+/// tab opened with, folded together with everything that arrived afterwards, is
+/// exactly the stream a client that watched none of it replays.
+#[tokio::test]
+async fn a_codex_child_tab_opens_mid_flight_and_follows_it_without_gaps() {
+    let codex = ScriptedCodex::subagent_work_conversation_paused_mid_child();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Delegate both jobs."),
+        )
+        .await
+        .expect_success();
+
+    // The launcher for the child appears in the conversation while the turn is
+    // still paused mid-sentence. That is what a developer clicks.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"]
+                == "child-alpha-1111"
+        }),
+    )
+    .await
+    .expect("the reviewer's row reaches the conversation while it is still working");
+
+    // A tab opened as soon as the child exists — which is a subscription that is
+    // answered rather than refused, the same test a restored tab makes.
+    let mut inspector = server.connect().await;
+    let (stream, snapshot) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let stream = inspector
+                .subscribe(
+                    "orchestration.subscribeSubagent",
+                    json!({"threadId": "codex-thread", "childId": "child-alpha-1111"}),
+                )
+                .await;
+            let frame = inspector.next_frame_for(&stream).await;
+            if frame["_tag"] != "Chunk" {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            inspector.ack(&stream).await;
+            let snapshot = frame["values"]
+                .as_array()
+                .expect("a chunk's values")
+                .iter()
+                .find(|item| item["kind"] == "snapshot")
+                .expect("a child stream opens with itself")["snapshot"]
+                .clone();
+            return (stream, snapshot);
+        }
+    })
+    .await
+    .expect("the child's tab opens while the child is still working");
+
+    assert_eq!(snapshot["stream"]["outcome"], Value::Null);
+    assert!(
+        matches!(
+            snapshot["stream"]["state"].as_str(),
+            Some("pending" | "working")
+        ),
+        "a completed spawn finished the child: {snapshot:#?}"
+    );
+    let spawned = &snapshot["entries"][0];
+    assert_eq!(spawned["payload"]["title"], "Spawned subagent");
+    assert_eq!(
+        spawned["payload"]["status"], "completed",
+        "the spawn operation is over even though the child is not: {snapshot:#?}"
+    );
+
+    codex.release_turn();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        // The last thing that touches this child: the `wait` that was waiting on
+        // it completes *after* it does, and revises the entry it already has
+        // rather than appending one after its conclusion.
+        inspector.values_until(&stream, |item| {
+            item["kind"] == "entry-upserted"
+                && item["entry"]["payload"]["title"] == "Waited for subagents"
+        }),
+    )
+    .await
+    .expect("the child's conclusion reaches the open tab");
+    assert!(
+        live.iter().any(|item| {
+            item["kind"] == "stream-updated" && item["stream"]["state"] == "completed"
+        }),
+        "the open tab was never told the child finished: {live:#?}"
+    );
+    client.events_through_the_turn(&subscription).await;
+    inspector.close().await;
+
+    let folded = folded_entries(&snapshot, &live);
+    let sequences: Vec<i64> = folded
+        .iter()
+        .map(|entry| entry["sequence"].as_i64().expect("a sequence"))
+        .collect();
+    assert_eq!(
+        sequences,
+        (1..=sequences.len() as i64).collect::<Vec<_>>(),
+        "the handoff lost or repeated an entry: {folded:#?}"
+    );
+
+    // A reader that watched none of it replays the same stream.
+    let replayed = child_stream(&server, "codex-thread", "child-alpha-1111").await;
+    assert_eq!(
+        replayed["entries"].as_array().expect("entries"),
+        &folded,
+        "replay and live continuation disagree"
+    );
+    assert_eq!(
+        replayed["stream"]["outcome"]["text"],
+        "The decoder looks correct."
+    );
+
+    client.close().await;
+    server.stop().await;
+    codex.assert_conversation_reaped();
+}
