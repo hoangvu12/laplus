@@ -536,6 +536,14 @@ fn terminal_task_status(status: &str) -> Option<&'static str> {
 struct Subagent {
     /// From `task_started`/`task_progress`, which are the only events carrying it.
     kind: Option<String>,
+    /// What the parent asked this child for, from `task_started` **only**.
+    ///
+    /// A `task_progress` carries a `description` too and it is a different fact:
+    /// "Running Pause 3 seconds" is what the child is doing now, and the row
+    /// shows it as exactly that. The assignment is what the child was delegated,
+    /// it never changes, and reading it off whichever event happened to arrive
+    /// last would leave a work stream headed by a moment of its own history.
+    assignment: Option<String>,
     finished: bool,
     /// An ending carrying the subagent's report has been published.
     ///
@@ -566,6 +574,99 @@ pub struct SubagentTask {
     /// Absent on every event that is not a forwarded message, which is all of them
     /// when the flag is off.
     pub said: Option<String>,
+}
+
+/// One line's worth of news about one subagent, for **both** the places a child
+/// is shown.
+///
+/// A subagent is two things at once in this application: a compact row in the
+/// parent's work log, and a work stream of its own that the row launches — see
+/// [`crate::subagents`]. One CLI line can move either or both, so one value
+/// carries both rather than the driver asking the reducer twice and having the
+/// two answers drift apart.
+///
+/// The identity is the CLI's `task_id`, which is the same id the row already
+/// collapses on and the same id the CLI itself uses to address a running agent
+/// (`agentId` in the `Agent` tool's own result). Nothing here is minted by
+/// laplus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentMoved {
+    /// The child, and the address of its work stream.
+    pub child_id: String,
+    /// The child's type — `general-purpose`, a project's own — remembered from
+    /// the events that carry it, because the terminal ones do not.
+    pub name: Option<String>,
+    /// What the parent asked it for. See [`Subagent::assignment`].
+    pub assignment: Option<String>,
+    /// The row's line, when this event tells the row something.
+    ///
+    /// `None` for a forwarded message that carried no prose — a child that only
+    /// called a tool. That line tells the *stream* everything (the call, its
+    /// input, its result) and the row nothing, and publishing a row from it
+    /// would blank the "Running Pause 3 seconds" the row was showing rather than
+    /// improve on it.
+    pub row: Option<SubagentTask>,
+    /// Whether this is the child *reporting*, rather than the CLI patching its
+    /// record.
+    ///
+    /// **A subagent ends twice on this wire and the bare one comes first**: a
+    /// `task_updated` carrying `{"status": "completed"}` and nothing else, then a
+    /// `task_notification` a millisecond later carrying what the child found —
+    /// lines 49 and 50 of `fixtures/claude-cli/22-background-subagent.ndjson`.
+    /// The row is told both, because it has to stop reading as running even if
+    /// the second never comes ([`SessionState::subagent_moved`]). The *stream*
+    /// keeps one terminal entry, so it needs to know which of the two endings is
+    /// the answer — see [`crate::turn`]'s `child_stream`.
+    pub reports: bool,
+    /// What the child itself did on this line, in the order it did it.
+    ///
+    /// Empty on every `task_*` event: the CLI's own account of a subagent says
+    /// what it is *up to*, and the child's work is what the child forwards.
+    pub did: Vec<SubagentDid>,
+}
+
+/// One thing a subagent did, as its own forwarded message proves it.
+///
+/// Deliberately short. This is not everything a message carries — a child's
+/// `thinking` blocks arrive with their text empty and a signature attached, and
+/// the prompt it was handed arrives as a `user` text block, which is the
+/// *parent's* words rather than the child's. Neither is here, because a work
+/// stream that showed them would be showing something the wire did not say.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubagentDid {
+    /// The child's own prose.
+    Said(String),
+    /// A tool the child called — and what came back, once it has.
+    ///
+    /// **One thing that moves rather than two that have to be paired.** The
+    /// Messages API sends an invocation and its result as separate messages
+    /// naming a shared id, and the id is what
+    /// [`crate::subagents::NewEntry::worked`] keys an entry by, so a call
+    /// arriving twice is one entry going from running to finished. Which means
+    /// the *result* has to carry what the call was: a `tool_result` names an id
+    /// and nothing else, so the reducer holds the invocation until it is
+    /// claimed.
+    Called {
+        id: String,
+        name: String,
+        input: Value,
+        /// `None` while it is still running.
+        returned: Option<SubagentReturn>,
+    },
+}
+
+/// What a subagent's tool call came back with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentReturn {
+    pub output: String,
+    pub failed: bool,
+}
+
+/// A subagent's tool call, held until its result names it.
+#[derive(Debug, Clone)]
+struct SubagentCall {
+    name: String,
+    input: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1206,6 +1307,15 @@ pub struct SessionState {
     #[serde(skip)]
     subagent_calls: BTreeMap<String, String>,
 
+    /// A subagent's own tool calls, by the id its result will name.
+    ///
+    /// `InFlight::tools` for children, and held here rather than on the turn for
+    /// the reason a background subagent exists at all: it outlives the turn that
+    /// spawned it, so a map that ended with the turn would lose what a call
+    /// *was* exactly when the result came back.
+    #[serde(skip)]
+    subagent_tool_calls: BTreeMap<String, SubagentCall>,
+
     /// Completed turns, in order.
     pub transcript: Vec<Turn>,
     /// Text accumulated from `content_block_delta` for the in-flight turn.
@@ -1314,7 +1424,7 @@ pub struct Turn {
 /// exactly one place. A driver that re-implemented "the buffered message wins"
 /// alongside this one would be two rules that agree until they do not, and the
 /// one that the golden files check would not be the one the UI sees.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Folded {
     /// A line that changed nothing a client would notice — a hook event, a
     /// block boundary, a rate-limit notice, drift, or a line that did not parse.
@@ -1354,10 +1464,11 @@ pub enum Folded {
     /// than the event. It is a variant of its own only so that the arm which
     /// reports a *refused* request does not have to wonder whether this was one.
     Measured,
-    /// A subagent started, got further, or finished. Rendered as a row of its
-    /// own rather than folded into the transcript, because a subagent's work is
-    /// the *agent's* doing and not another voice in the conversation.
-    SubagentProgress(SubagentTask),
+    /// A subagent started, got further, said something, or finished. Rendered as
+    /// a row of its own — and, since ticket 03, recorded in the child's own work
+    /// stream — rather than folded into the transcript, because a subagent's
+    /// work is the *agent's* doing and not another voice in the conversation.
+    SubagentProgress(SubagentMoved),
     /// The terminal `result` for the turn. `last_result` holds the duration and
     /// the cost.
     Completed,
@@ -1442,7 +1553,10 @@ impl SessionState {
     /// tidier and is not worth it: it assumes the notification always follows,
     /// and a subagent whose notification never came would then have a row that
     /// reads as still running forever.
-    fn subagent_moved(&mut self, task: SubagentTask) -> Folded {
+    ///
+    /// `assignment` is what the child was delegated, and only `task_started`
+    /// knows it — see [`Subagent::assignment`].
+    fn subagent_moved(&mut self, task: SubagentTask, assignment: Option<String>) -> Folded {
         if let Some(call) = &task.tool_use_id {
             self.subagent_calls
                 .insert(call.clone(), task.task_id.clone());
@@ -1450,6 +1564,9 @@ impl SessionState {
         let record = self.subagents.entry(task.task_id.clone()).or_default();
         if let Some(kind) = &task.subagent_type {
             record.kind = Some(kind.clone());
+        }
+        if assignment.is_some() {
+            record.assignment = assignment;
         }
         let ending = task.status != "running";
         if ending && (record.reported || (record.finished && task.summary.is_none())) {
@@ -1459,17 +1576,28 @@ impl SessionState {
             record.finished = true;
             record.reported |= task.summary.is_some();
         }
-        Folded::SubagentProgress(SubagentTask {
-            subagent_type: task.subagent_type.or_else(|| record.kind.clone()),
-            ..task
+        let (name, assignment) = (record.kind.clone(), record.assignment.clone());
+        Folded::SubagentProgress(SubagentMoved {
+            child_id: task.task_id.clone(),
+            name: name.clone(),
+            assignment,
+            row: Some(SubagentTask {
+                subagent_type: task.subagent_type.or(name),
+                ..task
+            }),
+            reports: false,
+            did: Vec::new(),
         })
     }
 
-    /// A subagent said something: put it on that subagent's row.
+    /// A subagent spoke, or worked: put it on that subagent's row and in that
+    /// subagent's stream.
     ///
-    /// Reached only under `--forward-subagent-text`, and it publishes the same
-    /// [`Folded::SubagentProgress`] the `task_*` events do, so the words land on
-    /// the row the developer is already watching rather than starting one of
+    /// Reached only under `--forward-subagent-text`, which is the whole of how a
+    /// child's own work reaches this server: the `task_*` events say what the CLI
+    /// thinks the child is up to, and this is the child itself. It publishes the
+    /// same [`Folded::SubagentProgress`] the `task_*` events do, so the words land
+    /// on the row the developer is already watching rather than starting one of
     /// their own — same `task_id`, same collapse key.
     ///
     /// **`running` is asserted rather than carried.** A forwarded message says
@@ -1478,32 +1606,107 @@ impl SessionState {
     /// prose tick a subagent off; the events that end one are the `task_*` events,
     /// and they are the only things here that may.
     ///
-    /// Three ways to say nothing, all of them ordinary: a subagent whose call was
-    /// never announced (no `task_started` seen, so nothing to attribute it to),
-    /// one already reported finished (a late line must not reopen a closed row),
-    /// and a message with no prose in it — a subagent that only called a tool
-    /// emits an envelope whose blocks are all `tool_use`.
-    fn subagent_said(&mut self, call: &str, said: String) -> Folded {
-        if said.trim().is_empty() {
-            return Folded::Nothing;
-        }
-        let Some(task_id) = self.subagent_calls.get(call) else {
+    /// **Which blocks are the child's own doing** is decided by the role, and it
+    /// is not symmetrical. An `assistant` message is the child talking and the
+    /// child calling tools. A `user` message is what the child was *given* —
+    /// its prompt, and the results of its calls — so only the results are taken
+    /// from it: the prompt is the assignment, which the stream already carries on
+    /// its head, and recording it as prose would put the parent's words in the
+    /// child's voice.
+    ///
+    /// Two ways to say nothing, both ordinary: a subagent whose call was never
+    /// announced (no `task_started` seen, so nothing to attribute this to), and
+    /// one already reported finished — a late line must not reopen a closed row,
+    /// and [`crate::subagents::Streams::record`] would refuse to reopen the
+    /// stream beside it.
+    fn subagent_spoke(&mut self, call: &str, message: &Message) -> Folded {
+        let Some(task_id) = self.subagent_calls.get(call).cloned() else {
             return Folded::Nothing;
         };
-        let Some(record) = self.subagents.get(task_id) else {
+        let Some(record) = self.subagents.get(&task_id) else {
             return Folded::Nothing;
         };
         if record.finished {
             return Folded::Nothing;
         }
-        Folded::SubagentProgress(SubagentTask {
-            task_id: task_id.clone(),
-            tool_use_id: Some(call.to_string()),
-            status: "running".to_string(),
-            description: None,
-            subagent_type: record.kind.clone(),
-            summary: None,
-            said: Some(said),
+        let (name, assignment) = (record.kind.clone(), record.assignment.clone());
+
+        let child = message.role == "assistant";
+        let mut did = Vec::new();
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text } if child && !text.trim().is_empty() => {
+                    did.push(SubagentDid::Said(text.clone()));
+                }
+                ContentBlock::ToolUse { id, name, input } if child => {
+                    self.subagent_tool_calls.insert(
+                        id.clone(),
+                        SubagentCall {
+                            name: name.clone(),
+                            input: input.clone(),
+                        },
+                    );
+                    did.push(SubagentDid::Called {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        returned: None,
+                    });
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if !child => {
+                    // What the call *was* lives on this side of the pair, exactly
+                    // as it does for the root agent's tools. A result for a call
+                    // this build never saw announced is still reported, under the
+                    // same neutral name the root path uses for one.
+                    let call = self.subagent_tool_calls.remove(tool_use_id);
+                    did.push(SubagentDid::Called {
+                        id: tool_use_id.clone(),
+                        name: call
+                            .as_ref()
+                            .map(|call| call.name.clone())
+                            .unwrap_or_else(|| "Tool".to_string()),
+                        input: call.map(|call| call.input).unwrap_or(Value::Null),
+                        returned: Some(SubagentReturn {
+                            output: text_content(content),
+                            failed: *is_error,
+                        }),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // A `user` message's text is the prompt the child was handed, so it is
+        // not the child talking and it is not this row's line.
+        let said = match child {
+            true => visible(message),
+            false => String::new(),
+        };
+        if did.is_empty() && said.trim().is_empty() {
+            return Folded::Nothing;
+        }
+        Folded::SubagentProgress(SubagentMoved {
+            child_id: task_id.clone(),
+            name: name.clone(),
+            assignment,
+            row: match !said.trim().is_empty() {
+                true => Some(SubagentTask {
+                    task_id,
+                    tool_use_id: Some(call.to_string()),
+                    status: "running".to_string(),
+                    description: None,
+                    subagent_type: name,
+                    summary: None,
+                    said: Some(said),
+                }),
+                false => None,
+            },
+            reports: false,
+            did,
         })
     }
 
@@ -1583,11 +1786,13 @@ impl SessionState {
             }
             Event::System(SystemEvent::TaskStarted(task)) => {
                 self.bump("system/task_started");
-                self.subagent_moved(task.progress("running"))
+                // The one event that says what the child was asked for.
+                let assignment = task.description.clone();
+                self.subagent_moved(task.progress("running"), assignment)
             }
             Event::System(SystemEvent::TaskProgress(task)) => {
                 self.bump("system/task_progress");
-                self.subagent_moved(task.progress("running"))
+                self.subagent_moved(task.progress("running"), None)
             }
             // A status in a patch and nothing else, so a subagent that ended
             // without a notification still stops reading as running. Anything
@@ -1596,15 +1801,18 @@ impl SessionState {
             Event::System(SystemEvent::TaskUpdated(update)) => {
                 self.bump("system/task_updated");
                 match update.patch.status.as_deref().map(terminal_task_status) {
-                    Some(Some(status)) => self.subagent_moved(SubagentTask {
-                        task_id: update.task_id.clone(),
-                        tool_use_id: None,
-                        status: status.to_string(),
-                        description: None,
-                        subagent_type: None,
-                        summary: None,
-                        said: None,
-                    }),
+                    Some(Some(status)) => self.subagent_moved(
+                        SubagentTask {
+                            task_id: update.task_id.clone(),
+                            tool_use_id: None,
+                            status: status.to_string(),
+                            description: None,
+                            subagent_type: None,
+                            summary: None,
+                            said: None,
+                        },
+                        None,
+                    ),
                     _ => Folded::Nothing,
                 }
             }
@@ -1615,7 +1823,16 @@ impl SessionState {
                     .as_deref()
                     .and_then(terminal_task_status)
                     .unwrap_or("completed");
-                self.subagent_moved(task.progress(status))
+                // The ending that carries the child's own answer, which is what
+                // makes it the one the work stream concludes on. See
+                // [`SubagentMoved::reports`].
+                match self.subagent_moved(task.progress(status), None) {
+                    Folded::SubagentProgress(moved) => Folded::SubagentProgress(SubagentMoved {
+                        reports: true,
+                        ..moved
+                    }),
+                    otherwise => otherwise,
+                }
             }
             Event::System(SystemEvent::Other) => {
                 self.bump("system/other");
@@ -1702,16 +1919,22 @@ impl SessionState {
                 let Some(call) = env.parent_tool_use_id.clone() else {
                     return Folded::Nothing;
                 };
-                self.subagent_said(&call, visible(&env.message))
+                self.subagent_spoke(&call, &env.message)
             }
             // The other half, which is the subagent's *input*: the prompt it was
-            // given, and the results of the tools it ran. Dropped rather than
-            // shown, because a row is a place for one line and the subagent's own
-            // conclusion is the better line to spend it on — the prompt is already
-            // the row's description.
+            // given, and the results of the tools it ran. It stays out of the
+            // conversation for the reason above, and out of the row because a row
+            // is a place for one line and the subagent's own conclusion is the
+            // better line to spend it on. What the child's own **work stream**
+            // takes from it is the tool results and nothing else — see
+            // [`SessionState::subagent_spoke`], which is where the asymmetry is
+            // argued.
             Event::User(env) if env.parent_tool_use_id.is_some() => {
                 self.bump("user/subagent");
-                Folded::Nothing
+                let Some(call) = env.parent_tool_use_id.clone() else {
+                    return Folded::Nothing;
+                };
+                self.subagent_spoke(&call, &env.message)
             }
 
             Event::Assistant(env) => {
@@ -2004,6 +2227,30 @@ mod tests {
         lines.iter().map(|line| state.fold_line(line)).collect()
     }
 
+    /// Every compact subagent row these lines produced, in order. A line that
+    /// moved a child's *stream* and told the row nothing draws none.
+    fn rows(outcomes: &[Folded]) -> Vec<&SubagentTask> {
+        outcomes
+            .iter()
+            .filter_map(|folded| match folded {
+                Folded::SubagentProgress(moved) => moved.row.as_ref(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Everything these lines said one child *did*, in order.
+    fn worked(outcomes: &[Folded]) -> Vec<&SubagentDid> {
+        outcomes
+            .iter()
+            .filter_map(|folded| match folded {
+                Folded::SubagentProgress(moved) => Some(moved.did.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Recorded in `fixtures/claude-cli/22-background-subagent.ndjson`: a
     /// background subagent forwards its whole exchange on this wire, tagged with
     /// the `Agent` call that owns it. Folding those put eleven of that capture's
@@ -2038,13 +2285,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
         ]);
 
-        let progress: Vec<&SubagentTask> = outcomes
-            .iter()
-            .filter_map(|folded| match folded {
-                Folded::SubagentProgress(task) => Some(task),
-                _ => None,
-            })
-            .collect();
+        let progress = rows(&outcomes);
 
         // Started, ended, and the notification that carries the report — but not
         // the fourth, which is an ending already published with nothing new.
@@ -2084,12 +2325,122 @@ mod tests {
             outcomes[2]
         );
         match &outcomes[1] {
-            Folded::SubagentProgress(task) => {
+            Folded::SubagentProgress(moved) => {
+                let task = moved.row.as_ref().expect("the report is a row");
                 assert_eq!(task.summary.as_deref(), Some("eleven variants"));
                 assert_eq!(task.subagent_type.as_deref(), Some("Explore"));
+                assert!(
+                    moved.reports,
+                    "the child's own answer must be the ending its stream concludes on"
+                );
             }
             other => panic!("expected the report, got {other:?}"),
         }
+    }
+
+    /// The head of a child's work stream, and the one field on it the CLI says
+    /// two different things about.
+    ///
+    /// `task_started.description` is what the child was **asked for**;
+    /// `task_progress.description` is what it is doing **now**, and the row shows
+    /// that as its latest activity. A stream headed by the second would say a
+    /// child was assigned a moment of its own history.
+    #[test]
+    fn a_childs_assignment_is_what_it_was_asked_for_rather_than_what_it_is_doing() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count to three","subagent_type":"general-purpose"}"#,
+            r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"toolu_1","description":"Running Pause 3 seconds","last_tool_name":"Bash"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"1 2 3"}"#,
+        ]);
+
+        let heads: Vec<(&str, Option<&str>, Option<&str>)> = outcomes
+            .iter()
+            .filter_map(|folded| match folded {
+                Folded::SubagentProgress(moved) => Some((
+                    moved.child_id.as_str(),
+                    moved.name.as_deref(),
+                    moved.assignment.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            heads,
+            vec![
+                ("t1", Some("general-purpose"), Some("Count to three")),
+                ("t1", Some("general-purpose"), Some("Count to three")),
+                ("t1", Some("general-purpose"), Some("Count to three")),
+            ],
+            "the child's identity moved while it worked: {outcomes:?}"
+        );
+        // And the row still shows what it is up to, which is the other reading of
+        // the same field.
+        assert_eq!(
+            rows(&outcomes)[1].description.as_deref(),
+            Some("Running Pause 3 seconds")
+        );
+    }
+
+    /// The whole of what Claude exposes about a child's work, and it arrives on
+    /// the child's own wire rather than in the `task_*` events: its prose, the
+    /// tools it ran, and what those returned.
+    ///
+    /// Shapes taken from `fixtures/claude-cli/22-background-subagent.ndjson`,
+    /// lines 34, 35, 37 and 38 — including the empty `thinking` block, which is
+    /// what a forwarded reasoning block actually looks like.
+    #[test]
+    fn a_childs_work_reaches_its_stream_as_the_child_reported_it() {
+        let outcomes = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count","subagent_type":"general-purpose"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Count to 3 slowly."}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"1"}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"sleep 3","description":"Pause 3 seconds"}}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"This command requires approval","is_error":true,"tool_use_id":"toolu_bash"}]},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque"}]},"parent_tool_use_id":"toolu_1"}"#,
+        ]);
+
+        assert_eq!(
+            worked(&outcomes),
+            vec![
+                &SubagentDid::Said("1".to_string()),
+                &SubagentDid::Called {
+                    id: "toolu_bash".to_string(),
+                    name: "Bash".to_string(),
+                    input: json!({"command": "sleep 3", "description": "Pause 3 seconds"}),
+                    returned: None,
+                },
+                // The same call, claimed by its result: one thing that moved,
+                // carrying what it *was* — which only this side of the pair knows.
+                &SubagentDid::Called {
+                    id: "toolu_bash".to_string(),
+                    name: "Bash".to_string(),
+                    input: json!({"command": "sleep 3", "description": "Pause 3 seconds"}),
+                    returned: Some(SubagentReturn {
+                        output: "This command requires approval".to_string(),
+                        failed: true,
+                    }),
+                },
+            ],
+            "{outcomes:?}"
+        );
+
+        // The prompt the child was handed is the parent's words, and it is not the
+        // child talking. The reasoning block carried nothing to record.
+        assert!(matches!(outcomes[1], Folded::Nothing), "{:?}", outcomes[1]);
+        assert!(matches!(outcomes[5], Folded::Nothing), "{:?}", outcomes[5]);
+
+        // And a message that was only a tool call tells the *row* nothing: it has
+        // room for one line, and blanking "Pause 3 seconds" to say nothing would
+        // be worse than leaving it.
+        assert_eq!(
+            rows(&outcomes)
+                .iter()
+                .map(|row| row.said.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("1")],
+            "a tool-only message drew a row"
+        );
     }
 
     /// `--forward-subagent-text` puts the subagent's own prose on the wire, as
@@ -2112,7 +2463,8 @@ mod tests {
         // The prompt it was given is not a row; its answer is.
         assert!(matches!(outcomes[1], Folded::Nothing), "{:?}", outcomes[1]);
         match &outcomes[2] {
-            Folded::SubagentProgress(task) => {
+            Folded::SubagentProgress(moved) => {
+                let task = moved.row.as_ref().expect("the child's prose is a row");
                 assert_eq!(task.said.as_deref(), Some("4"));
                 assert_eq!(task.task_id, "t1", "onto the row it belongs to");
                 assert_eq!(
@@ -2130,8 +2482,8 @@ mod tests {
     }
 
     /// Three ways a forwarded line says nothing, all ordinary. Attributing one to
-    /// the wrong row would be worse than dropping it, and reopening a finished row
-    /// would have a subagent come back to life after its report.
+    /// the wrong child would be worse than dropping it, and reopening a finished
+    /// one would have a subagent come back to life after its report.
     #[test]
     fn a_forwarded_line_with_nowhere_to_go_is_dropped() {
         // A call that was never announced — no `task_started`, so nothing says
@@ -2141,8 +2493,8 @@ mod tests {
         ]);
         assert!(matches!(orphan[0], Folded::Nothing), "{:?}", orphan[0]);
 
-        // A subagent that has already reported, and a message with no prose in it
-        // — a subagent that only called a tool emits one of those.
+        // A subagent that has already reported, and a message carrying neither
+        // prose nor work — which is what an empty text block is.
         let late = outcomes(&[
             r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","subagent_type":"Explore"}"#,
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"   "}]},"parent_tool_use_id":"toolu_1"}"#,
@@ -2165,13 +2517,7 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"1 2 3 — done"}"#,
         ]);
 
-        let progress: Vec<&SubagentTask> = outcomes
-            .iter()
-            .filter_map(|folded| match folded {
-                Folded::SubagentProgress(task) => Some(task),
-                _ => None,
-            })
-            .collect();
+        let progress = rows(&outcomes);
         assert_eq!(progress.len(), 3, "{outcomes:?}");
         assert_eq!(progress[0].status, "running");
         assert_eq!(progress[0].subagent_type.as_deref(), Some("general-purpose"));
@@ -2202,10 +2548,14 @@ mod tests {
             "an unknown status is still running, not an ending: {:?}",
             outcomes[2]
         );
-        let Folded::SubagentProgress(task) = &outcomes[3] else {
+        let Folded::SubagentProgress(moved) = &outcomes[3] else {
             panic!("a failure is an ending: {:?}", outcomes[3]);
         };
-        assert_eq!(task.status, "failed");
+        assert_eq!(moved.row.as_ref().expect("an ending is a row").status, "failed");
+        assert!(
+            !moved.reports,
+            "a status patch is not the child reporting: nothing here knows what it found"
+        );
     }
 
     #[test]

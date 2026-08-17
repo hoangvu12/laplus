@@ -1447,6 +1447,364 @@ async fn a_background_subagent_gets_its_own_row_and_stays_out_of_the_transcript(
     server.stop().await;
 }
 
+/// Open the child of `fixtures/claude-cli/22-background-subagent.ndjson`, drive
+/// it, and read its work back through the socket.
+///
+/// The same seam the OpenCode tracer uses and everything is asserted the way a
+/// client would learn it: the compact row a developer clicks, the subscription
+/// that row addresses, and the snapshot a reload takes. Nothing here reaches
+/// into the driver or the database.
+///
+/// The recording is paused just before the child's closing message, so the
+/// stream is opened while the child is genuinely working. That is the
+/// replay/live boundary — a client that lost an entry there, or was handed one
+/// twice, or saw them out of order, would be indistinguishable from one that
+/// never had the entry at all once the child was finished.
+#[tokio::test]
+async fn a_claude_child_work_stream_replays_and_then_continues_live() {
+    let agent = ScriptedAgent::replaying_paused_before("22-background-subagent", "I counted to 3");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count to three in the background"),
+        )
+        .await
+        .expect_success();
+
+    // The launcher: one compact row, naming the child and carrying the reference
+    // its work stream is addressed by. `taskId` is the CLI's own id for the
+    // subagent — nothing here is minted by laplus.
+    let child = "ab80091070230889d";
+    let opening = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == child
+        }),
+    )
+    .await
+    .expect("the compact child row reaches the socket while the child is working");
+    let row = opening
+        .iter()
+        .filter_map(|item| item["event"]["payload"].get("activity"))
+        .find(|activity| activity["payload"]["data"]["childId"] == child)
+        .expect("a row carrying the stream reference");
+    assert_eq!(row["payload"]["itemType"], "collab_agent_tool_call");
+    assert_eq!(row["payload"]["title"], "Subagent general-purpose");
+    assert_eq!(row["payload"]["data"]["taskId"], child);
+
+    // A second window, opening the child while it is still working. Its own
+    // connection, because a developer inspecting a child has not closed the
+    // conversation they are inspecting it from.
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "thread-1", "childId": child}),
+        )
+        .await;
+    let replayed = inspector.next_chunk(&stream).await;
+    inspector.ack(&stream).await;
+    let snapshot = replayed
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("a child stream opens with itself")["snapshot"]
+        .clone();
+    assert_eq!(snapshot["stream"]["childId"], child);
+    assert_eq!(snapshot["stream"]["name"], "general-purpose");
+    assert_eq!(
+        snapshot["stream"]["assignment"], "Count to three slowly",
+        "the assignment is what the child was asked for, not what it is doing now"
+    );
+    assert_eq!(
+        snapshot["stream"]["state"], "working",
+        "a child that is still working must not read as finished: {snapshot:#?}"
+    );
+    assert_eq!(snapshot["stream"]["outcome"], Value::Null);
+    assert_eq!(
+        snapshot["stream"]["parentChildId"],
+        Value::Null,
+        "Claude proves no hierarchy here, so none may be drawn"
+    );
+    assert!(
+        !snapshot["entries"]
+            .as_array()
+            .expect("entries")
+            .is_empty(),
+        "the child had already worked, and the replay lost it: {snapshot:#?}"
+    );
+
+    // Now let the recording finish, and fold what arrives the way a client does:
+    // upsert by entry id, order by sequence.
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        // The *outcome*, not merely the state. A subagent ends twice on this
+        // wire and the bare `task_updated` comes first, so the head reads
+        // `completed` a moment before the report that says what it completed
+        // with — waiting on the state alone would stop reading in that gap.
+        inspector.values_until(&stream, |item| {
+            item["kind"] == "stream-updated" && item["stream"]["outcome"]["kind"] == "completed"
+        }),
+    )
+    .await
+    .expect("the child's conclusion reaches its stream");
+
+    let mut folded: Vec<Value> = snapshot["entries"].as_array().expect("entries").clone();
+    let mut seen_ids: Vec<String> = folded
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an entry id").to_string())
+        .collect();
+    for item in replayed.iter().chain(live.iter()) {
+        let Some(entry) = item.get("entry") else {
+            continue;
+        };
+        let id = entry["id"].as_str().expect("an entry id").to_string();
+        if !seen_ids.contains(&id) {
+            seen_ids.push(id.clone());
+        }
+        match folded.iter().position(|held| held["id"] == entry["id"]) {
+            Some(index) => folded[index] = entry.clone(),
+            None => folded.push(entry.clone()),
+        }
+    }
+    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
+
+    // Everything the child did, in the order it did it: its prose, the three
+    // commands it tried and what each of them came back with, its closing
+    // message, and its report. The `detail` of a command is what that command
+    // *returned*, which for this recording is the CLI refusing it three times.
+    let read: Vec<(i64, &str, &str, &str)> = folded
+        .iter()
+        .map(|entry| {
+            let payload = &entry["payload"];
+            (
+                entry["sequence"].as_i64().expect("a sequence"),
+                entry["kind"].as_str().expect("a kind"),
+                payload["command"].as_str().unwrap_or_default(),
+                payload["status"]
+                    .as_str()
+                    .or_else(|| payload["kind"].as_str())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (1, "message", "", ""),
+            (2, "command", "python3 -c \"import time; time.sleep(3)\"", "failed"),
+            (
+                3,
+                "command",
+                "python3 -c \"import time; time.sleep(3); print('pause 1 done')\"",
+                "failed"
+            ),
+            (
+                4,
+                "command",
+                "python3 -c \"import time; time.sleep(3)\"; echo two",
+                "failed"
+            ),
+            (5, "message", "", ""),
+            (6, "outcome", "", "completed"),
+        ],
+        "the child's stream lost, repeated or reordered its work across the \
+         replay/live boundary: {folded:#?}"
+    );
+    assert_eq!(folded[0]["payload"]["text"], "1", "the child counting");
+    assert!(
+        folded[4]["payload"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("I counted to 3")),
+        "the child's closing message: {:#?}",
+        folded[4]
+    );
+    assert!(
+        folded[5]["payload"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("1 2 3 — done")),
+        "the child's report is the stream's terminal entry: {:#?}",
+        folded[5]
+    );
+    assert_eq!(
+        folded[1]["payload"]["detail"], "This command requires approval",
+        "what the command came back with is its own error"
+    );
+
+    // And each of those was one entry rather than several. A `tool_use` and the
+    // `tool_result` that claims it share the CLI's own call id, so a command
+    // finishing moves the row it was already drawn on.
+    assert_eq!(
+        seen_ids,
+        vec![
+            format!("{child}:n:1"),
+            format!("{child}:k:toolu_018P4BWzpkPTZVxuaZVhq1TL"),
+            format!("{child}:k:toolu_012uWvvv3ZAJrL6Y3aXxRU1a"),
+            format!("{child}:k:toolu_011MtuZgZ8pv9MccD3h1meMb"),
+            format!("{child}:n:5"),
+            format!("{child}:k:outcome"),
+        ],
+        "the child's stream carried an entry nothing asked for"
+    );
+
+    let concluded = live
+        .iter()
+        .rfind(|item| item["kind"] == "stream-updated")
+        .expect("the child settles")["stream"]
+        .clone();
+    assert_eq!(concluded["state"], "completed");
+    assert_eq!(concluded["outcome"]["kind"], "completed");
+
+    // The root turn ended **once**, though a subagent started, worked, ran three
+    // commands, spoke twice and finished inside it — and though the recording
+    // ends with two `result` lines. A child boundary is not a turn boundary.
+    let events = client.events_through_the_turn(&subscription).await;
+    let endings = opening
+        .iter()
+        .chain(events.iter())
+        .map(|item| &item["event"])
+        .filter(|event| event["type"] == "thread.activity-appended")
+        .filter(|event| event["payload"]["activity"]["kind"] == "turn.completed")
+        .count();
+    assert_eq!(endings, 1, "the turn ended {endings} times");
+    inspector.close().await;
+    client.close().await;
+
+    // A reload: a connection that watched none of it replays the same stream,
+    // and the conversation it belongs to still carries only the compact row.
+    let mut reloaded = server.connect().await;
+    let stream = reloaded
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "thread-1", "childId": child}),
+        )
+        .await;
+    let snapshot = reloaded
+        .next_chunk(&stream)
+        .await
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("a completed child replays")["snapshot"]
+        .clone();
+    let replayed_ids: Vec<&str> = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(replayed_ids, seen_ids, "the replay is not the same stream");
+    assert!(snapshot["stream"]["outcome"]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("1 2 3 — done")));
+    reloaded.close().await;
+
+    let thread = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await["thread"]
+        .clone();
+    let said: Vec<&str> = thread["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["text"].as_str())
+        .collect();
+    assert!(
+        !said.iter().any(|text| text.trim() == "1"),
+        "the child's prose reached the parent transcript: {said:#?}"
+    );
+    let carried: Vec<&Value> = thread["activities"]
+        .as_array()
+        .expect("activities")
+        .iter()
+        .filter(|activity| activity["payload"]["data"]["childId"] == child)
+        .collect();
+    assert!(!carried.is_empty(), "the snapshot lost the compact child row");
+    assert!(
+        carried
+            .iter()
+            .all(|activity| activity["payload"]["data"]["entries"].is_null()),
+        "an ordinary thread snapshot carried the child's whole history: {carried:#?}"
+    );
+
+    server.stop().await;
+}
+
+/// The other recording, and the case it is the evidence for: a child that
+/// answers in one word.
+///
+/// `fixtures/claude-cli/23-forwarded-subagent-text.ndjson` carries the shape
+/// `22` does not — the **prompt** the child was handed, forwarded as a `user`
+/// message on the child's own wire. It is the parent's words, so it is not one
+/// of the child's messages, and a stream that recorded it would put the
+/// assignment in the child's voice.
+#[tokio::test]
+async fn a_childs_prompt_is_not_one_of_the_things_the_child_said() {
+    let agent = ScriptedAgent::replaying("23-forwarded-subagent-text");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "what is 2+2"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+    client.close().await;
+
+    let child = "ae572c8d808b48d78";
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "thread-1", "childId": child}),
+        )
+        .await;
+    let snapshot = inspector
+        .next_chunk(&stream)
+        .await
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child replays")["snapshot"]
+        .clone();
+
+    assert_eq!(snapshot["stream"]["name"], "general-purpose");
+    assert_eq!(snapshot["stream"]["assignment"], "Compute 2+2");
+    assert_eq!(snapshot["stream"]["state"], "completed");
+    assert_eq!(snapshot["stream"]["outcome"]["kind"], "completed");
+    assert_eq!(snapshot["stream"]["outcome"]["text"], "4");
+
+    let read: Vec<(&str, &str)> = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            (
+                entry["kind"].as_str().expect("a kind"),
+                entry["payload"]["text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![("message", "4"), ("outcome", "4")],
+        "the prompt the child was handed became something the child said: \
+         {snapshot:#?}"
+    );
+
+    inspector.close().await;
+    server.stop().await;
+}
+
 /// The case `22-background-subagent` does not contain, and the one a developer
 /// actually hit.
 ///
@@ -1565,6 +1923,154 @@ async fn a_subagent_that_finishes_after_the_turn_still_gets_its_report_to_the_de
     assert_eq!(turns.len(), 2, "{turns:?}");
     assert_ne!(turns[0], turns[1], "both replies landed in the same turn");
 
+    client.close().await;
+    server.stop().await;
+}
+
+/// A background child goes on working after the turn that spawned it has
+/// settled — and its own boundaries settle nothing.
+///
+/// The half of the background case a recording cannot hold: in
+/// `22-background-subagent` the child finishes inside its turn, and the whole
+/// point of `run_in_background` is that it need not. So the shapes are the
+/// recording's, taken line for line, and only the *timing* is written — the
+/// `result` lands with the child still going, which is what puts everything
+/// after it in a session with nothing in flight.
+///
+/// Three things at that seam, and they are one behaviour: the child's stream is
+/// still open after the root settled, it goes on gaining entries and reaches its
+/// conclusion there, and none of that opens or ends a turn. The turn the
+/// developer sees afterwards is the one the *agent's own report* opens, which is
+/// what `a_subagent_that_finishes_after_the_turn_still_gets_its_report_to_the_developer`
+/// is about.
+#[tokio::test]
+async fn a_background_child_keeps_working_after_its_turn_has_settled() {
+    let agent = ScriptedAgent::emitting(&[
+        r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count the variants","subagent_type":"Explore"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Launched it in the background."}]}}"#,
+        // The turn ends here, with the subagent still working.
+        r#"{"type":"result","subtype":"success","duration_ms":5600,"num_turns":1}"#,
+        PAUSE,
+        PAUSE,
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"looking through the variants"}]}}"#,
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_grep","name":"Grep","input":{"pattern":"variant","path":"src"}}]}}"#,
+        r#"{"type":"user","parent_tool_use_id":"toolu_1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_grep","content":"eleven matches"}]}}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"eleven variants"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The subagent found eleven variants."}]}}"#,
+        r#"{"type":"result","subtype":"success","duration_ms":66000,"num_turns":1}"#,
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count the variants in the background"),
+        )
+        .await
+        .expect_success();
+
+    // Read to the moment the developer's turn is over. Everything after this
+    // point is a child that nobody is waiting for.
+    let first = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        first
+            .iter()
+            .map(|item| &item["event"])
+            .filter(|event| event["payload"]["activity"]["kind"] == "turn.completed")
+            .count(),
+        1,
+        "the developer's turn settled once: {first:#?}"
+    );
+
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "thread-1", "childId": "t1"}),
+        )
+        .await;
+    let replayed = inspector.next_chunk(&stream).await;
+    inspector.ack(&stream).await;
+    let snapshot = replayed
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child is still there after its turn ended")["snapshot"]
+        .clone();
+    assert_eq!(
+        snapshot["stream"]["state"], "working",
+        "a settled turn ended the child with it: {snapshot:#?}"
+    );
+    assert_eq!(snapshot["stream"]["assignment"], "Count the variants");
+
+    // And it goes on recording, with no turn in flight to record it into.
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        inspector.values_until(&stream, |item| {
+            item["kind"] == "stream-updated" && item["stream"]["outcome"]["kind"] == "completed"
+        }),
+    )
+    .await
+    .expect("the child concludes after the turn that spawned it");
+
+    let mut folded: Vec<Value> = snapshot["entries"].as_array().expect("entries").clone();
+    for item in replayed.iter().chain(live.iter()) {
+        let Some(entry) = item.get("entry") else {
+            continue;
+        };
+        match folded.iter().position(|held| held["id"] == entry["id"]) {
+            Some(index) => folded[index] = entry.clone(),
+            None => folded.push(entry.clone()),
+        }
+    }
+    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
+    let read: Vec<(&str, &str, &str)> = folded
+        .iter()
+        .map(|entry| {
+            (
+                entry["kind"].as_str().expect("a kind"),
+                entry["payload"]["text"]
+                    .as_str()
+                    .or_else(|| entry["payload"]["title"].as_str())
+                    .unwrap_or_default(),
+                entry["payload"]["status"]
+                    .as_str()
+                    .or_else(|| entry["payload"]["kind"].as_str())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            ("message", "looking through the variants", ""),
+            ("read", "Grep", "completed"),
+            ("outcome", "eleven variants", "completed"),
+        ],
+        "the child's work after the settle: {folded:#?}"
+    );
+    assert_eq!(folded[1]["payload"]["query"], "variant");
+    assert_eq!(folded[1]["payload"]["detail"], "eleven matches");
+
+    // And none of it opened or ended a turn of its own. The second ending is the
+    // agent's own report — a turn with a message in it — rather than anything a
+    // child boundary published.
+    let rest = client.events_through_the_turn(&subscription).await;
+    let endings: Vec<&Value> = rest
+        .iter()
+        .map(|item| &item["event"])
+        .filter(|event| event["payload"]["activity"]["kind"] == "turn.completed")
+        .collect();
+    assert_eq!(
+        endings.len(),
+        1,
+        "a child boundary settled a turn of its own: {endings:#?}"
+    );
+
+    inspector.close().await;
     client.close().await;
     server.stop().await;
 }
