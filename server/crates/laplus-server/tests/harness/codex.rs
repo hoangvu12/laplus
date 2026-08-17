@@ -78,6 +78,35 @@ impl ScriptedCodex {
         ScriptedCodex::conversation_from_fixture("02-command-execution", None)
     }
 
+    /// The recorded collaboration capture, replayed as a conversation.
+    ///
+    /// `09-subagent-spawn` is the only recording of what Codex's collaboration
+    /// traffic actually looks like, so this is what proves a child's identity,
+    /// canonical path, prose and outcome against Codex itself rather than against
+    /// a hand-written idea of it.
+    pub fn recorded_subagent_conversation() -> ScriptedCodex {
+        ScriptedCodex::conversation_from_fixture("09-subagent-spawn", None)
+    }
+
+    /// The synthetic collaboration capture: two children, a nested third, rich
+    /// child work, and five different endings. See the fixture README for what
+    /// in it is recorded shape and what is composition.
+    pub fn subagent_work_conversation() -> ScriptedCodex {
+        ScriptedCodex::conversation_from_fixture("10-subagent-work", None)
+    }
+
+    /// The same capture, stopped in the middle of a child's first sentence, so a
+    /// tab can be opened on a child that is still working.
+    pub fn subagent_work_conversation_paused_mid_child() -> ScriptedCodex {
+        let codex = ScriptedCodex::conversation_from_fixture(
+            "10-subagent-work",
+            Some("item/agentMessage/delta"),
+        );
+        std::fs::write(codex.directory.path().join("pause-turn"), "")
+            .expect("marks the first turn as paused");
+        codex
+    }
+
     pub fn subagent_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::plain_conversation();
         let events = codex.directory.path().join("turn-events-before-pause");
