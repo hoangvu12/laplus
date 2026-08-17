@@ -1839,7 +1839,10 @@ impl crate::session::Driver for OpenCode {
 
     async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
         self.settled = false;
-        let parts = prompt_parts(&prompt.text, &prompt.attachments);
+        let parts = prompt
+            .messages()
+            .flat_map(|(text, attachments)| prompt_parts(text, attachments))
+            .collect::<Vec<_>>();
         if parts.is_empty() { return Err(std::io::Error::other("OpenCode prompt has no resolvable text or attachments")); }
         let mut body = serde_json::json!({"parts": parts});
         if let Some(model) = self.model.as_deref() {

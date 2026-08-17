@@ -433,6 +433,7 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, att
         turn_id,
         text,
         attachments,
+        followups: Vec::new(),
         wanted: Retune { runtime_mode: start.runtime_mode.clone(), model: start.model.clone() },
     })
 }
@@ -491,11 +492,7 @@ pub fn send_prompts(
         .next()
         .ok_or_else(|| "The queued turn had no prompts to retry.".to_string())?;
     for next in prompts {
-        if !prompt.text.is_empty() && !next.text.is_empty() {
-            prompt.text.push_str("\n\n");
-        }
-        prompt.text.push_str(&next.text);
-        prompt.attachments.extend(next.attachments);
+        prompt.coalesce(next);
     }
     send_prompt(threads, start, prompt)
 }
@@ -634,11 +631,7 @@ async fn drive<D: Driver>(
                             deferred = Some(next);
                             break;
                         }
-                        if !prompt.text.is_empty() && !next.text.is_empty() {
-                            prompt.text.push_str("\n\n");
-                        }
-                        prompt.text.push_str(&next.text);
-                        prompt.attachments.extend(next.attachments);
+                        prompt.coalesce(next);
                         // One provider request has one effective model and
                         // runtime mode. The first message created the queued
                         // turn, so its captured selection remains authoritative

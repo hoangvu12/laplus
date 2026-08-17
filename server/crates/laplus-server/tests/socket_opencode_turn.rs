@@ -37,6 +37,13 @@ use laplus_server::config::ServerConfig;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
+fn part_labels(parts: &[Value]) -> Vec<(&str, &str)> {
+    parts.iter().map(|part| (
+        part["type"].as_str().unwrap(),
+        part["text"].as_str().or_else(|| part["filename"].as_str()).unwrap(),
+    )).collect()
+}
+
 struct FakeOpenCode {
     directory: tempfile::TempDir,
     log: PathBuf,
@@ -1537,12 +1544,16 @@ async fn busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order
     let mut second = follow_up_in("queue-thread", "message-2", "B", "approval-required");
     second["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-alt"});
     second["message"]["attachments"] = json!([{
-        "type":"image", "name":"queued.png", "mimeType":"image/png",
+        "type":"image", "name":"b.png", "mimeType":"image/png",
         "sizeBytes":2, "dataUrl":"data:image/png;base64,aGk="
     }]);
     client.call("orchestration.dispatchCommand", second).await.expect_success();
     let mut third = follow_up_in("queue-thread", "message-3", "C", "full-access");
     third["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    third["message"]["attachments"] = json!([{
+        "type":"image", "name":"c.gif", "mimeType":"image/gif",
+        "sizeBytes":3, "dataUrl":"data:image/gif;base64,dHdv"
+    }]);
     client.call("orchestration.dispatchCommand", third).await.expect_success();
     let snapshot = server.connect().await.into_thread_snapshot("queue-thread").await;
     let queued = snapshot["thread"]["messages"].as_array().unwrap().iter()
@@ -1552,6 +1563,8 @@ async fn busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order
     assert_eq!(queued[0]["text"], "B");
     assert_eq!(queued[1]["text"], "C");
     assert_eq!(queued[0]["turnId"], queued[1]["turnId"]);
+    assert_eq!(queued[0]["attachments"], json!([{"type":"image","id":"message-2-0","name":"b.png","mimeType":"image/png","sizeBytes":2}]));
+    assert_eq!(queued[1]["attachments"], json!([{"type":"image","id":"message-3-0","name":"c.gif","mimeType":"image/gif","sizeBytes":3}]));
     let messages = snapshot["thread"]["messages"].as_array().unwrap();
     let reply = messages.iter().position(|message| {
         message["role"] == "assistant"
@@ -1566,11 +1579,7 @@ async fn busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order
     assert_eq!(prompts[0]["sessionId"], prompts[1]["sessionId"], "the queued turn lost A's provider history");
     assert_eq!(prompts[1]["body"]["model"], json!({"providerID":"openai","modelID":"gpt-alt"}));
     let parts = prompts[1]["body"]["parts"].as_array().unwrap();
-    let queued_text = parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
-    assert!(queued_text.contains('B'));
-    assert!(queued_text.contains('C'));
-    assert!(queued_text.find('B') < queued_text.find('C'));
-    assert!(parts.iter().any(|part| part["type"] == "file" && part["filename"] == "queued.png"));
+    assert_eq!(part_labels(parts), vec![("text", "B"), ("file", "b.png"), ("text", "C"), ("file", "c.gif")]);
     assert!(requests.iter().any(|request| request["operation"] == "update"), "B's captured approval-required mode was not applied");
     client.close().await;
     server.stop().await;
@@ -1746,13 +1755,24 @@ async fn failed_queued_delivery_keeps_the_message_retryable() {
     a["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", a).await.expect_success();
     client.events_until_streaming(&subscription).await;
-    client.call("orchestration.dispatchCommand", follow_up("delivery-failure-thread", "delivery-failure-b", "B")).await.expect_success();
+    let mut b = follow_up("delivery-failure-thread", "delivery-failure-b", "B");
+    b["message"]["attachments"] = json!([{
+        "type":"image", "name":"retry.png", "mimeType":"image/png",
+        "sizeBytes":2, "dataUrl":"data:image/png;base64,aGk="
+    }]);
+    client.call("orchestration.dispatchCommand", b).await.expect_success();
     release.notify_one();
     client.values_until(&subscription, |item| item["event"]["payload"]["deliveryState"] == "retryable").await;
     let snapshot = server.connect().await.into_thread_snapshot("delivery-failure-thread").await;
     let message = snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "delivery-failure-b").unwrap();
     assert_eq!(message["deliveryState"], "retryable");
+    assert_eq!(message["attachments"], json!([{"type":"image","id":"delivery-failure-b-0","name":"retry.png","mimeType":"image/png","sizeBytes":2}]));
     assert_ne!(snapshot["thread"]["session"]["status"], "running");
+    let failed_parts = peer.requests().await.into_iter().filter(|request| request["operation"] == "prompt").next_back().unwrap()["body"]["parts"].clone();
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.turn.retry","commandId":"test:retry:delivery-failure","threadId":"delivery-failure-thread","createdAt":"2026-08-17T00:00:01.000Z"})).await.expect_success();
+    client.values_until(&subscription, |item| item["event"]["payload"]["deliveryState"] == "retryable").await;
+    let retried_parts = peer.requests().await.into_iter().filter(|request| request["operation"] == "prompt").next_back().unwrap()["body"]["parts"].clone();
+    assert_eq!(retried_parts, failed_parts, "retry changed the original text/image request");
     client.close().await;
     server.stop().await;
     peer.task.abort();
@@ -1775,12 +1795,28 @@ async fn failed_interrupt_reconciliation_settles_work_and_keeps_retry() {
     client.call("orchestration.dispatchCommand", a).await.expect_success();
     let events = client.events_until_streaming(&subscription).await;
     let active = last_session(&events, "running before failed reconciliation")["payload"]["session"]["activeTurnId"].as_str().unwrap();
+    let mut b = follow_up("reconcile-failure-thread", "reconcile-failure-b", "B");
+    b["message"]["attachments"] = json!([{
+        "type":"image", "name":"after-interrupt.webp", "mimeType":"image/webp",
+        "sizeBytes":3, "dataUrl":"data:image/webp;base64,dHdv"
+    }]);
+    client.call("orchestration.dispatchCommand", b).await.expect_success();
     client.call("orchestration.dispatchCommand", interrupt_turn("reconcile-failure-thread", Some(active))).await.expect_success();
-    client.call("orchestration.dispatchCommand", follow_up("reconcile-failure-thread", "reconcile-failure-b", "B")).await.expect_success();
     tokio::time::timeout(std::time::Duration::from_secs(5), client.values_until(&subscription, |item| item["event"]["payload"]["deliveryState"] == "retryable")).await.expect("bounded reconciliation failure");
     let snapshot = server.connect().await.into_thread_snapshot("reconcile-failure-thread").await;
-    assert_eq!(snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "reconcile-failure-b").unwrap()["deliveryState"], "retryable");
+    let retained = snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "reconcile-failure-b").unwrap();
+    assert_eq!(retained["deliveryState"], "retryable");
+    assert_eq!(retained["attachments"], json!([{"type":"image","id":"reconcile-failure-b-0","name":"after-interrupt.webp","mimeType":"image/webp","sizeBytes":3}]));
     assert_ne!(snapshot["thread"]["session"]["status"], "running");
+    let first = peer.requests().await.into_iter().find(|request| request["operation"] == "prompt").unwrap();
+    assert!(first["body"]["parts"].as_array().unwrap().iter().all(|part| part["filename"] != "after-interrupt.webp"), "the queued image moved onto the interrupted turn");
+    client.call("orchestration.dispatchCommand", json!({"type":"thread.turn.retry","commandId":"test:retry:after-interrupt","threadId":"reconcile-failure-thread","createdAt":"2026-08-17T00:00:01.000Z"})).await.expect_success();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while peer.prompts.load(Ordering::SeqCst) < 2 { tokio::task::yield_now().await; }
+    }).await.expect("the retained queued prompt is retried");
+    let requests = peer.requests().await;
+    let retry = requests.iter().filter(|request| request["operation"] == "prompt").next_back().unwrap();
+    assert_eq!(part_labels(retry["body"]["parts"].as_array().unwrap()), vec![("text", "B"), ("file", "after-interrupt.webp")]);
     client.close().await;
     server.stop().await;
     peer.task.abort();
@@ -1791,9 +1827,8 @@ async fn stopped_queued_opencode_work_survives_restart_and_retries_once_in_order
     let release = Arc::new(Notify::new());
     let peer = ExternalOpenCode::start_with_idle_release(None, Some(release)).await;
     let data = tempfile::tempdir().unwrap();
-    let database = data.path().join("registry.sqlite");
     let workspace = Workspace::with(&["src/"]);
-    let first = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let first = TestServer::start_persistent_with_config_in(data.path(), peer.config(None)).await;
     let mut client = first.connect().await;
     client.call("orchestration.dispatchCommand", create_project("unsent-project", workspace.path())).await.expect_success();
     let mut create = create_thread("unsent-project", "unsent-thread");
@@ -1807,8 +1842,17 @@ async fn stopped_queued_opencode_work_survives_restart_and_retries_once_in_order
     let mut b = follow_up("unsent-thread", "unsent-b", "B");
     b["titleSeed"] = json!("preserved queued title seed");
     b["sourceProposedPlan"] = json!({"threadId":"source-thread","planId":"source-plan"});
+    b["message"]["attachments"] = json!([{
+        "type":"image", "name":"b.png", "mimeType":"image/png",
+        "sizeBytes":2, "dataUrl":"data:image/png;base64,aGk="
+    }]);
     client.call("orchestration.dispatchCommand", b).await.expect_success();
-    client.call("orchestration.dispatchCommand", follow_up("unsent-thread", "unsent-c", "C")).await.expect_success();
+    let mut c = follow_up("unsent-thread", "unsent-c", "C");
+    c["message"]["attachments"] = json!([{
+        "type":"image", "name":"c.gif", "mimeType":"image/gif",
+        "sizeBytes":3, "dataUrl":"data:image/gif;base64,dHdv"
+    }]);
+    client.call("orchestration.dispatchCommand", c).await.expect_success();
     client.call("orchestration.dispatchCommand", json!({"type":"thread.session.stop","commandId":"test:stop:unsent","threadId":"unsent-thread","createdAt":"2026-08-15T00:00:00.000Z"})).await.expect_success();
     client.values_until(&subscription, |item| item["event"]["payload"]["session"]["status"] == "stopped").await;
     let stopped = first.connect().await.into_thread_snapshot("unsent-thread").await;
@@ -1819,17 +1863,28 @@ async fn stopped_queued_opencode_work_survives_restart_and_retries_once_in_order
     client.close().await;
     first.stop().await;
 
-    let restarted = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let restarted = TestServer::start_persistent_with_config_in(data.path(), peer.config(None)).await;
     let snapshot = restarted.connect().await.into_thread_snapshot("unsent-thread").await;
-    assert_eq!(snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "unsent-b").unwrap()["deliveryState"], "retryable");
+    let messages = snapshot["thread"]["messages"].as_array().unwrap();
+    let restored_b = messages.iter().find(|message| message["id"] == "unsent-b").unwrap();
+    let restored_c = messages.iter().find(|message| message["id"] == "unsent-c").unwrap();
+    assert_eq!(restored_b["deliveryState"], "retryable");
+    assert_eq!(restored_b["attachments"], json!([{"type":"image","id":"unsent-b-0","name":"b.png","mimeType":"image/png","sizeBytes":2}]));
+    assert_eq!(restored_c["attachments"], json!([{"type":"image","id":"unsent-c-0","name":"c.gif","mimeType":"image/gif","sizeBytes":3}]));
     assert_eq!(snapshot["thread"]["latestTurn"]["sourceProposedPlan"], json!({"threadId":"source-thread","planId":"source-plan"}));
     assert_eq!(peer.requests().await.iter().filter(|request| request["operation"] == "prompt").count(), 1, "restart submitted unsent work");
     let mut client = restarted.connect().await;
+    for (attachment_id, expected) in [("unsent-b-0", "hi"), ("unsent-c-0", "two")] {
+        let issued = client.call("assets.createUrl", json!({"resource":{"_tag":"attachment","attachmentId":attachment_id}})).await.expect_success();
+        let fetched = restarted.get(issued["relativeUrl"].as_str().unwrap()).await;
+        assert_eq!(fetched.status, 200);
+        assert_eq!(fetched.text, expected);
+    }
     client.call("orchestration.dispatchCommand", json!({"type":"thread.turn.retry","commandId":"test:retry:unsent","threadId":"unsent-thread","createdAt":"2026-08-15T00:00:01.000Z"})).await.expect_success();
     let requests = peer.requests_through(6).await;
     let retry = requests.iter().filter(|request| request["operation"] == "prompt").last().unwrap();
-    let text = retry["body"]["parts"].as_array().unwrap().iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
-    assert!(text.find('B') < text.find('C'));
+    let parts = retry["body"]["parts"].as_array().unwrap();
+    assert_eq!(part_labels(parts), vec![("text", "B"), ("file", "b.png"), ("text", "C"), ("file", "c.gif")]);
     client.close().await;
     restarted.stop().await;
     peer.task.abort();

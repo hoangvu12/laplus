@@ -323,9 +323,38 @@ pub struct Prompt {
     pub turn_id: String,
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    /// Later developer messages coalesced into this provider turn, in their
+    /// original message order. Keeping their text and images together prevents
+    /// a provider encoder from flattening `text B, text C, image B, image C`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followups: Vec<PromptMessage>,
     /// What the conversation said the agent should be running under when *this*
     /// turn was dispatched. See [`Retune`].
     pub wanted: Retune,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PromptMessage {
+    pub text: String,
+    pub attachments: Vec<PromptAttachment>,
+}
+
+impl Prompt {
+    pub fn coalesce(&mut self, next: Prompt) {
+        self.followups.push(PromptMessage {
+            text: next.text,
+            attachments: next.attachments,
+        });
+        self.followups.extend(next.followups);
+    }
+
+    pub fn messages(&self) -> impl Iterator<Item = (&str, &[PromptAttachment])> {
+        std::iter::once((self.text.as_str(), self.attachments.as_slice())).chain(
+            self.followups
+                .iter()
+                .map(|message| (message.text.as_str(), message.attachments.as_slice())),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

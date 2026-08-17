@@ -597,10 +597,15 @@ async fn a_prompt_sent_while_the_agent_is_working_is_queued_without_leaving_runn
         .expect("the first turn was named")
         .to_string();
 
+    let mut follow_up = follow_up("thread-1", "message-2", "the second thing");
+    follow_up["message"]["attachments"] = json!([{
+        "type":"image", "name":"queued.png", "mimeType":"image/png",
+        "sizeBytes":2, "dataUrl":"data:image/png;base64,aGk="
+    }]);
     client
         .call(
             "orchestration.dispatchCommand",
-            follow_up("thread-1", "message-2", "the second thing"),
+            follow_up,
         )
         .await
         .expect_success();
@@ -670,6 +675,11 @@ async fn a_prompt_sent_while_the_agent_is_working_is_queued_without_leaving_runn
         Some(&("and the second thing too".to_string(), false))
     );
     assert_eq!(agent.starts(), 1, "the queued turn reached a second process");
+    let sent: Value = serde_json::from_str(&agent.prompts()[1]).unwrap();
+    assert_eq!(sent["message"]["content"], json!([
+        {"type":"text","text":"the second thing"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}
+    ]));
 
     let snapshot = server.connect().await.into_thread_snapshot("thread-1").await;
     let transcript: Vec<&str> = snapshot["thread"]["messages"]
@@ -687,6 +697,9 @@ async fn a_prompt_sent_while_the_agent_is_working_is_queued_without_leaving_runn
             "and the second thing too",
         ]
     );
+    assert_eq!(snapshot["thread"]["messages"][2]["attachments"], json!([{
+        "type":"image","id":"message-2-0","name":"queued.png","mimeType":"image/png","sizeBytes":2
+    }]));
 
     client.close().await;
     server.stop().await;

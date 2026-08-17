@@ -1747,6 +1747,7 @@ impl Shell {
             turn_id: turn_id.clone(),
             text: start.message.text.clone(),
             attachments,
+            followups: Vec::new(),
             wanted: crate::threads::Retune {
                 runtime_mode: starting.runtime_mode.clone(),
                 model: starting.model.clone(),
