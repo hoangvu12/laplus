@@ -820,11 +820,26 @@ pub(crate) enum Request {
     ThreadResume { thread_id: String, access: Access },
     TurnStart {
         thread_id: String,
-        text: String,
+        input: Vec<TurnInput>,
         model: Option<String>,
         access: Option<Access>,
     },
     TurnInterrupt { thread_id: String, turn_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnInput {
+    Text { text: String },
+    Image { url: String },
+}
+
+impl TurnInput {
+    fn message(&self) -> Value {
+        match self {
+            Self::Text { text } => json!({"type": "text", "text": text}),
+            Self::Image { url } => json!({"type": "image", "url": url}),
+        }
+    }
 }
 
 impl Request {
@@ -872,7 +887,7 @@ impl Request {
             }
             Request::TurnStart {
                 thread_id,
-                text,
+                input,
                 model,
                 access,
             } => {
@@ -880,7 +895,7 @@ impl Request {
                     .map(|access| access.turn_params())
                     .unwrap_or_else(|| json!({}));
                 params["threadId"] = json!(thread_id);
-                params["input"] = json!([{"type": "text", "text": text}]);
+                params["input"] = Value::Array(input.iter().map(TurnInput::message).collect());
                 if let Some(model) = model {
                     params["model"] = json!(model);
                 }
@@ -1430,7 +1445,7 @@ mod tests {
         ] {
             let request = Request::TurnStart {
                 thread_id: "codex-thread-1".to_string(),
-                text: "A retuned turn.".to_string(),
+                input: vec![TurnInput::Text { text: "A retuned turn.".to_string() }],
                 model: Some("gpt-5.4-mini".to_string()),
                 access: Some(Access::for_runtime_mode(mode).expect("a contract runtime mode")),
             }
@@ -1438,6 +1453,25 @@ mod tests {
 
             assert_eq!(request["params"]["sandboxPolicy"]["type"], sandbox_type);
         }
+    }
+
+    #[test]
+    fn a_turn_start_serializes_the_complete_ordered_structured_input() {
+        let request = Request::TurnStart {
+            thread_id: "codex-thread-1".to_string(),
+            input: vec![
+                TurnInput::Text { text: "compare".to_string() },
+                TurnInput::Image { url: "data:image/png;base64,aGk=".to_string() },
+                TurnInput::Image { url: "data:image/webp;base64,dHdv".to_string() },
+            ],
+            model: None,
+            access: None,
+        }.message(3);
+        assert_eq!(request["params"]["input"], json!([
+            {"type":"text","text":"compare"},
+            {"type":"image","url":"data:image/png;base64,aGk="},
+            {"type":"image","url":"data:image/webp;base64,dHdv"}
+        ]));
     }
 
     #[test]
@@ -1467,8 +1501,7 @@ mod tests {
             .message(2),
             Request::TurnStart {
                 thread_id: "codex-thread-1".to_string(),
-                text: "Reply with exactly one short sentence saying hello. Do not use any tools."
-                    .to_string(),
+                input: vec![TurnInput::Text { text: "Reply with exactly one short sentence saying hello. Do not use any tools.".to_string() }],
                 model: None,
                 access: None,
             }

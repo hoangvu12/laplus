@@ -32,6 +32,40 @@ pub fn resolve_all_required(
     Ok(resolved)
 }
 
+/// Read one normalized image back for a provider that accepts inline data URLs.
+pub(crate) fn data_url(attachment: &PromptAttachment) -> Result<String, String> {
+    if !valid_id(&attachment.id) {
+        return Err("The stored image attachment has an unsafe identity.".into());
+    }
+    let extension = extension(&attachment.mime)
+        .ok_or_else(|| format!("Unsupported image attachment MIME type: {}.", attachment.mime))?;
+    let expected_name = format!("{}.{}", attachment.id, extension);
+    if attachment.path.file_name().and_then(|name| name.to_str()) != Some(&expected_name) {
+        return Err("The stored image attachment path does not match its identity.".into());
+    }
+    let bytes = std::fs::read(&attachment.path)
+        .map_err(|error| format!("The stored image attachment could not be read: {error}"))?;
+    if bytes.is_empty() || bytes.len() as u64 != attachment.size_bytes {
+        return Err("The stored image attachment content no longer matches its metadata.".into());
+    }
+    Ok(format!("data:{};base64,{}", attachment.mime, encode_base64(&bytes)))
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or_default();
+        let third = chunk.get(2).copied().unwrap_or_default();
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 3) << 4) | (second >> 4)) as usize] as char);
+        output.push(if chunk.len() > 1 { ALPHABET[(((second & 15) << 2) | (third >> 6)) as usize] as char } else { '=' });
+        output.push(if chunk.len() > 2 { ALPHABET[(third & 63) as usize] as char } else { '=' });
+    }
+    output
+}
+
 fn resolve(
     value: &Value,
     message_id: &str,

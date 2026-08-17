@@ -67,6 +67,12 @@ fn codex_follow_up_using_thread_settings(message_id: &str, text: &str) -> Value 
     })
 }
 
+fn codex_follow_up_with_attachments(message_id: &str, text: &str, attachments: Value) -> Value {
+    let mut command = codex_follow_up_using_thread_settings(message_id, text);
+    command["message"]["attachments"] = attachments;
+    command
+}
+
 fn set_codex_runtime_mode(runtime_mode: &str) -> Value {
     json!({
         "type": "thread.runtime-mode.set",
@@ -95,6 +101,95 @@ async fn open_shell(client: &mut SocketClient) -> String {
     client.next_chunk(&subscription).await;
     client.ack(&subscription).await;
     subscription
+}
+
+#[tokio::test]
+async fn codex_receives_text_and_images_as_complete_ordered_turn_inputs() {
+    let codex = ScriptedCodex::plain_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    client.call("orchestration.dispatchCommand", codex_thread("full-access")).await.expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client.call("orchestration.dispatchCommand", codex_follow_up_with_attachments(
+        "codex-images", "compare in order", json!([
+            {"type":"image","name":"one.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="},
+            {"type":"image","name":"two.webp","mimeType":"image/webp","sizeBytes":3,"dataUrl":"data:image/webp;base64,dHdv"}
+        ]),
+    )).await.expect_success();
+    client.events_through_the_turn(&subscription).await;
+    let turns = codex.turn_start_requests();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["params"]["input"], json!([
+        {"type":"text","text":"compare in order"},
+        {"type":"image","url":"data:image/png;base64,aGk="},
+        {"type":"image","url":"data:image/webp;base64,dHdv"}
+    ]));
+    client.close().await; server.stop().await; codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn codex_receives_image_only_bootstrap_and_refuses_an_unresolved_image() {
+    const IMAGE_ONLY: &str = "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
+    let codex = ScriptedCodex::plain_conversation();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    client.call("orchestration.dispatchCommand", codex_thread("full-access")).await.expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client.call("orchestration.dispatchCommand", codex_follow_up_with_attachments(
+        "codex-image-only", IMAGE_ONLY, json!([
+            {"type":"image","name":"only.gif","mimeType":"image/gif","sizeBytes":2,"dataUrl":"data:image/gif;base64,aGk="}
+        ]),
+    )).await.expect_success();
+    client.events_through_the_turn(&subscription).await;
+    assert_eq!(codex.turn_start_requests()[0]["params"]["input"], json!([
+        {"type":"text","text":IMAGE_ONLY}, {"type":"image","url":"data:image/gif;base64,aGk="}
+    ]));
+    client.call("orchestration.dispatchCommand", codex_follow_up_with_attachments(
+        "codex-missing", "do not send", json!([
+            {"type":"image","id":"missing-image","name":"missing.png","mimeType":"image/png","sizeBytes":2}
+        ]),
+    )).await.expect_declared("OrchestrationDispatchCommandError");
+    assert_eq!(codex.turn_start_requests().len(), 1);
+    client.close().await; server.stop().await; codex.assert_conversation_reaped();
+}
+
+#[tokio::test]
+async fn codex_refuses_a_stored_image_that_becomes_unreadable_before_dispatch() {
+    let codex = ScriptedCodex::conversation_paused_after_first_delta();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let preferences = tempfile::tempdir().expect("persistent test preferences");
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_persistent_with_config_in(preferences.path(), config).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    client.call("orchestration.dispatchCommand", codex_thread("full-access")).await.expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client.call("orchestration.dispatchCommand", follow_up("codex-thread", "message-1", "First turn.")).await.expect_success();
+    client.events_until_streaming(&subscription).await;
+    client.call("orchestration.dispatchCommand", codex_follow_up_with_attachments(
+        "queued-image", "inspect", json!([
+            {"type":"image","name":"queued.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="}
+        ]),
+    )).await.expect_success();
+    std::fs::remove_file(preferences.path().join("attachments/queued-image-0.png")).expect("removes stored image before dispatch");
+    codex.release_turn();
+    let mut events = client.events_through_the_turn(&subscription).await;
+    while !events.iter().any(|item| item["event"]["payload"]["session"]["status"] == "error") {
+        events.extend(client.events_through_the_turn(&subscription).await);
+    }
+    assert_eq!(codex.turn_start_requests().len(), 1, "Codex received an incomplete queued turn");
+    assert!(events.iter().any(|item| item["event"]["payload"]["session"]["lastError"]
+        .as_str().is_some_and(|error| error.contains("could not be read"))));
+    client.close().await; server.stop().await; codex.assert_conversation_reaped();
 }
 
 fn title_on_shell(snapshot: &Value, thread_id: &str) -> String {

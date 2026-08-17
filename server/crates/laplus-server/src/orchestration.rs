@@ -1609,8 +1609,16 @@ impl Shell {
             Arc::clone(&self.inner.mcp),
         ).map_err(CommandError::new)?;
         let attachments = match thread.provider.driver.as_str() {
-            "claudeAgent" => crate::attachments::resolve_all_required(&start.message.attachments, &start.message.message_id, &config.preferences),
-            _ => crate::attachments::resolve_all(&start.message.attachments, &start.message.message_id, &config.preferences),
+            "claudeAgent" | "codex" => crate::attachments::resolve_all_required(
+                &start.message.attachments,
+                &start.message.message_id,
+                &config.preferences,
+            ),
+            _ => crate::attachments::resolve_all(
+                &start.message.attachments,
+                &start.message.message_id,
+                &config.preferences,
+            ),
         }.map_err(CommandError::new)?;
 
         if let Some(thread) = pending {

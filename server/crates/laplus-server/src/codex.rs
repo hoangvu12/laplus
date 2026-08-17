@@ -391,7 +391,12 @@ impl Driver for Codex {
     }
 
     async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
-        let text = &prompt.text;
+        let mut input = vec![crate::codex_protocol::TurnInput::Text { text: prompt.text.clone() }];
+        for attachment in &prompt.attachments {
+            input.push(crate::codex_protocol::TurnInput::Image {
+                url: crate::attachments::data_url(attachment).map_err(std::io::Error::other)?,
+            });
+        }
         self.turn_id_unavailable = false;
         let (model, access) = match self.explicit_turn_config {
             true => (self.model.clone(), Some(self.access)),
@@ -400,7 +405,7 @@ impl Driver for Codex {
         self.app_server
             .send_request(Request::TurnStart {
                 thread_id: self.thread_id.clone(),
-                text: text.to_string(),
+                input,
                 model,
                 access,
             })
