@@ -14,7 +14,15 @@ import { createJSONStorage, persist } from "zustand/middleware";
 
 import { resolveStorage } from "./lib/storage";
 
-export const RIGHT_PANEL_KINDS = ["plan", "diff", "files", "file", "preview", "terminal"] as const;
+export const RIGHT_PANEL_KINDS = [
+  "plan",
+  "diff",
+  "files",
+  "file",
+  "preview",
+  "terminal",
+  "subagent",
+] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
 
 export type RightPanelSurface =
@@ -37,7 +45,16 @@ export type RightPanelSurface =
       revealLine: number | null;
       revealRequestId: number;
     }
-  | { id: "plan"; kind: "plan" };
+  | { id: "plan"; kind: "plan" }
+  /**
+   * One delegated child's work stream, addressed by its stable child id.
+   *
+   * Resource-addressed like a file, a terminal or a browser tab rather than a
+   * singleton like the diff or the plan: two children are two tabs, and opening
+   * the same child again activates the tab it already has. Read-only — nothing
+   * here can stop a child, and closing the tab is presentation only.
+   */
+  | { id: `subagent:${string}`; kind: "subagent"; resourceId: string };
 
 const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 const RIGHT_PANEL_STORAGE_VERSION = 7;
@@ -50,10 +67,15 @@ export interface ThreadRightPanelState {
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
-  open: (ref: ScopedThreadRef, kind: Exclude<RightPanelKind, "file" | "terminal">) => void;
+  open: (
+    ref: ScopedThreadRef,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "subagent">,
+  ) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
   openTerminal: (ref: ScopedThreadRef, terminalId: string) => void;
+  /** Open a child's work stream, or activate the tab it already has. */
+  openSubagent: (ref: ScopedThreadRef, childId: string) => void;
   splitTerminal: (
     ref: ScopedThreadRef,
     surfaceId: string,
@@ -72,7 +94,10 @@ interface RightPanelStoreState {
   show: (ref: ScopedThreadRef) => void;
   close: (ref: ScopedThreadRef) => void;
   toggleVisibility: (ref: ScopedThreadRef) => void;
-  toggle: (ref: ScopedThreadRef, kind: Exclude<RightPanelKind, "file" | "terminal">) => void;
+  toggle: (
+    ref: ScopedThreadRef,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "subagent">,
+  ) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
 
@@ -83,7 +108,7 @@ const EMPTY_THREAD_STATE: ThreadRightPanelState = {
 };
 
 const singletonSurface = (
-  kind: Exclude<RightPanelKind, "file" | "preview" | "terminal">,
+  kind: Exclude<RightPanelKind, "file" | "preview" | "terminal" | "subagent">,
 ): RightPanelSurface => {
   switch (kind) {
     case "diff":
@@ -110,6 +135,12 @@ const fileSurface = (
   relativePath,
   revealLine,
   revealRequestId,
+});
+
+const subagentSurface = (childId: string): RightPanelSurface => ({
+  id: `subagent:${childId}`,
+  kind: "subagent",
+  resourceId: childId,
 });
 
 const terminalSurface = (terminalId: string): RightPanelSurface => ({
@@ -183,6 +214,16 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                           ? surface.revealRequestId
                           : 0;
                       return [{ ...surface, revealLine, revealRequestId }];
+                    }
+                    if (surface.kind === "subagent") {
+                      // A surface whose id and resource disagree could never be
+                      // activated again, so it is dropped rather than restored
+                      // as a tab nothing can address.
+                      return "resourceId" in surface &&
+                        typeof surface.resourceId === "string" &&
+                        surface.id === `subagent:${surface.resourceId}`
+                        ? [surface]
+                        : [];
                     }
                     if (surface.kind !== "terminal") return [surface];
                     if (
@@ -290,6 +331,14 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) =>
             upsertSurface(current, terminalSurface(terminalId)),
+          ),
+        })),
+      // `upsertSurface` is the whole of "open or activate": a child already open
+      // keeps its position and its loaded stream, and only becomes active.
+      openSubagent: (ref, childId) =>
+        set((state) => ({
+          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) =>
+            upsertSurface(current, subagentSurface(childId)),
           ),
         })),
       splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal") =>

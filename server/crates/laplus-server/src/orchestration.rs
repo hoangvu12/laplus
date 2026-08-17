@@ -395,11 +395,23 @@ impl Shell {
             Vec::new()
         });
 
+        // Read with the conversations rather than lazily, for their reason and
+        // one of its own: a child stream is small and there are few of them, and
+        // a client that restored a child tab must find something to replay
+        // rather than an unavailable surface that would fill in a moment later.
+        // What is *not* eager is the wire — a stream crosses the socket only
+        // when its surface opens. See [`crate::subagents`].
+        let children = database.child_streams().unwrap_or_else(|error| {
+            eprintln!("laplus: cannot read the stored subagent work streams: {error}");
+            Vec::new()
+        });
+
         let database = Arc::new(database);
         let updates = broadcast::channel(BACKLOG).0;
         let transcripts = Transcripts::writing_to(Arc::clone(&database));
         let threads = Threads::new(sequences.clone(), updates.clone(), transcripts.clone());
         threads.restore(stored);
+        threads.subagents().restore(children);
 
         Shell {
             inner: Arc::new(Inner {

@@ -739,6 +739,69 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["tool-complete"]);
   });
 
+  /**
+   * The compact subagent row is an index into the child's work, and this is the
+   * address of it. Collapsing several updates of one child must keep it, or the
+   * row a developer finally clicks would be the one that lost the reference.
+   */
+  it("keeps a subagent row's work-stream reference through collapse", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "subagent-running",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.updated",
+        summary: "Subagent explore",
+        tone: "tool",
+        payload: {
+          itemType: "collab_agent_tool_call",
+          status: "running",
+          title: "Subagent explore",
+          detail: "Count the files",
+          data: { toolCallId: "subagent:call_task_1", childId: "call_task_1" },
+        },
+      }),
+      makeActivity({
+        id: "subagent-done",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "tool.completed",
+        summary: "Subagent explore",
+        tone: "tool",
+        payload: {
+          itemType: "collab_agent_tool_call",
+          status: "completed",
+          title: "Subagent explore",
+          detail: "eleven files",
+          data: { toolCallId: "subagent:call_task_1", childId: "call_task_1" },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.subagentChildId).toBe("call_task_1");
+    expect(entries[0]?.detail).toBe("eleven files");
+  });
+
+  /** A driver that records no child stream leaves the row without a reference. */
+  it("leaves a subagent row from a driver with no stream unreferenced", () => {
+    const entries = deriveWorkLogEntries([
+      makeActivity({
+        id: "subagent-legacy",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.updated",
+        summary: "Subagent explore",
+        tone: "tool",
+        payload: {
+          itemType: "collab_agent_tool_call",
+          status: "running",
+          title: "Subagent explore",
+          data: { toolCallId: "subagent:legacy" },
+        },
+      }),
+    ]);
+    expect(entries[0]?.subagentChildId).toBeUndefined();
+  });
+
   it("omits task.started but shows task.progress and task.completed", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

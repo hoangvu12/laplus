@@ -99,6 +99,10 @@
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
     },
+    "./state/subagents": {
+      "types": "./src/state/subagents.ts",
+      "default": "./src/state/subagents.ts"
+    },
     "./state/terminal": {
       "types": "./src/state/terminal.ts",
       "default": "./src/state/terminal.ts"

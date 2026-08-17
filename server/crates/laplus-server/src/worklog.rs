@@ -469,7 +469,18 @@ const STALE: &str = "Unknown pending permission request";
 /// `tool.updated` while it runs for the reason the rest of this module uses it:
 /// the UI drops `tool.started` before deriving the work log, so a row announced
 /// that way would never appear.
-pub fn subagent(task: &crate::protocol::SubagentTask, turn_id: Option<String>) -> Activity {
+///
+/// `child_id` is the row's **stream reference**: the address of the subagent
+/// work stream this row launches, and the id
+/// `orchestration.subscribeSubagent` is asked for. `None` is a driver that does
+/// not record one yet — the Claude and Codex adapters, until tickets 03 and 04 —
+/// and it is absent from the payload rather than null, so a client cannot offer
+/// to open a stream that is not there.
+pub fn subagent(
+    task: &crate::protocol::SubagentTask,
+    turn_id: Option<String>,
+    child_id: Option<&str>,
+) -> Activity {
     let ended = task.status != "running";
     let title = match task.subagent_type.as_deref() {
         Some(kind) if !kind.trim().is_empty() => format!("Subagent {kind}"),
@@ -505,6 +516,9 @@ pub fn subagent(task: &crate::protocol::SubagentTask, turn_id: Option<String>) -
     });
     if let Some(detail) = detail {
         payload["detail"] = json!(truncate(detail, DETAIL));
+    }
+    if let Some(child_id) = child_id {
+        payload["data"]["childId"] = json!(child_id);
     }
 
     Activity::tool(
@@ -1059,7 +1073,7 @@ mod tests {
     /// final report. Each outranks the one before it.
     #[test]
     fn a_row_prefers_the_subagents_own_words_to_a_description_of_them() {
-        let described = subagent(&task("running", None), None);
+        let described = subagent(&task("running", None), None, None);
         assert_eq!(described.payload["detail"], json!("Count to three"));
 
         let spoke = crate::protocol::SubagentTask {
@@ -1067,7 +1081,7 @@ mod tests {
             ..task("running", None)
         };
         assert_eq!(
-            subagent(&spoke, None).payload["detail"],
+            subagent(&spoke, None, None).payload["detail"],
             json!("found eleven variants"),
             "the description outranked the subagent's own words"
         );
@@ -1078,7 +1092,7 @@ mod tests {
             said: Some("found eleven variants".to_string()),
             ..task("completed", Some("eleven"))
         };
-        assert_eq!(subagent(&reported, None).payload["detail"], json!("eleven"));
+        assert_eq!(subagent(&reported, None, None).payload["detail"], json!("eleven"));
     }
 
     /// The collapse key is the subagent's, not the spawning call's. A background
@@ -1087,7 +1101,7 @@ mod tests {
     /// started — and two subagents would fold into one row.
     #[test]
     fn a_subagent_row_collapses_on_the_subagent_rather_than_the_call() {
-        let running = subagent(&task("running", None), None);
+        let running = subagent(&task("running", None), None, None);
 
         assert_eq!(running.kind, "tool.updated", "a started row would be dropped");
         assert_eq!(running.payload["status"], "running");
@@ -1100,7 +1114,7 @@ mod tests {
 
     #[test]
     fn a_finished_subagent_row_carries_its_report() {
-        let done = subagent(&task("completed", Some("1 2 3 — done")), None);
+        let done = subagent(&task("completed", Some("1 2 3 — done")), None, None);
 
         assert_eq!(done.kind, "tool.completed");
         assert_eq!(done.payload["status"], "completed");
@@ -1109,7 +1123,7 @@ mod tests {
         // The subagent's own answer wins over the description it started with.
         assert_eq!(done.payload["detail"], "1 2 3 — done");
 
-        let failed = subagent(&task("failed", None), None);
+        let failed = subagent(&task("failed", None), None, None);
         assert_eq!(failed.kind, "tool.completed");
         assert_eq!(failed.payload["status"], "failed");
     }

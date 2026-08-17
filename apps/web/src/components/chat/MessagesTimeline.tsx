@@ -135,6 +135,11 @@ interface TimelineRowSharedState {
   retryMessageId: MessageId | null;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+  /**
+   * Open or activate a delegated child's work stream. Absent when the surface
+   * this timeline is drawn in has nowhere to put one.
+   */
+  onOpenSubagent: ((childId: string) => void) | undefined;
   onToggleTurnFold: (turnId: TurnId) => void;
   onToggleWorkGroup: (groupId: string, anchorElement?: HTMLElement) => void;
 }
@@ -168,6 +173,7 @@ interface MessagesTimelineProps {
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
   routeThreadKey: string;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+  onOpenSubagent?: ((childId: string) => void) | undefined;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
   onRetryQueuedTurn?: () => void;
@@ -204,6 +210,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   turnDiffSummaryByAssistantMessageId,
   routeThreadKey,
   onOpenTurnDiff,
+  onOpenSubagent,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
   onRetryQueuedTurn = () => {},
@@ -440,6 +447,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       retryMessageId,
       onImageExpand,
       onOpenTurnDiff,
+      onOpenSubagent,
       onToggleTurnFold,
       onToggleWorkGroup,
     }),
@@ -456,6 +464,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       retryMessageId,
       onImageExpand,
       onOpenTurnDiff,
+      onOpenSubagent,
       onToggleTurnFold,
       onToggleWorkGroup,
     ],
@@ -1951,6 +1960,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
 }) {
   const { workEntry, workspaceRoot } = props;
   const activity = use(TimelineRowActivityCtx);
+  const shared = use(TimelineRowCtx);
   const [expanded, setExpanded] = useState(false);
   const iconConfig = workToneIcon(workEntry.tone);
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
@@ -1994,26 +2004,48 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   const showSuccessIndicator =
     workEntryIndicatesToolSuccess(workEntry) ||
     (turnSettled && workEntryIndicatesToolNeutralStatus(workEntry));
-  const rowToggleProps = canExpand
-    ? {
-        role: "button" as const,
-        tabIndex: 0 as const,
-        "aria-label": displayText,
-        onClick: () => setExpanded((v) => !v),
-        onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setExpanded((v) => !v);
+  // A compact subagent row is a **launcher**, not a disclosure: clicking it
+  // opens or activates that child's work stream in the right-panel workspace,
+  // where the full session is. Expanding it in place would put a second, worse
+  // copy of the child's work in the parent transcript, which is the thing this
+  // feature exists to stop.
+  const openSubagent = workEntry.subagentChildId ? shared.onOpenSubagent : undefined;
+  const childId = workEntry.subagentChildId;
+  const activate = openSubagent && childId ? () => openSubagent(childId) : null;
+  const rowToggleProps =
+    activate !== null
+      ? {
+          role: "button" as const,
+          tabIndex: 0 as const,
+          "aria-label": `Open subagent work stream: ${displayText}`,
+          onClick: activate,
+          onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              activate();
+            }
+          },
+        }
+      : canExpand
+        ? {
+            role: "button" as const,
+            tabIndex: 0 as const,
+            "aria-label": displayText,
+            onClick: () => setExpanded((v) => !v),
+            onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                setExpanded((v) => !v);
+              }
+            },
           }
-        },
-      }
-    : {};
+        : {};
 
   return (
     <div
       className={cn(
         "flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
-        canExpand &&
+        (canExpand || activate !== null) &&
           "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
       )}
       {...rowToggleProps}

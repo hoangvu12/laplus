@@ -1150,10 +1150,21 @@ impl OpenCode {
     /// keyed on it would be a second row appearing a beat after the first. The
     /// call id is there from the `pending` part onwards and lasts exactly as long
     /// as the subagent does, because OpenCode's `task` tool does not return early.
+    ///
+    /// **The row and the child's own stream are decided together**, from the
+    /// same part, because they are two views of one child and a driver that
+    /// could publish one without the other would let the launcher and what it
+    /// launches disagree. The row is the compact index — identity, assignment,
+    /// state, latest activity — and carries the `childId` the stream is
+    /// addressed by; [`crate::subagents`] holds the work itself. The child id is
+    /// the `task` call's, for the same reason the row's collapse key is: it is
+    /// there from the `pending` part onwards and lasts exactly as long as the
+    /// subagent.
     fn subagent_row(
         &mut self,
         part: &Value,
         driving: &crate::session::Driving,
+        decided: &mut crate::session::Decided,
     ) -> Drawn {
         if part.get("type").and_then(Value::as_str) != Some("tool")
             || part.get("tool").and_then(Value::as_str) != Some(TASK_TOOL)
@@ -1197,6 +1208,26 @@ impl OpenCode {
         let said = row.said.clone();
         let (kind, description) = (row.kind.clone(), row.description.clone());
 
+        // The child's own stream, from the same part. Recorded from `pending`
+        // onwards — before the row can be named — so that identity exists for
+        // the whole of the child's life rather than from the moment it becomes
+        // presentable.
+        let update = crate::subagents::Update::for_child(call.clone())
+            .named(kind.clone())
+            .assigned(description.clone());
+        decided.child_streams.push(match status {
+            "completed" => update.concluded(crate::subagents::Outcome::completed(field(
+                Some(state),
+                "output",
+            ))),
+            "error" => update.concluded(crate::subagents::Outcome::failed(field(
+                Some(state),
+                "error",
+            ))),
+            "pending" => update.in_state(crate::subagents::State::Pending),
+            _ => update.in_state(crate::subagents::State::Working),
+        });
+
         // OpenCode announces the call before it knows what it is: the first
         // `task` part is `pending` with an empty state, and the input naming the
         // agent arrives with `running`. Publishing that first one would put a row
@@ -1211,7 +1242,7 @@ impl OpenCode {
         Drawn::Row(crate::worklog::subagent(
             &crate::protocol::SubagentTask {
                 task_id: call.clone(),
-                tool_use_id: Some(call),
+                tool_use_id: Some(call.clone()),
                 status: match status {
                     "completed" => "completed",
                     "error" => "failed",
@@ -1228,18 +1259,26 @@ impl OpenCode {
                 said,
             },
             driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+            Some(&call),
         ))
     }
 
-    /// Something happened in a subagent's own session. Put it on that subagent's
-    /// row, or say nothing.
+    /// Something happened in a subagent's own session. Put it in that subagent's
+    /// work stream and on its row, or say nothing.
     ///
-    /// Only two of the child's events are worth anything to a row: which of its
-    /// messages are the subagent's own, and what those messages say. Its tool
-    /// calls, its permissions and its token accounting are the child's business —
-    /// a row is one line, and the subagent's prose is the best thing to spend it
-    /// on. The `task` part that owns the row is what ends it, so nothing here
-    /// needs to notice the child going idle.
+    /// **Two destinations, and they take different amounts.** The stream keeps
+    /// the child's prose as an ordered entry per part, because that is the thing
+    /// the developer opens the child to read. The row keeps only the latest of
+    /// it, because a row is one line. The `task` part that owns both is what
+    /// ends them, so nothing here needs to notice the child going idle.
+    ///
+    /// A part is keyed by OpenCode's own part id, which is what makes the
+    /// cumulative text it resends an edit of one entry rather than a paragraph
+    /// per token — see [`crate::subagents::NewEntry`].
+    ///
+    /// The child's tool calls, permissions and token accounting are still
+    /// dropped here. They are ticket 02's, and inventing them from what this
+    /// function already sees is not available: it would be prose relabelled.
     fn child_session_event(
         &mut self,
         envelope: &crate::opencode_protocol::EventEnvelope,
@@ -1292,14 +1331,23 @@ impl OpenCode {
                 // A subagent that has already reported does not speak again: the
                 // `task` part has published its output, and reopening the row
                 // would replace the answer with whatever was said on the way to
-                // it.
+                // it. The stream is closed for the same reason and by the same
+                // rule — see [`crate::subagents::Streams::record`].
                 if row.finished {
                     return;
                 }
+                decided.child_streams.push(
+                    crate::subagents::Update::for_child(call.clone())
+                        .in_state(crate::subagents::State::Working)
+                        .with(crate::subagents::NewEntry::said(
+                            part.get("id").and_then(Value::as_str).map(str::to_string),
+                            said,
+                        )),
+                );
                 row.said = Some(said.to_string());
                 let task = crate::protocol::SubagentTask {
                     task_id: call.clone(),
-                    tool_use_id: Some(call),
+                    tool_use_id: Some(call.clone()),
                     status: "running".to_string(),
                     description: row.description.clone(),
                     subagent_type: row.kind.clone(),
@@ -1311,6 +1359,7 @@ impl OpenCode {
                     .push(crate::threads::Change::Activity(crate::worklog::subagent(
                         &task,
                         driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
+                        Some(&call),
                     )));
             }
             _ => {}
@@ -1661,7 +1710,7 @@ impl crate::session::Driver for OpenCode {
                 // them is what the developer wants to read. `TooEarly` draws
                 // nothing *and falls through to nothing* — the tool row is not a
                 // consolation prize for a row that is not ready.
-                match self.subagent_row(part, driving) {
+                match self.subagent_row(part, driving, &mut decided) {
                     Drawn::Row(activity) => decided
                         .changes
                         .push(crate::threads::Change::Activity(activity)),

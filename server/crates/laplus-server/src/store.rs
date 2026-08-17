@@ -486,6 +486,60 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE thread_messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
     "#,
+    // Subagent work streams — the subagent-ux effort's ticket 01.
+    //
+    // Two tables rather than a column on `thread_activities`, and the split is
+    // the feature: the parent transcript keeps one compact row per child and the
+    // child's own prose and work live here, so opening a long conversation does
+    // not hydrate every child it ever ran. See `crate::subagents`.
+    r#"
+    CREATE TABLE thread_subagents (
+        thread_id       TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        -- The provider's own durable name for the child, and the address of its
+        -- right-panel surface. Only unique within its conversation, which is
+        -- what the composite key says.
+        child_id        TEXT NOT NULL,
+        -- The child that delegated this one, when the provider proves it. NULL
+        -- is "a direct child" and "the provider did not say" at once: laplus
+        -- does not draw a hierarchy it cannot prove.
+        parent_child_id TEXT,
+        name            TEXT,
+        assignment      TEXT,
+        -- `crate::subagents::State`.
+        state           TEXT NOT NULL,
+        -- `crate::subagents::OutcomeKind`, and the result it carried. Both NULL
+        -- until the child is terminal.
+        outcome_kind    TEXT,
+        outcome_text    TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL,
+        PRIMARY KEY (thread_id, child_id)
+    ) STRICT;
+
+    CREATE TABLE thread_subagent_entries (
+        thread_id  TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        child_id   TEXT NOT NULL,
+        -- Stable, and the reason this is an upsert: a provider that revises a
+        -- part it already sent revises this row rather than adding a second copy
+        -- of the same prose.
+        id         TEXT NOT NULL,
+        -- The position in the stream. Assigned once and never moved, for the
+        -- reason `thread_messages.ordinal` is stored rather than derived.
+        sequence   INTEGER NOT NULL,
+        -- `crate::subagents::EntryKind`. A row whose kind this build does not
+        -- know is skipped on read rather than refused, so a stream written by a
+        -- later build cannot stop an earlier one opening the conversation.
+        kind       TEXT NOT NULL,
+        -- The entry's own payload, verbatim. Same reasoning as an activity's:
+        -- its shape belongs to the kind.
+        payload    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (thread_id, child_id, id)
+    ) STRICT;
+
+    CREATE INDEX thread_subagent_entries_in_order
+        ON thread_subagent_entries (thread_id, child_id, sequence);
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -1605,6 +1659,17 @@ impl Database {
                     thread_id,
                     checkpoint,
                 } => upsert_checkpoint(&transaction, thread_id, checkpoint)?,
+                Write::SubagentStream { thread_id, head } => {
+                    upsert_subagent(&transaction, thread_id, head)?
+                }
+                Write::SubagentEntry {
+                    thread_id,
+                    child_id,
+                    entry,
+                } => upsert_subagent_entry(&transaction, thread_id, child_id, entry)?,
+                Write::ForgetSubagents { thread_id } => {
+                    forget_subagents(&transaction, thread_id)?
+                }
             }
         }
 
@@ -1696,6 +1761,56 @@ impl Database {
         }
 
         Ok(conversations)
+    }
+
+    /// Every subagent work stream this database holds, with the conversation
+    /// that owns it.
+    ///
+    /// Read separately from [`Database::conversations`] and never joined into
+    /// it, which is the whole storage decision of the feature: the parent's
+    /// transcript carries one compact row per child, and the child's own work is
+    /// only ever loaded by the surface that opens it. Two queries walked once
+    /// each, for the reason the transcript reader gives.
+    pub fn child_streams(&self) -> Result<Vec<(String, crate::subagents::Stream)>, StorageError> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .map_err(StorageError::while_("read the subagents"))?;
+
+        let heads: Vec<(String, crate::subagents::Stream)> = query(
+            &transaction,
+            "SELECT thread_id, child_id, parent_child_id, name, assignment, state, \
+                    outcome_kind, outcome_text, created_at, updated_at \
+             FROM thread_subagents ORDER BY thread_id ASC, created_at ASC, child_id ASC",
+            subagent_from_row,
+            "read the subagents",
+        )?;
+        let entries: Vec<(String, String, crate::subagents::Entry)> = query(
+            &transaction,
+            "SELECT thread_id, child_id, id, sequence, kind, payload, created_at \
+             FROM thread_subagent_entries \
+             ORDER BY thread_id ASC, child_id ASC, sequence ASC",
+            subagent_entry_from_row,
+            "read the subagent entries",
+        )?
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let at: HashMap<(String, String), usize> = heads
+            .iter()
+            .enumerate()
+            .map(|(index, (thread_id, stream))| {
+                ((thread_id.clone(), stream.child_id.clone()), index)
+            })
+            .collect();
+        let mut streams = heads;
+        for (thread_id, child_id, entry) in entries {
+            if let Some(index) = at.get(&(thread_id, child_id)) {
+                streams[*index].1.entries.push(entry);
+            }
+        }
+        Ok(streams)
     }
 
     // --- ticket 73: pairing links, sessions and socket tickets ---------------
@@ -2530,6 +2645,91 @@ fn upsert_checkpoint(
     Ok(())
 }
 
+fn upsert_subagent(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    head: &crate::subagents::Head,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO thread_subagents \
+                (thread_id, child_id, parent_child_id, name, assignment, state, \
+                 outcome_kind, outcome_text, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT (thread_id, child_id) DO UPDATE SET \
+                parent_child_id = excluded.parent_child_id, \
+                name = excluded.name, \
+                assignment = excluded.assignment, \
+                state = excluded.state, \
+                outcome_kind = excluded.outcome_kind, \
+                outcome_text = excluded.outcome_text, \
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                thread_id,
+                head.child_id,
+                head.parent_child_id,
+                head.name,
+                head.assignment,
+                head.state.as_str(),
+                head.outcome.as_ref().map(|outcome| outcome.kind.as_str()),
+                head.outcome.as_ref().and_then(|outcome| outcome.text.clone()),
+                head.created_at,
+                head.updated_at,
+            ],
+        )
+        .map_err(StorageError::while_("store the subagent"))?;
+    Ok(())
+}
+
+fn upsert_subagent_entry(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    child_id: &str,
+    entry: &crate::subagents::Entry,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO thread_subagent_entries \
+                (thread_id, child_id, id, sequence, kind, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (thread_id, child_id, id) DO UPDATE SET \
+                sequence = excluded.sequence, \
+                kind = excluded.kind, \
+                payload = excluded.payload",
+            rusqlite::params![
+                thread_id,
+                child_id,
+                entry.id,
+                entry.sequence,
+                entry.kind.as_str(),
+                entry.payload.to_string(),
+                entry.created_at,
+            ],
+        )
+        .map_err(StorageError::while_("store the subagent entry"))?;
+    Ok(())
+}
+
+/// Remove a conversation's children.
+///
+/// The entries first, because the two tables are keyed independently — the
+/// entry table has no foreign key onto the head, only onto the thread — so
+/// removing the heads alone would leave the work behind.
+fn forget_subagents(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+) -> Result<(), StorageError> {
+    for statement in [
+        "DELETE FROM thread_subagent_entries WHERE thread_id = ?1",
+        "DELETE FROM thread_subagents WHERE thread_id = ?1",
+    ] {
+        transaction
+            .execute(statement, rusqlite::params![thread_id])
+            .map_err(StorageError::while_("forget the subagents"))?;
+    }
+    Ok(())
+}
+
 fn remember_provider_resume_cursor(
     transaction: &Transaction<'_>,
     thread_id: &str,
@@ -2721,6 +2921,44 @@ fn activity_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Activity)> {
     ))
 }
 
+fn subagent_from_row(row: &Row<'_>) -> rusqlite::Result<(String, crate::subagents::Stream)> {
+    let state: String = row.get(5)?;
+    let outcome_kind: Option<String> = row.get(6)?;
+    Ok((
+        row.get(0)?,
+        crate::subagents::Stream::from(crate::subagents::Head {
+            child_id: row.get(1)?,
+            parent_child_id: row.get(2)?,
+            name: row.get(3)?,
+            assignment: row.get(4)?,
+            state: crate::subagents::state_from_stored(&state),
+            outcome: crate::subagents::outcome_from_stored(outcome_kind.as_deref(), row.get(7)?),
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        }),
+    ))
+}
+
+/// `None` for an entry whose kind this build does not know — see
+/// [`crate::subagents::entry_from_stored`], where dropping rather than refusing
+/// is argued.
+fn subagent_entry_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<Option<(String, String, crate::subagents::Entry)>> {
+    let thread_id: String = row.get(0)?;
+    let child_id: String = row.get(1)?;
+    let kind: String = row.get(4)?;
+    let payload: String = row.get(5)?;
+    Ok(crate::subagents::entry_from_stored(
+        row.get(2)?,
+        row.get(3)?,
+        &kind,
+        serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        row.get(6)?,
+    )
+    .map(|entry| (thread_id, child_id, entry)))
+}
+
 fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Checkpoint)> {
     let turn_count: i64 = row.get(2)?;
     let status: String = row.get(4)?;
@@ -2747,13 +2985,23 @@ fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Checkpoint)> 
 mod tests {
     use super::*;
 
+    /// Appending is the only supported edit, so the tail of the list is a
+    /// history: each entry is the schema one released build brought the file
+    /// to, and reordering them would migrate an existing database through
+    /// statements it has already run.
     #[test]
-    fn attachment_metadata_follows_the_queued_turn_and_pin_migrations() {
-        let newest = MIGRATIONS.last().expect("a newest migration");
-        assert!(newest.contains("ADD COLUMN attachments"));
-        let queued = MIGRATIONS.get(MIGRATIONS.len() - 2).expect("the queued-turn migration");
-        assert!(queued.contains("ADD COLUMN pending_turn"));
-        let pins = MIGRATIONS.get(MIGRATIONS.len() - 3).expect("the pin migration");
+    fn the_newest_migrations_are_appended_in_the_order_they_shipped() {
+        let at = |back: usize| {
+            MIGRATIONS
+                .get(MIGRATIONS.len() - back)
+                .expect("a migration at this position")
+        };
+        let subagents = at(1);
+        assert!(subagents.contains("CREATE TABLE thread_subagents"));
+        assert!(subagents.contains("CREATE TABLE thread_subagent_entries"));
+        assert!(at(2).contains("ADD COLUMN attachments"));
+        assert!(at(3).contains("ADD COLUMN pending_turn"));
+        let pins = at(4);
         assert!(pins.contains("ADD COLUMN pinned_at"));
         assert!(pins.contains("ADD COLUMN pin_order_key"));
     }
@@ -3553,6 +3801,89 @@ mod tests {
                 checkpoints: Vec::new(),
             }]
         );
+    }
+
+    /// A subagent work stream comes back off the disk as it went on: the same
+    /// identity, the same assignment, the same ordered entries, the same
+    /// terminal outcome. The whole of "the complete child stream replays after
+    /// an application restart", at the storage seam.
+    ///
+    /// It is read by [`Database::child_streams`] and **not** by
+    /// [`Database::conversations`], which is the storage half of the feature:
+    /// opening a long conversation must not hydrate every child it ever ran.
+    #[test]
+    fn a_child_work_stream_survives_the_disk_and_stays_out_of_the_transcript() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+        let head = crate::subagents::Head {
+            child_id: "call_task_1".to_string(),
+            parent_child_id: None,
+            name: Some("explore".to_string()),
+            assignment: Some("Count the files".to_string()),
+            state: crate::subagents::State::Completed,
+            outcome: Some(crate::subagents::Outcome::completed(Some(
+                "eleven files".to_string(),
+            ))),
+            created_at: "2026-07-26T00:23:07.100Z".to_string(),
+            updated_at: "2026-07-26T00:23:07.900Z".to_string(),
+        };
+        let entries = vec![
+            crate::subagents::Entry {
+                id: "call_task_1:k:child-prt-2".to_string(),
+                sequence: 1,
+                kind: crate::subagents::EntryKind::Message,
+                payload: serde_json::json!({"text": "looking through the directory"}),
+                created_at: "2026-07-26T00:23:07.200Z".to_string(),
+            },
+            crate::subagents::Entry {
+                id: "call_task_1:k:outcome".to_string(),
+                sequence: 2,
+                kind: crate::subagents::EntryKind::Outcome,
+                payload: serde_json::json!({"kind": "completed", "text": "eleven files"}),
+                created_at: "2026-07-26T00:23:07.900Z".to_string(),
+            },
+        ];
+
+        let mut writes = vec![
+            Write::Thread(Box::new(a_thread("thread-1", "project-1"))),
+            Write::SubagentStream {
+                thread_id: "thread-1".to_string(),
+                head: Box::new(head.clone()),
+            },
+        ];
+        for entry in &entries {
+            writes.push(Write::SubagentEntry {
+                thread_id: "thread-1".to_string(),
+                child_id: "call_task_1".to_string(),
+                entry: Box::new(entry.clone()),
+            });
+        }
+        fixture.database.transcribe(&writes).expect("stores");
+
+        let mut expected = crate::subagents::Stream::from(head);
+        expected.entries = entries;
+        assert_eq!(
+            fixture.database.child_streams().expect("reads"),
+            vec![("thread-1".to_string(), expected)]
+        );
+
+        // The conversation itself is unchanged by any of it.
+        let conversations = fixture.database.conversations().expect("reads");
+        assert_eq!(conversations.len(), 1);
+        assert!(conversations[0].activities.is_empty());
+
+        // And the developer deleting the conversation takes the work with it.
+        fixture
+            .database
+            .transcribe(&[Write::ForgetSubagents {
+                thread_id: "thread-1".to_string(),
+            }])
+            .expect("forgets");
+        assert!(fixture
+            .database
+            .child_streams()
+            .expect("reads")
+            .is_empty());
     }
 
     #[test]

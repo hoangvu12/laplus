@@ -115,6 +115,7 @@ pub mod settings;
 pub mod settling;
 pub mod startup;
 pub mod store;
+pub mod subagents;
 pub mod subscriptions;
 pub mod terminal;
 pub mod text_generation;

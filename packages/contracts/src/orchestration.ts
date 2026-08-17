@@ -29,6 +29,7 @@ export const ORCHESTRATION_WS_METHODS = {
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  subscribeSubagent: "orchestration.subscribeSubagent",
 } as const;
 
 export const ProviderApprovalPolicy = Schema.Literals([
@@ -523,6 +524,135 @@ export const OrchestrationThreadDetailSnapshot = Schema.Struct({
   thread: OrchestrationThread,
 });
 export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetailSnapshot.Type;
+
+/**
+ * A **subagent** is a delegated child agent; its **work stream** is that child's
+ * ordered, replayable conversation and work.
+ *
+ * The vocabulary below is deliberately provider-neutral: Claude, Codex and
+ * OpenCode all fill the same shape, and a field a protocol does not expose stays
+ * `null` rather than being invented. A child's work never appears on
+ * `OrchestrationThread` — the parent transcript keeps one compact
+ * `collab_agent_tool_call` row per child, carrying the `childId` these schemas
+ * are addressed by, and the work itself is fetched only when its surface opens.
+ */
+export const OrchestrationSubagentId = TrimmedNonEmptyString;
+export type OrchestrationSubagentId = typeof OrchestrationSubagentId.Type;
+
+/**
+ * Six states rather than "running or not": the compact row has to answer
+ * "should I still be waiting for this?", and the three terminal answers are not
+ * the same news. `blocked` is a child waiting on the developer.
+ */
+export const OrchestrationSubagentState = Schema.Literals([
+  "pending",
+  "working",
+  "blocked",
+  "completed",
+  "interrupted",
+  "failed",
+]);
+export type OrchestrationSubagentState = typeof OrchestrationSubagentState.Type;
+
+/**
+ * `empty` is a child that finished and returned no text. It is a conclusion, not
+ * a missing result, and it is a distinct member so that a client never has to
+ * present the last thing a child happened to say as what it concluded.
+ */
+export const OrchestrationSubagentOutcomeKind = Schema.Literals([
+  "completed",
+  "empty",
+  "failed",
+  "interrupted",
+]);
+export type OrchestrationSubagentOutcomeKind = typeof OrchestrationSubagentOutcomeKind.Type;
+
+export const OrchestrationSubagentOutcome = Schema.Struct({
+  kind: OrchestrationSubagentOutcomeKind,
+  text: Schema.NullOr(Schema.String),
+});
+export type OrchestrationSubagentOutcome = typeof OrchestrationSubagentOutcome.Type;
+
+/**
+ * What one stream entry is. `message` is the child's own prose and `outcome` is
+ * the terminal entry — the conclusion lives in the same ordered stream as the
+ * work that produced it rather than replacing it.
+ *
+ * An open vocabulary: commands, reads, edits, other tool calls, warnings and
+ * blockers are added here as the adapters learn to normalize them.
+ */
+export const OrchestrationSubagentEntryKind = Schema.Literals(["message", "outcome"]);
+export type OrchestrationSubagentEntryKind = typeof OrchestrationSubagentEntryKind.Type;
+
+/**
+ * `id` is stable and `sequence` is the order. A client **upserts by `id`** and
+ * sorts by `sequence`, which is what makes replay and live continuation meet
+ * without a cursor: an entry seen twice lands on the state already held, and a
+ * provider that revises a part it already sent moves that entry rather than
+ * appending a near-duplicate of the same prose.
+ */
+export const OrchestrationSubagentEntry = Schema.Struct({
+  id: TrimmedNonEmptyString,
+  sequence: NonNegativeInt,
+  kind: OrchestrationSubagentEntryKind,
+  payload: Schema.Unknown,
+  createdAt: IsoDateTime,
+});
+export type OrchestrationSubagentEntry = typeof OrchestrationSubagentEntry.Type;
+
+/**
+ * The stream without its work: what labels a tab and what the parent's compact
+ * row already says.
+ *
+ * `parentChildId` is the child that delegated this one, and `null` means both
+ * "a direct child of the conversation" and "the provider did not say" — laplus
+ * does not draw a hierarchy it cannot prove.
+ */
+export const OrchestrationSubagentStream = Schema.Struct({
+  childId: OrchestrationSubagentId,
+  parentChildId: Schema.NullOr(OrchestrationSubagentId),
+  name: Schema.NullOr(Schema.String),
+  assignment: Schema.NullOr(Schema.String),
+  state: OrchestrationSubagentState,
+  outcome: Schema.NullOr(OrchestrationSubagentOutcome),
+  entryCount: NonNegativeInt,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type OrchestrationSubagentStream = typeof OrchestrationSubagentStream.Type;
+
+export const OrchestrationSubagentSnapshot = Schema.Struct({
+  stream: OrchestrationSubagentStream,
+  entries: Schema.Array(OrchestrationSubagentEntry),
+});
+export type OrchestrationSubagentSnapshot = typeof OrchestrationSubagentSnapshot.Type;
+
+/**
+ * No cursor, deliberately. The subscription opens with the whole stream and then
+ * streams upserts, so replay and live continuation are one operation and there
+ * is no handoff for an entry to fall through.
+ */
+export const OrchestrationSubscribeSubagentInput = Schema.Struct({
+  threadId: ThreadId,
+  childId: OrchestrationSubagentId,
+});
+export type OrchestrationSubscribeSubagentInput = typeof OrchestrationSubscribeSubagentInput.Type;
+
+export const OrchestrationSubagentStreamItem = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("snapshot"),
+    snapshot: OrchestrationSubagentSnapshot,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("entry-upserted"),
+    entry: OrchestrationSubagentEntry,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("stream-updated"),
+    stream: OrchestrationSubagentStream,
+  }),
+]);
+export type OrchestrationSubagentStreamItem = typeof OrchestrationSubagentStreamItem.Type;
 
 export const ProjectCreateCommand = Schema.Struct({
   type: Schema.Literal("project.create"),
@@ -1502,6 +1632,10 @@ export const OrchestrationRpcSchemas = {
   subscribeShell: {
     input: OrchestrationSubscribeShellInput,
     output: OrchestrationShellStreamItem,
+  },
+  subscribeSubagent: {
+    input: OrchestrationSubscribeSubagentInput,
+    output: OrchestrationSubagentStreamItem,
   },
 } as const;
 

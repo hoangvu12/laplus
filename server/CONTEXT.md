@@ -392,6 +392,36 @@ opened. The opposite of a **resume**: a draft is a client with an id and nothing
 else, a resume is a client with the conversation and no need of us to prove it
 exists.
 
+**Subagent** — a delegated child agent, running its own work on the parent
+conversation's behalf. Each provider spells one differently — OpenCode runs one
+as a session with a `parentID`, Claude as a background task, Codex as a
+collaboration thread — and laplus keeps one provider-neutral model of them.
+`crate::subagents`.
+
+**Subagent work stream** — one subagent's ordered, replayable conversation and
+work. Not a progress log and not a result view: the child's prose, and its
+terminal outcome as the last entry of the same stream, so the conclusion stays
+attached to the work that produced it. Stored beside the parent transcript
+rather than in it, fetched only when its surface opens, and removed with the
+conversation that delegated it. `crate::subagents::Stream`.
+
+**Compact child row** — the one work-log row a conversation keeps per subagent:
+identity, assignment, state, latest meaningful activity or terminal preview, and
+the `childId` its work stream is addressed by. It is the index and the launcher;
+the work itself is never duplicated into the parent transcript.
+`crate::worklog::subagent`.
+
+**Stream entry** — one thing that happened in a subagent's session, with a
+stable id, a position, a kind and a payload. Upserted by id and ordered by
+position, which is what lets a client's replay and its live continuation meet
+without losing or repeating one. `crate::subagents::Entry`.
+
+**Child outcome** — how a subagent's work ended: a result, a failure, an
+interruption, or **empty** — completed with nothing to return. Four rather than
+three, because a child that finished and said nothing has concluded, and
+presenting the last thing it happened to say as its answer would be a guess.
+`crate::subagents::Outcome`.
+
 ## Lifecycle
 
 **Session status** — what the agent process is doing. The contract's seven:

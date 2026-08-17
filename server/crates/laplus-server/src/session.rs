@@ -1873,6 +1873,18 @@ pub(crate) struct Decided {
     /// The changes to apply, in the order they were decided — which is the order
     /// the developer saw the work happen.
     pub(crate) changes: Vec<Change>,
+    /// What the driver learned about the conversation's delegated children.
+    ///
+    /// Beside `changes` rather than among them, and the reason is where the two
+    /// go: a [`Change`] is folded into the parent conversation and published on
+    /// its feed, and a child's prose and work must not be — the parent keeps one
+    /// compact row per child and nothing else. See [`crate::subagents`], which
+    /// owns what a stream is and where it is stored.
+    ///
+    /// Applied in the order the driver decided, after the changes, so that the
+    /// compact row a client is about to click is already on the thread when the
+    /// stream behind it can be opened.
+    pub(crate) child_streams: Vec<crate::subagents::Update>,
     /// Opaque continuation data minted by the driver and published to nobody.
     pub(crate) provider_resume_cursor: Option<crate::provider::ResumeCursor>,
     /// The turn ended, and how. `None` on everything that did not end one.
@@ -1931,6 +1943,10 @@ pub(crate) struct Settles {
 pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
     for change in decided.changes {
         threads.apply(&start.thread_id, change);
+    }
+
+    for update in decided.child_streams {
+        threads.subagents().record(&start.thread_id, update);
     }
 
     if let Some(cursor) = &decided.provider_resume_cursor {

@@ -80,6 +80,15 @@ export interface WorkLogEntry {
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
   sourceActivityKind?: OrchestrationThreadActivity["kind"];
+  /**
+   * The subagent work stream this row launches.
+   *
+   * Present only on a compact child row whose driver records a stream — the
+   * row is an index into the child's work, and this is the address of it. A
+   * subagent row without one is a driver that has not learned to record child
+   * work yet, and it stays an ordinary unclickable row.
+   */
+  subagentChildId?: string;
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -772,6 +781,10 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (toolCallId) {
     entry.toolCallId = toolCallId;
   }
+  const subagentChildId = asTrimmedString(asRecord(payload?.data)?.childId);
+  if (subagentChildId) {
+    entry.subagentChildId = subagentChildId;
+  }
   let toolLifecycleStatus = extractWorkLogToolLifecycleStatus(payload);
   if (!toolLifecycleStatus && activity.kind === "tool.completed") {
     toolLifecycleStatus = "completed";
@@ -842,6 +855,7 @@ function mergeDerivedWorkLogEntries(
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
+  const subagentChildId = next.subagentChildId ?? previous.subagentChildId;
   return {
     ...previous,
     ...next,
@@ -857,6 +871,7 @@ function mergeDerivedWorkLogEntries(
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolLifecycleStatus !== undefined ? { toolLifecycleStatus } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
+    ...(subagentChildId ? { subagentChildId } : {}),
   };
 }
 

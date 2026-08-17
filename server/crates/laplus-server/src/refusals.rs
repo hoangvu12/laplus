@@ -197,6 +197,7 @@ const REFUSALS: &[(&str, Tag)] = &[
     ("orchestration.getArchivedShellSnapshot", Tag::EnvironmentAuthorization),
     ("orchestration.subscribeShell", Tag::EnvironmentAuthorization),
     ("orchestration.subscribeThread", Tag::EnvironmentAuthorization),
+    ("orchestration.subscribeSubagent", Tag::EnvironmentAuthorization),
     ("subscribeTerminalEvents", Tag::EnvironmentAuthorization),
     ("subscribeTerminalMetadata", Tag::EnvironmentAuthorization),
     ("subscribeServerConfig", Tag::EnvironmentAuthorization),
