@@ -139,6 +139,21 @@
 
 use serde_json::json;
 
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClaudeContentBlock<'a> {
+    Text { text: &'a str },
+    Image { source: ClaudeImageSource<'a> },
+}
+
+#[derive(serde::Serialize)]
+struct ClaudeImageSource<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'a str,
+    data: String,
+}
+
 use crate::agent::{permission_mode_for, Agent, Launch};
 use crate::approval::ApprovalRequest;
 use crate::clock::iso_from_epoch;
@@ -267,7 +282,19 @@ impl Driver for Claude {
         // A new prompt means the next `result` is this turn's rather than a
         // duplicate of the last one's. See `SessionState::completion_reported`.
         self.folding.completion_reported = false;
-        self.agent.send(&prompt.text).await
+        let mut content = Vec::with_capacity(1 + prompt.attachments.len());
+        if !prompt.text.is_empty() { content.push(ClaudeContentBlock::Text { text: &prompt.text }); }
+        for attachment in &prompt.attachments {
+            if !crate::attachments::SUPPORTED_MIMES.contains(&attachment.mime.as_str()) {
+                return Err(std::io::Error::other(format!("Unsupported Claude image attachment type '{}'.", attachment.mime)));
+            }
+            let bytes = tokio::fs::read(&attachment.path).await.map_err(|error| std::io::Error::other(format!("Failed to read Claude image attachment: {error}")))?;
+            content.push(ClaudeContentBlock::Image { source: ClaudeImageSource {
+                kind: "base64", media_type: &attachment.mime,
+                data: crate::attachments::encode_base64(&bytes),
+            }});
+        }
+        self.agent.send(&content).await
     }
 
     async fn interrupt(&mut self, request_id: &str) -> std::io::Result<()> {

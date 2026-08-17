@@ -51,6 +51,7 @@ use harness::conversation::{
 };
 use harness::workspace::Workspace;
 use harness::TestServer;
+use laplus_server::config::ServerConfig;
 use laplus_server::threads::Reconciliation;
 use serde_json::{json, Value};
 
@@ -147,6 +148,103 @@ async fn a_draft_becomes_the_conversation_the_composer_is_watching() {
 
     client.close().await;
     server.stop().await;
+}
+
+#[tokio::test]
+async fn claude_receives_text_and_images_as_one_streaming_user_message() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    let mut command = start_turn("thread-1", "message-1", "compare these");
+    command["message"]["attachments"] = json!([
+        {"type":"image","name":"first.png","mimeType":"image/png","sizeBytes":1,"dataUrl":"data:image/png;base64,YQ=="},
+        {"type":"image","name":"second.jpg","mimeType":"image/jpeg","sizeBytes":1,"dataUrl":"data:image/jpeg;base64,Yg=="},
+        {"type":"image","name":"third.gif","mimeType":"image/gif","sizeBytes":2,"dataUrl":"data:image/gif;base64,aGk="},
+        {"type":"image","name":"fourth.webp","mimeType":"image/webp","sizeBytes":3,"dataUrl":"data:image/webp;base64,Ynll"}
+    ]);
+    client.call("orchestration.dispatchCommand", command).await.expect_success();
+    let subscription = client.watch_conversation("thread-1").await;
+    client.events_through_the_turn(&subscription).await;
+    assert_eq!(agent.prompts().len(), 1);
+    assert_eq!(serde_json::from_str::<Value>(&agent.prompts()[0]).unwrap(), json!({"type":"user","session_id":"","parent_tool_use_id":null,"message":{"role":"user","content":[
+        {"type":"text","text":"compare these"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}},
+        {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"Yg=="}},
+        {"type":"image","source":{"type":"base64","media_type":"image/gif","data":"aGk="}},
+        {"type":"image","source":{"type":"base64","media_type":"image/webp","data":"Ynll"}}
+    ]}}));
+    client.close().await; server.stop().await;
+}
+
+#[tokio::test]
+async fn claude_receives_an_image_only_turn_without_an_empty_text_block() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    let mut command = start_turn("thread-1", "message-1", "");
+    command["message"]["attachments"] = json!([{"type":"image","name":"screen.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="}]);
+    client.call("orchestration.dispatchCommand", command).await.expect_success();
+    let subscription = client.watch_conversation("thread-1").await;
+    client.events_through_the_turn(&subscription).await;
+    let prompt: Value = serde_json::from_str(&agent.prompts()[0]).unwrap();
+    assert_eq!(prompt["message"]["content"], json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}]));
+    client.close().await; server.stop().await;
+}
+
+#[tokio::test]
+async fn claude_refuses_a_missing_stored_image_before_dispatch() {
+    let agent = ScriptedAgent::replaying("02-streamed-turn");
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    let mut command = start_turn("thread-1", "message-1", "do not send this alone");
+    command["message"]["attachments"] = json!([{"type":"image","id":"missing-image","name":"screen.png","mimeType":"image/png","sizeBytes":2}]);
+    let refusal = client.call("orchestration.dispatchCommand", command).await.expect_declared("OrchestrationDispatchCommandError");
+    assert!(refusal["message"].as_str().unwrap().contains("could not be resolved"), "{refusal:#}");
+    assert!(agent.prompts().is_empty());
+    client.close().await; server.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_reports_an_unreadable_stored_image_without_sending_partial_input() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let agent = ScriptedAgent::per_turn(&[
+        vec![r#"{"type":"system","subtype":"init","session_id":"session-images"}"#, r#"{"type":"result","subtype":"success","is_error":false}"#],
+        vec![r#"{"type":"result","subtype":"success","is_error":false}"#],
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let preferences = tempfile::tempdir().unwrap();
+    let mut config = ServerConfig::detect();
+    config.settings.providers.claude_agent.binary_path = agent.configured();
+    let server = TestServer::start_persistent_with_config_in(preferences.path(), config).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    let mut first = start_turn("thread-1", "message-1", "remember this");
+    first["message"]["attachments"] = json!([{"type":"image","name":"screen.png","mimeType":"image/png","sizeBytes":2,"dataUrl":"data:image/png;base64,aGk="}]);
+    client.call("orchestration.dispatchCommand", first).await.expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    let stored = preferences.path().join("attachments/message-1-0.png");
+    std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut second = follow_up("thread-1", "message-2", "do not send this alone");
+    second["message"]["attachments"] = json!([{"type":"image","id":"message-1-0","name":"screen.png","mimeType":"image/png","sizeBytes":2}]);
+    client.call("orchestration.dispatchCommand", second).await.expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    let failed = &activity(&events, "session.failed")["payload"]["activity"];
+    assert!(failed["summary"].as_str().unwrap().contains("could not be sent to the agent"), "{failed:#}");
+    assert_eq!(agent.prompts().len(), 1, "Claude received an incomplete second prompt");
+
+    std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o600)).unwrap();
+    client.close().await; server.stop().await;
 }
 
 /// The other half of the same rule: a client that says it already holds the

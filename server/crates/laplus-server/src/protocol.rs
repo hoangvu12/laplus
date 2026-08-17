@@ -1965,10 +1965,12 @@ fn visible(message: &Message) -> String {
 
 /// Build the stdin line for a user turn. The CLI reads NDJSON on stdin under
 /// `--input-format stream-json`; this is the whole of the outbound protocol.
-pub fn user_message_line(text: &str) -> String {
+pub fn user_message_line(content: &[impl Serialize]) -> String {
     serde_json::json!({
         "type": "user",
-        "message": { "role": "user", "content": [{ "type": "text", "text": text }] }
+        "session_id": "",
+        "parent_tool_use_id": Value::Null,
+        "message": { "role": "user", "content": content }
     })
     .to_string()
 }

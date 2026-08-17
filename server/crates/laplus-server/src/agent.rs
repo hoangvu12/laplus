@@ -339,8 +339,8 @@ impl Agent {
     }
 
     /// Send one user turn.
-    pub async fn send(&mut self, text: &str) -> std::io::Result<()> {
-        self.write_line(crate::protocol::user_message_line(text))
+    pub async fn send(&mut self, content: &[impl serde::Serialize]) -> std::io::Result<()> {
+        self.write_line(crate::protocol::user_message_line(content))
             .await
     }
 

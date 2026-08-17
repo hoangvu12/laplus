@@ -22,6 +22,16 @@ pub fn resolve_all(
         .map(|items| items.into_iter().flatten().collect())
 }
 
+pub fn resolve_all_required(
+    values: &[Value], message_id: &str, preferences: &Path,
+) -> Result<Vec<PromptAttachment>, String> {
+    let resolved = resolve_all(values, message_id, preferences)?;
+    if resolved.len() != values.len() {
+        return Err("A stored image attachment could not be resolved.".into());
+    }
+    Ok(resolved)
+}
+
 fn resolve(
     value: &Value,
     message_id: &str,
@@ -148,6 +158,24 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
         }
     }
     (used == 0).then_some(output)
+}
+
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        output.push(TABLE[(chunk[0] >> 2) as usize] as char);
+        output.push(TABLE[((chunk[0] & 0x03) << 4 | chunk.get(1).copied().unwrap_or(0) >> 4) as usize] as char);
+        match chunk.get(1) {
+            Some(second) => output.push(TABLE[((second & 0x0f) << 2 | chunk.get(2).copied().unwrap_or(0) >> 6) as usize] as char),
+            None => output.push('='),
+        }
+        match chunk.get(2) {
+            Some(third) => output.push(TABLE[(third & 0x3f) as usize] as char),
+            None => output.push('='),
+        }
+    }
+    output
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {

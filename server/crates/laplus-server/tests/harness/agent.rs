@@ -297,6 +297,8 @@ pub const LAST_WORDS: &str = "FATAL ERROR: the agent went away";
 /// escaped by a batch file, and a Windows path is mostly backslashes.
 pub const WORKING_DIRECTORY_MARKER: &str = "laplus-agent-was-here";
 
+const PROMPTS_LOG: &str = "prompts.log";
+
 /// What a scripted agent does when it is asked to continue a conversation.
 enum OnResume {
     /// What a healthy CLI does: resume, announce a session, take the turn.
@@ -492,6 +494,9 @@ impl ScriptedAgent {
     pub fn requests(&self) -> Vec<String> {
         self.logged(REQUESTS_LOG)
     }
+
+    /// Every streaming-input user message written to the CLI, as raw NDJSON.
+    pub fn prompts(&self) -> Vec<String> { self.logged(PROMPTS_LOG) }
 
     /// The sessions this agent was asked to resume, in the order it was asked.
     ///
@@ -691,6 +696,7 @@ impl ScriptedAgent {
              rem and counting that as a prompt would answer a turn nobody\r\n\
              rem sent — see [`skips_the_servers_own_question`].\r\n\
              {skip}\
+             >>\"%~dp0{PROMPTS_LOG}\" echo %LINE%\r\n\
              rem A relative path, so it lands wherever the agent was started —\r\n\
              rem which is the whole point of writing it.\r\n\
              echo.>\"{WORKING_DIRECTORY_MARKER}\"\r\n\
@@ -808,6 +814,7 @@ impl ScriptedAgent {
              \x20     continue\n\
              \x20     ;;\n\
              \x20 esac\n\
+             \x20 printf '%s\\n' \"$line\" >> \"$here/{PROMPTS_LOG}\"\n\
              \x20 : > \"{WORKING_DIRECTORY_MARKER}\"\n\
              \x20 turn=$((turn + 1))\n\
              \x20 case \"$turn\" in\n\
