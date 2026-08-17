@@ -403,7 +403,7 @@ fn dispatch_scoped(
         // it is one indexed row, and threading the database into the closure
         // would be a clone of it per favicon per sidebar render.
         assets::CREATE_URL => {
-            let call = CreateUrl::read(payload).map_err(DispatchError::Declared)?;
+            let call = CreateUrl::read(payload, services.config.current().preferences.clone()).map_err(DispatchError::Declared)?;
             let secret = services
                 .shell
                 .database()

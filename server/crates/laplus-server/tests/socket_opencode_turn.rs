@@ -1265,13 +1265,20 @@ async fn rejecting_an_opencode_question_uses_the_distinct_route_and_event() {
 async fn opencode_prompt_resolves_stored_attachments_and_omits_missing_references() {
     let peer = ExternalOpenCode::start(None).await;
     let workspace = Workspace::with(&["src/"]);
-    let server = TestServer::start_with(peer.config(None)).await;
+    let preferences = tempfile::tempdir().expect("persistent test preferences");
+    let server = TestServer::start_persistent_with_config_in(preferences.path(), peer.config(None)).await;
     let mut client = server.connect().await;
     client.call("orchestration.dispatchCommand", create_project("attachment-project", workspace.path())).await.expect_success();
     let mut create = create_thread("attachment-project", "attachment-thread");
     create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", create).await.expect_success();
     let subscription = client.watch_conversation("attachment-thread").await;
+    let mut invalid = start_turn("attachment-thread", "invalid-attachment-message", "must not commit");
+    invalid["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    invalid["message"]["attachments"] = json!([{"type":"image","name":"vector.svg","mimeType":"image/svg+xml","sizeBytes":2,"dataUrl":"data:image/svg+xml;base64,aGk="}]);
+    client.call("orchestration.dispatchCommand", invalid).await.expect_declared("OrchestrationDispatchCommandError");
+    let after_refusal = server.connect().await.into_thread_snapshot("attachment-thread").await;
+    assert!(after_refusal["thread"]["messages"].as_array().unwrap().is_empty(), "refusal committed no user message");
     let mut command = start_turn("attachment-thread", "attachment-message", "inspect");
     command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
     command["message"]["attachments"] = json!([
@@ -1279,7 +1286,10 @@ async fn opencode_prompt_resolves_stored_attachments_and_omits_missing_reference
         {"type":"image","id":"image-missing","name":"missing.png","mimeType":"image/png","sizeBytes":2}
     ]);
     client.call("orchestration.dispatchCommand", command).await.expect_success();
-    client.events_through_the_turn(&subscription).await;
+    let events = client.events_through_the_turn(&subscription).await;
+    let sent = events.iter().find(|item| item["event"]["type"] == "thread.message-sent").expect("durable user-message event");
+    assert_eq!(sent["event"]["payload"]["attachments"], json!([{"type":"image","id":"attachment-message-0","name":"screen.png","mimeType":"image/png","sizeBytes":2}]));
+    assert!(!sent.to_string().contains("data:image/png"), "inline upload data is not durable");
     let requests = peer.requests_through(2).await;
     let prompt = requests.iter().find(|request| request["operation"] == "prompt").unwrap();
     assert_eq!(prompt["body"]["parts"][0], json!({"type":"text","text":"inspect"}));
@@ -1288,7 +1298,21 @@ async fn opencode_prompt_resolves_stored_attachments_and_omits_missing_reference
     assert_eq!(prompt["body"]["parts"][1]["filename"], "screen.png");
     assert!(prompt["body"]["parts"][1]["url"].as_str().unwrap().starts_with("file://"));
     assert_eq!(prompt["body"]["parts"].as_array().unwrap().len(), 2, "missing references are omitted independently");
-    server.stop().await; peer.task.abort();
+    let snapshot = server.connect().await.into_thread_snapshot("attachment-thread").await;
+    assert_eq!(snapshot["thread"]["messages"][0]["attachments"], sent["event"]["payload"]["attachments"]);
+    let issued = client.call("assets.createUrl", json!({"resource":{"_tag":"attachment","attachmentId":"attachment-message-0"}})).await.expect_success();
+    assert_eq!(server.get(issued["relativeUrl"].as_str().unwrap()).await.text, "hi");
+    client.close().await;
+    server.stop().await;
+
+    let restarted = TestServer::start_persistent_with_config_in(preferences.path(), peer.config(None)).await;
+    let client = restarted.connect().await;
+    let snapshot = client.into_thread_snapshot("attachment-thread").await;
+    assert_eq!(snapshot["thread"]["messages"][0]["attachments"], json!([{"type":"image","id":"attachment-message-0","name":"screen.png","mimeType":"image/png","sizeBytes":2}]));
+    let mut client = restarted.connect().await;
+    let issued = client.call("assets.createUrl", json!({"resource":{"_tag":"attachment","attachmentId":"attachment-message-0"}})).await.expect_success();
+    assert_eq!(restarted.get(issued["relativeUrl"].as_str().unwrap()).await.text, "hi");
+    restarted.stop().await; peer.task.abort();
 }
 
 #[tokio::test]

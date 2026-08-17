@@ -617,11 +617,27 @@ pub struct Message {
     pub id: String,
     pub role: String,
     pub text: String,
+    pub attachments: Vec<ChatAttachment>,
     pub turn_id: Option<String>,
     /// True while more text is expected under this id.
     pub streaming: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAttachment {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+}
+
+impl From<&crate::threads::PromptAttachment> for ChatAttachment {
+    fn from(value: &crate::threads::PromptAttachment) -> Self {
+        Self { id: value.id.clone(), name: value.filename.clone(), mime_type: value.mime.clone(), size_bytes: value.size_bytes }
+    }
 }
 
 /// Something worth showing that is not a message. The UI's work log is built
@@ -1005,7 +1021,7 @@ impl Thread {
 
 impl Message {
     fn to_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "role": self.role,
             "text": self.text,
@@ -1013,7 +1029,17 @@ impl Message {
             "streaming": self.streaming,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-        })
+        });
+        if !self.attachments.is_empty() {
+            value["attachments"] = json!(self.attachments.iter().map(ChatAttachment::to_value).collect::<Vec<_>>());
+        }
+        value
+    }
+}
+
+impl ChatAttachment {
+    fn to_value(&self) -> Value {
+        json!({"type":"image","id":self.id,"name":self.name,"mimeType":self.mime_type,"sizeBytes":self.size_bytes})
     }
 }
 
@@ -1213,6 +1239,7 @@ pub enum Change {
         message_id: String,
         text: String,
         turn_id: String,
+        attachments: Vec<ChatAttachment>,
     },
     /// A prompt was durably added to the queued OpenCode turn.
     PromptQueued {
@@ -1747,10 +1774,17 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             message_id,
             text,
             turn_id,
+            attachments,
         } => {
             thread.latest_user_message_at = Some(at.to_string());
-            let (payload, verdict) =
+            let (mut payload, verdict) =
                 message_sent(thread, message_id, "user", text, Some(turn_id), false, at);
+            if let Some(message) = thread.messages.iter_mut().find(|message| message.id == *message_id) {
+                message.attachments = attachments.clone();
+            }
+            if !attachments.is_empty() {
+                payload["attachments"] = json!(attachments.iter().map(ChatAttachment::to_value).collect::<Vec<_>>());
+            }
             reconciled = verdict;
             payload
         }
@@ -2298,6 +2332,7 @@ fn message_sent(
             id: message_id.to_string(),
             role: role.to_string(),
             text: text.to_string(),
+            attachments: Vec::new(),
             turn_id: turn_id.cloned(),
             streaming,
             created_at: at.to_string(),

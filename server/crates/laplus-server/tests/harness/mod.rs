@@ -411,6 +411,21 @@ impl TestServer {
         .await
     }
 
+    /// A whole-process restart seam whose database, settings and stored
+    /// attachment files share the caller-owned preferences directory.
+    pub async fn start_persistent_with_config_in(preferences: &Path, mut config: ServerConfig) -> TestServer {
+        config.preferences = preferences.to_path_buf();
+        somewhere_that_is_not_the_developers(&mut config);
+        config.preferences = preferences.to_path_buf();
+        let server = Server::bind_with(
+            0,
+            config,
+            Database::open(&preferences.join("state.sqlite")).expect("the database opens"),
+            Assets::none(),
+        ).await.expect("server binds to a free loopback port");
+        TestServer::bootstrapped(server, None).await
+    }
+
     /// The one place a server here is actually started.
     ///
     /// Whatever the caller's configuration said about where the developer's

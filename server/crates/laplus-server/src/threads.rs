@@ -204,7 +204,7 @@ pub mod fold;
 // `docs/adr/0025`; the paths callers use are deliberately unchanged by it.
 pub use fold::{
     checkpoint_status, fresh_activity_id, fresh_message_id, fresh_turn_id, settled_override, tone,
-    Activity, Adoption, Attention, Busy, Change, Checkpoint, Conversation, Given, LatestTurn,
+    Activity, Adoption, Attention, Busy, Change, ChatAttachment, Checkpoint, Conversation, Given, LatestTurn,
     Lifecycle, TitleRegeneration, Woken,
     Message, MetaUpdate, Reconciled, Rendered, Session, Shelf, Thread, ThreadRow, TurnState, ACTIVE,
     BY_ACTIVITY, BY_THE_USER, SETTLED,
@@ -330,8 +330,10 @@ pub struct Prompt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PromptAttachment {
+    pub id: String,
     pub mime: String,
     pub filename: String,
+    pub size_bytes: u64,
     pub path: PathBuf,
 }
 
@@ -1810,6 +1812,7 @@ pub(crate) mod tests {
                 message_id: "message-1".to_string(),
                 text: "hello".to_string(),
                 turn_id: "turn-1".to_string(),
+                attachments: Vec::new(),
             },
         );
         threads.apply(
@@ -2167,6 +2170,7 @@ pub(crate) mod tests {
                     message_id: "message-1".to_string(),
                     text: "hello".to_string(),
                     turn_id: "turn-1".to_string(),
+                    attachments: Vec::new(),
                 },
             )
             .expect("applied");
@@ -2233,6 +2237,7 @@ pub(crate) mod tests {
                     message_id: "message-1".to_string(),
                     text: "hello".to_string(),
                     turn_id: "turn-1".to_string(),
+                    attachments: Vec::new(),
                 },
             )
             .expect("applied");
@@ -2268,6 +2273,7 @@ pub(crate) mod tests {
                     message_id: "message-1".to_string(),
                     text: "hello".to_string(),
                     turn_id: "turn-1".to_string(),
+                    attachments: Vec::new(),
                 },
             ),
             None
@@ -2720,6 +2726,7 @@ pub(crate) mod tests {
                     message_id: "message-1".to_string(),
                     text: "hello".to_string(),
                     turn_id: "turn-1".to_string(),
+                    attachments: Vec::new(),
                 },
             )
             .expect("said");
@@ -3446,6 +3453,7 @@ pub(crate) mod tests {
                 id: "message-1".to_string(),
                 role: "user".to_string(),
                 text: "yesterday".to_string(),
+                attachments: Vec::new(),
                 turn_id: Some("turn-1".to_string()),
                 streaming: false,
                 created_at: now_iso(),
@@ -3578,6 +3586,7 @@ pub(crate) mod tests {
             id: "assistant-1".to_string(),
             role: "assistant".to_string(),
             text: "hell".to_string(),
+            attachments: Vec::new(),
             turn_id: Some("turn-1".to_string()),
             streaming: true,
             created_at: now_iso(),

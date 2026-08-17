@@ -359,6 +359,7 @@ mod tests {
             id: id.to_string(),
             role: "user".to_string(),
             text: text.to_string(),
+            attachments: Vec::new(),
             turn_id: Some("turn-1".to_string()),
             streaming: false,
             created_at: "2026-07-26T00:23:04.909Z".to_string(),

@@ -127,6 +127,7 @@ struct Claims {
 
 const CLAIMS_VERSION: u8 = 1;
 const KIND_PROJECT_FAVICON: &str = "project-favicon";
+const KIND_ATTACHMENT: &str = "attachment";
 
 // ---------------------------------------------------------------------------
 // assets.createUrl
@@ -141,16 +142,17 @@ pub struct CreateUrl {
     /// thing the field is for.
     resource: Value,
     cwd: String,
+    preferences: PathBuf,
 }
 
 impl CreateUrl {
-    pub fn read(payload: &Value) -> Result<CreateUrl, Value> {
+    pub fn read(payload: &Value, preferences: PathBuf) -> Result<CreateUrl, Value> {
         let resource = payload.get("resource").cloned().unwrap_or(Value::Null);
         let tag = resource.get("_tag").and_then(Value::as_str).unwrap_or_default();
 
         match tag {
-            KIND_PROJECT_FAVICON => {}
-            "workspace-file" | "attachment" => {
+            KIND_PROJECT_FAVICON | KIND_ATTACHMENT => {}
+            "workspace-file" => {
                 return Err(crate::refusals::partial_refusal(CREATE_URL, tag))
             }
             other => {
@@ -167,7 +169,7 @@ impl CreateUrl {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if cwd.is_empty() {
+        if tag == KIND_PROJECT_FAVICON && cwd.is_empty() {
             return Err(error(
                 "AssetWorkspaceRootNormalizationError",
                 &resource,
@@ -175,7 +177,7 @@ impl CreateUrl {
             ));
         }
 
-        Ok(CreateUrl { resource, cwd })
+        Ok(CreateUrl { resource, cwd, preferences })
     }
 
     /// The refusal for a key that could not be loaded.
@@ -194,6 +196,9 @@ impl CreateUrl {
 
     /// Do the work. Blocking, and called from a blocking task.
     pub fn run(self, secret: &[u8], now_ms: i64) -> Result<Value, Value> {
+        if self.resource.get("_tag").and_then(Value::as_str) == Some(KIND_ATTACHMENT) {
+            return self.run_attachment(secret, now_ms);
+        }
         let root = WorkspaceRoot::check(&self.cwd).map_err(|rejection| {
             error(
                 "AssetWorkspaceRootNormalizationError",
@@ -245,6 +250,22 @@ impl CreateUrl {
             "expiresAt": expires_at,
         }))
     }
+
+    fn run_attachment(self, secret: &[u8], now_ms: i64) -> Result<Value, Value> {
+        let id = self.resource.get("attachmentId").and_then(Value::as_str).unwrap_or_default();
+        if !crate::attachments::valid_id(id) {
+            return Err(error("AssetAttachmentNotFoundError", &self.resource, "The attachment identity is invalid."));
+        }
+        let root = self.preferences.join("attachments");
+        let path = crate::attachments::SUPPORTED_MIMES.into_iter().filter_map(crate::attachments::extension).map(|extension| root.join(format!("{id}.{extension}"))).find(|path| path.is_file())
+            .ok_or_else(|| error("AssetAttachmentNotFoundError", &self.resource, "The attachment file could not be found."))?;
+        let root = std::fs::canonicalize(root).map_err(|failure| error("AssetAttachmentNotFoundError", &self.resource, failure))?;
+        let path = std::fs::canonicalize(path).map_err(|failure| error("AssetAttachmentNotFoundError", &self.resource, failure))?;
+        let relative = path.strip_prefix(&root).map_err(|_| error("AssetAttachmentNotFoundError", &self.resource, "The attachment path escaped storage."))?.to_string_lossy().into_owned();
+        let expires_at = now_ms.saturating_add(TTL_MS);
+        let claims = Claims { version: CLAIMS_VERSION, kind: KIND_ATTACHMENT.into(), workspace_root: root.to_string_lossy().into_owned(), relative_path: Some(relative.clone()), expires_at };
+        Ok(json!({"relativeUrl":format!("{ROUTE_PREFIX}/{}/{}", seal(&claims, secret), encode_segment(&relative)),"expiresAt":expires_at}))
+    }
 }
 
 /// One of this method's declared errors, with the resource it is about.
@@ -288,7 +309,7 @@ pub struct Served {
 /// wrong name and still expect the right file.
 pub fn serve(token: &str, secret: &[u8], now_ms: i64) -> Option<Served> {
     let claims = open(token, secret)?;
-    if claims.version != CLAIMS_VERSION || claims.kind != KIND_PROJECT_FAVICON {
+    if claims.version != CLAIMS_VERSION || !matches!(claims.kind.as_str(), KIND_PROJECT_FAVICON | KIND_ATTACHMENT) {
         return None;
     }
     if claims.expires_at <= now_ms {
@@ -429,7 +450,7 @@ mod tests {
     }
 
     fn call(cwd: &str) -> CreateUrl {
-        CreateUrl::read(&json!({"resource": {"_tag": "project-favicon", "cwd": cwd}}))
+        CreateUrl::read(&json!({"resource": {"_tag": "project-favicon", "cwd": cwd}}), PathBuf::new())
             .expect("a well-formed call")
     }
 
@@ -581,13 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn the_other_two_resources_are_refused_by_name() {
-        for resource in [
-            json!({"_tag": "attachment", "attachmentId": "a1"}),
-            json!({"_tag": "workspace-file", "threadId": "t1", "path": "a.png"}),
-        ] {
+    fn the_unimplemented_workspace_resource_is_refused_by_name() {
+        for resource in [json!({"_tag": "workspace-file", "threadId": "t1", "path": "a.png"})] {
             let tag = resource["_tag"].as_str().expect("a tag").to_string();
-            let refusal = CreateUrl::read(&json!({"resource": resource}))
+            let refusal = CreateUrl::read(&json!({"resource": resource}), PathBuf::new())
                 .expect_err("a refusal");
 
             assert_eq!(refusal["_tag"], json!("EnvironmentAuthorizationError"));
@@ -600,7 +618,7 @@ mod tests {
     #[test]
     fn a_blank_workspace_root_is_refused_with_the_resource_it_was_about() {
         let resource = json!({"_tag": "project-favicon", "cwd": "   "});
-        let refusal = CreateUrl::read(&json!({"resource": resource.clone()}))
+        let refusal = CreateUrl::read(&json!({"resource": resource.clone()}), PathBuf::new())
             .expect_err("a refusal");
 
         assert_eq!(refusal["_tag"], json!("AssetWorkspaceRootNormalizationError"));

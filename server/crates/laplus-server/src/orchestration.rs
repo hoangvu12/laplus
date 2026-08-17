@@ -1608,7 +1608,11 @@ impl Shell {
             &config.settings,
             Arc::clone(&self.inner.mcp),
         ).map_err(CommandError::new)?;
-        let attachments = crate::attachments::resolve_all(&start.message.attachments, &start.message.message_id);
+        let attachments = crate::attachments::resolve_all(
+            &start.message.attachments,
+            &start.message.message_id,
+            &config.preferences,
+        ).map_err(CommandError::new)?;
 
         if let Some(thread) = pending {
             self.inner
@@ -1641,6 +1645,7 @@ impl Shell {
                     message_id: start.message.message_id.clone(),
                     text: start.message.text.clone(),
                     turn_id: turn_id.clone(),
+                    attachments: attachments.iter().map(crate::threads::ChatAttachment::from).collect(),
                 },
             )
             .ok_or_else(|| self.not_open(&start.thread_id))?;

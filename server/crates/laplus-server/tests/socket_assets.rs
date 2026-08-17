@@ -182,10 +182,7 @@ async fn the_resources_this_server_does_not_issue_are_refused_by_name() {
     let server = TestServer::start().await;
     let mut client = server.connect().await;
 
-    for resource in [
-        json!({"_tag": "attachment", "attachmentId": "a1"}),
-        json!({"_tag": "workspace-file", "threadId": "t1", "path": "shot.png"}),
-    ] {
+    for resource in [json!({"_tag": "workspace-file", "threadId": "t1", "path": "shot.png"})] {
         let tag = resource["_tag"].as_str().expect("a tag").to_string();
         let refused = create_url(&mut client, resource).await;
         let error = refused.expect_declared("EnvironmentAuthorizationError");

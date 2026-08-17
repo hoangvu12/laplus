@@ -481,6 +481,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE threads ADD COLUMN pending_turn TEXT;
     "#,
+    // Durable chat-attachment metadata. Inline upload bytes live only in the
+    // attachment file; the transcript retains the safe identity and display data.
+    r#"
+    ALTER TABLE thread_messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
+    "#,
 ];
 
 /// SQLite's rendering of the contract's `IsoDateTime`, matching the captured
@@ -1631,7 +1636,7 @@ impl Database {
         )?;
         let messages: Vec<(String, Message)> = query(
             &transaction,
-            "SELECT thread_id, id, role, text, turn_id, created_at, updated_at \
+            "SELECT thread_id, id, role, text, attachments, turn_id, created_at, updated_at \
              FROM thread_messages ORDER BY thread_id ASC, ordinal ASC",
             message_from_row,
             "read the transcripts",
@@ -2421,11 +2426,12 @@ fn upsert_message(
     transaction
         .execute(
             "INSERT INTO thread_messages \
-                (thread_id, id, ordinal, role, text, turn_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                (thread_id, id, ordinal, role, text, attachments, turn_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT (thread_id, id) DO UPDATE SET \
                 ordinal = excluded.ordinal, \
                 text = excluded.text, \
+                attachments = excluded.attachments, \
                 updated_at = excluded.updated_at",
             rusqlite::params![
                 thread_id,
@@ -2433,6 +2439,7 @@ fn upsert_message(
                 ordinal as i64,
                 message.role,
                 message.text,
+                serde_json::to_string(&message.attachments).expect("attachment metadata serializes"),
                 message.turn_id,
                 message.created_at,
                 message.updated_at,
@@ -2677,16 +2684,20 @@ fn latest_turn_from_json(stored: &str) -> Option<LatestTurn> {
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Message)> {
+    let stored: String = row.get(4)?;
+    let attachments = serde_json::from_str::<Vec<crate::threads::ChatAttachment>>(&stored)
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error)))?;
     Ok((
         row.get(0)?,
         Message {
             id: row.get(1)?,
             role: row.get(2)?,
             text: row.get(3)?,
-            turn_id: row.get(4)?,
+            attachments,
+            turn_id: row.get(5)?,
             streaming: false,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
         },
     ))
 }
@@ -2737,10 +2748,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queued_turn_storage_follows_the_pin_forward_migration() {
+    fn attachment_metadata_follows_the_queued_turn_and_pin_migrations() {
         let newest = MIGRATIONS.last().expect("a newest migration");
-        assert!(newest.contains("ADD COLUMN pending_turn"));
-        let pins = MIGRATIONS.get(MIGRATIONS.len() - 2).expect("the pin migration");
+        assert!(newest.contains("ADD COLUMN attachments"));
+        let queued = MIGRATIONS.get(MIGRATIONS.len() - 2).expect("the queued-turn migration");
+        assert!(queued.contains("ADD COLUMN pending_turn"));
+        let pins = MIGRATIONS.get(MIGRATIONS.len() - 3).expect("the pin migration");
         assert!(pins.contains("ADD COLUMN pinned_at"));
         assert!(pins.contains("ADD COLUMN pin_order_key"));
     }
@@ -3454,6 +3467,7 @@ mod tests {
                 id: "message-1".to_string(),
                 role: "user".to_string(),
                 text: "the question".to_string(),
+                attachments: Vec::new(),
                 turn_id: Some("turn-1".to_string()),
                 streaming: false,
                 created_at: "2026-07-26T00:23:05.000Z".to_string(),
@@ -3463,6 +3477,7 @@ mod tests {
                 id: "assistant-1".to_string(),
                 role: "assistant".to_string(),
                 text: "the answer".to_string(),
+                attachments: Vec::new(),
                 turn_id: Some("turn-1".to_string()),
                 streaming: false,
                 created_at: "2026-07-26T00:23:06.000Z".to_string(),
@@ -3678,6 +3693,7 @@ mod tests {
                         id: "message-1".to_string(),
                         role: "user".to_string(),
                         text: "hello".to_string(),
+                        attachments: Vec::new(),
                         turn_id: Some("turn-1".to_string()),
                         streaming: false,
                         created_at: "2026-07-26T00:23:05.000Z".to_string(),
