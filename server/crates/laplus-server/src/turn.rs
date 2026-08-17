@@ -137,7 +137,7 @@
 //! under a thread whose history the agent has forgotten would leave the developer
 //! talking to something that cannot see the transcript in front of them.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub(crate) async fn prompt_content(text: &str, attachments: &[crate::threads::PromptAttachment]) -> Result<Vec<serde_json::Value>, String> {
     let mut content = Vec::with_capacity(1 + attachments.len());
@@ -575,6 +575,217 @@ fn unprompted(folding: &mut SessionState, decided: &mut Decided) -> InFlight {
     }
 }
 
+/// What one line said about a subagent, as an update to that subagent's own work
+/// stream.
+///
+/// The other half of [`decide`]'s `Folded::SubagentProgress` arm. The compact row
+/// says in one line what the child is up to; this is the ordered record behind
+/// it, which is what the row launches — its prose, the tools it ran and what they
+/// returned, and the report it ended with. See [`crate::subagents`] for what a
+/// stream is and [`crate::protocol::SubagentMoved`] for why one value carries
+/// both destinations.
+///
+/// **What Claude proves, and only that.** `--forward-subagent-text` is the whole
+/// of a child's own voice on this wire, and it says less than an OpenCode child
+/// session does. Four things are therefore *not* recorded, rather than inferred:
+///
+/// - **hierarchy.** A `task_id` names a child of this conversation and says
+///   nothing about a child of a child, so [`crate::subagents::Head`]'s
+///   `parent_child_id` is left `None`. A subagent that delegates further appears
+///   as what the wire shows: an `Agent` tool call in its own stream.
+/// - **child-owned blockers.** A permission request from a subagent's tool
+///   arrives naming the tool and the session, never the subagent, so a child's
+///   request stays the root agent's request and
+///   [`crate::approval::ApprovalRequest`]'s `subagent` stays `None` — spec story
+///   52's "providers without child-attribution metadata retain their truthful
+///   root behaviour". `fixtures/claude-cli/22-background-subagent.ndjson` is the
+///   evidence rather than the assumption: its child is refused three times, and
+///   every refusal reaches this server as a `tool_result` on the child's own
+///   wire rather than as a request anyone could answer.
+/// - **reasoning.** A forwarded `thinking` block carries an empty `thinking` and
+///   a signature, so there is nothing to record even before asking whether the
+///   entry vocabulary has a home for one.
+/// - **a separate warning channel.** A child's error is the failed tool result
+///   that reports it, recorded as failed work rather than lifted out into a
+///   second [`crate::subagents::EntryKind::Notice`] entry saying the same thing
+///   twice.
+fn child_stream(moved: &crate::protocol::SubagentMoved) -> crate::subagents::Update {
+    use crate::protocol::SubagentDid;
+    use crate::subagents::{NewEntry, Outcome, State, Update};
+
+    let mut update = Update::for_child(moved.child_id.clone())
+        .named(moved.name.clone())
+        .assigned(moved.assignment.clone());
+
+    // A child ends twice and the bare ending comes first, so the state and the
+    // outcome are settled by different events: the `task_updated` stops it
+    // reading as running, and the `task_notification` that follows spends the
+    // stream's one terminal entry on what the child actually returned. Recording
+    // an outcome on the bare one would spend it on a silence —
+    // [`crate::subagents::Streams::record`] keeps the first outcome it is given —
+    // and the answer arriving a millisecond later would be dropped.
+    let ending = moved.row.as_ref().filter(|row| row.status != "running");
+    update = match (ending, moved.reports) {
+        (None, _) => update.in_state(State::Working),
+        (Some(row), true) => {
+            let report = row
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|report| !report.is_empty())
+                .map(str::to_string);
+            update.concluded(match row.status.as_str() {
+                "failed" => Outcome::failed(report),
+                _ => Outcome::completed(report),
+            })
+        }
+        (Some(row), false) => update.in_state(match row.status.as_str() {
+            "failed" => State::Failed,
+            _ => State::Completed,
+        }),
+    };
+
+    for did in &moved.did {
+        update = match did {
+            // Unkeyed, and this is the one place Claude differs from OpenCode in
+            // a way the key is about: the CLI forwards a child's prose once, as
+            // the buffered block it belongs to, rather than resending the text so
+            // far. There is nothing to edit, so each block appends.
+            SubagentDid::Said(text) => update.with(NewEntry::said(None, text)),
+            // Keyed by the call's own id, which is what makes an invocation and
+            // its result one entry that moves from running to finished rather
+            // than two rows to be paired by eye.
+            SubagentDid::Called {
+                id,
+                name,
+                input,
+                returned,
+            } => {
+                let (kind, work) = child_work(name, input, returned.as_ref());
+                update.with(NewEntry::worked(Some(id.clone()), kind, &work))
+            }
+        };
+    }
+    update
+}
+
+/// One tool a subagent called, in the work vocabulary the child's tab renders
+/// with.
+///
+/// Everything is read off what the call carried. A tool that named no file, ran
+/// no command and returned nothing leaves a [`crate::subagents::Work`] with a
+/// name and a status, which is exactly as much as the CLI said about it.
+fn child_work(
+    name: &str,
+    input: &Value,
+    returned: Option<&crate::protocol::SubagentReturn>,
+) -> (crate::subagents::EntryKind, crate::subagents::Work) {
+    use crate::subagents::{Progress, Work};
+    let said = |field: &str| {
+        input
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    (
+        child_entry_kind(name),
+        Work {
+            title: name.to_string(),
+            status: match returned {
+                None => Progress::InProgress,
+                Some(returned) if returned.failed => Progress::Failed,
+                Some(_) => Progress::Completed,
+            },
+            // What came back, once it has — and until then the CLI's own one-line
+            // description of the call, which every Claude tool input carries and
+            // which is the only thing said about a call while it runs.
+            detail: match returned {
+                Some(returned) => bounded(&returned.output),
+                None => said("description"),
+            },
+            command: said("command"),
+            // Only the fields that name a *file*. `path` on a `Glob` is the
+            // directory it searched, and offering to open a directory as a file
+            // would be a navigation that fails.
+            paths: ["file_path", "notebook_path"]
+                .iter()
+                .filter_map(|field| said(field))
+                .collect(),
+            query: said("pattern"),
+        },
+    )
+}
+
+/// Which kind of work a Claude tool is, in the child stream's vocabulary.
+///
+/// A heuristic on the tool's name, like [`crate::worklog`]'s own classifier and
+/// deliberately alongside it rather than sharing it: that one picks the client's
+/// row `itemType` for the parent transcript and has six answers, and this picks
+/// the provider-neutral [`crate::subagents::EntryKind`] that OpenCode and Codex
+/// fill too, and has four. So a child's `WebFetch`, MCP call or image view lands
+/// on `Tool` where the same tool in the root transcript gets a globe, a wrench or
+/// an eye — the same work-entry component either way, with a less specific icon.
+/// Widening that vocabulary is a decision about the shared model rather than
+/// about Claude, so it is not taken here; `child_entry_kind` in `opencode.rs`
+/// carries the same note.
+///
+/// An `Agent` call is a **tool**, not a launcher. Claude gives a nested subagent
+/// no identity on this wire — see [`child_stream`] — and a row that offered to
+/// open a stream this server does not hold would be worse than the honest one.
+///
+/// **The needles are matched in an order, and the order is load-bearing.** A
+/// `NotebookEdit` is caught by `edit` and a `NotebookRead` by `read`, which is
+/// why neither is spelled out; spelling `notebook` into the edit branch — as
+/// this did until the review caught it — filed the read as a file change.
+fn child_entry_kind(tool: &str) -> crate::subagents::EntryKind {
+    use crate::subagents::EntryKind;
+    let name = tool.to_ascii_lowercase();
+    // `TodoWrite` is the agent's own scratchpad rather than the developer's
+    // files, and the `write` needle below would otherwise draw it as a file
+    // change. `child_entry_kind` in `opencode.rs` carves out the same tool for
+    // the same reason.
+    if name.starts_with("todo") {
+        return EntryKind::Tool;
+    }
+    if ["bash", "command", "shell", "terminal"]
+        .iter()
+        .any(|needle| name.contains(needle))
+    {
+        EntryKind::Command
+    } else if ["edit", "write", "patch"]
+        .iter()
+        .any(|needle| name.contains(needle))
+    {
+        EntryKind::Edit
+    } else if ["read", "grep", "glob", "list", "search", "find"]
+        .iter()
+        .any(|needle| name.contains(needle))
+    {
+        EntryKind::Read
+    } else {
+        EntryKind::Tool
+    }
+}
+
+/// How much of a child's tool output the stream keeps.
+///
+/// A bound rather than the whole thing, for [`crate::opencode`]'s reason: a
+/// child's `cat` of a large file would otherwise be copied into the durable
+/// stream and pushed to every watching client.
+const CHILD_OUTPUT: usize = 8 * 1024;
+
+fn bounded(output: &str) -> Option<String> {
+    if output.trim().is_empty() {
+        return None;
+    }
+    if output.chars().count() <= CHILD_OUTPUT {
+        return Some(output.to_string());
+    }
+    Some(output.chars().take(CHILD_OUTPUT).collect::<String>() + "…")
+}
+
 /// Fold one line and say what it turned out to be.
 ///
 /// No [`crate::threads::Threads`], no lock, no clock and no child process: a
@@ -713,14 +924,29 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
         // developer would otherwise experience as the agent losing the thread —
         // a follow-up that refers to what is plainly on screen may be answered
         // by an agent that no longer has it.
-        // A subagent moved. One row per subagent, kept up to date — the work the
-        // developer could not see at all before, because every `task_*` event
-        // reached `SystemEvent::Other` and was dropped in silence.
-        Folded::SubagentProgress(task) => {
+        // A subagent moved. Two destinations, because a child is two things at
+        // once: one compact row per subagent in the parent's work log, kept up to
+        // date, and the child's own work stream behind it — which is what the row
+        // launches and where everything the child actually did is kept. See
+        // [`child_stream`], and [`crate::protocol::SubagentMoved`] for why one
+        // value carries both.
+        //
+        // **A child boundary never ends the turn.** The turn is read, so a row
+        // is attributed to whatever was running when it was drawn, and it is
+        // never *taken* — so a subagent starting, working or finishing cannot
+        // settle or clear the root's. Which matters most in the background case:
+        // the child is still going after its turn has ended, and the rows it
+        // draws then belong to no turn at all.
+        Folded::SubagentProgress(moved) => {
             let turn_id = turn.as_ref().map(|turn| turn.turn_id.clone());
-            decided
-                .changes
-                .push(Change::Activity(crate::worklog::subagent(&task, turn_id, None)));
+            if let Some(task) = &moved.row {
+                decided.changes.push(Change::Activity(crate::worklog::subagent(
+                    task,
+                    turn_id,
+                    Some(&moved.child_id),
+                )));
+            }
+            decided.child_streams.push(child_stream(&moved));
         }
 
         Folded::Compacted(compaction) => {
@@ -1171,6 +1397,55 @@ fn human_duration(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four kinds a child's tools land on, and the three names whose answer
+    /// is decided by the *order* of the needles rather than by any one of them.
+    ///
+    /// `NotebookRead` is the case the review caught: with `notebook` spelled into
+    /// the edit branch it was filed as a file change, which is a claim the child
+    /// altered a file it only read.
+    #[test]
+    fn a_childs_tool_is_the_kind_of_work_it_actually_is() {
+        use crate::subagents::EntryKind;
+        let kinds: Vec<(&str, EntryKind)> = [
+            "Bash",
+            "BashOutput",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Read",
+            "NotebookRead",
+            "Grep",
+            "Glob",
+            "TodoWrite",
+            "Agent",
+            "WebFetch",
+        ]
+        .into_iter()
+        .map(|tool| (tool, child_entry_kind(tool)))
+        .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                ("Bash", EntryKind::Command),
+                ("BashOutput", EntryKind::Command),
+                ("Edit", EntryKind::Edit),
+                ("Write", EntryKind::Edit),
+                ("NotebookEdit", EntryKind::Edit),
+                ("Read", EntryKind::Read),
+                ("NotebookRead", EntryKind::Read),
+                ("Grep", EntryKind::Read),
+                ("Glob", EntryKind::Read),
+                // The agent's own scratchpad, not the developer's files.
+                ("TodoWrite", EntryKind::Tool),
+                // A nested subagent Claude gives no identity to, and everything
+                // laplus cannot place: the generic row rather than a guess.
+                ("Agent", EntryKind::Tool),
+                ("WebFetch", EntryKind::Tool),
+            ]
+        );
+    }
 
     fn result(
         is_error: bool,

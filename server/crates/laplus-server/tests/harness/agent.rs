@@ -336,6 +336,36 @@ impl ScriptedAgent {
         ScriptedAgent::emitting(&replayable(&recorded))
     }
 
+    /// Replay a committed capture, stopping for a moment just before the first
+    /// line that contains `needle`.
+    ///
+    /// The recording is unchanged — every line of it, in order, from the same
+    /// file the golden tests read. What is inserted is a [`PAUSE`], and it is
+    /// inserted because **a recording plays faster than a client can look**: a
+    /// capture of a subagent that ran for twenty seconds replays in
+    /// milliseconds, so a test that wants to open the child's work stream *while
+    /// the child is working* has nowhere to stand. The real CLI's own timing is
+    /// what the pause stands in for; nothing about the events changes.
+    ///
+    /// Two of them, because one second is a race on a loaded machine and this
+    /// buys the window rather than asserting on how long anything took — see
+    /// `READ_TIMEOUT` in `harness/mod.rs` for the rule that distinction follows.
+    pub fn replaying_paused_before(capture: &str, needle: &str) -> ScriptedAgent {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/claude-cli")
+            .join(format!("{capture}.ndjson"));
+        let recorded = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+
+        let mut lines = replayable(&recorded);
+        let at = lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{capture} has no line containing {needle}"));
+        lines.splice(at..at, [PAUSE, PAUSE]);
+        ScriptedAgent::emitting(&lines)
+    }
+
     /// Replay a capture for the first turn, then a script of your own for every
     /// turn after it.
     ///
