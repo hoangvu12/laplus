@@ -68,9 +68,11 @@ including a partial interrupted reply, as conversation history. _Avoid_: Steer,
 follow-up message.
 
 **Chat attachment** — a file stored by laplus and included with a developer
-prompt. OpenCode receives its resolved local `file://` URL; an external server
-can consume it only when it shares that filesystem. _Avoid_: Attachment alone,
-which already means a terminal output subscription in this context.
+prompt. Its provider representation is driver-specific: Claude and Codex
+receive the image contents, while OpenCode receives its resolved local `file://`
+URL. An external OpenCode server can consume it only when it shares that
+filesystem or an equivalent path mapping. _Avoid_: Attachment alone, which
+already means a terminal output subscription in this context.
 
 **Session** — the agent process behind a thread, as the client sees it. A thread
 with no session is normal — after a restart, every thread has none.
