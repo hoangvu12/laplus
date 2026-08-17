@@ -2462,7 +2462,7 @@ async fn the_recorded_codex_collaboration_opens_the_childs_own_work_stream() {
 /// reuses and why), and it exists for the parts of Codex's collaboration model
 /// the one real capture does not contain: a spawn that completes while its child
 /// keeps working, a child that runs a command, a child that a `subAgentActivity`
-/// interrupts, a canonical path three segments deep, and the four terminal agent
+/// interrupts, a canonical path three segments deep, and the five terminal agent
 /// states the recorded `agentsStates` map arrived too empty to carry.
 #[tokio::test]
 async fn codex_children_of_one_collaboration_keep_separate_identities_and_endings() {
@@ -2565,10 +2565,45 @@ async fn codex_children_of_one_collaboration_keep_separate_identities_and_ending
             ("tool".to_string(), "Subagent started".to_string()),
             ("tool".to_string(), "Waited for subagents".to_string()),
             ("message".to_string(), "Running the tests.".to_string()),
+            ("tool".to_string(), "Input sent to the subagent".to_string()),
             ("tool".to_string(), "Subagent interrupted".to_string()),
             ("outcome".to_string(), "interrupted".to_string()),
         ],
         "the tester's history: {tester:#?}"
+    );
+
+    // What the compact row says, which is the other half of an honest ending.
+    // While a child runs, the row carries the latest meaningful thing *it* did —
+    // not the parent's input to it, and not its path. Once it is over, the row
+    // carries what came back and stops carrying anything else.
+    let row_detail = |child: &str, status: &str| {
+        child_rows(&events)
+            .into_iter()
+            .filter(|row| {
+                row["payload"]["data"]["childId"] == child
+                    && row["payload"]["data"]["agentStatus"] == status
+            })
+            .map(|row| row["payload"]["detail"].clone())
+            .next_back()
+            .unwrap_or_else(|| panic!("no {status} row for {child}"))
+    };
+    assert_eq!(
+        row_detail("child-beta-2222", "running"),
+        "Running the tests.",
+        "a running row must show the child's own latest activity"
+    );
+    assert_eq!(
+        row_detail("child-beta-2222", "interrupted"),
+        "Codex reported this subagent as interrupted.",
+        "a terminal row must replace stale activity with what came back"
+    );
+    assert_eq!(
+        row_detail("child-epsilon-5555", "shutdown"),
+        "Codex shut this subagent down."
+    );
+    assert_eq!(
+        row_detail("child-alpha-1111", "completed"),
+        "The decoder looks correct."
     );
 
     // The nested agent: `/root/reviewer/helper` proves the reviewer launched it,

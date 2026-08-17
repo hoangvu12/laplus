@@ -143,10 +143,10 @@ It exists because 09 is one small real turn and cannot show any of this: a
 `spawnAgent` that completes while its child keeps working, a child that runs a
 command, a child that streams its prose in deltas, a `wait` naming two receivers,
 a canonical `agentPath` three segments deep (`/root/reviewer/helper`, whose
-parent laplus resolves to the reviewer's own thread), a `subAgentActivity` whose
-`kind` is `interrupted`, and the four terminal `agentsStates` — `completed`,
-`interrupted`, `errored`, `notFound` and `shutdown` — that 09's empty map could
-not carry. **A field this file invents would be worse than a field it omits**, so
+parent laplus resolves to the reviewer's own thread), `subAgentActivity` items
+whose `kind` is `interacted` and `interrupted`, and the five terminal
+`agentsStates` — `completed`, `interrupted`, `errored`, `notFound` and
+`shutdown` — that 09's always-empty map could not carry. **A field this file invents would be worse than a field it omits**, so
 it adds no key that is absent from the recordings above; where the protocol says
 nothing, the fixture says nothing.
 

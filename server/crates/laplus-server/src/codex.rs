@@ -45,7 +45,7 @@ use tokio::sync::mpsc as async_mpsc;
 
 use crate::approval::ApprovalRequest;
 use crate::codex_protocol::{
-    self as protocol, Access, Capabilities, ChildEvent, ChildWork, CollaborationAgent,
+    self as protocol, Access, Capabilities, ChildEvent, ChildNotification, CollaborationAgent,
     CollaborationCall, CommandExecution, ConversationFold, ConversationState, Incoming, Request,
     SubagentActivity,
 };
@@ -659,22 +659,25 @@ fn decide(
                 )));
             children.operated(&call, true, &mut decided);
             for agent in &call.agents {
+                children.reported(agent, &mut decided);
                 decided
                     .changes
                     .push(Change::Activity(collaboration_agent_row(
                         agent,
-                        None,
+                        children.latest_of(&agent.thread_id),
                         turn_id.clone(),
                     )));
-                children.reported(agent, &mut decided);
             }
         }
         ConversationFold::SubagentActivity(activity) => {
             let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            children.acted(&activity, &mut decided);
+            let latest = children.latest_of(&activity.agent_thread_id);
             decided
                 .changes
-                .push(Change::Activity(subagent_activity_row(&activity, turn_id)));
-            children.acted(&activity, &mut decided);
+                .push(Change::Activity(subagent_activity_row(
+                    &activity, latest, turn_id,
+                )));
         }
         // A descendant, announced by the child that launched it. Its identity,
         // its canonical path and the parentage that path proves are recorded;
@@ -685,14 +688,15 @@ fn decide(
         }
         ConversationFold::SubagentObserved(agent) => {
             let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
+            children.reported(&agent, &mut decided);
+            let latest = children
+                .latest_of(&agent.thread_id)
+                .or(agent.path.as_deref());
             decided
                 .changes
                 .push(Change::Activity(collaboration_agent_row(
-                    &agent,
-                    agent.path.as_deref(),
-                    turn_id,
+                    &agent, latest, turn_id,
                 )));
-            children.reported(&agent, &mut decided);
         }
         // A child's own prose and work. It updates that child's stream and
         // nothing else: the parent transcript keeps one compact row per child,
@@ -757,13 +761,10 @@ fn collaboration_call_row(
     turn_id: Option<String>,
 ) -> Activity {
     let (verb, past) = operation_words(&call.tool);
-    let status = if !ended {
-        "inProgress"
-    } else if call.status == "failed" {
-        "failed"
-    } else {
-        "completed"
-    };
+    // The same decision the child's own entry records, rendered as the client's
+    // `toolLifecycleStatus` literal. Deciding it twice is how the row and the
+    // entry would come to disagree about one operation.
+    let status = operation_progress(call, ended).as_str();
     let title = if ended { past } else { verb };
     let mut payload = serde_json::json!({
         "itemType": "collab_agent_tool_call",
@@ -815,7 +816,25 @@ fn collaboration_agent_row(
         Some(name) => format!("Subagent {name}"),
         None => format!("Subagent {}", short_agent_id(&agent.thread_id)),
     };
-    let shown_detail = agent.message.as_deref().or(detail);
+    // **A terminal row describes what came back, and nothing else.** Once an
+    // agent has reported, whatever it was last doing is stale, and a row that
+    // went on showing it would present the thing said on the way to an answer as
+    // the answer — the spec's "terminal state replaces stale activity". A
+    // completion with nothing to read says nothing rather than falling back,
+    // because there is no stale line it would be honest to show instead.
+    //
+    // While it runs, the most useful line wins: what the agent itself reported,
+    // then the latest meaningful thing its own stream saw it do, and its
+    // canonical path last — identity, which is what is left when there is no
+    // activity yet.
+    let ended = conclusion(&agent.status, agent.message.as_deref());
+    let shown_detail = match &ended {
+        Some(outcome) => outcome.text.clone(),
+        None => agent
+            .message
+            .clone()
+            .or_else(|| detail.map(str::to_string)),
+    };
     let mut payload = serde_json::json!({
         "itemType": "collab_agent_tool_call",
         "status": status,
@@ -840,7 +859,7 @@ fn collaboration_agent_row(
         },
     });
     if let Some(detail) = shown_detail {
-        payload["detail"] = Value::String(worklog_preview(detail));
+        payload["detail"] = Value::String(worklog_preview(&detail));
     }
     Activity::tool(
         if status == "inProgress" {
@@ -854,7 +873,11 @@ fn collaboration_agent_row(
     )
 }
 
-fn subagent_activity_row(activity: &SubagentActivity, turn_id: Option<String>) -> Activity {
+fn subagent_activity_row(
+    activity: &SubagentActivity,
+    latest: Option<&str>,
+    turn_id: Option<String>,
+) -> Activity {
     let status = if activity.kind == "interrupted" {
         "interrupted"
     } else {
@@ -866,7 +889,7 @@ fn subagent_activity_row(activity: &SubagentActivity, turn_id: Option<String>) -
         message: None,
         path: Some(activity.agent_path.clone()),
     };
-    let mut row = collaboration_agent_row(&agent, Some(&activity.agent_path), turn_id);
+    let mut row = collaboration_agent_row(&agent, latest.or(Some(&activity.agent_path)), turn_id);
     row.payload["data"]["activity"] = activity.raw.clone();
     row
 }
@@ -910,16 +933,26 @@ struct Subagent {
     /// already has revises that entry where it stands; a key it does not have
     /// would be new work after a conclusion, and is refused.
     keys: std::collections::HashSet<String>,
+    /// The latest meaningful thing this child did, for the compact row.
+    ///
+    /// One line, from the child's own stream rather than from the parent's
+    /// description of it: what the row has room for is what the developer would
+    /// most want to have waited for. A turn boundary is not activity and does
+    /// not move it, which is the spec's rule about heartbeats and partial
+    /// states applied to the one protocol event that is purely structural.
+    latest: Option<String>,
 }
 
 impl Children {
     /// This child, and everything already known about it, as the update every
-    /// caller below starts from.
+    /// caller below starts from — **or `None`, because a reported child is
+    /// closed to anything new.**
     ///
     /// `key` is the entry this update is about to carry, or `None` for an update
-    /// that carries no entry of its own. `None` once the child is closed to it —
-    /// see [`Subagent::keys`].
-    fn note(
+    /// that carries no entry of its own. A key the child's stream already holds
+    /// is still accepted after it has been reported on, and is the only thing
+    /// that is — see [`Subagent::keys`].
+    fn still_open(
         &mut self,
         thread_id: &str,
         path: Option<&str>,
@@ -943,6 +976,12 @@ impl Children {
     }
 
     /// The thread id of the agent whose canonical path is this path's parent.
+    ///
+    /// **Exactly one, or none.** Two live agents holding one canonical path
+    /// would make the parent ambiguous, and picking either — the lowest id, the
+    /// first the map happened to yield — would present a coin toss as proof.
+    /// The honesty rule is the same one that governs an unknown ancestor:
+    /// laplus draws the relationship the provider proves, or none.
     fn parent_of(&self, path: &str) -> Option<String> {
         let segments = path_segments(path);
         // The first segment is the conversation's own root. A path of root plus
@@ -951,16 +990,40 @@ impl Children {
             return None;
         }
         let ancestor = &segments[..segments.len() - 1];
+        let mut holders = self.by_thread.iter().filter(|(_, child)| {
+            child
+                .path
+                .as_deref()
+                .is_some_and(|known| path_segments(known) == ancestor)
+        });
+        let (thread_id, _) = holders.next()?;
+        match holders.next() {
+            Some(_) => None,
+            None => Some(thread_id.clone()),
+        }
+    }
+
+    /// The latest meaningful thing this child was seen to do.
+    fn latest_of(&self, thread_id: &str) -> Option<&str> {
+        self.by_thread.get(thread_id)?.latest.as_deref()
+    }
+
+    /// Remember what the compact row should say while this child runs.
+    ///
+    /// Only the child's **own** events move this. A spawn, a wait or an input
+    /// sent to it are the parent acting on the child, and a row that answered
+    /// "what is this subagent doing?" with "its parent waited for it" would be
+    /// describing the wrong agent. They are entries in the child's history all
+    /// the same — they belong to it — but they are not its activity.
+    fn did(&mut self, thread_id: &str, said: &str) {
+        let said = said.trim();
+        if said.is_empty() {
+            return;
+        }
         self.by_thread
-            .iter()
-            .filter(|(_, child)| {
-                child
-                    .path
-                    .as_deref()
-                    .is_some_and(|known| path_segments(known) == ancestor)
-            })
-            .map(|(thread_id, _)| thread_id.clone())
-            .min()
+            .entry(thread_id.to_string())
+            .or_default()
+            .latest = Some(said.to_string());
     }
 
     fn concluded(&mut self, thread_id: &str) {
@@ -980,14 +1043,9 @@ impl Children {
     /// other.
     fn operated(&mut self, call: &CollaborationCall, ended: bool, decided: &mut Decided) {
         let (verb, past) = operation_words(&call.tool);
-        let status = match (ended, call.status.as_str()) {
-            (false, _) => crate::subagents::Progress::InProgress,
-            (true, "failed") => crate::subagents::Progress::Failed,
-            (true, _) => crate::subagents::Progress::Completed,
-        };
         let work = crate::subagents::Work {
             title: if ended { past } else { verb }.to_string(),
-            status,
+            status: operation_progress(call, ended),
             detail: call.prompt.clone(),
             command: None,
             paths: Vec::new(),
@@ -1003,7 +1061,7 @@ impl Children {
         }
         let key = format!("collab:{}", call.id);
         for receiver in receivers {
-            let Some(update) = self.note(&receiver, None, Some(&key)) else {
+            let Some(update) = self.still_open(&receiver, None, Some(&key)) else {
                 continue;
             };
             // What the parent asked *this* child for, and only on the call that
@@ -1027,7 +1085,7 @@ impl Children {
     /// interaction itself as one entry of that agent's history.
     fn acted(&mut self, activity: &SubagentActivity, decided: &mut Decided) {
         let key = format!("activity:{}", activity.id);
-        let Some(update) = self.note(
+        let Some(update) = self.still_open(
             &activity.agent_thread_id,
             Some(&activity.agent_path),
             Some(&key),
@@ -1066,7 +1124,7 @@ impl Children {
     /// An agent state Codex reported — from a collaboration call's map, or from
     /// the child's own completed turn.
     fn reported(&mut self, agent: &CollaborationAgent, decided: &mut Decided) {
-        let Some(update) = self.note(&agent.thread_id, agent.path.as_deref(), None) else {
+        let Some(update) = self.still_open(&agent.thread_id, agent.path.as_deref(), None) else {
             return;
         };
         match conclusion(&agent.status, agent.message.as_deref()) {
@@ -1081,17 +1139,26 @@ impl Children {
     }
 
     /// Something a child's own thread said or did.
-    fn worked(&mut self, work: &ChildWork, decided: &mut Decided) {
-        let key = match &work.what {
+    fn worked(&mut self, work: &ChildNotification, decided: &mut Decided) {
+        let key = match &work.event {
             ChildEvent::Working => None,
             ChildEvent::Said { item_id, .. } => Some(format!("item:{item_id}")),
             ChildEvent::Ran(command) => Some(format!("item:{}", command.id)),
         };
-        let Some(update) = self.note(&work.thread_id, work.path.as_deref(), key.as_deref()) else {
+        let Some(update) =
+            self.still_open(&work.thread_id, work.path.as_deref(), key.as_deref())
+        else {
             return;
         };
         let update = update.in_state(crate::subagents::State::Working);
-        decided.child_streams.push(match &work.what {
+        match &work.event {
+            // A turn boundary is structure rather than progress, and the spec
+            // asks for the latest *meaningful* activity.
+            ChildEvent::Working => {}
+            ChildEvent::Said { text, .. } => self.did(&work.thread_id, text),
+            ChildEvent::Ran(command) => self.did(&work.thread_id, &command.command),
+        }
+        decided.child_streams.push(match &work.event {
             ChildEvent::Working => update,
             ChildEvent::Said { text, .. } => {
                 update.with(crate::subagents::NewEntry::said(key.clone(), text))
@@ -1110,6 +1177,16 @@ fn path_segments(path: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+/// How a collaboration operation is going. One decision, read by the operation's
+/// own row and by the entry it leaves in each child's history.
+fn operation_progress(call: &CollaborationCall, ended: bool) -> crate::subagents::Progress {
+    match (ended, call.status.as_str()) {
+        (false, _) => crate::subagents::Progress::InProgress,
+        (true, "failed") => crate::subagents::Progress::Failed,
+        (true, _) => crate::subagents::Progress::Completed,
+    }
 }
 
 /// What laplus calls each of Codex's five collaboration operations, running and
@@ -1169,8 +1246,11 @@ fn conclusion(status: &str, message: Option<&str>) -> Option<crate::subagents::O
 
 /// A command a child ran, in the vocabulary the main agent's work rows speak.
 fn command_work(command: &CommandExecution) -> crate::subagents::Work {
-    // The same rule the parent's own command rows follow: a non-zero exit is a
-    // failure whatever the item's status says.
+    // A non-zero exit is a failure whatever the item says, which is the half of
+    // `worklog::Call::command_returned`'s rule that transfers. The other half —
+    // "anything but completed failed" — does not: that rule is applied to a
+    // *finished* command, and this folds the running item as well as the
+    // finished one, where `inProgress` means running rather than failed.
     let failed = command.status == "failed"
         || command.exit_code.is_some_and(|code| code != 0);
     let status = match (command.status.as_str(), failed) {
@@ -1196,6 +1276,10 @@ fn command_work(command: &CommandExecution) -> crate::subagents::Work {
 
 /// A child's output, kept whole up to a bound. The child's tab renders it in
 /// full, so this is a guard against a runaway process rather than a preview.
+///
+/// The twin of `opencode::bounded`, deliberately copied rather than shared: the
+/// one place both could live is [`crate::subagents`], which three provider
+/// branches are editing at once. Fold the two together when they merge.
 fn bounded(output: &str) -> String {
     const CHILD_OUTPUT: usize = 8 * 1024;
     if output.chars().count() <= CHILD_OUTPUT {
@@ -1887,6 +1971,72 @@ mod tests {
             parent_of("thread-orphan"),
             None,
             "no agent holds /root/absent, so laplus must not invent one"
+        );
+
+        // And an ancestor two agents both claim proves nothing about either of
+        // them, so the relationship is dropped rather than settled by a tie-break
+        // the protocol never made.
+        let mut ambiguous = Children::default();
+        let mut drawn = Decided::default();
+        for (thread_id, path) in [
+            ("thread-one", "/root/reviewer"),
+            ("thread-two", "/root/reviewer"),
+            ("thread-nested", "/root/reviewer/helper"),
+        ] {
+            ambiguous.acted(
+                &SubagentActivity {
+                    id: format!("activity-{thread_id}"),
+                    kind: "started".to_string(),
+                    agent_thread_id: thread_id.to_string(),
+                    agent_path: path.to_string(),
+                    raw: Value::Null,
+                },
+                &mut drawn,
+            );
+        }
+        assert_eq!(
+            drawn
+                .child_streams
+                .iter()
+                .find(|update| update.child_id == "thread-nested")
+                .and_then(|update| update.parent_child_id.clone()),
+            None,
+            "two agents held the ancestor path; neither is proven to be the parent"
+        );
+    }
+
+    /// The compact row is the other half of an honest ending: once a child has
+    /// reported, the row says what came back rather than what it was doing.
+    #[test]
+    fn a_terminal_row_replaces_activity_with_what_came_back() {
+        let row = |status: &str, message: Option<&str>, latest: Option<&str>| {
+            collaboration_agent_row(
+                &CollaborationAgent {
+                    thread_id: "child-thread".to_string(),
+                    status: status.to_string(),
+                    message: message.map(str::to_string),
+                    path: Some("/root/reviewer".to_string()),
+                },
+                latest,
+                None,
+            )
+            .payload["detail"]
+                .clone()
+        };
+        assert_eq!(row("running", None, Some("ls src")), "ls src");
+        assert_eq!(
+            row("completed", Some("No defects found."), Some("ls src")),
+            "No defects found."
+        );
+        assert_eq!(
+            row("shutdown", None, Some("ls src")),
+            "Codex shut this subagent down.",
+            "a stopped child must not go on showing the command it was running"
+        );
+        assert_eq!(
+            row("completed", None, Some("ls src")),
+            Value::Null,
+            "a completion with nothing to read says nothing rather than something stale"
         );
     }
 

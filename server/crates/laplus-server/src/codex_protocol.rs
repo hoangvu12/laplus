@@ -167,7 +167,7 @@ pub enum ConversationFold {
     NestedSubagentActivity(SubagentActivity),
     SubagentObserved(CollaborationAgent),
     /// Something a child thread said or did, for that child's own work stream.
-    SubagentWorked(ChildWork),
+    SubagentWorked(ChildNotification),
     ApprovalRequested(ApprovalRequest),
     TokenUsage(crate::protocol::TokenUsage),
     TurnCompleted(Completion),
@@ -193,23 +193,31 @@ pub struct CollaborationAgent {
     pub path: Option<String>,
 }
 
-/// One thing that happened inside a child's own Codex thread.
+/// One notification from a child's own Codex thread.
 ///
 /// Codex runs a subagent as a *thread*, so a child's work arrives as the same
 /// `item/*` and `turn/*` notifications the root's does, under the child's own
 /// `threadId`. That is why this carries the same [`CommandExecution`] the root
 /// path folds rather than a parallel copy of it: one shape, decoded once, and a
 /// child's command is a command.
+///
+/// **A protocol notification, not yet a stream entry.** `CONTEXT.md` reserves
+/// *stream entry* for [`crate::subagents::Entry`] and *child work* for
+/// [`crate::subagents::Work`], and this is neither: it is what the wire said,
+/// and [`crate::codex::Children`] decides which of these become entries and in
+/// what vocabulary. A child opening a turn produces one of these and no entry
+/// at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildWork {
+pub struct ChildNotification {
     /// The child's Codex thread id — its identity, and the id its work stream is
     /// keyed by.
     pub thread_id: String,
     /// The canonical agent path, when a `subAgentActivity` has already named it.
     pub path: Option<String>,
-    pub what: ChildEvent,
+    pub event: ChildEvent,
 }
 
+/// What one of those notifications said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildEvent {
     /// The child opened a turn: it is working, whatever it says next.
@@ -605,11 +613,11 @@ impl ConversationState {
         // An item id is unique within its own thread, so the accumulator is
         // keyed by both. Two children streaming at once is the ordinary case.
         let said_key = |item_id: &str| format!("{thread_id}\u{1f}{item_id}");
-        let worked = |what: ChildEvent| {
-            ConversationFold::SubagentWorked(ChildWork {
+        let worked = |event: ChildEvent| {
+            ConversationFold::SubagentWorked(ChildNotification {
                 thread_id: thread_id.to_string(),
                 path: path.clone(),
-                what,
+                event,
             })
         };
         match method {
@@ -677,6 +685,15 @@ impl ConversationState {
                         }
                         None => ConversationFold::Nothing,
                     },
+                    // `fileChange`, `mcpToolCall`, `webSearch`, `reasoning` and
+                    // the rest are **known** item kinds this build does not read
+                    // the body of — the root path folds them to nothing too. A
+                    // child's edit could be an `EntryKind::Edit` carrying the
+                    // file it changed, and that is the one thing that would give
+                    // a Codex child tab file and diff navigation; there is no
+                    // capture of one, and guessing which field holds the path is
+                    // the fabrication the honesty rule exists to prevent.
+                    // Record one, and this arm is where it lands.
                     _ => ConversationFold::Nothing,
                 }
             }
@@ -712,6 +729,18 @@ impl ConversationState {
         }
     }
 
+    /// An app-server request: an approval this conversation has to answer.
+    ///
+    /// **Codex attributes these to a thread and laplus does not read it yet.**
+    /// `params.threadId` is on every one of them — see
+    /// `fixtures/codex-app-server/03-write-approval.jsonl` — so a permission a
+    /// *subagent* asked for is distinguishable from the root's, and
+    /// [`crate::approval::ApprovalRequest::subagent`] is the field that would
+    /// carry it. Until that is wired, a child's approval is folded as the root's:
+    /// truthful about the request, silent about who is waiting, and never
+    /// attributed to a child on a guess. The child's stream therefore records no
+    /// blocker, which is the honest degradation rather than the intended end
+    /// state.
     fn fold_request(&mut self, method: &str, id: &Value, params: &Value) -> ConversationFold {
         let (request_kind, tool_name, input) = match method {
             "item/commandExecution/requestApproval" => (
@@ -1797,10 +1826,10 @@ mod tests {
             "params": {"threadId": "child-thread", "itemId": "m-1", "delta": "the decoder."}
         }));
         let said = |folded: ConversationFold| match folded {
-            ConversationFold::SubagentWorked(ChildWork {
+            ConversationFold::SubagentWorked(ChildNotification {
                 thread_id,
                 path,
-                what: ChildEvent::Said { item_id, text },
+                event: ChildEvent::Said { item_id, text },
             }) => (thread_id, path, item_id, text),
             other => panic!("the child's prose was not the child's: {other:?}"),
         };
@@ -1827,7 +1856,7 @@ mod tests {
                 "exitCode": 0
             }}
         }));
-        let ConversationFold::SubagentWorked(ChildWork { what: ChildEvent::Ran(command), .. }) = ran
+        let ConversationFold::SubagentWorked(ChildNotification { event: ChildEvent::Ran(command), .. }) = ran
         else {
             panic!("the child's command was not folded as one");
         };
