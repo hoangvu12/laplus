@@ -472,10 +472,18 @@ const STALE: &str = "Unknown pending permission request";
 ///
 /// `child_id` is the row's **stream reference**: the address of the subagent
 /// work stream this row launches, and the id
-/// `orchestration.subscribeSubagent` is asked for. `None` is a driver that does
-/// not record one yet — the Claude and Codex adapters, until tickets 03 and 04 —
-/// and it is absent from the payload rather than null, so a client cannot offer
-/// to open a stream that is not there.
+/// `orchestration.subscribeSubagent` is asked for. It is absent from the
+/// payload rather than null, so a client cannot offer to open a stream that is
+/// not there.
+///
+/// Every driver that reaches this function now records one, so `None` no longer
+/// names a provider — it names a row with nothing to launch, and only the tests
+/// below still build one. They are what keeps the absent-payload behaviour
+/// honest: the rows that genuinely have no stream do not come through here at
+/// all. Codex's collaboration *operation* rows (spawn, wait, sendInput) are
+/// built by `codex::collaboration_call_row`, and they carry no `childId`
+/// precisely because completing an operation must not look like completing the
+/// child it concerns.
 pub fn subagent(
     task: &crate::protocol::SubagentTask,
     turn_id: Option<String>,

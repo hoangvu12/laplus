@@ -648,11 +648,15 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
  * put a second, worse copy of the child's work inside the parent transcript,
  * which is the thing the subagent work stream exists to stop.
  *
- * Launching outranks expanding, and both need somewhere to go: a row whose
- * driver records no stream (`subagentChildId` absent — Claude and Codex until
- * tickets 03 and 04) or a surface with nowhere to put a child tab falls back to
- * the ordinary disclosure, and a row with no body at all is inert rather than
- * offering an affordance that does nothing.
+ * Launching outranks expanding, and both need somewhere to go: a row with no
+ * stream to launch (`subagentChildId` absent) or a surface with nowhere to put
+ * a child tab falls back to the ordinary disclosure, and a row with no body at
+ * all is inert rather than offering an affordance that does nothing.
+ *
+ * All three drivers record a stream now, so the absent case is no longer a
+ * provider that has not caught up. It is a row that is not a child: an ordinary
+ * tool call, or one of Codex's collaboration operation rows, which stay
+ * deliberately separate from the children they concern.
  */
 export type WorkEntryActivation =
   | { readonly kind: "launch-subagent"; readonly childId: string }
