@@ -253,9 +253,17 @@ impl Entry {
     }
 }
 
-/// One delegated child: who it is, what it was asked for, and everything it did.
+/// A stream without its work: who the child is, what it was asked for, where it
+/// is, and how it ended.
+///
+/// A type of its own rather than eight fields on [`Stream`], because it is
+/// exactly the part that travels alone. It is what the durable row holds
+/// ([`crate::transcripts::Write::SubagentStream`]) and what crosses the wire on
+/// every update, and both are for [`crate::threads::ThreadRow`]'s reason: a
+/// child that says one more thing must not cost a copy of everything it has
+/// already said.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Stream {
+pub struct Head {
     /// Stable for the child's whole life, and the address of its right-panel
     /// surface. Minted by the adapter from whatever the provider makes durable.
     pub child_id: String,
@@ -273,63 +281,18 @@ pub struct Stream {
     pub assignment: Option<String>,
     pub state: State,
     pub outcome: Option<Outcome>,
-    pub entries: Vec<Entry>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-/// A stream without its work: everything the parent's compact row and a tab
-/// label need.
-///
-/// Written down on its own rather than as part of the stream, for
-/// [`crate::threads::ThreadRow`]'s reason: a child that says one more thing must
-/// not cost a copy of everything it has already said.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Head {
-    pub child_id: String,
-    pub parent_child_id: Option<String>,
-    pub name: Option<String>,
-    pub assignment: Option<String>,
-    pub state: State,
-    pub outcome: Option<Outcome>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-impl Stream {
-    pub fn row(&self) -> Head {
-        Head {
-            child_id: self.child_id.clone(),
-            parent_child_id: self.parent_child_id.clone(),
-            name: self.name.clone(),
-            assignment: self.assignment.clone(),
-            state: self.state,
-            outcome: self.outcome.clone(),
-            created_at: self.created_at.clone(),
-            updated_at: self.updated_at.clone(),
-        }
-    }
-
-    fn new(child_id: String, created_at: String) -> Stream {
-        Stream {
-            child_id,
-            parent_child_id: None,
-            name: None,
-            assignment: None,
-            state: State::Pending,
-            outcome: None,
-            entries: Vec::new(),
-            created_at: created_at.clone(),
-            updated_at: created_at,
-        }
-    }
-
-    /// The stream without its entries: identity, assignment, state, outcome.
+impl Head {
+    /// The contract's `OrchestrationSubagentStream`.
     ///
-    /// What a client needs to label a tab and what the parent's compact row
-    /// already says, and deliberately *not* the work — see the module note on
-    /// why the two travel separately.
-    pub fn head(&self) -> Value {
+    /// `entry_count` is passed rather than held, because it is the one thing on
+    /// this object that is a fact about the work rather than about the child —
+    /// storing it here would be a second copy of `entries.len()` to keep in
+    /// step.
+    fn to_value(&self, entry_count: usize) -> Value {
         json!({
             "childId": self.child_id,
             "parentChildId": self.parent_child_id,
@@ -337,15 +300,49 @@ impl Stream {
             "assignment": self.assignment,
             "state": self.state.as_str(),
             "outcome": self.outcome.as_ref().map(Outcome::to_value),
-            "entryCount": self.entries.len(),
+            "entryCount": entry_count,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         })
     }
+}
+
+/// One delegated child: who it is, what it was asked for, and everything it did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stream {
+    pub head: Head,
+    pub entries: Vec<Entry>,
+}
+
+impl Stream {
+    fn new(child_id: String, created_at: String) -> Stream {
+        Stream {
+            head: Head {
+                child_id,
+                parent_child_id: None,
+                name: None,
+                assignment: None,
+                state: State::Pending,
+                outcome: None,
+                created_at: created_at.clone(),
+                updated_at: created_at,
+            },
+            entries: Vec::new(),
+        }
+    }
+
+    /// The stream without its entries, on the wire.
+    ///
+    /// What a client needs to label a tab and what the parent's compact row
+    /// already says, and deliberately *not* the work — see the module note on
+    /// why the two travel separately.
+    fn head_value(&self) -> Value {
+        self.head.to_value(self.entries.len())
+    }
 
     fn snapshot(&self) -> Value {
         json!({
-            "stream": self.head(),
+            "stream": self.head_value(),
             "entries": self.entries.iter().map(Entry::to_value).collect::<Vec<_>>(),
         })
     }
@@ -532,7 +529,7 @@ impl Streams {
         let mut open = lock(&self.inner.open);
         for (thread_id, mut stream) in stored {
             stream.entries.sort_by_key(|entry| entry.sequence);
-            open.entry(slot_key(&thread_id, &stream.child_id))
+            open.entry(slot_key(&thread_id, &stream.head.child_id))
                 .or_insert_with(|| {
                     Arc::new(Slot {
                         stream: Mutex::new(stream),
@@ -572,35 +569,36 @@ impl Streams {
         {
             let mut stream = lock(&slot.stream);
             let mut head_moved = false;
-            if update.parent_child_id.is_some() && stream.parent_child_id != update.parent_child_id
+            if update.parent_child_id.is_some()
+                && stream.head.parent_child_id != update.parent_child_id
             {
-                stream.parent_child_id = update.parent_child_id;
+                stream.head.parent_child_id = update.parent_child_id;
                 head_moved = true;
             }
-            if update.name.is_some() && stream.name != update.name {
-                stream.name = update.name;
+            if update.name.is_some() && stream.head.name != update.name {
+                stream.head.name = update.name;
                 head_moved = true;
             }
-            if update.assignment.is_some() && stream.assignment != update.assignment {
-                stream.assignment = update.assignment;
+            if update.assignment.is_some() && stream.head.assignment != update.assignment {
+                stream.head.assignment = update.assignment;
                 head_moved = true;
             }
             // A terminal state is final. A provider that goes on narrating a
             // child it has already reported on must not reopen it, which is the
             // same rule the compact row has always followed.
             if let Some(state) = update.state {
-                if !stream.state.terminal() && stream.state != state {
-                    stream.state = state;
+                if !stream.head.state.terminal() && stream.head.state != state {
+                    stream.head.state = state;
                     head_moved = true;
                 }
             }
 
             let mut entries = update.entries;
             if let Some(outcome) = &update.outcome {
-                if stream.outcome.is_none() {
+                if stream.head.outcome.is_none() {
                     entries.push(NewEntry::concluded(outcome));
-                    stream.outcome = Some(outcome.clone());
-                    stream.state = outcome.kind.state();
+                    stream.head.outcome = Some(outcome.clone());
+                    stream.head.state = outcome.kind.state();
                     head_moved = true;
                 }
             }
@@ -614,8 +612,8 @@ impl Streams {
                     .map(|entry| entry.sequence + 1)
                     .unwrap_or(1);
                 let id = match &new.key {
-                    Some(key) => format!("{}:k:{key}", stream.child_id),
-                    None => format!("{}:n:{next}", stream.child_id),
+                    Some(key) => format!("{}:k:{key}", stream.head.child_id),
+                    None => format!("{}:n:{next}", stream.head.child_id),
                 };
                 let existing = stream.entries.iter().position(|entry| entry.id == id);
                 let entry = match existing {
@@ -648,7 +646,7 @@ impl Streams {
                 head_moved = true;
                 writes.push(Write::SubagentEntry {
                     thread_id: thread_id.to_string(),
-                    child_id: stream.child_id.clone(),
+                    child_id: stream.head.child_id.clone(),
                     entry: Box::new(entry.clone()),
                 });
                 published.push(json!({"kind": "entry-upserted", "entry": entry.to_value()}));
@@ -657,13 +655,13 @@ impl Streams {
             if !head_moved {
                 return;
             }
-            stream.updated_at = at;
-            published.push(json!({"kind": "stream-updated", "stream": stream.head()}));
+            stream.head.updated_at = at;
+            published.push(json!({"kind": "stream-updated", "stream": stream.head_value()}));
             writes.insert(
                 0,
                 Write::SubagentStream {
                     thread_id: thread_id.to_string(),
-                    head: Box::new(stream.row()),
+                    head: Box::new(stream.head.clone()),
                 },
             );
         }
@@ -732,7 +730,8 @@ impl Streams {
             .map(|(_, slot)| lock(&slot.stream).clone())
             .collect();
         found.sort_by(|left, right| {
-            (&left.created_at, &left.child_id).cmp(&(&right.created_at, &right.child_id))
+            (&left.head.created_at, &left.head.child_id)
+                .cmp(&(&right.head.created_at, &right.head.child_id))
         });
         found
     }
@@ -777,15 +776,8 @@ impl From<Head> for Stream {
     /// two ordered lists the way the transcript reader walks three.
     fn from(head: Head) -> Stream {
         Stream {
-            child_id: head.child_id,
-            parent_child_id: head.parent_child_id,
-            name: head.name,
-            assignment: head.assignment,
-            state: head.state,
-            outcome: head.outcome,
+            head,
             entries: Vec::new(),
-            created_at: head.created_at,
-            updated_at: head.updated_at,
         }
     }
 }
@@ -891,7 +883,7 @@ mod tests {
         );
 
         let stream = streams.get("thread-1", "child-1").expect("the stream");
-        assert_eq!(stream.state, State::Completed);
+        assert_eq!(stream.head.state, State::Completed);
         assert_eq!(stream.entries.len(), 2);
         let last = stream.entries.last().expect("the terminal entry");
         assert_eq!(last.kind, EntryKind::Outcome);
@@ -909,8 +901,8 @@ mod tests {
             Update::for_child("child-1").concluded(Outcome::completed(Some("   ".into()))),
         );
         let stream = streams.get("thread-1", "child-1").expect("the stream");
-        assert_eq!(stream.outcome.expect("an outcome").kind, OutcomeKind::Empty);
-        assert_eq!(stream.state, State::Completed);
+        assert_eq!(stream.head.outcome.expect("an outcome").kind, OutcomeKind::Empty);
+        assert_eq!(stream.head.state, State::Completed);
     }
 
     /// Anything a provider goes on saying after it has reported must not reopen
@@ -929,9 +921,9 @@ mod tests {
                 .concluded(Outcome::failed(Some("no".into()))),
         );
         let stream = streams.get("thread-1", "child-1").expect("the stream");
-        assert_eq!(stream.state, State::Completed);
+        assert_eq!(stream.head.state, State::Completed);
         assert_eq!(
-            stream.outcome.expect("an outcome").text.as_deref(),
+            stream.head.outcome.expect("an outcome").text.as_deref(),
             Some("eleven")
         );
     }

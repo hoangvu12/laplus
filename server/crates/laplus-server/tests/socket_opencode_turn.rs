@@ -2567,7 +2567,7 @@ async fn a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing() {
 /// The other half of [`a_subagent_gets_a_row_of_its_own_and_says_what_it_is_doing`],
 /// and the half that was only ever assumed.
 ///
-/// `subagent_row` returns `None` for two opposite reasons — "not a subagent",
+/// `normalize_subagent` returns `None` for two opposite reasons — "not a subagent",
 /// which is an invitation to draw the ordinary tool row, and "a subagent that
 /// cannot be named yet", which is a request to draw nothing at all. The caller
 /// cannot tell them apart, so the `pending` `task` part OpenCode opens every
@@ -2719,7 +2719,12 @@ async fn an_opencode_child_work_stream_replays_and_then_continues_live() {
         .as_array()
         .expect("the snapshot carries the entries so far")
         .clone();
-    let mut seen_ids: Vec<String> = Vec::new();
+    // Every entry id the wire ever carried, replay and live together, in the
+    // order it first appeared.
+    let mut seen_ids: Vec<String> = folded
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("an entry id").to_string())
+        .collect();
     for item in replayed.iter().chain(live.iter()) {
         let Some(entry) = item["entry"].as_object() else {
             continue;
@@ -2759,6 +2764,18 @@ async fn an_opencode_child_work_stream_replays_and_then_continues_live() {
         folded.len(),
         3,
         "a part OpenCode resent carrying the prose so far became a second entry"
+    );
+    // And the wire carried no fourth entry to be folded away. Without this the
+    // claim above would only be that the client's fold is idempotent, which is
+    // true of a server sending anything at all.
+    assert_eq!(
+        seen_ids,
+        vec![
+            "call_task_1:k:child-prt-2".to_string(),
+            "call_task_1:k:child-prt-3".to_string(),
+            "call_task_1:k:outcome".to_string(),
+        ],
+        "the child's stream carried an entry nothing asked for"
     );
 
     // The conclusion is the stream's, not a replacement for it.
@@ -2848,6 +2865,199 @@ async fn an_opencode_child_work_stream_replays_and_then_continues_live() {
     );
 
     server.stop().await;
+    peer.task.abort();
+}
+
+/// Closing the tab is presentation only: the server goes on recording the child
+/// while nobody is watching, and reopening replays what it recorded meanwhile.
+///
+/// The half of "closing a child tab hides only the view" that a client-state
+/// test cannot reach. The right-panel store has no way to send a provider
+/// command, which is an argument rather than evidence; this drives the actual
+/// unsubscribe against a child that is still working and then asks the server
+/// what it has.
+#[tokio::test]
+async fn closing_a_child_surface_does_not_stop_the_server_recording_it() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_subagent(release.clone()).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("child-hidden-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("child-hidden-project", "child-hidden-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("child-hidden-thread").await;
+    let mut command = start_turn("child-hidden-thread", "child-hidden-message", "count");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+
+    // Open the child, then close the tab while it is still working.
+    let mut inspector = server.connect().await;
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "child-hidden-thread", "childId": "call_task_1"}),
+        )
+        .await;
+    let opened = inspector.next_chunk(&stream).await;
+    let watching = opened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child opens")["snapshot"]["entries"]
+        .as_array()
+        .expect("entries")
+        .len();
+    inspector.interrupt(&stream).await;
+
+    // Everything the child does from here happens with no surface open.
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+
+    let stream = inspector
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "child-hidden-thread", "childId": "call_task_1"}),
+        )
+        .await;
+    let reopened = inspector.next_chunk(&stream).await;
+    let snapshot = reopened
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("the child reopens")["snapshot"]
+        .clone();
+    let entries = snapshot["entries"].as_array().expect("entries");
+    assert!(
+        entries.len() > watching,
+        "the child stopped being recorded when its tab closed: {watching} entries open, \
+         {} after", entries.len()
+    );
+    assert_eq!(
+        snapshot["stream"]["state"], "completed",
+        "a child nobody was watching never reached its conclusion: {snapshot:#?}"
+    );
+    assert_eq!(snapshot["stream"]["outcome"]["text"], "eleven files");
+
+    inspector.close().await;
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// The complete child stream replays after the application restarts.
+///
+/// Two servers over one database file with nothing shared but the path, which
+/// is the shape [`an_owned_opencode_session_is_re_adopted_after_a_server_restart`]
+/// uses. This is what exercises `Shell::new`'s restore of the stored streams —
+/// a socket test against one running process proves the memory, not the disk.
+#[tokio::test]
+async fn a_child_work_stream_replays_after_the_server_restarts() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_subagent(release.clone()).await;
+    let data = tempfile::tempdir().expect("a data directory");
+    let database = data.path().join("registry.sqlite");
+    let workspace = Workspace::with(&["src/"]);
+
+    let first = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let mut client = first.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("child-restart-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("child-restart-project", "child-restart-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("child-restart-thread").await;
+    let mut command = start_turn("child-restart-thread", "child-restart-message", "count");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+    client.close().await;
+    first.stop().await;
+
+    // A second process, which has never seen this child produce anything.
+    let second = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let mut reopened = second.connect().await;
+    let stream = reopened
+        .subscribe(
+            "orchestration.subscribeSubagent",
+            json!({"threadId": "child-restart-thread", "childId": "call_task_1"}),
+        )
+        .await;
+    let replayed = reopened.next_chunk(&stream).await;
+    let snapshot = replayed
+        .iter()
+        .find(|item| item["kind"] == "snapshot")
+        .expect("a restored child replays")["snapshot"]
+        .clone();
+
+    assert_eq!(snapshot["stream"]["name"], "explore");
+    assert_eq!(snapshot["stream"]["assignment"], "Count the files");
+    assert_eq!(snapshot["stream"]["state"], "completed");
+    assert_eq!(snapshot["stream"]["outcome"]["kind"], "completed");
+    assert_eq!(snapshot["stream"]["outcome"]["text"], "eleven files");
+    let read: Vec<(i64, &str, &str)> = snapshot["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            (
+                entry["sequence"].as_i64().expect("a sequence"),
+                entry["kind"].as_str().expect("a kind"),
+                entry["payload"]["text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (1, "message", "looking through the directory"),
+            (2, "message", "eleven so far"),
+            (3, "outcome", "eleven files"),
+        ],
+        "the restart did not bring the child's work back in order: {snapshot:#?}"
+    );
+
+    reopened.close().await;
+    second.stop().await;
     peer.task.abort();
 }
 

@@ -411,6 +411,12 @@ the `childId` its work stream is addressed by. It is the index and the launcher;
 the work itself is never duplicated into the parent transcript.
 `crate::worklog::subagent`.
 
+**Stream head** — a subagent work stream without its work: identity, parent
+identity, name, assignment, state and outcome. Exactly the part that travels
+alone — it is the durable row, and it is what crosses the wire on every update —
+so a child that says one more thing does not cost a copy of everything it has
+already said. `crate::subagents::Head`.
+
 **Stream entry** — one thing that happened in a subagent's session, with a
 stable id, a position, a kind and a payload. Upserted by id and ordered by
 position, which is what lets a client's replay and its live continuation meet

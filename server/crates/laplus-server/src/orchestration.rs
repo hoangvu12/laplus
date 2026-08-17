@@ -395,12 +395,22 @@ impl Shell {
             Vec::new()
         });
 
-        // Read with the conversations rather than lazily, for their reason and
-        // one of its own: a child stream is small and there are few of them, and
-        // a client that restored a child tab must find something to replay
-        // rather than an unavailable surface that would fill in a moment later.
-        // What is *not* eager is the wire — a stream crosses the socket only
-        // when its surface opens. See [`crate::subagents`].
+        // Read with the conversations rather than lazily, and the distinction
+        // worth being exact about is *which* laziness the spec asks for: it is
+        // the client's and the wire's — "load a full child stream only when its
+        // right-panel surface is open" — and that is honoured, because a stream
+        // crosses the socket only when `orchestration.subscribeSubagent` asks
+        // for one.
+        //
+        // This boot read is the same trade-off the conversations above are read
+        // under, and it inherits their cost: a process holds every child's
+        // entries for the life of the run, as it already holds every message and
+        // every work-log row. That is bounded by the same history and is what
+        // lets a restored child tab find something to replay rather than an
+        // unavailable surface that would fill in a moment later. If the boot
+        // read ever becomes the thing that costs, both halves move together —
+        // this is not a place to be lazier than the transcript beside it. See
+        // [`crate::subagents`].
         let children = database.child_streams().unwrap_or_else(|error| {
             eprintln!("laplus: cannot read the stored subagent work streams: {error}");
             Vec::new()

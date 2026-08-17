@@ -435,7 +435,7 @@ pub async fn rollback(
 /// in its input.
 const TASK_TOOL: &str = "task";
 
-/// What [`OpenCode::subagent_row`] decided to draw for a part, which is a
+/// What [`OpenCode::normalize_subagent`] decided to draw for a part, which is a
 /// three-way question the [`Option`] it used to return could only answer two
 /// ways. Not to be confused with [`SubagentRow`], which is what is *known* about
 /// a subagent; this is what to put on screen for one part.
@@ -449,10 +449,66 @@ enum Drawn {
     /// Some other tool. The ordinary tool row should handle it.
     NotASubagent,
     /// A subagent's part, but not one worth drawing yet. The naming rule in
-    /// [`OpenCode::subagent_row`] says why waiting is right; this says that
+    /// [`OpenCode::normalize_subagent`] says why waiting is right; this says that
     /// waiting means waiting rather than falling through.
     TooEarly,
     Row(crate::threads::Activity),
+}
+
+/// What one `task` part's status says about the subagent, in the three
+/// vocabularies that have to agree about it.
+///
+/// One reading rather than three, because the compact row, the child's
+/// lifecycle state and its terminal outcome are three views of one fact: a
+/// `task` part that reached `completed`. Deciding them separately is how a row
+/// saying "completed" ends up beside a stream still saying "working".
+struct Reported {
+    /// The compact row's `status`, in [`crate::protocol::SubagentTask`]'s
+    /// vocabulary.
+    row_status: &'static str,
+    state: crate::subagents::State,
+    /// `Some` exactly when the call is over. Also what
+    /// [`crate::worklog::subagent`] puts on the row as its summary, so the row's
+    /// answer and the stream's terminal entry are literally the same string.
+    outcome: Option<crate::subagents::Outcome>,
+}
+
+impl Reported {
+    fn of(
+        status: &str,
+        state: &Value,
+        field: &impl Fn(Option<&Value>, &str) -> Option<String>,
+    ) -> Reported {
+        match status {
+            "completed" => Reported {
+                row_status: "completed",
+                state: crate::subagents::State::Completed,
+                outcome: Some(crate::subagents::Outcome::completed(field(
+                    Some(state),
+                    "output",
+                ))),
+            },
+            "error" => Reported {
+                row_status: "failed",
+                state: crate::subagents::State::Failed,
+                outcome: Some(crate::subagents::Outcome::failed(field(Some(state), "error"))),
+            },
+            // Announced but not yet started. The row still reads as running —
+            // it is not drawn at all until the subagent can be named — while
+            // the stream distinguishes the two, because a tab opened on a child
+            // that has done nothing has something honest to say.
+            "pending" => Reported {
+                row_status: "running",
+                state: crate::subagents::State::Pending,
+                outcome: None,
+            },
+            _ => Reported {
+                row_status: "running",
+                state: crate::subagents::State::Working,
+                outcome: None,
+            },
+        }
+    }
 }
 
 /// What is known about one subagent, accumulated across the events that mention
@@ -1131,7 +1187,8 @@ impl OpenCode {
             });
     }
 
-    /// The `task` tool is a subagent, so it gets a subagent's row.
+    /// The `task` tool is a subagent, so it gets a subagent's row **and** a
+    /// subagent's work stream.
     ///
     /// Returns [`Drawn::NotASubagent`] for every other tool, which is what
     /// leaves the ordinary [`tool_activity`] to handle them. A `task` part is
@@ -1160,7 +1217,7 @@ impl OpenCode {
     /// the `task` call's, for the same reason the row's collapse key is: it is
     /// there from the `pending` part onwards and lasts exactly as long as the
     /// subagent.
-    fn subagent_row(
+    fn normalize_subagent(
         &mut self,
         part: &Value,
         driving: &crate::session::Driving,
@@ -1208,24 +1265,22 @@ impl OpenCode {
         let said = row.said.clone();
         let (kind, description) = (row.kind.clone(), row.description.clone());
 
+        // What this `task` status means, read **once**. The row and the child's
+        // own stream are two views of one child, so deciding their status apart
+        // is how they would come to disagree about whether it had finished.
+        let reported = Reported::of(status, state, &field);
+
         // The child's own stream, from the same part. Recorded from `pending`
         // onwards — before the row can be named — so that identity exists for
         // the whole of the child's life rather than from the moment it becomes
         // presentable.
         let update = crate::subagents::Update::for_child(call.clone())
             .named(kind.clone())
-            .assigned(description.clone());
-        decided.child_streams.push(match status {
-            "completed" => update.concluded(crate::subagents::Outcome::completed(field(
-                Some(state),
-                "output",
-            ))),
-            "error" => update.concluded(crate::subagents::Outcome::failed(field(
-                Some(state),
-                "error",
-            ))),
-            "pending" => update.in_state(crate::subagents::State::Pending),
-            _ => update.in_state(crate::subagents::State::Working),
+            .assigned(description.clone())
+            .in_state(reported.state);
+        decided.child_streams.push(match reported.outcome.clone() {
+            Some(outcome) => update.concluded(outcome),
+            None => update,
         });
 
         // OpenCode announces the call before it knows what it is: the first
@@ -1235,7 +1290,7 @@ impl OpenCode {
         // the defect the Claude driver has a whole record to avoid. So the row
         // waits until the subagent can be named — unless the call is already over,
         // because an unnamed subagent that failed still has to be reported.
-        if kind.is_none() && !matches!(status, "completed" | "error") {
+        if kind.is_none() && reported.outcome.is_none() {
             return Drawn::TooEarly;
         }
 
@@ -1243,19 +1298,10 @@ impl OpenCode {
             &crate::protocol::SubagentTask {
                 task_id: call.clone(),
                 tool_use_id: Some(call.clone()),
-                status: match status {
-                    "completed" => "completed",
-                    "error" => "failed",
-                    _ => "running",
-                }
-                .to_string(),
+                status: reported.row_status.to_string(),
                 description,
                 subagent_type: kind,
-                summary: match status {
-                    "completed" => field(Some(state), "output"),
-                    "error" => field(Some(state), "error"),
-                    _ => None,
-                },
+                summary: reported.outcome.and_then(|outcome| outcome.text),
                 said,
             },
             driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
@@ -1710,7 +1756,7 @@ impl crate::session::Driver for OpenCode {
                 // them is what the developer wants to read. `TooEarly` draws
                 // nothing *and falls through to nothing* — the tool row is not a
                 // consolation prize for a row that is not ready.
-                match self.subagent_row(part, driving, &mut decided) {
+                match self.normalize_subagent(part, driving, &mut decided) {
                     Drawn::Row(activity) => decided
                         .changes
                         .push(crate::threads::Change::Activity(activity)),

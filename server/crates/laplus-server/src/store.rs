@@ -1801,7 +1801,7 @@ impl Database {
             .iter()
             .enumerate()
             .map(|(index, (thread_id, stream))| {
-                ((thread_id.clone(), stream.child_id.clone()), index)
+                ((thread_id.clone(), stream.head.child_id.clone()), index)
             })
             .collect();
         let mut streams = heads;

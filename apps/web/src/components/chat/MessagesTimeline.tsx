@@ -76,6 +76,7 @@ import {
   resolveTimelineMinimapIndexFromPointer,
   resolveTimelineMinimapInteractiveWidth,
   resolveTimelineMinimapTopPercent,
+  resolveWorkEntryActivation,
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
   TIMELINE_MINIMAP_MIN_ITEMS,
@@ -1186,7 +1187,9 @@ const WorkGroupSection = memo(function WorkGroupSection({
 }: {
   groupedEntries: Extract<MessagesTimelineRow, { kind: "work" }>["groupedEntries"];
 }) {
-  const { workspaceRoot } = use(TimelineRowCtx);
+  const shared = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+  const { workspaceRoot } = shared;
   const nonEmptyEntries = useMemo(
     () => groupedEntries.filter((entry) => !workEntryIndicatesToolNeutralStatus(entry)),
     [groupedEntries],
@@ -1213,6 +1216,8 @@ const WorkGroupSection = memo(function WorkGroupSection({
             key={workEntry.id}
             workEntry={workEntry}
             workspaceRoot={workspaceRoot}
+            activeTurnInProgress={activity.activeTurnInProgress}
+            onOpenSubagent={shared.onOpenSubagent}
           />
         ))}
       </div>
@@ -1954,13 +1959,24 @@ function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
 
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
-const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
+/**
+ * One row of the work log.
+ *
+ * Takes what it needs rather than reading the timeline's two ambient contexts,
+ * which is what lets the subagent surface render a child's work through this
+ * same component in a read-only configuration — see
+ * `SubagentStreamPanel`, and the spec's "Reuse the main agent's transcript and
+ * work-entry components in a read-only configuration". A caller outside a turn
+ * passes neither prop: nothing is in flight and there is nowhere to launch a
+ * child from.
+ */
+export const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
+  activeTurnInProgress?: boolean;
+  onOpenSubagent?: ((childId: string) => void) | undefined;
 }) {
   const { workEntry, workspaceRoot } = props;
-  const activity = use(TimelineRowActivityCtx);
-  const shared = use(TimelineRowCtx);
   const [expanded, setExpanded] = useState(false);
   const iconConfig = workToneIcon(workEntry.tone);
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
@@ -1999,25 +2015,36 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
     : showDestructiveRowStyle
       ? "font-medium text-destructive"
       : "font-medium text-foreground/82";
-  const turnSettled = !activity.activeTurnInProgress;
+  const turnSettled = !props.activeTurnInProgress;
   const showNeutralIndicator = !turnSettled && workEntryIndicatesToolNeutralStatus(workEntry);
   const showSuccessIndicator =
     workEntryIndicatesToolSuccess(workEntry) ||
     (turnSettled && workEntryIndicatesToolNeutralStatus(workEntry));
-  // A compact subagent row is a **launcher**, not a disclosure: clicking it
-  // opens or activates that child's work stream in the right-panel workspace,
-  // where the full session is. Expanding it in place would put a second, worse
-  // copy of the child's work in the parent transcript, which is the thing this
-  // feature exists to stop.
-  const openSubagent = workEntry.subagentChildId ? shared.onOpenSubagent : undefined;
-  const childId = workEntry.subagentChildId;
-  const activate = openSubagent && childId ? () => openSubagent(childId) : null;
+  // `resolveWorkEntryActivation` is where launching-versus-expanding is
+  // decided and argued; this only performs it, so one keyboard-and-pointer
+  // affordance serves both rather than being written out twice.
+  const onOpenSubagent = props.onOpenSubagent;
+  const activation = resolveWorkEntryActivation({
+    subagentChildId: workEntry.subagentChildId,
+    canLaunchSubagent: onOpenSubagent !== undefined,
+    canExpand,
+  });
+  const activate =
+    activation.kind === "launch-subagent"
+      ? () => onOpenSubagent?.(activation.childId)
+      : activation.kind === "expand"
+        ? () => setExpanded((v) => !v)
+        : null;
   const rowToggleProps =
-    activate !== null
-      ? {
+    activate === null
+      ? {}
+      : {
           role: "button" as const,
           tabIndex: 0 as const,
-          "aria-label": `Open subagent work stream: ${displayText}`,
+          "aria-label":
+            activation.kind === "launch-subagent"
+              ? `Open subagent work stream: ${displayText}`
+              : displayText,
           onClick: activate,
           onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
             if (e.key === "Enter" || e.key === " ") {
@@ -2025,27 +2052,13 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
               activate();
             }
           },
-        }
-      : canExpand
-        ? {
-            role: "button" as const,
-            tabIndex: 0 as const,
-            "aria-label": displayText,
-            onClick: () => setExpanded((v) => !v),
-            onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                setExpanded((v) => !v);
-              }
-            },
-          }
-        : {};
+        };
 
   return (
     <div
       className={cn(
         "flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
-        (canExpand || activate !== null) &&
+        activate !== null &&
           "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
       )}
       {...rowToggleProps}

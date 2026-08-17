@@ -62,13 +62,3 @@ export function applySubagentStreamItem(
     }
   }
 }
-
-/**
- * The child's terminal entry, if it has reached one.
- *
- * Read off the stream rather than off the last entry: a provider may go on
- * narrating after it has reported, and the conclusion is the conclusion.
- */
-export function subagentStreamOutcome(state: SubagentStreamState) {
-  return state.stream?.outcome ?? null;
-}
