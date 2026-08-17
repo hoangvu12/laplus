@@ -146,13 +146,14 @@ function workEntryForKind(
 }
 
 /**
- * A blocker, as the row the conversation draws for the same wait.
+ * How each way a blocker can end is named.
  *
- * A question borrows the main agent's own `user-input.requested` chrome, because
- * it *is* the same event seen from the child's side. A permission has no
- * equivalent inert row in the transcript — the conversation shows it as an
- * actionable panel, which is where it stays — so it is drawn as an ordinary
- * informational row saying what the child stopped for.
+ * Keyed by the contract's own closed literal, like `OUTCOME_LABELS` and for its
+ * reason: the wire carries the resolution's *identity* and the wording is this
+ * client's, so a resolution added to `OrchestrationSubagentResolution` is a type
+ * error here rather than a blocker whose end silently goes unlabelled.
+ * **undelivered** is worded as the news it is — the developer decided and the
+ * child was never told, which is not the same as having been refused.
  */
 const RESOLUTION_LABELS: Record<OrchestrationSubagentResolution, string> = {
   approved: "Approved",
@@ -164,6 +165,19 @@ const RESOLUTION_LABELS: Record<OrchestrationSubagentResolution, string> = {
   undelivered: "Your decision could not be delivered",
 };
 
+/**
+ * A blocker, as the row the conversation draws for the same wait.
+ *
+ * A question borrows the main agent's own `user-input.requested` chrome, because
+ * it *is* the same event seen from the child's side. A permission has no
+ * equivalent inert row in the transcript — the conversation shows it as an
+ * actionable panel, which is where it stays — so it is drawn as an ordinary
+ * informational row saying what the child stopped for.
+ *
+ * Its twin is `blocker_activity` in `opencode.rs`, which says the same thing on
+ * the *compact* row. The sentence is written twice on purpose — see that
+ * function for why sending it over the wire would be worse.
+ */
 function blockerWorkEntry(
   entry: Extract<OrchestrationSubagentEntry, { kind: "blocker" }>,
 ): WorkLogEntry {
