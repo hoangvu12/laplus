@@ -5372,6 +5372,7 @@ mod tests {
                         suggestions: Vec::new(),
                         available_decisions: None,
                         provider_request_id: None,
+                        subagent: None,
                     },
                     Some("turn-1".to_string()),
                 )),

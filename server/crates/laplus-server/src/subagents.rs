@@ -66,9 +66,9 @@ pub const SUBSCRIBE_SUBAGENT: &str = "orchestration.subscribeSubagent";
 ///
 /// Six rather than "running or not", because the inline row has to answer
 /// "should I be waiting for this?" and the three terminal answers are not the
-/// same news. [`State::Blocked`] is declared here and reached by nobody yet —
-/// it is what a child-owned permission or question puts a child into, which is
-/// ticket 02's work.
+/// same news. [`State::Blocked`] is the one that answers "it is waiting on
+/// *you*": a child that stopped for a permission or a question, recorded by the
+/// adapter that received the request and cleared when the developer answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Delegated, and not yet doing anything this server has seen.
@@ -198,14 +198,39 @@ impl Outcome {
 
 /// What one entry in a child stream *is*.
 ///
-/// Two members, because ticket 01 records two things: what the child said and
-/// how it ended. The vocabulary is open by design — commands, reads, edits, tool
-/// calls, warnings and blockers are ticket 02's, and they are added here rather
-/// than by a second stream type.
+/// Eight members covering the spec's shared kinds: child prose, commands and
+/// output, reads and searches, edits and diffs, other tool calls and results,
+/// warnings and errors, approvals or questions, and the terminal outcome. They
+/// are one vocabulary rather than one per provider, because a developer reading
+/// a child's work should not have to learn which agent produced it — and a
+/// provider that does not expose one of them simply never records it.
+///
+/// **A kind is a rendering decision, not a taxonomy.** [`EntryKind::Command`]
+/// exists because the main agent's work log draws a command differently from a
+/// file change, and the child's tab reuses those same rows; a provider whose
+/// tool laplus cannot place lands on [`EntryKind::Tool`], which is what the
+/// generic row already draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     /// The child's own prose.
     Message,
+    /// A command the child ran, with whatever the provider said about how it
+    /// went. Payload: [`Work`], carrying `command`.
+    Command,
+    /// A file the child read, or a search it made — the evidence it examined.
+    /// Payload: [`Work`], carrying `paths` and/or `query`.
+    Read,
+    /// A file the child changed. Payload: [`Work`], carrying `paths`, which is
+    /// what the child's tab offers file and diff navigation from.
+    Edit,
+    /// Any other tool call and its result. Payload: [`Work`].
+    Tool,
+    /// A warning or an error, in its place in the work rather than lifted out of
+    /// it. Payload: [`Notice`].
+    Notice,
+    /// A permission or a question the child stopped for, and — on the same
+    /// entry, under the same key — how it was resolved. Payload: [`Blocker`].
+    Blocker,
     /// The terminal entry: its result, failure, interruption, or empty answer.
     Outcome,
 }
@@ -214,6 +239,12 @@ impl EntryKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EntryKind::Message => "message",
+            EntryKind::Command => "command",
+            EntryKind::Read => "read",
+            EntryKind::Edit => "edit",
+            EntryKind::Tool => "tool",
+            EntryKind::Notice => "notice",
+            EntryKind::Blocker => "blocker",
             EntryKind::Outcome => "outcome",
         }
     }
@@ -221,10 +252,135 @@ impl EntryKind {
     fn from_str(value: &str) -> Option<EntryKind> {
         Some(match value {
             "message" => EntryKind::Message,
+            "command" => EntryKind::Command,
+            "read" => EntryKind::Read,
+            "edit" => EntryKind::Edit,
+            "tool" => EntryKind::Tool,
+            "notice" => EntryKind::Notice,
+            "blocker" => EntryKind::Blocker,
             "outcome" => EntryKind::Outcome,
             _ => return None,
         })
     }
+}
+
+/// One piece of a child's work, in the vocabulary the main agent's work rows
+/// already speak.
+///
+/// The status strings are the client's `toolLifecycleStatus` literals rather
+/// than any provider's, for the reason [`crate::worklog::subagent`] builds the
+/// same row the Claude driver does: the child's tab renders through the *same*
+/// components as the parent transcript, so a translation done here is a
+/// translation the client does not have to do twice.
+///
+/// Every field but `title` and `status` is optional and an absent one is
+/// **omitted**, not defaulted. A provider that does not report a command's exit,
+/// or which file a search covered, leaves laplus with nothing to say about it,
+/// and saying nothing is the honest answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Work {
+    /// What to call it — the tool's own name or the title it reported.
+    pub title: String,
+    /// `inProgress`, `completed`, or `failed`.
+    pub status: Progress,
+    /// The output, the error, or the one-line summary the provider gave.
+    pub detail: Option<String>,
+    /// The command line, for [`EntryKind::Command`].
+    pub command: Option<String>,
+    /// The files read or changed. What file and diff navigation is offered from.
+    pub paths: Vec<String>,
+    /// The pattern, for a search.
+    pub query: Option<String>,
+}
+
+/// How a piece of child work is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl Progress {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Progress::InProgress => "inProgress",
+            Progress::Completed => "completed",
+            Progress::Failed => "failed",
+        }
+    }
+}
+
+impl Work {
+    /// A piece of work with nothing known about it but what it is and how it is
+    /// going. Every other field is filled in by the adapter that can prove it.
+    pub fn new(title: impl Into<String>, status: Progress) -> Work {
+        Work {
+            title: title.into(),
+            status,
+            detail: None,
+            command: None,
+            paths: Vec::new(),
+            query: None,
+        }
+    }
+
+    pub fn detailed(mut self, detail: Option<String>) -> Work {
+        self.detail = detail.filter(|detail| !detail.trim().is_empty());
+        self
+    }
+
+    pub fn running(mut self, command: Option<String>) -> Work {
+        self.command = command.filter(|command| !command.trim().is_empty());
+        self
+    }
+
+    pub fn about(mut self, paths: Vec<String>) -> Work {
+        self.paths = paths;
+        self
+    }
+
+    pub fn matching(mut self, query: Option<String>) -> Work {
+        self.query = query.filter(|query| !query.trim().is_empty());
+        self
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "title": self.title,
+            "status": self.status.as_str(),
+            "detail": self.detail,
+            "command": self.command,
+            "paths": self.paths,
+            "query": self.query,
+        })
+    }
+}
+
+/// A warning or an error the child hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// `warning` or `error`.
+    pub level: &'static str,
+    pub text: String,
+}
+
+/// A permission or a question a child stopped for.
+///
+/// **One entry for the whole blocker**, asked and answered: the resolution is
+/// written back under the same key rather than appended as a second row, so a
+/// child's history reads "it waited for this, and this is what it was told"
+/// instead of leaving the developer to pair two entries by an id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocker {
+    /// The provider's own request id — the identity a response is routed by.
+    pub request_id: String,
+    /// `permission` or `question`.
+    pub kind: &'static str,
+    pub title: String,
+    pub detail: Option<String>,
+    /// What the developer decided, once they have. `None` is still waiting.
+    pub resolution: Option<String>,
 }
 
 /// One thing that happened in a child's session.
@@ -369,6 +525,47 @@ impl NewEntry {
             key,
             kind: EntryKind::Message,
             payload: json!({"text": text}),
+        }
+    }
+
+    /// Something the child *did*: a command, a read or search, an edit, or any
+    /// other tool call.
+    ///
+    /// The key is the provider's own name for the call, so the same call
+    /// arriving again as it progresses — announced, running, finished — moves
+    /// one entry through its statuses rather than leaving three rows saying the
+    /// same thing at different times. That is [`NewEntry::key`]'s whole
+    /// property, applied to work rather than to prose.
+    pub fn worked(key: Option<String>, kind: EntryKind, work: &Work) -> NewEntry {
+        NewEntry {
+            key,
+            kind,
+            payload: work.to_value(),
+        }
+    }
+
+    /// A warning or an error, kept in the order it happened.
+    pub fn noticed(key: Option<String>, notice: &Notice) -> NewEntry {
+        NewEntry {
+            key,
+            kind: EntryKind::Notice,
+            payload: json!({"level": notice.level, "text": notice.text}),
+        }
+    }
+
+    /// A permission or question the child stopped for — and, under the same key,
+    /// what it was eventually told. See [`Blocker`].
+    pub fn blocked(blocker: &Blocker) -> NewEntry {
+        NewEntry {
+            key: Some(format!("blocker:{}", blocker.request_id)),
+            kind: EntryKind::Blocker,
+            payload: json!({
+                "requestId": blocker.request_id,
+                "blocker": blocker.kind,
+                "title": blocker.title,
+                "detail": blocker.detail,
+                "resolution": blocker.resolution,
+            }),
         }
     }
 

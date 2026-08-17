@@ -574,30 +574,149 @@ export const OrchestrationSubagentOutcome = Schema.Struct({
 export type OrchestrationSubagentOutcome = typeof OrchestrationSubagentOutcome.Type;
 
 /**
- * What one stream entry is. `message` is the child's own prose and `outcome` is
- * the terminal entry — the conclusion lives in the same ordered stream as the
- * work that produced it rather than replacing it.
+ * What one stream entry is.
  *
- * An open vocabulary: commands, reads, edits, other tool calls, warnings and
- * blockers are added here as the adapters learn to normalize them.
+ * Eight kinds covering everything a delegated child does that a developer would
+ * want to read: its prose, the commands it ran, the files it read and the
+ * searches it made, the files it changed, its other tool calls, the warnings and
+ * errors it hit, the permissions and questions it stopped for, and how it ended.
+ * The conclusion lives in the same ordered stream as the work that produced it
+ * rather than replacing it.
+ *
+ * A provider that does not expose one of these simply never records it. A
+ * provider tool laplus cannot place lands on `tool`, which is the generic row —
+ * guessing which of the specific kinds an unrecognised tool resembles would be
+ * inventing detail the protocol did not give.
  */
-export const OrchestrationSubagentEntryKind = Schema.Literals(["message", "outcome"]);
+export const OrchestrationSubagentEntryKind = Schema.Literals([
+  "message",
+  "command",
+  "read",
+  "edit",
+  "tool",
+  "notice",
+  "blocker",
+  "outcome",
+]);
 export type OrchestrationSubagentEntryKind = typeof OrchestrationSubagentEntryKind.Type;
+
+/** The child's own prose. */
+export const OrchestrationSubagentMessage = Schema.Struct({ text: Schema.String });
+export type OrchestrationSubagentMessage = typeof OrchestrationSubagentMessage.Type;
+
+/**
+ * One piece of a child's work — a command, a read, a search, an edit, or any
+ * other tool call.
+ *
+ * The vocabulary is the client's own work-log vocabulary rather than any
+ * provider's, because the child's surface renders through the *same* components
+ * as the parent transcript: `status` is a `toolLifecycleStatus`, `command` is
+ * what a command row shows, and `paths` is what file and diff navigation is
+ * offered from. Every optional field is `null` when the provider did not say,
+ * which a client must present as absence rather than as emptiness.
+ */
+export const OrchestrationSubagentWork = Schema.Struct({
+  title: Schema.String,
+  status: Schema.Literals(["inProgress", "completed", "failed"]),
+  /** The output, the error, or the one-line summary the provider gave. */
+  detail: Schema.NullOr(Schema.String),
+  /** The command line, on a `command` entry. */
+  command: Schema.NullOr(Schema.String),
+  /** The files read or changed — what a file or diff action opens. */
+  paths: Schema.Array(Schema.String),
+  /** The pattern, on a search. */
+  query: Schema.NullOr(Schema.String),
+});
+export type OrchestrationSubagentWork = typeof OrchestrationSubagentWork.Type;
+
+/** A warning or an error, kept in the order it happened. */
+export const OrchestrationSubagentNotice = Schema.Struct({
+  level: Schema.Literals(["warning", "error"]),
+  text: Schema.String,
+});
+export type OrchestrationSubagentNotice = typeof OrchestrationSubagentNotice.Type;
+
+/**
+ * A permission or a question the child stopped for.
+ *
+ * One entry for the whole blocker: `resolution` is `null` while the child is
+ * waiting and carries what the developer decided once they have, written back
+ * under the same entry id. A child's history therefore reads "it waited for
+ * this, and this is what it was told" rather than leaving two rows to be paired
+ * by an id. The actionable response itself is **not** here — it stays in the
+ * main conversation's existing request UI, which is what stops a blocker hiding
+ * inside a tab nobody has open.
+ */
+export const OrchestrationSubagentBlocker = Schema.Struct({
+  /** The provider's own request id: the identity a response is routed by. */
+  requestId: TrimmedNonEmptyString,
+  blocker: Schema.Literals(["permission", "question"]),
+  title: Schema.String,
+  detail: Schema.NullOr(Schema.String),
+  resolution: Schema.NullOr(Schema.String),
+});
+export type OrchestrationSubagentBlocker = typeof OrchestrationSubagentBlocker.Type;
+
+const subagentEntryIdentity = {
+  id: TrimmedNonEmptyString,
+  sequence: NonNegativeInt,
+  createdAt: IsoDateTime,
+};
 
 /**
  * `id` is stable and `sequence` is the order. A client **upserts by `id`** and
  * sorts by `sequence`, which is what makes replay and live continuation meet
  * without a cursor: an entry seen twice lands on the state already held, and a
- * provider that revises a part it already sent moves that entry rather than
- * appending a near-duplicate of the same prose.
+ * provider that revises a part it already sent — or a tool call that moves from
+ * running to finished — moves that entry rather than appending a near-duplicate.
+ *
+ * **A discriminated union rather than an opaque payload.** The kind decides the
+ * shape, and saying so here is what makes a client's rendering of a command,
+ * an edit and a blocker exhaustive rather than three casts that agree with the
+ * server by convention.
  */
-export const OrchestrationSubagentEntry = Schema.Struct({
-  id: TrimmedNonEmptyString,
-  sequence: NonNegativeInt,
-  kind: OrchestrationSubagentEntryKind,
-  payload: Schema.Unknown,
-  createdAt: IsoDateTime,
-});
+export const OrchestrationSubagentEntry = Schema.Union([
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("message"),
+    payload: OrchestrationSubagentMessage,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("command"),
+    payload: OrchestrationSubagentWork,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("read"),
+    payload: OrchestrationSubagentWork,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("edit"),
+    payload: OrchestrationSubagentWork,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("tool"),
+    payload: OrchestrationSubagentWork,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("notice"),
+    payload: OrchestrationSubagentNotice,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("blocker"),
+    payload: OrchestrationSubagentBlocker,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("outcome"),
+    payload: OrchestrationSubagentOutcome,
+  }),
+]);
 export type OrchestrationSubagentEntry = typeof OrchestrationSubagentEntry.Type;
 
 /**
