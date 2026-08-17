@@ -638,3 +638,34 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     }
   }
 }
+
+/**
+ * What clicking a work-log row does.
+ *
+ * Three answers rather than a boolean, because a compact subagent row is a
+ * **launcher** and not a disclosure: it opens that child's work stream in the
+ * right-panel workspace, where the full session is. Expanding it in place would
+ * put a second, worse copy of the child's work inside the parent transcript,
+ * which is the thing the subagent work stream exists to stop.
+ *
+ * Launching outranks expanding, and both need somewhere to go: a row whose
+ * driver records no stream (`subagentChildId` absent — Claude and Codex until
+ * tickets 03 and 04) or a surface with nowhere to put a child tab falls back to
+ * the ordinary disclosure, and a row with no body at all is inert rather than
+ * offering an affordance that does nothing.
+ */
+export type WorkEntryActivation =
+  | { readonly kind: "launch-subagent"; readonly childId: string }
+  | { readonly kind: "expand" }
+  | { readonly kind: "inert" };
+
+export function resolveWorkEntryActivation(input: {
+  readonly subagentChildId: string | undefined;
+  readonly canLaunchSubagent: boolean;
+  readonly canExpand: boolean;
+}): WorkEntryActivation {
+  if (input.subagentChildId !== undefined && input.canLaunchSubagent) {
+    return { kind: "launch-subagent", childId: input.subagentChildId };
+  }
+  return input.canExpand ? { kind: "expand" } : { kind: "inert" };
+}

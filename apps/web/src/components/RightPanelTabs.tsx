@@ -1,6 +1,6 @@
 import type { ContextMenuItem, PreviewSessionSnapshot } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
-import { ClipboardList, FileDiff, Files, Globe2, Plus, TerminalSquare, X } from "lucide-react";
+import { Bot, ClipboardList, FileDiff, Files, Globe2, Plus, TerminalSquare, X } from "lucide-react";
 import {
   type MouseEvent as ReactMouseEvent,
   type ReactElement,
@@ -33,6 +33,7 @@ interface RightPanelTabsProps {
   pendingSurfaceIds: ReadonlySet<string>;
   previewSessions: Readonly<Record<string, PreviewSessionSnapshot>>;
   terminalLabelsById: ReadonlyMap<string, string>;
+  subagentLabelsById?: ReadonlyMap<string, string>;
   onActivate: (surface: RightPanelSurface) => void;
   onCloseSurface: (surface: RightPanelSurface) => void;
   onCloseOtherSurfaces: (surface: RightPanelSurface) => void;
@@ -56,6 +57,8 @@ const SURFACE_DISABLED_REASONS = {
 } as const;
 
 type TabContextMenuAction = "copy-path" | "close" | "close-others" | "close-to-right" | "close-all";
+
+const EMPTY_LABELS: ReadonlyMap<string, string> = new Map();
 
 function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement }) {
   return (
@@ -189,6 +192,7 @@ function surfaceTitle(
   surface: RightPanelSurface,
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
   terminalLabelsById: ReadonlyMap<string, string>,
+  subagentLabels: ReadonlyMap<string, string>,
 ): string {
   switch (surface.kind) {
     case "diff":
@@ -204,6 +208,10 @@ function surfaceTitle(
       );
     case "plan":
       return "Plan";
+    // The existing tab language, unchanged: a name, no status decoration. The
+    // inline row in the conversation is where a child's state is reported.
+    case "subagent":
+      return subagentLabels.get(surface.resourceId) ?? "Subagent";
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -265,6 +273,8 @@ function SurfaceIcon({
       return <TerminalSquare className="size-3.5 shrink-0" />;
     case "plan":
       return <ClipboardList className="size-3.5 shrink-0" />;
+    case "subagent":
+      return <Bot className="size-3.5 shrink-0" />;
   }
 }
 
@@ -381,7 +391,12 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             {props.surfaces.map((surface) => {
               const active = surface.id === props.activeSurfaceId;
               const pending = props.pendingSurfaceIds.has(surface.id);
-              const title = surfaceTitle(surface, props.previewSessions, props.terminalLabelsById);
+              const title = surfaceTitle(
+                surface,
+                props.previewSessions,
+                props.terminalLabelsById,
+                props.subagentLabelsById ?? EMPTY_LABELS,
+              );
               return (
                 <div
                   key={surface.id}

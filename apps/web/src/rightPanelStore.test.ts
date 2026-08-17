@@ -434,6 +434,85 @@ describe("rightPanelStore", () => {
     });
   });
 
+  /**
+   * A subagent surface is resource-addressed like a file or a terminal, so
+   * opening the same child twice activates the tab it already has and opening
+   * another child adds one — the workspace's existing rules, unchanged.
+   */
+  it("opens a child work stream as a tab and activates it rather than duplicating", () => {
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.surfaces.map((surface) => surface.id)).toEqual([
+      "subagent:call_task_1",
+      "subagent:call_task_2",
+    ]);
+    expect(state.activeSurfaceId).toBe("subagent:call_task_1");
+    expect(state.isOpen).toBe(true);
+  });
+
+  it("keeps child tabs beside every other surface kind", () => {
+    useRightPanelStore.getState().openTerminal(refA, "term-1");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().open(refA, "diff");
+    useRightPanelStore.getState().openBrowser(refA, "tab-a");
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.kind,
+      ),
+    ).toEqual(["terminal", "subagent", "file", "diff", "preview"]);
+  });
+
+  /**
+   * Closing is presentation only. This store cannot send a provider command, so
+   * what the test can state is the whole of what closing does here: the surface
+   * goes and the neighbour it left becomes active.
+   */
+  it("closing a child tab hides only that surface", () => {
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+    useRightPanelStore.getState().closeSurface(refA, "subagent:call_task_2");
+
+    const closed = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(closed.surfaces.map((surface) => surface.id)).toEqual(["subagent:call_task_1"]);
+    expect(closed.activeSurfaceId).toBe("subagent:call_task_1");
+
+    // And the inline row reopens the same stream, at the same address.
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).activeSurfaceId,
+    ).toBe("subagent:call_task_2");
+  });
+
+  it("restores persisted child tabs and drops one nothing can address", () => {
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          "env-1:thread-A": {
+            isOpen: true,
+            activeSurfaceId: "subagent:call_task_1",
+            surfaces: [
+              { id: "subagent:call_task_1", kind: "subagent", resourceId: "call_task_1" },
+              { id: "subagent:mismatched", kind: "subagent", resourceId: "call_task_9" },
+            ],
+          },
+        },
+      }),
+    ).toEqual({
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: true,
+          activeSurfaceId: "subagent:call_task_1",
+          surfaces: [{ id: "subagent:call_task_1", kind: "subagent", resourceId: "call_task_1" }],
+        },
+      },
+    });
+  });
+
   it("reconciles browser surfaces without deleting other surface kinds", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
     useRightPanelStore.getState().openBrowser(refA, "tab-a");

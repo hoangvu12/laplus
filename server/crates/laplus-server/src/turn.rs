@@ -720,7 +720,7 @@ fn decide(folding: &mut SessionState, driving: &mut Driving, line: &str) -> Deci
             let turn_id = turn.as_ref().map(|turn| turn.turn_id.clone());
             decided
                 .changes
-                .push(Change::Activity(crate::worklog::subagent(&task, turn_id)));
+                .push(Change::Activity(crate::worklog::subagent(&task, turn_id, None)));
         }
 
         Folded::Compacted(compaction) => {

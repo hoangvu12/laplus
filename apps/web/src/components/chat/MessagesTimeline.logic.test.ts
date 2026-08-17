@@ -5,6 +5,7 @@ import {
   deriveMessagesTimelineRows,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
+  resolveWorkEntryActivation,
 } from "./MessagesTimeline.logic";
 
 describe("computeMessageDurationStart", () => {
@@ -1169,5 +1170,66 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(reordered).not.toBe(initial);
     expect(reordered.result).toEqual([initial.result[1], initial.result[0]]);
+  });
+});
+
+describe("resolveWorkEntryActivation", () => {
+  /**
+   * The row that opens a child's work stream. Launching outranks expanding, so
+   * a subagent row never puts a second copy of the child's work inside the
+   * parent transcript.
+   */
+  it("launches a child's work stream in preference to expanding in place", () => {
+    expect(
+      resolveWorkEntryActivation({
+        subagentChildId: "call_task_1",
+        canLaunchSubagent: true,
+        canExpand: true,
+      }),
+    ).toEqual({ kind: "launch-subagent", childId: "call_task_1" });
+  });
+
+  /** A driver that records no stream leaves an ordinary disclosure row. */
+  it("falls back to expanding when no work stream was recorded", () => {
+    expect(
+      resolveWorkEntryActivation({
+        subagentChildId: undefined,
+        canLaunchSubagent: true,
+        canExpand: true,
+      }),
+    ).toEqual({ kind: "expand" });
+  });
+
+  /** A surface with nowhere to put a child tab must not offer to open one. */
+  it("falls back to expanding when there is nowhere to open a child", () => {
+    expect(
+      resolveWorkEntryActivation({
+        subagentChildId: "call_task_1",
+        canLaunchSubagent: false,
+        canExpand: true,
+      }),
+    ).toEqual({ kind: "expand" });
+  });
+
+  /** No stream, no body: an affordance that did nothing would be a lie. */
+  it("is inert when there is neither a stream nor a body", () => {
+    expect(
+      resolveWorkEntryActivation({
+        subagentChildId: undefined,
+        canLaunchSubagent: true,
+        canExpand: false,
+      }),
+    ).toEqual({ kind: "inert" });
+  });
+
+  /** A child's row stays a launcher even with nothing to disclose. */
+  it("launches even when the row has no expandable body", () => {
+    expect(
+      resolveWorkEntryActivation({
+        subagentChildId: "call_task_1",
+        canLaunchSubagent: true,
+        canExpand: false,
+      }),
+    ).toEqual({ kind: "launch-subagent", childId: "call_task_1" });
   });
 });

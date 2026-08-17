@@ -102,6 +102,29 @@ pub enum Write {
         thread_id: String,
         checkpoint: Box<crate::threads::Checkpoint>,
     },
+    /// One subagent's identity, assignment, state and outcome.
+    ///
+    /// The head alone rather than the whole stream, for [`Write::Thread`]'s
+    /// reason: a child that says one more thing must not cost a copy of
+    /// everything it has already said.
+    SubagentStream {
+        thread_id: String,
+        head: Box<crate::subagents::Head>,
+    },
+    /// One entry in a subagent's work stream, at the position it holds.
+    ///
+    /// An upsert rather than an append, because a provider that revises a part
+    /// it already sent revises the row — see [`crate::subagents`].
+    SubagentEntry {
+        thread_id: String,
+        child_id: String,
+        entry: Box<crate::subagents::Entry>,
+    },
+    /// The conversation was deleted; its children go with it.
+    ///
+    /// A real deletion, unlike the thread's own — see [`crate::subagents`],
+    /// where the asymmetry is argued.
+    ForgetSubagents { thread_id: String },
 }
 
 impl Write {
@@ -112,7 +135,10 @@ impl Write {
             Write::Message { thread_id, .. }
             | Write::Activity { thread_id, .. }
             | Write::ProviderResumeCursor { thread_id, .. }
-            | Write::Checkpoint { thread_id, .. } => thread_id,
+            | Write::Checkpoint { thread_id, .. }
+            | Write::SubagentStream { thread_id, .. }
+            | Write::SubagentEntry { thread_id, .. }
+            | Write::ForgetSubagents { thread_id } => thread_id,
         }
     }
 }

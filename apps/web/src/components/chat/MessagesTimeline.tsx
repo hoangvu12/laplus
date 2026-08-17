@@ -76,6 +76,7 @@ import {
   resolveTimelineMinimapIndexFromPointer,
   resolveTimelineMinimapInteractiveWidth,
   resolveTimelineMinimapTopPercent,
+  resolveWorkEntryActivation,
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
   TIMELINE_MINIMAP_MIN_ITEMS,
@@ -135,6 +136,11 @@ interface TimelineRowSharedState {
   retryMessageId: MessageId | null;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+  /**
+   * Open or activate a delegated child's work stream. Absent when the surface
+   * this timeline is drawn in has nowhere to put one.
+   */
+  onOpenSubagent: ((childId: string) => void) | undefined;
   onToggleTurnFold: (turnId: TurnId) => void;
   onToggleWorkGroup: (groupId: string, anchorElement?: HTMLElement) => void;
 }
@@ -168,6 +174,7 @@ interface MessagesTimelineProps {
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
   routeThreadKey: string;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
+  onOpenSubagent?: ((childId: string) => void) | undefined;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
   onRetryQueuedTurn?: () => void;
@@ -204,6 +211,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   turnDiffSummaryByAssistantMessageId,
   routeThreadKey,
   onOpenTurnDiff,
+  onOpenSubagent,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
   onRetryQueuedTurn = () => {},
@@ -440,6 +448,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       retryMessageId,
       onImageExpand,
       onOpenTurnDiff,
+      onOpenSubagent,
       onToggleTurnFold,
       onToggleWorkGroup,
     }),
@@ -456,6 +465,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       retryMessageId,
       onImageExpand,
       onOpenTurnDiff,
+      onOpenSubagent,
       onToggleTurnFold,
       onToggleWorkGroup,
     ],
@@ -1177,7 +1187,9 @@ const WorkGroupSection = memo(function WorkGroupSection({
 }: {
   groupedEntries: Extract<MessagesTimelineRow, { kind: "work" }>["groupedEntries"];
 }) {
-  const { workspaceRoot } = use(TimelineRowCtx);
+  const shared = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+  const { workspaceRoot } = shared;
   const nonEmptyEntries = useMemo(
     () => groupedEntries.filter((entry) => !workEntryIndicatesToolNeutralStatus(entry)),
     [groupedEntries],
@@ -1204,6 +1216,8 @@ const WorkGroupSection = memo(function WorkGroupSection({
             key={workEntry.id}
             workEntry={workEntry}
             workspaceRoot={workspaceRoot}
+            activeTurnInProgress={activity.activeTurnInProgress}
+            onOpenSubagent={shared.onOpenSubagent}
           />
         ))}
       </div>
@@ -1945,12 +1959,24 @@ function toolWorkEntryHeading(workEntry: TimelineWorkEntry): string {
 
 const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
-const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
+/**
+ * One row of the work log.
+ *
+ * Takes what it needs rather than reading the timeline's two ambient contexts,
+ * which is what lets the subagent surface render a child's work through this
+ * same component in a read-only configuration — see
+ * `SubagentStreamPanel`, and the spec's "Reuse the main agent's transcript and
+ * work-entry components in a read-only configuration". A caller outside a turn
+ * passes neither prop: nothing is in flight and there is nowhere to launch a
+ * child from.
+ */
+export const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
+  activeTurnInProgress?: boolean;
+  onOpenSubagent?: ((childId: string) => void) | undefined;
 }) {
   const { workEntry, workspaceRoot } = props;
-  const activity = use(TimelineRowActivityCtx);
   const [expanded, setExpanded] = useState(false);
   const iconConfig = workToneIcon(workEntry.tone);
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
@@ -1989,31 +2015,50 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
     : showDestructiveRowStyle
       ? "font-medium text-destructive"
       : "font-medium text-foreground/82";
-  const turnSettled = !activity.activeTurnInProgress;
+  const turnSettled = !props.activeTurnInProgress;
   const showNeutralIndicator = !turnSettled && workEntryIndicatesToolNeutralStatus(workEntry);
   const showSuccessIndicator =
     workEntryIndicatesToolSuccess(workEntry) ||
     (turnSettled && workEntryIndicatesToolNeutralStatus(workEntry));
-  const rowToggleProps = canExpand
-    ? {
-        role: "button" as const,
-        tabIndex: 0 as const,
-        "aria-label": displayText,
-        onClick: () => setExpanded((v) => !v),
-        onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setExpanded((v) => !v);
-          }
-        },
-      }
-    : {};
+  // `resolveWorkEntryActivation` is where launching-versus-expanding is
+  // decided and argued; this only performs it, so one keyboard-and-pointer
+  // affordance serves both rather than being written out twice.
+  const onOpenSubagent = props.onOpenSubagent;
+  const activation = resolveWorkEntryActivation({
+    subagentChildId: workEntry.subagentChildId,
+    canLaunchSubagent: onOpenSubagent !== undefined,
+    canExpand,
+  });
+  const activate =
+    activation.kind === "launch-subagent"
+      ? () => onOpenSubagent?.(activation.childId)
+      : activation.kind === "expand"
+        ? () => setExpanded((v) => !v)
+        : null;
+  const rowToggleProps =
+    activate === null
+      ? {}
+      : {
+          role: "button" as const,
+          tabIndex: 0 as const,
+          "aria-label":
+            activation.kind === "launch-subagent"
+              ? `Open subagent work stream: ${displayText}`
+              : displayText,
+          onClick: activate,
+          onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              activate();
+            }
+          },
+        };
 
   return (
     <div
       className={cn(
         "flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
-        canExpand &&
+        activate !== null &&
           "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
       )}
       {...rowToggleProps}

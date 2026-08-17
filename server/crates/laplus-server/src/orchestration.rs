@@ -395,11 +395,33 @@ impl Shell {
             Vec::new()
         });
 
+        // Read with the conversations rather than lazily, and the distinction
+        // worth being exact about is *which* laziness the spec asks for: it is
+        // the client's and the wire's — "load a full child stream only when its
+        // right-panel surface is open" — and that is honoured, because a stream
+        // crosses the socket only when `orchestration.subscribeSubagent` asks
+        // for one.
+        //
+        // This boot read is the same trade-off the conversations above are read
+        // under, and it inherits their cost: a process holds every child's
+        // entries for the life of the run, as it already holds every message and
+        // every work-log row. That is bounded by the same history and is what
+        // lets a restored child tab find something to replay rather than an
+        // unavailable surface that would fill in a moment later. If the boot
+        // read ever becomes the thing that costs, both halves move together —
+        // this is not a place to be lazier than the transcript beside it. See
+        // [`crate::subagents`].
+        let children = database.child_streams().unwrap_or_else(|error| {
+            eprintln!("laplus: cannot read the stored subagent work streams: {error}");
+            Vec::new()
+        });
+
         let database = Arc::new(database);
         let updates = broadcast::channel(BACKLOG).0;
         let transcripts = Transcripts::writing_to(Arc::clone(&database));
         let threads = Threads::new(sequences.clone(), updates.clone(), transcripts.clone());
         threads.restore(stored);
+        threads.subagents().restore(children);
 
         Shell {
             inner: Arc::new(Inner {

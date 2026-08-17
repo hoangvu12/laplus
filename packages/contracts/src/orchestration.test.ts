@@ -15,6 +15,8 @@ import {
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
   OrchestrationSession,
+  OrchestrationSubagentStreamItem,
+  OrchestrationSubscribeSubagentInput,
   OrchestrationThread,
   OrchestrationThreadShell,
   ProjectCreateCommand,
@@ -916,5 +918,100 @@ it.effect("ModelSelection rejects malformed instance ids", () =>
       }),
     );
     assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+const decodeSubagentStreamItem = Schema.decodeUnknownEffect(OrchestrationSubagentStreamItem);
+const decodeSubscribeSubagentInput = Schema.decodeUnknownEffect(
+  OrchestrationSubscribeSubagentInput,
+);
+
+it.effect("a subagent stream opens with its identity, assignment and ordered work", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeSubagentStreamItem({
+      kind: "snapshot",
+      snapshot: {
+        stream: {
+          childId: "call_task_1",
+          parentChildId: null,
+          name: "explore",
+          assignment: "Count the files",
+          state: "working",
+          outcome: null,
+          entryCount: 1,
+          createdAt: "2026-08-17T00:00:00.000Z",
+          updatedAt: "2026-08-17T00:00:01.000Z",
+        },
+        entries: [
+          {
+            id: "call_task_1:k:child-prt-2",
+            sequence: 1,
+            kind: "message",
+            payload: { text: "looking through the directory" },
+            createdAt: "2026-08-17T00:00:01.000Z",
+          },
+        ],
+      },
+    });
+    assert.strictEqual(parsed.kind, "snapshot");
+    if (parsed.kind !== "snapshot") return;
+    assert.strictEqual(parsed.snapshot.stream.state, "working");
+    assert.strictEqual(parsed.snapshot.entries[0]?.sequence, 1);
+  }),
+);
+
+/**
+ * The terminal entry is part of the same stream as the work that produced it,
+ * and `empty` is a conclusion rather than a missing result.
+ */
+it.effect("a subagent's conclusion is an entry and a settled stream", () =>
+  Effect.gen(function* () {
+    const entry = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "call_task_1:k:outcome",
+        sequence: 3,
+        kind: "outcome",
+        payload: { kind: "empty", text: null },
+        createdAt: "2026-08-17T00:00:03.000Z",
+      },
+    });
+    assert.strictEqual(entry.kind, "entry-upserted");
+
+    const settled = yield* decodeSubagentStreamItem({
+      kind: "stream-updated",
+      stream: {
+        childId: "call_task_1",
+        parentChildId: null,
+        name: "explore",
+        assignment: "Count the files",
+        state: "completed",
+        outcome: { kind: "empty", text: null },
+        entryCount: 3,
+        createdAt: "2026-08-17T00:00:00.000Z",
+        updatedAt: "2026-08-17T00:00:03.000Z",
+      },
+    });
+    assert.strictEqual(settled.kind, "stream-updated");
+    if (settled.kind !== "stream-updated") return;
+    assert.strictEqual(settled.stream.outcome?.kind, "empty");
+  }),
+);
+
+it.effect("a subagent subscription names the thread and the child", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeSubscribeSubagentInput({
+      threadId: "thread-1",
+      childId: "call_task_1",
+    });
+    assert.strictEqual(parsed.childId, "call_task_1");
+
+    const blank = yield* Effect.exit(
+      decodeSubscribeSubagentInput({
+        threadId: "thread-1",
+        childId: "   ",
+      }),
+    );
+    assert.strictEqual(blank._tag, "Failure");
   }),
 );

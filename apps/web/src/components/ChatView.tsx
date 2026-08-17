@@ -117,6 +117,7 @@ import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
 import {
+  openSubagentSurface,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
@@ -222,6 +223,7 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
+import { SubagentStreamPanel } from "./chat/SubagentStreamPanel";
 import { ChatHeader, type ChatHeaderThreadAction } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -2181,6 +2183,18 @@ function ChatViewContent(props: ChatViewProps) {
       deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
     [activeThread?.proposedPlans, timelineMessages, workLogEntries],
   );
+  // A child tab wears the name its inline row already shows, so this feature
+  // introduces no second tab language. Read off the compact index rather than
+  // the stream: a tab must be labelled before its work has been fetched.
+  const subagentLabelsById = useMemo(() => {
+    const labels = new Map<string, string>();
+    for (const entry of workLogEntries) {
+      if (entry.subagentChildId) {
+        labels.set(entry.subagentChildId, entry.toolTitle ?? entry.label);
+      }
+    }
+    return labels;
+  }, [workLogEntries]);
   const [dockedDraftHeroThreadKey, setDockedDraftHeroThreadKey] = useState<string | null>(null);
   const draftHeroDockRequested =
     activeThreadKey !== null && dockedDraftHeroThreadKey === activeThreadKey;
@@ -3033,6 +3047,15 @@ function ChatViewContent(props: ChatViewProps) {
       setTerminalFocusRequestId((value) => value + 1);
     },
     [activeRightPanelSurface, activeThreadRef, closeTerminalMutation, storeCloseTerminal],
+  );
+  // Clicking an inline child row is the *only* thing that opens a child
+  // surface. Nothing about a child starting, updating, blocking, completing or
+  // failing calls this, so delegated work cannot steal the panel. What it does
+  // is `openSubagentSurface`'s, so that the wiring is somewhere a test can
+  // reach rather than inside this component.
+  const handleOpenSubagent = useCallback(
+    (childId: string) => openSubagentSurface(activeThreadRef, childId),
+    [activeThreadRef],
   );
   const activateRightPanelSurface = useCallback(
     (surface: RightPanelSurface) => {
@@ -5610,6 +5633,15 @@ function ChatViewContent(props: ChatViewProps) {
           initialGitScope={initialDiffPanelGitScope}
         />
       </Suspense>
+    ) : activeRightPanelSurface?.kind === "subagent" ? (
+      <SubagentStreamPanel
+        key={`${activeThreadKey}:${activeRightPanelSurface.resourceId}`}
+        environmentId={activeThread.environmentId}
+        threadId={activeThread.id}
+        childId={activeRightPanelSurface.resourceId}
+        threadRef={activeThreadRef}
+        markdownCwd={gitCwd ?? undefined}
+      />
     ) : activeRightPanelSurface?.kind === "plan" ? (
       <PlanSidebar
         activePlan={activePlan}
@@ -5741,6 +5773,7 @@ function ChatViewContent(props: ChatViewProps) {
                 activeThreadEnvironmentId={activeThread.environmentId}
                 routeThreadKey={routeThreadKey}
                 onOpenTurnDiff={onOpenTurnDiff}
+                onOpenSubagent={handleOpenSubagent}
                 revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                 onRevertUserMessage={onRevertUserMessage}
                 onRetryQueuedTurn={() => {
@@ -6034,6 +6067,7 @@ function ChatViewContent(props: ChatViewProps) {
           pendingSurfaceIds={pendingFileSurfaceIds}
           previewSessions={activePreviewState.sessions}
           terminalLabelsById={activeTerminalLabelsById}
+          subagentLabelsById={subagentLabelsById}
           onActivate={activateRightPanelSurface}
           onCloseSurface={closeRightPanelSurface}
           onCloseOtherSurfaces={closeOtherRightPanelSurfaces}
@@ -6061,6 +6095,7 @@ function ChatViewContent(props: ChatViewProps) {
             pendingSurfaceIds={pendingFileSurfaceIds}
             previewSessions={activePreviewState.sessions}
             terminalLabelsById={activeTerminalLabelsById}
+            subagentLabelsById={subagentLabelsById}
             onActivate={activateRightPanelSurface}
             onCloseSurface={closeRightPanelSurface}
             onCloseOtherSurfaces={closeOtherRightPanelSurfaces}

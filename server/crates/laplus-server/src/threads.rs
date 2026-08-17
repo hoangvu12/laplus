@@ -238,6 +238,14 @@ struct Inner {
     /// [`crate::transcripts`], whose whole purpose is that publishing a change
     /// and storing it are never the same wait.
     transcripts: Transcripts,
+    /// The subagent work streams of these conversations.
+    ///
+    /// Held here rather than beside this registry because the two share a
+    /// lifetime and one rule: a child stream exists for exactly as long as the
+    /// conversation that delegated it, so whatever removes a thread has to
+    /// remove its children in the same breath. Everything about what a stream
+    /// *is* lives in [`crate::subagents`]; this registry only owns when they go.
+    subagents: crate::subagents::Streams,
     /// Drivers whose thread has been forgotten and which are still winding down.
     ///
     /// [`Threads::forget`] cannot wait for them — a project delete answers the
@@ -484,6 +492,7 @@ impl Threads {
                 open: Mutex::new(HashMap::new()),
                 sequences,
                 shell,
+                subagents: crate::subagents::Streams::new(transcripts.clone()),
                 transcripts,
                 winding_down: Mutex::new(Vec::new()),
                 live_agents: AtomicUsize::new(0),
@@ -511,6 +520,18 @@ impl Threads {
                 *state = Some(Thread::restored(conversation));
             }
         }
+    }
+
+    /// The subagent work streams these conversations delegated.
+    ///
+    /// Handed out rather than wrapped, because everything a caller does with one
+    /// — record what an adapter decided, open a subscription, read a stream —
+    /// belongs to [`crate::subagents`] and re-declaring it here would be a
+    /// second interface to keep in step with the first. What this registry owns
+    /// about them is their lifetime, and that is not something a caller asks
+    /// for: see [`Threads::forget`] and [`Change::Deleted`].
+    pub fn subagents(&self) -> &crate::subagents::Streams {
+        &self.inner.subagents
     }
 
     /// Agent processes currently running. The gauge that makes "the subprocess
@@ -771,7 +792,17 @@ impl Threads {
             self.inner.transcripts.queue(write);
         }
         let read = read(thread);
+        let deleted = matches!(change, Change::Deleted).then(|| thread.id.clone());
         drop(state);
+
+        // A conversation the developer removed takes its children with it. Here
+        // rather than in the command, so that the one fold which can delete a
+        // thread is the one place the streams go — and after the lock, because
+        // the child registry is another lock and this is not the path to hold
+        // both on.
+        if let Some(thread_id) = deleted {
+            self.inner.subagents.forget(&[thread_id]);
+        }
 
         // `send` on a broadcast channel never blocks — it drops the oldest value
         // when the buffer is full and a lagging subscriber is resent a snapshot
@@ -1047,6 +1078,10 @@ impl Threads {
         }
         drop(winding_down);
 
+        // The children go with their conversation, on [`Change::Deleted`]'s
+        // footing: a project delete removes the thread rows, and a stream whose
+        // thread is gone is work nothing can open.
+        self.inner.subagents.forget(thread_ids);
         self.inner.transcripts.discard(thread_ids);
     }
 

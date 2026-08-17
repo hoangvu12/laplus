@@ -550,6 +550,74 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Work Log");
   });
 
+  /**
+   * The compact row is the launcher into the child's work stream, and clicking
+   * it must open that stream rather than expanding a second copy of the child's
+   * work inside the parent transcript.
+   */
+  it("makes a subagent row a launcher into its work stream", () => {
+    const subagentRow = {
+      id: "entry-subagent",
+      kind: "work" as const,
+      createdAt: "2026-03-17T19:12:28.000Z",
+      entry: {
+        id: "work-subagent",
+        createdAt: "2026-03-17T19:12:28.000Z",
+        label: "Subagent explore",
+        toolTitle: "Subagent explore",
+        detail: "Count the files",
+        tone: "tool" as const,
+        itemType: "collab_agent_tool_call" as const,
+        subagentChildId: "call_task_1",
+      },
+    };
+
+    const launcher = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        onOpenSubagent={() => {}}
+        timelineEntries={[subagentRow]}
+      />,
+    );
+    expect(launcher).toContain('aria-label="Open subagent work stream: Subagent explore');
+    expect(launcher).toContain('role="button"');
+
+    // A surface with nowhere to put a child tab leaves the row inert rather
+    // than offering an affordance that does nothing.
+    const inert = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={[subagentRow]} />,
+    );
+    expect(inert).toContain("Subagent explore");
+    expect(inert).not.toContain("Open subagent work stream");
+  });
+
+  /** A row from a driver that records no stream stays an ordinary row. */
+  it("leaves a subagent row without a stream reference unclickable", () => {
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        onOpenSubagent={() => {}}
+        timelineEntries={[
+          {
+            id: "entry-subagent",
+            kind: "work" as const,
+            createdAt: "2026-03-17T19:12:28.000Z",
+            entry: {
+              id: "work-subagent",
+              createdAt: "2026-03-17T19:12:28.000Z",
+              label: "Subagent explore",
+              toolTitle: "Subagent explore",
+              tone: "tool" as const,
+              itemType: "collab_agent_tool_call" as const,
+            },
+          },
+        ]}
+      />,
+    );
+    expect(markup).toContain("Subagent explore");
+    expect(markup).not.toContain("Open subagent work stream");
+  });
+
   it("formats changed file paths from the workspace root", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline

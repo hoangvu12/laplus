@@ -375,6 +375,14 @@ fn dispatch_scoped(
             .and_then(|call| services.shell.threads().subscribe(&call))
             .map(Answer::Stream)
             .map_err(DispatchError::Declared),
+        // One subagent's work stream. Answered from the read loop like the
+        // thread subscription beside it — a stream is in memory, and the whole
+        // point of the separate method is that it is *asked for* rather than
+        // carried by every thread snapshot.
+        crate::subagents::SUBSCRIBE_SUBAGENT => crate::subagents::Watch::read(payload)
+            .and_then(|call| services.shell.threads().subagents().subscribe(&call))
+            .map(Answer::Stream)
+            .map_err(DispatchError::Declared),
         // Every method that touches a disk reads its payload here and does its
         // work elsewhere. Reading is arithmetic on a string, so a malformed
         // call is refused immediately rather than after a thread has been found
