@@ -124,6 +124,7 @@ import {
   type RightPanelSurface,
   useRightPanelStore,
 } from "../rightPanelStore";
+import { resolveRightPanelSurfaceCleanup } from "../rightPanelCleanup";
 import {
   isPreviewSupportedInRuntime,
   setActivePreviewTab,
@@ -3099,28 +3100,28 @@ function ChatViewContent(props: ChatViewProps) {
   const cleanupRightPanelSurfaces = useCallback(
     (surfaces: readonly RightPanelSurface[]) => {
       if (!activeThreadRef) return;
-      if (surfaces.some((surface) => surface.kind === "plan")) {
+      // `resolveRightPanelSurfaceCleanup` is the whole of what a close may ask
+      // the server for, so a surface kind absent from its result — a child's
+      // work stream among them — provably reaches nothing.
+      const cleanup = resolveRightPanelSurfaceCleanup(surfaces);
+      if (cleanup.dismissPlanSidebar) {
         dismissPlanSidebarForCurrentTurn();
       }
 
-      for (const surface of surfaces) {
-        if (surface.kind === "preview" && surface.resourceId) {
-          void closePreviewSession({
-            closePreview,
-            snapshot: activePreviewState.sessions[surface.resourceId] ?? null,
-            tabId: surface.resourceId,
-            threadRef: activeThreadRef,
-          });
-        }
-        if (surface.kind === "terminal") {
-          for (const terminalId of surface.terminalIds) {
-            storeCloseTerminal(activeThreadRef, terminalId);
-            void closeTerminalMutation({
-              environmentId: activeThreadRef.environmentId,
-              input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
-            });
-          }
-        }
+      for (const tabId of cleanup.previewTabIds) {
+        void closePreviewSession({
+          closePreview,
+          snapshot: activePreviewState.sessions[tabId] ?? null,
+          tabId,
+          threadRef: activeThreadRef,
+        });
+      }
+      for (const terminalId of cleanup.terminalIds) {
+        storeCloseTerminal(activeThreadRef, terminalId);
+        void closeTerminalMutation({
+          environmentId: activeThreadRef.environmentId,
+          input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
+        });
       }
     },
     [

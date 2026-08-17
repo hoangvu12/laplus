@@ -1,6 +1,7 @@
 "use client";
 
 import { ScrollArea as ScrollAreaPrimitive } from "@base-ui/react/scroll-area";
+import type { Ref } from "react";
 
 import { cn } from "~/lib/utils";
 
@@ -11,12 +12,20 @@ function ScrollArea({
   scrollbarGutter = false,
   hideScrollbars = false,
   chainVerticalScroll = false,
+  viewportRef,
   ...props
 }: ScrollAreaPrimitive.Root.Props & {
   scrollFade?: boolean;
   scrollbarGutter?: boolean;
   hideScrollbars?: boolean;
   chainVerticalScroll?: boolean;
+  /**
+   * The element that actually scrolls, for a caller that needs to read or set
+   * its position. The root is not it — the viewport inside is — and reaching
+   * for it by selector from outside would make this component's markup part of
+   * its callers' contract.
+   */
+  viewportRef?: Ref<HTMLDivElement>;
 }) {
   return (
     <ScrollAreaPrimitive.Root
@@ -24,6 +33,7 @@ function ScrollArea({
       {...props}
     >
       <ScrollAreaPrimitive.Viewport
+        ref={viewportRef}
         className={cn(
           "h-full max-h-[inherit] overflow-auto overscroll-contain rounded-[inherit] outline-none transition-shadows focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background data-has-overflow-x:overscroll-x-contain",
           chainVerticalScroll && "overscroll-y-auto",

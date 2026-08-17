@@ -1,7 +1,9 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { type EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { createJSONStorage } from "zustand/middleware";
 
+import { createMemoryStorage } from "./lib/storage";
 import {
   migratePersistedRightPanelState,
   selectActiveRightPanel,
@@ -513,6 +515,102 @@ describe("rightPanelStore", () => {
     });
   });
 
+  /**
+   * "Several children coexist with files, diffs, terminals, previews and
+   * plans" — the whole list, in one workspace, with the children keeping their
+   * places among it. `files` and `file` are the one pair that cannot both be
+   * present: opening a file replaces the standalone explorer, which is the
+   * workspace's existing rule and not something child tabs change.
+   */
+  it("keeps several child tabs among every other surface kind", () => {
+    useRightPanelStore.getState().openTerminal(refA, "term-1");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().open(refA, "diff");
+    useRightPanelStore.getState().openBrowser(refA, "tab-a");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+    useRightPanelStore.getState().open(refA, "plan");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_3");
+    useRightPanelStore.getState().open(refA, "files");
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual([
+      "terminal:term-1",
+      "subagent:call_task_1",
+      "diff",
+      "browser:tab-a",
+      "subagent:call_task_2",
+      "plan",
+      "subagent:call_task_3",
+      "files",
+    ]);
+
+    // And a file tab takes the explorer's place without disturbing the children.
+    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.surfaces.map((surface) => surface.id)).toEqual([
+      "terminal:term-1",
+      "subagent:call_task_1",
+      "diff",
+      "browser:tab-a",
+      "subagent:call_task_2",
+      "plan",
+      "subagent:call_task_3",
+      "file:src/index.ts",
+    ]);
+    expect(state.activeSurfaceId).toBe("file:src/index.ts");
+  });
+
+  /**
+   * Opening is append-and-activate; activating an open child moves nothing.
+   * Both are the workspace's existing rules for a resource-addressed surface,
+   * and the point of the test is that a child obeys them rather than sorting
+   * itself anywhere special.
+   */
+  it("adds each new child at the end and never reorders one that is already open", () => {
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+
+    const order = ["subagent:call_task_1", "file:src/index.ts", "subagent:call_task_2"];
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual(order);
+
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    const activated = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(activated.surfaces.map((surface) => surface.id)).toEqual(order);
+    expect(activated.activeSurfaceId).toBe("subagent:call_task_1");
+  });
+
+  /**
+   * A child tab is not reconciled away by anything that prunes surfaces whose
+   * resource has gone. That is what keeps an unresolvable restored child on
+   * screen as an explicit unavailable surface — `SubagentStreamPanel.test.tsx`
+   * proves what that surface then says — rather than a tab that vanishes and
+   * leaves the developer wondering whether they imagined it.
+   */
+  it("never prunes a child tab whose stream it cannot vouch for", () => {
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().openBrowser(refA, "tab-a");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+
+    useRightPanelStore.getState().reconcileFileSurfaces(refA, false);
+    useRightPanelStore.getState().reconcileBrowserSurfaces(refA, []);
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([
+      { id: "subagent:call_task_1", kind: "subagent", resourceId: "call_task_1" },
+      { id: "subagent:call_task_2", kind: "subagent", resourceId: "call_task_2" },
+    ]);
+  });
+
   it("reconciles browser surfaces without deleting other surface kinds", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
     useRightPanelStore.getState().openBrowser(refA, "tab-a");
@@ -524,5 +622,131 @@ describe("rightPanelStore", () => {
         (surface) => surface.id,
       ),
     ).toEqual(["terminal:term-1", "browser:tab-b", "browser:tab-c"]);
+  });
+});
+
+/**
+ * Restoration, through the persistence this store actually configures rather
+ * than through its migration helper alone. What a reload does is: read back
+ * what the last write left, at the version it was written under. Anything the
+ * store forgets between those two moments is a tab the developer lost.
+ */
+describe("a right-panel workspace across a reload", () => {
+  /** Stands in for `localStorage`, and can be reloaded from a captured write. */
+  function browserStorage() {
+    let written: string | null = null;
+    return {
+      getItem: () => written,
+      setItem: (_name: string, value: string) => {
+        written = value;
+      },
+      removeItem: () => {
+        written = null;
+      },
+      /** What a reload would find. */
+      captured: () => written,
+      /** Put it back, after the page has gone away. */
+      restore: (value: string) => {
+        written = value;
+      },
+    };
+  }
+
+  afterEach(() => {
+    useRightPanelStore.persist.setOptions({
+      storage: createJSONStorage(() => createMemoryStorage()),
+    });
+  });
+
+  it("restores child tabs, their order and the active tab, carrying no stream with them", async () => {
+    const storage = browserStorage();
+    useRightPanelStore.persist.setOptions({ storage: createJSONStorage(() => storage) });
+
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+    useRightPanelStore.getState().openTerminal(refA, "term-1");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    const captured = storage.captured();
+    expect(captured).not.toBeNull();
+
+    // The window closes and reopens: the store is new and empty, and the only
+    // thing that survived is what was written.
+    useRightPanelStore.setState({ byThreadKey: {} });
+    storage.restore(captured!);
+    await useRightPanelStore.persist.rehydrate();
+
+    const restored = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(restored.surfaces.map((surface) => surface.id)).toEqual([
+      "subagent:call_task_1",
+      "file:src/index.ts",
+      "subagent:call_task_2",
+      "terminal:term-1",
+    ]);
+    expect(restored.activeSurfaceId).toBe("subagent:call_task_1");
+    expect(restored.isOpen).toBe(true);
+
+    // Lazily loaded, stated as what was persisted: a restored child tab is a
+    // reference and nothing more, so opening the workspace fetches no stream
+    // until a surface is mounted.
+    expect(restored.surfaces[0]).toEqual({
+      id: "subagent:call_task_1",
+      kind: "subagent",
+      resourceId: "call_task_1",
+    });
+    expect(restored.surfaces[2]).toEqual({
+      id: "subagent:call_task_2",
+      kind: "subagent",
+      resourceId: "call_task_2",
+    });
+  });
+
+  /** A workspace is per thread, and so is what comes back with it. */
+  it("restores each thread's child tabs to that thread", async () => {
+    const storage = browserStorage();
+    useRightPanelStore.persist.setOptions({ storage: createJSONStorage(() => storage) });
+
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openSubagent(refB, "call_task_2");
+    const captured = storage.captured();
+
+    useRightPanelStore.setState({ byThreadKey: {} });
+    storage.restore(captured!);
+    await useRightPanelStore.persist.rehydrate();
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual(["subagent:call_task_1"]);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refB).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual(["subagent:call_task_2"]);
+  });
+
+  /**
+   * A closed tab stays closed. Reopening is the inline row's job, which is what
+   * keeps "closing hides the view" from quietly meaning "until you reload".
+   */
+  it("does not bring back a child tab that was closed before the reload", async () => {
+    const storage = browserStorage();
+    useRightPanelStore.persist.setOptions({ storage: createJSONStorage(() => storage) });
+
+    useRightPanelStore.getState().openSubagent(refA, "call_task_1");
+    useRightPanelStore.getState().openSubagent(refA, "call_task_2");
+    useRightPanelStore.getState().closeSurface(refA, "subagent:call_task_1");
+    const captured = storage.captured();
+
+    useRightPanelStore.setState({ byThreadKey: {} });
+    storage.restore(captured!);
+    await useRightPanelStore.persist.rehydrate();
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual(["subagent:call_task_2"]);
   });
 });
