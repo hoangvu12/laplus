@@ -1,4 +1,4 @@
-{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.8"},"capabilities":{}}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.9"},"capabilities":{}}}}
 {"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (Windows 11; x86_64) unknown (laplus/client; 0.1.1)","codexHome":"C:/fixture/codex-home","platformFamily":"windows","platformOs":"windows"}}}
 {"dir":"recv","msg":{"method":"configWarning","params":{"summary":"optional sandbox dependency is unavailable","details":null}}}
 {"dir":"recv","msg":{"method":"remoteControl/status/changed","params":{"status":"disabled"}}}
