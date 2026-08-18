@@ -534,6 +534,80 @@ impl Threads {
         &self.inner.subagents
     }
 
+    /// Say whether this conversation is working, reading its **whole known
+    /// delegation tree** rather than only its root.
+    ///
+    /// The client draws a thread as *Working* from one thing — a session whose
+    /// status is `running` (`Sidebar.logic.ts`, `resolveThreadStatusPill`) — so
+    /// a conversation whose root has gone quiet while a background child is
+    /// still counting is one the sidebar would otherwise call idle. This is that
+    /// claim corrected, and it is a **reconciliation rather than a deferral**:
+    /// the root's turn settles exactly when it settled before, carrying the
+    /// state it truthfully reached, and what this republishes afterwards is the
+    /// session alone.
+    ///
+    /// Two directions, both idempotent, and both narrowed to a session with **no
+    /// turn in flight** — a turn of the developer's own already says the
+    /// conversation is working, and this must never touch one:
+    ///
+    /// - a quiet session (`ready` or `idle`) with an active descendant becomes
+    ///   `running`, with no `activeTurnId`, which the client's reducer folds
+    ///   without disturbing the turn it has already settled;
+    /// - a `running` session with no turn and nothing left in its tree becomes
+    ///   `ready`, which is the status the settle it stood in for wanted.
+    ///
+    /// A root that ended `interrupted`, `stopped` or `error` is left alone in
+    /// both directions: those say something about the conversation the developer
+    /// needs, and a delegation tree is not a reason to withhold it. That is also
+    /// what stops a Stop being undone — the session a stop leaves behind is
+    /// `interrupted`, so nothing the provider narrates afterwards can put the
+    /// conversation back to work.
+    ///
+    /// **Decided twice, and the second time under the fold's own lock.** The
+    /// session this reads is a copy, and a turn dispatched between the read and
+    /// the write would have this overwrite it with a session naming no turn —
+    /// the developer's own prompt announced as not running. So the state it was
+    /// decided against is re-checked in [`Threads::apply_unless`]'s refusal,
+    /// which is asked under the lock the fold runs under and before a sequence
+    /// is taken. The refusal costs the log nothing and the caller nothing: this
+    /// is a claim about the conversation that the next event will make again.
+    pub fn follow_delegation(&self, thread_id: &str) -> Option<i64> {
+        use crate::settling::SessionStatus;
+        let session = self.get(thread_id)?.session?;
+        if session.active_turn_id.is_some() {
+            return None;
+        }
+        let working = self.inner.subagents.working(thread_id);
+        let status = match (working, session.status) {
+            (true, SessionStatus::Ready | SessionStatus::Idle) => SessionStatus::Running,
+            (false, SessionStatus::Running) => SessionStatus::Ready,
+            _ => return None,
+        };
+        let decided_against = session.status;
+        self.apply_unless(
+            thread_id,
+            |thread| match &thread.session {
+                Some(current)
+                    if current.active_turn_id.is_none() && current.status == decided_against =>
+                {
+                    None
+                }
+                _ => Some(
+                    "The conversation moved between reading its delegation tree and reporting it."
+                        .to_string(),
+                ),
+            },
+            Change::Session(Session {
+                status,
+                runtime_mode: session.runtime_mode,
+                active_turn_id: None,
+                last_error: session.last_error,
+                updated_at: now_iso(),
+            }),
+        )?
+        .ok()
+    }
+
     /// Agent processes currently running. The gauge that makes "the subprocess
     /// is terminated and reaped when the session ends" observable from outside,
     /// without a test reaching into the registry to look — the same accounting

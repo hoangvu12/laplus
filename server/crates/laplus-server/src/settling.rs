@@ -13,6 +13,14 @@
 //! end of a turn** — not the last assistant message — which is what makes a
 //! turn's duration cover the whole turn.
 //!
+//! The converse does not hold, and has not since the delegation tree became
+//! work: **entering `running` is not the start of one.** A conversation whose
+//! background child outlives its turn reports `running` with no `activeTurnId`,
+//! which settles nothing and starts nothing — the reducer folds it against a
+//! turn it has already settled and leaves it alone
+//! (`threadReducer.ts`, `thread.session-set`). See
+//! [`crate::threads::Threads::follow_delegation`].
+//!
 //! # Why this is a module and not two `match`es
 //!
 //! Upstream writes the rule down twice, character for character: once in its
@@ -44,7 +52,11 @@ pub enum SessionStatus {
     Idle,
     /// The process is being started. Says nothing about how a turn went.
     Starting,
-    /// A turn is in progress.
+    /// **There is work in this conversation.** A turn is in progress — or, with
+    /// no `activeTurnId`, its delegation tree still is: a background subagent
+    /// outlives the turn that launched it, and the conversation is not idle
+    /// while one is running. `crate::threads::Threads::follow_delegation` is the
+    /// second case and `CONTEXT.md`'s **Delegation tree** argues it.
     Running,
     /// Started, idle, and ready for the next turn.
     Ready,

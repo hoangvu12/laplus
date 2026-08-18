@@ -596,6 +596,7 @@ export const OrchestrationSubagentEntryKind = Schema.Literals([
   "tool",
   "notice",
   "blocker",
+  "subagent",
   "outcome",
 ]);
 export type OrchestrationSubagentEntryKind = typeof OrchestrationSubagentEntryKind.Type;
@@ -677,6 +678,28 @@ export const OrchestrationSubagentBlocker = Schema.Struct({
 });
 export type OrchestrationSubagentBlocker = typeof OrchestrationSubagentBlocker.Type;
 
+/**
+ * A child this child delegated, as the launcher inside its stream.
+ *
+ * The same five things the parent conversation's compact child row carries, in
+ * the one other place a launcher may appear: a nested child belongs inside the
+ * stream of the agent that spawned it and **not** in the root transcript, so one
+ * worker has one visible parent. Clicking it opens that descendant as another
+ * ordinary child tab, addressed by `childId` exactly as the inline row is.
+ *
+ * It exists only where the provider proves the relationship. A hierarchy laplus
+ * cannot prove produces no nested launcher and nothing invented to stand in for
+ * one.
+ */
+export const OrchestrationSubagentLauncher = Schema.Struct({
+  childId: OrchestrationSubagentId,
+  name: Schema.NullOr(Schema.String),
+  assignment: Schema.NullOr(Schema.String),
+  state: OrchestrationSubagentState,
+  outcome: Schema.NullOr(OrchestrationSubagentOutcome),
+});
+export type OrchestrationSubagentLauncher = typeof OrchestrationSubagentLauncher.Type;
+
 const subagentEntryIdentity = {
   id: TrimmedNonEmptyString,
   sequence: NonNegativeInt,
@@ -730,6 +753,11 @@ export const OrchestrationSubagentEntry = Schema.Union([
     ...subagentEntryIdentity,
     kind: Schema.Literal("blocker"),
     payload: OrchestrationSubagentBlocker,
+  }),
+  Schema.Struct({
+    ...subagentEntryIdentity,
+    kind: Schema.Literal("subagent"),
+    payload: OrchestrationSubagentLauncher,
   }),
   Schema.Struct({
     ...subagentEntryIdentity,

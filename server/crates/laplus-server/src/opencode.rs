@@ -976,30 +976,24 @@ fn tool_activity(
     Some(crate::threads::Activity::tool(kind, tool, payload, turn_id))
 }
 
-/// How much of a tool's output one child entry keeps.
+/// Whatever OpenCode put in this field, as a child entry's output.
 ///
-/// Generous, because the entry *is* what the developer opened the tab to read —
-/// the compact row's own limit is [`crate::worklog`]'s and much shorter. Bounded
-/// at all because a child's stream is written to disk on every part, and one
-/// `cat` of a large file would otherwise be stored in full on every revision of
-/// the same call.
-const CHILD_OUTPUT: usize = 8 * 1024;
-
+/// The bound itself is [`crate::subagents::bounded`] — a property of the entry
+/// rather than of this protocol, and shared with the Codex driver, which carried
+/// its own copy while this one was in flight. What is left here is the part that
+/// *is* OpenCode's: a field that may be a string, a null or some other JSON, and
+/// the rule that a tool reporting an empty output said nothing, which is absence
+/// rather than an empty line to draw.
 fn bounded(value: Option<&Value>) -> Option<String> {
     let text = match value? {
         Value::String(text) => text.clone(),
         Value::Null => return None,
         other => other.to_string(),
     };
-    // A tool that reported an empty output said nothing, which is absence
-    // rather than an empty line to draw.
     if text.trim().is_empty() {
         return None;
     }
-    if text.chars().count() <= CHILD_OUTPUT {
-        return Some(text);
-    }
-    Some(text.chars().take(CHILD_OUTPUT).collect::<String>() + "…")
+    Some(crate::subagents::bounded(&text))
 }
 
 /// Which kind of work an OpenCode tool is, in the child stream's vocabulary.

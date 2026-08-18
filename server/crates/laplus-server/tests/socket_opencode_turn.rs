@@ -30,6 +30,7 @@ use harness::{
         revert_checkpoint,
         respond_to_approval, respond_to_user_input, start_turn, start_turn_in,
     },
+    subagents::{child_stream, folded_entries},
     workspace::Workspace,
     SocketClient, TestServer,
 };
@@ -3061,24 +3062,6 @@ async fn a_delegating_turn(
     (workspace, server, client, subscription, thread)
 }
 
-/// Every entry of one child's stream, in order, as a client folds them.
-fn folded_entries(snapshot: &Value, live: &[Value]) -> Vec<Value> {
-    let mut folded: Vec<Value> = snapshot["entries"]
-        .as_array()
-        .expect("the snapshot carries the entries so far")
-        .clone();
-    for item in live {
-        let Some(entry) = item.get("entry").filter(|entry| entry.is_object()) else {
-            continue;
-        };
-        match folded.iter().position(|held| held["id"] == entry["id"]) {
-            Some(index) => folded[index] = entry.clone(),
-            None => folded.push(entry.clone()),
-        }
-    }
-    folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
-    folded
-}
 
 /// The whole of what OpenCode exposes about a child's work, in the order it
 /// happened, read back through the subscription a tab opens.
@@ -4364,4 +4347,279 @@ async fn project_closure_reaps_its_threads_live_owned_opencode_server() {
     .await;
     client.close().await;
     server.stop().await;
+}
+
+/// **Ticket 06.** Stopping the parent stops the delegation tree, and the tree is
+/// what the conversation reports itself working on.
+///
+/// Four things at one seam, and they are one behaviour. The child is genuinely
+/// mid-flight — the scripted peer holds its session open until this test lets it
+/// go — so the stop lands on live work rather than on a child that had already
+/// finished:
+///
+/// - the developer's stop reaches every known active descendant, not only the
+///   root agent;
+/// - each of those records an **interrupted** terminal state and the terminal
+///   entry that says so, which is what makes the ending auditable rather than a
+///   stream that simply goes quiet;
+/// - nothing ordinary reaches the child afterwards: the peer is released and
+///   goes on narrating a child laplus has already ended, and none of it lands;
+/// - and with nothing left in the tree the conversation stops reporting itself
+///   as working.
+#[tokio::test]
+async fn stopping_the_parent_stops_its_delegation_tree() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_subagent(release.clone()).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("stop-tree-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("stop-tree-project", "stop-tree-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("stop-tree-thread").await;
+    let mut command = start_turn("stop-tree-thread", "stop-tree-message", "count");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+
+    let working = child_stream(&server, "stop-tree-thread", "call_task_1").await;
+    assert_eq!(
+        working["stream"]["state"], "working",
+        "the child had already finished, so nothing here is about stopping one: {working:#?}"
+    );
+    let before = working["entries"].as_array().expect("entries").len();
+
+    // The composer's stop button, with no turn named — which is what it sends.
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("stop-tree-thread", None),
+        )
+        .await
+        .expect_success();
+
+    let stopped = child_stream(&server, "stop-tree-thread", "call_task_1").await;
+    assert_eq!(stopped["stream"]["state"], "interrupted");
+    assert_eq!(stopped["stream"]["outcome"]["kind"], "interrupted");
+    let terminal = stopped["entries"]
+        .as_array()
+        .expect("entries")
+        .last()
+        .expect("a terminal entry")
+        .clone();
+    assert_eq!(
+        terminal["kind"], "outcome",
+        "the interruption is the last entry of the child's own stream: {stopped:#?}"
+    );
+    assert_eq!(terminal["payload"]["kind"], "interrupted");
+    let interrupted_at = stopped["entries"].as_array().expect("entries").len();
+    assert_eq!(interrupted_at, before + 1, "{stopped:#?}");
+
+    // And the provider goes on narrating a child that has already ended.
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+
+    let after = child_stream(&server, "stop-tree-thread", "call_task_1").await;
+    assert_eq!(
+        after["entries"], stopped["entries"],
+        "an interrupted child went on taking live work: {after:#?}"
+    );
+    assert_eq!(after["stream"]["state"], "interrupted");
+    assert_eq!(after["stream"]["outcome"]["kind"], "interrupted");
+
+    // Nothing is left in the tree, so nothing is holding the conversation open.
+    let session = server
+        .connect()
+        .await
+        .into_thread_snapshot("stop-tree-thread")
+        .await["thread"]["session"]
+        .clone();
+    assert_ne!(
+        session["status"], "running",
+        "a stopped delegation tree still reports the conversation as working: {session:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// **Ticket 06.** The conversation reports itself working while a descendant is,
+/// and stops only when the last of them is terminal.
+///
+/// The sidebar draws *Working* from one thing — a session whose status is
+/// `running` (`Sidebar.logic.ts`, `resolveThreadStatusPill`) — so this asserts
+/// exactly that, at the two moments it has to be true and false. What makes it a
+/// claim about the *tree* rather than about the root is the middle: the root's
+/// own turn has settled and no turn is in flight, and the conversation is still
+/// working because the child is.
+#[tokio::test]
+async fn the_conversation_stays_working_while_its_child_does() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_subagent(release.clone()).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("tree-working-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("tree-working-project", "tree-working-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("tree-working-thread").await;
+    let mut command = start_turn("tree-working-thread", "tree-working-message", "count");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+
+    // The child is still working, and the conversation says so.
+    let working = child_stream(&server, "tree-working-thread", "call_task_1").await;
+    assert_eq!(working["stream"]["state"], "working");
+    let session = server
+        .connect()
+        .await
+        .into_thread_snapshot("tree-working-thread")
+        .await["thread"]["session"]
+        .clone();
+    assert_eq!(session["status"], "running", "{session:#?}");
+
+    // Let it finish. The conversation leaves Working with the last descendant.
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+    let done = child_stream(&server, "tree-working-thread", "call_task_1").await;
+    assert_eq!(done["stream"]["state"], "completed");
+    let quiet = server
+        .connect()
+        .await
+        .into_thread_snapshot("tree-working-thread")
+        .await["thread"]["session"]
+        .clone();
+    assert_ne!(
+        quiet["status"], "running",
+        "every descendant is terminal and the conversation is still working: {quiet:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// **Ticket 06.** Ending the session ends the tree it was running, too.
+///
+/// `thread.session.stop` is not the composer's stop button — it ends the agent
+/// *process* and keeps the conversation, and the real client reaches for it
+/// before deleting a thread and before moving a worktree (`useThreadActions.ts`,
+/// `BranchToolbarBranchSelector.tsx`). It is included in the delegation tree's
+/// Stop for the reason the tree is stopped at all: when the process behind a
+/// child is gone, nothing will ever report on that child again, so a stream left
+/// at `working` is a claim no later event can correct. Recording the
+/// interruption is what keeps the ending auditable and stops the conversation
+/// reporting itself as working for ever.
+///
+/// This is the one Stop path the criteria do not name, so it is asserted rather
+/// than assumed.
+#[tokio::test]
+async fn ending_the_session_ends_the_delegation_tree_with_it() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_subagent(release.clone()).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("stop-session-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("stop-session-project", "stop-session-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("stop-session-thread").await;
+    let mut command = start_turn("stop-session-thread", "stop-session-message", "count");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+    let working = child_stream(&server, "stop-session-thread", "call_task_1").await;
+    assert_eq!(working["stream"]["state"], "working");
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.session.stop",
+                "commandId": "test:stop-session",
+                "threadId": "stop-session-thread",
+                "createdAt": "2026-08-18T00:00:00.000Z",
+            }),
+        )
+        .await
+        .expect_success();
+
+    let stopped = child_stream(&server, "stop-session-thread", "call_task_1").await;
+    assert_eq!(stopped["stream"]["state"], "interrupted");
+    assert_eq!(stopped["stream"]["outcome"]["kind"], "interrupted");
+    assert_eq!(
+        stopped["entries"]
+            .as_array()
+            .expect("entries")
+            .last()
+            .expect("a terminal entry")["kind"],
+        "outcome"
+    );
+
+    release.notify_one();
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
 }

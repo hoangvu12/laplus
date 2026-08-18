@@ -107,6 +107,23 @@ impl ScriptedCodex {
         codex
     }
 
+    /// The same capture, stopped once a *child* has announced a child of its
+    /// own, so a Stop can be asked whether it reaches a nested generation.
+    ///
+    /// `/root/reviewer/helper` is announced on the reviewer's own thread, and it
+    /// is the descendant that has no launcher in the conversation at all — its
+    /// launcher lives inside the reviewer's stream. Pausing here is the only
+    /// place both generations are alive at once.
+    pub fn subagent_work_conversation_paused_after_nesting() -> ScriptedCodex {
+        let codex = ScriptedCodex::conversation_from_fixture(
+            "10-subagent-work",
+            Some("/root/reviewer/helper"),
+        );
+        std::fs::write(codex.directory.path().join("pause-turn"), "")
+            .expect("marks the first turn as paused");
+        codex
+    }
+
     pub fn subagent_conversation() -> ScriptedCodex {
         let codex = ScriptedCodex::plain_conversation();
         let events = codex.directory.path().join("turn-events-before-pause");
@@ -628,12 +645,16 @@ impl ScriptedCodex {
                     .is_some_and(|method| method.ends_with("/requestApproval"))
             })
             .map(|index| index + 1);
-        let requested_pause = pause_after.map(|method| {
+        // A substring of the serialized record rather than its method alone, so
+        // a caller can stop at one particular event among many of a kind — a
+        // canonical agent path picks out the moment a *child* announced a child
+        // of its own, which "item/completed" could never do.
+        let requested_pause = pause_after.map(|needle| {
             events
                 .iter()
-                .position(|record| record["msg"]["method"] == method)
+                .position(|record| record["msg"].to_string().contains(needle))
                 .map(|index| index + 1)
-                .unwrap_or_else(|| panic!("the {} fixture has a {method} event", fixture.display()))
+                .unwrap_or_else(|| panic!("the {} fixture has no {needle} event", fixture.display()))
         });
         let pause_after = approval_pause
             .or(requested_pause)

@@ -47,8 +47,10 @@ mod harness;
 
 use harness::agent::{ScriptedAgent, AWAIT_QUESTION, PAUSE, WORKING_DIRECTORY_MARKER};
 use harness::conversation::{
-    activity, assistant_sends, create_project, follow_up, kinds, last_session, start_turn,
+    activity, assistant_sends, create_project, follow_up, interrupt_turn, kinds, last_session,
+    settle_watch_between_turns, start_turn,
 };
+use harness::subagents::child_stream;
 use harness::workspace::Workspace;
 use harness::TestServer;
 use laplus_server::config::ServerConfig;
@@ -2064,22 +2066,10 @@ async fn a_subagent_that_finishes_after_the_turn_still_gets_its_report_to_the_de
     // this test is about: a turn that opened and never settled would leave the
     // composer working forever, which is a worse bug than the one being fixed.
     let settles = std::cell::Cell::new(0usize);
+    let watching = settle_watch_between_turns();
     let events = client
-        .values_until(&subscription, |item| {
-            let settled = |status: Option<&str>| {
-                matches!(status, Some("ready") | Some("error") | Some("stopped"))
-            };
-            let done = match item["kind"].as_str() {
-                Some("event") => {
-                    item["event"]["type"] == "thread.session-set"
-                        && settled(item["event"]["payload"]["session"]["status"].as_str())
-                }
-                Some("snapshot") => {
-                    settled(item["snapshot"]["thread"]["session"]["status"].as_str())
-                }
-                _ => false,
-            };
-            if done {
+        .values_until(&subscription, move |item| {
+            if watching(item) {
                 settles.set(settles.get() + 1);
             }
             settles.get() >= 2
@@ -2272,7 +2262,7 @@ async fn a_background_child_keeps_working_after_its_turn_has_settled() {
     // And none of it opened or ended a turn of its own. The second ending is the
     // agent's own report — a turn with a message in it — rather than anything a
     // child boundary published.
-    let rest = client.events_through_the_turn(&subscription).await;
+    let rest = client.events_through_the_next_turn(&subscription).await;
     let endings: Vec<&Value> = rest
         .iter()
         .map(|item| &item["event"])
@@ -2308,5 +2298,198 @@ async fn an_unconfigured_server_starts_no_agent_of_its_own() {
     );
     assert_eq!(server.live_agents(), 0);
 
+    server.stop().await;
+}
+
+/// **Ticket 06.** The conversation goes on reporting itself as working while a
+/// background child does, and stops only when the child is terminal.
+///
+/// The case the spec's "a quiet or settled root does not make the thread idle"
+/// is about, and the one no other provider can be made to produce on demand: the
+/// developer's turn is **over** — it settled, and nothing is in flight — while
+/// the child it launched is still counting. The sidebar draws *Working* from one
+/// thing, a session whose status is `running` (`Sidebar.logic.ts`,
+/// `resolveThreadStatusPill`), so that is what is asserted here, at the two
+/// moments it must be true and false.
+///
+/// Note what the settle itself still does: the turn ends when the agent says it
+/// has, carrying the state it reached. The session that follows it says
+/// something else — that the conversation is not finished — and it names no
+/// turn, which is why the client's reducer folds it without disturbing the turn
+/// it has already settled.
+#[tokio::test]
+async fn the_conversation_stays_working_while_a_background_child_does() {
+    let agent = ScriptedAgent::emitting(&[
+        r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count the variants","subagent_type":"Explore"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Launched it in the background."}]}}"#,
+        // The turn ends here, with the subagent still working.
+        r#"{"type":"result","subtype":"success","duration_ms":5600,"num_turns":1}"#,
+        PAUSE,
+        PAUSE,
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"looking through the variants"}]}}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"eleven variants"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The subagent found eleven variants."}]}}"#,
+        r#"{"type":"result","subtype":"success","duration_ms":66000,"num_turns":1}"#,
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count the variants in the background"),
+        )
+        .await
+        .expect_success();
+    let settled = client.events_through_the_turn(&subscription).await;
+    let last = settled
+        .iter()
+        .rfind(|item| item["event"]["type"] == "thread.session-set")
+        .expect("the turn settled")["event"]["payload"]["session"]
+        .clone();
+    assert_eq!(last["status"], "ready");
+    assert_eq!(last["activeTurnId"], Value::Null);
+
+    // And the very next thing the conversation says about itself is that it is
+    // working — with no turn in flight to be working on.
+    let held = client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.session-set"
+        })
+        .await;
+    let session = held
+        .last()
+        .expect("a session")["event"]["payload"]["session"]
+        .clone();
+    assert_eq!(
+        session["status"], "running",
+        "the conversation went idle with a child still working: {session:#?}"
+    );
+    assert_eq!(
+        session["activeTurnId"],
+        Value::Null,
+        "a delegation tree is not a turn: {session:#?}"
+    );
+    let working = child_stream(&server, "thread-1", "t1").await;
+    assert!(
+        matches!(
+            working["stream"]["state"].as_str(),
+            Some("pending" | "working" | "blocked")
+        ),
+        "nothing was actually working: {working:#?}"
+    );
+
+    // It leaves Working with the last descendant, and not before.
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.session-set"
+                && item["event"]["payload"]["session"]["activeTurnId"] == Value::Null
+                && matches!(
+                    item["event"]["payload"]["session"]["status"].as_str(),
+                    Some("ready" | "idle")
+                )
+        })
+        .await;
+    let done = child_stream(&server, "thread-1", "t1").await;
+    assert_eq!(
+        done["stream"]["state"], "completed",
+        "the conversation stopped working before its child did: {done:#?}"
+    );
+    assert_eq!(done["stream"]["outcome"]["text"], "eleven variants");
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// **Ticket 06.** Stopping the parent stops the delegation tree, on the third of
+/// the three providers — and on the case Claude is the only one that produces:
+/// a conversation whose **only** remaining work is a background child.
+///
+/// The developer's own turn is already over when they press stop, so there is no
+/// turn to interrupt and nothing but the tree to act on. That is exactly what
+/// the composer sends in this state (`buildThreadTurnInterruptInput` omits the
+/// turn id once the session is not running), and it is the reading
+/// `Shell::interrupt_turn` has always taken of a stop with nothing to stop:
+/// succeed. What must not also happen is that the child goes on.
+#[tokio::test]
+async fn stopping_a_claude_parent_stops_the_child_that_outlived_its_turn() {
+    let agent = ScriptedAgent::emitting(&[
+        r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count the variants","subagent_type":"Explore"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Launched it in the background."}]}}"#,
+        // The turn ends here, with the subagent still working.
+        r#"{"type":"result","subtype":"success","duration_ms":5600,"num_turns":1}"#,
+        PAUSE,
+        PAUSE,
+        // Everything past the stop is a provider still narrating a child the
+        // developer has already ended.
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"looking through the variants"}]}}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"eleven variants"}"#,
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count the variants in the background"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    let working = child_stream(&server, "thread-1", "t1").await;
+    assert_eq!(
+        working["stream"]["state"], "working",
+        "there was nothing left to stop: {working:#?}"
+    );
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("thread-1", None),
+        )
+        .await
+        .expect_success();
+
+    let stopped = child_stream(&server, "thread-1", "t1").await;
+    assert_eq!(stopped["stream"]["state"], "interrupted");
+    assert_eq!(stopped["stream"]["outcome"]["kind"], "interrupted");
+    assert_eq!(
+        stopped["entries"]
+            .as_array()
+            .expect("entries")
+            .last()
+            .expect("a terminal entry")["kind"],
+        "outcome"
+    );
+    // The CLI goes on regardless: more prose, its own completion, and a report.
+    // None of it may reopen the child or replace the ending the developer asked
+    // for — so this waits for the stream to move and fails if it ever does.
+    // Written as a wait rather than a single later read because the lines it is
+    // about arrive after the script's two pauses, and a read taken before them
+    // would pass against a server that accepted every one.
+    let moved = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = child_stream(&server, "thread-1", "t1").await;
+            if snapshot["entries"] != stopped["entries"]
+                || snapshot["stream"]["outcome"] != stopped["stream"]["outcome"]
+            {
+                return snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if let Ok(after) = moved {
+        panic!("an interrupted child took live work after its ending: {after:#?}");
+    }
+
+    client.close().await;
     server.stop().await;
 }

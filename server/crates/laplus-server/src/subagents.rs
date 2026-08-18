@@ -231,6 +231,10 @@ pub enum EntryKind {
     /// A permission or a question the child stopped for, and — on the same
     /// entry, under the same key — how it was resolved. Payload: [`Blocker`].
     Blocker,
+    /// A child this child delegated: the compact launcher, in the stream of the
+    /// agent that spawned it rather than in the root transcript. Payload:
+    /// [`Delegated`].
+    Subagent,
     /// The terminal entry: its result, failure, interruption, or empty answer.
     Outcome,
 }
@@ -245,6 +249,7 @@ impl EntryKind {
             EntryKind::Tool => "tool",
             EntryKind::Notice => "notice",
             EntryKind::Blocker => "blocker",
+            EntryKind::Subagent => "subagent",
             EntryKind::Outcome => "outcome",
         }
     }
@@ -258,10 +263,34 @@ impl EntryKind {
             "tool" => EntryKind::Tool,
             "notice" => EntryKind::Notice,
             "blocker" => EntryKind::Blocker,
+            "subagent" => EntryKind::Subagent,
             "outcome" => EntryKind::Outcome,
             _ => return None,
         })
     }
+}
+
+/// How much of a tool's output one child entry keeps.
+///
+/// Generous, because the entry *is* what the developer opened the tab to read —
+/// the compact row's own limit is [`crate::worklog`]'s and much shorter. Bounded
+/// at all because a child's stream is written to disk on every part, and one
+/// `cat` of a large file would otherwise be stored in full on every revision of
+/// the same call.
+const CHILD_OUTPUT: usize = 8 * 1024;
+
+/// A child's output, kept whole up to [`CHILD_OUTPUT`].
+///
+/// Here rather than in a driver because the bound is a property of [`Work`] —
+/// what a child's tab can be asked to render and what a stream can be asked to
+/// store — and not of any one protocol. The OpenCode and Codex adapters each
+/// carried a copy of it while the other was in flight; this is the home both of
+/// them named.
+pub fn bounded(output: &str) -> String {
+    if output.chars().count() <= CHILD_OUTPUT {
+        return output.to_string();
+    }
+    output.chars().take(CHILD_OUTPUT).collect::<String>() + "…"
 }
 
 /// One piece of a child's work, in the vocabulary the main agent's work rows
@@ -453,6 +482,29 @@ impl Blocker {
     }
 }
 
+/// A nested child, as its launcher inside the stream of the child that
+/// delegated it. The glossary's **nested launcher**, and the contract's
+/// `OrchestrationSubagentLauncher`.
+///
+/// The same five things the parent conversation's **compact child row** carries
+/// ([`crate::worklog::subagent`]), in the one other place a launcher may appear.
+/// It is a launcher rather than a copy of the work: the descendant's prose and
+/// commands stay in its own stream, addressed by `child_id`, and clicking this
+/// opens that stream as another ordinary right-panel tab.
+///
+/// **Only where the provider proves the relationship.** This entry exists
+/// because [`Head::parent_child_id`] is set, and that field is filled only from
+/// evidence — so a hierarchy laplus cannot prove produces no nested launcher and
+/// no root-transcript row invented to stand in for one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launcher {
+    pub child_id: String,
+    pub name: Option<String>,
+    pub assignment: Option<String>,
+    pub state: State,
+    pub outcome: Option<Outcome>,
+}
+
 /// One thing that happened in a child's session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -460,7 +512,11 @@ pub struct Entry {
     /// same id **replaces** the one already there and keeps its position.
     pub id: String,
     /// Where it sits. Assigned once, when the entry is first seen, and never
-    /// moved.
+    /// moved — with one exception, which exists to keep the property the
+    /// ordering is *for*: the terminal entry steps aside for a **nested
+    /// launcher** proven after the child concluded, so the conclusion stays
+    /// last. See [`insert_before_the_conclusion`]. A client is unharmed either
+    /// way, because it upserts by [`Entry::id`] and only then sorts by this.
     pub sequence: i64,
     pub kind: EntryKind,
     pub payload: Value,
@@ -497,8 +553,12 @@ pub struct Head {
     ///
     /// `None` is "this is a direct child of the conversation" *and* "the
     /// provider did not say" — which is honest, because a hierarchy laplus
-    /// cannot prove is one it must not draw. Nothing reads it yet; ticket 06
-    /// places a nested launcher with it.
+    /// cannot prove is one it must not draw.
+    ///
+    /// Set, it is what places the child: [`Streams::record`] keeps a
+    /// [`Delegated`] launcher in the named parent's stream, and the provider
+    /// adapter draws no compact row for it in the root transcript. So this one
+    /// field decides both halves of "one worker has one visible parent".
     pub parent_child_id: Option<String>,
     /// The child's semantic name or type — `explore`, `general`, a project's
     /// own.
@@ -512,6 +572,20 @@ pub struct Head {
 }
 
 impl Head {
+    /// This child as the **nested launcher** its spawner's stream carries.
+    ///
+    /// Every field of one is a field of this, which is the point: a launcher is
+    /// the compact row, and a compact row is a head without its work.
+    fn launcher(&self) -> Launcher {
+        Launcher {
+            child_id: self.child_id.clone(),
+            name: self.name.clone(),
+            assignment: self.assignment.clone(),
+            state: self.state,
+            outcome: self.outcome.clone(),
+        }
+    }
+
     /// The contract's `OrchestrationSubagentStream`.
     ///
     /// `entry_count` is passed rather than held, because it is the one thing on
@@ -572,6 +646,45 @@ impl Stream {
             "entries": self.entries.iter().map(Entry::to_value).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Put a late nested launcher in front of a stream's conclusion, and answer
+/// with every entry whose position that moved.
+///
+/// The one exception to [`Entry::sequence`] being assigned once: **the terminal
+/// entry steps aside so that it stays terminal.** The alternative was to append
+/// behind it, which would put a launcher after the child's own answer and undo
+/// what the terminal entry is for.
+///
+/// Answers `None` for a stream with no conclusion to step around, which cannot
+/// happen from the one call site — it is guarded by the same `concluded` the
+/// outcome sets — and is answered rather than asserted because a stream restored
+/// from a build that recorded a terminal state without a terminal entry is a
+/// real shape on disk.
+fn insert_before_the_conclusion(
+    entries: &mut Vec<Entry>,
+    id: &str,
+    new: &NewEntry,
+    at: &str,
+) -> Option<Vec<Entry>> {
+    let conclusion = entries.iter().position(|entry| entry.kind == EntryKind::Outcome)?;
+    let taken = entries[conclusion].sequence;
+    let launcher = Entry {
+        id: id.to_string(),
+        sequence: taken,
+        kind: new.kind,
+        payload: new.payload.clone(),
+        created_at: at.to_string(),
+    };
+    // Everything from the conclusion onward shifts by one. In practice that is
+    // the conclusion alone, since nothing is recorded behind it.
+    for entry in &mut entries[conclusion..] {
+        entry.sequence += 1;
+    }
+    let mut moved: Vec<Entry> = entries[conclusion..].to_vec();
+    entries.insert(conclusion, launcher.clone());
+    moved.insert(0, launcher);
+    Some(moved)
 }
 
 /// One entry an adapter decided, before it has a place in a stream.
@@ -635,6 +748,26 @@ impl NewEntry {
                 "title": blocker.title,
                 "detail": blocker.detail,
                 "resolution": blocker.resolution.map(Resolution::as_str),
+            }),
+        }
+    }
+
+    /// A child this child delegated, as the launcher inside its stream.
+    ///
+    /// Keyed by the descendant's own identity, so the one launcher follows that
+    /// child through pending, working, blocked and its conclusion rather than
+    /// leaving a row per state change in its parent's history. See
+    /// [`Delegated`].
+    pub fn delegated(nested: &Launcher) -> NewEntry {
+        NewEntry {
+            key: Some(format!("child:{}", nested.child_id)),
+            kind: EntryKind::Subagent,
+            payload: json!({
+                "childId": nested.child_id,
+                "name": nested.name,
+                "assignment": nested.assignment,
+                "state": nested.state.as_str(),
+                "outcome": nested.outcome.as_ref().map(Outcome::to_value),
             }),
         }
     }
@@ -759,11 +892,51 @@ struct Inner {
     transcripts: Transcripts,
 }
 
-/// One child's slot: what it is, and who is watching.
+/// One child's slot: what it is, who is watching, and whether it is this run's.
 #[derive(Debug)]
 struct Slot {
     stream: Mutex<Stream>,
     events: broadcast::Sender<Value>,
+    /// Has **this run** heard this child say anything?
+    ///
+    /// The one thing a stored stream cannot tell you, and the thing the
+    /// delegation tree's liveness turns on. A stream restored from disk records
+    /// what the last run was told, which may be `working` — but the agent behind
+    /// it belonged to a process that is gone, so a restored child is not a
+    /// running one. Set the moment [`Streams::record`] touches the slot, which
+    /// is the only evidence that exists either way: an external OpenCode server
+    /// really can outlive laplus, and a child of one that is genuinely still
+    /// going says so as soon as it says anything.
+    ///
+    /// Read-time provenance rather than a rewrite of what was stored. The
+    /// stream, its tab and its compact row still report exactly what the
+    /// provider last said; what this qualifies is the separate claim that
+    /// somebody is *still working*.
+    heard: std::sync::atomic::AtomicBool,
+}
+
+impl Slot {
+    fn restored(stream: Stream) -> Slot {
+        Slot {
+            stream: Mutex::new(stream),
+            events: broadcast::channel(BACKLOG).0,
+            heard: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn opened(stream: Stream) -> Slot {
+        Slot {
+            stream: Mutex::new(stream),
+            events: broadcast::channel(BACKLOG).0,
+            heard: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Is this child one somebody could still be waiting for?
+    fn running(&self) -> bool {
+        self.heard.load(std::sync::atomic::Ordering::Relaxed)
+            && !lock(&self.stream).head.state.terminal()
+    }
 }
 
 /// The key a slot is held under. A child id is the provider's and is only
@@ -774,6 +947,20 @@ fn slot_key(thread_id: &str, child_id: &str) -> String {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Every slot one conversation owns.
+///
+/// A child id is the provider's and is only unique within its conversation, so
+/// each key is prefixed by the thread that owns it — see [`slot_key`]. Written
+/// once because four callers want the walk, and a fifth spelling of the
+/// separator would quietly answer for no conversation at all.
+fn slots_of<'a>(
+    open: &'a HashMap<String, Arc<Slot>>,
+    thread_id: &str,
+) -> impl Iterator<Item = (&'a String, &'a Arc<Slot>)> {
+    let prefix = format!("{thread_id}\u{1f}");
+    open.iter().filter(move |(key, _)| key.starts_with(&prefix))
 }
 
 impl Streams {
@@ -797,12 +984,7 @@ impl Streams {
         for (thread_id, mut stream) in stored {
             stream.entries.sort_by_key(|entry| entry.sequence);
             open.entry(slot_key(&thread_id, &stream.head.child_id))
-                .or_insert_with(|| {
-                    Arc::new(Slot {
-                        stream: Mutex::new(stream),
-                        events: broadcast::channel(BACKLOG).0,
-                    })
-                });
+                .or_insert_with(|| Arc::new(Slot::restored(stream)));
         }
     }
 
@@ -813,6 +995,38 @@ impl Streams {
     /// a change has to update the stream *and* describe itself to subscribers
     /// *and* be written down, and the three must not be possible to do
     /// inconsistently.
+    ///
+    /// # What a concluded child may still be told
+    ///
+    /// **No *new* entry after a conclusion; a revision of one it already holds
+    /// is fine.** A provider goes on narrating a thread it has already reported
+    /// on — a late item, a status change — and appending those would leave
+    /// entries *after* the stream's own terminal one, which is precisely what
+    /// story 15 asks the terminal entry not to be. The exception is not a
+    /// loophole but the recorded order: the call that was *waiting* on a
+    /// subagent completes after the subagent does, so its entry is revised where
+    /// it stands.
+    ///
+    /// The rule lives here rather than in each adapter because the two places it
+    /// was written disagreed about how long it lasts: this stream is restored
+    /// from disk and its conclusion survives a restart, while an adapter's own
+    /// in-memory note of it did not.
+    ///
+    /// **A nested launcher is the exception**, because it is not the concluded
+    /// child's own work: it is the only place a descendant is shown, the
+    /// adapter has already withheld that descendant's root row on the strength
+    /// of the same parentage, and refusing it would leave the descendant
+    /// visible nowhere. It is placed in front of the conclusion rather than
+    /// behind it — see [`insert_before_the_conclusion`].
+    ///
+    /// **A reported outcome replaces an empty one.** A child that concluded with
+    /// nothing to return, and then returned something, did not in the end return
+    /// nothing — the terminal entry is keyed, so the report upserts in place
+    /// rather than appending a second conclusion. Both a bare Claude
+    /// `task_updated` followed by its `task_notification` and a Codex
+    /// `turn/completed` whose report only arrives on the following `wait` land
+    /// here. It is not a reopening: the child stays terminal throughout and
+    /// gains no ordinary work.
     pub fn record(&self, thread_id: &str, update: Update) {
         if lock(&self.inner.forgotten).contains(thread_id) {
             return;
@@ -822,20 +1036,26 @@ impl Streams {
             Arc::clone(
                 open.entry(slot_key(thread_id, &update.child_id))
                     .or_insert_with(|| {
-                        Arc::new(Slot {
-                            stream: Mutex::new(Stream::new(update.child_id.clone(), now_iso())),
-                            events: broadcast::channel(BACKLOG).0,
-                        })
+                        Arc::new(Slot::opened(Stream::new(update.child_id.clone(), now_iso())))
                     }),
             )
         };
+        // Whatever this update turns out to move, the child has been heard from
+        // — including the restored one this run is meeting for the first time.
+        slot.heard
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let at = now_iso();
         let mut published = Vec::new();
         let mut writes = Vec::new();
-        {
+        let nested = {
             let mut stream = lock(&slot.stream);
             let mut head_moved = false;
+            // Read before this update touches anything: whether the stream had
+            // already spent its terminal entry is what decides which of this
+            // update's entries are revisions and which would be new work after
+            // a conclusion.
+            let concluded = stream.head.outcome.is_some();
             if update.parent_child_id.is_some()
                 && stream.head.parent_child_id != update.parent_child_id
             {
@@ -862,7 +1082,15 @@ impl Streams {
 
             let mut entries = update.entries;
             if let Some(outcome) = &update.outcome {
-                if stream.head.outcome.is_none() {
+                let reports = match &stream.head.outcome {
+                    None => true,
+                    // The one revision a conclusion admits. Anything else is a
+                    // provider still narrating: the answer is the answer.
+                    Some(held) => {
+                        held.kind == OutcomeKind::Empty && outcome.kind != OutcomeKind::Empty
+                    }
+                };
+                if reports {
                     entries.push(NewEntry::concluded(outcome));
                     stream.head.outcome = Some(outcome.clone());
                     stream.head.state = outcome.kind.state();
@@ -883,6 +1111,37 @@ impl Streams {
                     None => format!("{}:n:{next}", stream.head.child_id),
                 };
                 let existing = stream.entries.iter().position(|entry| entry.id == id);
+                if concluded && existing.is_none() {
+                    // **A descendant proven late is still a descendant.** The
+                    // provider adapter has already withheld this child's row
+                    // from the root transcript on the strength of the parentage
+                    // it proved, so refusing the launcher here would leave the
+                    // descendant visible in neither place — and it is the one
+                    // kind of entry that is not the concluded child's own work.
+                    // Codex reaches this whenever a `wait` names an agent for
+                    // the first time after that agent's spawner has reported.
+                    //
+                    // It goes *in front of* the conclusion rather than behind
+                    // it, because story 15 wants the result last in the stream.
+                    if new.kind == EntryKind::Subagent {
+                        if let Some(moved) =
+                            insert_before_the_conclusion(&mut stream.entries, &id, &new, &at)
+                        {
+                            for entry in moved {
+                                head_moved = true;
+                                writes.push(Write::SubagentEntry {
+                                    thread_id: thread_id.to_string(),
+                                    child_id: stream.head.child_id.clone(),
+                                    entry: Box::new(entry.clone()),
+                                });
+                                published.push(
+                                    json!({"kind": "entry-upserted", "entry": entry.to_value()}),
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let entry = match existing {
                     Some(index) => {
                         let entry = Entry {
@@ -931,13 +1190,73 @@ impl Streams {
                     head: Box::new(stream.head.clone()),
                 },
             );
-        }
+            // The launcher this child owes its spawner, decided under the same
+            // lock as the head it describes and spent below, outside it: the
+            // parent is another slot with another lock.
+            stream
+                .head
+                .parent_child_id
+                .clone()
+                .filter(|parent| parent != &stream.head.child_id)
+                .map(|parent| {
+                    Update::for_child(parent).with(NewEntry::delegated(&stream.head.launcher()))
+                })
+        };
 
         for write in writes {
             self.inner.transcripts.queue(write);
         }
         for event in published {
             let _ = slot.events.send(event);
+        }
+        // **A descendant is shown once, inside the stream of the child that
+        // launched it.** Recursion terminates because the launcher is built from
+        // the descendant's head *and carries no clock*: an echo that says nothing
+        // new is an entry equal to the one already there, which is skipped, moves
+        // no head, and returns before echoing again. Putting a timestamp on
+        // `Launcher` would make every echo differ from the last and turn one
+        // child's sentence into a walk up its whole ancestry.
+        if let Some(echo) = nested {
+            self.record(thread_id, echo);
+        }
+    }
+
+    /// Every child of this conversation still pending, working or blocked.
+    ///
+    /// The **known active delegation tree** — every generation of it, because a
+    /// stream is held per child rather than per level. What a thread's Working
+    /// state is derived from and what a Stop reaches.
+    pub fn active(&self, thread_id: &str) -> Vec<String> {
+        let mut running: Vec<String> = slots_of(&lock(&self.inner.open), thread_id)
+            .filter(|(_, slot)| slot.running())
+            .map(|(_, slot)| lock(&slot.stream).head.child_id.clone())
+            .collect();
+        running.sort();
+        running
+    }
+
+    /// Is there work anywhere in this conversation's known delegation tree?
+    pub fn working(&self, thread_id: &str) -> bool {
+        slots_of(&lock(&self.inner.open), thread_id).any(|(_, slot)| slot.running())
+    }
+
+    /// Stop the known active delegation tree.
+    ///
+    /// Every child that had not concluded records an **interruption** — a
+    /// terminal state and the terminal entry that says why — and, by the rule
+    /// [`Streams::record`] documents, receives no ordinary live work
+    /// afterwards. A child that had already reported is left exactly as it
+    /// reported: it was not stopped, it had finished.
+    ///
+    /// Deliberately not reachable from closing a surface. Closing a child tab is
+    /// presentation only (`rightPanelCleanup.ts`), and the whole point of the
+    /// distinction is that the common workspace gesture cannot end work.
+    pub fn interrupt(&self, thread_id: &str) {
+        for child_id in self.active(thread_id) {
+            self.record(
+                thread_id,
+                Update::for_child(child_id).concluded(Outcome::interrupted(None)),
+            );
         }
     }
 
@@ -990,10 +1309,7 @@ impl Streams {
 
     /// The children of one conversation, oldest first.
     pub fn of_thread(&self, thread_id: &str) -> Vec<Stream> {
-        let prefix = format!("{thread_id}\u{1f}");
-        let mut found: Vec<Stream> = lock(&self.inner.open)
-            .iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
+        let mut found: Vec<Stream> = slots_of(&lock(&self.inner.open), thread_id)
             .map(|(_, slot)| lock(&slot.stream).clone())
             .collect();
         found.sort_by(|left, right| {
@@ -1015,11 +1331,8 @@ impl Streams {
             let mut forgotten = lock(&self.inner.forgotten);
             for thread_id in thread_ids {
                 forgotten.insert(thread_id.clone());
-                let prefix = format!("{thread_id}\u{1f}");
-                let going: Vec<String> = open
-                    .keys()
-                    .filter(|key| key.starts_with(&prefix))
-                    .cloned()
+                let going: Vec<String> = slots_of(&open, thread_id)
+                    .map(|(key, _)| key.clone())
                     .collect();
                 for key in going {
                     open.remove(&key);
@@ -1193,6 +1506,323 @@ mod tests {
             stream.head.outcome.expect("an outcome").text.as_deref(),
             Some("eleven")
         );
+    }
+
+    /// The one revision a conclusion admits. A child that concluded with nothing
+    /// to return and then returned something did not, in the end, return
+    /// nothing — and the terminal entry moves with it rather than being joined
+    /// by a second.
+    #[test]
+    fn a_report_replaces_an_empty_conclusion_in_place() {
+        let streams = streams();
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").concluded(Outcome::completed(None)),
+        );
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").concluded(Outcome::completed(Some("eleven".into()))),
+        );
+
+        let stream = streams.get("thread-1", "child-1").expect("the stream");
+        let outcome = stream.head.outcome.expect("an outcome");
+        assert_eq!(outcome.kind, OutcomeKind::Completed);
+        assert_eq!(outcome.text.as_deref(), Some("eleven"));
+        assert_eq!(stream.head.state, State::Completed);
+        assert_eq!(
+            stream.entries.len(),
+            1,
+            "the report joined the empty conclusion instead of replacing it"
+        );
+        assert_eq!(stream.entries[0].payload["text"], "eleven");
+    }
+
+    /// A conclusion closes the stream to *new* work and to nothing else. The
+    /// call that was waiting on a child completes after the child does, so the
+    /// entry it already left is revised where it stands.
+    #[test]
+    fn a_concluded_child_revises_what_it_holds_and_takes_nothing_new() {
+        let streams = streams();
+        let waiting = |title: &str, status: Progress| Work {
+            title: title.to_string(),
+            status,
+            detail: None,
+            command: None,
+            paths: Vec::new(),
+            query: None,
+        };
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").with(NewEntry::worked(
+                Some("collab:wait-1".into()),
+                EntryKind::Tool,
+                &waiting("Waiting for subagents", Progress::InProgress),
+            )),
+        );
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").concluded(Outcome::completed(Some("done".into()))),
+        );
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1")
+                .with(NewEntry::worked(
+                    Some("collab:wait-1".into()),
+                    EntryKind::Tool,
+                    &waiting("Waited for subagents", Progress::Completed),
+                ))
+                .with(NewEntry::said(Some("item:late".into()), "one more thing")),
+        );
+
+        let stream = streams.get("thread-1", "child-1").expect("the stream");
+        let read: Vec<(&str, &str)> = stream
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.kind.as_str(),
+                    entry.payload["title"]
+                        .as_str()
+                        .or_else(|| entry.payload["text"].as_str())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![("tool", "Waited for subagents"), ("outcome", "done")],
+            "a conclusion is the last entry of the stream"
+        );
+    }
+
+    /// Story 44: a descendant the provider proves belongs to another child is
+    /// launched from inside that child's stream, and one launcher follows it
+    /// however many times it moves.
+    #[test]
+    fn a_proven_descendant_is_launchable_from_inside_its_parents_stream() {
+        let streams = streams();
+        let nested = || {
+            let mut update = Update::for_child("child-2").named(Some("helper".into()));
+            update.parent_child_id = Some("child-1".into());
+            update
+        };
+        streams.record("thread-1", Update::for_child("child-1").in_state(State::Working));
+        streams.record("thread-1", nested().in_state(State::Working));
+        streams.record(
+            "thread-1",
+            nested().concluded(Outcome::completed(Some("eleven".into()))),
+        );
+
+        let parent = streams.get("thread-1", "child-1").expect("the parent");
+        let launchers: Vec<&Entry> = parent
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Subagent)
+            .collect();
+        assert_eq!(launchers.len(), 1, "one launcher per descendant: {parent:#?}");
+        assert_eq!(launchers[0].payload["childId"], "child-2");
+        assert_eq!(launchers[0].payload["name"], "helper");
+        assert_eq!(launchers[0].payload["state"], "completed");
+        assert_eq!(launchers[0].payload["outcome"]["text"], "eleven");
+    }
+
+    /// Parentage the provider never proved draws nothing: a child with no
+    /// `parentChildId` leaves no launcher anywhere but the root's own row.
+    #[test]
+    fn an_unproven_relationship_puts_a_launcher_in_no_ones_stream() {
+        let streams = streams();
+        streams.record("thread-1", Update::for_child("child-1").in_state(State::Working));
+        streams.record("thread-1", Update::for_child("child-2").in_state(State::Working));
+        for child in ["child-1", "child-2"] {
+            let stream = streams.get("thread-1", child).expect("the stream");
+            assert!(
+                stream
+                    .entries
+                    .iter()
+                    .all(|entry| entry.kind != EntryKind::Subagent),
+                "{child} invented a descendant: {stream:#?}"
+            );
+        }
+    }
+
+    /// Stopping the parent stops the tree: every child that had not reported
+    /// records an interruption, and a child that had already reported keeps what
+    /// it reported.
+    #[test]
+    fn stopping_the_tree_interrupts_exactly_what_was_still_working() {
+        let streams = streams();
+        streams.record("thread-1", Update::for_child("running").in_state(State::Working));
+        streams.record("thread-1", Update::for_child("waiting").in_state(State::Blocked));
+        streams.record(
+            "thread-1",
+            Update::for_child("finished").concluded(Outcome::completed(Some("eleven".into()))),
+        );
+        assert!(streams.working("thread-1"));
+
+        streams.interrupt("thread-1");
+
+        assert!(!streams.working("thread-1"), "the tree is still reported active");
+        assert!(streams.active("thread-1").is_empty());
+        for child in ["running", "waiting"] {
+            let stream = streams.get("thread-1", child).expect("the stream");
+            assert_eq!(stream.head.state, State::Interrupted);
+            assert_eq!(
+                stream.head.outcome.expect("an outcome").kind,
+                OutcomeKind::Interrupted
+            );
+            assert_eq!(
+                stream.entries.last().expect("the terminal entry").kind,
+                EntryKind::Outcome
+            );
+        }
+        let finished = streams.get("thread-1", "finished").expect("the stream");
+        assert_eq!(finished.head.state, State::Completed);
+        assert_eq!(
+            finished.head.outcome.expect("an outcome").text.as_deref(),
+            Some("eleven"),
+            "a child that had finished was rewritten as one that was stopped"
+        );
+    }
+
+    /// And an interrupted child takes no ordinary live work afterwards.
+    #[test]
+    fn an_interrupted_child_stops_receiving_live_work() {
+        let streams = streams();
+        streams.record("thread-1", Update::for_child("child-1").in_state(State::Working));
+        streams.interrupt("thread-1");
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1")
+                .in_state(State::Working)
+                .with(NewEntry::said(Some("item:late".into()), "still going")),
+        );
+
+        let stream = streams.get("thread-1", "child-1").expect("the stream");
+        assert_eq!(stream.head.state, State::Interrupted);
+        assert_eq!(stream.entries.len(), 1);
+        assert_eq!(stream.entries[0].kind, EntryKind::Outcome);
+    }
+
+    /// **A restored child is not a running one.** A stream left `working` on
+    /// disk records what the last run was told; the agent behind it belonged to
+    /// a process that is gone, so counting it would hold the conversation
+    /// Working for ever with nothing able to clear it. The stored stream is
+    /// untouched — this is a read-time claim about liveness, not a rewrite of
+    /// what was recorded.
+    #[test]
+    fn a_child_restored_from_disk_is_not_work_in_progress() {
+        let streams = streams();
+        let mut stranded = Stream::new("child-1".into(), "2026-08-17T00:00:00.000Z".into());
+        stranded.head.state = State::Working;
+        streams.restore(vec![("thread-1".to_string(), stranded)]);
+
+        assert_eq!(
+            streams
+                .get("thread-1", "child-1")
+                .expect("the stream")
+                .head
+                .state,
+            State::Working,
+            "the stored stream was rewritten rather than merely discounted"
+        );
+        assert!(!streams.working("thread-1"));
+        assert!(streams.active("thread-1").is_empty());
+    }
+
+    /// And nothing is lost by that: a child of a provider that really did
+    /// outlive laplus — an external OpenCode server is the case — counts again
+    /// the moment it says anything, which is the only evidence either way.
+    #[test]
+    fn a_restored_child_counts_again_as_soon_as_it_is_heard_from() {
+        let streams = streams();
+        let mut stranded = Stream::new("child-1".into(), "2026-08-17T00:00:00.000Z".into());
+        stranded.head.state = State::Working;
+        streams.restore(vec![("thread-1".to_string(), stranded)]);
+        assert!(!streams.working("thread-1"));
+
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").with(NewEntry::said(Some("part-1".into()), "still here")),
+        );
+
+        assert!(streams.working("thread-1"));
+        assert_eq!(streams.active("thread-1"), vec!["child-1".to_string()]);
+    }
+
+    /// A stop reaches this run's tree and not a previous run's. Interrupting an
+    /// orphan would write a terminal outcome over a stream nothing in this
+    /// process ever drove, which is the one thing a read-time liveness claim
+    /// must not turn into a durable edit.
+    #[test]
+    fn stopping_the_tree_does_not_rewrite_a_previous_runs_children() {
+        let streams = streams();
+        let mut stranded = Stream::new("child-1".into(), "2026-08-17T00:00:00.000Z".into());
+        stranded.head.state = State::Working;
+        streams.restore(vec![("thread-1".to_string(), stranded)]);
+
+        streams.interrupt("thread-1");
+
+        let stream = streams.get("thread-1", "child-1").expect("the stream");
+        assert_eq!(stream.head.state, State::Working);
+        assert_eq!(stream.head.outcome, None);
+        assert!(stream.entries.is_empty());
+    }
+
+    /// A descendant whose parentage is only proven after its spawner has
+    /// reported is still a descendant: the adapter has already withheld its row
+    /// from the root transcript, so refusing the launcher would leave it
+    /// visible in neither place. It goes **in front of** the conclusion, because
+    /// the conclusion is what has to stay last.
+    #[test]
+    fn a_descendant_proven_after_its_parent_reported_is_still_launchable() {
+        let streams = streams();
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").with(NewEntry::said(Some("part-1".into()), "reviewing")),
+        );
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").concluded(Outcome::completed(Some("looks right".into()))),
+        );
+
+        let mut nested = Update::for_child("child-2").named(Some("helper".into()));
+        nested.parent_child_id = Some("child-1".into());
+        streams.record("thread-1", nested.concluded(Outcome::failed(Some("gone".into()))));
+
+        let parent = streams.get("thread-1", "child-1").expect("the parent");
+        let read: Vec<(&str, i64)> = parent
+            .entries
+            .iter()
+            .map(|entry| (entry.kind.as_str(), entry.sequence))
+            .collect();
+        assert_eq!(
+            read,
+            vec![("message", 1), ("subagent", 2), ("outcome", 3)],
+            "the conclusion is no longer the last entry of the stream: {parent:#?}"
+        );
+        let launcher = &parent.entries[1];
+        assert_eq!(launcher.payload["childId"], "child-2");
+        assert_eq!(launcher.payload["name"], "helper");
+    }
+
+    /// And that exception is only for a launcher. Ordinary work arriving after a
+    /// conclusion is still refused, so the terminal entry does not become a
+    /// place things get inserted in front of.
+    #[test]
+    fn late_work_that_is_not_a_descendant_is_still_refused() {
+        let streams = streams();
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").concluded(Outcome::completed(Some("done".into()))),
+        );
+        streams.record(
+            "thread-1",
+            Update::for_child("child-1").with(NewEntry::said(Some("item:late".into()), "one more")),
+        );
+
+        let stream = streams.get("thread-1", "child-1").expect("the stream");
+        assert_eq!(stream.entries.len(), 1);
+        assert_eq!(stream.entries[0].kind, EntryKind::Outcome);
     }
 
     /// Deleting the conversation takes its children with it, which is the whole

@@ -1128,3 +1128,61 @@ it.effect("a subagent notice says whether it is a warning or an error", () =>
     assert.strictEqual(noticed.entry.payload.level, "warning");
   }),
 );
+
+/**
+ * A nested child is a launcher inside its parent's stream, and the union says
+ * so: the `subagent` kind carries the descendant's identity and where it got to
+ * rather than a copy of its work, which stays in the stream this opens.
+ */
+it.effect("a nested subagent entry launches the descendant it names", () =>
+  Effect.gen(function* () {
+    const nested = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "child-alpha:k:child:child-gamma",
+        sequence: 6,
+        kind: "subagent",
+        payload: {
+          childId: "child-gamma",
+          name: "helper",
+          assignment: "Check the tests",
+          state: "completed",
+          outcome: { kind: "completed", text: "eleven tests pass" },
+        },
+        createdAt: "2026-08-17T00:00:06.000Z",
+      },
+    });
+    if (nested.kind !== "entry-upserted" || nested.entry.kind !== "subagent") {
+      assert.fail("a nested launcher decoded as something else");
+      return;
+    }
+    assert.strictEqual(nested.entry.payload.childId, "child-gamma");
+    assert.strictEqual(nested.entry.payload.state, "completed");
+    assert.strictEqual(nested.entry.payload.outcome?.text, "eleven tests pass");
+  }),
+);
+
+/** Absent detail is absence rather than emptiness, here as everywhere else. */
+it.effect("a nested subagent laplus knows only the identity of says only that", () =>
+  Effect.gen(function* () {
+    const nested = yield* decodeSubagentStreamItem({
+      kind: "entry-upserted",
+      entry: {
+        id: "child-alpha:k:child:child-gamma",
+        sequence: 6,
+        kind: "subagent",
+        payload: {
+          childId: "child-gamma",
+          name: null,
+          assignment: null,
+          state: "pending",
+          outcome: null,
+        },
+        createdAt: "2026-08-17T00:00:06.000Z",
+      },
+    });
+    if (nested.kind !== "entry-upserted" || nested.entry.kind !== "subagent") return;
+    assert.strictEqual(nested.entry.payload.name, null);
+    assert.strictEqual(nested.entry.payload.outcome, null);
+  }),
+);

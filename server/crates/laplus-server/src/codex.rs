@@ -658,8 +658,26 @@ fn decide(
                     turn_id.clone(),
                 )));
             children.operated(&call, true, &mut decided);
+            // **Every agent this call names is registered before any row is
+            // drawn**, and the two passes are not a style choice.
+            // [`Children::parent_of`] resolves a path against the paths it
+            // already holds, so a `wait` that listed a descendant ahead of its
+            // spawner would draw the descendant a root row — published, and
+            // never retractable — purely because of the order Codex happened to
+            // report its fleet in.
             for agent in &call.agents {
                 children.reported(agent, &mut decided);
+            }
+            for agent in &call.agents {
+                // A descendant of another child is launched from inside that
+                // child's stream, so it gets no row here — see
+                // [`Children::nested`]. The `wait` that reports on the whole
+                // fleet is where an agent Codex has proven belongs to another
+                // agent is most likely to be seen from the root for the first
+                // time.
+                if children.nested(&agent.thread_id) {
+                    continue;
+                }
                 decided
                     .changes
                     .push(Change::Activity(collaboration_agent_row(
@@ -672,12 +690,14 @@ fn decide(
         ConversationFold::SubagentActivity(activity) => {
             let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
             children.acted(&activity, &mut decided);
-            let latest = children.latest_of(&activity.agent_thread_id);
-            decided
-                .changes
-                .push(Change::Activity(subagent_activity_row(
-                    &activity, latest, turn_id,
-                )));
+            if !children.nested(&activity.agent_thread_id) {
+                let latest = children.latest_of(&activity.agent_thread_id);
+                decided
+                    .changes
+                    .push(Change::Activity(subagent_activity_row(
+                        &activity, latest, turn_id,
+                    )));
+            }
         }
         // A descendant, announced by the child that launched it. Its identity,
         // its canonical path and the parentage that path proves are recorded;
@@ -689,14 +709,16 @@ fn decide(
         ConversationFold::SubagentObserved(agent) => {
             let turn_id = driving.turn.as_ref().map(|turn| turn.turn_id.clone());
             children.reported(&agent, &mut decided);
-            let latest = children
-                .latest_of(&agent.thread_id)
-                .or(agent.path.as_deref());
-            decided
-                .changes
-                .push(Change::Activity(collaboration_agent_row(
-                    &agent, latest, turn_id,
-                )));
+            if !children.nested(&agent.thread_id) {
+                let latest = children
+                    .latest_of(&agent.thread_id)
+                    .or(agent.path.as_deref());
+                decided
+                    .changes
+                    .push(Change::Activity(collaboration_agent_row(
+                        &agent, latest, turn_id,
+                    )));
+            }
         }
         // A child's own prose and work. It updates that child's stream and
         // nothing else: the parent transcript keeps one compact row per child,
@@ -920,19 +942,6 @@ struct Children {
 struct Subagent {
     /// The canonical agent path, once a `subAgentActivity` has named it.
     path: Option<String>,
-    /// Reported, and therefore closed. Codex can go on narrating a thread after
-    /// its outcome — a late item, a status change — and a stream that kept
-    /// appending would leave entries *after* its own terminal one.
-    concluded: bool,
-    /// The entry keys this child's stream already holds.
-    ///
-    /// What a closed child may still be told. The `wait` that was waiting on a
-    /// subagent completes *after* the subagent does — that is the recorded
-    /// order, not a race — so a closed child that refused every later event
-    /// would keep "Waiting for subagents" in its history forever. A key it
-    /// already has revises that entry where it stands; a key it does not have
-    /// would be new work after a conclusion, and is refused.
-    keys: std::collections::HashSet<String>,
     /// The latest meaningful thing this child did, for the compact row.
     ///
     /// One line, from the child's own stream rather than from the parent's
@@ -945,26 +954,17 @@ struct Subagent {
 
 impl Children {
     /// This child, and everything already known about it, as the update every
-    /// caller below starts from — **or `None`, because a reported child is
-    /// closed to anything new.**
+    /// caller below starts from.
     ///
-    /// `key` is the entry this update is about to carry, or `None` for an update
-    /// that carries no entry of its own. A key the child's stream already holds
-    /// is still accepted after it has been reported on, and is the only thing
-    /// that is — see [`Subagent::keys`].
-    fn still_open(
-        &mut self,
-        thread_id: &str,
-        path: Option<&str>,
-        key: Option<&str>,
-    ) -> Option<crate::subagents::Update> {
+    /// **How long a reported child stays closed is not this adapter's question
+    /// any more.** It used to be: a `concluded` flag and the set of entry keys a
+    /// closed child would still accept lived here, which made the rule
+    /// in-memory — a restart lost it — while the stream's own conclusion is
+    /// restored from disk. `crate::subagents::Streams::record` owns it now, for
+    /// every provider and across a restart, so this simply forwards what Codex
+    /// said and lets the stream decide what it may still be told.
+    fn about(&mut self, thread_id: &str, path: Option<&str>) -> crate::subagents::Update {
         let child = self.by_thread.entry(thread_id.to_string()).or_default();
-        if child.concluded && !key.is_some_and(|key| child.keys.contains(key)) {
-            return None;
-        }
-        if let Some(key) = key {
-            child.keys.insert(key.to_string());
-        }
         if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
             child.path = Some(path.to_string());
         }
@@ -972,7 +972,22 @@ impl Children {
         let mut update = crate::subagents::Update::for_child(thread_id)
             .named(path.as_deref().and_then(agent_name).map(str::to_string));
         update.parent_child_id = path.as_deref().and_then(|path| self.parent_of(path));
-        Some(update)
+        update
+    }
+
+    /// Does a *child* hold this agent's parent path?
+    ///
+    /// The question the root transcript asks before drawing a compact row: a
+    /// descendant Codex proves belongs to another child is shown inside that
+    /// child's stream and nowhere else, so the developer sees one worker with
+    /// one visible parent. Unproven parentage answers `false` and keeps the
+    /// truthful root behaviour.
+    fn nested(&self, thread_id: &str) -> bool {
+        self.by_thread
+            .get(thread_id)
+            .and_then(|child| child.path.as_deref())
+            .and_then(|path| self.parent_of(path))
+            .is_some()
     }
 
     /// The thread id of the agent whose canonical path is this path's parent.
@@ -1026,10 +1041,6 @@ impl Children {
             .latest = Some(said.to_string());
     }
 
-    fn concluded(&mut self, thread_id: &str) {
-        self.by_thread.entry(thread_id.to_string()).or_default().concluded = true;
-    }
-
     /// A collaboration operation, in the stream of every child it concerns.
     ///
     /// **The operation is not the child.** A `spawnAgent` that completed has
@@ -1061,9 +1072,7 @@ impl Children {
         }
         let key = format!("collab:{}", call.id);
         for receiver in receivers {
-            let Some(update) = self.still_open(&receiver, None, Some(&key)) else {
-                continue;
-            };
+            let update = self.about(&receiver, None);
             // What the parent asked *this* child for, and only on the call that
             // asked it. A later `wait` carries no prompt, and an assignment
             // absent from the protocol stays absent.
@@ -1085,13 +1094,7 @@ impl Children {
     /// interaction itself as one entry of that agent's history.
     fn acted(&mut self, activity: &SubagentActivity, decided: &mut Decided) {
         let key = format!("activity:{}", activity.id);
-        let Some(update) = self.still_open(
-            &activity.agent_thread_id,
-            Some(&activity.agent_path),
-            Some(&key),
-        ) else {
-            return;
-        };
+        let update = self.about(&activity.agent_thread_id, Some(&activity.agent_path));
         let title = match activity.kind.as_str() {
             "started" => "Subagent started",
             "interacted" => "Input sent to the subagent",
@@ -1111,10 +1114,7 @@ impl Children {
             },
         ));
         match conclusion(&activity.kind, None) {
-            Some(outcome) => {
-                self.concluded(&activity.agent_thread_id);
-                decided.child_streams.push(update.concluded(outcome));
-            }
+            Some(outcome) => decided.child_streams.push(update.concluded(outcome)),
             None => decided
                 .child_streams
                 .push(update.in_state(crate::subagents::State::Working)),
@@ -1124,14 +1124,9 @@ impl Children {
     /// An agent state Codex reported — from a collaboration call's map, or from
     /// the child's own completed turn.
     fn reported(&mut self, agent: &CollaborationAgent, decided: &mut Decided) {
-        let Some(update) = self.still_open(&agent.thread_id, agent.path.as_deref(), None) else {
-            return;
-        };
+        let update = self.about(&agent.thread_id, agent.path.as_deref());
         match conclusion(&agent.status, agent.message.as_deref()) {
-            Some(outcome) => {
-                self.concluded(&agent.thread_id);
-                decided.child_streams.push(update.concluded(outcome));
-            }
+            Some(outcome) => decided.child_streams.push(update.concluded(outcome)),
             None => decided
                 .child_streams
                 .push(update.in_state(agent_state(&agent.status))),
@@ -1145,12 +1140,9 @@ impl Children {
             ChildEvent::Said { item_id, .. } => Some(format!("item:{item_id}")),
             ChildEvent::Ran(command) => Some(format!("item:{}", command.id)),
         };
-        let Some(update) =
-            self.still_open(&work.thread_id, work.path.as_deref(), key.as_deref())
-        else {
-            return;
-        };
-        let update = update.in_state(crate::subagents::State::Working);
+        let update = self
+            .about(&work.thread_id, work.path.as_deref())
+            .in_state(crate::subagents::State::Working);
         match &work.event {
             // A turn boundary is structure rather than progress, and the spec
             // asks for the latest *meaningful* activity.
@@ -1267,25 +1259,11 @@ fn command_work(command: &CommandExecution) -> crate::subagents::Work {
             .aggregated_output
             .as_deref()
             .filter(|output| !output.trim().is_empty())
-            .map(bounded),
+            .map(crate::subagents::bounded),
         command: Some(command.command.clone()),
         paths: Vec::new(),
         query: None,
     }
-}
-
-/// A child's output, kept whole up to a bound. The child's tab renders it in
-/// full, so this is a guard against a runaway process rather than a preview.
-///
-/// The twin of `opencode::bounded`, deliberately copied rather than shared: the
-/// one place both could live is [`crate::subagents`], which three provider
-/// branches are editing at once. Fold the two together when they merge.
-fn bounded(output: &str) -> String {
-    const CHILD_OUTPUT: usize = 8 * 1024;
-    if output.chars().count() <= CHILD_OUTPUT {
-        return output.to_string();
-    }
-    output.chars().take(CHILD_OUTPUT).collect::<String>() + "…"
 }
 
 /// The agent's own name, out of the path Codex identifies it by.
