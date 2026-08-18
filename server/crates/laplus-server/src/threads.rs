@@ -534,6 +534,55 @@ impl Threads {
         &self.inner.subagents
     }
 
+    /// Say whether this conversation is working, reading its **whole known
+    /// delegation tree** rather than only its root.
+    ///
+    /// The client draws a thread as *Working* from one thing — a session whose
+    /// status is `running` (`Sidebar.logic.ts`, `resolveThreadStatusPill`) — so
+    /// a conversation whose root has gone quiet while a background child is
+    /// still counting is one the sidebar would otherwise call idle. This is that
+    /// claim corrected, and it is a **reconciliation rather than a deferral**:
+    /// the root's turn settles exactly when it settled before, carrying the
+    /// state it truthfully reached, and what this republishes afterwards is the
+    /// session alone.
+    ///
+    /// Two directions, both idempotent, and both narrowed to a session with **no
+    /// turn in flight** — a turn of the developer's own already says the
+    /// conversation is working, and this must never touch one:
+    ///
+    /// - a quiet session (`ready` or `idle`) with an active descendant becomes
+    ///   `running`, with no `activeTurnId`, which the client's reducer folds
+    ///   without disturbing the turn it has already settled;
+    /// - a `running` session with no turn and nothing left in its tree becomes
+    ///   `ready`, which is the status the settle it stood in for wanted.
+    ///
+    /// A root that ended `interrupted`, `stopped` or `error` is left alone in
+    /// both directions: those say something about the conversation the developer
+    /// needs, and a delegation tree is not a reason to withhold it.
+    pub fn follow_delegation(&self, thread_id: &str) -> Option<i64> {
+        let session = self.get(thread_id)?.session?;
+        if session.active_turn_id.is_some() {
+            return None;
+        }
+        let working = self.inner.subagents.working(thread_id);
+        use crate::settling::SessionStatus;
+        let status = match (working, session.status) {
+            (true, SessionStatus::Ready | SessionStatus::Idle) => SessionStatus::Running,
+            (false, SessionStatus::Running) => SessionStatus::Ready,
+            _ => return None,
+        };
+        self.apply(
+            thread_id,
+            Change::Session(Session {
+                status,
+                runtime_mode: session.runtime_mode,
+                active_turn_id: None,
+                last_error: session.last_error,
+                updated_at: now_iso(),
+            }),
+        )
+    }
+
     /// Agent processes currently running. The gauge that makes "the subprocess
     /// is terminated and reaped when the session ends" observable from outside,
     /// without a test reaching into the registry to look — the same accounting

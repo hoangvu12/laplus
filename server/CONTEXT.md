@@ -426,11 +426,49 @@ finishes be one entry that moves rather than two that repeat.
 
 **Entry kind** — what a stream entry _is_, in one vocabulary all three providers
 fill: the child's prose, a command, a read or search, an edit, another tool call,
-a warning or error, a blocker, and the terminal outcome. The kind decides the
-payload and the row the client draws, so a child's command reads as a command
-and its edit as a file change. A provider tool laplus cannot place is a generic
-tool call rather than a guess at which specific kind it resembles.
-`crate::subagents::EntryKind`.
+a warning or error, a blocker, a **nested launcher**, and the terminal outcome.
+The kind decides the payload and the row the client draws, so a child's command
+reads as a command and its edit as a file change. A provider tool laplus cannot
+place is a generic tool call rather than a guess at which specific kind it
+resembles. `crate::subagents::EntryKind`.
+
+**Nested launcher** — a subagent's compact row inside the stream of the subagent
+that delegated it. The same five things the parent conversation's **compact child
+row** carries — identity, name, assignment, state and outcome — in the one other
+place a launcher may appear, and it opens the descendant as another ordinary
+right-panel tab. `crate::subagents::Delegated`.
+
+**Drawn only where the provider proves the relationship, and drawn there
+_instead_ of in the root transcript.** It exists because **stream head**'s
+`parent_child_id` is set, and that field is filled from evidence alone, so a
+hierarchy laplus cannot prove produces no nested launcher and nothing invented to
+stand in for one — a descendant announced on the root thread is placed by what
+the provider proved about it rather than by where laplus first heard of it. One
+worker has one visible parent.
+
+**Delegation tree** — every subagent a conversation has delegated, at every
+generation. Not a shape this server stores: a child stream is held per child and
+the tree is what they say about each other, so "the whole tree" is a question
+answered by reading them all (`crate::subagents::Streams::active`). It is the
+subject of two rules.
+
+**The conversation is working while its tree is.** A quiet or settled root does
+not make the thread idle while a descendant is pending, running or blocked — the
+sidebar draws _Working_ from a session whose status is `running`
+(`Sidebar.logic.ts`, `resolveThreadStatusPill`), so
+`crate::threads::Threads::follow_delegation` is what keeps that claim true of the
+tree rather than only of the root. It **reconciles rather than defers**: the
+root's turn settles when it settled before, carrying the state it truthfully
+reached, and the session republished afterwards names no turn. The conversation
+leaves Working when the last descendant is terminal.
+
+**Stopping the parent stops the tree.** Every child that had not already reported
+records an interruption — its terminal state and the last entry of its stream —
+and takes no ordinary live work afterwards. Recorded on the developer's own
+command rather than waited for, because no provider reports back that a subagent
+it was running has been abandoned. **Closing a child tab is not this**: a closed
+surface asks the server for nothing at all, which is the whole of what keeps the
+common workspace gesture safe.
 
 **Child work** — one piece of what a subagent did, carried in the _client's_
 work-log vocabulary rather than any provider's: a title, a lifecycle status, and

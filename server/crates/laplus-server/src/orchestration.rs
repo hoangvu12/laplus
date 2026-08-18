@@ -1517,7 +1517,34 @@ impl Shell {
             .threads
             .interrupt(&interrupt.thread_id, interrupt.turn_id.clone())
             .map_err(CommandError::new)?;
+        self.stop_the_delegation_tree(&interrupt.thread_id);
         Ok(self.inner.sequences.current())
+    }
+
+    /// Stopping the parent stops the tree it delegated.
+    ///
+    /// **Recorded here, on the developer's own command, rather than waited for.**
+    /// No provider reports back that a subagent it was running has been
+    /// abandoned — a child's last word is whatever it happened to be saying — so
+    /// a stream that waited for one would sit at `working` forever and the
+    /// sidebar would go on calling the conversation active. What the developer
+    /// asked for is knowable at the moment they ask, which is the same reading
+    /// [`Shell::stop_session`] takes of freeing the slot before the child has
+    /// been reaped.
+    ///
+    /// Every child that had not already reported records an **interruption**,
+    /// which is both its terminal state and the last entry of its stream, and
+    /// from then on it takes no ordinary live work — see
+    /// [`crate::subagents::Streams::record`]. A child that had already reported
+    /// keeps what it reported: it was not stopped, it had finished.
+    ///
+    /// **Closing a child tab is not this**, and cannot become it: a closed
+    /// surface asks the server for nothing at all
+    /// (`rightPanelCleanup.ts::resolveRightPanelSurfaceCleanup`), which is the
+    /// whole of what keeps the common workspace gesture safe.
+    fn stop_the_delegation_tree(&self, thread_id: &str) {
+        self.inner.threads.subagents().interrupt(thread_id);
+        self.inner.threads.follow_delegation(thread_id);
     }
 
     /// End the agent process behind a conversation, and keep the conversation.
@@ -1557,6 +1584,10 @@ impl Shell {
             .threads
             .stop_session(thread_id)
             .map_err(CommandError::new)?;
+        // Before the early answer as well as after it: a conversation whose
+        // process has already gone still holds the children it delegated, and
+        // they are exactly the ones nothing will ever report on again.
+        self.stop_the_delegation_tree(thread_id);
         if !stopped {
             return Ok(self.inner.sequences.current());
         }

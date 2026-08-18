@@ -472,25 +472,19 @@ impl SocketClient {
     /// one of the things discarded — so a reader that only watched for the event
     /// would wait for one that had already been superseded.
     pub async fn events_through_the_turn(&mut self, subscription: &str) -> Vec<Value> {
-        self.values_until(subscription, |item| {
-            let settled = |status: Option<&str>| {
-                matches!(
-                    status,
-                    Some("ready") | Some("error") | Some("stopped") | Some("interrupted")
-                )
-            };
-            match item["kind"].as_str() {
-                Some("event") => {
-                    item["event"]["type"] == "thread.session-set"
-                        && settled(item["event"]["payload"]["session"]["status"].as_str())
-                }
-                Some("snapshot") => {
-                    settled(item["snapshot"]["thread"]["session"]["status"].as_str())
-                }
-                _ => false,
-            }
-        })
-        .await
+        let watching = settle_watch(true);
+        self.values_until(subscription, move |item| watching(item)).await
+    }
+
+    /// The same, for a reader that is **not** already inside a turn.
+    ///
+    /// [`settle_watch`] says why the two differ: a conversation whose delegation
+    /// tree outlives its root turn publishes two more sessions of its own, and a
+    /// reader standing between turns would otherwise take the first of them for
+    /// the settle it was waiting for.
+    pub async fn events_through_the_next_turn(&mut self, subscription: &str) -> Vec<Value> {
+        let watching = settle_watch(false);
+        self.values_until(subscription, move |item| watching(item)).await
     }
 
     /// Read the turn out up to and including the moment its working tree has
@@ -673,5 +667,54 @@ impl SocketClient {
             .expect("the shell describes itself");
         self.close().await;
         snapshot["snapshot"].clone()
+    }
+}
+
+/// "This item is the end of a turn", as a predicate with a memory.
+///
+/// A turn settles when the session leaves `running` **having been running on a
+/// turn**, and the second half of that is load-bearing rather than pedantry: a
+/// conversation whose delegation tree is still working goes on reporting
+/// `running` after its root turn has settled, and returns to `ready` when the
+/// last descendant finishes (`Threads::follow_delegation`). Neither of those two
+/// events names a turn, so a reader that took any quiet status for a settle
+/// would stop a test one turn short of what it came to watch.
+///
+/// `on_a_turn_already` is what a caller knows and this cannot see: a reader that
+/// dispatched a turn and only then subscribed has already missed the session
+/// that named it, while a reader standing between turns has not.
+///
+/// A *snapshot* saying the session has gone quiet ends the read too, and that is
+/// not belt-and-braces: a turn that publishes hundreds of events outruns the
+/// subscription's backlog, and the pump answers that by discarding what it could
+/// not deliver and describing the world again. The terminal event is then one of
+/// the things discarded — so a reader that only watched for the event would wait
+/// for one that had already been superseded.
+pub fn settle_watch(on_a_turn_already: bool) -> impl Fn(&Value) -> bool {
+    let on_a_turn = std::cell::Cell::new(on_a_turn_already);
+    move |item: &Value| {
+        let settled = |status: Option<&str>| {
+            matches!(
+                status,
+                Some("ready") | Some("error") | Some("stopped") | Some("interrupted")
+            )
+        };
+        match item["kind"].as_str() {
+            Some("event") if item["event"]["type"] == "thread.session-set" => {
+                let session = &item["event"]["payload"]["session"];
+                if session["activeTurnId"].is_string() {
+                    on_a_turn.set(true);
+                }
+                settled(session["status"].as_str()) && on_a_turn.replace(false)
+            }
+            Some("snapshot") => {
+                let session = &item["snapshot"]["thread"]["session"];
+                if session["activeTurnId"].is_string() {
+                    on_a_turn.set(true);
+                }
+                settled(session["status"].as_str())
+            }
+            _ => false,
+        }
     }
 }

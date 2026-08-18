@@ -28,6 +28,7 @@ pub mod cloudflare;
 pub mod codex;
 pub mod conversation;
 pub mod shape;
+pub mod subagents;
 pub mod terminal;
 pub mod workspace;
 

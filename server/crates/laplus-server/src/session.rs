@@ -1978,8 +1978,16 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
         threads.apply(&start.thread_id, change);
     }
 
+    let tree_moved = !decided.child_streams.is_empty();
     for update in decided.child_streams {
         threads.subagents().record(&start.thread_id, update);
+    }
+    // A descendant that has just finished — or just started while the root was
+    // already quiet — is the other half of what the conversation reports as
+    // working. Asked here rather than inside the registry because the answer is
+    // a session event and the streams know nothing about sessions.
+    if tree_moved {
+        threads.follow_delegation(&start.thread_id);
     }
 
     if let Some(cursor) = &decided.provider_resume_cursor {
@@ -2034,6 +2042,11 @@ pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
             updated_at: now_iso(),
         }),
     );
+    // The turn is over; the delegation tree may not be. The settle above stands
+    // — the turn reports how it went — and this says whether the conversation is
+    // still working, which is a question about the tree rather than about the
+    // turn. See [`Threads::follow_delegation`].
+    threads.follow_delegation(&start.thread_id);
 }
 
 /// The thread and project a turn needs, gathered into what a session takes.

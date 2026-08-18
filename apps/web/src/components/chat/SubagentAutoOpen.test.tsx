@@ -17,10 +17,11 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { type EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { WorkLogEntry, WorkLogToolLifecycleStatus } from "../../session-logic";
 import { openSubagentSurface, useRightPanelStore } from "../../rightPanelStore";
+import { toastManager } from "../ui/toast";
 import { SimpleWorkEntryRow } from "./MessagesTimeline";
 
 const threadRef = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"));
@@ -104,6 +105,31 @@ describe("a child running in the background", () => {
     expect(workspace()).toEqual({});
     first.unmount();
     expect(workspace()).toEqual({});
+  });
+
+  /**
+   * **Ticket 06.** And it raises no toast either.
+   *
+   * Spec story 59 and the Out of Scope list both name per-child completion
+   * notifications, and for the reason the panel is left shut: several children
+   * finishing within a second of each other would be a burst of notifications
+   * about work the developer delegated precisely so as not to watch it. The
+   * compact row is the whole of what a completion moves.
+   *
+   * The guard is worth keeping for the same future change the test above
+   * guards against — "tell me when a child finishes" is a reasonable-sounding
+   * request, and this is where it would land.
+   */
+  it("raises no toast as a child finishes, fails or is stopped", () => {
+    const raised = vi.spyOn(toastManager, "add");
+
+    const view = render(row(childRow({ toolLifecycleStatus: "inProgress" })));
+    for (const status of ["completed", "failed", "stopped"] as const) {
+      view.rerender(row(childRow({ toolLifecycleStatus: status, detail: "eleven files" })));
+    }
+
+    expect(raised).not.toHaveBeenCalled();
+    raised.mockRestore();
   });
 
   /**

@@ -36,8 +36,10 @@
 import type {
   EnvironmentId,
   OrchestrationSubagentEntry,
+  OrchestrationSubagentLauncher,
   OrchestrationSubagentOutcomeKind,
   OrchestrationSubagentResolution,
+  OrchestrationSubagentState,
   OrchestrationSubagentWork,
   ScopedThreadRef,
   ThreadId,
@@ -49,6 +51,7 @@ import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 import type { WorkLogEntry } from "../../session-logic";
 import { useEnvironmentQuery } from "../../state/query";
 import { subagentEnvironment } from "../../state/subagents";
+import { openSubagentSurface } from "../../rightPanelStore";
 import { openSubagentDiff, openSubagentFile, subagentFileTarget } from "../../subagentFileActions";
 import ChatMarkdown from "../ChatMarkdown";
 import { SimpleWorkEntryRow } from "./MessagesTimeline";
@@ -203,6 +206,58 @@ function blockerWorkEntry(
     tone: "info",
     ...(detail ? { detail } : {}),
     ...(blocker === "question" ? { sourceActivityKind: "user-input.requested" as const } : {}),
+  };
+}
+
+/**
+ * How a nested child's state reads on its launcher.
+ *
+ * Keyed by the contract's own closed literal, like `OUTCOME_LABELS` and
+ * `RESOLUTION_LABELS`: a state added to `OrchestrationSubagentState` is a type
+ * error here rather than a descendant whose row silently loses its status.
+ */
+const LAUNCHER_STATES: Record<OrchestrationSubagentState, string> = {
+  pending: "Pending",
+  working: "Working",
+  blocked: "Blocked",
+  completed: "Completed",
+  interrupted: "Interrupted",
+  failed: "Failed",
+};
+
+/**
+ * A child this child launched, as the same compact row the conversation draws
+ * for a direct child.
+ *
+ * `subagentChildId` is what makes it a launcher rather than a mention:
+ * `SimpleWorkEntryRow` reads it and offers the identical "Open subagent work
+ * stream" activation the inline row in the transcript offers, so a nested child
+ * opens as another ordinary right-panel tab and clicking one already open
+ * activates it. Nothing about the descendant's own work is copied here — that
+ * lives in its own stream, which is what this opens.
+ */
+function launcherWorkEntry(
+  entry: Extract<OrchestrationSubagentEntry, { kind: "subagent" }>,
+): WorkLogEntry {
+  const launcher: OrchestrationSubagentLauncher = entry.payload;
+  const label = `Subagent ${launcher.name ?? launcher.childId}`;
+  return {
+    id: entry.id,
+    createdAt: entry.createdAt,
+    label,
+    toolTitle: label,
+    tone: launcher.outcome?.kind === "failed" ? "error" : "tool",
+    itemType: "collab_agent_tool_call",
+    toolLifecycleStatus:
+      launcher.state === "completed"
+        ? "completed"
+        : launcher.state === "failed"
+          ? "failed"
+          : launcher.state === "interrupted"
+            ? "stopped"
+            : "inProgress",
+    subagentChildId: launcher.childId,
+    detail: launcher.outcome?.text ?? launcher.assignment ?? LAUNCHER_STATES[launcher.state],
   };
 }
 
@@ -396,6 +451,16 @@ function SubagentStreamEntry(props: {
       return (
         <div className="min-w-0 px-1 py-0.5" data-subagent-entry="blocker">
           <SimpleWorkEntryRow workEntry={blockerWorkEntry(entry)} workspaceRoot={undefined} />
+        </div>
+      );
+    case "subagent":
+      return (
+        <div className="min-w-0 px-1 py-0.5" data-subagent-entry="subagent">
+          <SimpleWorkEntryRow
+            workEntry={launcherWorkEntry(entry)}
+            workspaceRoot={undefined}
+            onOpenSubagent={(childId) => openSubagentSurface(props.threadRef, childId)}
+          />
         </div>
       );
     case "outcome":
