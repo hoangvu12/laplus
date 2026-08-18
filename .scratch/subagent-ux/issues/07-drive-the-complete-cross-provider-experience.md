@@ -33,13 +33,13 @@
       — **The release contract across all three providers** below. Every test
       named there was checked to exist and was run green in this ticket's
       verification; the counts are in **Focused verification**.
-- [~] Focused contract, client, provider, and UI checks pass, and the user-visible flow is driven rather than inferred from a green suite.
-  — **Half met, and the half that is met is the weaker one.** Every focused
-  check passes at its recorded baseline (**Focused verification**). The
-  driving clause is **not** met, and AGENTS.md's own warning applies to this
-  ticket more than to any other in the feature: "A green suite is not evidence
-  the application works." Do not read the numbers below as the feature being
-  driven.
+- [ ] Focused contract, client, provider, and UI checks pass, and the user-visible flow is driven rather than inferred from a green suite.
+      — **Half met, and the half that is met is the weaker one, so this stays
+      unticked.** Every focused check passes at its recorded baseline
+      (**Focused verification**). The driving clause is **not** met, and
+      AGENTS.md's own warning applies to this ticket more than to any other in
+      the feature: "A green suite is not evidence the application works." Do not
+      read the numbers below as the feature being driven.
 - [x] Development servers, provider doubles, and browser processes used for verification are stopped after the focused run.
       — Satisfied by construction and then checked rather than assumed: this
       ticket started no dev server, no provider double and no browser. `pgrep`
