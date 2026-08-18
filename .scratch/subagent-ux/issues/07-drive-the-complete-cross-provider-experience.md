@@ -316,7 +316,7 @@ Codex is the only provider that can produce this.
 
 - [ ] With several children genuinely working and at least one child tab **open**, press the composer's stop button.
 - [ ] Each child reaches _Interrupted_ and stops moving. **The open tab's terminal entry should arrive live, not only on reopen** — that is the specific thing to watch.
-- [ ] The compact rows say interrupted, and the sidebar leaves Working.
+- [ ] The compact rows say interrupted, and the sidebar leaves Working. (The server half is now proven statically for all three providers — see **A release blocker — since fixed**. What is left for the window is that the row _renders_ as stopped, and that it does so where the developer is looking.)
 - [ ] A child that had already reported keeps what it reported rather than being overwritten with an interruption.
 - [ ] Do the same through the other Stop door, ending the session.
 
@@ -387,47 +387,107 @@ directly — by reading the code it describes and, for the blocker, by driving i
 — rather than taken from a summary. Re-running the two axes is still worth
 doing before the release; they may find things this section does not.
 
-### A release blocker
+### A release blocker — since fixed
 
-**A stopped child's compact row contradicts its own stream, and then reports the
-answer the developer declined to wait for.** `Shell::stop_the_delegation_tree`
-(`orchestration.rs`) reaches only `Streams::interrupt` and `follow_delegation`.
+**A stopped child's compact row contradicted its own stream, and then reported
+the answer the developer declined to wait for.** `Shell::stop_the_delegation_tree`
+(`orchestration.rs`) reached only `Streams::interrupt` and `follow_delegation`.
 Every compact-row emitter lives in a provider fold path (`turn.rs::fold`,
-`opencode.rs`, `codex.rs`), so a Stop draws no row and nothing refuses one
+`opencode.rs`, `codex.rs`), so a Stop drew no row and nothing refused one
 afterwards. Two consequences, both driven and both real:
 
-1. Immediately after the Stop the row still reads `running` with its pre-stop
-   detail, while the child's tab reads _Interrupted_.
+1. Immediately after the Stop the row still read `running` with its pre-stop
+   detail, while the child's tab read _Interrupted_.
 2. The provider goes on narrating a child the developer ended. `Streams::record`
    refuses all of it — that is ticket 06 criterion 7, and it holds — but the row
-   does not, so the row settles on `tool.completed` / `status: "completed"` /
+   did not, so the row settled on `tool.completed` / `status: "completed"` /
    `detail: "eleven variants"`.
 
-`socket_turn::a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to` is
-the executable form, marked `#[ignore]` so the suite stays at its baseline:
-
-```
-cargo test -p laplus-server --test socket_turn a_stopped_claude_child_row_agrees -- --ignored
-```
-
-This is the predicted shape exactly. Ticket 02 made the compact row the
+This was the predicted shape exactly. Ticket 02 made the compact row the
 terminal-preview surface (spec: _"When a child becomes terminal, replace latest
 activity atomically with a bounded result, failure, interruption, or
 empty-result preview"_, story 39). Ticket 06 added a new terminal path that
-bypasses it, and asserted only the stream. It is not caught by S1 in **The
+bypassed it, and asserted only the stream. It was not caught by S1 in **The
 browser gap** either: S1's _"The compact rows say interrupted"_ would find it,
 but a statically provable contradiction should not be waiting on a window.
 
-**Not fixed here, deliberately.** The fix needs a terminal row drawn on the
-developer's own command _and_ a rule that a concluded child's row is not
-redrawn by later provider narration. The row's collapse key is provider-specific
-(`subagent:{taskId}` for Claude and OpenCode, `agent:{threadId}` for Codex), so
-the emitter cannot be provider-neutral without either a provider switch in the
-orchestration layer or new state on the shared child-stream model; and the
-suppression rule sits at `session::spend`, the choke point that applies _every_
-transcript activity for _every_ provider. That is not a change to make in the
-last minutes before a publish. Its own ticket, and it should block the release
-until it lands.
+#### How it was fixed
+
+Two halves, treated separately and both provider-neutral.
+
+**One — a stopped child's row says so, on the developer's own command.**
+`Streams::interrupt` now answers with a `subagents::Interrupted` per child it
+actually ended, carrying the child id, the child's name and whether it is a
+descendant. `stop_the_delegation_tree` turns each into
+`worklog::child_interrupted`: `kind: "tool.completed"`, `status: "stopped"`,
+`detail: "Interrupted"` (`OutcomeKind::without_a_report`, so the row and the
+stream's terminal entry say one word), `data.childId`, and the row's collapse
+key from `worklog::child_row_key`.
+
+The collapse key is the only provider-specific thing left, and it is spelled in
+exactly one place: `child_row_key` matches exhaustively on
+`provider::DriverKind` and dispatches to `worklog::subagent_row_key`
+(`subagent:{childId}`, Claude and OpenCode) or `codex::agent_row_key`
+(`agent:{childId}`). Both row builders now call those same two functions, so the
+Stop's row and the provider's row cannot spell the key differently, and a fourth
+driver is a compile error rather than a silent miss. The alternative the review
+floated — new state on the shared child-stream model — was rejected: it would
+have had to be threaded through `Update` and set by every adapter that builds
+one, and it would have raised a persistence question (`Head` is written to disk
+and crosses the wire) for something already derivable from a thread's own
+driver, with each adapter still spelling the key twice.
+
+**A descendant is given no row**, which is `Interrupted::nested`. A child of a
+child has no row in the root transcript to end — its launcher lives inside its
+spawner's stream and recording the interruption has already moved it — so
+drawing one would have put a worker in the conversation that the conversation
+had deliberately never shown. `stopping_a_codex_parent_stops_the_generation_below_it_too`
+now asserts the transcript directly, not only the events after the release.
+
+**Two — later provider narration cannot move a stopped child's row.** In
+`session::spend`, the choke point that applies every provider's transcript
+activities, an activity naming a child that `Streams` holds as interrupted is
+refused. The subject is read off the row as `data.childId` — the stream
+reference every driver's compact child row carries, and one that the rows which
+are _not_ the child (`codex::collaboration_call_row`'s spawn and wait) do not —
+so the rule needs no provider knowledge and no key. It is scoped to
+**interrupted** rather than to all terminal states, because a _completed_
+child's row is legitimately moved again by the report that follows its bare
+ending; that is the same distinction `Streams::record`'s empty-outcome revision
+draws. `Streams::record` itself is untouched, so ticket 06 criterion 7 is proven
+by exactly the tests that always proved it.
+
+#### How it is proven
+
+`socket_turn::a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`
+is no longer `#[ignore]`d, and the two OpenCode and Codex Stop tests were
+extended rather than duplicated — they already stop a genuinely mid-flight child
+and then release the provider to narrate afterwards, which is the exact shape
+both halves need.
+
+| Provider     | Half one — the row says stopped                                                                    | Half two — narration does not move it                                                          |
+| ------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Claude**   | `socket_turn::a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`                     | same test: the row after the CLI's three post-pause lines equals the row drawn on the Stop     |
+| **OpenCode** | `socket_opencode_turn::stopping_the_parent_stops_its_delegation_tree`                              | same test, after `release.notify_one()`                                                        |
+| **Codex**    | `socket_codex_turn::stopping_a_codex_parent_stops_the_child_it_was_running`, on `agent:{threadId}` | same test, after `codex.release_turn()` — including the `wait` that completes behind the child |
+
+Every new assertion was mutation-checked: removing the row emitter turns half
+one red on all three (`running` / `inProgress` against `stopped`); removing the
+`spend` refusal turns half two red on all three, and the failure prints the
+defect itself — `"eleven variants"`, `"eleven files"`,
+`"The decoder looks correct."`, each with `status: "completed"`; drawing rows for
+descendants turns the nesting test red; spelling Codex's key `subagent:` turns
+the key assertion red; and changing the row's `detail` or its `kind` turns those
+assertions red on all three.
+
+**The Claude test asserted the wrong thing and was corrected.** It required
+`payload.status == "interrupted"`, but `status` is the client's
+`WorkLogToolLifecycleStatus` — `inProgress`, `completed`, `failed`, `declined`,
+`stopped` (`session-logic.ts::extractWorkLogToolLifecycleStatus`). A word outside
+those five is read as _no status_, and a `tool.completed` with no status defaults
+to `completed`, so the original assertion could have been satisfied by a row the
+developer still saw as finished. `stopped` is the mapping
+`codex::collaboration_agent_row` has always made for the same state.
 
 ### Fixed in the review
 

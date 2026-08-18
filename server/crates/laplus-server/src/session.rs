@@ -1964,6 +1964,25 @@ pub(crate) struct Settles {
     pub(crate) last_error: Option<String>,
 }
 
+/// The child a transcript activity's compact row belongs to, if it is one.
+///
+/// `data.childId` is the row's **stream reference** — the address of the child
+/// work stream the row launches — and every driver's compact child row carries
+/// it ([`crate::worklog::subagent`], [`crate::codex::collaboration_agent_row`]).
+/// Reading the row's subject off the row itself is what lets [`spend`] refuse a
+/// stopped child's narration without knowing which provider produced it.
+fn compact_child_row_subject(change: &Change) -> Option<&str> {
+    let Change::Activity(activity) = change else {
+        return None;
+    };
+    activity
+        .payload
+        .get("data")?
+        .get("childId")?
+        .as_str()
+        .filter(|child_id| !child_id.is_empty())
+}
+
 /// Apply what a driver decided.
 ///
 /// The impure half of the pair, and it is deliberately this short: every line of
@@ -1974,7 +1993,42 @@ pub(crate) struct Settles {
 /// changes go where they went before the split — the id after the row that may
 /// have preceded it on the same event, the ending last of all.
 pub(crate) fn spend(threads: &Threads, start: &Start, decided: Decided) {
+    // A child the developer stopped keeps the ending they asked for.
+    //
+    // The provider was never told, so it goes on narrating a child laplus has
+    // already ended — and a child is two things at once.
+    // [`crate::subagents::Streams::record`] refuses every bit of that for the
+    // child's *stream*; this is the same refusal for the compact row in the
+    // parent's transcript, which is the surface the developer is more likely to
+    // be looking at because the child's tab may never have been opened. Without
+    // it the row carries on to the answer the developer declined to wait for,
+    // beside a stream that says it was interrupted.
+    //
+    // **Here rather than in the three adapters**, because this is where every
+    // provider's transcript activities are applied, and because the two places
+    // the rule was written before disagreed about how long an ending lasts —
+    // the same argument `Streams::record` makes for owning its own version.
+    //
+    // **Recognised by `data.childId`, which needs no provider knowledge**: every
+    // compact child row carries the stream reference it launches, and the rows
+    // that are *not* the child deliberately do not — a Codex spawn or wait
+    // (`codex::collaboration_call_row`) still lands, because completing an
+    // operation is not completing the child it concerns.
+    //
+    // **Only children that were interrupted.** A completed child's row is
+    // legitimately moved again by the report that follows its bare ending; see
+    // [`crate::subagents::Streams::interrupted`].
+    //
+    // Asked lazily, so a batch with no child row in it costs no lock at all.
+    let mut stopped: Option<Vec<String>> = None;
     for change in decided.changes {
+        if let Some(child_id) = compact_child_row_subject(&change) {
+            let stopped =
+                stopped.get_or_insert_with(|| threads.subagents().interrupted(&start.thread_id));
+            if stopped.iter().any(|ended| ended == child_id) {
+                continue;
+            }
+        }
         threads.apply(&start.thread_id, change);
     }
 

@@ -52,3 +52,27 @@ pub fn folded_entries(snapshot: &Value, live: &[Value]) -> Vec<Value> {
     folded.sort_by_key(|entry| entry["sequence"].as_i64().unwrap_or_default());
     folded
 }
+
+/// The compact row one child owns in its parent's transcript.
+///
+/// The **last** row drawn for that child, because the row is redrawn as the
+/// child moves and what the developer is left looking at is whatever was drawn
+/// last — which is the whole of what "the row said it completed" and "the row
+/// said it was stopped" are claims about.
+///
+/// Found by `data.childId`, the stream reference every driver's compact child
+/// row carries ([`laplus_server::worklog::subagent`],
+/// `codex::collaboration_agent_row`), rather than by a provider's own id: the
+/// three suites are asking one question about one shared surface, and a
+/// provider-shaped lookup would let one of them pass on a row the others would
+/// not accept.
+pub async fn child_row(server: &TestServer, thread_id: &str, child_id: &str) -> Value {
+    let snapshot = server.connect().await.into_thread_snapshot(thread_id).await;
+    snapshot["thread"]["activities"]
+        .as_array()
+        .expect("a thread snapshot carries its activities")
+        .iter()
+        .rfind(|activity| activity["payload"]["data"]["childId"] == child_id)
+        .unwrap_or_else(|| panic!("no compact row for {child_id}: {snapshot:#?}"))
+        .clone()
+}

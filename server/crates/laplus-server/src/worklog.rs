@@ -451,6 +451,97 @@ const REQUEST_ID: &str = "requestId";
 /// that read better would silently make a stale panel permanent.
 const STALE: &str = "Unknown pending permission request";
 
+/// The collapse key of a compact child row drawn by [`subagent`].
+///
+/// One definition rather than a `format!` at each use, because a **third**
+/// caller now needs it and it is not a row builder: the terminal row a Stop
+/// draws ([`crate::orchestration::Shell::stop_the_delegation_tree`]) has to
+/// land on the row the provider had already been moving, and a second spelling
+/// of the key would leave the developer reading two rows for one child.
+pub fn subagent_row_key(child_id: &str) -> String {
+    format!("subagent:{child_id}")
+}
+
+/// The collapse key of the compact row a delegated child owns in its parent's
+/// transcript, whichever driver drew it.
+///
+/// **Two spellings, one per row builder**, and the split is the drivers' rather
+/// than this function's: [`subagent`] draws Claude's and OpenCode's rows and
+/// keys them by the CLI task id, and [`crate::codex::collaboration_agent_row`]
+/// draws Codex's and keys them by the child's own Codex thread id. Both are the
+/// child id the stream is held under, so this needs nothing but the driver to
+/// answer — which is what lets a Stop reach the right row for every provider
+/// from one place.
+///
+/// The match is exhaustive on purpose: a fourth driver that draws child rows is
+/// a compile error here rather than a Stop that silently draws none.
+pub fn child_row_key(driver: crate::provider::DriverKind, child_id: &str) -> String {
+    match driver {
+        crate::provider::DriverKind::Claude | crate::provider::DriverKind::OpenCode => {
+            subagent_row_key(child_id)
+        }
+        crate::provider::DriverKind::Codex => crate::codex::agent_row_key(child_id),
+    }
+}
+
+/// A child the developer stopped, as its compact row's ending.
+///
+/// **Drawn on the developer's own command**, because nothing else will draw it:
+/// no provider is told that a subagent it was running has been abandoned, so
+/// every other row in this module is a translation of something a CLI said and
+/// this one is a translation of something the developer did. The reasoning is
+/// [`crate::orchestration::Shell::stop_the_delegation_tree`]'s, applied to the
+/// second place a child is shown — [`crate::subagents::Streams::interrupt`]
+/// already writes the same ending into the child's own stream, and the whole
+/// defect this exists for was the two disagreeing.
+///
+/// **`stopped`, not `interrupted`.** `payload.status` is the client's
+/// `WorkLogToolLifecycleStatus` (`session-logic.ts`,
+/// `extractWorkLogToolLifecycleStatus`), whose five literals do not include
+/// `interrupted`; a word outside them is read as *no status at all*, and a
+/// `tool.completed` with no status defaults to `completed` — which would draw
+/// the stopped child as one that finished. It is the same mapping
+/// [`crate::codex::collaboration_agent_row`] already makes.
+///
+/// **`detail` is set rather than left off**, for
+/// [`crate::subagents::OutcomeKind::without_a_report`]'s reason: the client
+/// carries a field forward when the newer row omits it
+/// (`session-logic.ts::mergeDerivedWorkLogEntries`), so an absent detail would
+/// leave whatever the child was last doing standing as its ending. The sentence
+/// is that function's, so the row and the stream's terminal entry say the same
+/// word.
+///
+/// The title is `Subagent {name}` from [`crate::subagents::Interrupted::name`],
+/// which is the value every adapter already titles its own row with, so this
+/// lands on that row rather than renaming it.
+pub fn child_interrupted(
+    driver: crate::provider::DriverKind,
+    child: &crate::subagents::Interrupted,
+    turn_id: Option<String>,
+) -> Activity {
+    let title = match child.name.as_deref() {
+        Some(name) if !name.trim().is_empty() => format!("Subagent {name}"),
+        _ => "Subagent task".to_string(),
+    };
+    Activity::tool(
+        "tool.completed",
+        &title,
+        json!({
+            "itemType": "collab_agent_tool_call",
+            "status": "stopped",
+            "title": title,
+            "detail": crate::subagents::OutcomeKind::Interrupted.without_a_report(),
+            "data": {
+                "toolCallId": child_row_key(driver, &child.child_id),
+                // The stream this row launches, which is also how
+                // [`crate::session::spend`] recognises a row as this child's.
+                "childId": child.child_id,
+            },
+        }),
+        turn_id,
+    )
+}
+
 /// Permission requests still waiting on an answer, oldest first.
 ///
 /// The client's own fold (`derivePendingApprovals`), run over the same
@@ -525,7 +616,7 @@ pub fn subagent(
         "status": task.status,
         "title": title,
         "data": {
-            "toolCallId": format!("subagent:{}", task.task_id),
+            "toolCallId": subagent_row_key(&task.task_id),
             "taskId": task.task_id,
             // The call that spawned it, kept so a later ticket can tie the two
             // rows together without re-deriving the link from ordering.

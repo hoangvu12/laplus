@@ -815,6 +815,17 @@ fn collaboration_call_row(
     )
 }
 
+/// The collapse key of the compact row a Codex child owns in the conversation.
+///
+/// Codex's own spelling of [`crate::worklog::subagent_row_key`], and separate
+/// from it for the reason the two rows are separate: a Codex child *is* a
+/// thread, and its row has always collapsed on that thread's id. Written once
+/// because a Stop now draws a terminal row for the same child from outside this
+/// module — see [`crate::worklog::child_row_key`], which dispatches to this.
+pub(crate) fn agent_row_key(thread_id: &str) -> String {
+    format!("agent:{thread_id}")
+}
+
 fn collaboration_agent_row(
     agent: &CollaborationAgent,
     detail: Option<&str>,
@@ -875,7 +886,7 @@ fn collaboration_agent_row(
         "status": status,
         "title": title,
         "data": {
-            "toolCallId": format!("agent:{}", agent.thread_id),
+            "toolCallId": agent_row_key(&agent.thread_id),
             "agentThreadId": agent.thread_id,
             "agentStatus": agent.status,
             "message": agent.message,

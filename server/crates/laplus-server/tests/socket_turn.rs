@@ -50,7 +50,7 @@ use harness::conversation::{
     activity, assistant_sends, create_project, follow_up, interrupt_turn, kinds, last_session,
     settle_watch_between_turns, start_turn,
 };
-use harness::subagents::child_stream;
+use harness::subagents::{child_row, child_stream};
 use harness::workspace::Workspace;
 use harness::TestServer;
 use laplus_server::config::ServerConfig;
@@ -2495,30 +2495,36 @@ async fn stopping_a_claude_parent_stops_the_child_that_outlived_its_turn() {
 }
 
 /// **The compact row and the child's stream must not contradict each other after
-/// a Stop.** Ignored because it fails: this is the defect, written down.
+/// a Stop.**
 ///
 /// The row is the surface the developer is actually looking at — the child's tab
-/// may never have been opened — and `Shell::stop_the_delegation_tree`
-/// (`orchestration.rs`) reaches only `Streams::interrupt` and
-/// `follow_delegation`. Every compact-row emitter lives in a provider fold path
-/// (`turn.rs::fold`, `opencode.rs`, `codex.rs`), so no row is drawn for a Stop
-/// and nothing refuses one afterwards. Two things follow, and this test asserts
-/// against both:
+/// may never have been opened — and it used to be the one surface a Stop could
+/// not reach. `Shell::stop_the_delegation_tree` (`orchestration.rs`) called only
+/// `Streams::interrupt` and `follow_delegation`, while every compact-row emitter
+/// lives in a provider fold path (`turn.rs::fold`, `opencode.rs`, `codex.rs`),
+/// so a Stop drew no row and nothing refused one afterwards. Two things followed
+/// and this asserts against both:
 ///
-/// 1. Immediately after the Stop the row still reads `running` with its pre-stop
-///    detail while the stream reads `interrupted`.
-/// 2. The CLI goes on narrating a child the developer ended — `Streams::record`
-///    refuses all of it, but the row does not, so the row settles on
-///    `tool.completed` / `status: "completed"` / `detail: "eleven variants"`:
-///    the answer the developer had already declined to wait for, presented as
-///    the child's ending, beside a stream that says it was interrupted.
+/// 1. Immediately after the Stop the row still read `running` with its pre-stop
+///    detail while the stream read `interrupted`. Now the developer's own
+///    command draws the ending, because nothing else ever will: the CLI is not
+///    told that a subagent it was running has been abandoned.
+/// 2. The CLI goes on narrating a child the developer ended.
+///    `Streams::record` refused all of it for the stream, but the row did not,
+///    so the row settled on `tool.completed` / `status: "completed"` /
+///    `detail: "eleven variants"` — the answer the developer had already
+///    declined to wait for, presented as the child's ending. `session::spend`
+///    now refuses it for the row too.
 ///
-/// The fix needs a terminal row drawn on the developer's own command and a rule
-/// that a concluded child's row is not redrawn by later provider narration —
-/// the row's collapse key is provider-specific (`subagent:{taskId}` for Claude
-/// and OpenCode, `agent:{threadId}` for Codex), so it is not a one-line change
-/// and it was not taken in the feature-wide review that found it.
-#[ignore = "known defect: a stopped child's compact row contradicts its stream"]
+/// **`stopped`, not `interrupted`.** This test was first written asserting
+/// `payload.status == "interrupted"`, and that was wrong: `status` is the
+/// client's `WorkLogToolLifecycleStatus`, whose five literals are `inProgress`,
+/// `completed`, `failed`, `declined` and `stopped`
+/// (`session-logic.ts::extractWorkLogToolLifecycleStatus`). A word outside them
+/// is read as *no status*, and a `tool.completed` with no status defaults to
+/// `completed` — so the original assertion would have been satisfied by a row
+/// the developer still saw as finished. `stopped` is the mapping the Codex
+/// driver has always made for the same state.
 #[tokio::test]
 async fn a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to() {
     let agent = ScriptedAgent::emitting(&[
@@ -2555,21 +2561,38 @@ async fn a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to() {
     let stopped = child_stream(&server, "thread-1", "t1").await;
     assert_eq!(stopped["stream"]["state"], "interrupted");
 
-    // Long enough for the three lines past the script's two pauses to be folded,
-    // which is the window the second half of the defect lives in.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let snapshot = server.connect().await.into_thread_snapshot("thread-1").await;
-    let row = snapshot["thread"]["activities"]
-        .as_array()
-        .expect("activities")
-        .iter()
-        .rfind(|activity| activity["payload"]["data"]["taskId"] == "t1")
-        .cloned()
-        .expect("the child's compact row");
+    // One: the ending is on the row already, before the CLI has said anything
+    // at all — which is the only moment it can be, because the CLI will never
+    // mention it.
+    let ended = child_row(&server, "thread-1", "t1").await;
     assert_eq!(
-        row["payload"]["status"], "interrupted",
-        "the compact row disagreed with the stopped child's stream: {row:#?}"
+        ended["payload"]["status"], "stopped",
+        "the compact row disagreed with the stopped child's stream: {ended:#?}"
     );
+    assert_eq!(ended["kind"], "tool.completed", "{ended:#?}");
+    assert_eq!(
+        ended["payload"]["data"]["toolCallId"], "subagent:t1",
+        "the ending landed beside the child's row instead of on it: {ended:#?}"
+    );
+    assert_eq!(
+        ended["payload"]["detail"], "Interrupted",
+        "the row kept the line the child was on when it was stopped: {ended:#?}"
+    );
+
+    // Two: long enough for the three lines past the script's two pauses to be
+    // folded, which is the window the second half of the defect lived in. The
+    // row does not move — not to `completed`, and not onto "eleven variants".
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let after = child_row(&server, "thread-1", "t1").await;
+    assert_eq!(
+        after, ended,
+        "narration after a Stop moved the stopped child's row: {after:#?}"
+    );
+
+    // And the stream it belongs to still says the same thing it did.
+    let stream = child_stream(&server, "thread-1", "t1").await;
+    assert_eq!(stream["stream"]["state"], "interrupted");
+    assert_eq!(stream["stream"]["outcome"]["kind"], "interrupted");
 
     client.close().await;
     server.stop().await;
