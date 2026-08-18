@@ -369,7 +369,150 @@ and consolidated above; what is missing is not more tests but a window.
 ## Residual risks
 
 - **The feature has never been drawn on a screen.** Every criterion in **The browser gap** is open, and AGENTS.md's warning is the honest summary: a whole afternoon's findings once came from driving the window for a minute, none of which a passing suite had caught. This feature has had none of that minute. The tests are strong — they assert wire ids, whole ordered lists, real clicks against the real store, and several are mutation-checked — but every one of them runs where nothing is laid out.
-- **`turn.rs::child_stream` reasons from a rule that ticket 06 changed.** Its comment says the Claude adapter must not conclude on the bare `task_updated` because "`Streams::record` keeps the first outcome it is given". That is **no longer true**: ticket 06's arbitration (A) made `Streams::record` let a reported outcome replace an `Empty` one, upserted in place (`subagents::a_report_replaces_an_empty_conclusion_in_place`). Ticket 03 predicted this exact change and wrote down that it would close its gap, but ticket 06 landed the rule without revisiting the Claude adapter, so `child_stream`'s `(Some(row), false)` arm still sets state without an outcome and the gap stands: a Claude child ending with a bare `task_updated` and no `task_notification` still reaches a terminal state with no terminal entry. Nothing is claimed falsely — the compact row still reads "Completed with no result" — and no capture contains the case, so this is stale reasoning and a small missed follow-up rather than a live defect. Left for the feature-wide review to arbitrate rather than taken unilaterally here.
+- **`turn.rs::child_stream`'s stale reasoning — arbitrated.** The comment claiming `Streams::record` "keeps the first outcome it is given" was false and has been **rewritten**. The behavioural gap behind it — a Claude child ending with a bare `task_updated` and no `task_notification` reaches a terminal state with no terminal entry — was **deliberately not closed**, and the reason is now written at the call site. Ticket 03 and this ticket both assumed arbitration (A) would close it; it only half does. (A) is narrow in both directions: **only `Empty` may be replaced**. `protocol::terminal_task_status` folds `failed`, `error`, `cancelled`, `killed` and `timeout` onto `"failed"`, so concluding the bare ending would record `Outcome::failed(None)` for every one of those — not `Empty` — and the `task_notification`'s actual reason a millisecond later would then be refused for ever. That trades a case no capture contains for a case the captures do contain. Closing it properly means deciding what a bare _failure_ concludes as, which is a change to the shared rule rather than to this adapter, and needs a fixture that does not exist. Its own ticket.
 - **Half of Codex's rich-work evidence is composed rather than recorded**, as ticket 04 says plainly. Interruption, nesting, multi-receiver waits and the five terminal states are proven against `10-subagent-work.jsonl`, which invents no field but was assembled from shapes lifted from three real captures. A real Codex conversation delegating two levels deep — scenario **N1** — is the first thing that would test that assembly against reality.
 - **Arbitration (B), a concluded child reopening on proven provider evidence, is not implemented** and remains deferred to its own ticket. The visible cost is Codex's: a genuinely resumed child is invisible from its second turn onward.
 - **`cargo fmt --check` remains unrun** for this branch, as for every branch in this feature and for CI. The tree has never been rustfmt-formatted.
+
+## What the feature-wide review found (base `8ca1365d` → `0f6e46d9`)
+
+The final review ran `/code-review`'s two axes against the whole feature rather
+than against any one ticket's base. Its subject was the seam per-ticket review
+cannot see: individually-correct changes composing into something wrong.
+
+### A release blocker
+
+**A stopped child's compact row contradicts its own stream, and then reports the
+answer the developer declined to wait for.** `Shell::stop_the_delegation_tree`
+(`orchestration.rs`) reaches only `Streams::interrupt` and `follow_delegation`.
+Every compact-row emitter lives in a provider fold path (`turn.rs::fold`,
+`opencode.rs`, `codex.rs`), so a Stop draws no row and nothing refuses one
+afterwards. Two consequences, both driven and both real:
+
+1. Immediately after the Stop the row still reads `running` with its pre-stop
+   detail, while the child's tab reads _Interrupted_.
+2. The provider goes on narrating a child the developer ended. `Streams::record`
+   refuses all of it — that is ticket 06 criterion 7, and it holds — but the row
+   does not, so the row settles on `tool.completed` / `status: "completed"` /
+   `detail: "eleven variants"`.
+
+`socket_turn::a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to` is
+the executable form, marked `#[ignore]` so the suite stays at its baseline:
+
+```
+cargo test -p laplus-server --test socket_turn a_stopped_claude_child_row_agrees -- --ignored
+```
+
+This is the predicted shape exactly. Ticket 02 made the compact row the
+terminal-preview surface (spec: _"When a child becomes terminal, replace latest
+activity atomically with a bounded result, failure, interruption, or
+empty-result preview"_, story 39). Ticket 06 added a new terminal path that
+bypasses it, and asserted only the stream. It is not caught by S1 in **The
+browser gap** either: S1's _"The compact rows say interrupted"_ would find it,
+but a statically provable contradiction should not be waiting on a window.
+
+**Not fixed here, deliberately.** The fix needs a terminal row drawn on the
+developer's own command _and_ a rule that a concluded child's row is not
+redrawn by later provider narration. The row's collapse key is provider-specific
+(`subagent:{taskId}` for Claude and OpenCode, `agent:{threadId}` for Codex), so
+the emitter cannot be provider-neutral without either a provider switch in the
+orchestration layer or new state on the shared child-stream model; and the
+suppression rule sits at `session::spend`, the choke point that applies _every_
+transcript activity for _every_ provider. That is not a change to make in the
+last minutes before a publish. Its own ticket, and it should block the release
+until it lands.
+
+### Fixed in the review
+
+- **Codex's terminal child row left stale activity standing** (`codex.rs::collaboration_agent_row`).
+  A silent completion emitted no `detail` at all, on the reasoning that "there is
+  no stale line it would be honest to show instead". On this wire that is not
+  silence: `session-logic.ts::mergeDerivedWorkLogEntries` collapses a child's rows
+  onto one entry with `detail = next.detail ?? previous.detail`, so an absent
+  `detail` leaves the _running_ row's line standing as the child's ending —
+  exactly the stale activity ticket 02's cross-provider rule exists to prevent,
+  and one of the two providers it was never checked against. The empty conclusion
+  is now said, in the words the other two drivers already use: the sentence moved
+  to `subagents::OutcomeKind::without_a_report` and `worklog::concluded_without_a_report`
+  delegates to it, so the vocabulary cannot drift a second time.
+  `codex::a_terminal_row_replaces_activity_with_what_came_back` carries the
+  assertion that previously pinned the wrong behaviour.
+- **`turn.rs::child_stream`'s stale justification** — see **Residual risks**.
+- **The Claude driver's third copy of the output bound.** `turn.rs` still declared
+  its own `CHILD_OUTPUT` and `bounded`; ticket 03 recorded that they belonged in
+  `subagents.rs` and that unifying them while ticket 04 was in flight would
+  collide, ticket 04 built the home, and nobody went back for Claude's copy. The
+  two constants were still in step by luck. `turn.rs::bounded` now delegates and
+  keeps only the part that is this wire's (whitespace-only output is absence).
+- **Documentation made false by a later wave**, all verified against the code
+  they describe: `subagents::EntryKind`'s "Eight members" is nine and omitted the
+  nested launcher; three intra-doc links and the `server/CONTEXT.md` glossary
+  still named `crate::subagents::Delegated`, renamed to `Launcher` in `ca3d0456`;
+  `Streams::active`'s doc claimed Working state is derived from it when
+  `threads.rs` derives it from `Streams::working`; `session-logic.ts`'s
+  `subagentChildId` still said an absent stream means "a driver that has not
+  learned to record child work yet", which commit `86ec2ba7` corrected in its two
+  siblings and missed here; `worklog.rs`'s doc for `waiting_child` was attached
+  to the `SUBAGENT` constant above it; and a `worklog` test doc still described
+  `description` in the vocabulary its production comment had abandoned.
+
+### Recorded, not acted on
+
+- **Two `child_entry_kind` classifiers** (`turn.rs`, `opencode.rs`) remain
+  duplicated and have diverged (`terminal`, `notebook` ordering, `TodoWrite`).
+  Ticket 03 already recorded this as deliberate, with repo precedent —
+  `worklog::opencode_item_type` sits beside `worklog::Kind::of` saying its
+  first-party rules intentionally differ. The classifier is per-provider on
+  purpose. Standing.
+- **A nested descendant's tab is labelled generic "Subagent".**
+  `ChatView.tsx::subagentLabelsById` is built from the root transcript's work-log
+  entries only, and ticket 06 deliberately keeps a descendant _out_ of the root
+  transcript, so a tab opened from a launcher inside another child's stream can
+  never find its name — even though `OrchestrationSubagentLauncher.name` carries
+  it. Codex-only, since Codex is the only provider that proves nesting. A label
+  degradation rather than a wrong claim; worth a follow-up ticket, and worth
+  looking at during **N1**.
+- **Codex child approvals are unattributed**, and this ticket's **What each
+  provider honestly does not expose** files it under the wrong heading. Codex
+  _does_ expose `threadId` on `item/commandExecution/requestApproval`
+  (`fixtures/codex-app-server/03-write-approval.jsonl`), so this is an
+  unimplemented requirement (story 50) rather than an honest omission. It was not
+  implemented, and should not be: no capture contains a _child_ raising an
+  approval — the fixture's `threadId` is the root's — so the attribution could be
+  written but not proven.
+- **Codex children still produce no `read` or `edit` entries**, so file and diff
+  navigation from a Codex child tab is unreachable where OpenCode and Claude have
+  it. Disclosed by ticket 04; it is a partial requirement (stories 10–12), not a
+  nuance.
+- **Cosmetic Standards findings, not taken**, because a pure-quality change with
+  no test behind it is a bad trade before a publish: three near-identical
+  right-panel wrappers (`rightPanelStore::openSubagentSurface`,
+  `subagentFileActions::openSubagentFile`/`openSubagentDiff`); the module-global
+  scroll-position map in `subagentScroll.ts` with its test-only reset; and
+  `client-runtime/state/subagents.ts`'s `export *` re-export, which follows the
+  established shape of `state/terminal.ts`, `state/projects.ts`, `state/shell.ts`
+  and `state/threads.ts` and is reached through an explicit subpath, so AGENTS.md's
+  "no root export" rule is not breached.
+
+### Two of this ticket's own leads, checked statically
+
+- **H1c is a false lead.** `Threads::follow_delegation` returns early unless the
+  session status actually transitions, so `session.updatedAt` does not move per
+  child event and the Working duration will not reset. Do not spend browser time
+  on it.
+- **The four cross-ticket claims each worker asserted and nobody composed** were
+  checked and hold, with one exception. `worklog::subagent`'s terminal rule is
+  correct for Claude (`protocol::subagent_moved`'s `reported`/`finished` gate lets
+  the report through and refuses the second bare ending, so the row cannot regress
+  from a report back to "Completed with no result") and was wrong for Codex, which
+  is the fix above. `settle_watch` weakened nothing: `settle_watch()` starts its
+  `on_a_turn` cell `true`, so for every pre-existing caller the predicate matches
+  the same first settle the base predicate did, and `values_until` loops until a
+  match rather than returning on exhaustion — a stricter predicate would hang, not
+  pass vacuously. The contract's discriminated `payload` union decodes everything
+  the server can emit by construction: `EntryKind` is a closed Rust enum whose
+  nine `as_str` values are exactly the union's nine literals, and every payload
+  builder matches its member's schema, so forward-compatibility is a question
+  about unknown _provider_ variants — which the adapters still route to
+  `EntryKind::Tool` and to the drift counters — rather than about unknown entry
+  kinds.

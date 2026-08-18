@@ -2493,3 +2493,84 @@ async fn stopping_a_claude_parent_stops_the_child_that_outlived_its_turn() {
     client.close().await;
     server.stop().await;
 }
+
+/// **The compact row and the child's stream must not contradict each other after
+/// a Stop.** Ignored because it fails: this is the defect, written down.
+///
+/// The row is the surface the developer is actually looking at — the child's tab
+/// may never have been opened — and `Shell::stop_the_delegation_tree`
+/// (`orchestration.rs`) reaches only `Streams::interrupt` and
+/// `follow_delegation`. Every compact-row emitter lives in a provider fold path
+/// (`turn.rs::fold`, `opencode.rs`, `codex.rs`), so no row is drawn for a Stop
+/// and nothing refuses one afterwards. Two things follow, and this test asserts
+/// against both:
+///
+/// 1. Immediately after the Stop the row still reads `running` with its pre-stop
+///    detail while the stream reads `interrupted`.
+/// 2. The CLI goes on narrating a child the developer ended — `Streams::record`
+///    refuses all of it, but the row does not, so the row settles on
+///    `tool.completed` / `status: "completed"` / `detail: "eleven variants"`:
+///    the answer the developer had already declined to wait for, presented as
+///    the child's ending, beside a stream that says it was interrupted.
+///
+/// The fix needs a terminal row drawn on the developer's own command and a rule
+/// that a concluded child's row is not redrawn by later provider narration —
+/// the row's collapse key is provider-specific (`subagent:{taskId}` for Claude
+/// and OpenCode, `agent:{threadId}` for Codex), so it is not a one-line change
+/// and it was not taken in the feature-wide review that found it.
+#[ignore = "known defect: a stopped child's compact row contradicts its stream"]
+#[tokio::test]
+async fn a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to() {
+    let agent = ScriptedAgent::emitting(&[
+        r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_1","description":"Count the variants","subagent_type":"Explore"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Launched it in the background."}]}}"#,
+        r#"{"type":"result","subtype":"success","duration_ms":5600,"num_turns":1}"#,
+        PAUSE,
+        PAUSE,
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"role":"assistant","content":[{"type":"text","text":"looking through the variants"}]}}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_1","status":"completed","summary":"eleven variants"}"#,
+    ]);
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut client = server.connect().await;
+
+    let subscription = client.open_conversation(&workspace, "thread-1").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            start_turn("thread-1", "message-1", "count the variants in the background"),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("thread-1", None),
+        )
+        .await
+        .expect_success();
+
+    let stopped = child_stream(&server, "thread-1", "t1").await;
+    assert_eq!(stopped["stream"]["state"], "interrupted");
+
+    // Long enough for the three lines past the script's two pauses to be folded,
+    // which is the window the second half of the defect lives in.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let snapshot = server.connect().await.into_thread_snapshot("thread-1").await;
+    let row = snapshot["thread"]["activities"]
+        .as_array()
+        .expect("activities")
+        .iter()
+        .rfind(|activity| activity["payload"]["data"]["taskId"] == "t1")
+        .cloned()
+        .expect("the child's compact row");
+    assert_eq!(
+        row["payload"]["status"], "interrupted",
+        "the compact row disagreed with the stopped child's stream: {row:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}

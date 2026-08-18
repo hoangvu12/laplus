@@ -153,6 +153,34 @@ impl OutcomeKind {
             OutcomeKind::Interrupted => State::Interrupted,
         }
     }
+
+    /// What a **compact child row** says when the child ended with nothing to
+    /// read.
+    ///
+    /// A conclusion rather than a gap, which is what [`OutcomeKind::Empty`]
+    /// exists for: the row has to be able to say "this is over and there is
+    /// nothing to read" without either going blank or reverting to the last
+    /// thing the child was doing.
+    ///
+    /// **A row that says nothing does not stay silent.** The client collapses a
+    /// child's rows onto one entry and carries a field forward when the newer
+    /// row omits it (`session-logic.ts::mergeDerivedWorkLogEntries`,
+    /// `detail = next.detail ?? previous.detail`), so a terminal row that left
+    /// `detail` off would leave the *previous* line — stale activity — standing
+    /// as the child's ending. That is the defect the terminal rule exists to
+    /// prevent, so the sentence is written here once and shared rather than left
+    /// to each driver to remember.
+    ///
+    /// [`OutcomeKind::Completed`] cannot reach this — [`Outcome::completed`]
+    /// turns a blank result into [`OutcomeKind::Empty`] — and it answers with
+    /// the same sentence rather than a panic.
+    pub fn without_a_report(self) -> &'static str {
+        match self {
+            OutcomeKind::Completed | OutcomeKind::Empty => "Completed with no result",
+            OutcomeKind::Failed => "Failed with no reported reason",
+            OutcomeKind::Interrupted => "Interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,9 +226,10 @@ impl Outcome {
 
 /// What one entry in a child stream *is*.
 ///
-/// Eight members covering the spec's shared kinds: child prose, commands and
+/// Nine members covering the spec's shared kinds: child prose, commands and
 /// output, reads and searches, edits and diffs, other tool calls and results,
-/// warnings and errors, approvals or questions, and the terminal outcome. They
+/// warnings and errors, approvals or questions, a **nested launcher**, and the
+/// terminal outcome. They
 /// are one vocabulary rather than one per provider, because a developer reading
 /// a child's work should not have to learn which agent produced it — and a
 /// provider that does not expose one of them simply never records it.
@@ -233,7 +262,7 @@ pub enum EntryKind {
     Blocker,
     /// A child this child delegated: the compact launcher, in the stream of the
     /// agent that spawned it rather than in the root transcript. Payload:
-    /// [`Delegated`].
+    /// [`Launcher`].
     Subagent,
     /// The terminal entry: its result, failure, interruption, or empty answer.
     Outcome,
@@ -283,9 +312,10 @@ const CHILD_OUTPUT: usize = 8 * 1024;
 ///
 /// Here rather than in a driver because the bound is a property of [`Work`] —
 /// what a child's tab can be asked to render and what a stream can be asked to
-/// store — and not of any one protocol. The OpenCode and Codex adapters each
-/// carried a copy of it while the other was in flight; this is the home both of
-/// them named.
+/// store — and not of any one protocol. All three adapters carried a copy of it
+/// while the others were in flight; this is the home they named, and the last
+/// copy (the Claude driver's, in [`crate::turn`]) was retired by the
+/// feature-wide review.
 pub fn bounded(output: &str) -> String {
     if output.chars().count() <= CHILD_OUTPUT {
         return output.to_string();
@@ -556,7 +586,7 @@ pub struct Head {
     /// cannot prove is one it must not draw.
     ///
     /// Set, it is what places the child: [`Streams::record`] keeps a
-    /// [`Delegated`] launcher in the named parent's stream, and the provider
+    /// [`Launcher`] launcher in the named parent's stream, and the provider
     /// adapter draws no compact row for it in the root transcript. So this one
     /// field decides both halves of "one worker has one visible parent".
     pub parent_child_id: Option<String>,
@@ -757,7 +787,7 @@ impl NewEntry {
     /// Keyed by the descendant's own identity, so the one launcher follows that
     /// child through pending, working, blocked and its conclusion rather than
     /// leaving a row per state change in its parent's history. See
-    /// [`Delegated`].
+    /// [`Launcher`].
     pub fn delegated(nested: &Launcher) -> NewEntry {
         NewEntry {
             key: Some(format!("child:{}", nested.child_id)),
@@ -1224,8 +1254,9 @@ impl Streams {
     /// Every child of this conversation still pending, working or blocked.
     ///
     /// The **known active delegation tree** — every generation of it, because a
-    /// stream is held per child rather than per level. What a thread's Working
-    /// state is derived from and what a Stop reaches.
+    /// stream is held per child rather than per level. What a Stop reaches.
+    /// Whether the conversation is working is [`Streams::working`], which asks
+    /// the same question without naming the answers.
     pub fn active(&self, thread_id: &str) -> Vec<String> {
         let mut running: Vec<String> = slots_of(&lock(&self.inner.open), thread_id)
             .filter(|(_, slot)| slot.running())

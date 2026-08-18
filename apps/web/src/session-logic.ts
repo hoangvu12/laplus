@@ -84,9 +84,13 @@ export interface WorkLogEntry {
    * The subagent work stream this row launches.
    *
    * Present only on a compact child row whose driver records a stream — the
-   * row is an index into the child's work, and this is the address of it. A
-   * subagent row without one is a driver that has not learned to record child
-   * work yet, and it stays an ordinary unclickable row.
+   * row is an index into the child's work, and this is the address of it.
+   *
+   * All three drivers record a stream now, so its absence no longer names a
+   * provider that has not caught up. It names a row that is not a child: an
+   * ordinary tool call, or one of Codex's collaboration operation rows, which
+   * stay deliberately separate from the children they concern. Such a row stays
+   * an ordinary unclickable one.
    */
   subagentChildId?: string;
 }

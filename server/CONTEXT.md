@@ -436,7 +436,7 @@ resembles. `crate::subagents::EntryKind`.
 that delegated it. The same five things the parent conversation's **compact child
 row** carries — identity, name, assignment, state and outcome — in the one other
 place a launcher may appear, and it opens the descendant as another ordinary
-right-panel tab. `crate::subagents::Delegated`.
+right-panel tab. `crate::subagents::Launcher`.
 
 **Drawn only where the provider proves the relationship, and drawn there
 _instead_ of in the root transcript.** It exists because **stream head**'s

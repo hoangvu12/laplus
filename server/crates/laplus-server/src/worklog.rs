@@ -549,18 +549,22 @@ pub fn subagent(
     )
 }
 
-/// What a finished subagent row says when the child returned no text.
+/// What a finished subagent row says when the child returned no text, in this
+/// wire's status vocabulary.
 ///
-/// A conclusion rather than a gap, which is the same distinction
-/// [`crate::subagents::OutcomeKind::Empty`] exists for: the row has to be able
-/// to say "this is over and there is nothing to read" without either going
-/// blank or reverting to the last thing the child was doing.
+/// The sentence itself is [`crate::subagents::OutcomeKind::without_a_report`],
+/// shared with the Codex driver, which builds its own compact row
+/// (`codex::collaboration_agent_row`) and reaches the same case by a different
+/// road. What is left here is the translation: this row is keyed by a provider
+/// status string rather than by an outcome.
 fn concluded_without_a_report(status: &str) -> &'static str {
+    use crate::subagents::OutcomeKind;
     match status {
-        "failed" => "Failed with no reported reason",
-        "interrupted" => "Interrupted",
-        _ => "Completed with no result",
+        "failed" => OutcomeKind::Failed,
+        "interrupted" => OutcomeKind::Interrupted,
+        _ => OutcomeKind::Empty,
     }
+    .without_a_report()
 }
 
 pub fn unanswered(activities: &[Activity]) -> Vec<&str> {
@@ -693,15 +697,18 @@ impl Decision {
     }
 }
 
-/// Who is waiting, when it is not the root agent.
-///
-/// Put on the request row as its own field rather than folded into the detail,
-/// because the developer has to know *before deciding* which worker will receive
-/// the answer, and a sentence buried in a command preview is not that. `None`
-/// leaves the payload exactly as it was, which is the root behaviour every
-/// provider without child attribution keeps.
+/// The request row's field for the child that raised it.
 const SUBAGENT: &str = "subagent";
 
+/// Who is waiting, when it is not the root agent.
+///
+/// Put on the request row as its own field, under [`SUBAGENT`], rather than left
+/// to the sentence [`asked_by`] writes: the developer has to know *before
+/// deciding* which worker will receive the answer, and the client needs the
+/// child's identity as data rather than as prose — a name inside a summary is
+/// not something a surface can be addressed by. `None` leaves the payload
+/// exactly as it was, which is the root behaviour every provider without child
+/// attribution keeps.
 fn waiting_child(request: &ApprovalRequest) -> Option<Value> {
     let waiting = request.subagent.as_ref()?;
     Some(json!({"childId": waiting.child_id, "name": waiting.name}))
@@ -1148,9 +1155,10 @@ mod tests {
     }
 
     /// What the row says, in the order the three candidates are worth having. The
-    /// description is the CLI's account of what the subagent is up to; `said` is
-    /// the subagent's own words, forwarded while it works; the summary is its
-    /// final report. Each outranks the one before it.
+    /// description is the parent saying what it asked for; `said` is the
+    /// subagent's own words, forwarded while it works; the summary is its final
+    /// report. Each outranks the one before it — see [`subagent`], whose comment
+    /// is the one this mirrors.
     #[test]
     fn a_row_prefers_the_subagents_own_words_to_a_description_of_them() {
         let described = subagent(&task("running", None), None, None);

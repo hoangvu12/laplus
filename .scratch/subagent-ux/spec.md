@@ -296,3 +296,94 @@ degrading honestly when a protocol does not expose a field or relationship.
 - This is a multi-session, cross-contract feature. The next step is to split the
   spec into tracer-bullet tickets with explicit blocking edges before beginning
   implementation.
+
+## Feature-wide review and verification
+
+Ran after the seventh ticket merged, against base `8ca1365d` and head
+`0f6e46d9` — `/code-review`'s two axes over the composed feature rather than
+over any one ticket's base, because each ticket was reviewed only against its
+own and what nobody had checked was the interaction.
+
+**Status is deliberately not `ready-for-human`.** The review did not come back
+clean.
+
+### The blocker
+
+**A stopped child's compact row contradicts its own stream, and then reports the
+answer the developer declined to wait for.** `Shell::stop_the_delegation_tree`
+reaches only `Streams::interrupt` and `Threads::follow_delegation`; every
+compact-row emitter lives in a provider fold path, so a Stop draws no row and
+nothing refuses one afterwards. The row stays `running` with its pre-stop
+detail, and then the provider's continued narration — which `Streams::record`
+correctly refuses for the stream — carries the row to `completed` with the
+child's report on it, beside a stream that says `interrupted`.
+
+Ticket 02 made the compact row the terminal-preview surface; ticket 06 added a
+new terminal path that bypasses it and asserted only the stream. Neither ticket
+was wrong about itself. `socket_turn::a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`
+is the executable form, `#[ignore]`d so the suite stays at its baseline:
+
+```
+cargo test -p laplus-server --test socket_turn a_stopped_claude_child_row_agrees -- --ignored
+```
+
+The full account, the two fixes the review did take, and everything it recorded
+without acting on, are in ticket 07 under **What the feature-wide review found**.
+
+### What was run, and what it said
+
+All numbers below are real output from the integration worktree, with
+`CARGO_TARGET_DIR=/tmp/laplus-target-integration` — per-worktree, because a
+shared target directory silently served one worktree's test binaries to another
+earlier in this run.
+
+- `cargo test -p laplus-server --no-fail-fast` — **1520 passed, 0 failed, 3
+  ignored.** The baseline is 1520/0. Three ignored: `local_generation_peer_child`
+  and `opencode_peer_child`, both pre-existing, and
+  `a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`, added by this
+  review to hold the blocker above. Run it with `-- --ignored` and it fails on
+  `left: "completed"` / `right: "interrupted"`.
+- `vp run -r test` — all six projects green: `packages/shared` 4 files / 35
+  tests, `packages/contracts` 23 / 203, `packages/client-runtime` 36 / 424,
+  `apps/web` 186 / 1715.
+- The feature's focused files, run by name: `apps/web` 8 files / 156 tests
+  (`SubagentStreamPanel`, `SubagentNesting`, `SubagentStreamScroller`,
+  `subagentScroll`, `rightPanelStore`, `rightPanelCleanup`, `session-logic`,
+  `subagentFileActions`); `contracts/src/orchestration.test.ts` 49 tests;
+  `client-runtime/src/state/subagentStream.test.ts` 5 tests.
+- `vp run -r typecheck` — clean across all 6 projects (`apps/cli`, `apps/web`,
+  `packages/contracts`, `packages/shared`, `packages/client-runtime`,
+  `oxlint-plugin-t3code`).
+- `vp lint` — **11 warnings**, the baseline, none of them in this feature's
+  files. (`vp lint --report-unused-disable-directives`, which the `lint` package
+  script adds, reports a twelfth in `ThreadTerminalDrawer.tsx`, untouched here.)
+- `cargo clippy -p laplus-server --all-targets` — **76 warnings**, the baseline.
+- `cargo fmt` was **not** run and `cargo fmt --check` was **not** run.
+  `server/CLAUDE.md:169` records that this tree has never been rustfmt-formatted
+  and that the check fails on all 29 files.
+
+### What none of that proves
+
+**No browser run happened.** Not a single line of this feature has been drawn in
+a window. That was the user's decision — they will drive the UI themselves — and
+it is the largest open risk, not an oversight. AGENTS.md's warning applies
+directly: a whole afternoon's findings once came from driving the window for a
+minute, none of which a passing suite had caught.
+
+Concretely:
+
+- **Tickets 05 and 07 retain browser-only acceptance criteria.** Ticket 05's
+  criteria for resizing, the narrow layout, real scroll restoration against real
+  metrics and a real jump-to-latest gesture cannot be met by happy-dom, which
+  lays nothing out. Ticket 07's criteria 1–6 are deliberately left unticked and
+  the ticket stays `ready-for-agent` for exactly this reason.
+- **Ticket 07 carries the human checklist for them**, under **The browser gap**:
+  H1 (the held-Working state and the four things it drives — do this first), B1–B6,
+  N1 (a nested launcher clicked inside an open child tab), S1 (Stop with the tree
+  live), R1 (resizing and the narrow layout) and C1 (blockers, OpenCode only).
+  Ticket 07 also records which of its own leads the feature-wide review has since
+  settled statically, so the window time is not spent on them.
+
+The honest summary: the feature is implemented, reviewed and green at every seam
+a test can reach — with one seam a test _did_ reach and found broken, recorded
+above — and nobody has yet opened the window.

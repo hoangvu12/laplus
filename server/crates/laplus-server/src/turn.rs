@@ -620,10 +620,26 @@ fn child_stream(moved: &crate::protocol::SubagentMoved) -> crate::subagents::Upd
     // A child ends twice and the bare ending comes first, so the state and the
     // outcome are settled by different events: the `task_updated` stops it
     // reading as running, and the `task_notification` that follows spends the
-    // stream's one terminal entry on what the child actually returned. Recording
-    // an outcome on the bare one would spend it on a silence —
-    // [`crate::subagents::Streams::record`] keeps the first outcome it is given —
-    // and the answer arriving a millisecond later would be dropped.
+    // stream's one terminal entry on what the child actually returned.
+    //
+    // **The bare ending records no outcome, and the reason is no longer the one
+    // this comment used to give.** It said `Streams::record` keeps the first
+    // outcome it is given; since the arbitration ticket 06 landed, `record`
+    // lets a *reported* outcome replace an [`crate::subagents::OutcomeKind::Empty`]
+    // one, upserted under the terminal entry's own key — so concluding the bare
+    // ending as `Empty` would no longer lose the answer that follows.
+    //
+    // What stops it now is the other half of that same rule, which is narrow in
+    // both directions: only `Empty` may be replaced. `terminal_task_status`
+    // folds `failed`, `error`, `cancelled`, `killed` and `timeout` onto
+    // `"failed"`, so a bare *failed* ending would record `Outcome::failed(None)`
+    // — not `Empty` — and the `task_notification`'s actual reason a millisecond
+    // later would then be refused for ever. Concluding here would trade a case
+    // no capture contains (a bare ending with no notification, where the stream
+    // reaches a terminal state with no terminal entry and the compact row still
+    // reads "Completed with no result") for a case the captures do contain.
+    // Closing it properly means deciding what a bare *failure* concludes as, and
+    // that is a change to this shared rule rather than to this adapter.
     let ending = moved.row.as_ref().filter(|row| row.status != "running");
     update = match (ending, moved.reports) {
         (None, _) => update.in_state(State::Working),
@@ -769,21 +785,22 @@ fn child_entry_kind(tool: &str) -> crate::subagents::EntryKind {
     }
 }
 
-/// How much of a child's tool output the stream keeps.
+/// How much of a child's tool output the stream keeps, and whether it kept any.
 ///
-/// A bound rather than the whole thing, for [`crate::opencode`]'s reason: a
-/// child's `cat` of a large file would otherwise be copied into the durable
-/// stream and pushed to every watching client.
-const CHILD_OUTPUT: usize = 8 * 1024;
-
+/// The bound is [`crate::subagents::bounded`] — a property of the entry rather
+/// than of this protocol, and shared with the OpenCode and Codex drivers. This
+/// driver carried its own copy of it, and of the constant behind it, until the
+/// feature-wide review found the two still in step by luck; a tunable declared
+/// twice is one a later change moves in one place only.
+///
+/// What is left here is the part that *is* this wire's: a tool that returned
+/// only whitespace said nothing, which is absence rather than an empty line to
+/// draw.
 fn bounded(output: &str) -> Option<String> {
     if output.trim().is_empty() {
         return None;
     }
-    if output.chars().count() <= CHILD_OUTPUT {
-        return Some(output.to_string());
-    }
-    Some(output.chars().take(CHILD_OUTPUT).collect::<String>() + "…")
+    Some(crate::subagents::bounded(output))
 }
 
 /// Fold one line and say what it turned out to be.

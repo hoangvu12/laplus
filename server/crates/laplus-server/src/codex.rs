@@ -841,9 +841,17 @@ fn collaboration_agent_row(
     // **A terminal row describes what came back, and nothing else.** Once an
     // agent has reported, whatever it was last doing is stale, and a row that
     // went on showing it would present the thing said on the way to an answer as
-    // the answer — the spec's "terminal state replaces stale activity". A
-    // completion with nothing to read says nothing rather than falling back,
-    // because there is no stale line it would be honest to show instead.
+    // the answer — the spec's "terminal state replaces stale activity".
+    //
+    // **A silent completion says so**, rather than leaving `detail` off. Leaving
+    // it off is not silence on this wire: the client collapses an agent's rows
+    // onto one entry and carries a field forward when the newer row omits it
+    // (`session-logic.ts::mergeDerivedWorkLogEntries`), so an absent `detail`
+    // leaves the *running* row's line standing as the ending — exactly the stale
+    // activity the paragraph above refuses. The sentence is
+    // [`crate::subagents::OutcomeKind::without_a_report`], shared with
+    // [`crate::worklog::subagent`], because two drivers saying it differently is
+    // a second vocabulary for one fact.
     //
     // While it runs, the most useful line wins: what the agent itself reported,
     // then the latest meaningful thing its own stream saw it do, and its
@@ -851,7 +859,12 @@ fn collaboration_agent_row(
     // activity yet.
     let ended = conclusion(&agent.status, agent.message.as_deref());
     let shown_detail = match &ended {
-        Some(outcome) => outcome.text.clone(),
+        Some(outcome) => Some(
+            outcome
+                .text
+                .clone()
+                .unwrap_or_else(|| outcome.kind.without_a_report().to_string()),
+        ),
         None => agent
             .message
             .clone()
@@ -2011,10 +2024,20 @@ mod tests {
             "Codex shut this subagent down.",
             "a stopped child must not go on showing the command it was running"
         );
+        // **Not `null`.** An absent `detail` is not silence once the client has
+        // collapsed this row onto the running one it replaces — it leaves "ls
+        // src" standing as the child's ending. The empty conclusion has to be
+        // said, in the words the other two drivers already say it in
+        // (`worklog::concluded_without_a_report`).
         assert_eq!(
             row("completed", None, Some("ls src")),
-            Value::Null,
-            "a completion with nothing to read says nothing rather than something stale"
+            "Completed with no result",
+            "a completion with nothing to read says so rather than leaving stale activity standing"
+        );
+        assert_eq!(
+            row("completed", None, None),
+            "Completed with no result",
+            "and says it with nothing behind it too, so the two cases read alike"
         );
     }
 
