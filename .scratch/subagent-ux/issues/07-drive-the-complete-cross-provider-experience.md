@@ -376,9 +376,16 @@ and consolidated above; what is missing is not more tests but a window.
 
 ## What the feature-wide review found (base `8ca1365d` → `0f6e46d9`)
 
-The final review ran `/code-review`'s two axes against the whole feature rather
-than against any one ticket's base. Its subject was the seam per-ticket review
-cannot see: individually-correct changes composing into something wrong.
+The final review read the whole feature against base `8ca1365d` rather than any
+one ticket's base. Its subject was the seam per-ticket review cannot see:
+individually-correct changes composing into something wrong.
+
+**A note on how this section was produced.** `/code-review`'s two axis
+sub-agents were launched and never returned a report to the reviewer, so what
+follows is **not** their output. Every finding below was located and verified
+directly — by reading the code it describes and, for the blocker, by driving it
+— rather than taken from a summary. Re-running the two axes is still worth
+doing before the release; they may find things this section does not.
 
 ### A release blocker
 
@@ -484,7 +491,7 @@ until it lands.
   navigation from a Codex child tab is unreachable where OpenCode and Claude have
   it. Disclosed by ticket 04; it is a partial requirement (stories 10–12), not a
   nuance.
-- **Cosmetic Standards findings, not taken**, because a pure-quality change with
+- **Cosmetic quality findings, not taken**, because a pure-quality change with
   no test behind it is a bad trade before a publish: three near-identical
   right-panel wrappers (`rightPanelStore::openSubagentSurface`,
   `subagentFileActions::openSubagentFile`/`openSubagentDiff`); the module-global

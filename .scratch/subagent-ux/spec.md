@@ -300,9 +300,15 @@ degrading honestly when a protocol does not expose a field or relationship.
 ## Feature-wide review and verification
 
 Ran after the seventh ticket merged, against base `8ca1365d` and head
-`0f6e46d9` — `/code-review`'s two axes over the composed feature rather than
-over any one ticket's base, because each ticket was reviewed only against its
-own and what nobody had checked was the interaction.
+`0f6e46d9` — over the composed feature rather than over any one ticket's base,
+because each ticket was reviewed only against its own and what nobody had
+checked was the interaction.
+
+`/code-review`'s two axis sub-agents were launched and never returned a report,
+so the findings recorded here and in ticket 07 were located and verified
+directly rather than taken from them. **Re-running the two axes is outstanding**
+and should happen before the release; this review's coverage is what one reader
+reached, not what two independent axes would.
 
 **Status is deliberately not `ready-for-human`.** The review did not come back
 clean.
