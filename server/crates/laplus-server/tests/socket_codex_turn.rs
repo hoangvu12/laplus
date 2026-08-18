@@ -8,7 +8,7 @@ use harness::conversation::{
     activities, activity, assistant_sends, create_project, create_thread, follow_up, follow_up_in,
     interrupt_turn, last_session, respond_to_approval,
 };
-use harness::subagents::{child_stream, folded_entries};
+use harness::subagents::{child_row, child_stream, folded_entries};
 use harness::workspace::Workspace;
 use harness::{SocketClient, TestServer};
 use laplus_server::config::ServerConfig;
@@ -2899,6 +2899,25 @@ async fn stopping_a_codex_parent_stops_the_child_it_was_running() {
         before + 1
     );
 
+    // The compact row says the same thing, on the same command, and collapsed
+    // on the key Codex's own rows use — `agent:{threadId}` rather than the
+    // `subagent:{taskId}` the other two drivers spell it with — so the ending
+    // lands on the row Codex had been moving instead of beside it.
+    let ended = child_row(&server, "codex-thread", "child-alpha-1111").await;
+    assert_eq!(
+        ended["payload"]["status"], "stopped",
+        "the compact row disagreed with the stopped child's stream: {ended:#?}"
+    );
+    assert_eq!(ended["kind"], "tool.completed", "{ended:#?}");
+    assert_eq!(
+        ended["payload"]["data"]["toolCallId"], "agent:child-alpha-1111",
+        "the ending landed beside the child's row instead of on it: {ended:#?}"
+    );
+    assert_eq!(
+        ended["payload"]["detail"], "Interrupted",
+        "the row kept the line the child was on when it was stopped: {ended:#?}"
+    );
+
     // The provider goes on narrating children laplus has already ended, and
     // none of it lands.
     codex.release_turn();
@@ -2928,6 +2947,15 @@ async fn stopping_a_codex_parent_stops_the_child_it_was_running() {
             .expect("a terminal entry")["kind"],
         "outcome",
         "something landed behind the child's conclusion: {after:#?}"
+    );
+
+    // Including the `wait` that completes after the child ended: it moves the
+    // *operation* row it owns, which is not the child, and leaves the child's
+    // own row on the ending the developer asked for.
+    let after_row = child_row(&server, "codex-thread", "child-alpha-1111").await;
+    assert_eq!(
+        after_row, ended,
+        "narration after a Stop moved the stopped child's row: {after_row:#?}"
     );
 
     // The provider goes on to name agents laplus had never heard of — `wait`'s
@@ -3065,13 +3093,25 @@ async fn stopping_a_codex_parent_stops_the_generation_below_it_too() {
             .any(|row| row["payload"]["data"]["childId"] == "child-gamma-3333"),
         "the descendant was in the root transcript after all"
     );
-
-    let session = server
+    // Not even the ending the Stop draws. A terminal row for a descendant would
+    // put a child in the conversation the conversation had deliberately never
+    // shown — the row a Stop draws is for the children that own one, and the
+    // descendant's interruption is on the launcher inside its spawner's stream.
+    let transcript = server
         .connect()
         .await
         .into_thread_snapshot("codex-thread")
-        .await["thread"]["session"]
-        .clone();
+        .await;
+    assert!(
+        !transcript["thread"]["activities"]
+            .as_array()
+            .expect("a thread snapshot carries its activities")
+            .iter()
+            .any(|activity| activity["payload"]["data"]["childId"] == "child-gamma-3333"),
+        "stopping the tree gave the descendant a root row: {transcript:#?}"
+    );
+
+    let session = transcript["thread"]["session"].clone();
     assert_ne!(
         session["status"], "running",
         "a stopped tree still reports the conversation as working: {session:#?}"

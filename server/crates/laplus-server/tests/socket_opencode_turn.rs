@@ -30,7 +30,7 @@ use harness::{
         revert_checkpoint,
         respond_to_approval, respond_to_user_input, start_turn, start_turn_in,
     },
-    subagents::{child_stream, folded_entries},
+    subagents::{child_row, child_stream, folded_entries},
     workspace::Workspace,
     SocketClient, TestServer,
 };
@@ -4362,8 +4362,11 @@ async fn project_closure_reaps_its_threads_live_owned_opencode_server() {
 /// - each of those records an **interrupted** terminal state and the terminal
 ///   entry that says so, which is what makes the ending auditable rather than a
 ///   stream that simply goes quiet;
+/// - the compact row in the parent's transcript says it too, drawn on the
+///   developer's own command because no provider will ever draw it;
 /// - nothing ordinary reaches the child afterwards: the peer is released and
-///   goes on narrating a child laplus has already ended, and none of it lands;
+///   goes on narrating a child laplus has already ended, and none of it lands —
+///   neither in the stream nor on the row;
 /// - and with nothing left in the tree the conversation stops reporting itself
 ///   as working.
 #[tokio::test]
@@ -4435,6 +4438,25 @@ async fn stopping_the_parent_stops_its_delegation_tree() {
     let interrupted_at = stopped["entries"].as_array().expect("entries").len();
     assert_eq!(interrupted_at, before + 1, "{stopped:#?}");
 
+    // The compact row says the same thing, on the same command. It is the
+    // surface the developer is more likely to be reading — the child's tab may
+    // never have been opened — and no provider will ever draw this row, because
+    // no provider is told its subagent was abandoned.
+    let ended = child_row(&server, "stop-tree-thread", "call_task_1").await;
+    assert_eq!(
+        ended["payload"]["status"], "stopped",
+        "the compact row disagreed with the stopped child's stream: {ended:#?}"
+    );
+    assert_eq!(ended["kind"], "tool.completed", "{ended:#?}");
+    assert_eq!(
+        ended["payload"]["data"]["toolCallId"], "subagent:call_task_1",
+        "the ending landed beside the child's row instead of on it: {ended:#?}"
+    );
+    assert_eq!(
+        ended["payload"]["detail"], "Interrupted",
+        "the row kept the line the child was on when it was stopped: {ended:#?}"
+    );
+
     // And the provider goes on narrating a child that has already ended.
     release.notify_one();
     client.events_through_the_turn(&subscription).await;
@@ -4446,6 +4468,15 @@ async fn stopping_the_parent_stops_its_delegation_tree() {
     );
     assert_eq!(after["stream"]["state"], "interrupted");
     assert_eq!(after["stream"]["outcome"]["kind"], "interrupted");
+
+    // None of it moves the row either, which is the half that produced the
+    // worst outcome: a row settling on the answer the developer declined to
+    // wait for, beside a stream that says it was interrupted.
+    let after_row = child_row(&server, "stop-tree-thread", "call_task_1").await;
+    assert_eq!(
+        after_row, ended,
+        "narration after a Stop moved the stopped child's row: {after_row:#?}"
+    );
 
     // Nothing is left in the tree, so nothing is holding the conversation open.
     let session = server

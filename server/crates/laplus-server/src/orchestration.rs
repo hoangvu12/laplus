@@ -1542,9 +1542,72 @@ impl Shell {
     /// surface asks the server for nothing at all
     /// (`rightPanelCleanup.ts::resolveRightPanelSurfaceCleanup`), which is the
     /// whole of what keeps the common workspace gesture safe.
+    ///
+    /// **The compact row is ended here too, and it has to be.** A child is two
+    /// things at once — a stream, and one row in the parent's transcript — and
+    /// every other row in this application is drawn by a provider fold path
+    /// from something a CLI said. Nothing is said here: the CLI is not told its
+    /// subagent was abandoned, so a row left to the provider stays `running`
+    /// and is then carried to `completed` by narration about a child the
+    /// developer had already declined to wait for. So the same command that
+    /// writes the interruption into the stream writes it onto the row, from the
+    /// one answer [`crate::subagents::Streams::interrupt`] gives about what it
+    /// actually ended. The other half of keeping the two in step —
+    /// refusing the narration that follows — is
+    /// [`crate::session::spend`]'s, because that is where every provider's
+    /// activities are applied.
+    ///
+    /// **A descendant gets none**, which is
+    /// [`crate::subagents::Interrupted::nested`]: a child of a child has no row
+    /// in this transcript to end, only a launcher inside its spawner's stream,
+    /// and the interruption recorded above has already moved that.
     fn stop_the_delegation_tree(&self, thread_id: &str) {
-        self.inner.threads.subagents().interrupt(thread_id);
+        let stopped = self.inner.threads.subagents().interrupt(thread_id);
+        self.draw_the_endings_the_provider_will_not(thread_id, &stopped);
         self.inner.threads.follow_delegation(thread_id);
+    }
+
+    /// Put the interruption on each stopped child's compact row.
+    ///
+    /// The driver is read from the thread because the row's collapse key is the
+    /// driver's — see [`crate::worklog::child_row_key`] — and it is the only
+    /// provider-specific thing about any of this. A thread naming a driver this
+    /// build does not know draws no rows, which is the same silence it already
+    /// gets everywhere else rather than a guess at a key that would land beside
+    /// the row instead of on it.
+    ///
+    /// The turn is whatever is running *now*, read rather than remembered, on
+    /// [`crate::turn`]'s reading of a child boundary: a row is attributed to
+    /// the turn it was drawn in, and a background child that outlived its turn
+    /// belongs to none.
+    fn draw_the_endings_the_provider_will_not(
+        &self,
+        thread_id: &str,
+        stopped: &[crate::subagents::Interrupted],
+    ) {
+        if stopped.iter().all(|child| child.nested) {
+            return;
+        }
+        let Some(driver) = self
+            .inner
+            .threads
+            .get(thread_id)
+            .and_then(|thread| crate::provider::registration(&thread.provider.driver))
+            .map(|registered| registered.kind)
+        else {
+            return;
+        };
+        let turn_id = self.inner.threads.active_turn(thread_id);
+        for child in stopped.iter().filter(|child| !child.nested) {
+            self.inner.threads.apply(
+                thread_id,
+                Change::Activity(crate::worklog::child_interrupted(
+                    driver,
+                    child,
+                    turn_id.clone(),
+                )),
+            );
+        }
     }
 
     /// End the agent process behind a conversation, and keep the conversation.

@@ -470,6 +470,20 @@ it was running has been abandoned. **Closing a child tab is not this**: a closed
 surface asks the server for nothing at all, which is the whole of what keeps the
 common workspace gesture safe.
 
+**And it stops the tree in both of the places a child is shown.** A child is a
+stream _and_ a **compact child row**, and the same silence that makes the
+interruption a decision rather than a report means no provider will ever draw
+that row: `crate::orchestration::Shell::stop_the_delegation_tree` draws it
+itself, from what `crate::subagents::Streams::interrupt` answers it actually
+ended, keyed by `crate::worklog::child_row_key` because the collapse key is the
+driver's. A descendant gets none — it has no row in the root transcript, only a
+**nested launcher** inside its spawner's stream. Afterwards, an activity that
+would move a stopped child's row is refused in `crate::session::spend`, where
+every provider's transcript activities are applied, so the provider narrating a
+child it was told to end cannot carry the row to the answer the developer
+declined to wait for. That refusal is the row's half of the rule
+`crate::subagents::Streams::record` already keeps for the stream.
+
 **Child work** — one piece of what a subagent did, carried in the _client's_
 work-log vocabulary rather than any provider's: a title, a lifecycle status, and
 whatever the protocol exposed of the command, the files, the pattern and the

@@ -311,30 +311,54 @@ and should happen before the release; this review's coverage is what one reader
 reached, not what two independent axes would.
 
 **Status is deliberately not `ready-for-human`.** The review did not come back
-clean.
+clean. Its one blocker has since been fixed — see below — but the review's own
+two axes were never re-run.
 
-### The blocker
+### The blocker — fixed
 
-**A stopped child's compact row contradicts its own stream, and then reports the
-answer the developer declined to wait for.** `Shell::stop_the_delegation_tree`
-reaches only `Streams::interrupt` and `Threads::follow_delegation`; every
-compact-row emitter lives in a provider fold path, so a Stop draws no row and
-nothing refuses one afterwards. The row stays `running` with its pre-stop
+**A stopped child's compact row contradicted its own stream, and then reported
+the answer the developer declined to wait for.** `Shell::stop_the_delegation_tree`
+reached only `Streams::interrupt` and `Threads::follow_delegation`; every
+compact-row emitter lives in a provider fold path, so a Stop drew no row and
+nothing refused one afterwards. The row stayed `running` with its pre-stop
 detail, and then the provider's continued narration — which `Streams::record`
-correctly refuses for the stream — carries the row to `completed` with the
-child's report on it, beside a stream that says `interrupted`.
+correctly refuses for the stream — carried the row to `completed` with the
+child's report on it, beside a stream that said `interrupted`.
 
 Ticket 02 made the compact row the terminal-preview surface; ticket 06 added a
 new terminal path that bypasses it and asserted only the stream. Neither ticket
-was wrong about itself. `socket_turn::a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`
-is the executable form, `#[ignore]`d so the suite stays at its baseline:
+was wrong about itself.
+
+**Fixed in two halves, both provider-neutral.** `Streams::interrupt` now answers
+with what it actually ended, and `stop_the_delegation_tree` draws each stopped
+child's terminal row from that answer — `worklog::child_row_key` is the one
+place the row's provider-specific collapse key is spelled, and a descendant
+(which owns no root row) is deliberately given none. And `session::spend`, the
+choke point where every provider's transcript activities are applied, refuses an
+activity that would move the row of a child `Streams` holds as interrupted;
+it recognises one by `data.childId`, the stream reference every driver's compact
+child row already carries, so it needs no provider knowledge at all.
+
+Neither half weakens `Streams::record`: ticket 06 criterion 7 is proven by the
+same tests it always was.
+
+Proven for all three providers, each mutation-checked:
 
 ```
-cargo test -p laplus-server --test socket_turn a_stopped_claude_child_row_agrees -- --ignored
+cargo test -p laplus-server --test socket_turn a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to
+cargo test -p laplus-server --test socket_opencode_turn stopping_the_parent_stops_its_delegation_tree
+cargo test -p laplus-server --test socket_codex_turn stopping_a_codex_parent
 ```
 
-The full account, the two fixes the review did take, and everything it recorded
-without acting on, are in ticket 07 under **What the feature-wide review found**.
+The Claude test is no longer `#[ignore]`d. It also no longer asserts
+`payload.status == "interrupted"`, which was wrong: `status` is the client's
+`WorkLogToolLifecycleStatus`, whose literals do not include that word, and a
+`tool.completed` carrying an unreadable status is drawn as _completed_. The row
+says `stopped`, which is the mapping the Codex driver already made.
+
+The full account, the two fixes the review itself took, and everything it
+recorded without acting on, are in ticket 07 under **What the feature-wide
+review found**.
 
 ### What was run, and what it said
 
@@ -343,12 +367,12 @@ All numbers below are real output from the integration worktree, with
 shared target directory silently served one worktree's test binaries to another
 earlier in this run.
 
-- `cargo test -p laplus-server --no-fail-fast` — **1520 passed, 0 failed, 3
-  ignored.** The baseline is 1520/0. Three ignored: `local_generation_peer_child`
-  and `opencode_peer_child`, both pre-existing, and
-  `a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`, added by this
-  review to hold the blocker above. Run it with `-- --ignored` and it fails on
-  `left: "completed"` / `right: "interrupted"`.
+- `cargo test -p laplus-server --no-fail-fast` — at review time **1520 passed, 0
+  failed, 3 ignored**, against a 1520/0 baseline. The third ignored test was
+  `a_stopped_claude_child_row_agrees_with_the_stream_it_belongs_to`, added by
+  this review to hold the blocker above; the fix un-ignores it, so the suite is
+  now **1521 passed, 0 failed, 2 ignored** — `local_generation_peer_child` and
+  `opencode_peer_child`, both pre-existing.
 - `vp run -r test` — all six projects green: `packages/shared` 4 files / 35
   tests, `packages/contracts` 23 / 203, `packages/client-runtime` 36 / 424,
   `apps/web` 186 / 1715.
@@ -391,5 +415,6 @@ Concretely:
   settled statically, so the window time is not spent on them.
 
 The honest summary: the feature is implemented, reviewed and green at every seam
-a test can reach — with one seam a test _did_ reach and found broken, recorded
-above — and nobody has yet opened the window.
+a test can reach — including the one seam a test _did_ reach and find broken,
+now fixed and proven for all three providers — and nobody has yet opened the
+window.

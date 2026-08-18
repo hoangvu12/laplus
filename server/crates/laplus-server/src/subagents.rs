@@ -535,6 +535,30 @@ pub struct Launcher {
     pub outcome: Option<Outcome>,
 }
 
+/// One child a Stop ended, and what the parent's transcript needs to say so.
+///
+/// [`Streams::interrupt`] answers with these because the compact row a stopped
+/// child owns is drawn from them, outside this module: nothing about a Stop
+/// reaches a provider adapter, so the row the adapter would have drawn has to
+/// come from what the registry knows.
+///
+/// Three fields, and each is load-bearing. The **id** addresses the row's
+/// collapse key. The **name** is what titles it, and it is the same value the
+/// adapters put on their own rows — Claude's `subagent_type`, OpenCode's agent
+/// kind, the last segment of Codex's `agentPath` — so the terminal row lands on
+/// the running one rather than renaming it. And **nested** is what keeps
+/// "one worker, one visible parent" true: a descendant of another child has no
+/// row in the root transcript at all ([`Head::parent_child_id`]), only a
+/// launcher inside its spawner's stream, which recording the interruption has
+/// already moved. Drawing it a root row here would put a child in the
+/// conversation that the conversation had deliberately never shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interrupted {
+    pub child_id: String,
+    pub name: Option<String>,
+    pub nested: bool,
+}
+
 /// One thing that happened in a child's session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -1282,13 +1306,70 @@ impl Streams {
     /// Deliberately not reachable from closing a surface. Closing a child tab is
     /// presentation only (`rightPanelCleanup.ts`), and the whole point of the
     /// distinction is that the common workspace gesture cannot end work.
-    pub fn interrupt(&self, thread_id: &str) {
+    ///
+    /// **Answers with what it actually ended**, because a child is two things at
+    /// once and only one of them lives here. The other is the compact row in the
+    /// parent's transcript, which no provider will now draw — the CLI was never
+    /// told — so [`crate::orchestration::Shell::stop_the_delegation_tree`] draws
+    /// it from this, and a stream that was already terminal must not produce
+    /// one. See [`Interrupted`] for why the answer carries a name and a
+    /// parentage rather than only an id.
+    pub fn interrupt(&self, thread_id: &str) -> Vec<Interrupted> {
+        let mut stopped = Vec::new();
         for child_id in self.active(thread_id) {
             self.record(
                 thread_id,
-                Update::for_child(child_id).concluded(Outcome::interrupted(None)),
+                Update::for_child(child_id.clone()).concluded(Outcome::interrupted(None)),
             );
+            // Read back rather than assumed. `active` and `record` take the
+            // slot's lock separately, so a child that concluded on its own in
+            // between is one this Stop did not end — and telling the transcript
+            // otherwise would overwrite the ending it did reach.
+            let Some(stream) = self.get(thread_id, &child_id) else {
+                continue;
+            };
+            if stream.head.outcome.map(|outcome| outcome.kind) != Some(OutcomeKind::Interrupted) {
+                continue;
+            }
+            stopped.push(Interrupted {
+                nested: stream
+                    .head
+                    .parent_child_id
+                    .is_some_and(|parent| parent != child_id),
+                child_id,
+                name: stream.head.name,
+            });
         }
+        stopped
+    }
+
+    /// Every child of this conversation whose ending is an **interruption**.
+    ///
+    /// What [`crate::session::spend`] refuses later provider narration on behalf
+    /// of: the compact row is the half of a stopped child that [`Streams`] does
+    /// not own, and a provider goes on describing both.
+    ///
+    /// **Interrupted rather than terminal.** A child that *completed* is
+    /// legitimately described again — Claude's bare `task_updated` is followed
+    /// by the `task_notification` carrying the report, and a Codex `wait` names
+    /// an agent that had already finished — and [`Streams::record`]'s
+    /// empty-outcome revision exists for exactly that. An interruption admits no
+    /// such revision, here or in `record`: it is the one ending that is not the
+    /// child's own account of itself, so nothing the child says later is a
+    /// better version of it.
+    ///
+    /// **Not only the ones a Stop ended.** Codex reports `interrupted` and
+    /// `shutdown` of its own accord (`codex::conclusion`), and a child that
+    /// reached this state that way is in exactly the same position: `record`
+    /// will not move its stream off the ending, so nothing should move its row
+    /// off it either.
+    pub fn interrupted(&self, thread_id: &str) -> Vec<String> {
+        slots_of(&lock(&self.inner.open), thread_id)
+            .filter_map(|(_, slot)| {
+                let stream = lock(&slot.stream);
+                (stream.head.state == State::Interrupted).then(|| stream.head.child_id.clone())
+            })
+            .collect()
     }
 
     /// Open an `orchestration.subscribeSubagent` subscription: the whole stream,
