@@ -312,10 +312,16 @@ const CHILD_OUTPUT: usize = 8 * 1024;
 ///
 /// Here rather than in a driver because the bound is a property of [`Work`] —
 /// what a child's tab can be asked to render and what a stream can be asked to
-/// store — and not of any one protocol. All three adapters carried a copy of it
-/// while the others were in flight; this is the home they named, and the last
-/// copy (the Claude driver's, in [`crate::turn`]) was retired by the
-/// feature-wide review.
+/// store — and not of any one protocol. All three adapters carried a copy of the
+/// truncation while the others were in flight; this is the home they named.
+///
+/// Two drivers still wrap it, and that is the point rather than a leftover: what
+/// each keeps is its own wire's rule about *absence*, which is not shared.
+/// `turn::bounded` reads whitespace-only output as a tool that said nothing;
+/// `opencode::bounded` reads the same from a `Value` that may be null or not a
+/// string. Both return `Option<String>` and both delegate the bound to this
+/// function, so the size lives in one place and the wire-specific silence stays
+/// with the wire that defines it.
 pub fn bounded(output: &str) -> String {
     if output.chars().count() <= CHILD_OUTPUT {
         return output.to_string();

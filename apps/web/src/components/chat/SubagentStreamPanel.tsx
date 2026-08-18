@@ -257,8 +257,30 @@ function launcherWorkEntry(
     itemType: "collab_agent_tool_call",
     toolLifecycleStatus: reached.status,
     subagentChildId: launcher.childId,
-    detail: launcher.outcome?.text ?? launcher.assignment ?? reached.label,
+    detail: launcherDetail(launcher, reached.label),
   };
+}
+
+/**
+ * What a nested launcher's row says it is doing, or what came back.
+ *
+ * **A terminal descendant never falls back to its assignment.** The spec's rule
+ * is that terminal state "replace[s] latest activity atomically with a bounded
+ * result, failure, interruption, or empty-result preview" — and an assignment is
+ * what the child was asked before it began, which is staler than the activity
+ * the rule exists to displace. A descendant that was interrupted, or failed
+ * without saying why, or completed without a report, carries `outcome.text:
+ * null`, so reading the text alone would have shown its task as though it were
+ * its answer.
+ *
+ * `OUTCOME_LABELS` is the same sentence the child's own conclusion row uses, so
+ * a descendant reads the same in its parent's stream as it does in its own tab.
+ */
+function launcherDetail(launcher: OrchestrationSubagentLauncher, reached: string): string {
+  if (launcher.outcome) {
+    return launcher.outcome.text ?? OUTCOME_LABELS[launcher.outcome.kind];
+  }
+  return launcher.assignment ?? reached;
 }
 
 function noticeWorkEntry(

@@ -453,11 +453,12 @@ const STALE: &str = "Unknown pending permission request";
 
 /// The collapse key of a compact child row drawn by [`subagent`].
 ///
-/// One definition rather than a `format!` at each use, because a **third**
-/// caller now needs it and it is not a row builder: the terminal row a Stop
-/// draws ([`crate::orchestration::Shell::stop_the_delegation_tree`]) has to
-/// land on the row the provider had already been moving, and a second spelling
-/// of the key would leave the developer reading two rows for one child.
+/// One definition rather than a `format!` at each use, because a caller that is
+/// **not** a row builder now needs it: the terminal row a Stop draws
+/// ([`crate::orchestration::Shell::stop_the_delegation_tree`], through
+/// [`child_row_key`]) has to land on the row the provider had already been
+/// moving, and a second spelling of the key would leave the developer reading
+/// two rows for one child.
 pub fn subagent_row_key(child_id: &str) -> String {
     format!("subagent:{child_id}")
 }

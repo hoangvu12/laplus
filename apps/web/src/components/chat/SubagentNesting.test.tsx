@@ -152,6 +152,36 @@ describe("a nested child inside its parent's work stream", () => {
   });
 
   /**
+   * The case the test above cannot see: a descendant that ended **without**
+   * saying anything. Its `outcome.text` is null, and the row used to fall
+   * through to `assignment` — so an interrupted worker showed the task it had
+   * been given as though that were what came back, which is the stale activity
+   * the spec's terminal rule exists to displace ("replace latest activity
+   * atomically with a bounded result, failure, interruption, or empty-result
+   * preview").
+   *
+   * Asserted for all three silent endings, and each asserts the *absence* of the
+   * assignment as well as the presence of the sentence — the bug was a fallback,
+   * so a test that only looked for the right words would have passed while the
+   * wrong ones sat beside them.
+   */
+  it.each([
+    ["interrupted", { kind: "interrupted" as const, text: null }, "Interrupted"],
+    ["failed with no reason", { kind: "failed" as const, text: null }, "Failed"],
+    [
+      "completed with nothing",
+      { kind: "empty" as const, text: null },
+      "Completed — no result returned",
+    ],
+  ])("says what came back when a descendant ends silently (%s)", (_name, outcome, expected) => {
+    open([launcher({ state: outcome.kind === "empty" ? "completed" : outcome.kind, outcome })]);
+
+    const row = screen.getByRole("button", { name: /Open subagent work stream/ });
+    expect(row.textContent).toContain(expected);
+    expect(row.textContent).not.toContain("Check the tests");
+  });
+
+  /**
    * The negative claim, and the one that keeps the surface read-only: a stream
    * with no descendant offers nothing to launch. Without this the test above
    * would pass against a panel that drew a launcher for every entry.

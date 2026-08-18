@@ -1,6 +1,6 @@
 # Inspectable subagent work streams
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## Problem Statement
 
@@ -418,3 +418,63 @@ The honest summary: the feature is implemented, reviewed and green at every seam
 a test can reach — including the one seam a test _did_ reach and find broken,
 now fixed and proven for all three providers — and nobody has yet opened the
 window.
+
+### The two axes, re-run
+
+The first feature-wide pass reported Standards and Spec findings it had not
+received — its two axis sub-agents were launched and never returned, and it
+retracted that framing itself. Both axes were then re-run properly and their
+reports read directly. What follows is that second pass.
+
+**Fixed from the Standards axis.** Two doc comments asserted things that were
+not true: `subagents::bounded` claimed the Claude driver's copy "was retired by
+the feature-wide review" while `turn::bounded` was still there, and
+`worklog::subagent_row_key` counted "a **third** caller" where there are two.
+Both now say what is so. The axis also read three `bounded`s as duplication;
+they are not — each driver's wrapper holds only its own wire's rule about
+_absence_ (whitespace-only output for Claude, a null-or-non-string `Value` for
+OpenCode) and both delegate the bound itself. That is now written down where it
+was previously left to be inferred.
+
+**Fixed from the Spec axis — a nested launcher could show a descendant's task as
+its answer.** `launcherWorkEntry` read `outcome?.text ?? assignment`, and
+`Outcome::interrupted(None)`, `failed(None)` and `completed(None)` all carry
+`text: null` — so a descendant that ended silently rendered the assignment it
+had been given before it began. That is precisely the stale activity story 42's
+terminal rule displaces, on ticket 06's new surface, bypassing the shared
+sentence (`OutcomeKind::without_a_report`) that exists to prevent it. Now routed
+through `OUTCOME_LABELS`, so a descendant reads the same in its parent's stream
+as in its own tab. Proven by three cases in `SubagentNesting.test.tsx`, each
+asserting the assignment's _absence_ as well as the sentence's presence, and
+mutation-checked against the original expression.
+
+### Known drift, recorded rather than changed
+
+These are real and none is a defect in behaviour. Each was left alone because
+the feature was one step from a publish and the change is wider than the finding.
+
+- **The contract inverts the glossary's two stream words.**
+  `OrchestrationSubagentStream` is the _head_ and `OrchestrationSubagentSnapshot`
+  is the stream, while `CONTEXT.md` defines a **subagent work stream** as the
+  conversation _and_ its work and **stream head** as that without it.
+  `subagents.rs`'s `Head::to_value` makes the inversion explicit. The rename
+  wants contracts, the Rust server and the client moving together.
+- **Story 38 — the row stops showing the assignment once the child speaks.**
+  Both row builders rank latest activity above the description, so "why does
+  this child exist" is legible only before its first activity. It falls between
+  ticket 01 (asserts assignment on the head) and ticket 02 (owns the row's
+  detail and deliberately ranks activity first); no ticket carries a criterion
+  for it.
+- **Story 39 — `pending` and `blocked` are unreachable on a compact row.**
+  `WorkLogToolLifecycleStatus` has no such members, and a child that blocks
+  emits its request row without re-emitting its own compact row, so the row
+  keeps its pre-block detail. The blocker is still actionable in the
+  conversation, which is what ticket 02's criterion 8 proves.
+- **Story 40 — a nested launcher has no latest-activity field.** `Launcher`
+  carries identity, assignment, state and outcome, so a running descendant shows
+  its assignment until it ends. Structural rather than a render bug.
+- **`EntryKind::Subagent` names what the glossary calls a nested launcher**, and
+  `child_entry_kind` is written once per driver. Both were deliberate — the
+  first so that all nine variants match their wire literal exactly, the second
+  with the repo's own precedent (`worklog::opencode_item_type` beside
+  `worklog::Kind::of`).
