@@ -4540,3 +4540,86 @@ async fn the_conversation_stays_working_while_its_child_does() {
     server.stop().await;
     peer.task.abort();
 }
+
+/// **Ticket 06.** Ending the session ends the tree it was running, too.
+///
+/// `thread.session.stop` is not the composer's stop button — it ends the agent
+/// *process* and keeps the conversation, and the real client reaches for it
+/// before deleting a thread and before moving a worktree (`useThreadActions.ts`,
+/// `BranchToolbarBranchSelector.tsx`). It is included in the delegation tree's
+/// Stop for the reason the tree is stopped at all: when the process behind a
+/// child is gone, nothing will ever report on that child again, so a stream left
+/// at `working` is a claim no later event can correct. Recording the
+/// interruption is what keeps the ending auditable and stops the conversation
+/// reporting itself as working for ever.
+///
+/// This is the one Stop path the criteria do not name, so it is asserted rather
+/// than assumed.
+#[tokio::test]
+async fn ending_the_session_ends_the_delegation_tree_with_it() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::spawning_a_subagent(release.clone()).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("stop-session-project", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("stop-session-project", "stop-session-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("stop-session-thread").await;
+    let mut command = start_turn("stop-session-thread", "stop-session-message", "count");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.values_until(&subscription, |item| {
+            item["event"]["payload"]["activity"]["payload"]["data"]["childId"] == "call_task_1"
+        }),
+    )
+    .await
+    .expect("the child is delegated");
+    let working = child_stream(&server, "stop-session-thread", "call_task_1").await;
+    assert_eq!(working["stream"]["state"], "working");
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            json!({
+                "type": "thread.session.stop",
+                "commandId": "test:stop-session",
+                "threadId": "stop-session-thread",
+                "createdAt": "2026-08-18T00:00:00.000Z",
+            }),
+        )
+        .await
+        .expect_success();
+
+    let stopped = child_stream(&server, "stop-session-thread", "call_task_1").await;
+    assert_eq!(stopped["stream"]["state"], "interrupted");
+    assert_eq!(stopped["stream"]["outcome"]["kind"], "interrupted");
+    assert_eq!(
+        stopped["entries"]
+            .as_array()
+            .expect("entries")
+            .last()
+            .expect("a terminal entry")["kind"],
+        "outcome"
+    );
+
+    release.notify_one();
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}

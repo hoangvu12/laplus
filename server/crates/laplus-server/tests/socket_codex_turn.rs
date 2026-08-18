@@ -2826,11 +2826,13 @@ async fn a_codex_child_tab_opens_mid_flight_and_follows_it_without_gaps() {
 /// exactly the question a stream that merely went quiet could not answer — and a
 /// child that takes no further ordinary work while Codex goes on narrating it.
 ///
-/// **The one thing that still reaches it is a revision of an entry it already
-/// holds**, and that is the recorded order rather than a leak: the `wait` that
-/// was waiting on this child completes after it ends, and moves the row it left
-/// rather than appending one behind the conclusion. So the assertion is on the
-/// entry *identities*, which is what "no new work after an ending" means.
+/// **Two things still reach it, and neither is work.** The `wait` that was
+/// waiting on this child completes after it ends — the recorded order, not a
+/// leak — and moves the row it already left rather than appending one behind the
+/// conclusion. And a descendant whose parentage Codex only proves after this
+/// child reported takes its launcher here, because that is the one place a
+/// descendant is shown and the root transcript has already declined to show it.
+/// Both keep the conclusion last, which is the property asserted below.
 #[tokio::test]
 async fn stopping_a_codex_parent_stops_the_child_it_was_running() {
     let codex = ScriptedCodex::subagent_work_conversation_paused_mid_child();
@@ -2902,17 +2904,18 @@ async fn stopping_a_codex_parent_stops_the_child_it_was_running() {
     codex.release_turn();
     client.events_through_the_turn(&subscription).await;
     let after = child_stream(&server, "codex-thread", "child-alpha-1111").await;
-    let identities = |snapshot: &Value| {
+    let work_in = |snapshot: &Value| {
         snapshot["entries"]
             .as_array()
             .expect("entries")
             .iter()
+            .filter(|entry| entry["kind"] != "subagent")
             .map(|entry| entry["id"].clone())
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        identities(&after),
-        identities(&stopped),
+        work_in(&after),
+        work_in(&stopped),
         "an interrupted child took new work after its ending: {after:#?}"
     );
     assert_eq!(after["stream"]["state"], "interrupted");
@@ -2925,6 +2928,153 @@ async fn stopping_a_codex_parent_stops_the_child_it_was_running() {
             .expect("a terminal entry")["kind"],
         "outcome",
         "something landed behind the child's conclusion: {after:#?}"
+    );
+
+    // The provider goes on to name agents laplus had never heard of — `wait`'s
+    // `agentsStates` reports the whole fleet, two of them for the first time —
+    // and the conversation still does not go back to work. That is the shape
+    // the "a stop is undone by what the provider says next" worry had.
+    let session = server
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await["thread"]["session"]
+        .clone();
+    assert_ne!(
+        session["status"], "running",
+        "narration after a stop put the conversation back to work: {session:#?}"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
+/// **Ticket 06.** A Stop reaches the generation the root transcript never showed.
+///
+/// Codex is the only provider here that proves a child-to-child relationship, so
+/// it is the only one that can be asked this. `/root/reviewer/helper` has no
+/// launcher in the conversation at all — its launcher lives inside the
+/// reviewer's stream — and the whole risk of placing it there is that a
+/// descendant nothing in the transcript points at becomes a descendant nothing
+/// stops either. Both generations are alive when the developer stops, and both
+/// have to record an interruption of their own.
+///
+/// The pause is taken at the moment the reviewer announces its own child, which
+/// is the only point in the capture where that is true.
+#[tokio::test]
+async fn stopping_a_codex_parent_stops_the_generation_below_it_too() {
+    let codex = ScriptedCodex::subagent_work_conversation_paused_after_nesting();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("project-1", workspace.path()),
+        )
+        .await
+        .expect_success();
+    client
+        .call("orchestration.dispatchCommand", codex_thread("full-access"))
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            follow_up("codex-thread", "message-1", "Delegate both jobs."),
+        )
+        .await
+        .expect_success();
+
+    // Wait until the descendant exists at all — its stream answering rather
+    // than being refused is the only signal that the nesting has been folded.
+    let nested = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let mut inspector = server.connect().await;
+            let subscription = inspector
+                .subscribe(
+                    "orchestration.subscribeSubagent",
+                    json!({"threadId": "codex-thread", "childId": "child-gamma-3333"}),
+                )
+                .await;
+            let frame = inspector.next_frame_for(&subscription).await;
+            if frame["_tag"] != "Chunk" {
+                inspector.close().await;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let snapshot = frame["values"]
+                .as_array()
+                .expect("a chunk's values")
+                .iter()
+                .find(|item| item["kind"] == "snapshot")
+                .expect("a child stream opens with itself")["snapshot"]
+                .clone();
+            inspector.close().await;
+            return snapshot;
+        }
+    })
+    .await
+    .expect("the reviewer's own child reaches the server while the turn is paused");
+    assert_eq!(nested["stream"]["parentChildId"], "child-alpha-1111");
+    assert_eq!(
+        nested["stream"]["state"], "working",
+        "the descendant had already finished, so nothing here is about stopping one: {nested:#?}"
+    );
+    assert_eq!(nested["stream"]["outcome"], Value::Null);
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("codex-thread", None),
+        )
+        .await
+        .expect_success();
+
+    // Both generations, each with a terminal state and a terminal entry of its
+    // own.
+    for child in ["child-alpha-1111", "child-gamma-3333"] {
+        let stopped = child_stream(&server, "codex-thread", child).await;
+        assert_eq!(
+            stopped["stream"]["state"], "interrupted",
+            "{child} was left running by a stop: {stopped:#?}"
+        );
+        assert_eq!(stopped["stream"]["outcome"]["kind"], "interrupted");
+        let terminal = stopped["entries"]
+            .as_array()
+            .expect("entries")
+            .last()
+            .expect("a terminal entry")
+            .clone();
+        assert_eq!(terminal["kind"], "outcome", "{child}: {stopped:#?}");
+        assert_eq!(terminal["payload"]["kind"], "interrupted");
+    }
+
+    codex.release_turn();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    // And the descendant had no launcher in the conversation at any point,
+    // which is what made the question worth asking: nothing in the transcript
+    // pointed at the agent that was just stopped.
+    assert!(
+        !child_rows(&events)
+            .iter()
+            .any(|row| row["payload"]["data"]["childId"] == "child-gamma-3333"),
+        "the descendant was in the root transcript after all"
+    );
+
+    let session = server
+        .connect()
+        .await
+        .into_thread_snapshot("codex-thread")
+        .await["thread"]["session"]
+        .clone();
+    assert_ne!(
+        session["status"], "running",
+        "a stopped tree still reports the conversation as working: {session:#?}"
     );
 
     client.close().await;

@@ -522,6 +522,13 @@ call is the child's whole work and nothing the row can say in its one line.
 `idle`, `starting`, `running`, `ready`, `interrupted`, `stopped`, `error`.
 `crate::settling::SessionStatus`.
 
+**`running` is "there is work here", not "there is a turn here".** It usually
+names one, on `activeTurnId` — but a conversation whose background subagent
+outlived the turn that launched it reports `running` with no turn at all, which
+is the whole of how the sidebar keeps calling an active **delegation tree**
+working. The client draws its badge from this field alone (`Sidebar.logic.ts`,
+`resolveThreadStatusPill`), so there is nowhere else that claim could be made.
+
 **Turn state** — how the most recent turn went. The contract's four: `running`,
 `completed`, `interrupted`, `error`. `crate::settling::TurnState`.
 
@@ -566,6 +573,12 @@ command is how a picker moves one between turns.
 the end of a turn, not the last assistant message, which is what makes a turn's
 duration cover the whole turn. Upstream's word (`decider.settled.test.ts`,
 `threadSettled.test.ts`), kept.
+
+**The converse is not true: entering `running` is not the start of a turn.** A
+conversation still working on its **delegation tree** re-enters it naming no
+turn, which settles nothing and starts nothing — the client's reducer folds it
+against a turn it has already settled and leaves that turn alone. So a reader
+counting turns must count the sessions that _name_ one, not the transitions.
 
 Note the two are not opposites of each other. `interrupted` and `stopped` are
 different _statuses_ — the developer asked, versus the process went away — and
@@ -735,11 +748,11 @@ triggers, and a reset would move a conversation the developer can no longer see.
 The inbox reset's three triggers, two of them narrow on purpose — the snooze
 reset takes only the first:
 
-| When                                                  | Why it is that narrow                                                                                                                                                                                   |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| a turn is requested                                   | not narrow at all: the developer typed something and pressed enter                                                                                                                                      |
-| the session becomes `starting` or `running`           | `ready`, `stopped` and `error` are a status arriving _after_ the fact and must not fight an explicit settle. `SessionStatus::is_working` is the same reading `Busy` refuses a settle with, deliberately |
-| an approval or a question is appended to the work log | `crate::worklog::blocks_on_the_developer` — any work-log row would wake a settled conversation on every tool call of every turn                                                                         |
+| When                                                  | Why it is that narrow                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| a turn is requested                                   | not narrow at all: the developer typed something and pressed enter                                                                                                                                                                                                                                                                                                                                                                          |
+| the session becomes `starting` or `running`           | `ready`, `stopped` and `error` are a status arriving _after_ the fact and must not fight an explicit settle. `SessionStatus::is_working` is the same reading `Busy` refuses a settle with, deliberately. A **delegation tree** that outlives its turn re-enters `running` through this same row, so a conversation settled while quiet returns to the inbox when its own child is still working — which is the rule, not an exception to it |
+| an approval or a question is appended to the work log | `crate::worklog::blocks_on_the_developer` — any work-log row would wake a settled conversation on every tool call of every turn                                                                                                                                                                                                                                                                                                             |
 
 Every trigger is a path this server already owned, so a reset is a guarded
 emission _beside_ an event that already fires rather than a new mechanism. The

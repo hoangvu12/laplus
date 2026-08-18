@@ -48,7 +48,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { FileDiffIcon, Loader2 } from "lucide-react";
 
 import { formatWorkspaceRelativePath } from "../../filePathDisplay";
-import type { WorkLogEntry } from "../../session-logic";
+import type { WorkLogEntry, WorkLogToolLifecycleStatus } from "../../session-logic";
 import { useEnvironmentQuery } from "../../state/query";
 import { subagentEnvironment } from "../../state/subagents";
 import { openSubagentSurface } from "../../rightPanelStore";
@@ -210,19 +210,25 @@ function blockerWorkEntry(
 }
 
 /**
- * How a nested child's state reads on its launcher.
+ * How a nested child's state reads on its launcher, and which work-entry
+ * lifecycle the shared row draws it in.
  *
- * Keyed by the contract's own closed literal, like `OUTCOME_LABELS` and
- * `RESOLUTION_LABELS`: a state added to `OrchestrationSubagentState` is a type
- * error here rather than a descendant whose row silently loses its status.
+ * One table rather than a label table beside a cascade of ternaries, because
+ * both answers are the same question about the same closed literal — and keyed
+ * by that literal, like `OUTCOME_LABELS` and `RESOLUTION_LABELS`, so a state
+ * added to `OrchestrationSubagentState` is a type error here rather than a
+ * descendant whose row silently loses its status.
  */
-const LAUNCHER_STATES: Record<OrchestrationSubagentState, string> = {
-  pending: "Pending",
-  working: "Working",
-  blocked: "Blocked",
-  completed: "Completed",
-  interrupted: "Interrupted",
-  failed: "Failed",
+const LAUNCHER_STATES: Record<
+  OrchestrationSubagentState,
+  { readonly label: string; readonly status: WorkLogToolLifecycleStatus }
+> = {
+  pending: { label: "Pending", status: "inProgress" },
+  working: { label: "Working", status: "inProgress" },
+  blocked: { label: "Blocked", status: "inProgress" },
+  completed: { label: "Completed", status: "completed" },
+  interrupted: { label: "Interrupted", status: "stopped" },
+  failed: { label: "Failed", status: "failed" },
 };
 
 /**
@@ -241,6 +247,7 @@ function launcherWorkEntry(
 ): WorkLogEntry {
   const launcher: OrchestrationSubagentLauncher = entry.payload;
   const label = `Subagent ${launcher.name ?? launcher.childId}`;
+  const reached = LAUNCHER_STATES[launcher.state];
   return {
     id: entry.id,
     createdAt: entry.createdAt,
@@ -248,16 +255,9 @@ function launcherWorkEntry(
     toolTitle: label,
     tone: launcher.outcome?.kind === "failed" ? "error" : "tool",
     itemType: "collab_agent_tool_call",
-    toolLifecycleStatus:
-      launcher.state === "completed"
-        ? "completed"
-        : launcher.state === "failed"
-          ? "failed"
-          : launcher.state === "interrupted"
-            ? "stopped"
-            : "inProgress",
+    toolLifecycleStatus: reached.status,
     subagentChildId: launcher.childId,
-    detail: launcher.outcome?.text ?? launcher.assignment ?? LAUNCHER_STATES[launcher.state],
+    detail: launcher.outcome?.text ?? launcher.assignment ?? reached.label,
   };
 }
 

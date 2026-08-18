@@ -658,8 +658,17 @@ fn decide(
                     turn_id.clone(),
                 )));
             children.operated(&call, true, &mut decided);
+            // **Every agent this call names is registered before any row is
+            // drawn**, and the two passes are not a style choice.
+            // [`Children::parent_of`] resolves a path against the paths it
+            // already holds, so a `wait` that listed a descendant ahead of its
+            // spawner would draw the descendant a root row — published, and
+            // never retractable — purely because of the order Codex happened to
+            // report its fleet in.
             for agent in &call.agents {
                 children.reported(agent, &mut decided);
+            }
+            for agent in &call.agents {
                 // A descendant of another child is launched from inside that
                 // child's stream, so it gets no row here — see
                 // [`Children::nested`]. The `wait` that reports on the whole

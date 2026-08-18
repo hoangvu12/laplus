@@ -472,8 +472,7 @@ impl SocketClient {
     /// one of the things discarded — so a reader that only watched for the event
     /// would wait for one that had already been superseded.
     pub async fn events_through_the_turn(&mut self, subscription: &str) -> Vec<Value> {
-        let watching = settle_watch(true);
-        self.values_until(subscription, move |item| watching(item)).await
+        self.values_until(subscription, settle_watch()).await
     }
 
     /// The same, for a reader that is **not** already inside a turn.
@@ -483,8 +482,8 @@ impl SocketClient {
     /// reader standing between turns would otherwise take the first of them for
     /// the settle it was waiting for.
     pub async fn events_through_the_next_turn(&mut self, subscription: &str) -> Vec<Value> {
-        let watching = settle_watch(false);
-        self.values_until(subscription, move |item| watching(item)).await
+        self.values_until(subscription, settle_watch_between_turns())
+            .await
     }
 
     /// Read the turn out up to and including the moment its working tree has
@@ -680,17 +679,28 @@ impl SocketClient {
 /// events names a turn, so a reader that took any quiet status for a settle
 /// would stop a test one turn short of what it came to watch.
 ///
-/// `on_a_turn_already` is what a caller knows and this cannot see: a reader that
-/// dispatched a turn and only then subscribed has already missed the session
-/// that named it, while a reader standing between turns has not.
-///
 /// A *snapshot* saying the session has gone quiet ends the read too, and that is
 /// not belt-and-braces: a turn that publishes hundreds of events outruns the
 /// subscription's backlog, and the pump answers that by discarding what it could
 /// not deliver and describing the world again. The terminal event is then one of
 /// the things discarded — so a reader that only watched for the event would wait
 /// for one that had already been superseded.
-pub fn settle_watch(on_a_turn_already: bool) -> impl Fn(&Value) -> bool {
+///
+/// Whether a turn was in flight when the read began is the one thing this cannot
+/// see and the caller always knows, so it is two functions rather than a flag: a
+/// reader that dispatched a turn and only then subscribed has already missed the
+/// session that named it, while a reader standing between turns has not.
+pub fn settle_watch() -> impl Fn(&Value) -> bool {
+    watching(true)
+}
+
+/// [`settle_watch`] for a reader standing between turns, which must let the
+/// delegation tree's own sessions past.
+pub fn settle_watch_between_turns() -> impl Fn(&Value) -> bool {
+    watching(false)
+}
+
+fn watching(on_a_turn_already: bool) -> impl Fn(&Value) -> bool {
     let on_a_turn = std::cell::Cell::new(on_a_turn_already);
     move |item: &Value| {
         let settled = |status: Option<&str>| {
