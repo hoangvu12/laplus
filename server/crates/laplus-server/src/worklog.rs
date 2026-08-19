@@ -1243,6 +1243,7 @@ mod tests {
             subagent_type: Some("general-purpose".to_string()),
             summary: summary.map(str::to_string),
             said: None,
+            task_type: None,
         }
     }
 
