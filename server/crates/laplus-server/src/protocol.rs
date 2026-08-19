@@ -474,6 +474,17 @@ pub struct TaskEvent {
     pub task_id: String,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// What kind of task this is — `local_agent` for a delegated child,
+    /// `local_bash` for a background shell, and the rest of the family the CLI
+    /// runs through the same events. See [`task_is_agent`], which is the only
+    /// reader: not every `task_*` event is a subagent, and this is the field
+    /// that says which.
+    ///
+    /// Carried by `task_started` **only**. The `task_updated` and
+    /// `task_notification` that end the same task omit it, which is why the
+    /// answer is remembered per `task_id` rather than re-read per event.
+    #[serde(default)]
+    pub task_type: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -514,8 +525,33 @@ impl TaskEvent {
             subagent_type: self.subagent_type.clone(),
             summary: self.summary.clone(),
             said: None,
+            task_type: self.task_type.clone(),
         }
     }
+}
+
+/// Whether a `task_*` event is about a **subagent**, or about one of the other
+/// things the CLI runs through the same three events.
+///
+/// A denylist rather than an allowlist, and deliberately: the agent-flavoured
+/// names drift — `subagent`, `local_agent`, `local_workflow` — so a list of the
+/// ones to *accept* silently drops real children the day the CLI adds another.
+/// A list of the ones to reject fails the other way, which for this is the safe
+/// way: an unrecognised task becomes a row that should not have been there
+/// rather than a child that vanished.
+///
+/// `None` is an agent for the same reason. A `task_notification` arriving with
+/// no start seen — a resumed session, a capture joined late — is more likely a
+/// child than a shell, and [`SessionState::subagent_moved`] has already
+/// remembered the answer for any task whose start this build did see.
+fn task_is_agent(task_type: Option<&str>) -> bool {
+    !matches!(
+        task_type,
+        // Watch loops: a `Monitor`, and a shell that outlived its turn.
+        Some("monitor" | "monitor_mcp" | "local_bash" | "shell")
+            // Plan-mode bookkeeping, which is not work at all.
+            | Some("plan" | "dream")
+    )
 }
 
 /// The row status a CLI task status becomes, or `None` when it is not terminal.
@@ -550,6 +586,15 @@ struct Subagent {
     /// Separate from `finished` because the two arrive on different events and in
     /// that order — see [`SessionState::subagent_moved`].
     reported: bool,
+    /// Whether this task is a subagent at all, remembered from the one event
+    /// that said so.
+    ///
+    /// `None` until a `task_type` has been seen. Only `task_started` carries
+    /// one, and a background shell's ending looks exactly like a child's, so
+    /// without this the two events that finish a `local_bash` would each be
+    /// read as a child ending — the row would be suppressed on the way in and
+    /// resurrected on the way out.
+    agent: Option<bool>,
 }
 
 /// What a subagent's row is told to say.
@@ -567,6 +612,10 @@ pub struct SubagentTask {
     pub subagent_type: Option<String>,
     /// The subagent's final report, on the event that finishes it.
     pub summary: Option<String>,
+    /// From [`TaskEvent::task_type`], and `None` on every event that did not
+    /// carry one — including the forwarded messages, which are a child talking
+    /// and therefore a child by construction.
+    pub task_type: Option<String>,
     /// The last thing the subagent said, under `--forward-subagent-text`.
     ///
     /// Its own prose rather than a description of it: `description` is the CLI
@@ -1557,6 +1606,22 @@ impl SessionState {
     /// `assignment` is what the child was delegated, and only `task_started`
     /// knows it — see [`Subagent::assignment`].
     fn subagent_moved(&mut self, task: SubagentTask, assignment: Option<String>) -> Folded {
+        let record = self.subagents.entry(task.task_id.clone()).or_default();
+        if let Some(task_type) = &task.task_type {
+            record.agent = Some(task_is_agent(Some(task_type)));
+        }
+        // Not a child: a background shell, a watch loop, or plan-mode
+        // bookkeeping. It gets no row and no work stream, and nothing is lost
+        // by that — the `Bash` call that started it is already in the work log
+        // as itself, with its own result. A second row calling it a subagent
+        // was the same command twice, once under a name it does not have.
+        //
+        // The call is deliberately never joined to a task id below: were a
+        // forwarded message ever to name it, attributing that message to a
+        // shell would be worse than dropping it.
+        if record.agent == Some(false) {
+            return Folded::Nothing;
+        }
         if let Some(call) = &task.tool_use_id {
             self.subagent_calls
                 .insert(call.clone(), task.task_id.clone());
@@ -1704,6 +1769,9 @@ impl SessionState {
                     subagent_type: name,
                     summary: None,
                     said: Some(said),
+                    // A child talking is a child, whatever the CLI called the
+                    // task; the classification is already remembered anyway.
+                    task_type: None,
                 }),
                 false => None,
             },
@@ -1812,6 +1880,9 @@ impl SessionState {
                             subagent_type: None,
                             summary: None,
                             said: None,
+                            // A `task_updated` names no type. What this task is
+                            // was settled by its `task_started`.
+                            task_type: None,
                         },
                         None,
                     ),
@@ -2239,6 +2310,61 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Recorded in `fixtures/claude-cli/24-background-shell-task.ndjson`: a
+    /// `Bash` call with `run_in_background` runs through the very same three
+    /// `task_*` events a subagent does, and is not one.
+    ///
+    /// The golden for that capture cannot pin this. `SessionState::subagents`
+    /// is `#[serde(skip)]`, so a build that drew the row again would fold to a
+    /// byte-identical state file — the row only exists in the [`Folded`]
+    /// outcomes, which is where this looks.
+    ///
+    /// The ending is the half worth testing. Only `task_started` names a
+    /// `task_type`, so a build that classified per-event rather than
+    /// remembering per task would suppress the row on the way in and publish
+    /// two on the way out, which is the bug wearing a hat.
+    #[test]
+    fn a_background_shell_is_not_a_subagent() {
+        let shell = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"buqjylq01","tool_use_id":"toolu_1","description":"Sleep for 25 seconds in background","task_type":"local_bash"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"buqjylq01","patch":{"status":"completed"}}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"buqjylq01","tool_use_id":"toolu_1","status":"completed","summary":"Background command \"Sleep for 25 seconds in background\" completed (exit code 0)"}"#,
+        ]);
+        assert!(
+            rows(&shell).is_empty(),
+            "a background shell drew a subagent row: {:?}",
+            rows(&shell)
+        );
+
+        // The same three events for a real child still draw one, so this is a
+        // classification and not a way of losing subagents.
+        let child = outcomes(&[
+            r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_2","description":"Count to three","subagent_type":"general-purpose","task_type":"local_agent"}"#,
+            r#"{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}"#,
+        ]);
+        assert_eq!(rows(&child).len(), 2, "a real subagent lost its row");
+    }
+
+    /// The denylist, as a table — including the case that decides its shape.
+    ///
+    /// A type this build has never heard of is a subagent. An allowlist would
+    /// answer the other way and quietly drop real children the next time the
+    /// CLI renames one, which is the failure this is built to avoid.
+    #[test]
+    fn an_unrecognised_task_type_is_a_subagent() {
+        assert!(task_is_agent(Some("local_agent")));
+        assert!(task_is_agent(Some("subagent")));
+        assert!(task_is_agent(Some("local_workflow")));
+        assert!(task_is_agent(None), "a task with no type is a subagent");
+
+        assert!(!task_is_agent(Some("local_bash")));
+        assert!(!task_is_agent(Some("shell")));
+        assert!(!task_is_agent(Some("monitor")));
+        assert!(!task_is_agent(Some("monitor_mcp")));
+        assert!(!task_is_agent(Some("plan")));
+        assert!(!task_is_agent(Some("dream")));
     }
 
     /// Everything these lines said one child *did*, in order.

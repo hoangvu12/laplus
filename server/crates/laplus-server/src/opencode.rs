@@ -1546,6 +1546,9 @@ impl OpenCode {
                 subagent_type: kind,
                 summary: reported.outcome.and_then(|outcome| outcome.text),
                 said,
+                // OpenCode announces children and nothing else through this
+                // type, so there is no non-agent task to tell apart.
+                task_type: None,
             },
             driving.turn.as_ref().map(|turn| turn.turn_id.clone()),
             Some(&call),
@@ -1977,6 +1980,7 @@ impl OpenCode {
             subagent_type: row.kind.clone(),
             summary: None,
             said: row.latest.clone(),
+            task_type: None,
         };
         decided
             .changes
