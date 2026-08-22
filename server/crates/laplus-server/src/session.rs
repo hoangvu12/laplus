@@ -996,8 +996,14 @@ async fn drive<D: Driver>(
             }
             Next::ReconcileInterrupt => {
                 interrupt_reconciliation = None;
+                let stopped_turn = driving.turn.as_ref().and_then(|turn| {
+                    turn.stopped.as_ref().map(|request_id| (turn.turn_id.clone(), request_id.clone()))
+                });
                 match driver.reconcile_interrupt(&mut driving).await {
                 InterruptReconciliation::Settled(decided) => {
+                    if let Some((turn_id, request_id)) = stopped_turn {
+                        stopped(&threads, &start, &turn_id, &request_id);
+                    }
                     spend(&threads, &start, decided);
                     if let Some(finished) = driving.finished.take() { checkpoint(&threads, &start, &finished).await; }
                 }
@@ -1010,6 +1016,9 @@ async fn drive<D: Driver>(
                     )));
                 }
                 InterruptReconciliation::EscalateOwned(decided) => {
+                    if let Some((turn_id, request_id)) = stopped_turn {
+                        stopped(&threads, &start, &turn_id, &request_id);
+                    }
                     spend(&threads, &start, decided);
                     if let Some(finished) = driving.finished.take() { checkpoint(&threads, &start, &finished).await; }
                     reaped_idle = true;
@@ -1164,6 +1173,9 @@ async fn drive<D: Driver>(
     // which is the same reading `interrupted` and `stopped` already share
     // (`CONTEXT.md`, *Settling*): from the turn's point of view it did not finish,
     // and nothing went wrong.
+    if reaped_idle {
+        threads.wind_down(&start.thread_id, epoch);
+    }
     let Reaped { refused, death } = driver.stop(&mut driving, asked_to_stop).await;
     if let Some(why) = &send_failure {
         threads.apply(
@@ -1664,7 +1676,11 @@ async fn answer<D: Driver>(
     // After the resolution, so the work log reads in the order it happened: the
     // developer answered the question, and answering it that way stopped the turn.
     if let Some(turn_id) = cancelled {
-        stopped(threads, start, &turn_id, &asked.request_id);
+        if D::INTERRUPT_RECONCILIATION_AFTER.is_some() {
+            stopping(threads, start, &turn_id, &asked.request_id);
+        } else {
+            stopped(threads, start, &turn_id, &asked.request_id);
+        }
     }
 }
 
@@ -1842,7 +1858,11 @@ async fn interrupt<D: Driver>(
         return;
     };
     active.stop(&request_id);
-    stopped(threads, start, &turn_id, &request_id);
+    if D::INTERRUPT_RECONCILIATION_AFTER.is_some() {
+        stopping(threads, start, &turn_id, &request_id);
+    } else {
+        stopped(threads, start, &turn_id, &request_id);
+    }
 }
 
 /// Ask the agent how full its context window is.
@@ -2022,30 +2042,9 @@ impl Pushed {
     }
 }
 
-/// Say in the conversation that the developer stopped this turn.
-///
-/// Two changes rather than one, because they are read by different parts of the
-/// client and neither can be derived from the other:
-///
-/// - **The event settles the turn.** `thread.turn-interrupt-requested` is the
-///   contract's own, and the client's reducer moves the latest turn to
-///   `interrupted` on it *immediately* — so the turn stops being reported as
-///   running when the developer's click lands rather than when the agent gets
-///   round to admitting it. Without it the composer would show work in progress
-///   for as long as the agent took to wind down.
-/// - **The row is the record.** The work log is what a developer reads later,
-///   and "this turn stopped because I stopped it" is not derivable from the
-///   partial reply above it.
-///
-/// Shared by the two things that stop a turn — the stop button, and cancelling a
-/// permission — because they are the same event to a client either way.
-fn stopped(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
-    threads.apply(
-        &start.thread_id,
-        Change::InterruptRequested {
-            turn_id: turn_id.to_string(),
-        },
-    );
+/// OpenCode's visible request receipt while message-history verification keeps
+/// the turn running. The final interrupt event and record come from [`stopped`].
+fn stopping(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
     threads.apply(
         &start.thread_id,
         Change::Activity(Activity::info(
@@ -2054,6 +2053,17 @@ fn stopped(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
             json!({"requestId": request_id, "turnId": turn_id, "detail": "The stop request landed; waiting for the provider to go quiet."}),
             Some(turn_id.to_string()),
         )),
+    );
+}
+
+/// Settle the turn and durably record that the developer stopped it. The event
+/// drives client state; the work-log row preserves the human-readable reason.
+fn stopped(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
+    threads.apply(
+        &start.thread_id,
+        Change::InterruptRequested {
+            turn_id: turn_id.to_string(),
+        },
     );
     threads.apply(
         &start.thread_id,

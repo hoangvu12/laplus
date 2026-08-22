@@ -1607,6 +1607,32 @@ impl Threads {
         }
     }
 
+    /// Free a session's slot while its task is still reaping, retaining the
+    /// handle so server shutdown continues to await it. This is the transition
+    /// used by an owned OpenCode escalation: the killed server is already no
+    /// longer able to read prompts, while the next prompt must be allowed to
+    /// attach the replacement session immediately.
+    pub(crate) fn wind_down(&self, thread_id: &str, epoch: u64) -> bool {
+        let Some(entry) = self.find(thread_id) else {
+            return false;
+        };
+        let old = {
+            let mut live = lock(&entry.live);
+            match live.as_ref().map(|running| running.epoch) {
+                Some(held) if held == epoch => live.take(),
+                _ => None,
+            }
+        };
+        let Some(old) = old else {
+            return false;
+        };
+        self.inner.live_agents.fetch_sub(1, Ordering::Relaxed);
+        let mut winding_down = lock(&self.inner.winding_down);
+        winding_down.retain(|driver| !driver.is_finished());
+        winding_down.push(old.task);
+        true
+    }
+
     /// End every session and wait for the agents to be reaped.
     ///
     /// What the server calls on its way down. Dropping the prompt channel is the

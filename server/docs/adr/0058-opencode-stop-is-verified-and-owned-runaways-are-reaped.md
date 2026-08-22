@@ -5,9 +5,10 @@ Status: Accepted
 
 An accepted OpenCode abort request begins a stopping phase; it does not prove
 the turn stopped. Laplus samples the session's assistant messages and treats
-two unchanged samples as quiescence. Provider status is only a hint and cannot
-settle an interrupted turn. A failed sample leaves the conversation loop alive
-and visibly reports that verification is continuing.
+one unbroken quiet interval as quiescence; equal point samples alone prove
+nothing, and any changed snapshot restarts the interval. Provider status is
+only a hint and cannot settle an interrupted turn. A failed sample leaves the
+conversation loop alive and visibly reports that verification is continuing.
 
 If output keeps changing through the bounded verification window, Laplus
 settles the interrupted turn and reaps a server process it launched, allowing

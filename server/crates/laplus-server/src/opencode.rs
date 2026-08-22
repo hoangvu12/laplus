@@ -831,14 +831,68 @@ struct EmittedPart {
     message_id: Option<String>,
 }
 
-#[derive(Default)]
 struct StopVerification {
     signature: Option<String>,
+    quiet_since: std::time::Duration,
+    started_at: std::time::Instant,
     changing_samples: u8,
     external_failure_reported: bool,
+    reconciliation_error_reported: bool,
+    last_message_count: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopObservation {
+    Pending,
+    Changed,
+    Quiet,
+}
+
+const STOP_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
+const STOP_ESCALATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+
+impl Default for StopVerification {
+    fn default() -> Self {
+        Self {
+            signature: None,
+            quiet_since: std::time::Duration::ZERO,
+            started_at: std::time::Instant::now(),
+            changing_samples: 0,
+            external_failure_reported: false,
+            reconciliation_error_reported: false,
+            last_message_count: None,
+        }
+    }
+}
+
+impl StopVerification {
+    /// Observe one authoritative message-history snapshot. `elapsed` is supplied
+    /// by the caller so the policy is testable without sleeping: every change
+    /// starts a fresh quiet window, and equal point samples alone prove nothing.
+    fn observe(&mut self, signature: &str, elapsed: std::time::Duration) -> StopObservation {
+        if self.signature.as_deref() != Some(signature) {
+            let changed = self.signature.is_some();
+            if changed {
+                self.changing_samples = self.changing_samples.saturating_add(1);
+            }
+            self.signature = Some(signature.to_string());
+            self.quiet_since = elapsed;
+            return if changed { StopObservation::Changed } else { StopObservation::Pending };
+        }
+        if elapsed.saturating_sub(self.quiet_since) >= STOP_QUIET_WINDOW {
+            StopObservation::Quiet
+        } else {
+            StopObservation::Pending
+        }
+    }
+
+    fn should_escalate(&self, elapsed: std::time::Duration) -> bool {
+        self.changing_samples > 0 && elapsed >= STOP_ESCALATION_WINDOW
+    }
 }
 
 pub(crate) struct OpenCode {
+    instance_id: String,
     client: OpenCodeClient,
     events: EventStream,
     session_id: String,
@@ -2374,6 +2428,7 @@ impl crate::session::Driver for OpenCode {
         };
         Ok(crate::session::Opened {
             driver: Self {
+                instance_id: start.provider.instance_id.clone(),
                 client,
                 events,
                 session_id: session.id.clone(),
@@ -2738,7 +2793,14 @@ impl crate::session::Driver for OpenCode {
     async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
         self.stop_verification = StopVerification::default();
         match tokio::time::timeout(ABORT_TIMEOUT, self.client.abort(&self.session_id)).await {
-            Ok(outcome) => outcome.map(|_| ()).map_err(std::io::Error::other),
+            Ok(Ok(_)) => {
+                eprintln!(
+                    "laplus: OpenCode stop verification (instance {}, session {}, phase abort sent, last message count unknown).",
+                    self.instance_id, self.session_id
+                );
+                Ok(())
+            }
+            Ok(Err(error)) => Err(std::io::Error::other(error)),
             Err(_) => Err(std::io::Error::other(
                 "OpenCode did not answer the request to stop the turn.",
             )),
@@ -2748,32 +2810,42 @@ impl crate::session::Driver for OpenCode {
         use crate::session::InterruptReconciliation;
         let messages = match self.client.messages(&self.session_id).await {
             Ok(messages) => messages,
-            Err(error) => return InterruptReconciliation::Failed(error.to_string()),
+            Err(error) if !self.stop_verification.reconciliation_error_reported => {
+                self.stop_verification.reconciliation_error_reported = true;
+                return InterruptReconciliation::Failed(format!(
+                    "OpenCode stop verification failed (instance {}, session {}, phase verifying, last message count {}): {error}",
+                    self.instance_id,
+                    self.session_id,
+                    self.stop_verification.last_message_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+                ));
+            }
+            Err(_) => return InterruptReconciliation::Pending,
         };
         let signature = assistant_output_signature(&messages);
         let count = messages.as_array().map_or(0, Vec::len);
-        let unchanged = self.stop_verification.signature.as_deref() == Some(&signature);
+        self.stop_verification.last_message_count = Some(count);
+        let verification_elapsed = self.stop_verification.started_at.elapsed();
+        let observation = self.stop_verification.observe(&signature, verification_elapsed);
         eprintln!(
             "laplus: OpenCode stop verification (instance {}, session {}, phase verifying, last message count {}).",
-            self.owned.as_ref().map_or("external", |_| "owned"), self.session_id, count
+            self.instance_id, self.session_id, count
         );
-        if !unchanged {
-            if self.stop_verification.signature.is_some() {
-                self.stop_verification.changing_samples = self.stop_verification.changing_samples.saturating_add(1);
-            }
-            self.stop_verification.signature = Some(signature);
-            if self.stop_verification.changing_samples < 4 {
+        if observation != StopObservation::Quiet {
+            if !self.stop_verification.should_escalate(verification_elapsed) {
                 return InterruptReconciliation::Pending;
             }
             if self.owned.is_some() {
                 let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
-                eprintln!("laplus: OpenCode stop verification (instance owned, session {}, phase escalated, last message count {}).", self.session_id, count);
+                eprintln!("laplus: OpenCode stop verification (instance {}, session {}, phase escalated, last message count {}).", self.instance_id, self.session_id, count);
                 return InterruptReconciliation::EscalateOwned(settled);
             }
             if !self.stop_verification.external_failure_reported {
                 self.stop_verification.external_failure_reported = true;
                 return InterruptReconciliation::Failed(
-                    "OpenCode ignored the stop request and is still producing output; the external server is operator-owned and will remain under supervision".to_string()
+                    format!(
+                        "OpenCode ignored the stop request and is still producing output (instance {}, session {}, phase escalated, last message count {}); the external server is operator-owned and will remain under supervision",
+                        self.instance_id, self.session_id, count
+                    )
                 );
             }
             return InterruptReconciliation::Pending;
@@ -2803,7 +2875,7 @@ impl crate::session::Driver for OpenCode {
         }
         self.ignore_idle_until_busy = true;
         let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
-        eprintln!("laplus: OpenCode stop verification (instance {}, session {}, phase settled, last message count {}).", self.owned.as_ref().map_or("external", |_| "owned"), self.session_id, count);
+        eprintln!("laplus: OpenCode stop verification (instance {}, session {}, phase settled, last message count {}).", self.instance_id, self.session_id, count);
         InterruptReconciliation::Settled(crate::session::Decided {
             changes: extended
                 .changes
@@ -3066,6 +3138,54 @@ impl Drop for EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_verification_requires_one_unbroken_quiet_window() {
+        let mut verification = StopVerification::default();
+
+        assert_eq!(
+            verification.observe("first", std::time::Duration::ZERO),
+            StopObservation::Pending
+        );
+        assert_eq!(
+            verification.observe("first", std::time::Duration::from_secs(2)),
+            StopObservation::Pending,
+            "two equal point samples are not a quiet window"
+        );
+        assert_eq!(
+            verification.observe("later output", std::time::Duration::from_secs(3)),
+            StopObservation::Changed,
+            "new output resets the quiet window"
+        );
+        assert_eq!(
+            verification.observe("later output", std::time::Duration::from_secs(6)),
+            StopObservation::Pending
+        );
+        assert_eq!(
+            verification.observe("later output", std::time::Duration::from_secs(7)),
+            StopObservation::Quiet
+        );
+    }
+
+    #[test]
+    fn stop_verification_escalates_only_after_the_bounded_window_saw_output() {
+        let mut verification = StopVerification::default();
+
+        assert_eq!(
+            verification.observe("first", std::time::Duration::ZERO),
+            StopObservation::Pending
+        );
+        assert_eq!(
+            verification.observe("changed", std::time::Duration::from_secs(7)),
+            StopObservation::Changed
+        );
+        assert!(!verification.should_escalate(std::time::Duration::from_secs(7)));
+        assert!(verification.should_escalate(STOP_ESCALATION_WINDOW));
+
+        let mut never_changed = StopVerification::default();
+        never_changed.observe("quiet", std::time::Duration::ZERO);
+        assert!(!never_changed.should_escalate(STOP_ESCALATION_WINDOW));
+    }
 
     fn windows() -> HashMap<String, u64> {
         [("opencode/deepseek-v4-flash-free".to_string(), 128_000)]
