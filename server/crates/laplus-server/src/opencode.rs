@@ -831,6 +831,13 @@ struct EmittedPart {
     message_id: Option<String>,
 }
 
+#[derive(Default)]
+struct StopVerification {
+    signature: Option<String>,
+    changing_samples: u8,
+    external_failure_reported: bool,
+}
+
 pub(crate) struct OpenCode {
     client: OpenCodeClient,
     events: EventStream,
@@ -850,6 +857,7 @@ pub(crate) struct OpenCode {
     /// map because settlement closes the parts in the order they were first
     /// spoken, and that order is the transcript's.
     emitted_parts: Vec<(String, EmittedPart)>,
+    stop_verification: StopVerification,
     ignore_idle_until_busy: bool,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
     pending_questions: HashMap<String, crate::approval::ApprovalRequest>,
@@ -1411,6 +1419,21 @@ fn event_session(properties: &Value) -> Option<&str> {
                 .and_then(|info| info.get("sessionID"))
                 .and_then(Value::as_str)
         })
+}
+
+/// Stable evidence of assistant output for stop verification. Provider status
+/// is deliberately absent: a fake-idle response must not prove quiescence.
+fn assistant_output_signature(messages: &Value) -> String {
+    let output = messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant"))
+        .flat_map(|message| message.get("parts").and_then(Value::as_array).into_iter().flatten())
+        .filter(|part| matches!(part.get("type").and_then(Value::as_str), Some("text" | "tool")))
+        .map(|part| serde_json::to_string(part).unwrap_or_default())
+        .collect::<Vec<_>>();
+    output.join("\n")
 }
 
 impl OpenCode {
@@ -2364,6 +2387,7 @@ impl crate::session::Driver for OpenCode {
                 pending_parts: HashMap::new(),
                 pending_deltas: HashMap::new(),
                 emitted_parts: Vec::new(),
+                stop_verification: StopVerification::default(),
                 ignore_idle_until_busy: false,
                 pending_permissions: HashMap::new(),
                 pending_questions: HashMap::new(),
@@ -2613,6 +2637,12 @@ impl crate::session::Driver for OpenCode {
             }
             "session.idle" => {
                 if self.ignore_idle_until_busy { return Some(decided); }
+                // An idle event after abort is only the provider's claim. The
+                // bounded message snapshots in `reconcile_interrupt` are the
+                // proof; accepting this here recreates the fake-idle bug.
+                if driving.turn.as_ref().is_some_and(|turn| turn.was_stopped()) {
+                    return Some(decided);
+                }
                 return Some(self.settle(driving, crate::settling::SessionStatus::Ready, None))
             }
             "session.status"
@@ -2623,6 +2653,9 @@ impl crate::session::Driver for OpenCode {
                     == Some("idle") =>
             {
                 if self.ignore_idle_until_busy { return Some(decided); }
+                if driving.turn.as_ref().is_some_and(|turn| turn.was_stopped()) {
+                    return Some(decided);
+                }
                 return Some(self.settle(driving, crate::settling::SessionStatus::Ready, None));
             }
             "session.status" => match envelope
@@ -2677,6 +2710,7 @@ impl crate::session::Driver for OpenCode {
 
     async fn send(&mut self, prompt: &crate::threads::Prompt) -> std::io::Result<()> {
         self.settled = false;
+        self.stop_verification = StopVerification::default();
         let parts = prompt
             .messages()
             .flat_map(|(text, attachments)| prompt_parts(text, attachments))
@@ -2702,6 +2736,7 @@ impl crate::session::Driver for OpenCode {
     /// is what establishes the real outcome anyway — so failing fast here loses
     /// no information and returns the loop to its signals.
     async fn interrupt(&mut self, _request_id: &str) -> std::io::Result<()> {
+        self.stop_verification = StopVerification::default();
         match tokio::time::timeout(ABORT_TIMEOUT, self.client.abort(&self.session_id)).await {
             Ok(outcome) => outcome.map(|_| ()).map_err(std::io::Error::other),
             Err(_) => Err(std::io::Error::other(
@@ -2709,12 +2744,39 @@ impl crate::session::Driver for OpenCode {
             )),
         }
     }
-    async fn reconcile_interrupt(&mut self, driving: &mut crate::session::Driving) -> Result<crate::session::Decided, String> {
-        self.client.session(&self.session_id).await.map_err(|error| error.to_string())?;
-        let messages = self.client.messages(&self.session_id).await.map_err(|error| error.to_string())?;
-        let statuses = self.client.session_statuses().await.map_err(|error| error.to_string())?;
-        if statuses.get(&self.session_id).and_then(|status| status.get("type")).and_then(Value::as_str).is_some_and(|status| status != "idle") {
-            return Err("OpenCode still reports the interrupted session as busy".to_string());
+    async fn reconcile_interrupt(&mut self, driving: &mut crate::session::Driving) -> crate::session::InterruptReconciliation {
+        use crate::session::InterruptReconciliation;
+        let messages = match self.client.messages(&self.session_id).await {
+            Ok(messages) => messages,
+            Err(error) => return InterruptReconciliation::Failed(error.to_string()),
+        };
+        let signature = assistant_output_signature(&messages);
+        let count = messages.as_array().map_or(0, Vec::len);
+        let unchanged = self.stop_verification.signature.as_deref() == Some(&signature);
+        eprintln!(
+            "laplus: OpenCode stop verification (instance {}, session {}, phase verifying, last message count {}).",
+            self.owned.as_ref().map_or("external", |_| "owned"), self.session_id, count
+        );
+        if !unchanged {
+            if self.stop_verification.signature.is_some() {
+                self.stop_verification.changing_samples = self.stop_verification.changing_samples.saturating_add(1);
+            }
+            self.stop_verification.signature = Some(signature);
+            if self.stop_verification.changing_samples < 4 {
+                return InterruptReconciliation::Pending;
+            }
+            if self.owned.is_some() {
+                let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
+                eprintln!("laplus: OpenCode stop verification (instance owned, session {}, phase escalated, last message count {}).", self.session_id, count);
+                return InterruptReconciliation::EscalateOwned(settled);
+            }
+            if !self.stop_verification.external_failure_reported {
+                self.stop_verification.external_failure_reported = true;
+                return InterruptReconciliation::Failed(
+                    "OpenCode ignored the stop request and is still producing output; the external server is operator-owned and will remain under supervision".to_string()
+                );
+            }
+            return InterruptReconciliation::Pending;
         }
         // What the provider kept of the interrupted turn is folded through the
         // same per-part path the live stream used, so it *extends* each matching
@@ -2741,7 +2803,8 @@ impl crate::session::Driver for OpenCode {
         }
         self.ignore_idle_until_busy = true;
         let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
-        Ok(crate::session::Decided {
+        eprintln!("laplus: OpenCode stop verification (instance {}, session {}, phase settled, last message count {}).", self.owned.as_ref().map_or("external", |_| "owned"), self.session_id, count);
+        InterruptReconciliation::Settled(crate::session::Decided {
             changes: extended
                 .changes
                 .into_iter()

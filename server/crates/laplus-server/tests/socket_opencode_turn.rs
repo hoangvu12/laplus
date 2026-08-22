@@ -4934,7 +4934,9 @@ async fn interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrive
             .count(),
         1
     );
-    let requests = peer.requests_through(6).await;
+    // create, prompt, abort, then two message snapshots. Status is
+    // intentionally not consulted as proof of quiescence.
+    let requests = peer.requests_through(5).await;
     assert!(requests.iter().any(|request| request["operation"] == "abort"));
     assert!(requests.iter().any(|request| request["operation"] == "messages"));
     let interrupted = server

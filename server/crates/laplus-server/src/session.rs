@@ -253,8 +253,8 @@ pub(crate) trait Driver: Send + Sized {
     /// [`Driver::next`] like everything else, and `request_id` is what matches
     /// the answer to it.
     fn interrupt(&mut self, request_id: &str) -> impl Future<Output = std::io::Result<()>> + Send;
-    fn reconcile_interrupt(&mut self, _driving: &mut Driving) -> impl Future<Output = Result<Decided, String>> + Send {
-        async { Err("this provider cannot reconcile an interrupted turn".to_string()) }
+    fn reconcile_interrupt(&mut self, _driving: &mut Driving) -> impl Future<Output = InterruptReconciliation> + Send {
+        async { InterruptReconciliation::Failed("this provider cannot reconcile an interrupted turn".to_string()) }
     }
 
     /// Answer something the agent has stopped for.
@@ -313,6 +313,13 @@ pub(crate) trait Driver: Send + Sized {
     fn continuation_id(&self) -> Option<String> {
         None
     }
+}
+
+pub(crate) enum InterruptReconciliation {
+    Settled(Decided),
+    Pending,
+    Failed(String),
+    EscalateOwned(Decided),
 }
 
 /// What the developer said back to something the agent stopped for.
@@ -987,14 +994,27 @@ async fn drive<D: Driver>(
                 accepting = false;
                 driver.close_input();
             }
-            Next::ReconcileInterrupt => match driver.reconcile_interrupt(&mut driving).await {
-                Ok(decided) => {
+            Next::ReconcileInterrupt => {
+                interrupt_reconciliation = None;
+                match driver.reconcile_interrupt(&mut driving).await {
+                InterruptReconciliation::Settled(decided) => {
                     spend(&threads, &start, decided);
                     if let Some(finished) = driving.finished.take() { checkpoint(&threads, &start, &finished).await; }
                 }
-                Err(error) => {
-                    send_failure = Some(format!("The interrupted turn could not be reconciled with the provider: {error}"));
+                InterruptReconciliation::Pending => {}
+                InterruptReconciliation::Failed(error) => {
+                    eprintln!("laplus: interrupted turn remains under supervision: {error}");
+                    threads.apply(&start.thread_id, Change::Activity(Activity::failed(
+                        "turn.interrupt-verification-failed",
+                        &format!("The interrupted turn could not yet be verified with the provider: {error}"),
+                    )));
+                }
+                InterruptReconciliation::EscalateOwned(decided) => {
+                    spend(&threads, &start, decided);
+                    if let Some(finished) = driving.finished.take() { checkpoint(&threads, &start, &finished).await; }
+                    reaped_idle = true;
                     break;
+                }
                 }
             },
             Next::IdleReap => {
@@ -2025,6 +2045,15 @@ fn stopped(threads: &Threads, start: &Start, turn_id: &str, request_id: &str) {
         Change::InterruptRequested {
             turn_id: turn_id.to_string(),
         },
+    );
+    threads.apply(
+        &start.thread_id,
+        Change::Activity(Activity::info(
+            "turn.stopping",
+            "Stopping the turn…",
+            json!({"requestId": request_id, "turnId": turn_id, "detail": "The stop request landed; waiting for the provider to go quiet."}),
+            Some(turn_id.to_string()),
+        )),
     );
     threads.apply(
         &start.thread_id,
