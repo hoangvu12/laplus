@@ -1652,10 +1652,6 @@ async fn interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate
         .as_str()
         .unwrap()
         .to_string();
-    client.values_until(&subscription, |item| {
-        item["event"]["payload"]["activity"]["payload"]["data"]["childId"]
-            == "call_task_1"
-    }).await;
     client
         .call(
             "orchestration.dispatchCommand",

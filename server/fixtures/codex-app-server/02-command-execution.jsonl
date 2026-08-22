@@ -1,4 +1,4 @@
-{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.9"},"capabilities":{}}}}
+{"dir":"send","msg":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"laplus/client","title":"laplus","version":"0.1.11"},"capabilities":{}}}}
 {"dir":"recv","msg":{"id":1,"result":{"userAgent":"laplus/client/0.146.0 (Linux; aarch64) unknown"}}}
 {"dir":"send","msg":{"jsonrpc":"2.0","method":"initialized"}}
 {"dir":"send","msg":{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"<workspace>","model":"gpt-5.4-mini","approvalPolicy":"untrusted","sandbox":"read-only","approvalsReviewer":"user"}}}

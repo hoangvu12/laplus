@@ -2746,6 +2746,14 @@ impl crate::session::Driver for OpenCode {
             },
             "session.error" => {
                 if self.ignore_idle_until_busy { return Some(decided); }
+                // An abort commonly ends with an AbortError after OpenCode has
+                // already emitted one or more idle claims. Like those claims,
+                // it is part of the stop exchange rather than an independent
+                // turn failure; reconciliation owns the final interrupted
+                // settlement and the partial output it preserves.
+                if driving.turn.as_ref().is_some_and(|turn| turn.was_stopped()) {
+                    return Some(decided);
+                }
                 let error = envelope
                     .properties
                     .get("error")
