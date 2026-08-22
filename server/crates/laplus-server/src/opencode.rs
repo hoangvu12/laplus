@@ -599,6 +599,26 @@ const CATALOGUE_TIMEOUT: Duration = Duration::from_secs(30);
 const CATALOGUE_POLL: Duration = Duration::from_millis(250);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
+/// OpenCode's own idle-instance disposal: its per-directory instances — LSP
+/// servers, file watchers, MCP clients — are disposed by opencode itself once
+/// they have sat idle this many milliseconds, so even the *live* server shrinks
+/// between a conversation's work. Thirty seconds, deliberately shorter than
+/// [`crate::session::CONVERSATION_IDLE_WINDOW`]: laplus gives the whole process
+/// up first, and this only has to beat that to matter.
+///
+/// **FLAG — the knob's name is evidenced upstream, not verified against any
+/// install.** Upstream PR #16616 defines `OPENCODE_IDLE_TIMEOUT`
+/// (milliseconds, default 300000, `0` disables) for exactly this purpose, but
+/// closed it unmerged ("addressed as part of broader serve hardening"; its
+/// successor #21573 closed unmerged too), and a byte scan of the installed CLI
+/// (1.18.21) finds no such variable — nor any other `OPENCODE_*` idle- or
+/// disposal-named one. Setting an environment variable the child does not read
+/// is inert; if a future build ships the knob, disposal starts working with no
+/// further change here. Re-verify against the minimum supported version before
+/// relying on this as behaviour.
+const OPENCODE_IDLE_DISPOSAL_ENV: &str = "OPENCODE_IDLE_TIMEOUT";
+const OPENCODE_IDLE_DISPOSAL_VALUE: &str = "30000";
+
 /// One loopback OpenCode server owned by a conversation.
 pub(crate) struct OwnedServer {
     child: Child,
@@ -621,6 +641,9 @@ impl OwnedServer {
             .arg(format!("--port={port}"))
             .current_dir(directory)
             .env("OPENCODE_CONFIG_CONTENT", "{}")
+            // See `OPENCODE_IDLE_DISPOSAL_ENV`: inert on builds without the
+            // knob, and the one line where it would be set if verified.
+            .env(OPENCODE_IDLE_DISPOSAL_ENV, OPENCODE_IDLE_DISPOSAL_VALUE)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -785,6 +808,29 @@ async fn wait_for_catalogue(
     }
 }
 
+/// What one provider text part has already put on screen.
+///
+/// Held per part because a turn's narration is several parts — commentary, tool
+/// calls, more commentary — and one laplus message per part is what keeps text
+/// spoken after a tool call reading below that tool call. The message id is
+/// minted at the part's **first** emission and reused for every later delta of
+/// the same part, which is what makes identity stable across replay, reconcile
+/// and restart: the same provider part id always answers for the same transcript
+/// row. It is deliberately not [`crate::session::InFlight::assistant_message_id`],
+/// which belongs to the Claude/Codex flow; this driver mints and closes its own.
+///
+/// `text` is the cumulative rule's left-hand side: what OpenCode sends about a
+/// part is cumulative, so only the suffix beyond what is recorded here may be
+/// emitted, and nothing already on screen may be retracted.
+#[derive(Default)]
+struct EmittedPart {
+    /// Everything emitted for this part so far.
+    text: String,
+    /// The laplus message minted at first emission. `None` until then, which is
+    /// also why a part that never says anything produces no message at all.
+    message_id: Option<String>,
+}
+
 pub(crate) struct OpenCode {
     client: OpenCodeClient,
     events: EventStream,
@@ -800,8 +846,10 @@ pub(crate) struct OpenCode {
     roles: HashMap<String, String>,
     pending_parts: HashMap<String, Value>,
     pending_deltas: HashMap<String, String>,
-    emitted_parts: HashMap<String, String>,
-    assistant_text: String,
+    /// Per-part transcript state, in first-emission order. A `Vec` rather than a
+    /// map because settlement closes the parts in the order they were first
+    /// spoken, and that order is the transcript's.
+    emitted_parts: Vec<(String, EmittedPart)>,
     ignore_idle_until_busy: bool,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
     pending_questions: HashMap<String, crate::approval::ApprovalRequest>,
@@ -1371,6 +1419,21 @@ impl OpenCode {
         self.roles.get(message_id).map(|role| role == "assistant")
     }
 
+    /// This part's emission state, created at the end of the first-emission
+    /// order when it is new.
+    fn emitted_part_mut(&mut self, part_id: &str) -> &mut EmittedPart {
+        if let Some(at) = self.emitted_parts.iter().position(|(id, _)| id == part_id) {
+            return &mut self.emitted_parts[at].1;
+        }
+        self.emitted_parts
+            .push((part_id.to_string(), EmittedPart::default()));
+        let (_, emitted) = self
+            .emitted_parts
+            .last_mut()
+            .expect("the entry was just pushed");
+        emitted
+    }
+
     fn emit_text(
         &mut self,
         part_id: &str,
@@ -1379,20 +1442,18 @@ impl OpenCode {
         driving: &mut crate::session::Driving,
         decided: &mut crate::session::Decided,
     ) {
-        let emitted = self.emitted_parts.entry(part_id.to_string()).or_default();
+        let emitted = self.emitted_part_mut(part_id);
         // Cumulative updates reconcile true deltas. A stale snapshot is ignored;
         // a divergent snapshot cannot safely retract text already on screen.
-        let suffix = if text.starts_with(emitted.as_str()) {
-            &text[emitted.len()..]
-        } else if emitted.starts_with(text) {
-            ""
+        let suffix = if text.starts_with(emitted.text.as_str()) {
+            &text[emitted.text.len()..]
         } else {
             ""
         };
         if suffix.is_empty() {
             return;
         }
-        emitted.push_str(suffix);
+        emitted.text.push_str(suffix);
         if kind == "reasoning" {
             if let Some(activity) = crate::worklog::thinking(
                 suffix,
@@ -1407,9 +1468,16 @@ impl OpenCode {
         let Some(active) = driving.turn.as_mut() else {
             return;
         };
-        self.assistant_text.push_str(suffix);
-        let message_id = active
-            .assistant_message_id
+        // One laplus message **per provider text part**, minted at the part's
+        // first emission and reused for every later delta of the same part.
+        // Holding a single id for the whole turn was the defect: narration from
+        // either side of a tool call arrived as one growing wall of text with
+        // the tool activity underneath it. The position is also taken here, at
+        // first emission, because the fold inserts a message where it was first
+        // seen — which is exactly what puts post-tool commentary below the tool
+        // rows, live and after a reload.
+        let message_id = emitted
+            .message_id
             .get_or_insert_with(crate::threads::fresh_message_id)
             .clone();
         decided
@@ -1419,6 +1487,43 @@ impl OpenCode {
                 turn_id: active.turn_id.clone(),
                 text: suffix.to_string(),
             });
+    }
+
+    /// Close every open part message with whatever it held, in first-emission
+    /// order, and forget them.
+    ///
+    /// Settlement's closing half, shared with the abnormal exits: an interrupt
+    /// closes each partial block with what had arrived when it landed, and so
+    /// does a stream that died mid-turn — a message left open is rendered as
+    /// still arriving for the life of the thread, and no event after this one
+    /// will ever close it.
+    ///
+    /// Returns whether anything was closed, so a caller can tell "closed two
+    /// stranded messages" from "nothing was open".
+    fn close_open_parts(
+        &mut self,
+        driving: &crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) -> bool {
+        let Some(turn_id) = driving.turn.as_ref().map(|turn| turn.turn_id.clone()) else {
+            return false;
+        };
+        let mut closed = false;
+        for (_, emitted) in &self.emitted_parts {
+            let Some(message_id) = emitted.message_id.clone() else {
+                continue;
+            };
+            closed = true;
+            decided
+                .changes
+                .push(crate::threads::Change::AssistantMessage {
+                    message_id,
+                    turn_id: turn_id.clone(),
+                    text: emitted.text.clone(),
+                });
+        }
+        self.emitted_parts.clear();
+        closed
     }
 
     /// The `task` tool is a subagent, so it gets a subagent's row **and** a
@@ -2011,7 +2116,12 @@ impl OpenCode {
             return;
         }
         if let Some(delta) = self.pending_deltas.remove(part_id) {
-            let previous = self.emitted_parts.get(part_id).cloned().unwrap_or_default();
+            let previous = self
+                .emitted_parts
+                .iter()
+                .find(|(id, _)| id == part_id)
+                .map(|(_, emitted)| emitted.text.clone())
+                .unwrap_or_default();
             self.emit_text(part_id, kind, &(previous + &delta), driving, decided);
         }
         if let Some(text) = part.get("text").and_then(Value::as_str) {
@@ -2056,7 +2166,13 @@ impl OpenCode {
         if !matches!(kind, "text" | "reasoning") {
             return;
         }
-        let cumulative = self.emitted_parts.get(part_id).cloned().unwrap_or_default() + delta;
+        let cumulative = self
+            .emitted_parts
+            .iter()
+            .find(|(id, _)| id == part_id)
+            .map(|(_, emitted)| emitted.text.clone())
+            .unwrap_or_default()
+            + delta;
         self.emit_text(part_id, kind, &cumulative, driving, decided);
     }
 
@@ -2076,14 +2192,19 @@ impl OpenCode {
         self.settled = true;
         self.ignore_idle_until_busy = true;
         let mut changes = Vec::new();
-        if !self.assistant_text.is_empty() {
-            let message_id = finished
-                .assistant_message_id
-                .unwrap_or_else(crate::threads::fresh_message_id);
+        // Every open text part of the turn closes with whatever it holds, in
+        // first-emission order — closing one aggregate here is what folded a
+        // turn's whole narration into a single row. An interrupt takes the same
+        // path, so each partial block keeps exactly what had arrived when the
+        // stop landed and nothing is invented after it.
+        for (_, emitted) in &self.emitted_parts {
+            let Some(message_id) = emitted.message_id.clone() else {
+                continue;
+            };
             changes.push(crate::threads::Change::AssistantMessage {
                 message_id,
                 turn_id: finished.turn_id.clone(),
-                text: self.assistant_text.clone(),
+                text: emitted.text.clone(),
             });
         }
         if let Some(message) = error.as_deref().filter(|_| !interrupted) {
@@ -2112,7 +2233,6 @@ impl OpenCode {
         self.pending_parts.clear();
         self.pending_deltas.clear();
         self.emitted_parts.clear();
-        self.assistant_text.clear();
         crate::session::Decided {
             changes,
             settles: Some(crate::session::Settles {
@@ -2159,6 +2279,10 @@ impl crate::session::Driver for OpenCode {
     const APPROVAL_RESOLVED_BY_EVENT: bool = true;
     const USER_INPUT_RESOLVED_BY_EVENT: bool = true;
     const INTERRUPT_RECONCILIATION_AFTER: Option<std::time::Duration> = Some(std::time::Duration::from_secs(2));
+
+    fn continuation_id(&self) -> Option<String> {
+        Some(self.session_id.clone())
+    }
 
     async fn open(start: &crate::session::Start) -> Result<crate::session::Opened<Self>, String> {
         // Cursor validation precedes launching an owned process or making any
@@ -2239,8 +2363,7 @@ impl crate::session::Driver for OpenCode {
                 roles: HashMap::new(),
                 pending_parts: HashMap::new(),
                 pending_deltas: HashMap::new(),
-                emitted_parts: HashMap::new(),
-                assistant_text: String::new(),
+                emitted_parts: Vec::new(),
                 ignore_idle_until_busy: false,
                 pending_permissions: HashMap::new(),
                 pending_questions: HashMap::new(),
@@ -2261,7 +2384,22 @@ impl crate::session::Driver for OpenCode {
     ) -> Option<crate::session::Decided> {
         let event = match self.events.next().await {
             Ok(event) => event,
-            Err(_) => return None,
+            Err(_) => {
+                // A stream that dies mid-turn strands what it was streaming:
+                // the loop's own ending flush keys off
+                // [`crate::session::InFlight::assistant_message_id`], which this
+                // driver no longer uses, and no later event will ever arrive to
+                // close these messages. So the driver closes them itself, with
+                // whatever they held — it minted the identities, so retiring
+                // them stays driver-owned rather than the session loop's job.
+                // One last `Some` publishes the closings through the ordinary
+                // spend path; the next call reports the stream as gone.
+                let mut decided = crate::session::Decided::default();
+                if self.close_open_parts(driving, &mut decided) {
+                    return Some(decided);
+                }
+                return None;
+            }
         };
         let unknown = event.is_unknown();
         let envelope = event.envelope();
@@ -2578,16 +2716,39 @@ impl crate::session::Driver for OpenCode {
         if statuses.get(&self.session_id).and_then(|status| status.get("type")).and_then(Value::as_str).is_some_and(|status| status != "idle") {
             return Err("OpenCode still reports the interrupted session as busy".to_string());
         }
-        if let Some(text) = messages.as_array()
+        // What the provider kept of the interrupted turn is folded through the
+        // same per-part path the live stream used, so it *extends* each matching
+        // part's message rather than appending to one accumulated string. Parts
+        // already fully streamed compute an empty suffix and change nothing;
+        // parts with more text on the provider than was streamed grow by exactly
+        // the difference; a part never seen here is inserted fresh, in provider
+        // order.
+        let mut extended = crate::session::Decided::default();
+        if let Some(parts) = messages
+            .as_array()
             .and_then(|messages| messages.iter().rev().find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")))
-            .and_then(|message| message.get("parts")).and_then(Value::as_array)
-            .map(|parts| parts.iter().filter(|part| part.get("type").and_then(Value::as_str) == Some("text")).filter_map(|part| part.get("text").and_then(Value::as_str)).collect::<String>())
-            .filter(|text| text.starts_with(&self.assistant_text))
+            .and_then(|message| message.get("parts"))
+            .and_then(Value::as_array)
         {
-            self.assistant_text = text;
+            for part in parts.iter().filter(|part| part.get("type").and_then(Value::as_str) == Some("text")) {
+                let Some(id) = part.get("id").or_else(|| part.get("partID")).and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    self.emit_text(id, "text", text, driving, &mut extended);
+                }
+            }
         }
         self.ignore_idle_until_busy = true;
-        Ok(self.settle(driving, crate::settling::SessionStatus::Interrupted, None))
+        let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
+        Ok(crate::session::Decided {
+            changes: extended
+                .changes
+                .into_iter()
+                .chain(settled.changes)
+                .collect(),
+            ..settled
+        })
     }
     async fn answer(
         &mut self,

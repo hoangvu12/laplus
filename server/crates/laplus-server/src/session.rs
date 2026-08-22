@@ -111,6 +111,21 @@
 //! and it gets no checkpoint — because no checkpoint status means "the developer
 //! ended the session" and both the ones there are would relabel the turn.
 //!
+//! ## A conversation-owned OpenCode server is given up when idle
+//!
+//! One more thing this loop does around the verbs, for one driver only: an
+//! OpenCode server laplus itself launched is given up after a bounded quiet
+//! stretch between turns (ADR-0057). The decision is a pure function of idle
+//! time and session conditions — [`conversation_idle_decision`] — armed as a
+//! deadline beside `interrupt_reconciliation`'s, and the reap itself is the
+//! session *ending quietly*: no row, no error, no retryable marker, no session
+//! event. Nothing is lost by it, because the durable resume cursor survives
+//! independently of the process ([`crate::provider::ResumeCursor`]) and the
+//! next prompt attaches a fresh server that adopts the session by id
+//! (ADR-0041). An active turn, a queued prompt or an unanswered request
+//! refuses it at any age; an external endpoint (ADR-0036) and every Claude or
+//! Codex child are outside this machinery entirely.
+//!
 //! ## A turn is also a point in time, and this is the only place that knows when
 //!
 //! Ticket 20 asks for a turn to be reviewable as a diff, and a diff needs a
@@ -288,6 +303,16 @@ pub(crate) trait Driver: Send + Sized {
         driving: &mut Driving,
         asked_to_stop: bool,
     ) -> impl Future<Output = Reaped> + Send;
+
+    /// The provider's own name for the session it is driving, when it has one.
+    ///
+    /// Diagnostics only — the idle-reap log lines name it so that a week of
+    /// process churn stays explicable (ADR-0057). Nothing routes by it, which
+    /// is why the default is `None`: a driver without a provider-side session
+    /// id has nothing to say.
+    fn continuation_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What the developer said back to something the agent stopped for.
@@ -497,6 +522,113 @@ pub fn send_prompts(
     send_prompt(threads, start, prompt)
 }
 
+// ---------------------------------------------------------------------------
+// Conversation-owned server idling
+// ---------------------------------------------------------------------------
+
+/// How long a conversation-owned OpenCode server may sit idle between turns
+/// before this loop gives it up.
+///
+/// [`crate::text_generation`]'s pool reaps at thirty seconds (ADR-0043), but a
+/// conversation pays more to come back: full `opencode serve` startup, catalogue
+/// population and session adoption against the new process, where a pooled
+/// generation request pays one socket dial. So this window runs three times
+/// that — still minutes rather than the days an unreaped server lives, which is
+/// the defect being repaired. It must stay longer than the disposal timeout
+/// handed to the child at spawn (`crate::opencode`'s `OPENCODE_IDLE_TIMEOUT`),
+/// so opencode disposes its own per-directory instances before laplus gives up
+/// the process they live in.
+pub const CONVERSATION_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// What the session looked like when its idle deadline fired.
+///
+/// Pure data on purpose: policy that answers from this is assertable without
+/// arming anything, which is ADR-0043's pattern and the reason neither wall
+/// clock nor process lifetime can be made part of the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleSession {
+    /// The agent is an OpenCode server laplus itself launched. An external
+    /// endpoint is operator-owned (ADR-0036) and never this machinery's to
+    /// kill; a Claude or Codex child belongs to its session task and has no
+    /// server to give up.
+    pub owned_opencode_server: bool,
+    pub turn_in_flight: bool,
+    pub prompt_waiting: bool,
+    /// A permission request or a question the agent stopped for. Either one
+    /// holds the server past any age — an answer must reach the agent that
+    /// asked, and both kinds live in the same outstanding map here.
+    pub request_outstanding: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationIdleDecision {
+    Keep,
+    Reap,
+}
+
+/// Whether a conversation-owned server may be given up after `idle_for` idle.
+///
+/// Quiet means all of it: no turn in flight (a slow turn is never killed
+/// underneath the developer), nothing queued, nothing asked. Any of those
+/// refuses at any age; only a genuinely idle owned server past the window
+/// reaps.
+pub fn conversation_idle_decision(
+    idle_for: std::time::Duration,
+    session: IdleSession,
+) -> ConversationIdleDecision {
+    conversation_idle_decision_against(idle_for, CONVERSATION_IDLE_WINDOW, session)
+}
+
+/// [`conversation_idle_decision`] against an explicit window. The loop passes
+/// the window it actually armed with, so arming and deciding can never disagree;
+/// see [`conversation_idle_window`] for where a test moves both.
+pub(crate) fn conversation_idle_decision_against(
+    idle_for: std::time::Duration,
+    window: std::time::Duration,
+    session: IdleSession,
+) -> ConversationIdleDecision {
+    let quiet = session.owned_opencode_server
+        && !session.turn_in_flight
+        && !session.prompt_waiting
+        && !session.request_outstanding;
+    match quiet && idle_for >= window {
+        true => ConversationIdleDecision::Reap,
+        false => ConversationIdleDecision::Keep,
+    }
+}
+
+/// The window the loop arms with.
+///
+/// **`LAPLUS_TEST_CONVERSATION_IDLE_SECS` is a test seam, not a setting** —
+/// the same audience as `LAPLUS_TEST_LAUNCH_EDITOR`, and for the same reason:
+/// an integration test must reach the decision boundary without waiting out
+/// ninety real seconds, while a configuration surface would make the window
+/// somebody's tuning problem instead of a code constant. Production binaries
+/// never set it; the value read is once per arm and falls back to
+/// [`CONVERSATION_IDLE_WINDOW`].
+pub(crate) fn conversation_idle_window() -> std::time::Duration {
+    std::env::var("LAPLUS_TEST_CONVERSATION_IDLE_SECS")
+        .ok()
+        .and_then(|secs| secs.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(CONVERSATION_IDLE_WINDOW)
+}
+
+/// Whether this session's agent is an OpenCode server laplus itself launched —
+/// the only kind this loop may give up when idle.
+///
+/// Mirrors the condition [`crate::opencode::OpenCode::open`] uses to choose
+/// between spawning and attaching: `Start` is fixed for the session's life and
+/// ownership is decided there exactly once, so reading the same field here sees
+/// what the driver saw. If those two conditions ever drift apart, this is the
+/// one to fix by deriving from the other.
+fn reaps_when_idle(start: &Start) -> bool {
+    match &start.driver {
+        DriverStart::OpenCode(opencode_start) => opencode_start.settings.server_url.is_empty(),
+        DriverStart::Claude(_) | DriverStart::Codex(_) => false,
+    }
+}
+
 /// The session: start an agent, feed it turns and decisions, publish what it
 /// says, reap it.
 ///
@@ -545,6 +677,20 @@ async fn drive<D: Driver>(
     };
     spend(&threads, &start, opened);
 
+    // Named once per fresh attach in owned mode, so the resume half of every
+    // reap/resume pair is explicable from logs alone (ADR-0057). A cursor is
+    // the durable session this conversation is adopting; without one there was
+    // nothing to resume and nothing worth a line.
+    let idle_reaping = reaps_when_idle(&start);
+    if idle_reaping && start.resume_cursor.is_some() {
+        eprintln!(
+            "laplus: conversation {} resumed its OpenCode session (instance {}, provider session {}).",
+            start.thread_id,
+            start.provider.instance_id,
+            driver.continuation_id().as_deref().unwrap_or("unknown"),
+        );
+    }
+
     let mut driving = Driving {
         provider: start.provider.clone(),
         turn: None,
@@ -580,6 +726,24 @@ async fn drive<D: Driver>(
     // agent had started work or asking either driver to duplicate this policy.
     let mut send_failure = None;
     let mut interrupt_reconciliation = None;
+    // The idle deadline, armed as `(since it went quiet, when it fires)` — the
+    // same armed-deadline shape `interrupt_reconciliation` uses, and never
+    // armed at the same time as one: an interrupt pending means a turn in
+    // flight means not quiet.
+    //
+    // **The reap is a quiet session ending rather than an in-place server
+    // stop.** Ending the task is what the loop already knows how to do — the
+    // slot detaches cleanly, nothing is published, and the next prompt
+    // attaches a fresh session that resumes by durable cursor (ADR-0041),
+    // which is the path every laplus restart already proves. Stopping only the
+    // [`crate::opencode::OwnedServer`] and carrying on would leave this driver
+    // holding a dead client and event stream, needing a transparent respawn
+    // inside every verb that touches them; invasive where the ending is
+    // nearly free. What "quiet" buys is invisibility (the conversation reads
+    // exactly as it did after its last turn settled), so the ending below is
+    // gated on `reaped_idle` and publishes no session event at all.
+    let mut idle_deadline: Option<(tokio::time::Instant, tokio::time::Instant)> = None;
+    let mut reaped_idle = false;
 
     'session: loop {
         // Anything already owed to the turn that just ended is dealt with before
@@ -722,7 +886,16 @@ async fn drive<D: Driver>(
             signal = signals.recv(), if listening => Next::Signal(signal),
             prompt = prompts.recv(), if accepting && waiting.is_none() => Next::Prompt(prompt),
             _ = async { tokio::time::sleep_until(interrupt_reconciliation.expect("guarded interrupt deadline")).await }, if interrupt_reconciliation.is_some() => Next::ReconcileInterrupt,
+            _ = async { tokio::time::sleep_until(idle_deadline.expect("guarded idle deadline").1).await }, if idle_deadline.is_some() => Next::IdleReap,
         };
+
+        // Any wake other than the idle deadline itself is activity, and
+        // activity restarts the quiet stretch from zero — a stray provider
+        // event between turns is the conversation still being talked to. The
+        // bottom of this iteration re-arms if the loop is genuinely quiet.
+        if !matches!(next, Next::IdleReap) {
+            idle_deadline = None;
+        }
 
         match next {
             Next::Event(Some(mut decided)) => {
@@ -824,10 +997,78 @@ async fn drive<D: Driver>(
                     break;
                 }
             },
+            Next::IdleReap => {
+                let Some((since, _)) = idle_deadline.take() else {
+                    continue;
+                };
+                let conditions = IdleSession {
+                    owned_opencode_server: idle_reaping,
+                    turn_in_flight: driving.turn.is_some(),
+                    prompt_waiting: waiting.is_some(),
+                    request_outstanding: !driving.outstanding.is_empty(),
+                };
+                match conversation_idle_decision_against(since.elapsed(), conversation_idle_window(), conditions) {
+                    // Not quiet, or the window moved: the bottom of this
+                    // iteration re-arms only if the session is genuinely
+                    // idle again.
+                    ConversationIdleDecision::Keep => {}
+                    ConversationIdleDecision::Reap => {
+                        // One last look at the prompt channel. `select!` is
+                        // free to take either arm when both are ready, so a
+                        // prompt may have landed while this deadline was
+                        // firing; taking it here turns the reap back into a
+                        // turn instead of abandoning an accepted message in
+                        // a channel about to be dropped.
+                        let mut arrived: Option<Prompt> = None;
+                        while let Ok(prompt) = prompts.try_recv() {
+                            match arrived.as_mut() {
+                                Some(held) => held.coalesce(prompt),
+                                None => arrived = Some(prompt),
+                            }
+                        }
+                        if let Some(prompt) = arrived {
+                            waiting = Some(prompt);
+                        } else {
+                            eprintln!(
+                                "laplus: conversation {} has sat idle for {}s; giving up its OpenCode server (instance {}, provider session {}).",
+                                start.thread_id,
+                                since.elapsed().as_secs(),
+                                start.provider.instance_id,
+                                driver.continuation_id().as_deref().unwrap_or("unknown"),
+                            );
+                            reaped_idle = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
         interrupt_reconciliation = match driving.turn.as_ref() {
             Some(turn) if turn.stopped.is_some() => interrupt_reconciliation.or_else(|| D::INTERRUPT_RECONCILIATION_AFTER.map(|after| tokio::time::Instant::now() + after)),
             _ => None,
+        };
+        // Arm the idle deadline for the stretch that is about to start, keep
+        // one already running while nothing has happened, and drop it the
+        // moment anything is owed or in flight. A quiet stretch that survives
+        // to fire consults [`conversation_idle_decision`] above; activity
+        // resets it from zero rather than pausing it, so a conversation talked
+        // to in dribbles never crosses the window by accumulation.
+        idle_deadline = if idle_reaping
+            && accepting
+            && listening
+            && driving.turn.is_none()
+            && waiting.is_none()
+            && driving.outstanding.is_empty()
+        {
+            match idle_deadline {
+                Some(armed) => Some(armed),
+                None => {
+                    let now = tokio::time::Instant::now();
+                    Some((now, now + conversation_idle_window()))
+                }
+            }
+        } else {
+            None
         };
     }
 
@@ -952,7 +1193,13 @@ async fn drive<D: Driver>(
     if asked_to_stop || failure.is_some() {
         threads.pending_retryable(&start.thread_id);
     }
-    if ours {
+    // **An idle reap publishes nothing.** The conversation reads exactly as it
+    // did after its last turn settled — session `ready`, no error, no row —
+    // because that is the truth and the whole point (ADR-0057): reaping is
+    // meant to be invisible, memory following what the developer is working on
+    // rather than announcing itself. The next prompt attaches a fresh session,
+    // whose own events describe the conversation from there.
+    if ours && !reaped_idle {
         threads.apply(
             &start.thread_id,
             Change::Session(Session {
@@ -1132,6 +1379,9 @@ enum Next {
     Prompt(Option<Prompt>),
     Signal(Option<Signal>),
     ReconcileInterrupt,
+    /// The idle deadline between turns has fired. Whether it means a reap is
+    /// [`conversation_idle_decision`]'s to say, not the timer's.
+    IdleReap,
 }
 
 /// What the session and its driver both need, and neither could hold alone.

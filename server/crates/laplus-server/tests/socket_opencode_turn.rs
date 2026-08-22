@@ -585,6 +585,11 @@ struct PeerState {
     child_reply_fails: bool,
     fail_reconciliation: bool,
     fail_followup_prompt: bool,
+    /// Script a turn whose narration is several text parts spoken around a tool
+    /// call — commentary, tools, more commentary, an announced-but-empty part —
+    /// which is the transcript shape one-message-per-text-part exists to keep
+    /// apart. Held before its second part completes when an idle gate is set.
+    text_parts: bool,
     /// Accept the abort and never answer it. An OpenCode wedged on a stalled
     /// provider socket does exactly this: the port is open, the request is
     /// read, and no response is ever written.
@@ -857,6 +862,58 @@ async fn prompt(
     }
     if state.questions {
         sender.send(Ok("data: {\"type\":\"question.asked\",\"properties\":{\"id\":\"que-1\",\"sessionID\":\"ses_owned_1\",\"questions\":[{\"header\":\"Database Choice\",\"question\":\"Which database?\",\"options\":[{\"label\":\"SQLite\",\"description\":\"Local\"},{\"label\":\"Postgres\",\"description\":\"Shared\"}],\"multiple\":false},{\"header\":\"Features\",\"question\":\"Which features?\",\"options\":[{\"label\":\"Search\",\"description\":\"Search\"},{\"label\":\"Sync\",\"description\":\"Sync\"}],\"multiple\":true}]}}\n\n".to_string())).await.unwrap();
+        return StatusCode::NO_CONTENT;
+    }
+    // One turn, narrated the way OpenCode actually narrates: a first text part,
+    // a tool call with its statuses, reasoning, then a second text part — and
+    // behind the gate on purpose, so an interrupt can land between the second
+    // part's first delta and its completion. Held through reconciliation, the
+    // gate also keeps every confirmation of quiet back, which is what forces
+    // the bounded reconcile to close the partials; what the gate releases
+    // afterwards is therefore *late* output, and none of it may revise what
+    // settlement closed. The snapshots it sends are deliberately awkward — a
+    // duplicate of the same cumulative text and then a stale regression — and
+    // the title event last is the drain marker: a reader that has seen it knows
+    // every earlier event was delivered first.
+    if state.text_parts {
+        for event in [
+            "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"busy\"}}}\n\n",
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-a\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
+            "data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"role\":\"assistant\"}}}\n\n",
+            "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"prt-a\",\"field\":\"text\",\"delta\":\"Reading the tree first. \"}}\n\n",
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-a\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"Reading the tree first. \"}}}\n\n",
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"prt-tool\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"tool\",\"callID\":\"call-parts-1\",\"tool\":\"bash\",\"state\":{\"status\":\"running\",\"input\":{\"command\":\"ls -1\"},\"time\":{\"start\":1}}}}}\n\n",
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"prt-tool\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"tool\",\"callID\":\"call-parts-1\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls -1\"},\"title\":\"ls -1\",\"output\":\"src\",\"time\":{\"start\":1,\"end\":2}}}}}\n\n",
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prs-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"weighing what changed\"}}}\n\n",
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
+            "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"prt-b\",\"field\":\"text\",\"delta\":\"The tree holds \"}}\n\n",
+        ] {
+            sender.send(Ok(event.to_string())).await.expect("send scripted text-part SSE event");
+        }
+        let gated = state.idle_release.is_some();
+        let finish = async move {
+            if let Some(release) = &state.idle_release {
+                release.notified().await;
+            }
+            for event in [
+                "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"The tree holds eleven files.\"}}}\n\n",
+                "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"The tree holds eleven files.\"}}}\n\n",
+                "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"The tree holds\"}}}\n\n",
+                // Announced and never filled: a part that says nothing has to
+                // produce no message at all.
+                "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-c\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
+                "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"status\":{\"type\":\"idle\"}}}\n\n",
+                "data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_owned_1\"}}\n\n",
+                "data: {\"type\":\"session.updated\",\"properties\":{\"info\":{\"id\":\"ses_owned_1\",\"title\":\"Late marker\"}}}\n\n",
+            ] {
+                sender.send(Ok(event.to_string())).await.expect("send scripted text-part SSE event");
+            }
+        };
+        if gated {
+            tokio::spawn(finish);
+        } else {
+            finish.await;
+        }
         return StatusCode::NO_CONTENT;
     }
     for event in [
@@ -1311,9 +1368,23 @@ impl ExternalOpenCode {
         Self::serving(directory, log, state).await
     }
 
-    /// An external peer whose `abort` is accepted and never answered.
-    async fn with_unanswered_abort(idle_release: Arc<Notify>) -> Self {
+    /// A turn narrated as several text parts around a tool call, held before
+    /// its second part completes until the gate is released.
+    async fn narrating_in_text_parts(idle_release: Option<Arc<Notify>>) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release,
+            text_parts: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// An external peer whose `abort` is accepted and never answered.
+    async fn with_unanswered_abort(idle_release: Arc<Notify>) -> Self {        let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
         let state = PeerState {
             log: Arc::new(log.clone()),
@@ -4650,6 +4721,262 @@ async fn ending_the_session_ends_the_delegation_tree_with_it() {
     );
 
     release.notify_one();
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// The assistant transcript as a client that takes a snapshot sees it: one row
+/// per message, in stored order.
+fn assistant_texts(snapshot: &Value) -> Vec<String> {
+    snapshot["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .map(|message| message["text"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+async fn start_text_parts_turn(
+    peer: &ExternalOpenCode,
+    suffix: &str,
+) -> (Workspace, TestServer, SocketClient, String) {
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project(&format!("parts-project-{suffix}"), workspace.path()),
+        )
+        .await
+        .expect_success();
+    let thread = format!("parts-thread-{suffix}");
+    let mut create = create_thread(&format!("parts-project-{suffix}"), &thread);
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation(&thread).await;
+    let mut command = start_turn(&thread, &format!("parts-message-{suffix}"), "look around");
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    (workspace, server, client, subscription)
+}
+
+/// Text spoken between tool calls reads between the tool rows — each provider
+/// text part its own assistant message, in speech order, live and after a full
+/// reload.
+///
+/// The scripted turn says something, runs a tool, thinks, then says more; it
+/// also resends its second part's snapshot twice more than needed (a duplicate
+/// and a stale regression), announces a third part and never fills it. What a
+/// client may observe is exactly two messages with exactly the spoken texts,
+/// the tool rows between their first appearances, the reasoning in the work log
+/// and nowhere else.
+#[tokio::test]
+async fn opencode_text_parts_read_between_the_tool_rows_live_and_after_a_reload() {
+    let peer = ExternalOpenCode::narrating_in_text_parts(None).await;
+    let workspace = Workspace::with(&["src/"]);
+    let registry = tempfile::tempdir().unwrap();
+    let database = registry.path().join("registry.sqlite");
+    let config = peer.config(None);
+    let server = TestServer::start_at_with_config(&database, config.clone()).await;
+    let mut client = server.connect().await;
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            create_project("parts-project-interleave", workspace.path()),
+        )
+        .await
+        .expect_success();
+    let mut create = create_thread("parts-project-interleave", "parts-thread-interleave");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", create)
+        .await
+        .expect_success();
+    let subscription = client.watch_conversation("parts-thread-interleave").await;
+    let mut command = start_turn(
+        "parts-thread-interleave",
+        "parts-message-interleave",
+        "look around",
+    );
+    command["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", command)
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    // Live, as a folding client saw it: each part streams under its own id
+    // (each event carries only that event's suffix), then both close in
+    // first-emission order. The duplicate and stale snapshots and the empty
+    // third part are invisible here.
+    assert_eq!(
+        assistant_sends(&events),
+        vec![
+            ("Reading the tree first. ".to_string(), true),
+            ("The tree holds ".to_string(), true),
+            ("eleven files.".to_string(), true),
+            ("Reading the tree first. ".to_string(), false),
+            ("The tree holds eleven files.".to_string(), false),
+        ]
+    );
+
+    // Placement: the first part opened before the tool row and the second part
+    // only after the tool had finished, so text spoken after the call reads
+    // below it.
+    let position = |wanted: &dyn Fn(&Value) -> bool| {
+        events
+            .iter()
+            .position(|item| wanted(item))
+            .expect("the event a placement assertion turns on")
+    };
+    let first_part = position(&|item| {
+        item["event"]["type"] == "thread.message-sent"
+            && item["event"]["payload"]["role"] == "assistant"
+    });
+    let tool_row = position(&|item| {
+        item["event"]["payload"]["activity"]["payload"]["data"]["toolCallId"] == "call-parts-1"
+    });
+    let second_part = position(&|item| {
+        item["event"]["type"] == "thread.message-sent"
+            && item["event"]["payload"]["role"] == "assistant"
+            && item["event"]["payload"]["text"] == "The tree holds "
+    });
+    assert!(first_part < tool_row, "the first part precedes the tool");
+    assert!(tool_row < second_part, "the tool precedes the second part");
+
+    // Reasoning stays a work-log entry: said once, and never as a bubble.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|item| item["event"]["payload"]["activity"]["payload"]["thinking"]
+                == "weighing what changed")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|item| {
+        item["event"]["type"] == "thread.message-sent"
+            && item["event"]["payload"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("weighing"))
+    }));
+
+    let thread = "parts-thread-interleave";
+    let settled = server.connect().await.into_thread_snapshot(thread).await;
+    assert_eq!(
+        assistant_texts(&settled),
+        vec![
+            "Reading the tree first. ".to_string(),
+            "The tree holds eleven files.".to_string(),
+        ],
+        "both parts survive settlement as their own messages, nothing doubled, no empty bubble"
+    );
+    client.close().await;
+    server.stop().await;
+
+    // A full reload reads the same transcript in the same order.
+    let restarted = TestServer::start_at_with_config(&database, config).await;
+    let reloaded = restarted
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-interleave")
+        .await;
+    assert_eq!(assistant_texts(&reloaded), assistant_texts(&settled));
+    restarted.stop().await;
+    peer.task.abort();
+}
+
+/// Interrupting mid-turn closes every open part with whatever it held when the
+/// stop landed — the first part whole, the second part at exactly the words
+/// that had arrived, and nothing invented afterwards.
+///
+/// The gate is held *through* the ending: no idle ever confirms quiet, so it is
+/// the bounded interrupt reconciliation that proves the outcome and closes the
+/// partials from per-part state alone. What the gate releases afterwards is
+/// late output — the second part's completion, a duplicate and a stale snapshot,
+/// two idles — and none of it may revise a settled turn.
+#[tokio::test]
+async fn interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrived() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::narrating_in_text_parts(Some(Arc::clone(&idle_release))).await;
+    let (_workspace, server, mut client, subscription) =
+        start_text_parts_turn(&peer, "partial").await;
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "running the partial turn")["payload"]["session"]
+        ["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("parts-thread-partial", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+
+    // The gate holds: no idle, no completion. The bounded reconciliation is
+    // what settles the turn — asked for, answered by the provider going silent,
+    // and closed out of what had actually streamed.
+    let after = client.events_through_the_turn(&subscription).await;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|item| item["event"]["payload"]["activity"]["kind"] == "turn.completed")
+            .count(),
+        1
+    );
+    let requests = peer.requests_through(6).await;
+    assert!(requests.iter().any(|request| request["operation"] == "abort"));
+    assert!(requests.iter().any(|request| request["operation"] == "messages"));
+    let interrupted = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-partial")
+        .await;
+    assert_eq!(interrupted["thread"]["latestTurn"]["state"], "interrupted");
+    assert_eq!(interrupted["thread"]["session"]["status"], "interrupted");
+    assert_eq!(interrupted["thread"]["session"]["lastError"], Value::Null);
+    assert_eq!(
+        assistant_texts(&interrupted),
+        vec![
+            "Reading the tree first. ".to_string(),
+            // Exactly the delta that had arrived; the completion behind the gate
+            // was never spoken before the stop, so no closing may claim it.
+            "The tree holds ".to_string(),
+        ]
+    );
+
+    // Late output arrives now, after settlement. The drain marker proves every
+    // queued event was delivered; nothing may reopen or rewrite the transcript.
+    idle_release.notify_one();
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.meta-updated"
+                && item["event"]["payload"]["title"] == "Late marker"
+        })
+        .await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let after_the_fact = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-partial")
+        .await;
+    assert_eq!(
+        after_the_fact["thread"]["latestTurn"]["state"],
+        "interrupted"
+    );
+    assert_eq!(assistant_texts(&after_the_fact), assistant_texts(&interrupted));
     client.close().await;
     server.stop().await;
     peer.task.abort();
