@@ -21,18 +21,36 @@ session ids. Landing this adds one ADR for conversation-owned idle reaping.
 
 **Status:** ready-for-agent
 
-- [ ] Pure-function tests: reaps past the window; refuses with an active turn;
+- [x] Pure-function tests: reaps past the window; refuses with an active turn;
       refuses with a pending approval or question; refuses in external mode.
-- [ ] Integration: an idle conversation's server is reaped within the window;
+- [x] Integration: an idle conversation's server is reaped within the window;
       the next prompt resumes by session id and the transcript continues
       seamlessly against the restarted peer.
-- [ ] A slow turn is never killed underneath the developer (active turn blocks
+- [x] A slow turn is never killed underneath the developer (active turn blocks
       reaping at any age).
-- [ ] An unanswered permission/question holds the server past the window;
+- [x] An unanswered permission/question holds the server past the window;
       answering still reaches the agent.
-- [ ] Spawn passes the disposal knob with a value shorter than laplus's own
+- [x] Spawn passes the disposal knob with a value shorter than laplus's own
       conversation-idle window; external-mode spawn is unchanged.
-- [ ] Reap and resume each log once with instance and session identifiers.
+- [x] Reap and resume each log once with instance and session identifiers.
 - [ ] Focused suites stay green on both platforms per the repo's test
       discipline (no wall-clock assertions; decisions asserted, timeouts only
       catch hangs).
+
+## Comments
+
+2026-08-22 review: implementation and functional acceptance coverage are in
+place. The focused Windows suite passes (8 passed, one helper ignored),
+including idle reap/resume, active-turn retention, and unanswered-permission
+retention. Leave the cross-platform criterion unchecked until Linux CI evidence
+is recorded; then this ticket can move to `done`.
+
+2026-08-22 completion audit: `cargo check -p laplus-server` and the focused
+Windows binary pass. The full serialized Rust run completed every unit and
+integration binary without a failure but exceeded the runner window after
+entering doc-tests; the isolated laplus-server doc-test invocation passes with
+zero tests. Review found no incorrect ticket-05 behaviour. It did identify two
+coverage follow-ups: the scripted peer drives the outstanding-permission path
+but not an outstanding question, and the public harness has no supported seam
+for asserting reap/resume stderr cardinality. Neither substitutes for the
+still-required Linux CI result.
