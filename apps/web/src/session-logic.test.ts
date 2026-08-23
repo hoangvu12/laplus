@@ -828,6 +828,97 @@ describe("deriveWorkLogEntries", () => {
     expect(entries[0]?.detail).toBe("eleven files");
   });
 
+  /**
+   * Two subagents run concurrently, so their update streams interleave and no
+   * two updates of one child are ever adjacent. The rows are named by a stable
+   * id rather than by their neighbour, so two children stay two rows — one per
+   * child, anchored where it was spawned, showing its latest activity — instead
+   * of one stale copy per child event.
+   */
+  it("keeps one row per child when concurrent subagents interleave", () => {
+    const childActivity = (
+      id: string,
+      createdAt: string,
+      childId: string,
+      detail: string,
+      kind: "tool.updated" | "tool.completed",
+      status: string,
+    ) =>
+      makeActivity({
+        id,
+        createdAt,
+        kind,
+        summary: "Subagent general",
+        tone: "tool",
+        payload: {
+          itemType: "collab_agent_tool_call",
+          status,
+          title: "Subagent general",
+          detail,
+          data: { toolCallId: `subagent:${childId}`, childId },
+        },
+      });
+
+    const entries = deriveWorkLogEntries([
+      childActivity(
+        "c1-read",
+        "2026-08-23T00:00:01.000Z",
+        "call_1",
+        "Read ChatMarkdown.tsx",
+        "tool.updated",
+        "running",
+      ),
+      childActivity(
+        "c2-grep",
+        "2026-08-23T00:00:02.000Z",
+        "call_2",
+        "Grep desktopBridge",
+        "tool.updated",
+        "running",
+      ),
+      childActivity(
+        "c1-select",
+        "2026-08-23T00:00:03.000Z",
+        "call_1",
+        "Select-String wry sources",
+        "tool.updated",
+        "running",
+      ),
+      childActivity(
+        "c2-cargo",
+        "2026-08-23T00:00:04.000Z",
+        "call_2",
+        "Read Cargo.toml",
+        "tool.updated",
+        "running",
+      ),
+      childActivity(
+        "c1-done",
+        "2026-08-23T00:00:05.000Z",
+        "call_1",
+        "Report written",
+        "tool.completed",
+        "completed",
+      ),
+      childActivity(
+        "c2-done",
+        "2026-08-23T00:00:06.000Z",
+        "call_2",
+        "Findings saved",
+        "tool.completed",
+        "completed",
+      ),
+    ]);
+
+    expect(entries.map((entry) => entry.id)).toEqual(["c1-read", "c2-grep"]);
+    expect(entries[0]?.detail).toBe("Report written");
+    expect(entries[1]?.detail).toBe("Findings saved");
+    // Each row stays at the moment its child was delegated, not at the moment
+    // of its last update.
+    expect(entries[0]?.createdAt).toBe("2026-08-23T00:00:01.000Z");
+    expect(entries[1]?.createdAt).toBe("2026-08-23T00:00:02.000Z");
+  });
+
   /** A driver that records no child stream leaves the row without a reference. */
   it("leaves a subagent row from a driver with no stream unreferenced", () => {
     const entries = deriveWorkLogEntries([
@@ -846,6 +937,80 @@ describe("deriveWorkLogEntries", () => {
       }),
     ]);
     expect(entries[0]?.subagentChildId).toBeUndefined();
+  });
+
+  /**
+   * A completed row is the child's ending. A straggler update after it starts
+   * its own row rather than rewriting the conclusion.
+   */
+  it("does not fold an update into a subagent row that already ended", () => {
+    const make = (
+      id: string,
+      createdAt: string,
+      detail: string,
+      kind: "tool.updated" | "tool.completed",
+      status: string,
+    ) =>
+      makeActivity({
+        id,
+        createdAt,
+        kind,
+        summary: "Subagent general",
+        tone: "tool",
+        payload: {
+          itemType: "collab_agent_tool_call",
+          status,
+          title: "Subagent general",
+          detail,
+          data: { toolCallId: "subagent:call_task_1", childId: "call_task_1" },
+        },
+      });
+
+    const entries = deriveWorkLogEntries([
+      make("running", "2026-02-23T00:00:01.000Z", "Count the files", "tool.updated", "running"),
+      make("done", "2026-02-23T00:00:02.000Z", "eleven files", "tool.completed", "completed"),
+      make("straggler", "2026-02-23T00:00:03.000Z", "one more thing", "tool.updated", "running"),
+    ]);
+
+    // The ending keeps the row identity it was delegated under; only the
+    // straggler starts fresh.
+    expect(entries.map((entry) => entry.id)).toEqual(["running", "straggler"]);
+    expect(entries[0]?.detail).toBe("eleven files");
+  });
+
+  /**
+   * The non-adjacent fold is scoped to rows with an explicit id. Distant rows
+   * whose only claim to kinship is identical content must keep standing
+   * separately — they may be work that genuinely happened twice.
+   */
+  it("still folds fallback-keyed rows by adjacency only", () => {
+    const entry = (id: string, createdAt: string) =>
+      makeActivity({
+        id,
+        createdAt,
+        kind: "tool.updated" as const,
+        summary: "Tool call",
+        tone: "tool" as const,
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: "same preview",
+        },
+      });
+
+    const entries = deriveWorkLogEntries([
+      entry("first", "2026-02-23T00:00:01.000Z"),
+      makeActivity({
+        id: "between",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "task.progress",
+        summary: "Thinking",
+        tone: "info",
+      }),
+      entry("second", "2026-02-23T00:00:03.000Z"),
+    ]);
+
+    expect(entries.map((row) => row.id)).toEqual(["first", "between", "second"]);
   });
 
   it("omits task.started but shows task.progress and task.completed", () => {

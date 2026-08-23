@@ -840,11 +840,57 @@ function collapseDerivedWorkLogEntries(
   entries: ReadonlyArray<DerivedWorkLogEntry>,
 ): DerivedWorkLogEntry[] {
   const collapsed: DerivedWorkLogEntry[] = [];
+  // Where a subagent row first appeared, so its later updates can find it from
+  // anywhere in the timeline rather than only from directly above.
+  const subagentAnchors = new Map<string, number>();
+  // Fold `entry` into the row at `index`, keeping the row's original identity:
+  // its place in the transcript and its timestamp are where the child was
+  // delegated, not when its latest update happened to land.
+  const foldIntoAnchor = (index: number, entry: DerivedWorkLogEntry) => {
+    const anchor = collapsed[index]!;
+    collapsed[index] = {
+      ...mergeDerivedWorkLogEntries(anchor, entry),
+      id: anchor.id,
+      createdAt: anchor.createdAt,
+    };
+  };
+  // A compact subagent row is the one kind whose updates cannot be relied on to
+  // arrive together: two children run concurrently, their streams interleave,
+  // and one child's next update rarely sits directly below its own last one.
+  // What names the row is its stable identity — every driver keys all of a
+  // child's activity by one `data.toolCallId` — not its neighbour. Folding each
+  // row back into where it first appeared is what keeps two concurrent
+  // children at two rows instead of one stale copy per child event.
+  //
+  // Other tool rows keep the adjacency-only rule and the last-writer identity:
+  // ordinary calls run one at a time, their updates do arrive together, and
+  // their tests hold them to it.
+  const isSubagentRow = (entry: DerivedWorkLogEntry) =>
+    entry.itemType === "collab_agent_tool_call" &&
+    entry.collapseKey !== undefined &&
+    entry.toolCallId !== undefined;
   for (const entry of entries) {
+    const lastIndex = collapsed.length - 1;
     const previous = collapsed.at(-1);
     if (previous && shouldCollapseToolLifecycleEntries(previous, entry)) {
-      collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
+      if (isSubagentRow(previous) && subagentAnchors.get(previous.collapseKey!) === lastIndex) {
+        foldIntoAnchor(lastIndex, entry);
+      } else {
+        collapsed[lastIndex] = mergeDerivedWorkLogEntries(previous, entry);
+      }
       continue;
+    }
+    if (isSubagentRow(entry)) {
+      const anchorIndex = subagentAnchors.get(entry.collapseKey!);
+      if (anchorIndex === undefined) {
+        subagentAnchors.set(entry.collapseKey!, collapsed.length);
+      } else if (collapsed[anchorIndex]?.activityKind !== "tool.completed") {
+        // A terminal row is the child's ending; a straggler update starts a new
+        // row rather than rewriting history — the rule the adjacency path
+        // already follows.
+        foldIntoAnchor(anchorIndex, entry);
+        continue;
+      }
     }
     collapsed.push(entry);
   }
