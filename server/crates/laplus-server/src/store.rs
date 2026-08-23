@@ -1760,6 +1760,20 @@ impl Database {
             }
         }
 
+        // Rows written before the durable write carried the fold's resolution
+        // hold a null `assistant_message_id`, and a conversation served from one
+        // would offer no per-message revert — the client keys the diff onto the
+        // transcript through that field. The transcript is in hand here, so the
+        // same rule the fold applies is applied once on the way into memory.
+        for conversation in &mut conversations {
+            for checkpoint in &mut conversation.checkpoints {
+                crate::threads::fold::bind_checkpoint_assistant_message(
+                    checkpoint,
+                    &conversation.messages,
+                );
+            }
+        }
+
         Ok(conversations)
     }
 
@@ -3800,6 +3814,114 @@ mod tests {
                 activities,
                 checkpoints: Vec::new(),
             }]
+        );
+    }
+
+    /// A checkpoint read back with no assistant message bound to it is bound to
+    /// one on the way into memory, by the same rule the fold applies at capture
+    /// time — its turn's last assistant message. Rows written before the
+    /// durable write carried the resolution hold a null here, and a
+    /// conversation served from one would offer no per-message revert; the
+    /// transcript is in hand during the read, so this is where that is healed.
+    ///
+    /// A row that already names a message is left exactly as written.
+    #[test]
+    fn a_checkpoint_read_without_an_assistant_message_is_bound_to_its_turns_last_one() {
+        let fixture = Fixture::new();
+        fixture.add("project-1");
+
+        let messages = vec![
+            Message {
+                id: "assistant-early".to_string(),
+                role: "assistant".to_string(),
+                text: "an earlier turn's reply".to_string(),
+                attachments: Vec::new(),
+                turn_id: Some("turn-0".to_string()),
+                streaming: false,
+                created_at: "2026-07-26T00:23:06.000Z".to_string(),
+                updated_at: "2026-07-26T00:23:07.000Z".to_string(),
+            },
+            Message {
+                id: "user-2".to_string(),
+                role: "user".to_string(),
+                text: "the second question".to_string(),
+                attachments: Vec::new(),
+                turn_id: Some("turn-1".to_string()),
+                streaming: false,
+                created_at: "2026-07-26T00:24:05.000Z".to_string(),
+                updated_at: "2026-07-26T00:24:05.000Z".to_string(),
+            },
+            Message {
+                id: "assistant-first-of-turn".to_string(),
+                role: "assistant".to_string(),
+                text: "narration before a tool call".to_string(),
+                attachments: Vec::new(),
+                turn_id: Some("turn-1".to_string()),
+                streaming: false,
+                created_at: "2026-07-26T00:24:06.000Z".to_string(),
+                updated_at: "2026-07-26T00:24:06.500Z".to_string(),
+            },
+            Message {
+                id: "assistant-last-of-turn".to_string(),
+                role: "assistant".to_string(),
+                text: "the answer".to_string(),
+                attachments: Vec::new(),
+                turn_id: Some("turn-1".to_string()),
+                streaming: false,
+                created_at: "2026-07-26T00:24:07.000Z".to_string(),
+                updated_at: "2026-07-26T00:24:07.500Z".to_string(),
+            },
+        ];
+        let checkpoints = vec![
+            crate::threads::Checkpoint {
+                turn_id: "turn-1".to_string(),
+                turn_count: 1,
+                reference: "refs/laplus/thread-1/1".to_string(),
+                status: "ready",
+                files: Vec::new(),
+                // The shape every row written before the durable write was fixed
+                // holds, and what the fold hands `durable` for a fresh capture.
+                assistant_message_id: None,
+                completed_at: "2026-07-26T00:24:08.000Z".to_string(),
+            },
+            crate::threads::Checkpoint {
+                turn_id: "turn-2".to_string(),
+                turn_count: 2,
+                reference: "refs/laplus/thread-1/2".to_string(),
+                status: "ready",
+                files: Vec::new(),
+                assistant_message_id: Some("already-named".to_string()),
+                completed_at: "2026-07-26T00:25:08.000Z".to_string(),
+            },
+        ];
+
+        let mut writes = vec![Write::Thread(Box::new(a_thread("thread-1", "project-1")))];
+        for (ordinal, message) in messages.iter().enumerate() {
+            writes.push(Write::Message {
+                thread_id: "thread-1".to_string(),
+                ordinal,
+                message: message.clone(),
+            });
+        }
+        for checkpoint in &checkpoints {
+            writes.push(Write::Checkpoint {
+                thread_id: "thread-1".to_string(),
+                checkpoint: Box::new(checkpoint.clone()),
+            });
+        }
+        fixture.database.transcribe(&writes).expect("stores");
+
+        let conversations = fixture.database.conversations().expect("reads");
+        let read = &conversations[0].checkpoints;
+        assert_eq!(
+            read[0].assistant_message_id.as_deref(),
+            Some("assistant-last-of-turn"),
+            "the turn's last assistant message is what a null resolves to"
+        );
+        assert_eq!(
+            read[1].assistant_message_id.as_deref(),
+            Some("already-named"),
+            "a row that already names a message is left alone"
         );
     }
 

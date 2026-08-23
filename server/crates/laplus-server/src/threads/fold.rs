@@ -2232,17 +2232,7 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
             // its own. Upstream's reactor resolves it the same way and from
             // the same end of the list.
             let mut captured = (**recorded).clone();
-            if captured.assistant_message_id.is_none() {
-                captured.assistant_message_id = thread
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| {
-                        message.role == "assistant"
-                            && message.turn_id.as_deref() == Some(captured.turn_id.as_str())
-                    })
-                    .map(|message| message.id.clone());
-            }
+            bind_checkpoint_assistant_message(&mut captured, &thread.messages);
             match thread
                 .checkpoints
                 .iter_mut()
@@ -2397,6 +2387,29 @@ impl Change {
     }
 }
 
+/// Bind a checkpoint to the reply it is remembered by: its turn's **last**
+/// assistant message. A turn may say several things — one laplus message per
+/// provider text part — and the diff belongs to the whole of what the turn
+/// left behind, which is what walking from the end finds.
+///
+/// The one rule in two places: the fold applies it as each capture lands, and
+/// [`crate::store::Database::conversations`] applies it to rows read back from
+/// SQLite, whose `assistant_message_id` predates the durable write carrying
+/// the resolved value (or was written by any build before it did).
+pub(crate) fn bind_checkpoint_assistant_message(checkpoint: &mut Checkpoint, messages: &[Message]) {
+    if checkpoint.assistant_message_id.is_some() {
+        return;
+    }
+    checkpoint.assistant_message_id = messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == "assistant"
+                && message.turn_id.as_deref() == Some(checkpoint.turn_id.as_str())
+        })
+        .map(|message| message.id.clone());
+}
+
 /// What a change owes the database, once it has been folded in.
 ///
 /// Three rules, and each is a decision this module's documentation argues:
@@ -2454,10 +2467,25 @@ pub(crate) fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
     // activity, because that is what a checkpoint *is* — one row per turn, and
     // a second capture of the same turn replaces the first. So there is no
     // ordinal to find and nothing that can be written out of order.
+    //
+    // **The row written is the one the fold just left in the conversation**, not
+    // the change's own copy. The fold resolves `assistant_message_id` against the
+    // transcript — a mapping the driver cannot know — and persisting the
+    // unresolved original would put that work on screen only: a live client
+    // reads the event and draws the per-message revert, while a restart
+    // hydrates from this row and serves checkpoints with no message bound to
+    // them. Every conversation would lose that revert across an update, which
+    // is the report this ordering answers.
     if let Change::Checkpointed(recorded) = change {
+        let held = thread
+            .checkpoints
+            .iter()
+            .find(|held| held.turn_id == recorded.turn_id)
+            .cloned()
+            .unwrap_or_else(|| (**recorded).clone());
         writes.push(Write::Checkpoint {
             thread_id: thread.id.clone(),
-            checkpoint: recorded.clone(),
+            checkpoint: Box::new(held),
         });
     }
 

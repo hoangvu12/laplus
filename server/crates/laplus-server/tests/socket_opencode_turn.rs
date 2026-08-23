@@ -2349,7 +2349,15 @@ async fn checkpointed_external_thread(
     let mut turn = start_turn("rollback-thread", "rollback-message-1", "first");
     turn["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", turn).await.expect_success();
-    client.events_through_the_checkpoint(&watch, 1).await;
+    // The event a live client folds carries the checkpoint bound to its turn's
+    // reply — the mapping the UI's per-message revert is keyed through. A
+    // capture that reached the wire unbound would draw no revert affordance
+    // even while the server still held the conversation.
+    let seen = client.events_through_the_checkpoint(&watch, 1).await;
+    assert!(seen.iter().any(|item| {
+        let payload = &item["event"]["payload"];
+        payload["checkpointTurnCount"] == json!(1) && payload["assistantMessageId"].is_string()
+    }), "the turn-diff event must name the assistant message the diff belongs to");
     client.close().await;
     first.stop().await;
 
@@ -2377,6 +2385,26 @@ async fn rollback_outcome(fails: bool) {
     let probe = workspace.path().join("tracked.txt");
     let peer = ExternalOpenCode::for_rollback(probe, fails).await;
     checkpointed_external_thread(&peer, &database, &workspace).await;
+    // The durable row carries the resolution the fold made, not the driver's
+    // unbound capture — a restart hydrates checkpoints from here, and a null
+    // `assistant_message_id` is a conversation whose per-message revert
+    // disappears across an update.
+    {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT assistant_message_id FROM thread_checkpoints WHERE thread_id = 'rollback-thread'")
+            .unwrap();
+        let rows: Vec<Option<String>> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!rows.is_empty(), "the turns recorded no checkpoints at all");
+        assert!(
+            rows.iter().all(|assistant| assistant.is_some()),
+            "a stored OpenCode checkpoint has no assistant message bound to it"
+        );
+    }
     let cursor_before = rusqlite::Connection::open(&database).unwrap().query_row::<String, _, _>(
         "SELECT provider_resume_cursor FROM threads WHERE id = 'rollback-thread'",
         [],
