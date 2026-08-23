@@ -1,0 +1,20 @@
+# nextest configuration for this workspace. Discovered because it sits at
+# `.config/nextest.toml` relative to the workspace root (`server/`).
+#
+# Pilot tracked in `.scratch/build-performance/nextest-pilot.md`; background in
+# `.scratch/build-performance/research.md` and `popular-projects.md`.
+#
+# Deliberately absent on purpose:
+#
+# - **No retries.** While this is a pilot, a flaky test must show up as red,
+#   not be silently retried green.
+# - **No global thread cap.** The `.cmd` provider doubles are load-sensitive
+#   (the reason the Windows shards used to serialize), but that is controlled
+#   per-experiment with `-j` on the command line in rust.yml, where each step
+#   of the tuning ladder is visible in review. Local runs default to full CPUs.
+# - **No test groups.** The one shared-process interference class in the
+#   suite — the process-wide env-var overrides in the http_cloudflare tests
+#   (`TUNNEL_ORIGIN_CERT`, `LAPLUS_CLOUDFLARE_API`, ...), self-serialized with
+#   an in-process mutex — is `#![cfg(unix)]`-gated, so it never runs in the
+#   Windows shards at all, and nextest's separate process per test covers it
+#   everywhere else. Revisit only if a future test reaches across processes.

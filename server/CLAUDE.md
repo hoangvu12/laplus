@@ -133,7 +133,8 @@ have already cost someone an afternoon (ticket 29):
 - **Use `--no-fail-fast`.** `cargo test` stops at the first failing binary, so
   one failing lib test means no integration binary runs at all — and the summary
   line then reads like a suite that lost two hundred tests rather than one that
-  never started them.
+  never started them. (CI's Windows shards run cargo-nextest instead, which has
+  no fail-fast mode at all; this rule is about local `cargo test` runs.)
 - **Redirect to a file and grep the file; never pipe into `head`.** Piping kills
   cargo mid-run and orphans the `git` children it had spawned, which then compete
   with the _next_ run. Several confusing failures have been self-inflicted this
@@ -152,9 +153,15 @@ one that passes when it should not.
 **two runners**:
 
 - **`windows-latest`**, the whole default set — `laplus-server` and `xtask` —
-  with `cargo test --no-fail-fast -- --test-threads=1`. The `.cmd` provider
-  doubles use anonymous pipes and become unreliable under concurrent runner
-  load, so this uses the same documented load-control lever as the release gate.
+  in four shards running cargo-nextest at `-j 2` (`xtask`, the doctests, and
+  anything else still on plain `cargo test` keep
+  `--no-fail-fast -- --test-threads=1`). nextest gives every test its own
+  process, which removed the shared-process interference that had forced
+  `--test-threads=1` everywhere; the `.cmd` provider doubles remain unreliable
+  under concurrent runner _load_, so `-j 2` is the same load-control lever as
+  before, one notch looser. The pilot, its tuning ladder, and the evidence it
+  needs are tracked in `.scratch/build-performance/nextest-pilot.md`; config is
+  `server/.config/nextest.toml`.
   This is the platform laplus installs on, and the only one that exercises the
   crate's `cfg(windows)` blocks or the ConPTY behind `portable-pty`.
 - **`ubuntu-latest`**, `-p laplus-server` only. Added by ticket 05 of the

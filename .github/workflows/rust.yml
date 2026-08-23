@@ -41,14 +41,18 @@ jobs:
             os: ubuntu-latest
             command: cargo test -p laplus-server --no-fail-fast
 
-          # Windows provider doubles become unreliable when tests inside one
-          # binary run concurrently. Keep that proven constraint, but run
-          # independent integration binaries in four CI jobs so one slow
-          # binary no longer blocks every binary behind it.
+          # The Windows shards run under cargo-nextest (pilot tracked in
+          # .scratch/build-performance/nextest-pilot.md). nextest gives every
+          # test its own process, which removes the shared-process interference
+          # that forced `-- --test-threads=1` here. The `.cmd` provider doubles
+          # stay load-sensitive, so parallelism starts at two rather than the
+          # full runner; raise it across several green runs before trusting
+          # more. There is no --no-fail-fast to carry over: nextest always runs
+          # every selected test and reports failures at the end.
           - name: windows unit and HTTP
             os: windows-latest
             command: >-
-              cargo test -p laplus-server --lib --bins
+              cargo nextest run -p laplus-server --lib --bins
               --test claude_text_generation --test cli --test http_boot
               --test http_cloudflare_account --test http_cloudflare_adoption
               --test http_cloudflare_cleanup --test http_cloudflare_connector
@@ -57,32 +61,32 @@ jobs:
               --test http_pairing --test http_public_exposure --test http_ui
               --test network_public_exposure --test opencode_protocol
               --test opencode_text_generation --test process_shutdown
-              --test protocol_golden --no-fail-fast -- --test-threads=1
+              --test protocol_golden -j 2
 
           - name: windows Codex and core socket
             os: windows-latest
             command: >-
-              cargo test -p laplus-server
+              cargo nextest run -p laplus-server
               --test socket_activity_resets --test socket_archiving
               --test socket_assets --test socket_branches
               --test socket_codex_turn --test socket_concurrency
               --test socket_conformance --test socket_continuity
               --test socket_deleting --test socket_diffs --test socket_files
-              --test socket_filesystem --no-fail-fast -- --test-threads=1
+              --test socket_filesystem -j 2
 
           - name: windows OpenCode socket
             os: windows-latest
             command: >-
-              cargo test -p laplus-server
+              cargo nextest run -p laplus-server
               --test socket_first_turn_titles --test socket_git
               --test socket_handshake --test socket_interrupt
               --test socket_lifecycle_fields --test socket_managing_worktrees
-              --test socket_opencode_turn --no-fail-fast -- --test-threads=1
+              --test socket_opencode_turn -j 2
 
           - name: windows remaining socket and xtask
             os: windows-latest
             command: >-
-              cargo test -p laplus-server
+              cargo nextest run -p laplus-server
               --test socket_permissions --test socket_pinning
               --test socket_projects --test socket_provider
               --test socket_provider_maintenance --test socket_renaming
@@ -93,7 +97,7 @@ jobs:
               --test socket_terminal_lifecycle --test socket_thread_modes
               --test socket_tools --test socket_turn --test socket_usage
               --test socket_user_input --test socket_watch
-              --test socket_worktrees --no-fail-fast -- --test-threads=1
+              --test socket_worktrees -j 2
 
     defaults:
       run:
@@ -119,6 +123,12 @@ jobs:
         with:
           workspaces: server
           cache-on-failure: true
+
+      - name: Install nextest
+        if: runner.os == 'Windows'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       - name: Test
         run: ${{ matrix.command }}
