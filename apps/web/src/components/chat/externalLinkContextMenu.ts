@@ -23,6 +23,14 @@ const EXTERNAL_LINK_CONTEXT_MENU_ITEMS = [
 interface ShowExternalLinkContextMenuOptions {
   readonly href: string;
   readonly position: { readonly x: number; readonly y: number };
+  /**
+   * Whether this runtime can host the integrated browser at all. When it
+   * cannot — laplus has no Electron-style browser webview in any of its
+   * runtimes — the menu still appears, minus that item: "Open in system
+   * browser" and "Copy Link" are answers for everywhere, and gating the whole
+   * menu on a feature the runtime lacks is what left links with no way out.
+   */
+  readonly previewAvailable?: boolean;
   readonly showContextMenu: (
     items: readonly ContextMenuItem<ExternalLinkContextMenuAction>[],
     position: { readonly x: number; readonly y: number },
@@ -50,15 +58,22 @@ export function resolveExternalWebLinkHost(href: string | undefined): string | n
 export async function showExternalLinkContextMenu({
   href,
   position,
+  previewAvailable = true,
   showContextMenu,
   openInPreview,
   openExternal,
   copyLink,
   reportFailure,
 }: ShowExternalLinkContextMenuOptions): Promise<void> {
+  const items = (
+    previewAvailable
+      ? EXTERNAL_LINK_CONTEXT_MENU_ITEMS
+      : EXTERNAL_LINK_CONTEXT_MENU_ITEMS.filter((item) => item.id !== "open-in-preview")
+  ) as readonly ContextMenuItem<ExternalLinkContextMenuAction>[];
+
   let action: ExternalLinkContextMenuAction | null;
   try {
-    action = await showContextMenu(EXTERNAL_LINK_CONTEXT_MENU_ITEMS, position);
+    action = await showContextMenu(items, position);
   } catch (cause) {
     reportFailure("show-link-context-menu", cause);
     return;

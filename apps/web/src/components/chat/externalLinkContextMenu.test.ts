@@ -41,6 +41,32 @@ describe("external chat link context menu", () => {
     expect(harness.copyLink).not.toHaveBeenCalled();
   });
 
+  /**
+   * A runtime with no integrated browser keeps the menu anyway: the system
+   * browser and clipboard are answers for everywhere, and gating them behind a
+   * webview feature the runtime lacks is how links lost their way out.
+   */
+  it("drops only the integrated-browser item when preview is unsupported", async () => {
+    const harness = createHarness("open-external");
+
+    await showExternalLinkContextMenu({
+      href: "https://example.com/docs",
+      position: { x: 1, y: 2 },
+      previewAvailable: false,
+      ...harness,
+    });
+
+    expect(harness.showContextMenu).toHaveBeenCalledWith(
+      [
+        { id: "open-external", label: "Open in system browser" },
+        { id: "copy-link", label: "Copy Link" },
+      ],
+      { x: 1, y: 2 },
+    );
+    expect(harness.openExternal).toHaveBeenCalledWith("https://example.com/docs");
+    expect(harness.openInPreview).not.toHaveBeenCalled();
+  });
+
   it("copies the exact destination without opening it", async () => {
     const harness = createHarness("copy-link");
     const href = "https://example.com/docs?topic=menus#copy";

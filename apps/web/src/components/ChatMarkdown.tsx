@@ -1404,7 +1404,7 @@ function ChatMarkdown({
                 }
               }}
               onContextMenu={(event) => {
-                if (!canOpenInPreview || !href || !faviconHost) return;
+                if (!href || !faviconHost) return;
                 event.preventDefault();
                 event.stopPropagation();
                 const api = readLocalApi();
@@ -1412,6 +1412,7 @@ function ChatMarkdown({
                 void showExternalLinkContextMenu({
                   href,
                   position: { x: event.clientX, y: event.clientY },
+                  previewAvailable: canOpenInPreview,
                   showContextMenu: (items, position) => api.contextMenu.show(items, position),
                   openInPreview: async (target) => {
                     const result = await openExternalLinkInPreview(target);

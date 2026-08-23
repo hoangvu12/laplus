@@ -64,6 +64,15 @@
 //! `-webkit-app-region: drag`, which upstream marks its topbars with, is inert
 //! in WebView2 for the same family of reasons. The topbars carry
 //! `data-tauri-drag-region` as well, which Tauri's own injected script acts on.
+//!
+//! **Link opening has a shell half, and upstream's Electron shell owned it.**
+//! Every external link in the page is a `target="_blank"` anchor or a
+//! `window.open`, and inside a webview both arrive as a new-window request that
+//! wry answers by *cancelling* when nobody is listening (`SetHandled(true)`,
+//! wry 0.55.1 `src/webview2/mod.rs:781-783`) — a silent dead click. Upstream's
+//! `setWindowOpenHandler` → `shell.openExternal` was the listening half; the
+//! Tauri port shipped without one until the two closures on the builder below,
+//! which hand allowed schemes to the operating system and deny the rest.
 
 // Laplus is a window, not a console: without this Windows gives the process
 // one, and the developer gets a black rectangle beside their application for
@@ -198,11 +207,11 @@ fn main() -> ExitCode {
 /// known until the listener is bound — the configuration cannot name a port the
 /// developer may have overridden.
 fn window(app: &tauri::App, url: &str) -> tauri::Result<()> {
-    let url = url
+    let url: tauri::Url = url
         .parse()
         .expect("the server's own address is a valid url");
 
-    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url))
+    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url.clone()))
         .title("laplus")
         .inner_size(1440.0, 900.0)
         // Below this the UI's three panes stop having room to be three panes.
@@ -213,9 +222,74 @@ fn window(app: &tauri::App, url: &str) -> tauri::Result<()> {
         // allowed to do to this window. The label above is what that capability
         // names, so renaming the window revokes its titlebar.
         .decorations(false)
+        // A new-window request *is* a link click — every external anchor in the
+        // page is `target="_blank"`, and `shell.openExternal`'s browser fallback
+        // is a `window.open` — so this closure is what a click on a link reaches.
+        // Allowed schemes go to the operating system's own handler, and the
+        // request is denied either way: opening a second webview of this
+        // application at some external URL is nobody's ask, and denying is also
+        // what keeps an unhandled request from being silently cancelled instead
+        // (the defect this exists for). See the module note on link opening.
+        .on_new_window(move |request, _| {
+            if externally_openable(&request) {
+                open_in_the_system_browser(request.as_str());
+            }
+            tauri::webview::NewWindowResponse::Deny
+        })
+        // And the same question about *this* window navigating itself away. The
+        // page's own routes are hash changes and never leave the origin, so a
+        // cross-origin http(s) navigation here is something else — model output
+        // that talked the page into it — and it goes to the system browser
+        // rather than replacing the application with it.
+        .on_navigation({
+            let home = url.origin().ascii_serialization();
+            move |target| {
+                if externally_openable(target) && target.origin().ascii_serialization() != home {
+                    open_in_the_system_browser(target.as_str());
+                    return false;
+                }
+                true
+            }
+        })
         .build()?;
 
     Ok(())
+}
+
+/// Whether this URL is one the operating system may be handed to open.
+///
+/// An allowlist rather than a blocklist, because these URLs come from model
+/// output as much as from the user: a link to `file://`, a custom scheme, or
+/// anything else exotic must refuse quietly rather than become a click that
+/// launches whatever the scheme's handler is. Mailto survives because "email
+/// this address" is a normal thing for documentation to ask for; `ws`/`wss` do
+/// not, because no desktop handler carries them anywhere worth going.
+fn externally_openable(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "http" | "https" | "mailto")
+}
+
+/// Hand a URL to whichever application the operating system opens it with.
+///
+/// Three lines of standard library rather than `tauri-plugin-opener` (or any
+/// other opener crate): the plugin exists to expose the capability *to the
+/// page* through the IPC and its permission machinery, and this deliberately
+/// does not — the page asks for links to open by making the webview ask, which
+/// is the request this crate is already answering. What remains is spawning one
+/// well-known launcher per platform with the URL as a single argument, which no
+/// shell is involved in parsing. Best-effort by design: a failure to spawn is
+/// printed and otherwise dropped, because there is no surface to report it on
+/// and a dead click is the honest outcome of a machine with no default browser.
+fn open_in_the_system_browser(url: &str) {
+    let (program, arguments): (&str, [&str; 1]) = if cfg!(windows) {
+        ("explorer.exe", [url])
+    } else if cfg!(target_os = "macos") {
+        ("open", [url])
+    } else {
+        ("xdg-open", [url])
+    };
+    if let Err(error) = std::process::Command::new(program).args(arguments).spawn() {
+        eprintln!("laplus: could not open {url} in the system browser: {error}");
+    }
 }
 
 /// What the three network-access commands need: the store the file rides on,
@@ -556,6 +630,34 @@ mod tests {
                 granted.iter().any(|identifier| identifier == needed),
                 "{needed} is not granted: the control that presses it does nothing"
             );
+        }
+    }
+
+    /// The allowlist behind both link-opening closures. Schemes are spelled out
+    /// rather than derived, because the list is a security decision and a
+    /// refactor that generalised it into "not obviously hostile" would be the
+    /// bug.
+    #[test]
+    fn external_opening_is_an_allowlist_of_schemes_the_os_may_carry() {
+        let parse = |text: &str| text.parse::<tauri::Url>().expect("a test url");
+        for allowed in [
+            "https://example.com/docs?topic=menus#copy",
+            "http://127.0.0.1:4773/",
+            "mailto:someone@example.com",
+        ] {
+            assert!(externally_openable(&parse(allowed)), "{allowed} is refused");
+        }
+        for refused in [
+            // A path on this machine is not something model output may open.
+            "file:///C:/Windows/system.ini",
+            // No desktop handler carries these anywhere worth going.
+            "ws://127.0.0.1:4773/",
+            "wss://example.com/socket",
+            // A custom scheme's handler is whatever somebody installed.
+            "vscode://file/C:/Windows/system.ini",
+            "ssh://git@example.com/laplus.git",
+        ] {
+            assert!(!externally_openable(&parse(refused)), "{refused} is allowed");
         }
     }
 
