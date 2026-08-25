@@ -30,6 +30,19 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Notify;
 
 const SETTINGS: &str = "account.json";
+/// The `--config` laplus points every account command at.
+///
+/// **Not a place to put settings** — it exists so that there is a file to name.
+/// See [`Account::neutral_config`].
+const NEUTRAL_CONFIG: &str = "account.yml";
+/// Deliberately inert: cloudflared reads this file, so anything in it would be
+/// exactly the override the flag exists to prevent.
+const NEUTRAL_CONFIG_BODY: &str = concat!(
+    "# Intentionally empty, and not a place for settings.\n",
+    "# laplus names this file with --config so that cloudflared cannot auto-load\n",
+    "# ~/.cloudflared/config.yml underneath an account command. Every value those\n",
+    "# commands need is passed as an explicit flag.\n",
+);
 /// Long enough for a real browser round trip, bounded so an abandoned sign-in
 /// cannot leave a child process waiting for the life of the server.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -293,6 +306,9 @@ impl Account {
             .startable(executable)
             .ok_or_else(unusable_executable)?;
         crate::cloudflare_connector::compatible_version(&executable).await?;
+        // Resolved before the child is spawned, because `authorize` has nowhere to
+        // report a local failure that is not already a failed sign-in.
+        let config = self.neutral_config()?;
         {
             let mut login = self.login.lock().unwrap();
             if login.running {
@@ -305,17 +321,23 @@ impl Account {
             login.failure = None;
         }
         let account = Arc::clone(self);
-        tokio::spawn(async move { account.authorize(executable).await });
+        tokio::spawn(async move { account.authorize(executable, config).await });
         Ok(())
     }
 
-    async fn authorize(self: Arc<Self>, executable: PathBuf) {
+    async fn authorize(self: Arc<Self>, executable: PathBuf, config: PathBuf) {
         // No `--origincert`: where the certificate is written is cloudflared's
         // decision, and redirecting it would mean managing a file laplus does
-        // not own.
+        // not own. `--config` is the opposite case, and is why this one needs it:
+        // a developer's `~/.cloudflared/config.yml` may carry an `origincert` of
+        // its own, and letting that decide would write the certificate somewhere
+        // `certificate_path` will never look — a sign-in that succeeds at
+        // Cloudflare and then reports failure here.
         let mut command = crate::cloudflare_connector::command(&executable);
         command
-            .args(["tunnel", "login"])
+            .args(["tunnel", "--config"])
+            .arg(&config)
+            .arg("login")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -449,14 +471,46 @@ impl Account {
         self.persist(&settings)
     }
 
-    /// A startable, compatible cloudflared and the certificate it may spend.
+    /// A `--config` that says nothing, so that nobody else's can speak.
+    ///
+    /// **cloudflared auto-loads `~/.cloudflared/config.yml` for `tunnel`
+    /// subcommands, and what it finds there outranks the positional argument.** A
+    /// developer whose config names a different tunnel and its own
+    /// `credentials-file` — the ordinary shape for anyone already running a tunnel
+    /// by hand — makes `list` report that account through someone else's identity,
+    /// and `token` write a credential for a tunnel laplus never asked about. The
+    /// connector has always avoided this by naming its own file (ADR-0045); these
+    /// commands did not, which left laplus reading Cloudflare state through a file
+    /// it does not own.
+    ///
+    /// Written once and reused, in laplus's own directory rather than
+    /// cloudflared's, for the same reason everything else here is.
+    fn neutral_config(&self) -> Result<PathBuf, Refusal> {
+        let path = self.directory.join(NEUTRAL_CONFIG);
+        if !path.is_file() {
+            crate::cloudflare_connector::private_directory(&self.directory)?;
+            crate::cloudflare_connector::private_write(&path, NEUTRAL_CONFIG_BODY.as_bytes())?;
+        }
+        Ok(path)
+    }
+
+    /// A startable, compatible cloudflared, already carrying the certificate it
+    /// may spend and the `--config` that keeps anyone else's out.
     ///
     /// Every account-management command needs the same four answers — there is
     /// a certificate, its authority was accepted, the named executable runs,
     /// and it is new enough — and each of them is a different refusal. Asked
     /// once here so that adoption cannot answer them differently from listing,
     /// which is exactly the sort of drift a second copy produces.
-    async fn consented_command(&self, executable: &Path) -> Result<(PathBuf, PathBuf), Refusal> {
+    ///
+    /// Returns the built command rather than its ingredients, because five call
+    /// sites repeating the same three arguments were five chances to omit one, and
+    /// omitting `--config` is silent: it fails by answering about the wrong tunnel,
+    /// not by failing to answer.
+    async fn consented_command(
+        &self,
+        executable: &Path,
+    ) -> Result<tokio::process::Command, Refusal> {
         let certificate = certificate_path();
         if !certificate.is_file() {
             return Err(sign_in_first());
@@ -474,7 +528,15 @@ impl Account {
             .startable(executable)
             .ok_or_else(unusable_executable)?;
         crate::cloudflare_connector::compatible_version(&executable).await?;
-        Ok((executable, certificate))
+        let config = self.neutral_config()?;
+        let mut command = crate::cloudflare_connector::command(&executable);
+        command
+            .args(["tunnel", "--config"])
+            .arg(&config)
+            .arg("--origincert")
+            .arg(&certificate)
+            .stdin(Stdio::null());
+        Ok(command)
     }
 
     /// What the developer chose, if anything.
@@ -488,17 +550,9 @@ impl Account {
     /// mutates nothing, which is what makes an interrupted discovery safe to
     /// simply run again.
     pub async fn list_tunnels(&self, executable: &Path) -> Result<(), Refusal> {
-        let (executable, certificate) = self.consented_command(executable).await?;
-        let output = crate::cloudflare_connector::command(&executable)
-            .args([
-                "tunnel",
-                "--origincert",
-                &certificate.to_string_lossy(),
-                "list",
-                "--output",
-                "json",
-            ])
-            .stdin(Stdio::null())
+        let mut command = self.consented_command(executable).await?;
+        let output = command
+            .args(["list", "--output", "json"])
             .output()
             .await
             .map_err(|_| {
@@ -640,21 +694,12 @@ impl Account {
         if credential_for(credential_file, tunnel_id) {
             return Ok(());
         }
-        let (executable, certificate) = self.consented_command(executable).await?;
+        let mut command = self.consented_command(executable).await?;
         if let Some(parent) = credential_file.parent() {
             crate::cloudflare_connector::private_directory(parent)?;
         }
-        let output = crate::cloudflare_connector::command(&executable)
-            .args([
-                "tunnel",
-                "--origincert",
-                &certificate.to_string_lossy(),
-                "token",
-                "--cred-file",
-                &credential_file.to_string_lossy(),
-                tunnel_id,
-            ])
-            .stdin(Stdio::null())
+        let output = command
+            .args(["token", "--cred-file", &credential_file.to_string_lossy(), tunnel_id])
             .output()
             .await
             .map_err(|_| {
@@ -725,7 +770,7 @@ impl Account {
             Ok(name) => name,
             Err(refusal) => return Err(FailedAllocation::without_a_tunnel(refusal)),
         };
-        let (executable, certificate) = self
+        let mut command = self
             .consented_command(executable)
             .await
             .map_err(FailedAllocation::without_a_tunnel)?;
@@ -733,11 +778,8 @@ impl Account {
             crate::cloudflare_connector::private_directory(parent)
                 .map_err(FailedAllocation::without_a_tunnel)?;
         }
-        let output = crate::cloudflare_connector::command(&executable)
+        let output = command
             .args([
-                "tunnel",
-                "--origincert",
-                &certificate.to_string_lossy(),
                 "create",
                 "--credentials-file",
                 &credential_file.to_string_lossy(),
@@ -745,7 +787,6 @@ impl Account {
                 "json",
                 &name,
             ])
-            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|_| {
@@ -826,18 +867,9 @@ impl Account {
         tunnel_id: &str,
         hostname: &str,
     ) -> Result<(), Refusal> {
-        let (executable, certificate) = self.consented_command(executable).await?;
-        let output = crate::cloudflare_connector::command(&executable)
-            .args([
-                "tunnel",
-                "--origincert",
-                &certificate.to_string_lossy(),
-                "route",
-                "dns",
-                tunnel_id,
-                hostname,
-            ])
-            .stdin(Stdio::null())
+        let mut command = self.consented_command(executable).await?;
+        let output = command
+            .args(["route", "dns", tunnel_id, hostname])
             .output()
             .await
             .map_err(|_| {
@@ -874,16 +906,9 @@ impl Account {
     /// The DNS record is *not* removed by this, and cannot be: `cloudflared` has
     /// no `route dns delete`. See [`crate::cloudflare_dns`].
     pub async fn delete_tunnel(&self, executable: &Path, tunnel_id: &str) -> Result<(), Refusal> {
-        let (executable, certificate) = self.consented_command(executable).await?;
-        let output = crate::cloudflare_connector::command(&executable)
-            .args([
-                "tunnel",
-                "--origincert",
-                &certificate.to_string_lossy(),
-                "delete",
-                tunnel_id,
-            ])
-            .stdin(Stdio::null())
+        let mut command = self.consented_command(executable).await?;
+        let output = command
+            .args(["delete", tunnel_id])
             .output()
             .await
             .map_err(|_| {
@@ -1166,6 +1191,37 @@ fn step(certificate: bool, consented: bool, selection: Option<&Selection>) -> Se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this is here for is silent: without `--config`, cloudflared
+    /// auto-loads `~/.cloudflared/config.yml` and answers about whatever tunnel
+    /// *that* names, which is a well-formed answer to the wrong question.
+    #[test]
+    fn account_commands_are_pointed_at_a_config_laplus_owns_and_nobody_writes() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let account = Account::open(directory.path());
+
+        let config = account.neutral_config().expect("a neutral config");
+        assert_eq!(config, directory.path().join(NEUTRAL_CONFIG));
+        let cloudflared_own = certificate_path();
+        assert!(
+            !config.starts_with(cloudflared_own.parent().expect("a certificate directory")),
+            "{config:?} is inside cloudflared's own directory"
+        );
+
+        // Inert, because cloudflared reads it: anything here would be the very
+        // override the flag exists to prevent.
+        let body = std::fs::read_to_string(&config).expect("a readable config");
+        assert!(
+            body.lines().all(|line| line.trim().is_empty() || line.starts_with('#')),
+            "{body}"
+        );
+
+        // Reused rather than rewritten, so a file a connector is reading is never
+        // replaced underneath it.
+        std::fs::write(&config, "# edited\n").expect("a writable config");
+        assert_eq!(account.neutral_config().expect("the same config"), config);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "# edited\n");
+    }
 
     #[test]
     fn activity_is_read_from_connections_and_deleted_tunnels_are_not_choices() {

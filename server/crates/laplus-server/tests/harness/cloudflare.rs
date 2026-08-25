@@ -360,13 +360,30 @@ with open(TRACE, 'a') as f:
 
 mode = open(MODE).read().strip() if os.path.exists(MODE) else 'ok'
 certificate = os.environ.get('TUNNEL_ORIGIN_CERT', CERTIFICATE)
+# Where cloudflared would auto-load a config.yml from, if laplus let it.
+DEFAULT_CONFIG_DIR = os.path.dirname(os.path.abspath(certificate))
 
 def after(flag, default=None):
     return ARGS[ARGS.index(flag) + 1] if flag in ARGS else default
 
+def account_command():
+    # Every account subcommand names the certificate this consent was given for,
+    # and a --config of laplus's own. Without the latter cloudflared auto-loads
+    # ~/.cloudflared/config.yml, and a developer's config naming a different
+    # tunnel makes these commands answer about the wrong one -- silently, because
+    # the wrong answer is still a well-formed answer.
+    assert ARGS[0] == 'tunnel', ARGS
+    assert after('--origincert') == certificate, ARGS
+    config = after('--config')
+    assert config is not None, ARGS
+    assert os.path.dirname(os.path.abspath(config)) != DEFAULT_CONFIG_DIR, ARGS
+
 # --- account management: everything that spends the account certificate ---
 
-if ARGS[:2] == ['tunnel', 'login']:
+if ARGS[0] == 'tunnel' and ARGS[-1] == 'login':
+    # No --origincert: where the certificate lands is cloudflared's call.
+    # --config all the same, so a developer's own cannot redirect it.
+    assert after('--config') is not None, ARGS
     print('Please open the following URL and log in with your Cloudflare account:')
     print('https://dash.cloudflare.com/argotunnel?callback=test-callback')
     sys.stdout.flush()
@@ -381,7 +398,7 @@ if ARGS[:2] == ['tunnel', 'login']:
     raise SystemExit(0)
 
 if 'list' in ARGS:
-    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
+    account_command()
     if not os.path.exists(certificate):
         print('Cannot determine default origin certificate path', file=sys.stderr)
         raise SystemExit(1)
@@ -393,7 +410,7 @@ if 'token' in ARGS:
     # *retrieved* rather than created. `--cred-file` writes the same
     # `<UUID>.json` shape `create` does, which is what lets laplus run a tunnel
     # it did not allocate without ever holding account-wide authority again.
-    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
+    account_command()
     credentials = after('--cred-file')
     assert credentials is not None, ARGS
     if mode == 'token-fails':
@@ -413,7 +430,7 @@ if 'token' in ARGS:
 if 'create' in ARGS:
     # `--credentials-file` is what keeps the narrow run credential out of
     # cloudflared's own default location and inside laplus's private directory.
-    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
+    account_command()
     credentials = after('--credentials-file')
     assert credentials is not None, ARGS
     if mode == 'create-fails':
@@ -431,7 +448,7 @@ if 'create' in ARGS:
     raise SystemExit(0)
 
 if 'route' in ARGS:
-    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
+    account_command()
     # `cloudflared tunnel route dns` creates a CNAME and there is no symmetric
     # `route dns delete` — removing a record is a Cloudflare DNS API call with
     # its own authority (`research.md`). Refused explicitly rather than by
@@ -448,7 +465,7 @@ if 'route' in ARGS:
     raise SystemExit(0)
 
 if 'delete' in ARGS:
-    assert ARGS[1] == '--origincert' and ARGS[2] == certificate, ARGS
+    account_command()
     if mode == 'delete-fails':
         print('cannot delete tunnel with active connections', file=sys.stderr)
         raise SystemExit(1)
