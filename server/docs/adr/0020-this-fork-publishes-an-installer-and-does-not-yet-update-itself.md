@@ -5,8 +5,10 @@ Status: Accepted; the deferral superseded by [ADR-0031](0031-a-server-says-who-w
 
 > **What survives.** Everything about publishing. This fork still ships a Windows
 > installer on a tag and nothing else, with no nightly cron; `tauri.conf.json` is
-> still the version and the tag is checked against it; the Rust suite still runs in
-> the release job; and the two-signatures reasoning is unchanged.
+> still the version and the tag is checked against it; Rust verification now
+> remains in `rust.yml` while the release job performs a compile check before
+> building, signing, installing and measuring; and the two-signatures reasoning
+> is unchanged.
 >
 > **What 0031 lifts** is the last section: "self-update is deferred, not refused."
 > Its own precondition — "unblocked the moment a release exists to update from" —
@@ -96,10 +98,13 @@ than details:
   and the published artifact permanently disagreeing. Note that this is _not_
   the version the window reports — ADR-0011 makes that the UI bundle's, on
   purpose, and the two numbers differ without either being wrong.
-- **The Rust suite runs in the release job.** A tag can point at any commit, and
-  neither existing workflow fires on one. The TypeScript suite stays out: its
-  known-red 15-second timeout would gate every release on a flake, which is the
-  same as having no gate, and `ci.yml` covers that half on `main`.
+- **Verification and artifact production are separate jobs.** `rust.yml` owns
+  the full platform matrix on pushes to `main`; the release job performs a
+  compile check and then proves the shipped artifact by building, signing,
+  installing and measuring it. Repeating every process-heavy integration binary
+  on the more heavily loaded installer runner added twenty to thirty minutes and
+  made publication depend on a second, less reliable execution of the same
+  harnesses. TypeScript verification likewise remains in `ci.yml`.
 
 **Self-update is deferred, not refused.** `capabilities.serverSelfUpdate` stays
 false and states the truth. The updater is a follow-up, unblocked the moment a

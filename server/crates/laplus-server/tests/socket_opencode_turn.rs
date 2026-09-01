@@ -56,6 +56,7 @@ enum Startup {
     DelayedCatalogue,
     Gated,
     ResistsStop,
+    Runaway,
     Exit,
     NeverReady,
     McpFailure,
@@ -85,6 +86,10 @@ impl FakeOpenCode {
         Self::scripted(Startup::ResistsStop)
     }
 
+    fn runaway() -> Self {
+        Self::scripted(Startup::Runaway)
+    }
+
     fn spawning_a_subagent() -> Self {
         Self::scripted(Startup::Subagent)
     }
@@ -110,6 +115,7 @@ impl FakeOpenCode {
             (Startup::Healthy, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::DelayedCatalogue, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_DELAY_CATALOGUE=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Runaway, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\nset OPENCODE_TEST_RUNAWAY=true\r\nset OPENCODE_TEST_SUBAGENT=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::Gated, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_GATED=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=false\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
             (Startup::McpFailure, true) => "set OPENCODE_TEST_PORT=%~3\r\nset OPENCODE_TEST_LOG={log}\r\nset OPENCODE_TEST_HEALTHY=true\r\nset OPENCODE_TEST_MCP_FAIL=true\r\n\"{executable}\" --exact opencode_peer_child --ignored --nocapture",
@@ -117,6 +123,7 @@ impl FakeOpenCode {
             (Startup::Healthy, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::DelayedCatalogue, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_DELAY_CATALOGUE=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::ResistsStop, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
+            (Startup::Runaway, false) => "trap '' TERM\nOPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true OPENCODE_TEST_RUNAWAY=true OPENCODE_TEST_SUBAGENT=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::Gated, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_GATED=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::NeverReady, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=false exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
             (Startup::McpFailure, false) => "OPENCODE_TEST_PORT=\"$3\" OPENCODE_TEST_LOG='{log}' OPENCODE_TEST_HEALTHY=true OPENCODE_TEST_MCP_FAIL=true exec '{executable}' --exact opencode_peer_child --ignored --nocapture",
@@ -562,6 +569,7 @@ struct PeerState {
     idle_release: Option<Arc<Notify>>,
     prompts: Arc<AtomicUsize>,
     catalogue_requests: Arc<AtomicUsize>,
+    message_snapshots: Arc<AtomicUsize>,
     delayed_catalogue: bool,
     permissions: bool,
     questions: bool,
@@ -594,6 +602,9 @@ struct PeerState {
     /// provider socket does exactly this: the port is open, the request is
     /// read, and no response is ever written.
     unanswered_abort: bool,
+    /// The first two reconciliation snapshots pause, the third contains new
+    /// output, proving that equal point samples were not quiescence.
+    output_changes_during_stop: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -784,9 +795,17 @@ async fn session_messages(
     if state.fail_reconciliation {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    let snapshot = state.message_snapshots.fetch_add(1, Ordering::SeqCst) + 1;
+    let text = if state.output_changes_during_stop && snapshot >= 3 {
+        format!("output snapshot {snapshot}")
+    } else {
+        String::new()
+    };
     Ok(Json(json!([
         {"info":{"id":"assistant-1","role":"assistant"},"parts":[]},
-        {"info":{"id":"assistant-2","role":"assistant"},"parts":[]}
+        {"info":{"id":"assistant-2","role":"assistant"},"parts":[
+            {"id":"stop-proof-text","type":"text","text":text}
+        ]}
     ])))
 }
 
@@ -1383,6 +1402,19 @@ impl ExternalOpenCode {
         Self::serving(directory, log, state).await
     }
 
+    async fn changing_output_during_stop(idle_release: Arc<Notify>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(idle_release),
+            output_changes_during_stop: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
     /// An external peer whose `abort` is accepted and never answered.
     async fn with_unanswered_abort(idle_release: Arc<Notify>) -> Self {        let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
@@ -1457,7 +1489,15 @@ impl ExternalOpenCode {
     }
 
     async fn requests_through(&self, count: usize) -> Vec<Value> {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        self.requests_through_within(count, std::time::Duration::from_secs(5)).await
+    }
+
+    async fn requests_through_within(
+        &self,
+        count: usize,
+        bound: std::time::Duration,
+    ) -> Vec<Value> {
+        tokio::time::timeout(bound, async {
             loop {
                 if let Ok(contents) = std::fs::read_to_string(&self.log) {
                     let values = contents
@@ -1682,9 +1722,9 @@ async fn missing_opencode_idle_reconciles_and_late_idle_cannot_settle_queued_wor
     let c = before["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "message-c").unwrap()["turnId"].as_str().unwrap().to_string();
     assert_ne!(a, b);
     assert_eq!(b, c);
-    client.values_until(&subscription, |item| item["event"]["type"] == "thread.turn-start-requested").await;
-    let requests = peer.requests_through(7).await;
-    assert!(requests.iter().any(|request| request["operation"] == "get"));
+    let requests = peer
+        .requests_through_within(7, std::time::Duration::from_secs(10))
+        .await;
     assert!(requests.iter().any(|request| request["operation"] == "messages"));
     let queued_prompt = requests.iter().filter(|request| request["operation"] == "prompt").last().unwrap();
     let queued_text = queued_prompt["body"]["parts"].as_array().unwrap().iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n");
@@ -2036,9 +2076,9 @@ async fn failed_queued_delivery_keeps_the_message_retryable() {
 }
 
 #[tokio::test]
-async fn failed_interrupt_reconciliation_settles_work_and_keeps_retry() {
+async fn failed_interrupt_reconciliation_is_reported_once_and_later_turns_still_run() {
     let release = Arc::new(Notify::new());
-    let peer = ExternalOpenCode::with_reconciliation_failure(release).await;
+    let peer = ExternalOpenCode::with_reconciliation_failure(Arc::clone(&release)).await;
     let workspace = Workspace::with(&["src/"]);
     let server = TestServer::start_with(peer.config(None)).await;
     let mut client = server.connect().await;
@@ -2052,28 +2092,27 @@ async fn failed_interrupt_reconciliation_settles_work_and_keeps_retry() {
     client.call("orchestration.dispatchCommand", a).await.expect_success();
     let events = client.events_until_streaming(&subscription).await;
     let active = last_session(&events, "running before failed reconciliation")["payload"]["session"]["activeTurnId"].as_str().unwrap();
-    let mut b = follow_up("reconcile-failure-thread", "reconcile-failure-b", "B");
-    b["message"]["attachments"] = json!([{
-        "type":"image", "name":"after-interrupt.webp", "mimeType":"image/webp",
-        "sizeBytes":3, "dataUrl":"data:image/webp;base64,dHdv"
-    }]);
-    client.call("orchestration.dispatchCommand", b).await.expect_success();
     client.call("orchestration.dispatchCommand", interrupt_turn("reconcile-failure-thread", Some(active))).await.expect_success();
-    tokio::time::timeout(std::time::Duration::from_secs(5), client.values_until(&subscription, |item| item["event"]["payload"]["deliveryState"] == "retryable")).await.expect("bounded reconciliation failure");
-    let snapshot = server.connect().await.into_thread_snapshot("reconcile-failure-thread").await;
-    let retained = snapshot["thread"]["messages"].as_array().unwrap().iter().find(|message| message["id"] == "reconcile-failure-b").unwrap();
-    assert_eq!(retained["deliveryState"], "retryable");
-    assert_eq!(retained["attachments"], json!([{"type":"image","id":"reconcile-failure-b-0","name":"after-interrupt.webp","mimeType":"image/webp","sizeBytes":3}]));
-    assert_ne!(snapshot["thread"]["session"]["status"], "running");
-    let first = peer.requests().await.into_iter().find(|request| request["operation"] == "prompt").unwrap();
-    assert!(first["body"]["parts"].as_array().unwrap().iter().all(|part| part["filename"] != "after-interrupt.webp"), "the queued image moved onto the interrupted turn");
-    client.call("orchestration.dispatchCommand", json!({"type":"thread.turn.retry","commandId":"test:retry:after-interrupt","threadId":"reconcile-failure-thread","createdAt":"2026-08-17T00:00:01.000Z"})).await.expect_success();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    client.values_until(&subscription, |item| {
+        item["event"]["payload"]["activity"]["kind"] == "turn.interrupt-verification-failed"
+    }).await;
+    let failed = server.connect().await.into_thread_snapshot("reconcile-failure-thread").await;
+    assert_eq!(failed["thread"]["session"]["status"], "running");
+    let failures = failed["thread"]["activities"].as_array().unwrap().iter().filter(|row| row["kind"] == "turn.interrupt-verification-failed").collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1);
+    let diagnostic = failures[0].to_string();
+    for expected in ["openExternal", "ses_owned_1", "verifying", "last message count unknown"] {
+        assert!(diagnostic.contains(expected), "missing {expected:?}: {diagnostic}");
+    }
+
+    release.notify_one();
+    client.events_through_the_turn(&subscription).await;
+    let mut b = follow_up("reconcile-failure-thread", "reconcile-failure-b", "B");
+    b["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", b).await.expect_success();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while peer.prompts.load(Ordering::SeqCst) < 2 { tokio::task::yield_now().await; }
-    }).await.expect("the retained queued prompt is retried");
-    let requests = peer.requests().await;
-    let retry = requests.iter().filter(|request| request["operation"] == "prompt").next_back().unwrap();
-    assert_eq!(part_labels(retry["body"]["parts"].as_array().unwrap()), vec![("text", "B"), ("file", "after-interrupt.webp")]);
+    }).await.expect("a later turn reaches OpenCode after reconciliation failed");
     client.close().await;
     server.stop().await;
     peer.task.abort();
@@ -2700,6 +2739,8 @@ async fn opencode_peer_child() {
         idle_release: (std::env::var("OPENCODE_TEST_GATED").as_deref() == Ok("true"))
             .then(|| Arc::new(Notify::new())),
         subagent: std::env::var("OPENCODE_TEST_SUBAGENT").as_deref() == Ok("true"),
+        output_changes_during_stop: std::env::var("OPENCODE_TEST_RUNAWAY").as_deref()
+            == Ok("true"),
         delayed_catalogue: std::env::var("OPENCODE_TEST_DELAY_CATALOGUE").as_deref()
             == Ok("true"),
         ..Default::default()
@@ -2714,6 +2755,7 @@ async fn opencode_peer_child() {
         .route("/session/{id}", get(get_session).patch(update_session))
         .route("/session/{id}/prompt_async", post(prompt))
         .route("/session/{id}/abort", post(abort))
+        .route("/session/{id}/message", get(session_messages))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -4259,6 +4301,91 @@ async fn an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server() {
 }
 
 #[tokio::test]
+async fn an_owned_runaway_is_killed_once_and_the_follow_up_resumes_its_session() {
+    let SocketTurn {
+        _workspace,
+        opencode,
+        server,
+        mut client,
+        subscription,
+        ..
+    } = start_socket_turn(FakeOpenCode::runaway(), "runaway-project", "runaway-thread").await;
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "owned runaway before stop")["payload"]["session"]
+        ["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_port = opencode.requests_through(4).await[0]["port"]
+        .as_u64()
+        .expect("owned runaway port") as u16;
+
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("runaway-thread", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+
+    client.values_until(&subscription, |item| {
+        item["event"]["type"] == "thread.turn-interrupt-requested"
+    }).await;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while tokio::net::TcpStream::connect(("127.0.0.1", first_port))
+            .await
+            .is_ok()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the escalation kills the owned runaway");
+    let interrupted = server.connect().await.into_thread_snapshot("runaway-thread").await;
+    assert_eq!(interrupted["thread"]["latestTurn"]["state"], "interrupted");
+    assert_eq!(
+        interrupted["thread"]["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "turn.interrupted")
+            .count(),
+        1,
+        "owned escalation settles the stopped turn exactly once"
+    );
+    let child = child_row(&server, "runaway-thread", "call_task_1").await;
+    assert_eq!(child["payload"]["status"], "stopped");
+    assert_eq!(child["payload"]["detail"], "Interrupted");
+
+    let mut follow_up = follow_up("runaway-thread", "runaway-follow-up", "continue");
+    follow_up["modelSelection"] = json!({"instanceId":"openLocal","model":"openai/gpt-5"});
+    client
+        .call("orchestration.dispatchCommand", follow_up)
+        .await
+        .expect_success();
+    let requests = opencode.requests_through(14).await;
+    let restart = requests
+        .iter()
+        .rposition(|request| request["operation"] == "launch")
+        .expect("the owned peer relaunched");
+    assert!(restart > 0, "the first launch was mistaken for a restart: {requests:#?}");
+    let after_restart = &requests[restart..];
+    assert!(after_restart.iter().any(|request| request["operation"] == "get"), "restart did not adopt the durable session: {requests:#?}");
+    assert!(after_restart.iter().any(|request| request["operation"] == "prompt"), "follow-up did not reach restarted peer: {requests:#?}");
+    assert_eq!(
+        after_restart
+            .iter()
+            .find(|request| request["operation"] == "get")
+            .unwrap()["sessionId"],
+        "ses_owned_1",
+        "the restarted peer resumes by durable provider session id"
+    );
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn an_owned_turn_waits_for_a_catalogue_that_populates_after_health_is_ready() {
     let SocketTurn {
         _workspace,
@@ -4951,6 +5078,22 @@ async fn interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrive
         .await
         .expect_success();
 
+    // A stop request is not proof that OpenCode stopped. Until message-history
+    // verification observes a bounded quiet window, the turn remains active
+    // and the work log says that verification is in progress.
+    let stopping = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-partial")
+        .await;
+    assert_eq!(stopping["thread"]["latestTurn"]["state"], "running");
+    assert_eq!(stopping["thread"]["session"]["status"], "running");
+    let activities = stopping["thread"]["activities"]
+        .as_array()
+        .expect("the durable work log");
+    assert!(activities.iter().any(|activity| activity["kind"] == "turn.stopping"));
+    assert!(!activities.iter().any(|activity| activity["kind"] == "turn.interrupted"));
+
     // The gate holds: no idle, no completion. The bounded reconciliation is
     // what settles the turn — asked for, answered by the provider going silent,
     // and closed out of what had actually streamed.
@@ -4962,7 +5105,9 @@ async fn interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrive
             .count(),
         1
     );
-    let requests = peer.requests_through(6).await;
+    // create, prompt, abort, then two message snapshots. Status is
+    // intentionally not consulted as proof of quiescence.
+    let requests = peer.requests_through(5).await;
     assert!(requests.iter().any(|request| request["operation"] == "abort"));
     assert!(requests.iter().any(|request| request["operation"] == "messages"));
     let interrupted = server
@@ -5005,6 +5150,82 @@ async fn interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrive
         "interrupted"
     );
     assert_eq!(assistant_texts(&after_the_fact), assistant_texts(&interrupted));
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+#[tokio::test]
+async fn an_external_runaway_is_reported_once_and_remains_supervised_without_a_kill() {
+    let release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::changing_output_during_stop(Arc::clone(&release)).await;
+    let (_workspace, server, mut client, subscription) =
+        start_text_parts_turn(&peer, "stop-pause").await;
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "running turn before stop verification")["payload"]
+        ["session"]["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("parts-thread-stop-pause", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+
+    // create, prompt, abort, and two identical message snapshots. The old
+    // point-sample policy settled here even though the provider resumes output
+    // in its next authoritative history response.
+    peer.requests_through(5).await;
+    let paused = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-stop-pause")
+        .await;
+    assert_eq!(paused["thread"]["latestTurn"]["state"], "running");
+    assert_eq!(paused["thread"]["session"]["status"], "running");
+
+    client.values_until(&subscription, |item| {
+        item["event"]["payload"]["activity"]["kind"]
+            == "turn.interrupt-verification-failed"
+    }).await;
+    // One more authoritative snapshot after the visible failure proves the
+    // ladder remains armed and supervising rather than ending the loop there.
+    peer.requests_through(9).await;
+    let supervised = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-stop-pause")
+        .await;
+    assert_eq!(supervised["thread"]["latestTurn"]["state"], "running");
+    assert_eq!(supervised["thread"]["session"]["status"], "running");
+    let failures = supervised["thread"]["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|activity| activity["kind"] == "turn.interrupt-verification-failed")
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 1, "external escalation reports the runaway once");
+    let diagnostic = failures[0].to_string();
+    for expected in ["OpenCode ignored the stop request", "openExternal", "ses_owned_1", "escalated", "last message count 2"] {
+        assert!(diagnostic.contains(expected), "missing {expected:?}: {diagnostic}");
+    }
+    assert!(
+        tokio::net::TcpStream::connect(peer.endpoint.trim_start_matches("http://"))
+            .await
+            .is_ok(),
+        "external escalation never kills the operator-owned peer"
+    );
+
+    client.call("orchestration.dispatchCommand", json!({
+        "type":"thread.session.stop",
+        "commandId":"test:stop:external-runaway",
+        "threadId":"parts-thread-stop-pause",
+        "createdAt":"2026-08-22T00:00:00.000Z"
+    })).await.expect_success();
+    release.notify_one();
     client.close().await;
     server.stop().await;
     peer.task.abort();

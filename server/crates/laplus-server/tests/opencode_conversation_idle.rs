@@ -228,7 +228,12 @@ impl FakeOpenCode {
             }
         })
         .await
-        .expect("OpenCode records its launch, session and prompt requests")
+        .unwrap_or_else(|_| {
+            panic!(
+                "OpenCode records {count} launch/session/prompt requests; observed: {}",
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            )
+        })
     }
 }
 
@@ -407,11 +412,11 @@ async fn reply_permission(
     for event in [
         r#"data: {"id":"evt-reply-1","type":"permission.replied","properties":{"sessionID":"ses_owned_1","requestID":"per-1","reply":"once"}}"#,
         r#"data: {"type":"message.part.updated","properties":{"part":{"id":"part-tool-1","messageID":"message-1","sessionID":"ses_owned_1","type":"tool","callID":"call-1","tool":"mystery","state":{"status":"completed","input":{"secret":42},"output":"done","title":"Mystery","time":{"start":1,"end":2}}}}}"#,
-        r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-2","messageID":"message-2","sessionID":"ses_owned_1","type":"text","text":""}}}}"#,
+        r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-2","messageID":"message-2","sessionID":"ses_owned_1","type":"text","text":""}}}"#,
         r#"data: {"type":"message.updated","properties":{"info":{"id":"message-2","sessionID":"ses_owned_1","role":"assistant"}}}"#,
         r#"data: {"type":"session.status","properties":{"sessionID":"ses_owned_1","status":{"type":"busy"}}}"#,
         r#"data: {"type":"message.part.delta","properties":{"sessionID":"ses_owned_1","messageID":"message-2","partID":"text-2","field":"text","delta":"answered "}}"#,
-        r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-2","messageID":"message-2","sessionID":"ses_owned_1","type":"text","text":"answered after approval"}}}}"#,
+        r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-2","messageID":"message-2","sessionID":"ses_owned_1","type":"text","text":"answered after approval"}}}"#,
         r#"data: {"type":"session.idle","properties":{"sessionID":"ses_owned_1"}}"#,
     ] {
         sender
@@ -444,12 +449,12 @@ async fn prompt(
             r#"data: {"type":"message.updated","properties":{"info":{"id":"message-9","sessionID":"ses_owned_1","role":"assistant"}}}"#,
             r#"data: {"type":"session.status","properties":{"sessionID":"ses_owned_1","status":{"type":"busy"}}}"#,
             r#"data: {"type":"message.part.delta","properties":{"sessionID":"ses_owned_1","messageID":"message-9","partID":"text-9","field":"text","delta":"picked up "}}"#,
-            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-9","messageID":"message-9","sessionID":"ses_owned_1","type":"text","text":"picked up where we left off"}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-9","messageID":"message-9","sessionID":"ses_owned_1","type":"text","text":"picked up where we left off"}}}"#,
             r#"data: {"type":"session.idle","properties":{"sessionID":"ses_owned_1"}}"#,
         ]
     } else if mode == "stall" {
         vec![
-            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-1","messageID":"message-1","sessionID":"ses_owned_1","type":"text","text":""}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-1","messageID":"message-1","sessionID":"ses_owned_1","type":"text","text":""}}}"#,
             r#"data: {"type":"message.updated","properties":{"info":{"id":"message-1","sessionID":"ses_owned_1","role":"assistant"}}}"#,
             r#"data: {"type":"session.status","properties":{"sessionID":"ses_owned_1","status":{"type":"busy"}}}"#,
             r#"data: {"type":"message.part.delta","properties":{"sessionID":"ses_owned_1","messageID":"message-1","partID":"text-1","field":"text","delta":"working "}}"#,
@@ -462,11 +467,11 @@ async fn prompt(
         ]
     } else {
         vec![
-            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-1","messageID":"message-1","sessionID":"ses_owned_1","type":"text","text":""}}}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-1","messageID":"message-1","sessionID":"ses_owned_1","type":"text","text":""}}}"#,
             r#"data: {"type":"message.updated","properties":{"info":{"id":"message-1","sessionID":"ses_owned_1","role":"assistant"}}}"#,
             r#"data: {"type":"session.status","properties":{"sessionID":"ses_owned_1","status":{"type":"busy"}}}"#,
-            r#"data: {"type":"message.part.delta","properties":{"sessionID":"ses_owned_1","messageID":"message-1","partID":"text-1","field":"text","delta":"hello "}}"#,
-            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-1","messageID":"message-1","sessionID":"ses_owned_1","type":"text","text":"first answer"}}}}"#,
+            r#"data: {"type":"message.part.delta","properties":{"sessionID":"ses_owned_1","messageID":"message-1","partID":"text-1","field":"text","delta":"first "}}"#,
+            r#"data: {"type":"message.part.updated","properties":{"part":{"id":"text-1","messageID":"message-1","sessionID":"ses_owned_1","type":"text","text":"first answer"}}}"#,
             r#"data: {"type":"session.status","properties":{"sessionID":"ses_owned_1","status":{"type":"idle"}}}"#,
             r#"data: {"type":"session.idle","properties":{"sessionID":"ses_owned_1"}}"#,
         ]
@@ -548,13 +553,13 @@ async fn an_idle_conversation_gives_up_its_server_and_resumes_by_session_id() {
         activity["kind"] == "session.failed" || activity["kind"] == "turn.delivery-failed"
     }));
 
-    let requests = opencode.requests_through(5).await;
+    let requests = opencode.requests_through(4).await;
     assert_eq!(
-        requests[..5]
+        requests[..4]
             .iter()
             .map(|row| row["operation"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["launch", "mcp.add", "create", "update", "prompt"],
+        vec!["launch", "mcp.add", "create", "prompt"],
         "the first server's lifetime"
     );
     let port = requests[0]["port"].as_u64().expect("the owned port") as u16;
@@ -597,9 +602,9 @@ async fn an_idle_conversation_gives_up_its_server_and_resumes_by_session_id() {
 
     // The fresh server adopted the *same* session id before prompting: get,
     // update, prompt — the durable-cursor resume, nothing else.
-    let requests = opencode.requests_through(10).await;
+    let requests = opencode.requests_through(9).await;
     assert_eq!(
-        requests[5..]
+        requests[4..]
             .iter()
             .map(|row| row["operation"].as_str().unwrap())
             .collect::<Vec<_>>(),
@@ -660,7 +665,7 @@ async fn an_active_turn_is_never_reaped_regardless_of_age() {
     dispatch(&mut client, turn).await;
 
     client.events_until_streaming(&watch).await;
-    let requests = opencode.requests_through(5).await;
+    let requests = opencode.requests_through(4).await;
     let port = requests[0]["port"].as_u64().expect("the owned port") as u16;
 
     // Stand well past the shortened window while the provider is mid-turn.
@@ -707,7 +712,7 @@ async fn an_unanswered_permission_holds_past_the_window_and_answering_still_reac
 
     let (_, request_id) = client.events_until_permission(&watch).await;
     assert_eq!(request_id, "per-1");
-    let requests = opencode.requests_through(5).await;
+    let requests = opencode.requests_through(4).await;
     let port = requests[0]["port"].as_u64().expect("the owned port") as u16;
 
     // Past the window with nobody answering, the server is still exactly where
@@ -728,7 +733,7 @@ async fn an_unanswered_permission_holds_past_the_window_and_answering_still_reac
         assistant_sends(&settled).last().expect("a reply after approval").0,
         "answered after approval"
     );
-    let requests = opencode.requests_through(6).await;
+    let requests = opencode.requests_through(5).await;
     let reply = requests
         .iter()
         .find(|row| row["operation"] == "permission.reply")

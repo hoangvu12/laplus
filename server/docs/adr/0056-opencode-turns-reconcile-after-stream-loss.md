@@ -11,3 +11,12 @@ provider settles or the developer stops it. Missing sessions and terminal
 authentication or protocol errors fail visibly while preserving partial work,
 and no recovery path resends the developer's prompt. This favors durable,
 idempotent recovery over a time limit that could misclassify healthy long work.
+
+An interrupt uses the same recovery machinery but does not trust session
+status as proof of completion. Laplus samples authoritative assistant message
+output across a bounded quiet window; every changed snapshot restarts that
+window, and only one unbroken quiet interval proves settlement. While that
+proof is pending the turn remains running with a visible stopping activity, so
+queued work cannot enter the stopping turn. Inspection failures and a
+still-changing external server remain supervised instead of ending the
+conversation; owned-server escalation is ADR-0058.
