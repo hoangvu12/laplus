@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: needs-triage
 
 # 04 — Stop escalation ladder; reconcile failure no longer ends the conversation
 
@@ -19,7 +19,7 @@ adds one ADR for the ladder.
 
 **Blocked by:** 03 — Stop is proven, not believed.
 
-**Status:** ready-for-agent
+**Status:** needs-triage
 
 - [x] Owned mode, scripted peer faking endless busy: after the window the owned
       child is terminated (process-double observable), the turn settles
