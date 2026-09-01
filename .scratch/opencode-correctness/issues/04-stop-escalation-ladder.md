@@ -133,3 +133,13 @@ first only when it is the sole test in the process.
 
 Not proven: that the two loopback failures predate this branch, since they never
 reach the code it touches and this machine cannot bind the address either way.
+
+2026-09-01 addendum on the suite's own noise. A second full `--test-threads=1`
+invocation of `socket_opencode_turn`, on identical code, read 52 passed and 5
+failed rather than 53 and 4: the same four, plus
+`retuning_opencode_reapplies_the_same_permission_rules_with_patch` timing out
+at `socket_opencode_turn.rs:1564` waiting on its external peer. It passes in
+2.7s in its own invocation and passed in the other full run, so it belongs with
+the load-dependent flakes rather than with this change. Recorded because two
+runs of the same code disagreeing about which tests fail is the thing a future
+reader most needs to know before trusting a single number from this file.
