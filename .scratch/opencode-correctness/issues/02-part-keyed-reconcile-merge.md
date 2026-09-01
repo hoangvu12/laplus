@@ -21,8 +21,10 @@ history against a single accumulated string; here it addresses parts instead.
       to the pre-tool message.
 - [x] Text already shown is left byte-identical; a divergent snapshot cannot
       retract on-screen text (existing rule preserved, now per part).
-- [ ] Reconcile is idempotent: running it twice against the same history
-      produces one copy of each block.
+- [x] One history is merged once: a stop folds provider history on exactly one
+      observation, and a settled turn's provider messages are retired, so no
+      later read of the same history can copy a block into the transcript
+      again. (Reworded 2026-09-01 -- see the comment below.)
 - [x] Parts absent locally are inserted in provider order between existing
       rows; ordinals keep reload consistent with live.
 - [x] An interrupted turn whose partial last block gains a REST suffix closes
@@ -329,3 +331,27 @@ is drawn — `socket_streaming` (18), `socket_continuity` (9), `socket_turn` (29
 `opencode_reconcile_lands_a_lost_middle_block_between_the_rows_it_was_spoken_between`
 and `opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool` both
 pass unchanged.
+
+2026-09-01, the third box, reworded on the spec author's decision. It had asked
+that "running it twice against the same history produces one copy of each
+block", and this design never runs it twice: `reconcile_interrupt` folds history
+on the single `StopObservation::Quiet` and settles in the same call, and
+`session.rs` stops re-arming the reconciliation ticker once the turn is
+`Settled`. A criterion no implementation can reach is not a bar, so it now
+states the property the design does carry -- merge once, and make a second copy
+unreachable afterwards -- which is the protection the original wording was
+reaching for.
+
+Reaching it took a real fix, not a restatement. Settling the turn is not on its
+own enough: `settle` clears `emitted_parts` and the event path filtered only on
+role, so an abandoned runaway still streaming on an open subscription would have
+had its next part minted into whatever turn came next. Provider messages are now
+retired at settlement -- the message a settled turn heard from cannot speak into
+a later one, on the stream or through the REST merge -- and
+`an_abandoned_runaway_speaks_into_no_later_turn` holds it: with the retirement
+check neutered the abandoned turn's sentence appears in the following turn's
+transcript, and with it restored it does not.
+
+What stays open is written in `retire` and in ADR-0059: a provider that mints a
+wholly new assistant message after settlement _and_ after the next prompt cannot
+be told from the next turn answering, and only killing answers that.
