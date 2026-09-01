@@ -1,4 +1,4 @@
-Status: ready-for-human
+Status: ready-for-agent
 
 # 04 — Stop escalation ladder; reconcile failure no longer ends the conversation
 
@@ -19,7 +19,7 @@ adds one ADR for the ladder.
 
 **Blocked by:** 03 — Stop is proven, not believed.
 
-**Status:** ready-for-human
+**Status:** ready-for-agent
 
 - [x] Owned mode, scripted peer faking endless busy: after the window the owned
       child is terminated (process-double observable), the turn settles
@@ -28,7 +28,7 @@ adds one ADR for the ladder.
 - [x] External mode, same fake: a failure row names the provider as ignoring
       the stop; no kill is attempted; supervision continues while busy
       (ADR-0056 semantics).
-- [x] A reconcile error leaves the session loop alive: the conversation accepts
+- [ ] A reconcile error leaves the session loop alive: the conversation accepts
       answers and further turns afterwards; only the failed stop is reported.
 - [x] Subagent rows under the stopped turn are ended as today (delegation tree
       does not outlive the stop).
@@ -57,3 +57,23 @@ supervised. Reconciliation transport failures likewise report once and leave
 the conversation able to settle and accept later turns. The policy unit tests
 and scripted HTTP/SSE process-double tests cover the owned, external, quiet,
 settle-once, restart, and failure-survival paths.
+
+2026-09-01 correction while proving ticket 02: this ticket's reconcile-error
+criterion was checked but is not met. `failed_interrupt_reconciliation_is_
+reported_once_and_later_turns_still_run`, added by 805487b alongside the
+checkmark, is red: against a peer whose `session.messages` answers 500 forever
+the harness wedges after sixty seconds on `no frame within READ_TIMEOUT`, and
+the server says why — `interrupted turn remains under supervision: OpenCode
+stop verification failed (phase verifying): OpenCode request failed (500)`.
+Verification returns `Pending` forever, so the stopped turn never settles and
+the conversation cannot accept the later turn the criterion promises. Reverting
+ticket 02's test changes does not affect it; the failure is this ticket's.
+
+ADR-0056 says inspection failures "remain supervised instead of ending the
+conversation", and supervision without any terminal condition is what that
+reads as today. What is missing is the second half: a permanently unreadable
+history must eventually settle the stopped turn as interrupted while still
+reporting the failure, so that supervision does not become the wedge it was
+meant to prevent. That is a policy decision for this ticket, so the box is
+unchecked and the status returns to `ready-for-agent` rather than being
+silently left as proven.
