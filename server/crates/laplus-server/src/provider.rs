@@ -1780,6 +1780,11 @@ fn bounded_catalogue_command(
     crate::process::without_a_console(&mut command);
     let mut child = command.spawn().map_err(|error| BoundedCommandFailure::Permanent(
         format!("{} could not start: {error}", arguments.join(" "))))?;
+    // Probes re-run every five minutes, so "laplus was killed mid-probe" is a
+    // case that comes around rather than a corner. The tree kills below are what
+    // handle a probe that hangs; this is what handles a laplus that does not get
+    // to run them.
+    crate::process::bound_to_this_server(&child);
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout.take(u64::MAX).read_to_end(&mut bytes); bytes });

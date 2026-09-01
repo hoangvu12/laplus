@@ -657,6 +657,13 @@ impl OwnedServer {
                 binary.display()
             )
         })?;
+        // The Windows half of what `process_group(0)` above buys on Unix, and
+        // more than it: a process group survives the death of the process that
+        // made it, and a job object does not. This is the case ADR-0057's idle
+        // reap cannot reach, because a reaper only runs in a laplus that is
+        // still alive — `pingdotgg/t3code#5241` is the same reaper with the same
+        // blind spot and twenty-eight orphans behind it.
+        crate::process::bound_to_this_server_async(&child);
         let process_group_id = child
             .id()
             .ok_or_else(|| "OpenCode started without a process id.".to_string())?;

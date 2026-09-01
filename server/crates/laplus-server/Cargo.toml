@@ -29,6 +29,12 @@ sha2.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 
+# Target-gated because a job object is a Windows idea and there is no portable
+# half to depend on. `crate::process` carries the `cfg(not(windows))` no-op and
+# says what that platform is still missing.
+[target.'cfg(windows)'.dependencies]
+win32job.workspace = true
+
 [dev-dependencies]
 rcgen = "0.13"
 # A throwaway directory per test, removed on drop. The registry's tests need a

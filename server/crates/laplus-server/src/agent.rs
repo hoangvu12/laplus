@@ -81,6 +81,13 @@
 //! `kill_on_drop` is set as well. It is not the mechanism — [`Agent::stop`] is —
 //! but a panic unwinding past an `Agent` must not leave a `claude` running, and
 //! that is a path no amount of care in the happy case covers.
+//!
+//! **Neither of them covers an exit this process does not get to run code
+//! after**, and `kill_on_drop` least of all: it needs a tokio runtime that a
+//! `taskkill /F` has already taken away. So the child is also joined to a job
+//! object at spawn — [`crate::process::bound_to_this_server`] is what that
+//! guarantees, what it does not, and the three days of orphaned processes that
+//! were the argument for it.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -287,6 +294,12 @@ impl Agent {
         crate::process::without_a_console(command.as_std_mut());
 
         let mut child = command.spawn()?;
+        // Before the pipes are taken, so that the window in which this `claude`
+        // is unsupervised is as short as this function can make it. What it
+        // covers is mostly not `claude` itself — see
+        // `crate::process::bound_to_this_server`, and the dev servers its Bash
+        // tool starts, which no kill of this handle has ever reached.
+        crate::process::bound_to_this_server_async(&child);
 
         // `take` rather than `expect` on each: all three were piped a few lines
         // above, so their absence is this function's own bug and not something a
@@ -487,14 +500,21 @@ impl Agent {
             }
         }
 
-        // On Windows this kills the process this server started. That is the
-        // real `claude.exe` in production — `crate::provider` resolves a native
-        // binary — so the kill lands where it says it does. A `.cmd` shim, which
-        // is what the suite's stand-ins are, is started through `cmd.exe` and
-        // would leave a grandchild for the OS to reap at exit; the same
-        // reasoning as `provider::probe`'s timeout, and the same conclusion,
-        // which is that a job object is not worth it here.
-        let _ = self.child.kill().await;
+        // **The tree, not the handle.** This used to kill only the process this
+        // server started, reasoning that `crate::provider` resolves a native
+        // `claude.exe` in production so the kill lands where it says it does.
+        // That is true about `claude.exe` and says nothing about what `claude`
+        // started: its Bash tool's dev servers, the stdio MCP servers its
+        // configuration names, its subagents. Those are this server's
+        // grandchildren, a kill of this handle has never reached them, and on
+        // 2026-09-01 six of them — two `bun dev` and four `vite` — were found
+        // three days old with dead parents, holding four loopback ports.
+        //
+        // The same reasoning retired the rest of that comment. A job object is
+        // now taken out at spawn (`crate::process::bound_to_this_server`), which
+        // is what covers the exits this function is never called on; this is
+        // what keeps a conversation's cost from being paid until then.
+        crate::process::terminate_tree_and_wait_async(&mut self.child).await;
         self.last_words().await
     }
 

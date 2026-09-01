@@ -306,6 +306,10 @@ async fn generate_with_claude(
     if attachments.is_empty() { command.arg(prompt(&operation)); } else { command.arg("--input-format").arg("stream-json").stdin(std::process::Stdio::piped()); }
     crate::process::without_a_console(command.as_std_mut());
     let mut child = command.spawn().map_err(|error| Error(format!("Claude text generation could not start: {error}")))?;
+    // A short-lived `claude` is still a `claude`. This one is bounded by a
+    // timeout and reaped by `kill_on_drop`, and neither of those survives an
+    // abrupt end to this process — see `crate::process::bound_to_this_server`.
+    crate::process::bound_to_this_server_async(&child);
     if !attachments.is_empty() {
         use tokio::io::AsyncWriteExt;
         let content = crate::turn::prompt_content(&prompt(&operation), attachments).await.map_err(Error)?;

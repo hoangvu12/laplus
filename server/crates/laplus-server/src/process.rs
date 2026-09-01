@@ -37,6 +37,131 @@ pub fn without_a_console(command: &mut Command) -> &mut Command {
     command
 }
 
+/// Bind this child's life to this server's — in the kernel, rather than in this
+/// code.
+///
+/// **Every other reaping path in this crate is cooperative.** [`crate::agent`]'s
+/// `Agent::stop`, [`crate::codex`]'s `AppServer::stop` and [`crate::opencode`]'s
+/// `OwnedServer::stop` all run because `Server::shutdown` called them, and
+/// `Server::shutdown` runs because Tauri raised `RunEvent::ExitRequested` or
+/// because [`crate::server`]'s `asked_to_stop` heard a signal. None of that
+/// happens when laplus is ended from Task Manager, terminated with
+/// `taskkill /F`, or dies on a panic. `kill_on_drop` is no help either: it
+/// needs a tokio runtime that, in exactly those cases, no longer exists.
+///
+/// What the gap costs was measured rather than supposed. On 2026-09-01 this
+/// machine was holding two `codex app-server` trees and six dev servers started
+/// three days earlier — every one with a dead parent, none of them visible to a
+/// restarted laplus, together holding four loopback ports. Upstream has the same
+/// hole open as `pingdotgg/t3code#5241`, where the reporter counted twenty-eight
+/// orphaned `opencode serve` processes and 8.8 GB of resident memory, and
+/// reached the conclusion this server would also have reached: their inactivity
+/// reaper cannot see an orphan, because it only closes sessions a live backend
+/// still owns.
+///
+/// A job object closes it. The handle belongs to this process; when this process
+/// ends by any means, including ones it cannot run code after, the kernel closes
+/// the handle and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` terminates every process
+/// in the job. **Membership is inherited**, which is the half that matters most:
+/// assigning the `cmd.exe` that fronts `codex.cmd` covers the `node` and
+/// `codex.exe` beneath it, and assigning `claude.exe` covers the dev servers its
+/// Bash tool starts — which is the leak that was actually on the machine, and
+/// the one no amount of care in `Agent::stop` could have reached, because those
+/// processes are not this server's children and never were.
+///
+/// **A backstop, not a replacement.** The graceful paths still do the work and
+/// still do it better: they close stdin, let the CLI finish its output, and
+/// collect what it said on the way down. A job object has none of that
+/// discretion — it is what decides the outcome when none of them get to run.
+///
+/// **Failure is reported and not fatal**, for the same reason `asked_to_stop`
+/// treats a handler that will not install that way: a server that refused to
+/// start because it could not create a job object would supervise its children
+/// worse than one that carries on exactly as every version before this did.
+pub fn bound_to_this_server(child: &Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        join_the_job(child.as_raw_handle() as isize);
+    }
+    #[cfg(not(windows))]
+    let _ = child;
+}
+
+/// [`bound_to_this_server`], for the children started onto the async runtime.
+///
+/// Two functions rather than one over a trait because the two `Child` types
+/// share no handle accessor, and a trait implemented for both would need its own
+/// `cfg(not(windows))` twin to keep the signature — more code, in a module whose
+/// reason for existing is that the same four lines were about to be written a
+/// third time.
+///
+/// A child whose handle has already gone is one that has already exited, so
+/// there is nothing to bind and nothing to report.
+pub fn bound_to_this_server_async(child: &tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(handle) = child.raw_handle() {
+        join_the_job(handle as isize);
+    }
+    #[cfg(not(windows))]
+    let _ = child;
+}
+
+/// The one job object this process owns, created on first use.
+///
+/// A `OnceLock` rather than a field on the server, because the thing being
+/// modelled is a property of the *process* — the kernel closes the handle when
+/// the process ends, and nothing finer-grained than that is what makes the
+/// guarantee true. It also means a child started before any `Server` exists, or
+/// after one has been dropped, is covered on the same terms as every other.
+///
+/// `None` once creation has failed: the failure is reported at the point it
+/// happens and never again, so a machine that will not give this server a job
+/// object does not also print a line per child for the rest of the session.
+#[cfg(windows)]
+static SUPERVISION: std::sync::OnceLock<Option<win32job::Job>> = std::sync::OnceLock::new();
+
+/// A job object that terminates its members when its last handle closes.
+///
+/// Separate from [`SUPERVISION`] only so the tests can hold one of their own:
+/// the guarantee is "when the handle closes", and a static that lives as long as
+/// the process is by construction something a test in that process can never
+/// watch close.
+#[cfg(windows)]
+fn supervision_job() -> Result<win32job::Job, win32job::JobError> {
+    let mut limits = win32job::ExtendedLimitInfo::new();
+    limits.limit_kill_on_job_close();
+    win32job::Job::create_with_limit_info(&limits)
+}
+
+/// Put one process handle into [`SUPERVISION`], if there is one to put it in.
+#[cfg(windows)]
+fn join_the_job(handle: isize) {
+    let job = SUPERVISION.get_or_init(|| {
+        match supervision_job() {
+            Ok(job) => Some(job),
+            Err(error) => {
+                eprintln!(
+                    "laplus: cannot supervise child processes through a job object: {error}. \
+                     Agents will still be stopped when laplus exits normally, but one that \
+                     survives an abrupt exit will have to be ended by hand."
+                );
+                None
+            }
+        }
+    });
+
+    // A process that is already in a job this server does not own — a CI
+    // container, a debugger — cannot always be re-assigned, and one that exited
+    // between `spawn` and here cannot be assigned at all. Both are ordinary, and
+    // both leave the cooperative paths doing what they already did.
+    if let Some(job) = job.as_ref() {
+        if let Err(error) = job.assign_process(handle) {
+            eprintln!("laplus: a child process could not be supervised: {error}");
+        }
+    }
+}
+
 /// Terminate a child and everything it launched, then wait for the child.
 ///
 /// Windows command shims are processes, not aliases: starting `codex.cmd`
@@ -64,6 +189,37 @@ pub fn terminate_tree_and_wait(child: &mut Child) {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// [`terminate_tree_and_wait`], for a child on the async runtime.
+///
+/// **A job object does not make this redundant, and the two answer different
+/// questions.** [`bound_to_this_server`] decides what happens to a child when
+/// *laplus* ends; this decides what happens when a *conversation* does, which is
+/// the common case and the earlier one. The job stays open for as long as the
+/// server runs, so a `claude` reaped at the end of a turn takes its `bun dev`
+/// with it only if something walks the tree here — otherwise the dev server
+/// lives until laplus exits, which on a machine left open for a week is not a
+/// bound at all.
+pub async fn terminate_tree_and_wait_async(child: &mut tokio::process::Child) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let mut command = tokio::process::Command::new("taskkill.exe");
+        command
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        without_a_console(command.as_std_mut());
+        let _ = command.status().await;
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 /// Where to look for a program, and what counts as startable when it is found.
@@ -195,6 +351,130 @@ fn executable_extensions() -> Vec<String> {
         .filter(|extension| extension.starts_with('.') && extension.len() > 1)
         .map(str::to_lowercase)
         .collect()
+}
+
+#[cfg(all(test, windows))]
+mod supervision {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::time::{Duration, Instant};
+
+    /// A hang detector, not a budget — the same rule as `READ_TIMEOUT` in the
+    /// integration harness. Every assertion below is about *what* the kernel
+    /// did, and this only bounds how long the test waits to see it.
+    const SETTLES_WITHIN: Duration = Duration::from_secs(10);
+
+    /// Something that stays alive without a console, a network, or a file on
+    /// disk, and that starts a child of its own. `cmd.exe` is the parent and
+    /// `ping` is the grandchild, which is the shape that matters: it is
+    /// `codex.cmd`'s tree, and it is `claude` starting a dev server.
+    fn a_tree() -> std::process::Child {
+        Command::new("cmd.exe")
+            .args(["/C", "ping -n 60 127.0.0.1 > nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cmd.exe starts")
+    }
+
+    /// Wait for the job to hold at least `wanted` processes, and answer with
+    /// what it held when the wait ended.
+    fn holds_at_least(job: &win32job::Job, wanted: usize) -> usize {
+        let deadline = Instant::now() + SETTLES_WITHIN;
+        loop {
+            let held = job.query_process_id_list().expect("the job can be queried").len();
+            if held >= wanted || Instant::now() >= deadline {
+                return held;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The whole of what the job object is for, in one assertion each.
+    ///
+    /// **Inheritance is the first half.** Assigning the process this server
+    /// started is only worth anything if what *it* starts joins too — that is
+    /// the difference between reaping `cmd.exe` and reaping the `codex.exe`
+    /// underneath it, and between reaping `claude.exe` and reaping the `bun dev`
+    /// it left behind, which is the leak this was written for.
+    ///
+    /// **Closing the handle is the second.** Dropping the job here stands in for
+    /// the process exiting, which is the only way this guarantee is ever
+    /// invoked in production and not something a test inside that process can
+    /// arrange. What the kernel does on the last handle closing is the same
+    /// either way.
+    #[test]
+    fn a_supervised_tree_joins_whole_and_dies_when_the_job_handle_closes() {
+        let job = supervision_job().expect("a job object");
+        let mut child = a_tree();
+        job.assign_process(child.as_raw_handle() as isize)
+            .expect("the child joins the job");
+
+        assert!(
+            holds_at_least(&job, 2) >= 2,
+            "the child's own child did not inherit the job, so reaping the tree \
+             would still have left the process that does the work"
+        );
+
+        drop(job);
+
+        let deadline = Instant::now() + SETTLES_WITHIN;
+        loop {
+            match child.try_wait().expect("the child can be observed") {
+                Some(_) => break,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    panic!("the supervised tree outlived the job handle that bounded it");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// The path every spawn site actually calls, against the process-wide job.
+    ///
+    /// It cannot assert the reap — [`SUPERVISION`] closes when this test process
+    /// does — so what it pins is that a real child is accepted into the job and
+    /// is a member afterwards. The reap itself is the test above.
+    #[test]
+    fn the_spawn_sites_route_a_child_into_the_process_wide_job() {
+        let mut child = a_tree();
+        bound_to_this_server(&child);
+
+        let members = SUPERVISION
+            .get()
+            .expect("supervision was initialised by the call above")
+            .as_ref()
+            .expect("this platform gives laplus a job object")
+            .query_process_id_list()
+            .expect("the job can be queried");
+
+        assert!(
+            members.contains(&(child.id() as usize)),
+            "a child that went through `bound_to_this_server` is not in the job: {members:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A child that has already exited is not an error to bind. `Agent::stop`
+    /// and `AppServer::stop` both race a CLI that exits on its own, so this is
+    /// an ordinary case rather than a defensive one.
+    #[test]
+    fn binding_a_child_that_has_already_gone_is_not_a_failure() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "exit"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cmd.exe starts");
+        let _ = child.wait();
+
+        bound_to_this_server(&child);
+    }
 }
 
 #[cfg(test)]

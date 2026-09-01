@@ -1493,6 +1493,10 @@ impl AppServer {
         }
         crate::process::without_a_console(command.as_std_mut());
         let mut child = command.spawn()?;
+        // On Windows this handle is the `cmd.exe` fronting `codex.cmd`, and the
+        // `node` and `codex.exe` under it join the job by inheritance — which is
+        // the tree `terminate_tree_and_wait` walks by hand on the graceful path.
+        crate::process::bound_to_this_server_async(&child);
         let stdin = child.stdin.take().ok_or_else(missing_async_pipe)?;
         let stdout = child.stdout.take().ok_or_else(missing_async_pipe)?;
         let child_stderr = child.stderr.take().ok_or_else(missing_async_pipe)?;
@@ -1641,19 +1645,7 @@ impl AppServer {
             }
         }
 
-        #[cfg(windows)]
-        if let Some(pid) = self.child.id() {
-            let mut command = AsyncCommand::new("taskkill.exe");
-            command
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            crate::process::without_a_console(command.as_std_mut());
-            let _ = command.status().await;
-        }
-        let _ = self.child.kill().await;
-        let _ = self.child.wait().await;
+        crate::process::terminate_tree_and_wait_async(&mut self.child).await;
         self.last_words().await
     }
 
@@ -1726,6 +1718,10 @@ impl Client {
         let mut child = command
             .spawn()
             .map_err(|error| format!("{} could not be started: {error}", binary.display()))?;
+        // The short-lived probe half of the same guarantee. `Drop` already
+        // reaps this tree, and this is what covers the run where `Drop` does not
+        // get to happen.
+        crate::process::bound_to_this_server(&child);
         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let (Some(stdin), Some(stdout), Some(child_stderr)) = pipes else {
             let _ = child.kill();
