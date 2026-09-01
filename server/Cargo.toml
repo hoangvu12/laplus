@@ -111,6 +111,17 @@ tokio-rustls = "0.26"
 # defaults. Comparing a tuned binary against an untuned one would have flattered
 # Tauri by 3.3 MB, so both halves are measured under these and both are built
 # with them.
+# Dev-profile weight control: full debuginfo made every dependency rlib carry
+# hundreds of MB and grew `target/debug/deps` past 60 GB. Line tables keep panic
+# backtraces pointing at real file/line numbers — which is all test output and
+# agent workflows ever consume — while dependencies get none at all: nobody
+# single-steps through tokio internals in a debugger against this tree.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 strip = true
 lto = true
