@@ -842,6 +842,15 @@ struct StopVerification {
     /// When the current unbroken run of unreadable history snapshots began.
     /// `None` whenever the last snapshot was readable, so a transient failure
     /// only delays the proof rather than counting towards abandoning it.
+    ///
+    /// **Elapsed since [`StopVerification::started_at`], like `quiet_since`
+    /// beside it**, rather than an `Instant` that would carry that invariant in
+    /// its own type. The whole of this policy is driven by an `elapsed` the
+    /// caller supplies precisely so it can be tested without sleeping, and an
+    /// `Instant` here could only be compared against a real clock — which would
+    /// make the terminal rung the one rung of the ladder a test has to wait out.
+    /// The invariant is held instead by the two functions that touch it, both of
+    /// which are given the same `elapsed` every other rung is.
     unreadable_since: Option<std::time::Duration>,
 }
 
@@ -884,6 +893,11 @@ impl StopVerification {
     /// Observe one authoritative message-history snapshot. `elapsed` is supplied
     /// by the caller so the policy is testable without sleeping: every change
     /// starts a fresh quiet window, and equal point samples alone prove nothing.
+    ///
+    /// It closes the *unreadable* window as well as advancing the quiet one,
+    /// because reaching here at all is the history having answered — see
+    /// [`StopVerification::should_abandon`], whose rung is about an unbroken run
+    /// of snapshots that did not.
     fn observe(&mut self, signature: &str, elapsed: std::time::Duration) -> StopObservation {
         // Reaching here at all means the history answered, which reopens the
         // unreadable window: only an *unbroken* run of failures abandons.
@@ -908,8 +922,20 @@ impl StopVerification {
         self.changing_samples > 0 && elapsed >= STOP_ESCALATION_WINDOW
     }
 
-    /// Record one history snapshot that could not be read at all, and say
-    /// whether the ladder has run out of rungs.
+    /// Record one history snapshot that could not be read at all, opening the
+    /// unreadable window if this is the first of a run.
+    ///
+    /// A recorder only, like [`StopVerification::observe`] beside it: what a run
+    /// of failures then *means* is [`StopVerification::should_abandon`]'s to
+    /// say, the same way [`StopVerification::should_escalate`] answers for
+    /// `observe`. Keeping the two apart is what lets the caller record every
+    /// unreadable sample while asking about the verdict only where it has one to
+    /// act on.
+    fn observe_unreadable(&mut self, elapsed: std::time::Duration) {
+        self.unreadable_since.get_or_insert(elapsed);
+    }
+
+    /// Whether the ladder has run out of rungs.
     ///
     /// A history that never answers can never close the quiet window and can
     /// never show the changed output an escalation needs, so supervision on
@@ -919,9 +945,9 @@ impl StopVerification {
     /// verification, and the caller settles the stopped turn as interrupted.
     /// The first failure in a run never abandons, so a stop cannot be
     /// abandoned on a single answer.
-    fn abandon_verification(&mut self, elapsed: std::time::Duration) -> bool {
-        let since = *self.unreadable_since.get_or_insert(elapsed);
-        elapsed.saturating_sub(since) >= STOP_ESCALATION_WINDOW
+    fn should_abandon(&self, elapsed: std::time::Duration) -> bool {
+        self.unreadable_since
+            .is_some_and(|since| elapsed.saturating_sub(since) >= STOP_ESCALATION_WINDOW)
     }
 
     /// The last message count worth naming in a diagnostic. `unknown` until a
@@ -1655,7 +1681,19 @@ impl OpenCode {
         after
     }
 
-    /// The row this provider part already has in the transcript, if it has one.
+    /// The name a later pass can find this provider part's row by, if the part
+    /// is the sort that has one.
+    ///
+    /// **The two arms answer to different standards, and deliberately.** A text
+    /// part answers only once laplus has *drawn* it, because its identity is a
+    /// laplus message id that does not exist before then — `emitted_parts` is
+    /// the record of that minting and the only place the id can be read from. A
+    /// tool part answers with the provider's own call id, which exists whether
+    /// or not a row does. Checking drawnness there would need a second index of
+    /// which calls reached the work log, and would buy nothing: the fold
+    /// resolves an anchor against the transcript, and one that names no row
+    /// leaves the block appended — which is where a block with nothing drawn
+    /// after it belongs anyway.
     fn drawn_as(&self, part: &Value) -> Option<crate::threads::Anchor> {
         match part.get("type").and_then(Value::as_str)? {
             "text" => {
@@ -3048,7 +3086,7 @@ impl crate::session::Driver for OpenCode {
             Ok(messages) => messages,
             Err(error) => {
                 let elapsed = self.stop_verification.started_at.elapsed();
-                let abandon = self.stop_verification.abandon_verification(elapsed);
+                self.stop_verification.observe_unreadable(elapsed);
                 let count = self.stop_verification.reported_count();
                 if !self.stop_verification.reconciliation_error_reported {
                     self.stop_verification.reconciliation_error_reported = true;
@@ -3057,7 +3095,7 @@ impl crate::session::Driver for OpenCode {
                         self.instance_id, self.session_id,
                     ));
                 }
-                if !abandon {
+                if !self.stop_verification.should_abandon(elapsed) {
                     return InterruptReconciliation::Pending;
                 }
                 // The failure was reported once and is still on the thread; what
@@ -3477,17 +3515,25 @@ mod tests {
         let mut verification = StopVerification::default();
 
         assert!(
-            !verification.abandon_verification(std::time::Duration::ZERO),
+            !verification.should_abandon(std::time::Duration::ZERO),
+            "a history nobody has failed to read is not a run of failures"
+        );
+        verification.observe_unreadable(std::time::Duration::ZERO);
+        assert!(
+            !verification.should_abandon(std::time::Duration::ZERO),
             "one unreadable answer is not a window"
         );
-        assert!(!verification.abandon_verification(std::time::Duration::from_secs(7)));
-        assert!(verification.abandon_verification(STOP_ESCALATION_WINDOW));
+        verification.observe_unreadable(std::time::Duration::from_secs(7));
+        assert!(!verification.should_abandon(std::time::Duration::from_secs(7)));
+        verification.observe_unreadable(STOP_ESCALATION_WINDOW);
+        assert!(verification.should_abandon(STOP_ESCALATION_WINDOW));
 
         let mut recovered = StopVerification::default();
-        recovered.abandon_verification(std::time::Duration::ZERO);
+        recovered.observe_unreadable(std::time::Duration::ZERO);
         recovered.observe("readable again", std::time::Duration::from_secs(7));
+        recovered.observe_unreadable(STOP_ESCALATION_WINDOW);
         assert!(
-            !recovered.abandon_verification(STOP_ESCALATION_WINDOW),
+            !recovered.should_abandon(STOP_ESCALATION_WINDOW),
             "a history that answered restarts the unreadable window"
         );
     }
