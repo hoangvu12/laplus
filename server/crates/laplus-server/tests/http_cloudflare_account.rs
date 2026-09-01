@@ -473,8 +473,21 @@ async fn the_fixture_answers_every_command_a_dedicated_tunnel_needs() {
         }
     };
     let origincert = fake.certificate.to_string_lossy().to_string();
+    // `--config`, for the same reason `--origincert` is here: the shape a real
+    // account command takes is what this pins, and `Account::consented_command`
+    // passes one on every single call. In laplus's own directory rather than
+    // cloudflared's — which is what the flag is *for*, and what the fixture
+    // asserts by refusing a config that sits beside the certificate.
+    let config = directory.path().join("private").join("account.yml");
+    let config = config.to_string_lossy().to_string();
     let argv = |rest: &[&str]| {
-        let mut arguments = vec!["tunnel".to_string(), "--origincert".into(), origincert.clone()];
+        let mut arguments = vec![
+            "tunnel".to_string(),
+            "--config".into(),
+            config.clone(),
+            "--origincert".into(),
+            origincert.clone(),
+        ];
         arguments.extend(rest.iter().map(|word| word.to_string()));
         arguments
     };
@@ -553,15 +566,24 @@ async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
     );
 
     // There is no such verb, and the fixture must not invent one. Invoked in
-    // exactly the shape a real `route dns` takes — `--origincert` and all — so
-    // that what is refused is the *verb* and not a malformed argument list; the
-    // first version of this test passed because it omitted `--origincert`, and
-    // would have gone on passing if the fixture had grown a `delete` branch.
+    // exactly the shape a real `route dns` takes — `--origincert`, `--config`
+    // and all — so that what is refused is the *verb* and not a malformed
+    // argument list; the first version of this test passed because it omitted
+    // `--origincert`, and would have gone on passing if the fixture had grown a
+    // `delete` branch. `--config` joined that shape when
+    // `Account::consented_command` started passing one on every call, and this
+    // test kept the old argv — which the fixture then refused, on Linux only,
+    // because the whole file is `cfg(unix)`.
     std::env::set_var("TUNNEL_ORIGIN_CERT", &fake.certificate);
     std::fs::write(&fake.certificate, CERTIFICATE).unwrap();
     let origincert = fake.certificate.to_string_lossy().to_string();
+    let config = directory.path().join("private").join("account.yml");
+    let config = config.to_string_lossy().to_string();
     let created = tokio::process::Command::new(&fake.executable)
-        .args(["tunnel", "--origincert", &origincert, "route", "dns", "t", "laplus.example.com"])
+        .args([
+            "tunnel", "--config", &config, "--origincert", &origincert, "route", "dns", "t",
+            "laplus.example.com",
+        ])
         .env("TUNNEL_ORIGIN_CERT", &fake.certificate)
         .output()
         .await
@@ -572,7 +594,10 @@ async fn deleting_a_dns_record_is_an_api_call_the_cli_cannot_make() {
         String::from_utf8_lossy(&created.stderr)
     );
     let attempted = tokio::process::Command::new(&fake.executable)
-        .args(["tunnel", "--origincert", &origincert, "route", "dns", "delete", "laplus.example.com"])
+        .args([
+            "tunnel", "--config", &config, "--origincert", &origincert, "route", "dns", "delete",
+            "laplus.example.com",
+        ])
         .env("TUNNEL_ORIGIN_CERT", &fake.certificate)
         .output()
         .await
