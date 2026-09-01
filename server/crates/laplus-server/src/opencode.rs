@@ -852,6 +852,16 @@ enum StopObservation {
     Quiet,
 }
 
+/// How many retired provider messages are remembered at once.
+///
+/// Bounded on purpose, and generously: a runaway is *one* message, and the turn
+/// that retires it is the turn before the one it would leak into, so the set
+/// that matters is small and recent. Sixty-four short ids is a few kilobytes
+/// and spans far more settled turns than a leak has ever needed, where an
+/// unbounded set would grow for the life of a conversation in order to answer a
+/// question about its last few turns.
+const RETIRED_MESSAGE_MEMORY: usize = 64;
+
 const STOP_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 const STOP_ESCALATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -943,6 +953,13 @@ pub(crate) struct OpenCode {
     /// map because settlement closes the parts in the order they were first
     /// spoken, and that order is the transcript's.
     emitted_parts: Vec<(String, EmittedPart)>,
+    /// The provider messages the turn in flight has heard from. Emptied into
+    /// [`OpenCode::retired_messages`] by every settlement — see
+    /// [`OpenCode::retire`].
+    turn_messages: Vec<String>,
+    /// The provider messages that may never speak into this conversation again,
+    /// newest last. See [`OpenCode::retire`].
+    retired_messages: std::collections::VecDeque<String>,
     stop_verification: StopVerification,
     ignore_idle_until_busy: bool,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
@@ -1507,6 +1524,26 @@ fn event_session(properties: &Value) -> Option<&str> {
         })
 }
 
+/// The provider **message** an event is about, in whichever of the three shapes
+/// OpenCode says it — a nested part, a flattened part or delta, or a message's
+/// own `info`. `None` for the events that are about a session rather than a
+/// message, which is what leaves `session.idle`, `session.error`, the status
+/// events and the permission exchange outside the retirement rule entirely.
+///
+/// `role` is what tells a message's `info` from a session's: both carry an `id`
+/// and only one of them is a message.
+fn event_message(properties: &Value) -> Option<&str> {
+    if let Some(id) = properties
+        .pointer("/part/messageID")
+        .or_else(|| properties.get("messageID"))
+        .and_then(Value::as_str)
+    {
+        return Some(id);
+    }
+    let info = properties.get("info").unwrap_or(properties);
+    info.get("role").and(info.get("id")).and_then(Value::as_str)
+}
+
 /// Stable evidence of assistant output for stop verification. Provider status
 /// is deliberately absent: a fake-idle response must not prove quiescence.
 fn assistant_output_signature(messages: &Value) -> String {
@@ -1526,6 +1563,55 @@ impl OpenCode {
     fn assistant_role(&self, properties: &Value) -> Option<bool> {
         let message_id = properties.get("messageID").and_then(Value::as_str)?;
         self.roles.get(message_id).map(|role| role == "assistant")
+    }
+
+    /// Forget a provider message, and refuse everything it says from here on.
+    ///
+    /// **A turn that has ended cannot be spoken into**, and that has to be
+    /// enforced rather than assumed, because none of this driver's settlements
+    /// kills anything. An abort may have been ignored, an escalation may have
+    /// been abandoned, an external server is never ours to kill at all — and
+    /// through every one of those the event subscription stays open on a session
+    /// whose provider is still producing. [`OpenCode::settle`] clears
+    /// `emitted_parts`, so without this rule the runaway's next part looks like a
+    /// part nobody has drawn, and the next turn is what it would be drawn into:
+    /// story 10 of `.scratch/opencode-correctness/spec.md` — "stale output
+    /// cannot keep flowing into the conversation afterwards" — defeated by a
+    /// different door than the one the quiescence proof guards.
+    ///
+    /// Two rules feed it, and between them they cover the two shapes a late part
+    /// takes. A message the settled turn heard from is retired *by* that
+    /// settlement, which catches the runaway whose next part races the follow-up
+    /// prompt that settlement releases. A message first heard from while no turn
+    /// is driving is retired where it is heard, because nothing that arrives
+    /// before the developer has asked for the next turn can belong to it.
+    ///
+    /// **What is not claimed.** A provider that mints a *wholly new* assistant
+    /// message after the settlement and after the next prompt has gone out is
+    /// indistinguishable on the wire from the next turn answering, and no rule
+    /// here can tell those apart. What is closed is every late part of a message
+    /// this conversation has already heard from, or could have.
+    fn retire(&mut self, message_id: String) {
+        if self.retired(&message_id) {
+            return;
+        }
+        if self.retired_messages.len() >= RETIRED_MESSAGE_MEMORY {
+            self.retired_messages.pop_front();
+        }
+        self.retired_messages.push_back(message_id);
+    }
+
+    /// Whether this provider message has been retired — see [`OpenCode::retire`].
+    fn retired(&self, message_id: &str) -> bool {
+        self.retired_messages.iter().any(|known| known == message_id)
+    }
+
+    /// Remember that the turn in flight has heard from a provider message, so
+    /// that settling the turn retires it.
+    fn note_turn_message(&mut self, message_id: &str) {
+        if !self.turn_messages.iter().any(|known| known == message_id) {
+            self.turn_messages.push(message_id.to_string());
+        }
     }
 
     /// This part's emission state, created at the end of the first-emission
@@ -2380,6 +2466,14 @@ impl OpenCode {
             return Default::default();
         };
         let interrupted = finished.was_stopped();
+        // Whatever this turn heard from cannot speak into the next one. The
+        // provider may well still be producing — an abort this driver never
+        // proved, an escalation it abandoned, an external server it may not kill
+        // — and the subscription stays open through all of it. See
+        // [`OpenCode::retire`].
+        for message_id in std::mem::take(&mut self.turn_messages) {
+            self.retire(message_id);
+        }
         self.settled = true;
         self.ignore_idle_until_busy = true;
         let mut changes = Vec::new();
@@ -2556,6 +2650,8 @@ impl crate::session::Driver for OpenCode {
                 pending_parts: HashMap::new(),
                 pending_deltas: HashMap::new(),
                 emitted_parts: Vec::new(),
+                turn_messages: Vec::new(),
+                retired_messages: std::collections::VecDeque::new(),
                 stop_verification: StopVerification::default(),
                 ignore_idle_until_busy: false,
                 pending_permissions: HashMap::new(),
@@ -2615,6 +2711,24 @@ impl crate::session::Driver for OpenCode {
             return Some(decided);
         }
         let mut decided = crate::session::Decided::default();
+        // The one place either half of the retirement rule is applied, so that a
+        // part, a delta, a tool row and a token count all obey it at once.
+        // [`OpenCode::retire`] carries the reasoning.
+        if let Some(message_id) = event_message(&envelope.properties) {
+            if self.retired(message_id) {
+                return Some(decided);
+            }
+            let message_id = message_id.to_string();
+            if driving.turn.is_some() {
+                self.note_turn_message(&message_id);
+            } else {
+                // Retired but still handled: this event is the last one this
+                // message is heard on, and dropping it as well would change what
+                // a settled turn's own trailing events do today for no gain —
+                // `emit_text` already mints nothing without a turn.
+                self.retire(message_id);
+            }
+        }
         match envelope.kind.as_str() {
             "message.updated" => {
                 let info = envelope
@@ -3009,9 +3123,25 @@ impl crate::session::Driver for OpenCode {
         // have, and [`crate::threads::Change::AssistantBlockRecovered`] is where
         // that becomes a `createdAt`.
         let mut extended = crate::session::Decided::default();
-        if let Some(parts) = messages
+        let recovered = messages
             .as_array()
-            .and_then(|messages| messages.iter().rev().find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")))
+            .and_then(|messages| messages.iter().rev().find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")));
+        // History is kept by session rather than by turn, so its newest
+        // assistant message can be one an earlier turn already settled — and
+        // merging that would leak it into this turn by the REST route rather
+        // than the stream one. Naming it as this turn's where it *is* this
+        // turn's is the other half: a runaway whose parts the stream never
+        // delivered is still retired by this turn's settlement.
+        let recovered_id = recovered
+            .and_then(|message| message.pointer("/info/id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let leaked = recovered_id.as_deref().is_some_and(|id| self.retired(id));
+        if let Some(id) = recovered_id.filter(|_| !leaked) {
+            self.note_turn_message(&id);
+        }
+        if let Some(parts) = recovered
+            .filter(|_| !leaked)
             .and_then(|message| message.get("parts"))
             .and_then(Value::as_array)
         {

@@ -623,6 +623,17 @@ struct PeerState {
     /// A provider that thinks for a moment after a tool returns is the ordinary
     /// case and gives one.
     lost_middle: bool,
+    /// The runaway. Nothing laplus does to an external server stops it, so when
+    /// the *next* prompt arrives this peer is still writing the message of the
+    /// turn that was stopped — an already-drawn part growing, and a part laplus
+    /// has never seen — and it says so on the subscription that was never
+    /// closed.
+    ///
+    /// **Written from inside the prompt handler on purpose.** Laplus awaits the
+    /// prompt response before it reads a single event, so everything queued here
+    /// is read *after* the later turn is in flight. That is the race the leak
+    /// needs, made a certainty instead of a coin toss.
+    speaks_after_the_stop: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -910,6 +921,23 @@ async fn prompt(
     );
     let prompt_number = state.prompts.fetch_add(1, Ordering::SeqCst) + 1;
     if prompt_number > 1 {
+        if state.speaks_after_the_stop {
+            let sender = state.subscriber.lock().expect("subscriber lock").clone()
+                .expect("event subscription outlives the turn it was opened for");
+            for event in [
+                // The part the developer already read, longer than they read it.
+                "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"hello from OpenCode, and still going\"}}}\n\n",
+                // A part laplus has never seen, on the same abandoned message.
+                "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"text-runaway\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
+                "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"text-runaway\",\"field\":\"text\",\"delta\":\"a sentence from the turn you stopped\"}}\n\n",
+                // The drain marker: a reader that has seen this title knows every
+                // event above it was delivered and folded first. It names no
+                // message, so no rule about messages can drop it.
+                "data: {\"type\":\"session.updated\",\"properties\":{\"info\":{\"id\":\"ses_owned_1\",\"title\":\"Runaway marker\"}}}\n\n",
+            ] {
+                sender.send(Ok(event.to_string())).await.expect("send scripted runaway SSE event");
+            }
+        }
         return if state.fail_followup_prompt {
             StatusCode::INTERNAL_SERVER_ERROR
         } else {
@@ -1519,6 +1547,27 @@ impl ExternalOpenCode {
             idle_release: Some(idle_release),
             text_parts: true,
             lost_middle: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// A provider that ignores the stop, never answers for its own history, and
+    /// is still writing the abandoned turn's message when the next prompt
+    /// arrives. Every half of the leak in one peer.
+    ///
+    /// `idle_release` is never fired by the test that uses this: an idle would
+    /// be a settlement the ladder did not have to reach for, and the rung under
+    /// test is the one that settles a turn nothing can prove quiet.
+    async fn speaking_after_an_abandoned_stop(idle_release: Arc<Notify>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(idle_release),
+            fail_reconciliation: true,
+            speaks_after_the_stop: true,
             ..Default::default()
         };
         Self::serving(directory, log, state).await
@@ -2246,6 +2295,78 @@ async fn failed_interrupt_reconciliation_is_reported_once_and_later_turns_still_
     client.close().await;
     server.stop().await;
     peer.task.abort();
+}
+
+/// Output from a turn the ladder gave up on reaches no later turn.
+///
+/// Story 10 of `.scratch/opencode-correctness/spec.md`: a stop settles "only
+/// once the provider has actually gone quiet, so that stale output cannot keep
+/// flowing into the conversation afterwards" — and the terminal rung settles a
+/// turn that was never proved quiet, on purpose, because the alternative is a
+/// conversation wedged for ever. So the honesty of that rung rests entirely on
+/// this: the runaway it leaves running must not be able to speak again.
+///
+/// Nothing here is killed. The abort was accepted and ignored, the history
+/// answers 500 to every sample so no proof can ever arrive, the server is
+/// external and never ours to kill, and the event subscription is the same one
+/// it always was. The peer therefore writes two more parts of the *abandoned*
+/// turn's message — one part the developer already read, one they never saw —
+/// from inside the second prompt's handler, which is what guarantees laplus
+/// reads them with the later turn in flight rather than between turns.
+///
+/// Story 11 is why that ordering is the real case rather than a contrived one:
+/// a queued prompt is "held until the stopped turn has provably ended", so the
+/// settlement is exactly what releases the follow-up into the runaway's path.
+#[tokio::test]
+async fn an_abandoned_runaway_speaks_into_no_later_turn() {
+    // Never fired: see the peer's constructor.
+    let never = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::speaking_after_an_abandoned_stop(Arc::clone(&never)).await;
+    let workspace = Workspace::with(&["src/"]);
+    let server = TestServer::start_with(peer.config(None)).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("runaway-project", workspace.path())).await.expect_success();
+    let mut create = create_thread("runaway-project", "runaway-thread");
+    create["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", create).await.expect_success();
+    let subscription = client.watch_conversation("runaway-thread").await;
+    let mut a = start_turn("runaway-thread", "runaway-a", "A");
+    a["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", a).await.expect_success();
+    let events = client.events_until_streaming(&subscription).await;
+    let stopped_turn = last_session(&events, "running before the stop")["payload"]["session"]
+        ["activeTurnId"].as_str().expect("the turn about to be stopped").to_string();
+    client.call("orchestration.dispatchCommand", interrupt_turn("runaway-thread", Some(&stopped_turn))).await.expect_success();
+    // The ladder's last rung, reached rather than assumed: no idle is ever sent
+    // and no history sample ever answers, so nothing but abandonment can settle
+    // this turn.
+    client.events_through_the_turn(&subscription).await;
+    let abandoned = server.connect().await.into_thread_snapshot("runaway-thread").await;
+    assert_eq!(abandoned["thread"]["latestTurn"]["state"], "interrupted");
+
+    let mut b = follow_up("runaway-thread", "runaway-b", "B");
+    b["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
+    client.call("orchestration.dispatchCommand", b).await.expect_success();
+    client.values_until(&subscription, |item| {
+        item["event"]["type"] == "thread.meta-updated"
+            && item["event"]["payload"]["title"] == "Runaway marker"
+    }).await;
+
+    let after = server.connect().await.into_thread_snapshot("runaway-thread").await;
+    let assistant = after["thread"]["messages"].as_array().expect("the transcript")
+        .iter().filter(|message| message["role"] == "assistant").collect::<Vec<_>>();
+    assert_eq!(
+        assistant.iter().map(|message| message["text"].as_str().unwrap_or_default()).collect::<Vec<_>>(),
+        vec!["hello from OpenCode"],
+        "the stopped turn keeps what it held and the runaway adds nothing"
+    );
+    for message in &assistant {
+        assert_eq!(
+            message["turnId"].as_str(),
+            Some(stopped_turn.as_str()),
+            "an assistant row was minted into a turn the provider was never answering"
+        );
+    }
 }
 
 #[tokio::test]
