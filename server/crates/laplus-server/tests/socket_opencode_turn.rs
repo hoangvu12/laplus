@@ -605,6 +605,13 @@ struct PeerState {
     /// The first two reconciliation snapshots pause, the third contains new
     /// output, proving that equal point samples were not quiescence.
     output_changes_during_stop: bool,
+    /// The provider's authoritative history holds more of the turn than the
+    /// event stream ever delivered: the block that was streaming completed,
+    /// two further blocks were spoken after the tool call, and an earlier
+    /// block reads differently there than what the developer was shown. Every
+    /// snapshot is identical, so reconciliation reads the same history several
+    /// times over before it proves quiet.
+    lost_suffix: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -795,6 +802,29 @@ async fn session_messages(
     if state.fail_reconciliation {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    // The whole turn as the provider kept it, which is more than the stream
+    // delivered. Deliberately awkward in the same way the SSE script is: the
+    // first block reads differently here than what was shown, the tool part
+    // sits between the blocks it was spoken between, and the two trailing
+    // blocks were never streamed at all. Every request answers identically —
+    // stability is what the quiet window is measuring, and it is also what
+    // makes repeated reads of one history a test of idempotence.
+    if state.lost_suffix {
+        state.message_snapshots.fetch_add(1, Ordering::SeqCst);
+        return Ok(Json(json!([
+            {"info":{"id":"message-0","role":"user"},"parts":[
+                {"id":"prt-prompt","type":"text","text":"look around"}
+            ]},
+            {"info":{"id":"message-1","role":"assistant"},"parts":[
+                {"id":"prt-a","type":"text","text":"Reading the forest first. "},
+                {"id":"prt-tool","type":"tool","callID":"call-parts-1","tool":"bash",
+                 "state":{"status":"completed","input":{"command":"ls -1"},"title":"ls -1","output":"src"}},
+                {"id":"prt-b","type":"text","text":"The tree holds eleven files."},
+                {"id":"prt-d","type":"text","text":"Then I looked again."},
+                {"id":"prt-e","type":"text","text":"Nothing else to add."}
+            ]}
+        ])));
+    }
     let snapshot = state.message_snapshots.fetch_add(1, Ordering::SeqCst) + 1;
     let text = if state.output_changes_during_stop && snapshot >= 3 {
         format!("output snapshot {snapshot}")
@@ -913,6 +943,18 @@ async fn prompt(
         let finish = async move {
             if let Some(release) = &state.idle_release {
                 release.notified().await;
+            }
+            // A recovered stream re-delivers exactly the blocks reconciliation
+            // had already taken from history. One copy of each is the whole
+            // claim: a merge that ran and a replay that follows it must not
+            // between them put a block on screen twice.
+            if state.lost_suffix {
+                for event in [
+                    "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-d\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"Then I looked again.\"}}}\n\n",
+                    "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-e\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"Nothing else to add.\"}}}\n\n",
+                ] {
+                    sender.send(Ok(event.to_string())).await.expect("send replayed text-part SSE event");
+                }
             }
             for event in [
                 "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"The tree holds eleven files.\"}}}\n\n",
@@ -1397,6 +1439,29 @@ impl ExternalOpenCode {
             healthy: true,
             idle_release,
             text_parts: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// The same interleaved narration, streamed only as far as the second
+    /// block's first delta — and a provider history that holds the rest of the
+    /// turn the stream never delivered.
+    ///
+    /// What a developer meets when the event stream dies mid-turn and the stop
+    /// that follows has to recover the transcript from `session.messages`
+    /// alone. The gate is held throughout, so nothing but reconciliation can
+    /// account for what appears; releasing it afterwards replays the recovered
+    /// blocks back down the stream.
+    async fn narrating_past_a_lost_suffix(idle_release: Arc<Notify>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(idle_release),
+            text_parts: true,
+            lost_suffix: true,
             ..Default::default()
         };
         Self::serving(directory, log, state).await
@@ -4897,8 +4962,22 @@ async fn start_text_parts_turn(
     peer: &ExternalOpenCode,
     suffix: &str,
 ) -> (Workspace, TestServer, SocketClient, String) {
+    start_text_parts_turn_at(peer, suffix, None).await
+}
+
+/// The same, optionally on a database that outlives the server, so the settled
+/// transcript can be read again after a full reload.
+async fn start_text_parts_turn_at(
+    peer: &ExternalOpenCode,
+    suffix: &str,
+    database: Option<&Path>,
+) -> (Workspace, TestServer, SocketClient, String) {
     let workspace = Workspace::with(&["src/"]);
-    let server = TestServer::start_with(peer.config(None)).await;
+    let config = peer.config(None);
+    let server = match database {
+        Some(database) => TestServer::start_at_with_config(database, config).await,
+        None => TestServer::start_with(config).await,
+    };
     let mut client = server.connect().await;
     client
         .call(
@@ -5150,6 +5229,217 @@ async fn interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrive
         "interrupted"
     );
     assert_eq!(assistant_texts(&after_the_fact), assistant_texts(&interrupted));
+    client.close().await;
+    server.stop().await;
+    peer.task.abort();
+}
+
+/// A recovered transcript reads like a live one: the block that was cut off
+/// closes with the rest of what it said, the blocks the stream never delivered
+/// arrive as rows of their own in provider order below the tool call, and what
+/// was already on screen is left exactly as the developer read it.
+///
+/// The stream stops after the second block's first delta and no idle ever
+/// arrives, so the bounded interrupt reconciliation is the only thing that can
+/// account for anything beyond it. The history it reads holds more of the turn
+/// than the stream delivered — and disagrees with the stream about the first
+/// block, which is the one thing it is not allowed to act on.
+#[tokio::test]
+async fn opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::narrating_past_a_lost_suffix(Arc::clone(&idle_release)).await;
+    let registry = tempfile::tempdir().unwrap();
+    let database = registry.path().join("registry.sqlite");
+    let (_workspace, server, mut client, subscription) =
+        start_text_parts_turn_at(&peer, "lost-suffix", Some(&database)).await;
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "running the turn whose stream was lost")["payload"]
+        ["session"]["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("parts-thread-lost-suffix", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+    let events = client.events_through_the_turn(&subscription).await;
+
+    // The identity the merge turns on: the cut-off block's message, minted at
+    // its first delta while the stream was alive.
+    let partial = events
+        .iter()
+        .find(|item| {
+            item["event"]["type"] == "thread.message-sent"
+                && item["event"]["payload"]["text"] == "The tree holds "
+        })
+        .expect("the block that was streaming when the stream died")["event"]["payload"]
+        ["messageId"]
+        .as_str()
+        .expect("the streamed block's message id")
+        .to_string();
+
+    let interrupted = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-lost-suffix")
+        .await;
+    assert_eq!(interrupted["thread"]["latestTurn"]["state"], "interrupted");
+    assert_eq!(
+        assistant_texts(&interrupted),
+        vec![
+            // Byte-identical to what was on screen. History reads
+            // "Reading the forest first. " for this part; a snapshot that
+            // disagrees may not retract words the developer has already read.
+            "Reading the tree first. ".to_string(),
+            // Extended by exactly the suffix the stream never delivered.
+            "The tree holds eleven files.".to_string(),
+            // Never streamed at all: each its own row, in provider order.
+            "Then I looked again.".to_string(),
+            "Nothing else to add.".to_string(),
+        ],
+        "the recovered turn reads as the provider spoke it"
+    );
+    let rows = interrupted["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .map(|message| {
+            (
+                message["id"].as_str().unwrap().to_string(),
+                message["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows[1],
+        (partial, "The tree holds eleven files.".to_string()),
+        "the cut-off block closes under the identity it streamed with"
+    );
+
+    // Placement. The rows the merge invented are below the tool call they were
+    // spoken after, and in the order history lists them — not appended to the
+    // block that had been speaking before the call.
+    let position = |wanted: &dyn Fn(&Value) -> bool| {
+        events
+            .iter()
+            .position(|item| wanted(item))
+            .expect("the event a placement assertion turns on")
+    };
+    let said = |text: &'static str| {
+        move |item: &Value| {
+            item["event"]["type"] == "thread.message-sent"
+                && item["event"]["payload"]["text"] == text
+        }
+    };
+    let tool_row = position(&|item| {
+        item["event"]["payload"]["activity"]["payload"]["data"]["toolCallId"] == "call-parts-1"
+    });
+    let looked_again = position(&said("Then I looked again."));
+    let nothing_else = position(&said("Nothing else to add."));
+    assert!(
+        tool_row < looked_again,
+        "a block spoken after the tool call reads below it"
+    );
+    assert!(
+        looked_again < nothing_else,
+        "blocks absent locally are inserted in provider order"
+    );
+
+    client.close().await;
+    server.stop().await;
+
+    // Ordinals: a full reload reads the recovered transcript in the live order.
+    let restarted = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let reloaded = restarted
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-lost-suffix")
+        .await;
+    assert_eq!(assistant_texts(&reloaded), assistant_texts(&interrupted));
+    restarted.stop().await;
+    peer.task.abort();
+}
+
+/// Reconciliation reads one unchanging history several times before it will
+/// call the provider quiet, and leaves one copy of each block for it — and a
+/// stream that comes back afterwards and replays the very blocks the merge
+/// recovered does not add a second copy either.
+#[tokio::test]
+async fn opencode_reconcile_leaves_one_copy_of_each_block_however_often_it_reads() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::narrating_past_a_lost_suffix(Arc::clone(&idle_release)).await;
+    let (_workspace, server, mut client, subscription) =
+        start_text_parts_turn(&peer, "twice").await;
+    let before = client.events_until_streaming(&subscription).await;
+    let turn_id = last_session(&before, "running the turn reconciled twice")["payload"]["session"]
+        ["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("parts-thread-twice", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    // Quiescence is proven across snapshots, so the same history was addressed
+    // more than once before anything was taken out of it. The turn has settled
+    // by now, so the log holds every read it took.
+    let reads = peer
+        .requests_through(5)
+        .await
+        .into_iter()
+        .filter(|request| request["operation"] == "messages")
+        .count();
+    assert!(
+        reads >= 2,
+        "one history, read {reads} times over while the quiet window ran"
+    );
+    let merged = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-twice")
+        .await;
+    assert_eq!(
+        assistant_texts(&merged),
+        vec![
+            "Reading the tree first. ".to_string(),
+            "The tree holds eleven files.".to_string(),
+            "Then I looked again.".to_string(),
+            "Nothing else to add.".to_string(),
+        ],
+        "repeated reads of one history leave one copy of each block"
+    );
+
+    // The stream comes back and re-delivers what the merge already recovered.
+    // The drain marker proves every replayed event was handled first.
+    idle_release.notify_one();
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.meta-updated"
+                && item["event"]["payload"]["title"] == "Late marker"
+        })
+        .await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let replayed = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-twice")
+        .await;
+    assert_eq!(
+        assistant_texts(&replayed),
+        assistant_texts(&merged),
+        "a replayed block is still one block"
+    );
     client.close().await;
     server.stop().await;
     peer.task.abort();
