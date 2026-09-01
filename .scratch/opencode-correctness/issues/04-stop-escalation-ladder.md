@@ -75,5 +75,5 @@ reads as today. What is missing is the second half: a permanently unreadable
 history must eventually settle the stopped turn as interrupted while still
 reporting the failure, so that supervision does not become the wedge it was
 meant to prevent. That is a policy decision for this ticket, so the box is
-unchecked and the status returns to `ready-for-agent` rather than being
+unchecked and the status returns to `needs-triage` rather than being
 silently left as proven.

@@ -23,7 +23,7 @@ history against a single accumulated string; here it addresses parts instead.
       retract on-screen text (existing rule preserved, now per part).
 - [ ] Reconcile is idempotent: running it twice against the same history
       produces one copy of each block.
-- [x] Parts absent locally are inserted in provider order between existing
+- [ ] Parts absent locally are inserted in provider order between existing
       rows; ordinals keep reload consistent with live.
 - [x] An interrupted turn whose partial last block gains a REST suffix closes
       with the extended text under the same part identity.
@@ -159,3 +159,12 @@ loopback (`AddrNotAvailable`, 10049); and the three owned-server reaping tests â
 `project_closure_reaps_its_threads_live_owned_opencode_server` â€” all pass when
 run as their own invocation, which is the process-double interference this
 ticket's previous comment already describes.
+
+2026-09-01, on the fourth box: unchecked after all. The comment above states the
+limit plainly -- a recovered row's `createdAt` is minted at merge time, so it can
+only sort after every row already on screen -- and this criterion asks for
+insertion _between existing rows_. Provider order below the tool call is proved,
+live and across a reload, and so is the ordinal half. Interleaving above a row
+already drawn is not, because the design appends. Leaving the box checked on the
+strength of the half that holds would repeat the error this branch corrects in
+ticket 04, so it comes off, and what is proved stays written down above.
