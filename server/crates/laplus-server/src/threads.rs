@@ -204,7 +204,7 @@ pub mod fold;
 // `docs/adr/0025`; the paths callers use are deliberately unchanged by it.
 pub use fold::{
     checkpoint_status, fresh_activity_id, fresh_message_id, fresh_turn_id, settled_override, tone,
-    Activity, Adoption, Attention, Busy, Change, ChatAttachment, Checkpoint, Conversation, Given, LatestTurn,
+    Activity, Adoption, Anchor, Attention, Busy, Change, ChatAttachment, Checkpoint, Conversation, Given, LatestTurn,
     Lifecycle, TitleRegeneration, Woken,
     Message, MetaUpdate, Reconciled, Rendered, Session, Shelf, Thread, ThreadRow, TurnState, ACTIVE,
     BY_ACTIVITY, BY_THE_USER, SETTLED,

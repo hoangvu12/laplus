@@ -839,6 +839,19 @@ struct StopVerification {
     external_failure_reported: bool,
     reconciliation_error_reported: bool,
     last_message_count: Option<usize>,
+    /// When the current unbroken run of unreadable history snapshots began.
+    /// `None` whenever the last snapshot was readable, so a transient failure
+    /// only delays the proof rather than counting towards abandoning it.
+    ///
+    /// **Elapsed since [`StopVerification::started_at`], like `quiet_since`
+    /// beside it**, rather than an `Instant` that would carry that invariant in
+    /// its own type. The whole of this policy is driven by an `elapsed` the
+    /// caller supplies precisely so it can be tested without sleeping, and an
+    /// `Instant` here could only be compared against a real clock — which would
+    /// make the terminal rung the one rung of the ladder a test has to wait out.
+    /// The invariant is held instead by the two functions that touch it, both of
+    /// which are given the same `elapsed` every other rung is.
+    unreadable_since: Option<std::time::Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -847,6 +860,16 @@ enum StopObservation {
     Changed,
     Quiet,
 }
+
+/// How many retired provider messages are remembered at once.
+///
+/// Bounded on purpose, and generously: a runaway is *one* message, and the turn
+/// that retires it is the turn before the one it would leak into, so the set
+/// that matters is small and recent. Sixty-four short ids is a few kilobytes
+/// and spans far more settled turns than a leak has ever needed, where an
+/// unbounded set would grow for the life of a conversation in order to answer a
+/// question about its last few turns.
+const RETIRED_MESSAGE_MEMORY: usize = 64;
 
 const STOP_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(4);
 const STOP_ESCALATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
@@ -861,6 +884,7 @@ impl Default for StopVerification {
             external_failure_reported: false,
             reconciliation_error_reported: false,
             last_message_count: None,
+            unreadable_since: None,
         }
     }
 }
@@ -869,7 +893,15 @@ impl StopVerification {
     /// Observe one authoritative message-history snapshot. `elapsed` is supplied
     /// by the caller so the policy is testable without sleeping: every change
     /// starts a fresh quiet window, and equal point samples alone prove nothing.
+    ///
+    /// It closes the *unreadable* window as well as advancing the quiet one,
+    /// because reaching here at all is the history having answered — see
+    /// [`StopVerification::should_abandon`], whose rung is about an unbroken run
+    /// of snapshots that did not.
     fn observe(&mut self, signature: &str, elapsed: std::time::Duration) -> StopObservation {
+        // Reaching here at all means the history answered, which reopens the
+        // unreadable window: only an *unbroken* run of failures abandons.
+        self.unreadable_since = None;
         if self.signature.as_deref() != Some(signature) {
             let changed = self.signature.is_some();
             if changed {
@@ -888,6 +920,42 @@ impl StopVerification {
 
     fn should_escalate(&self, elapsed: std::time::Duration) -> bool {
         self.changing_samples > 0 && elapsed >= STOP_ESCALATION_WINDOW
+    }
+
+    /// Record one history snapshot that could not be read at all, opening the
+    /// unreadable window if this is the first of a run.
+    ///
+    /// A recorder only, like [`StopVerification::observe`] beside it: what a run
+    /// of failures then *means* is [`StopVerification::should_abandon`]'s to
+    /// say, the same way [`StopVerification::should_escalate`] answers for
+    /// `observe`. Keeping the two apart is what lets the caller record every
+    /// unreadable sample while asking about the verdict only where it has one to
+    /// act on.
+    fn observe_unreadable(&mut self, elapsed: std::time::Duration) {
+        self.unreadable_since.get_or_insert(elapsed);
+    }
+
+    /// Whether the ladder has run out of rungs.
+    ///
+    /// A history that never answers can never close the quiet window and can
+    /// never show the changed output an escalation needs, so supervision on
+    /// its own has no terminal condition — which is the wedge. It is bounded
+    /// by the same window that bounds escalation: an unbroken run of
+    /// unreadable snapshots that lasts [`STOP_ESCALATION_WINDOW`] abandons
+    /// verification, and the caller settles the stopped turn as interrupted.
+    /// The first failure in a run never abandons, so a stop cannot be
+    /// abandoned on a single answer.
+    fn should_abandon(&self, elapsed: std::time::Duration) -> bool {
+        self.unreadable_since
+            .is_some_and(|since| elapsed.saturating_sub(since) >= STOP_ESCALATION_WINDOW)
+    }
+
+    /// The last message count worth naming in a diagnostic. `unknown` until a
+    /// snapshot has been read, which is exactly the case a stop that never
+    /// reads one stays in.
+    fn reported_count(&self) -> String {
+        self.last_message_count
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string())
     }
 }
 
@@ -911,6 +979,13 @@ pub(crate) struct OpenCode {
     /// map because settlement closes the parts in the order they were first
     /// spoken, and that order is the transcript's.
     emitted_parts: Vec<(String, EmittedPart)>,
+    /// The provider messages the turn in flight has heard from. Emptied into
+    /// [`OpenCode::retired_messages`] by every settlement — see
+    /// [`OpenCode::retire`].
+    turn_messages: Vec<String>,
+    /// The provider messages that may never speak into this conversation again,
+    /// newest last. See [`OpenCode::retire`].
+    retired_messages: std::collections::VecDeque<String>,
     stop_verification: StopVerification,
     ignore_idle_until_busy: bool,
     pending_permissions: HashMap<String, crate::approval::ApprovalRequest>,
@@ -1475,6 +1550,26 @@ fn event_session(properties: &Value) -> Option<&str> {
         })
 }
 
+/// The provider **message** an event is about, in whichever of the three shapes
+/// OpenCode says it — a nested part, a flattened part or delta, or a message's
+/// own `info`. `None` for the events that are about a session rather than a
+/// message, which is what leaves `session.idle`, `session.error`, the status
+/// events and the permission exchange outside the retirement rule entirely.
+///
+/// `role` is what tells a message's `info` from a session's: both carry an `id`
+/// and only one of them is a message.
+fn event_message(properties: &Value) -> Option<&str> {
+    if let Some(id) = properties
+        .pointer("/part/messageID")
+        .or_else(|| properties.get("messageID"))
+        .and_then(Value::as_str)
+    {
+        return Some(id);
+    }
+    let info = properties.get("info").unwrap_or(properties);
+    info.get("role").and(info.get("id")).and_then(Value::as_str)
+}
+
 /// Stable evidence of assistant output for stop verification. Provider status
 /// is deliberately absent: a fake-idle response must not prove quiescence.
 fn assistant_output_signature(messages: &Value) -> String {
@@ -1496,6 +1591,55 @@ impl OpenCode {
         self.roles.get(message_id).map(|role| role == "assistant")
     }
 
+    /// Forget a provider message, and refuse everything it says from here on.
+    ///
+    /// **A turn that has ended cannot be spoken into**, and that has to be
+    /// enforced rather than assumed, because none of this driver's settlements
+    /// kills anything. An abort may have been ignored, an escalation may have
+    /// been abandoned, an external server is never ours to kill at all — and
+    /// through every one of those the event subscription stays open on a session
+    /// whose provider is still producing. [`OpenCode::settle`] clears
+    /// `emitted_parts`, so without this rule the runaway's next part looks like a
+    /// part nobody has drawn, and the next turn is what it would be drawn into:
+    /// story 10 of `.scratch/opencode-correctness/spec.md` — "stale output
+    /// cannot keep flowing into the conversation afterwards" — defeated by a
+    /// different door than the one the quiescence proof guards.
+    ///
+    /// Two rules feed it, and between them they cover the two shapes a late part
+    /// takes. A message the settled turn heard from is retired *by* that
+    /// settlement, which catches the runaway whose next part races the follow-up
+    /// prompt that settlement releases. A message first heard from while no turn
+    /// is driving is retired where it is heard, because nothing that arrives
+    /// before the developer has asked for the next turn can belong to it.
+    ///
+    /// **What is not claimed.** A provider that mints a *wholly new* assistant
+    /// message after the settlement and after the next prompt has gone out is
+    /// indistinguishable on the wire from the next turn answering, and no rule
+    /// here can tell those apart. What is closed is every late part of a message
+    /// this conversation has already heard from, or could have.
+    fn retire(&mut self, message_id: String) {
+        if self.retired(&message_id) {
+            return;
+        }
+        if self.retired_messages.len() >= RETIRED_MESSAGE_MEMORY {
+            self.retired_messages.pop_front();
+        }
+        self.retired_messages.push_back(message_id);
+    }
+
+    /// Whether this provider message has been retired — see [`OpenCode::retire`].
+    fn retired(&self, message_id: &str) -> bool {
+        self.retired_messages.iter().any(|known| known == message_id)
+    }
+
+    /// Remember that the turn in flight has heard from a provider message, so
+    /// that settling the turn retires it.
+    fn note_turn_message(&mut self, message_id: &str) {
+        if !self.turn_messages.iter().any(|known| known == message_id) {
+            self.turn_messages.push(message_id.to_string());
+        }
+    }
+
     /// This part's emission state, created at the end of the first-emission
     /// order when it is new.
     fn emitted_part_mut(&mut self, part_id: &str) -> &mut EmittedPart {
@@ -1511,11 +1655,90 @@ impl OpenCode {
         emitted
     }
 
+    /// For each part of a provider message, the first row *after* it that laplus
+    /// already has on screen — `None` where nothing after it was ever drawn,
+    /// which is what makes a trailing block belong at the end.
+    ///
+    /// Walked from the end, because a part's answer is the answer of the part
+    /// after it unless that part is itself a row.
+    ///
+    /// **Reasoning is deliberately not an anchor.** Its rows are minted per
+    /// delta and carry no identity a later pass could find, so a block next to
+    /// one anchors on whatever is drawn beyond it instead. Nor is a `task` call,
+    /// which draws a subagent row rather than a tool row — naming one resolves
+    /// to nothing in the fold, and a block that cannot be placed is appended,
+    /// which is where it would have gone anyway.
+    fn rows_after_each(&self, parts: &[Value]) -> Vec<Option<crate::threads::Anchor>> {
+        let mut after = Vec::with_capacity(parts.len());
+        let mut next = None;
+        for part in parts.iter().rev() {
+            after.push(next.clone());
+            if let Some(drawn) = self.drawn_as(part) {
+                next = Some(drawn);
+            }
+        }
+        after.reverse();
+        after
+    }
+
+    /// The name a later pass can find this provider part's row by, if the part
+    /// is the sort that has one.
+    ///
+    /// **The two arms answer to different standards, and deliberately.** A text
+    /// part answers only once laplus has *drawn* it, because its identity is a
+    /// laplus message id that does not exist before then — `emitted_parts` is
+    /// the record of that minting and the only place the id can be read from. A
+    /// tool part answers with the provider's own call id, which exists whether
+    /// or not a row does. Checking drawnness there would need a second index of
+    /// which calls reached the work log, and would buy nothing: the fold
+    /// resolves an anchor against the transcript, and one that names no row
+    /// leaves the block appended — which is where a block with nothing drawn
+    /// after it belongs anyway.
+    fn drawn_as(&self, part: &Value) -> Option<crate::threads::Anchor> {
+        match part.get("type").and_then(Value::as_str)? {
+            "text" => {
+                let id = part
+                    .get("id")
+                    .or_else(|| part.get("partID"))
+                    .and_then(Value::as_str)?;
+                let (_, emitted) = self.emitted_parts.iter().find(|(known, _)| known == id)?;
+                emitted
+                    .message_id
+                    .clone()
+                    .map(crate::threads::Anchor::Message)
+            }
+            "tool" if part.get("tool").and_then(Value::as_str) != Some(TASK_TOOL) => part
+                .get("callID")
+                .and_then(Value::as_str)
+                .map(|call| crate::threads::Anchor::ToolCall(call.to_string())),
+            _ => None,
+        }
+    }
+
     fn emit_text(
         &mut self,
         part_id: &str,
         kind: &str,
         text: &str,
+        driving: &mut crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) {
+        self.emit_text_spoken_before(part_id, kind, text, None, driving, decided);
+    }
+
+    /// [`OpenCodeSession::emit_text`], for text that did not arrive now.
+    ///
+    /// `spoken_before` names the row the provider lists this part immediately
+    /// before, and is spent only if this call is what *mints* the part's message
+    /// — a part already on screen keeps the position it took when it was first
+    /// seen, which is what leaves a recovered turn's existing rows exactly where
+    /// the developer read them.
+    fn emit_text_spoken_before(
+        &mut self,
+        part_id: &str,
+        kind: &str,
+        text: &str,
+        spoken_before: Option<&crate::threads::Anchor>,
         driving: &mut crate::session::Driving,
         decided: &mut crate::session::Decided,
     ) {
@@ -1553,16 +1776,31 @@ impl OpenCode {
         // first emission, because the fold inserts a message where it was first
         // seen — which is exactly what puts post-tool commentary below the tool
         // rows, live and after a reload.
+        //
+        // A block being minted from provider history rather than from the
+        // stream is the one exception, and it is an exception about *when*
+        // rather than about identity: it was spoken earlier than this, between
+        // rows already drawn, so it names the row it precedes and the fold
+        // resolves the moment. See [`crate::threads::Change::AssistantBlockRecovered`].
+        let minting = emitted.message_id.is_none();
         let message_id = emitted
             .message_id
             .get_or_insert_with(crate::threads::fresh_message_id)
             .clone();
         decided
             .changes
-            .push(crate::threads::Change::AssistantDelta {
-                message_id,
-                turn_id: active.turn_id.clone(),
-                text: suffix.to_string(),
+            .push(match spoken_before.filter(|_| minting) {
+                Some(before) => crate::threads::Change::AssistantBlockRecovered {
+                    message_id,
+                    turn_id: active.turn_id.clone(),
+                    text: suffix.to_string(),
+                    before: before.clone(),
+                },
+                None => crate::threads::Change::AssistantDelta {
+                    message_id,
+                    turn_id: active.turn_id.clone(),
+                    text: suffix.to_string(),
+                },
             });
     }
 
@@ -2266,6 +2504,14 @@ impl OpenCode {
             return Default::default();
         };
         let interrupted = finished.was_stopped();
+        // Whatever this turn heard from cannot speak into the next one. The
+        // provider may well still be producing — an abort this driver never
+        // proved, an escalation it abandoned, an external server it may not kill
+        // — and the subscription stays open through all of it. See
+        // [`OpenCode::retire`].
+        for message_id in std::mem::take(&mut self.turn_messages) {
+            self.retire(message_id);
+        }
         self.settled = true;
         self.ignore_idle_until_busy = true;
         let mut changes = Vec::new();
@@ -2442,6 +2688,8 @@ impl crate::session::Driver for OpenCode {
                 pending_parts: HashMap::new(),
                 pending_deltas: HashMap::new(),
                 emitted_parts: Vec::new(),
+                turn_messages: Vec::new(),
+                retired_messages: std::collections::VecDeque::new(),
                 stop_verification: StopVerification::default(),
                 ignore_idle_until_busy: false,
                 pending_permissions: HashMap::new(),
@@ -2501,6 +2749,24 @@ impl crate::session::Driver for OpenCode {
             return Some(decided);
         }
         let mut decided = crate::session::Decided::default();
+        // The one place either half of the retirement rule is applied, so that a
+        // part, a delta, a tool row and a token count all obey it at once.
+        // [`OpenCode::retire`] carries the reasoning.
+        if let Some(message_id) = event_message(&envelope.properties) {
+            if self.retired(message_id) {
+                return Some(decided);
+            }
+            let message_id = message_id.to_string();
+            if driving.turn.is_some() {
+                self.note_turn_message(&message_id);
+            } else {
+                // Retired but still handled: this event is the last one this
+                // message is heard on, and dropping it as well would change what
+                // a settled turn's own trailing events do today for no gain —
+                // `emit_text` already mints nothing without a turn.
+                self.retire(message_id);
+            }
+        }
         match envelope.kind.as_str() {
             "message.updated" => {
                 let info = envelope
@@ -2818,16 +3084,36 @@ impl crate::session::Driver for OpenCode {
         use crate::session::InterruptReconciliation;
         let messages = match self.client.messages(&self.session_id).await {
             Ok(messages) => messages,
-            Err(error) if !self.stop_verification.reconciliation_error_reported => {
-                self.stop_verification.reconciliation_error_reported = true;
-                return InterruptReconciliation::Failed(format!(
-                    "OpenCode stop verification failed (instance {}, session {}, phase verifying, last message count {}): {error}",
-                    self.instance_id,
-                    self.session_id,
-                    self.stop_verification.last_message_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
-                ));
+            Err(error) => {
+                let elapsed = self.stop_verification.started_at.elapsed();
+                self.stop_verification.observe_unreadable(elapsed);
+                let count = self.stop_verification.reported_count();
+                if !self.stop_verification.reconciliation_error_reported {
+                    self.stop_verification.reconciliation_error_reported = true;
+                    return InterruptReconciliation::Failed(format!(
+                        "OpenCode stop verification failed (instance {}, session {}, phase verifying, last message count {count}): {error}",
+                        self.instance_id, self.session_id,
+                    ));
+                }
+                if !self.stop_verification.should_abandon(elapsed) {
+                    return InterruptReconciliation::Pending;
+                }
+                // The failure was reported once and is still on the thread; what
+                // ends here is only the supervision of a turn nothing can ever
+                // prove settled. Interrupted is the honest verdict — the stop
+                // was sent and the turn is not coming back to this loop — and it
+                // is a verdict about the *turn*, not the conversation, which
+                // stays alive for the next prompt. Nothing is killed: an
+                // unreadable history is not the proof of a runaway that
+                // ADR-0058's owned reap is built on, and an external server is
+                // never ours to kill regardless.
+                let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
+                eprintln!(
+                    "laplus: OpenCode stop verification (instance {}, session {}, phase abandoned, last message count {count}).",
+                    self.instance_id, self.session_id,
+                );
+                return InterruptReconciliation::Settled(settled);
             }
-            Err(_) => return InterruptReconciliation::Pending,
         };
         let signature = assistant_output_signature(&messages);
         let count = messages.as_array().map_or(0, Vec::len);
@@ -2863,21 +3149,50 @@ impl crate::session::Driver for OpenCode {
         // part's message rather than appending to one accumulated string. Parts
         // already fully streamed compute an empty suffix and change nothing;
         // parts with more text on the provider than was streamed grow by exactly
-        // the difference; a part never seen here is inserted fresh, in provider
-        // order.
+        // the difference; a part never seen here is inserted fresh, at the
+        // position the provider's own list gives it.
+        //
+        // **Position comes from the list, not from the clock.** A block minted
+        // here would otherwise take the moment the merge ran, which is later
+        // than every row on screen — so a block the stream dropped in the
+        // *middle* of a turn would be appended under the whole transcript
+        // instead of going back between the tools it was spoken between. Each
+        // unseen part therefore carries the first row after it that laplus does
+        // have, and [`crate::threads::Change::AssistantBlockRecovered`] is where
+        // that becomes a `createdAt`.
         let mut extended = crate::session::Decided::default();
-        if let Some(parts) = messages
+        let recovered = messages
             .as_array()
-            .and_then(|messages| messages.iter().rev().find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")))
+            .and_then(|messages| messages.iter().rev().find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")));
+        // History is kept by session rather than by turn, so its newest
+        // assistant message can be one an earlier turn already settled — and
+        // merging that would leak it into this turn by the REST route rather
+        // than the stream one. Naming it as this turn's where it *is* this
+        // turn's is the other half: a runaway whose parts the stream never
+        // delivered is still retired by this turn's settlement.
+        let recovered_id = recovered
+            .and_then(|message| message.pointer("/info/id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let leaked = recovered_id.as_deref().is_some_and(|id| self.retired(id));
+        if let Some(id) = recovered_id.filter(|_| !leaked) {
+            self.note_turn_message(&id);
+        }
+        if let Some(parts) = recovered
+            .filter(|_| !leaked)
             .and_then(|message| message.get("parts"))
             .and_then(Value::as_array)
         {
-            for part in parts.iter().filter(|part| part.get("type").and_then(Value::as_str) == Some("text")) {
+            let followed_by = self.rows_after_each(parts);
+            for (part, spoken_before) in parts.iter().zip(followed_by) {
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
                 let Some(id) = part.get("id").or_else(|| part.get("partID")).and_then(Value::as_str) else {
                     continue;
                 };
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    self.emit_text(id, "text", text, driving, &mut extended);
+                    self.emit_text_spoken_before(id, "text", text, spoken_before.as_ref(), driving, &mut extended);
                 }
             }
         }
@@ -3193,6 +3508,34 @@ mod tests {
         let mut never_changed = StopVerification::default();
         never_changed.observe("quiet", std::time::Duration::ZERO);
         assert!(!never_changed.should_escalate(STOP_ESCALATION_WINDOW));
+    }
+
+    #[test]
+    fn stop_verification_abandons_only_an_unbroken_unreadable_window() {
+        let mut verification = StopVerification::default();
+
+        assert!(
+            !verification.should_abandon(std::time::Duration::ZERO),
+            "a history nobody has failed to read is not a run of failures"
+        );
+        verification.observe_unreadable(std::time::Duration::ZERO);
+        assert!(
+            !verification.should_abandon(std::time::Duration::ZERO),
+            "one unreadable answer is not a window"
+        );
+        verification.observe_unreadable(std::time::Duration::from_secs(7));
+        assert!(!verification.should_abandon(std::time::Duration::from_secs(7)));
+        verification.observe_unreadable(STOP_ESCALATION_WINDOW);
+        assert!(verification.should_abandon(STOP_ESCALATION_WINDOW));
+
+        let mut recovered = StopVerification::default();
+        recovered.observe_unreadable(std::time::Duration::ZERO);
+        recovered.observe("readable again", std::time::Duration::from_secs(7));
+        recovered.observe_unreadable(STOP_ESCALATION_WINDOW);
+        assert!(
+            !recovered.should_abandon(STOP_ESCALATION_WINDOW),
+            "a history that answered restarts the unreadable window"
+        );
     }
 
     fn windows() -> HashMap<String, u64> {

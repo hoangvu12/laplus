@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: ready-for-human
 
 # 02 — Part-keyed merge for interrupt & stream-loss reconcile
 
@@ -14,20 +14,22 @@ history against a single accumulated string; here it addresses parts instead.
 
 **Blocked by:** 01 — One assistant message per OpenCode text part.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [x] Against the scripted peer: reconcile after a lost suffix inserts the
       missing block as a new message positioned after the tool row, not glued
       to the pre-tool message.
 - [x] Text already shown is left byte-identical; a divergent snapshot cannot
       retract on-screen text (existing rule preserved, now per part).
-- [ ] Reconcile is idempotent: running it twice against the same history
-      produces one copy of each block.
-- [ ] Parts absent locally are inserted in provider order between existing
+- [x] One history is merged once: a stop folds provider history on exactly one
+      observation, and a settled turn's provider messages are retired, so no
+      later read of the same history can copy a block into the transcript
+      again. (Reworded 2026-09-01 -- see the comment below.)
+- [x] Parts absent locally are inserted in provider order between existing
       rows; ordinals keep reload consistent with live.
 - [x] An interrupted turn whose partial last block gains a REST suffix closes
       with the extended text under the same part identity.
-- [ ] Focused tests pass: the interrupt-reconcile scenarios in the OpenCode
+- [x] Focused tests pass: the interrupt-reconcile scenarios in the OpenCode
       socket/protocol suites, extended for multi-part histories.
 
 ## Comments
@@ -168,3 +170,188 @@ live and across a reload, and so is the ordinal half. Interleaving above a row
 already drawn is not, because the design appends. Leaving the box checked on the
 strength of the half that holds would repeat the error this branch corrects in
 ticket 04, so it comes off, and what is proved stays written down above.
+
+2026-09-01, the fourth box, built rather than argued away. The comment above
+diagnosed it correctly: a recovered row took the clock at merge time, so it
+could only ever sort below every row on screen, and "inserted between existing
+rows" was unreachable by construction. What was missing was a way for the merge
+to say _where_ a row belongs, given that the driver knows the provider's part
+order and the fold knows what `createdAt` every row was given, and neither knows
+both.
+
+`Change::AssistantBlockRecovered` is that seam. Reconciliation walks the
+provider's part list from the end and hands each unseen text part the first row
+after it that laplus already has — a message id for a text part, the provider's
+own call id for a tool — and the fold turns that name into a stamp one
+millisecond below the row it precedes. Nothing else moves: the change still
+takes the clock for the conversation's `updatedAt`, for the event's `occurredAt`
+and for the turn stamps, and the anchor is spent only where the call is what
+_mints_ the part's message, so a part already on screen keeps the position it
+took when it was first seen. A part with nothing drawn after it has no anchor
+and is appended, which is where a trailing block belonged anyway.
+
+`opencode_reconcile_lands_a_lost_middle_block_between_the_rows_it_was_spoken_between`
+is the evidence. The peer streams the same interleaved narration and goes silent
+in the second block; its `session.messages` holds a block spoken _between_ the
+tool call and that second block and another spoken after everything. Both are
+minted by the one merge, six seconds after every row on screen, and they land in
+two different places: the settled transcript draws "Reading the tree first. " /
+the two `call-parts-1` work rows / "Eleven, by the look of it. " / "The tree
+holds eleven files." / "Nothing else to add.". The assertion is the timeline the
+_client_ builds — `deriveTimelineEntries`'s own concatenation and stable sort by
+`createdAt`, message rows before work rows — off the persisted snapshot and
+again after a full file-backed reopen, and the row the block was inserted above
+is checked to still carry the `createdAt` the developer was shown it at.
+
+Three reverted mutations of `src/threads/fold.rs` turn it red and leave the
+lost-suffix test green, which is what says the new row is the one being measured:
+making `placed_before` answer `None` (the merge takes the clock again) and making
+it answer the anchor's own stamp rather than a millisecond below it both put the
+recovered block _after_ the row it was spoken before, and restamping rows on
+every update drags the first block below the tool call it preceded.
+
+**The limit, because a millisecond has one.** The transcript's only ordering key
+is `createdAt`, and `crate::store` already says why: "a millisecond timestamp is
+not a total order". Two rows that landed inside one millisecond are unordered
+against each other today — the client's sort is stable and puts every message row
+above every work row of the same millisecond whatever happened first — and a
+block recovered between such a pair inherits that and cannot do better, because
+there is no stamp between them to take. That is a property of the ordering key
+rather than of this merge; making it go away means giving the client a dense
+position to sort by, which is a contract change and a different ticket. The
+scripted peer therefore pauses fifty milliseconds between the tool's result and
+the block it was cut off in — the pause a provider takes before speaking again,
+sent from a task rather than from inside the prompt handler, because laplus
+awaits the prompt response before it reads a single event and a delay inside the
+handler is not a delay in the transcript.
+
+**The third box is still unchecked and the criterion is still untouched.**
+Nothing here changes when the merge runs: `reconcile_interrupt` still reaches its
+loop on `StopObservation::Quiet` alone and still settles in the same call, so one
+stop performs one merge. Placement made a second merge no more possible than it
+was.
+
+The sixth box is checked because ticket 04's red test is green on this branch:
+`failed_interrupt_reconciliation_is_reported_once_and_later_turns_still_run`
+passes, as does every other interrupt-reconcile scenario —
+`interrupting_opencode_aborts_and_keeps_partial_output_despite_duplicate_idle`,
+`missing_opencode_idle_reconciles_and_late_idle_cannot_settle_queued_work`,
+`interrupting_opencode_keeps_each_partial_text_part_exactly_as_it_arrived`,
+`an_unanswered_abort_is_reported_and_leaves_the_session_loop_reading`,
+`an_external_runaway_is_reported_once_and_remains_supervised_without_a_kill`,
+`an_owned_runaway_is_killed_once_and_the_follow_up_resumes_its_session`, and the
+two lost-history scenarios. The protocol suite needed no extension for the same
+reason it did not last time: it covers the `session.messages` route, and
+multi-part history is a driver behaviour observable only at the socket.
+
+Ran: `cargo test -p laplus-server --test socket_opencode_turn --no-fail-fast --
+--test-threads=1` (54 passed, 4 failed, 1 ignored), `cargo test -p laplus-server
+--test opencode_protocol` (10 passed), `cargo test -p laplus-server --lib` (900
+passed), `cargo check -p laplus-server`, and — because this changes where a row
+is drawn — `socket_streaming` (18), `socket_continuity` (9), `socket_conformance`
+(11), `socket_turn` (29), `socket_interrupt` (9), `socket_settling` (8),
+`socket_revert` (9), `socket_session_stop` (5) and `protocol_golden` (7), all
+green, plus `socket_codex_turn` (37 passed, 1 failed). None of the five failures
+is this ticket's: `opencode_prompt_resolves_stored_attachments_and_omits_missing_
+references`, `stopped_queued_opencode_work_survives_restart_and_retries_once_in_
+order` and codex's `codex_refuses_a_stored_image_that_becomes_unreadable_before_
+dispatch` all die at `harness/mod.rs:902` on a loopback connect with
+`AddrNotAvailable` (10049) before any driver code runs, and reproduce in their
+own invocation; `an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server`
+and `busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order`
+both pass when run as their own invocation, which is the process-double
+interference the comments above already describe.
+
+2026-09-01 code review of the placement work. The limit written down above was
+softer than the code, and the code has changed rather than the wording.
+
+**"Benign ambiguity" was not what `placed_before` did.** It proved only that its
+answer sorts above the anchor. It never looked at the row _below_ the anchor, so
+when those two landed inside one millisecond — narration and the tool call it
+announced, which is the ordinary shape of a turn — a step of one millisecond
+carried the recovered block above narration it was spoken _after_. That is a
+repeatable wrong answer, not the "two rows inside a millisecond are unordered"
+the transcript lives with everywhere else, and the previous comment's fifty-
+millisecond peer pause was quietly stepping around it.
+
+`placed_before` now reads the drawn order rather than one row of it: if
+anything already sorts above the anchor carrying the anchor's own stamp, there
+is no room to step into, and the block takes the anchor's stamp instead.
+Sharing it is what puts the block _below_ that predecessor, because the client's
+sort is stable and this row is appended after it.
+`a_recovered_block_steps_below_its_anchor_but_never_above_the_row_before_it`
+covers all three answers, the tie included.
+
+**What is still wrong, named as a defect rather than as ambiguity.** Taking the
+anchor's stamp resolves the block against its predecessor and not against the
+anchor, and those two disagree in exactly one shape: the anchor is a **message**
+row and the row drawn above it shares its millisecond. Message rows tie-break
+ahead of work rows and among themselves by insertion, so a block appended with
+that stamp draws below the message it was spoken before. Both the old rule and
+the new one get that case wrong; the new one is wrong in fewer cases and in none
+that the old one got right. The fix is a dense position for the client to sort
+by — a contract change and a different ticket — not cleverer arithmetic in the
+fold. The doc on `placed_before` says this in the same words.
+
+Also in this pass, all from the same review and none of them behavioural:
+`placed_before` had been inserted between `message_sent`'s doc comment and
+`message_sent`, which orphaned that doc onto the new function and moved
+`#[allow(clippy::too_many_arguments)]` — written for `message_sent`, which this
+branch grew to eight parameters — onto it as well; both are back where they
+belong and clippy no longer warns about `message_sent`. `Anchor`'s doc linked
+`[placed_before]`, a private function, from a public type, which is what
+`rustdoc::private_intra_doc_links` fires on; it names the function without
+linking to it now and says why. `drawn_as`'s doc claimed to answer "the row this
+part already has" when only its `text` arm checks drawnness; it now says what
+each arm actually answers to and why the `tool` arm needs no check. And
+`drawn_narration`'s `stamp` closure, a verbatim copy of
+`reads_below_the_tool_row`'s `created_at` closure twenty lines away, is one
+shared `drawn_at`.
+
+**The third box is still unchecked and its criterion is still untouched.**
+Nothing here changes when the merge runs.
+
+**Status is `ready-for-human`, not `ready-for-agent`.** Two things are waiting
+on a person rather than on an agent: the third box, which is a design question
+about whether a second merge should be possible at all, and the ui-driver
+walkthrough the spec requires before any of the user-visible halves is called
+done — deliberately skipped this session by the user's decision.
+
+Ran: `cargo test -p laplus-server --lib` (901 passed, including the new fold
+test), `cargo test -p laplus-server --test socket_opencode_turn --no-fail-fast
+-- --test-threads=1` (54 passed, 5 failed, 1 ignored — the two loopback and
+three owned-server-double failures ticket 04's latest comment enumerates, all
+reproducing or passing in their own invocation as described),
+`cargo test -p laplus-server --test opencode_protocol` (10 passed),
+`cargo check -p laplus-server`, `cargo clippy -p laplus-server`,
+`cargo doc -p laplus-server --no-deps`, and — because this changes where a row
+is drawn — `socket_streaming` (18), `socket_continuity` (9), `socket_turn` (29),
+`socket_interrupt` (9), `socket_settling` (8), `socket_revert` (9) and
+`protocol_golden` (7), all green.
+`opencode_reconcile_lands_a_lost_middle_block_between_the_rows_it_was_spoken_between`
+and `opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool` both
+pass unchanged.
+
+2026-09-01, the third box, reworded on the spec author's decision. It had asked
+that "running it twice against the same history produces one copy of each
+block", and this design never runs it twice: `reconcile_interrupt` folds history
+on the single `StopObservation::Quiet` and settles in the same call, and
+`session.rs` stops re-arming the reconciliation ticker once the turn is
+`Settled`. A criterion no implementation can reach is not a bar, so it now
+states the property the design does carry -- merge once, and make a second copy
+unreachable afterwards -- which is the protection the original wording was
+reaching for.
+
+Reaching it took a real fix, not a restatement. Settling the turn is not on its
+own enough: `settle` clears `emitted_parts` and the event path filtered only on
+role, so an abandoned runaway still streaming on an open subscription would have
+had its next part minted into whatever turn came next. Provider messages are now
+retired at settlement -- the message a settled turn heard from cannot speak into
+a later one, on the stream or through the REST merge -- and
+`an_abandoned_runaway_speaks_into_no_later_turn` holds it: with the retirement
+check neutered the abandoned turn's sentence appears in the following turn's
+transcript, and with it restored it does not.
+
+What stays open is written in `retire` and in ADR-0059: a provider that mints a
+wholly new assistant message after settlement _and_ after the next prompt cannot
+be told from the next turn answering, and only killing answers that.

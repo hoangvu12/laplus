@@ -1,7 +1,18 @@
 # ADR-0058 — OpenCode stop is verified and owned runaways are reaped
 
 Date: 2026-08-22
-Status: Accepted
+Status: Accepted; the ladder's missing bottom superseded by [ADR-0059](0059-a-stop-that-cannot-be-proved-still-ends-the-turn.md)
+
+> **Superseded in part on 2026-09-01.** "A failed sample leaves the conversation
+> loop alive and visibly reports that verification is continuing" describes a
+> ladder with no bottom: a history that answers nothing but errors can never
+> close the quiet interval this ADR proves quiescence with, and can never show
+> the changed output its escalation rests on, so verification returns _pending_
+> for ever and the stopped turn is immortal. ADR-0059 ends the ladder, and says
+> what ending it costs — a queued prompt released into a conversation whose
+> provider may still be producing, and the rule about retired provider messages
+> that makes that release safe. Everything else below stands, including the
+> whole of the proof and the owned reap.
 
 An accepted OpenCode abort request begins a stopping phase; it does not prove
 the turn stopped. Laplus samples the session's assistant messages and treats

@@ -1435,6 +1435,28 @@ pub enum Change {
         turn_id: String,
         text: String,
     },
+    /// A narration block laplus never saw, recovered from provider history and
+    /// minted where the provider says it was spoken rather than where the
+    /// recovery happened. `thread.message-sent` with `streaming: true`, exactly
+    /// like [`Change::AssistantDelta`] — the whole of the difference is the
+    /// `createdAt` the row is created with.
+    ///
+    /// **Why it is a change of its own.** Live text belongs at the end of the
+    /// transcript because that is where it happened, so a delta may take the
+    /// clock and nothing else. A block the stream dropped happened *earlier*,
+    /// between rows the developer is already looking at, and the transcript's
+    /// only ordering key is `createdAt` — `deriveTimelineEntries`
+    /// (`apps/web/src/session-logic.ts`) concatenates message rows and work
+    /// rows and sorts the lot by it. Taking the clock at merge time is what put
+    /// a recovered mid-turn block below every row on screen however the merge
+    /// behaved. Naming the neighbour instead is what puts it back.
+    AssistantBlockRecovered {
+        message_id: String,
+        turn_id: String,
+        text: String,
+        /// The row the provider lists this block immediately before.
+        before: Anchor,
+    },
     /// The buffered assistant message, which is authoritative.
     /// `thread.message-sent` with `streaming: false`, which the client replaces
     /// with.
@@ -1506,6 +1528,30 @@ pub enum Change {
     Reverted { turn_count: u64 },
 }
 
+/// A row already on screen, named the way a driver is able to name one.
+///
+/// The knowledge is split, so the answer is too. A driver reconciling an
+/// interrupted turn holds the provider's part list and knows which of those
+/// parts it has already drawn; what it does not hold is the `createdAt` the
+/// fold gave any of them, because the fold takes that stamp after the driver
+/// has stopped looking. So a recovered block names its neighbour by an identity
+/// both halves share — the message id a text part was minted under, or the
+/// provider's own call id for a tool — and this module's own `placed_before`
+/// resolves the moment against the transcript. Not a link, because that
+/// function is private and this type is not: a doc link out of a public item
+/// into a private one is what `private_intra_doc_links` fires on, and the name
+/// is worth more here than the hyperlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchor {
+    /// An assistant message, by the id its part was minted under.
+    Message(String),
+    /// A tool call, by the provider's call id. A call has more than one work row
+    /// — invocation, then result — and the **first** of them is the anchor: a
+    /// block spoken before the call belongs above the whole of it rather than
+    /// between the two halves.
+    ToolCall(String),
+}
+
 impl Change {
     /// What the project list is told about this change, if anything.
     ///
@@ -1539,6 +1585,7 @@ impl Change {
             Change::Deleted => Some(Listing::Removal),
             _ if thread.lifecycle.deleted() => None,
             Change::AssistantDelta { .. }
+            | Change::AssistantBlockRecovered { .. }
             | Change::Activity(_)
             | Change::Checkpointed(_)
             | Change::RevertRequested { .. }
@@ -1778,7 +1825,7 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
         } => {
             thread.latest_user_message_at = Some(at.to_string());
             let (mut payload, verdict) =
-                message_sent(thread, message_id, "user", text, Some(turn_id), false, at);
+                message_sent(thread, message_id, "user", text, Some(turn_id), false, at, at);
             if let Some(message) = thread.messages.iter_mut().find(|message| message.id == *message_id) {
                 message.attachments = attachments.clone();
             }
@@ -2148,6 +2195,31 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 Some(turn_id),
                 true,
                 at,
+                at,
+            );
+            reconciled = verdict;
+            payload
+        }
+        // The one row on this feed that is not created at the moment it is
+        // folded in. `at` still stamps everything a repeat would churn — the
+        // conversation's `updatedAt`, the event's `occurredAt`, the turn stamps
+        // — and only the transcript position moves.
+        Change::AssistantBlockRecovered {
+            message_id,
+            turn_id,
+            text,
+            before,
+        } => {
+            let created_at = placed_before(thread, before).unwrap_or_else(|| at.to_string());
+            let (payload, verdict) = message_sent(
+                thread,
+                message_id,
+                "assistant",
+                text,
+                Some(turn_id),
+                true,
+                at,
+                &created_at,
             );
             reconciled = verdict;
             payload
@@ -2164,6 +2236,7 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 text,
                 Some(turn_id),
                 false,
+                at,
                 at,
             );
             reconciled = verdict;
@@ -2267,6 +2340,104 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
     }
 }
 
+/// The moment a row must carry to render immediately above the row it names, or
+/// `None` when the transcript holds no such row.
+///
+/// **One millisecond earlier, because that is the smallest step the ordering key
+/// has.** The transcript is laid out by `createdAt` and by nothing else —
+/// `deriveTimelineEntries` (`apps/web/src/session-logic.ts`) concatenates
+/// message rows and work rows and sorts the lot by that string — so "above" is a
+/// strictly smaller stamp. Every stamp on this feed is rendered by
+/// [`crate::clock`] in one fixed shape, so a millisecond is both the resolution
+/// and the step.
+///
+/// **A step down is only right if there is room for it**, which is why the
+/// anchor is not the only row read. Taking the anchor's millisecond minus one
+/// unconditionally draws the recovered block above whatever the anchor's own
+/// predecessor is whenever those two landed inside the same millisecond — not an
+/// ambiguity but a wrong answer, and a repeatable one. So the drawn order is
+/// consulted: if any row already sorts above the anchor with the anchor's own
+/// stamp, there is no room below it, and the block takes the anchor's stamp
+/// instead of a step under it. Sharing the stamp is what puts it *below* that
+/// predecessor, because the client's sort is stable and this row is appended
+/// after it.
+///
+/// **The case that stays wrong, named rather than softened.** Taking the
+/// anchor's stamp resolves against a predecessor and not against the anchor, and
+/// the two disagree in exactly one shape: the anchor is a **message** row, and
+/// the row drawn above it shares its millisecond. Message rows tie-break ahead
+/// of work rows and among themselves by insertion, so a block appended with that
+/// stamp draws *below* the message it was spoken before. It is a known defect of
+/// this placement, not a property of the provider's history: two rows inside one
+/// millisecond have no stamp between them, and the fix is a dense position for
+/// the client to sort by rather than a cleverer arithmetic here — a contract
+/// change, and a different ticket. `crate::store` makes the same observation from
+/// the other end and answers it for a *reload* by storing each row's ordinal;
+/// what an ordinal cannot answer is where a row belongs that nobody stored.
+///
+/// Several blocks recovered before one anchor all take this same stamp and are
+/// ordered against each other by position instead: the fold appends them in
+/// provider order, a live client appends them in the order the events arrive,
+/// and a reload reads them back by ordinal — three routes to the one order.
+fn placed_before(thread: &Thread, before: &Anchor) -> Option<String> {
+    let (anchor, anchored) = drawn_position(thread, before)?;
+    let millis = crate::clock::epoch_millis_from_iso(anchored)?;
+    let crowded = drawn_rows(thread).any(|(position, created_at)| {
+        position < anchor && crate::clock::epoch_millis_from_iso(created_at) == Some(millis)
+    });
+    Some(crate::clock::iso_from_epoch_millis(if crowded {
+        millis
+    } else {
+        millis.saturating_sub(1)
+    }))
+}
+
+/// Every row the timeline draws, paired with the position the client's tie-break
+/// gives it: `deriveTimelineEntries` concatenates the message rows and the work
+/// rows and stable-sorts the lot by `createdAt`, so within one millisecond the
+/// order is exactly this concatenation.
+fn drawn_rows(thread: &Thread) -> impl Iterator<Item = (usize, &str)> {
+    thread
+        .messages
+        .iter()
+        .map(|message| message.created_at.as_str())
+        .chain(
+            thread
+                .activities
+                .iter()
+                .map(|activity| activity.created_at.as_str()),
+        )
+        .enumerate()
+}
+
+/// Where an [`Anchor`] sits in [`drawn_rows`], and the stamp it sits there by.
+/// `None` when the transcript holds no such row, which is what leaves a block
+/// that cannot be placed to be appended.
+fn drawn_position<'a>(thread: &'a Thread, before: &Anchor) -> Option<(usize, &'a str)> {
+    match before {
+        Anchor::Message(message_id) => {
+            let at = thread
+                .messages
+                .iter()
+                .position(|message| &message.id == message_id)?;
+            Some((at, thread.messages[at].created_at.as_str()))
+        }
+        Anchor::ToolCall(call_id) => {
+            let at = thread.activities.iter().position(|activity| {
+                activity
+                    .payload
+                    .pointer("/data/toolCallId")
+                    .and_then(Value::as_str)
+                    == Some(call_id.as_str())
+            })?;
+            Some((
+                thread.messages.len() + at,
+                thread.activities[at].created_at.as_str(),
+            ))
+        }
+    }
+}
+
 /// Append or replace a message, and move the latest turn with it.
 ///
 /// The two-line rule at the heart of the ticket: a streaming send appends,
@@ -2274,6 +2445,10 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
 /// that has to stay in step with it.
 /// The reconciliation verdict is returned rather than counted here, which is
 /// the whole of why this module needs no `&self` — see `docs/adr/0025`.
+///
+/// `created_at` is separate from `at` for exactly one caller — see
+/// [`Change::AssistantBlockRecovered`], which is a row that happened before the
+/// change carrying it. Everywhere else the two are the same string.
 #[allow(clippy::too_many_arguments)]
 fn message_sent(
     thread: &mut Thread,
@@ -2283,6 +2458,7 @@ fn message_sent(
     turn_id: Option<&String>,
     streaming: bool,
     at: &str,
+    created_at: &str,
 ) -> (Value, Option<Reconciled>) {
     let mut reconciled = None;
     match thread
@@ -2325,7 +2501,7 @@ fn message_sent(
             attachments: Vec::new(),
             turn_id: turn_id.cloned(),
             streaming,
-            created_at: at.to_string(),
+            created_at: created_at.to_string(),
             updated_at: at.to_string(),
         }),
     }
@@ -2348,7 +2524,7 @@ fn message_sent(
         "text": text,
         "turnId": turn_id,
         "streaming": streaming,
-        "createdAt": at,
+        "createdAt": created_at,
         "updatedAt": at,
     });
 
@@ -2360,6 +2536,7 @@ impl Change {
         match self {
             Change::UserMessage { .. }
             | Change::AssistantDelta { .. }
+            | Change::AssistantBlockRecovered { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
             Change::PromptQueued { .. } | Change::TurnDeliveryStateChanged { .. } => "thread.turn-delivery-state-changed",
             Change::MetaUpdated(_) => "thread.meta-updated",
@@ -2415,7 +2592,10 @@ pub(crate) fn bind_checkpoint_assistant_message(checkpoint: &mut Checkpoint, mes
 /// Three rules, and each is a decision this module's documentation argues:
 ///
 /// - **A delta owes nothing.** The buffered message supersedes it within the
-///   turn, and a row per token would put the disk in the streaming path.
+///   turn, and a row per token would put the disk in the streaming path. A
+///   recovered block owes nothing for the same reason and keeps the same debt:
+///   settlement closes it like any other part, and that write carries both the
+///   position and the `createdAt` the fold gave it.
 /// - **Everything else writes the row.** Every change moves `updatedAt` and most
 ///   of them move the latest turn with it. The row is a dozen small fields and
 ///   the writes are batched, so writing it unconditionally costs less than
@@ -2426,7 +2606,7 @@ pub(crate) fn bind_checkpoint_assistant_message(checkpoint: &mut Checkpoint, mes
 ///   be a different conversation.
 pub(crate) fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
     let message_id = match change {
-        Change::AssistantDelta { .. } => return Vec::new(),
+        Change::AssistantDelta { .. } | Change::AssistantBlockRecovered { .. } => return Vec::new(),
         Change::UserMessage { message_id, .. } | Change::AssistantMessage { message_id, .. } => {
             Some(message_id)
         }
@@ -2714,6 +2894,75 @@ pub(crate) mod tests {
             latest_user_message_at: Some(at(offset_millis)),
             ..a_thread("thread-1")
         }
+    }
+
+    // -- where a recovered block is drawn ------------------------------------
+
+    fn a_drawn_message(id: &str, created_at: String) -> Message {
+        Message {
+            id: id.to_string(),
+            role: "assistant".to_string(),
+            text: "narration".to_string(),
+            attachments: Vec::new(),
+            turn_id: Some("turn-1".to_string()),
+            streaming: false,
+            created_at,
+            updated_at: at(0),
+        }
+    }
+
+    fn a_drawn_tool_row(call_id: &str, created_at: String) -> Activity {
+        Activity {
+            id: format!("act-{call_id}"),
+            tone: "info",
+            kind: "tool.updated".to_string(),
+            summary: "ls -1".to_string(),
+            payload: json!({"data": {"toolCallId": call_id}}),
+            turn_id: Some("turn-1".to_string()),
+            sequence: Some(1),
+            created_at,
+        }
+    }
+
+    /// A recovered block steps one millisecond under the row it precedes — and
+    /// stops stepping when something is already drawn in that millisecond,
+    /// because the step would otherwise carry it above a row it was spoken
+    /// after.
+    ///
+    /// The tie case is the one worth having a test for: it is not the benign
+    /// "two rows inside a millisecond are unordered" that the transcript lives
+    /// with everywhere, it is a *deterministic* misplacement, and it is the
+    /// ordinary shape of a turn — narration, then the tool call it announced,
+    /// both landing inside the same millisecond.
+    #[test]
+    fn a_recovered_block_steps_below_its_anchor_but_never_above_the_row_before_it() {
+        let mut thread = a_thread("thread-1");
+        thread.messages.push(a_drawn_message("message-1", at(0)));
+        thread.activities.push(a_drawn_tool_row("call-1", at(10)));
+
+        assert_eq!(
+            placed_before(&thread, &Anchor::ToolCall("call-1".to_string())),
+            Some(at(9)),
+            "with room below the anchor, a block takes the millisecond under it"
+        );
+        assert_eq!(
+            placed_before(&thread, &Anchor::Message("message-1".to_string())),
+            Some(at(-1)),
+            "the same for a message anchor, which the first block of a turn has"
+        );
+
+        thread.activities[0].created_at = at(0);
+        assert_eq!(
+            placed_before(&thread, &Anchor::ToolCall("call-1".to_string())),
+            Some(at(0)),
+            "a tool row sharing the narration's millisecond leaves no room to step into"
+        );
+
+        assert_eq!(
+            placed_before(&thread, &Anchor::ToolCall("call-never-drawn".to_string())),
+            None,
+            "a block that cannot be placed is appended by its caller instead"
+        );
     }
 
     /// An unanswered permission request, as the work log records one.
