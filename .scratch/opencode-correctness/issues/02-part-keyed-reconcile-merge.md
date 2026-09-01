@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: ready-for-human
 
 # 02 — Part-keyed merge for interrupt & stream-loss reconcile
 
@@ -14,7 +14,7 @@ history against a single accumulated string; here it addresses parts instead.
 
 **Blocked by:** 01 — One assistant message per OpenCode text part.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
 - [x] Against the scripted peer: reconcile after a lost suffix inserts the
       missing block as a new message positioned after the tool row, not glued
@@ -259,3 +259,73 @@ own invocation; `an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server`
 and `busy_opencode_messages_stay_separate_but_start_one_queued_turn_in_order`
 both pass when run as their own invocation, which is the process-double
 interference the comments above already describe.
+
+2026-09-01 code review of the placement work. The limit written down above was
+softer than the code, and the code has changed rather than the wording.
+
+**"Benign ambiguity" was not what `placed_before` did.** It proved only that its
+answer sorts above the anchor. It never looked at the row _below_ the anchor, so
+when those two landed inside one millisecond — narration and the tool call it
+announced, which is the ordinary shape of a turn — a step of one millisecond
+carried the recovered block above narration it was spoken _after_. That is a
+repeatable wrong answer, not the "two rows inside a millisecond are unordered"
+the transcript lives with everywhere else, and the previous comment's fifty-
+millisecond peer pause was quietly stepping around it.
+
+`placed_before` now reads the drawn order rather than one row of it: if
+anything already sorts above the anchor carrying the anchor's own stamp, there
+is no room to step into, and the block takes the anchor's stamp instead.
+Sharing it is what puts the block _below_ that predecessor, because the client's
+sort is stable and this row is appended after it.
+`a_recovered_block_steps_below_its_anchor_but_never_above_the_row_before_it`
+covers all three answers, the tie included.
+
+**What is still wrong, named as a defect rather than as ambiguity.** Taking the
+anchor's stamp resolves the block against its predecessor and not against the
+anchor, and those two disagree in exactly one shape: the anchor is a **message**
+row and the row drawn above it shares its millisecond. Message rows tie-break
+ahead of work rows and among themselves by insertion, so a block appended with
+that stamp draws below the message it was spoken before. Both the old rule and
+the new one get that case wrong; the new one is wrong in fewer cases and in none
+that the old one got right. The fix is a dense position for the client to sort
+by — a contract change and a different ticket — not cleverer arithmetic in the
+fold. The doc on `placed_before` says this in the same words.
+
+Also in this pass, all from the same review and none of them behavioural:
+`placed_before` had been inserted between `message_sent`'s doc comment and
+`message_sent`, which orphaned that doc onto the new function and moved
+`#[allow(clippy::too_many_arguments)]` — written for `message_sent`, which this
+branch grew to eight parameters — onto it as well; both are back where they
+belong and clippy no longer warns about `message_sent`. `Anchor`'s doc linked
+`[placed_before]`, a private function, from a public type, which is what
+`rustdoc::private_intra_doc_links` fires on; it names the function without
+linking to it now and says why. `drawn_as`'s doc claimed to answer "the row this
+part already has" when only its `text` arm checks drawnness; it now says what
+each arm actually answers to and why the `tool` arm needs no check. And
+`drawn_narration`'s `stamp` closure, a verbatim copy of
+`reads_below_the_tool_row`'s `created_at` closure twenty lines away, is one
+shared `drawn_at`.
+
+**The third box is still unchecked and its criterion is still untouched.**
+Nothing here changes when the merge runs.
+
+**Status is `ready-for-human`, not `ready-for-agent`.** Two things are waiting
+on a person rather than on an agent: the third box, which is a design question
+about whether a second merge should be possible at all, and the ui-driver
+walkthrough the spec requires before any of the user-visible halves is called
+done — deliberately skipped this session by the user's decision.
+
+Ran: `cargo test -p laplus-server --lib` (901 passed, including the new fold
+test), `cargo test -p laplus-server --test socket_opencode_turn --no-fail-fast
+-- --test-threads=1` (54 passed, 5 failed, 1 ignored — the two loopback and
+three owned-server-double failures ticket 04's latest comment enumerates, all
+reproducing or passing in their own invocation as described),
+`cargo test -p laplus-server --test opencode_protocol` (10 passed),
+`cargo check -p laplus-server`, `cargo clippy -p laplus-server`,
+`cargo doc -p laplus-server --no-deps`, and — because this changes where a row
+is drawn — `socket_streaming` (18), `socket_continuity` (9), `socket_turn` (29),
+`socket_interrupt` (9), `socket_settling` (8), `socket_revert` (9) and
+`protocol_golden` (7), all green.
+`opencode_reconcile_lands_a_lost_middle_block_between_the_rows_it_was_spoken_between`
+and `opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool` both
+pass unchanged.
