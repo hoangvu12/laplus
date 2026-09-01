@@ -18,19 +18,26 @@ are untouched.
 
 **Status:** ready-for-agent
 
-- [ ] Against the scripted peer: text → tool → text produces two assistant
+- [x] Against the scripted peer: text → tool → text produces two assistant
       messages either side of the tool row, in that order, live.
-- [ ] The same transcript after a full reload shows the same order (ordinals).
-- [ ] A part that produces no text produces no message; empty bubbles never
+- [x] The same transcript after a full reload shows the same order (ordinals).
+- [x] A part that produces no text produces no message; empty bubbles never
       appear.
-- [ ] Interrupting mid-turn leaves each partial block with exactly what had
+- [x] Interrupting mid-turn leaves each partial block with exactly what had
       arrived; nothing is invented after the stop.
-- [ ] Duplicate/spurious part snapshots cannot double-render a block
+- [x] Duplicate/spurious part snapshots cannot double-render a block
       (cumulative-snapshot rule preserved per part).
-- [ ] Settled-turn fold keeps every intermediate message inside the fold and
+- [x] Settled-turn fold keeps every intermediate message inside the fold and
       only the terminal message visible — existing client behaviour verified,
       no reducer change expected.
 - [ ] A ui-driver walkthrough shows correct placement during a live turn
       (per AGENTS.md: user-visible change gets driven).
-- [ ] Focused tests pass: OpenCode socket/protocol suites covering the
+- [x] Focused tests pass: OpenCode socket/protocol suites covering the
       interleave scenario, plus the reasoning-stays-work-log case.
+
+## Comments
+
+2026-08-22 review: implementation and focused scripted-peer coverage are in
+place on `main`. The live/reload text-part test and interrupted-part test pass
+on Windows. This ticket remains open only for the required ui-driver
+walkthrough; do not mark it `done` until that user-visible evidence is recorded.

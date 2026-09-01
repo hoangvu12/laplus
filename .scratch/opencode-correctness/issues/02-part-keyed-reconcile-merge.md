@@ -29,3 +29,10 @@ history against a single accumulated string; here it addresses parts instead.
       with the extended text under the same part identity.
 - [ ] Focused tests pass: the interrupt-reconcile scenarios in the OpenCode
       socket/protocol suites, extended for multi-part histories.
+
+## Comments
+
+2026-08-22 review: the part-keyed merge seam is implemented, but the tracker
+does not yet carry enough test evidence to check these acceptance criteria.
+Keep this ticket `ready-for-agent`; the remaining work is the explicit
+multi-part lost-suffix, provider-order, divergence, and idempotence coverage.
