@@ -5157,12 +5157,6 @@ fn assistant_texts(snapshot: &Value) -> Vec<String> {
 /// merge invents seconds after the tool activity is necessarily last however
 /// the merge behaved.
 fn reads_below_the_tool_row(snapshot: &Value, call_id: &str, text: &str) -> bool {
-    let created_at = |row: &Value, what: &str| {
-        row["createdAt"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{what} carries the createdAt the client sorts by"))
-            .to_string()
-    };
     let tool_row = snapshot["thread"]["activities"]
         .as_array()
         .expect("the work log")
@@ -5175,7 +5169,17 @@ fn reads_below_the_tool_row(snapshot: &Value, call_id: &str, text: &str) -> bool
         .iter()
         .find(|message| message["role"] == "assistant" && message["text"] == text)
         .unwrap_or_else(|| panic!("no assistant row reading {text:?}"));
-    created_at(message_row, "an assistant row") > created_at(tool_row, "a work row")
+    drawn_at(message_row, "an assistant row") > drawn_at(tool_row, "a work row")
+}
+
+/// The one key on-screen order is decided by, read off a row the client would
+/// draw. Shared by both placement helpers below and above, because a second copy
+/// of it is a second chance to compare the wrong field.
+fn drawn_at(row: &Value, what: &str) -> String {
+    row["createdAt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{what} carries the createdAt the client sorts by"))
+        .to_string()
 }
 
 /// The transcript in the order a client draws it, narrowed to the rows placement
@@ -5188,12 +5192,6 @@ fn reads_below_the_tool_row(snapshot: &Value, call_id: &str, text: &str) -> bool
 /// log would answer one nothing renders: rows minted during a merge arrive after
 /// everything whatever `createdAt` they carry.
 fn drawn_narration(snapshot: &Value, call_id: &str) -> Vec<String> {
-    let stamp = |row: &Value, what: &str| {
-        row["createdAt"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{what} carries the createdAt the client sorts by"))
-            .to_string()
-    };
     let mut rows = snapshot["thread"]["messages"]
         .as_array()
         .expect("the transcript")
@@ -5201,7 +5199,7 @@ fn drawn_narration(snapshot: &Value, call_id: &str) -> Vec<String> {
         .filter(|message| message["role"] == "assistant")
         .map(|message| {
             (
-                stamp(message, "an assistant row"),
+                drawn_at(message, "an assistant row"),
                 message["text"].as_str().unwrap_or_default().to_string(),
             )
         })
@@ -5214,7 +5212,7 @@ fn drawn_narration(snapshot: &Value, call_id: &str) -> Vec<String> {
             .filter(|activity| activity["payload"]["data"]["toolCallId"] == call_id)
             .map(|activity| {
                 (
-                    stamp(activity, "a work row"),
+                    drawn_at(activity, "a work row"),
                     format!("<{}>", activity["kind"].as_str().unwrap_or_default()),
                 )
             }),
