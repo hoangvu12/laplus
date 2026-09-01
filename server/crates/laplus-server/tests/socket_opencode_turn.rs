@@ -4942,6 +4942,40 @@ fn assistant_texts(snapshot: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Whether the assistant row reading `text` renders below the work row for
+/// `call_id`.
+///
+/// Not a question about the transcript array: messages and work rows are two
+/// lists in the snapshot, and the client interleaves them itself.
+/// `deriveTimelineEntries` (`apps/web/src/session-logic.ts`) concatenates
+/// message rows, proposed plans and work rows and sorts the lot by `createdAt`,
+/// so on-screen placement of a message *relative to a tool call* is that one
+/// comparison and nothing else — which is why this reads the persisted snapshot
+/// rather than the event log. The log is in arrival order, where a row the
+/// merge invents seconds after the tool activity is necessarily last however
+/// the merge behaved.
+fn reads_below_the_tool_row(snapshot: &Value, call_id: &str, text: &str) -> bool {
+    let created_at = |row: &Value, what: &str| {
+        row["createdAt"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what} carries the createdAt the client sorts by"))
+            .to_string()
+    };
+    let tool_row = snapshot["thread"]["activities"]
+        .as_array()
+        .expect("the work log")
+        .iter()
+        .find(|activity| activity["payload"]["data"]["toolCallId"] == call_id)
+        .unwrap_or_else(|| panic!("no work row for the {call_id} tool call"));
+    let message_row = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("the transcript")
+        .iter()
+        .find(|message| message["role"] == "assistant" && message["text"] == text)
+        .unwrap_or_else(|| panic!("no assistant row reading {text:?}"));
+    created_at(message_row, "an assistant row") > created_at(tool_row, "a work row")
+}
+
 async fn start_text_parts_turn(
     peer: &ExternalOpenCode,
     suffix: &str,
@@ -5298,45 +5332,41 @@ async fn opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool()
             )
         })
         .collect::<Vec<_>>();
+    let cut_off = rows.get(1).unwrap_or_else(|| {
+        panic!("the merge left the transcript as {rows:?}, which has no second assistant row")
+    });
     assert_eq!(
-        rows[1],
+        *cut_off,
         (partial, "The tree holds eleven files.".to_string()),
         "the cut-off block closes under the identity it streamed with"
     );
 
-    // Placement. The rows the merge invented are below the tool call they were
-    // spoken after, and in the order history lists them — not appended to the
-    // block that had been speaking before the call.
-    let position = |wanted: &dyn Fn(&Value) -> bool| {
-        events
-            .iter()
-            .position(|item| wanted(item))
-            .expect("the event a placement assertion turns on")
-    };
-    let said = |text: &'static str| {
-        move |item: &Value| {
-            item["event"]["type"] == "thread.message-sent"
-                && item["event"]["payload"]["text"] == text
-        }
-    };
-    let tool_row = position(&|item| {
-        item["event"]["payload"]["activity"]["payload"]["data"]["toolCallId"] == "call-parts-1"
-    });
-    let looked_again = position(&said("Then I looked again."));
-    let nothing_else = position(&said("Nothing else to add."));
-    assert!(
-        tool_row < looked_again,
-        "a block spoken after the tool call reads below it"
-    );
-    assert!(
-        looked_again < nothing_else,
-        "blocks absent locally are inserted in provider order"
-    );
+    // Placement, read the way the client lays it out rather than the way the
+    // events happened to arrive. `deriveTimelineEntries`
+    // (`apps/web/src/session-logic.ts`) sorts message rows and work rows
+    // together by `createdAt`, so "below the tool call" is a claim about that
+    // timestamp on the persisted snapshot. It could not be one about arrival
+    // order: the merge invents these rows seconds after the tool activity, so
+    // in the event log they cannot be anywhere but last, whatever the code did.
+    //
+    // Between themselves the two recovered rows are minted in one pass and can
+    // share a millisecond, where the client's sort is stable and falls back to
+    // the order the snapshot lists them in — which is the order
+    // `assistant_texts` above already fixes, and which the reload below fixes
+    // again.
+    for recovered in ["Then I looked again.", "Nothing else to add."] {
+        assert!(
+            reads_below_the_tool_row(&interrupted, "call-parts-1", recovered),
+            "a block spoken after the tool call reads below it: {recovered:?}"
+        );
+    }
 
     client.close().await;
     server.stop().await;
 
-    // Ordinals: a full reload reads the recovered transcript in the live order.
+    // Ordinals: a full reload reads the recovered transcript in the live order,
+    // tool row included — placement that only holds until the window closes is
+    // not placement.
     let restarted = TestServer::start_at_with_config(&database, peer.config(None)).await;
     let reloaded = restarted
         .connect()
@@ -5344,6 +5374,12 @@ async fn opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool()
         .into_thread_snapshot("parts-thread-lost-suffix")
         .await;
     assert_eq!(assistant_texts(&reloaded), assistant_texts(&interrupted));
+    for recovered in ["Then I looked again.", "Nothing else to add."] {
+        assert!(
+            reads_below_the_tool_row(&reloaded, "call-parts-1", recovered),
+            "a reloaded block still reads below the tool call: {recovered:?}"
+        );
+    }
     restarted.stop().await;
     peer.task.abort();
 }
