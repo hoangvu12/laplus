@@ -12,8 +12,10 @@ Status: Accepted; the supervision sentence amended on 2026-09-01
 > half this amendment narrows — an inspection failure still may not end the
 > conversation. What it may now do is end the _turn_: a history that stays
 > unreadable for a bounded window settles the stopped turn as interrupted while
-> the failure it already reported stands. That rung belongs to ADR-0058, which
-> owns the ladder.
+> the failure it already reported stands. That rung, and what releasing a queued
+> prompt on it costs, belong to
+> [ADR-0059](0059-a-stop-that-cannot-be-proved-still-ends-the-turn.md), which
+> supersedes ADR-0058 in part.
 
 An interrupted OpenCode event stream does not by itself complete, fail, or
 repeat a turn. Laplus visibly enters turn recovery, asks OpenCode for the
