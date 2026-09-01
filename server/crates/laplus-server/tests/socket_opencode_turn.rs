@@ -2156,6 +2156,14 @@ async fn failed_interrupt_reconciliation_is_reported_once_and_later_turns_still_
 
     release.notify_one();
     client.events_through_the_turn(&subscription).await;
+    // A history that never answers can never prove quiet, so supervision ends
+    // at the escalation window instead of running forever: the stop degrades to
+    // an honest interrupted turn, reported once and settled once.
+    let abandoned = server.connect().await.into_thread_snapshot("reconcile-failure-thread").await;
+    assert_eq!(abandoned["thread"]["latestTurn"]["state"], "interrupted");
+    let rows = abandoned["thread"]["activities"].as_array().unwrap();
+    assert_eq!(rows.iter().filter(|row| row["kind"] == "turn.interrupt-verification-failed").count(), 1);
+    assert_eq!(rows.iter().filter(|row| row["kind"] == "turn.completed").count(), 1);
     let mut b = follow_up("reconcile-failure-thread", "reconcile-failure-b", "B");
     b["modelSelection"] = json!({"instanceId":"openExternal","model":"openai/gpt-5"});
     client.call("orchestration.dispatchCommand", b).await.expect_success();

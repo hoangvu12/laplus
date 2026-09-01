@@ -839,6 +839,10 @@ struct StopVerification {
     external_failure_reported: bool,
     reconciliation_error_reported: bool,
     last_message_count: Option<usize>,
+    /// When the current unbroken run of unreadable history snapshots began.
+    /// `None` whenever the last snapshot was readable, so a transient failure
+    /// only delays the proof rather than counting towards abandoning it.
+    unreadable_since: Option<std::time::Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -861,6 +865,7 @@ impl Default for StopVerification {
             external_failure_reported: false,
             reconciliation_error_reported: false,
             last_message_count: None,
+            unreadable_since: None,
         }
     }
 }
@@ -870,6 +875,9 @@ impl StopVerification {
     /// by the caller so the policy is testable without sleeping: every change
     /// starts a fresh quiet window, and equal point samples alone prove nothing.
     fn observe(&mut self, signature: &str, elapsed: std::time::Duration) -> StopObservation {
+        // Reaching here at all means the history answered, which reopens the
+        // unreadable window: only an *unbroken* run of failures abandons.
+        self.unreadable_since = None;
         if self.signature.as_deref() != Some(signature) {
             let changed = self.signature.is_some();
             if changed {
@@ -888,6 +896,30 @@ impl StopVerification {
 
     fn should_escalate(&self, elapsed: std::time::Duration) -> bool {
         self.changing_samples > 0 && elapsed >= STOP_ESCALATION_WINDOW
+    }
+
+    /// Record one history snapshot that could not be read at all, and say
+    /// whether the ladder has run out of rungs.
+    ///
+    /// A history that never answers can never close the quiet window and can
+    /// never show the changed output an escalation needs, so supervision on
+    /// its own has no terminal condition — which is the wedge. It is bounded
+    /// by the same window that bounds escalation: an unbroken run of
+    /// unreadable snapshots that lasts [`STOP_ESCALATION_WINDOW`] abandons
+    /// verification, and the caller settles the stopped turn as interrupted.
+    /// The first failure in a run never abandons, so a stop cannot be
+    /// abandoned on a single answer.
+    fn abandon_verification(&mut self, elapsed: std::time::Duration) -> bool {
+        let since = *self.unreadable_since.get_or_insert(elapsed);
+        elapsed.saturating_sub(since) >= STOP_ESCALATION_WINDOW
+    }
+
+    /// The last message count worth naming in a diagnostic. `unknown` until a
+    /// snapshot has been read, which is exactly the case a stop that never
+    /// reads one stays in.
+    fn reported_count(&self) -> String {
+        self.last_message_count
+            .map_or_else(|| "unknown".to_string(), |count| count.to_string())
     }
 }
 
@@ -2818,16 +2850,36 @@ impl crate::session::Driver for OpenCode {
         use crate::session::InterruptReconciliation;
         let messages = match self.client.messages(&self.session_id).await {
             Ok(messages) => messages,
-            Err(error) if !self.stop_verification.reconciliation_error_reported => {
-                self.stop_verification.reconciliation_error_reported = true;
-                return InterruptReconciliation::Failed(format!(
-                    "OpenCode stop verification failed (instance {}, session {}, phase verifying, last message count {}): {error}",
-                    self.instance_id,
-                    self.session_id,
-                    self.stop_verification.last_message_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
-                ));
+            Err(error) => {
+                let elapsed = self.stop_verification.started_at.elapsed();
+                let abandon = self.stop_verification.abandon_verification(elapsed);
+                let count = self.stop_verification.reported_count();
+                if !self.stop_verification.reconciliation_error_reported {
+                    self.stop_verification.reconciliation_error_reported = true;
+                    return InterruptReconciliation::Failed(format!(
+                        "OpenCode stop verification failed (instance {}, session {}, phase verifying, last message count {count}): {error}",
+                        self.instance_id, self.session_id,
+                    ));
+                }
+                if !abandon {
+                    return InterruptReconciliation::Pending;
+                }
+                // The failure was reported once and is still on the thread; what
+                // ends here is only the supervision of a turn nothing can ever
+                // prove settled. Interrupted is the honest verdict — the stop
+                // was sent and the turn is not coming back to this loop — and it
+                // is a verdict about the *turn*, not the conversation, which
+                // stays alive for the next prompt. Nothing is killed: an
+                // unreadable history is not the proof of a runaway that
+                // ADR-0058's owned reap is built on, and an external server is
+                // never ours to kill regardless.
+                let settled = self.settle(driving, crate::settling::SessionStatus::Interrupted, None);
+                eprintln!(
+                    "laplus: OpenCode stop verification (instance {}, session {}, phase abandoned, last message count {count}).",
+                    self.instance_id, self.session_id,
+                );
+                return InterruptReconciliation::Settled(settled);
             }
-            Err(_) => return InterruptReconciliation::Pending,
         };
         let signature = assistant_output_signature(&messages);
         let count = messages.as_array().map_or(0, Vec::len);
@@ -3193,6 +3245,26 @@ mod tests {
         let mut never_changed = StopVerification::default();
         never_changed.observe("quiet", std::time::Duration::ZERO);
         assert!(!never_changed.should_escalate(STOP_ESCALATION_WINDOW));
+    }
+
+    #[test]
+    fn stop_verification_abandons_only_an_unbroken_unreadable_window() {
+        let mut verification = StopVerification::default();
+
+        assert!(
+            !verification.abandon_verification(std::time::Duration::ZERO),
+            "one unreadable answer is not a window"
+        );
+        assert!(!verification.abandon_verification(std::time::Duration::from_secs(7)));
+        assert!(verification.abandon_verification(STOP_ESCALATION_WINDOW));
+
+        let mut recovered = StopVerification::default();
+        recovered.abandon_verification(std::time::Duration::ZERO);
+        recovered.observe("readable again", std::time::Duration::from_secs(7));
+        assert!(
+            !recovered.abandon_verification(STOP_ESCALATION_WINDOW),
+            "a history that answered restarts the unreadable window"
+        );
     }
 
     fn windows() -> HashMap<String, u64> {
