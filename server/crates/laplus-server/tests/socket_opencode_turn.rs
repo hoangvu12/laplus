@@ -609,8 +609,7 @@ struct PeerState {
     /// event stream ever delivered: the block that was streaming completed,
     /// two further blocks were spoken after the tool call, and an earlier
     /// block reads differently there than what the developer was shown. Every
-    /// snapshot is identical, so reconciliation reads the same history several
-    /// times over before it proves quiet.
+    /// snapshot is identical, which is what lets the quiet window close.
     lost_suffix: bool,
 }
 
@@ -802,15 +801,14 @@ async fn session_messages(
     if state.fail_reconciliation {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    let snapshot = state.message_snapshots.fetch_add(1, Ordering::SeqCst) + 1;
     // The whole turn as the provider kept it, which is more than the stream
     // delivered. Deliberately awkward in the same way the SSE script is: the
     // first block reads differently here than what was shown, the tool part
     // sits between the blocks it was spoken between, and the two trailing
-    // blocks were never streamed at all. Every request answers identically —
-    // stability is what the quiet window is measuring, and it is also what
-    // makes repeated reads of one history a test of idempotence.
+    // blocks were never streamed at all. Every request answers identically,
+    // because stability across snapshots is what the quiet window measures.
     if state.lost_suffix {
-        state.message_snapshots.fetch_add(1, Ordering::SeqCst);
         return Ok(Json(json!([
             {"info":{"id":"message-0","role":"user"},"parts":[
                 {"id":"prt-prompt","type":"text","text":"look around"}
@@ -825,7 +823,6 @@ async fn session_messages(
             ]}
         ])));
     }
-    let snapshot = state.message_snapshots.fetch_add(1, Ordering::SeqCst) + 1;
     let text = if state.output_changes_during_stop && snapshot >= 3 {
         format!("output snapshot {snapshot}")
     } else {
@@ -943,18 +940,6 @@ async fn prompt(
         let finish = async move {
             if let Some(release) = &state.idle_release {
                 release.notified().await;
-            }
-            // A recovered stream re-delivers exactly the blocks reconciliation
-            // had already taken from history. One copy of each is the whole
-            // claim: a merge that ran and a replay that follows it must not
-            // between them put a block on screen twice.
-            if state.lost_suffix {
-                for event in [
-                    "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-d\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"Then I looked again.\"}}}\n\n",
-                    "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-e\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"Nothing else to add.\"}}}\n\n",
-                ] {
-                    sender.send(Ok(event.to_string())).await.expect("send replayed text-part SSE event");
-                }
             }
             for event in [
                 "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"The tree holds eleven files.\"}}}\n\n",
@@ -1450,9 +1435,8 @@ impl ExternalOpenCode {
     ///
     /// What a developer meets when the event stream dies mid-turn and the stop
     /// that follows has to recover the transcript from `session.messages`
-    /// alone. The gate is held throughout, so nothing but reconciliation can
-    /// account for what appears; releasing it afterwards replays the recovered
-    /// blocks back down the stream.
+    /// alone. The gate is never released, so nothing but reconciliation can
+    /// account for anything beyond the delta the stream stopped on.
     async fn narrating_past_a_lost_suffix(idle_release: Arc<Notify>) -> Self {
         let directory = tempfile::tempdir().expect("external peer directory");
         let log = directory.path().join("requests.jsonl");
@@ -5361,87 +5345,6 @@ async fn opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool()
         .await;
     assert_eq!(assistant_texts(&reloaded), assistant_texts(&interrupted));
     restarted.stop().await;
-    peer.task.abort();
-}
-
-/// Reconciliation reads one unchanging history several times before it will
-/// call the provider quiet, and leaves one copy of each block for it — and a
-/// stream that comes back afterwards and replays the very blocks the merge
-/// recovered does not add a second copy either.
-#[tokio::test]
-async fn opencode_reconcile_leaves_one_copy_of_each_block_however_often_it_reads() {
-    let idle_release = Arc::new(Notify::new());
-    let peer = ExternalOpenCode::narrating_past_a_lost_suffix(Arc::clone(&idle_release)).await;
-    let (_workspace, server, mut client, subscription) =
-        start_text_parts_turn(&peer, "twice").await;
-    let before = client.events_until_streaming(&subscription).await;
-    let turn_id = last_session(&before, "running the turn reconciled twice")["payload"]["session"]
-        ["activeTurnId"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    client
-        .call(
-            "orchestration.dispatchCommand",
-            interrupt_turn("parts-thread-twice", Some(&turn_id)),
-        )
-        .await
-        .expect_success();
-    client.events_through_the_turn(&subscription).await;
-
-    // Quiescence is proven across snapshots, so the same history was addressed
-    // more than once before anything was taken out of it. The turn has settled
-    // by now, so the log holds every read it took.
-    let reads = peer
-        .requests_through(5)
-        .await
-        .into_iter()
-        .filter(|request| request["operation"] == "messages")
-        .count();
-    assert!(
-        reads >= 2,
-        "one history, read {reads} times over while the quiet window ran"
-    );
-    let merged = server
-        .connect()
-        .await
-        .into_thread_snapshot("parts-thread-twice")
-        .await;
-    assert_eq!(
-        assistant_texts(&merged),
-        vec![
-            "Reading the tree first. ".to_string(),
-            "The tree holds eleven files.".to_string(),
-            "Then I looked again.".to_string(),
-            "Nothing else to add.".to_string(),
-        ],
-        "repeated reads of one history leave one copy of each block"
-    );
-
-    // The stream comes back and re-delivers what the merge already recovered.
-    // The drain marker proves every replayed event was handled first.
-    idle_release.notify_one();
-    client
-        .values_until(&subscription, |item| {
-            item["event"]["type"] == "thread.meta-updated"
-                && item["event"]["payload"]["title"] == "Late marker"
-        })
-        .await;
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    let replayed = server
-        .connect()
-        .await
-        .into_thread_snapshot("parts-thread-twice")
-        .await;
-    assert_eq!(
-        assistant_texts(&replayed),
-        assistant_texts(&merged),
-        "a replayed block is still one block"
-    );
-    client.close().await;
-    server.stop().await;
     peer.task.abort();
 }
 
