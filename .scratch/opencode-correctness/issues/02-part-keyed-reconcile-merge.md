@@ -21,7 +21,7 @@ history against a single accumulated string; here it addresses parts instead.
       to the pre-tool message.
 - [x] Text already shown is left byte-identical; a divergent snapshot cannot
       retract on-screen text (existing rule preserved, now per part).
-- [x] Reconcile is idempotent: running it twice against the same history
+- [ ] Reconcile is idempotent: running it twice against the same history
       produces one copy of each block.
 - [x] Parts absent locally are inserted in provider order between existing
       rows; ordinals keep reload consistent with live.
@@ -102,3 +102,60 @@ opencode_server` passes when run on its own. Orphaned `--exact
 opencode_peer_child` processes from an earlier interrupted run were holding the
 test binary and competing with the suite; reaping those by pid is what made the
 serialized run reproducible.
+
+2026-09-01 review of the evidence above, which was in part not evidence. Three
+of its assertions could not have failed, so they are gone or rewritten, and the
+third box is unchecked.
+
+**The third box is unchecked because the merge cannot run twice.**
+`reconcile_interrupt` (`src/opencode.rs`) reaches its merge loop on exactly one
+observation — `StopObservation::Quiet` — and settles in the same call; every
+earlier snapshot returns `Pending` before the loop, and `session.rs` clears the
+reconciliation ticker once a turn is `Settled`. So one stop performs one merge,
+by construction, and there is no history a second merge could disagree with.
+`opencode_reconcile_leaves_one_copy_of_each_block_however_often_it_reads` did
+not show otherwise: its `reads >= 2` counted `session.messages` polls, which the
+four-second quiet window guarantees whatever the merge does, and its replay half
+addressed a settled turn, where `emit_text` returns early because `driving.turn`
+is `None` and the text already matches — ticket 01's settled-turn immutability
+re-proved, not this criterion. The test is deleted along with the SSE replay
+branch that only it used; neither had a criterion left to serve. Making this box
+real would mean changing the design so a merge can run more than once, which is
+a question for whoever wants the property, not a test that can be written today.
+
+**The first and fourth boxes now assert what the client renders.** The placement
+assertions had read the _arrival-ordered_ event log, in which a row invented
+seconds after the tool activity is necessarily last however the merge behaved.
+On-screen order is `createdAt`: `deriveTimelineEntries` in
+`apps/web/src/session-logic.ts` concatenates message rows and work rows and
+sorts the lot by it. So the
+assertions now compare the recovered rows' `createdAt` against the
+`call-parts-1` work row's, off the persisted snapshot, and do it again after the
+reload — which previously compared `assistant_texts` only and so dropped the
+tool row entirely, leaving the placement claim surviving no restart at all.
+
+The limit of what that proves is worth writing down. A recovered row's
+`createdAt` is minted when the merge emits it, so it can only sort _after_ every
+row already on screen: what holds is that the blocks the stream never delivered
+read below the tool call they were spoken after and in provider order among
+themselves, live and after a reload. A part whose provider position preceded a
+row already on screen would be appended rather than sorted above it. That case
+is not in the scenario and is not claimed here.
+
+Also in this pass: the peer's `lost_suffix` history no longer keeps its own copy
+of the snapshot counter, and `rows[1]` now says what it expected to find rather
+than panicking on an index.
+
+Ran: `cargo test -p laplus-server --test socket_opencode_turn --no-fail-fast --
+--test-threads=1` (51 passed, 6 failed, 1 ignored) and
+`cargo check -p laplus-server`.
+`opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool` passes,
+as does every other interrupt-reconcile scenario named above. Of the six
+failures, `failed_interrupt_reconciliation_is_reported_once_and_later_turns_
+still_run` is ticket 04's and red on this branch's HEAD; two are this machine's
+loopback (`AddrNotAvailable`, 10049); and the three owned-server reaping tests —
+`an_owned_opencode_turn_crosses_the_socket_and_reaps_its_server`,
+`stopping_busy_owned_opencode_aborts_and_reaps_its_server`,
+`project_closure_reaps_its_threads_live_owned_opencode_server` — all pass when
+run as their own invocation, which is the process-double interference this
+ticket's previous comment already describes.
