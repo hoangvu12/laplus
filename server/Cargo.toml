@@ -100,6 +100,15 @@ tokio = { version = "1", features = [
 ] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tokio-rustls = "0.26"
+# A safe API over Windows job objects, which is the one mechanism that bounds a
+# child's life by this process's without needing this process to run any code —
+# see `crate::process::bound_to_this_server` for what it buys and what it does
+# not. A dependency rather than four `unsafe` calls because `unsafe_code` is
+# forbidden below, and this is a case where the alternative would be to lift
+# that for the whole workspace. It costs the workspace nothing new: `windows`
+# 0.61 and `thiserror` 1 are already in the lock via Tauri and `portable-pty`,
+# so what is added is the wrapper.
+win32job = "2.0.3"
 
 # What a released artifact is built with, and the settings ticket 24's
 # measurement assumes. Here rather than in the shell's own manifest because
