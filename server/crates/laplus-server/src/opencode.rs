@@ -1543,11 +1543,78 @@ impl OpenCode {
         emitted
     }
 
+    /// For each part of a provider message, the first row *after* it that laplus
+    /// already has on screen — `None` where nothing after it was ever drawn,
+    /// which is what makes a trailing block belong at the end.
+    ///
+    /// Walked from the end, because a part's answer is the answer of the part
+    /// after it unless that part is itself a row.
+    ///
+    /// **Reasoning is deliberately not an anchor.** Its rows are minted per
+    /// delta and carry no identity a later pass could find, so a block next to
+    /// one anchors on whatever is drawn beyond it instead. Nor is a `task` call,
+    /// which draws a subagent row rather than a tool row — naming one resolves
+    /// to nothing in the fold, and a block that cannot be placed is appended,
+    /// which is where it would have gone anyway.
+    fn rows_after_each(&self, parts: &[Value]) -> Vec<Option<crate::threads::Anchor>> {
+        let mut after = Vec::with_capacity(parts.len());
+        let mut next = None;
+        for part in parts.iter().rev() {
+            after.push(next.clone());
+            if let Some(drawn) = self.drawn_as(part) {
+                next = Some(drawn);
+            }
+        }
+        after.reverse();
+        after
+    }
+
+    /// The row this provider part already has in the transcript, if it has one.
+    fn drawn_as(&self, part: &Value) -> Option<crate::threads::Anchor> {
+        match part.get("type").and_then(Value::as_str)? {
+            "text" => {
+                let id = part
+                    .get("id")
+                    .or_else(|| part.get("partID"))
+                    .and_then(Value::as_str)?;
+                let (_, emitted) = self.emitted_parts.iter().find(|(known, _)| known == id)?;
+                emitted
+                    .message_id
+                    .clone()
+                    .map(crate::threads::Anchor::Message)
+            }
+            "tool" if part.get("tool").and_then(Value::as_str) != Some(TASK_TOOL) => part
+                .get("callID")
+                .and_then(Value::as_str)
+                .map(|call| crate::threads::Anchor::ToolCall(call.to_string())),
+            _ => None,
+        }
+    }
+
     fn emit_text(
         &mut self,
         part_id: &str,
         kind: &str,
         text: &str,
+        driving: &mut crate::session::Driving,
+        decided: &mut crate::session::Decided,
+    ) {
+        self.emit_text_spoken_before(part_id, kind, text, None, driving, decided);
+    }
+
+    /// [`OpenCodeSession::emit_text`], for text that did not arrive now.
+    ///
+    /// `spoken_before` names the row the provider lists this part immediately
+    /// before, and is spent only if this call is what *mints* the part's message
+    /// — a part already on screen keeps the position it took when it was first
+    /// seen, which is what leaves a recovered turn's existing rows exactly where
+    /// the developer read them.
+    fn emit_text_spoken_before(
+        &mut self,
+        part_id: &str,
+        kind: &str,
+        text: &str,
+        spoken_before: Option<&crate::threads::Anchor>,
         driving: &mut crate::session::Driving,
         decided: &mut crate::session::Decided,
     ) {
@@ -1585,16 +1652,31 @@ impl OpenCode {
         // first emission, because the fold inserts a message where it was first
         // seen — which is exactly what puts post-tool commentary below the tool
         // rows, live and after a reload.
+        //
+        // A block being minted from provider history rather than from the
+        // stream is the one exception, and it is an exception about *when*
+        // rather than about identity: it was spoken earlier than this, between
+        // rows already drawn, so it names the row it precedes and the fold
+        // resolves the moment. See [`crate::threads::Change::AssistantBlockRecovered`].
+        let minting = emitted.message_id.is_none();
         let message_id = emitted
             .message_id
             .get_or_insert_with(crate::threads::fresh_message_id)
             .clone();
         decided
             .changes
-            .push(crate::threads::Change::AssistantDelta {
-                message_id,
-                turn_id: active.turn_id.clone(),
-                text: suffix.to_string(),
+            .push(match spoken_before.filter(|_| minting) {
+                Some(before) => crate::threads::Change::AssistantBlockRecovered {
+                    message_id,
+                    turn_id: active.turn_id.clone(),
+                    text: suffix.to_string(),
+                    before: before.clone(),
+                },
+                None => crate::threads::Change::AssistantDelta {
+                    message_id,
+                    turn_id: active.turn_id.clone(),
+                    text: suffix.to_string(),
+                },
             });
     }
 
@@ -2915,8 +2997,17 @@ impl crate::session::Driver for OpenCode {
         // part's message rather than appending to one accumulated string. Parts
         // already fully streamed compute an empty suffix and change nothing;
         // parts with more text on the provider than was streamed grow by exactly
-        // the difference; a part never seen here is inserted fresh, in provider
-        // order.
+        // the difference; a part never seen here is inserted fresh, at the
+        // position the provider's own list gives it.
+        //
+        // **Position comes from the list, not from the clock.** A block minted
+        // here would otherwise take the moment the merge ran, which is later
+        // than every row on screen — so a block the stream dropped in the
+        // *middle* of a turn would be appended under the whole transcript
+        // instead of going back between the tools it was spoken between. Each
+        // unseen part therefore carries the first row after it that laplus does
+        // have, and [`crate::threads::Change::AssistantBlockRecovered`] is where
+        // that becomes a `createdAt`.
         let mut extended = crate::session::Decided::default();
         if let Some(parts) = messages
             .as_array()
@@ -2924,12 +3015,16 @@ impl crate::session::Driver for OpenCode {
             .and_then(|message| message.get("parts"))
             .and_then(Value::as_array)
         {
-            for part in parts.iter().filter(|part| part.get("type").and_then(Value::as_str) == Some("text")) {
+            let followed_by = self.rows_after_each(parts);
+            for (part, spoken_before) in parts.iter().zip(followed_by) {
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
                 let Some(id) = part.get("id").or_else(|| part.get("partID")).and_then(Value::as_str) else {
                     continue;
                 };
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    self.emit_text(id, "text", text, driving, &mut extended);
+                    self.emit_text_spoken_before(id, "text", text, spoken_before.as_ref(), driving, &mut extended);
                 }
             }
         }

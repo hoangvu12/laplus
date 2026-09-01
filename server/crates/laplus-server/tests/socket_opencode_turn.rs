@@ -611,6 +611,18 @@ struct PeerState {
     /// block reads differently there than what the developer was shown. Every
     /// snapshot is identical, which is what lets the quiet window close.
     lost_suffix: bool,
+    /// The same loss, except that one of the blocks the stream never delivered
+    /// was spoken in the **middle** of the turn — after the tool call and
+    /// before the block the stream was cut off in — with another after
+    /// everything. Recovery has somewhere to put each, and they are not the
+    /// same somewhere.
+    ///
+    /// The script pauses before the cut-off block for this scenario, which is
+    /// not decoration: the transcript is ordered by a millisecond, so a block
+    /// recovered between two rows needs two rows a millisecond can tell apart.
+    /// A provider that thinks for a moment after a tool returns is the ordinary
+    /// case and gives one.
+    lost_middle: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -823,6 +835,26 @@ async fn session_messages(
             ]}
         ])));
     }
+    // The same shape with the loss moved into the middle of the turn. `prt-mid`
+    // sits between the tool call and the block the stream was cut off in, and
+    // was never streamed at all; `prt-z` was never streamed either and belongs
+    // under everything. One merge, two blocks, two different places to put
+    // them.
+    if state.lost_middle {
+        return Ok(Json(json!([
+            {"info":{"id":"message-0","role":"user"},"parts":[
+                {"id":"prt-prompt","type":"text","text":"look around"}
+            ]},
+            {"info":{"id":"message-1","role":"assistant"},"parts":[
+                {"id":"prt-a","type":"text","text":"Reading the tree first. "},
+                {"id":"prt-tool","type":"tool","callID":"call-parts-1","tool":"bash",
+                 "state":{"status":"completed","input":{"command":"ls -1"},"title":"ls -1","output":"src"}},
+                {"id":"prt-mid","type":"text","text":"Eleven, by the look of it. "},
+                {"id":"prt-b","type":"text","text":"The tree holds eleven files."},
+                {"id":"prt-z","type":"text","text":"Nothing else to add."}
+            ]}
+        ])));
+    }
     let text = if state.output_changes_during_stop && snapshot >= 3 {
         format!("output snapshot {snapshot}")
     } else {
@@ -931,10 +963,34 @@ async fn prompt(
             "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"prt-tool\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"tool\",\"callID\":\"call-parts-1\",\"tool\":\"bash\",\"state\":{\"status\":\"running\",\"input\":{\"command\":\"ls -1\"},\"time\":{\"start\":1}}}}}\n\n",
             "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"part\":{\"id\":\"prt-tool\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"tool\",\"callID\":\"call-parts-1\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"ls -1\"},\"title\":\"ls -1\",\"output\":\"src\",\"time\":{\"start\":1,\"end\":2}}}}}\n\n",
             "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prs-1\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"reasoning\",\"text\":\"weighing what changed\"}}}\n\n",
-            "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
-            "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"prt-b\",\"field\":\"text\",\"delta\":\"The tree holds \"}}\n\n",
         ] {
             sender.send(Ok(event.to_string())).await.expect("send scripted text-part SSE event");
+        }
+        let speaks_again = [
+            "data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt-b\",\"messageID\":\"message-1\",\"sessionID\":\"ses_owned_1\",\"type\":\"text\",\"text\":\"\"}}}\n\n",
+            "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_owned_1\",\"messageID\":\"message-1\",\"partID\":\"prt-b\",\"field\":\"text\",\"delta\":\"The tree holds \"}}\n\n",
+        ];
+        // The pause a provider takes between a tool's result and its next
+        // sentence, scripted only where a test needs the rows either side of it
+        // to be a millisecond apart — see [`PeerState::lost_middle`].
+        //
+        // **From a task rather than from here**, because a delay inside this
+        // handler is not a delay in the transcript: laplus awaits the prompt
+        // response before it reads a single event, so everything written here
+        // queues up and is folded in one burst whenever this returns. Sending
+        // the rest after the answer is what makes the gap the driver's own.
+        if state.lost_middle {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                for event in speaks_again {
+                    sender.send(Ok(event.to_string())).await.expect("send scripted text-part SSE event");
+                }
+            });
+        } else {
+            for event in speaks_again {
+                sender.send(Ok(event.to_string())).await.expect("send scripted text-part SSE event");
+            }
         }
         let gated = state.idle_release.is_some();
         let finish = async move {
@@ -1446,6 +1502,23 @@ impl ExternalOpenCode {
             idle_release: Some(idle_release),
             text_parts: true,
             lost_suffix: true,
+            ..Default::default()
+        };
+        Self::serving(directory, log, state).await
+    }
+
+    /// The same loss with one of the never-streamed blocks spoken in the middle
+    /// of the turn rather than after it, so that recovery has to put two blocks
+    /// from one merge in two different places.
+    async fn narrating_past_a_lost_middle(idle_release: Arc<Notify>) -> Self {
+        let directory = tempfile::tempdir().expect("external peer directory");
+        let log = directory.path().join("requests.jsonl");
+        let state = PeerState {
+            log: Arc::new(log.clone()),
+            healthy: true,
+            idle_release: Some(idle_release),
+            text_parts: true,
+            lost_middle: true,
             ..Default::default()
         };
         Self::serving(directory, log, state).await
@@ -4984,6 +5057,51 @@ fn reads_below_the_tool_row(snapshot: &Value, call_id: &str, text: &str) -> bool
     created_at(message_row, "an assistant row") > created_at(tool_row, "a work row")
 }
 
+/// The transcript in the order a client draws it, narrowed to the rows placement
+/// is a claim about: the assistant's own messages and one tool call's work rows.
+///
+/// `deriveTimelineEntries` (`apps/web/src/session-logic.ts`), mirrored down to
+/// its tie-break — message rows first, then work rows, the lot sorted by
+/// `createdAt` with a stable sort. Reading a snapshot's arrays in the order they
+/// happen to be stored would answer a different question, and reading the event
+/// log would answer one nothing renders: rows minted during a merge arrive after
+/// everything whatever `createdAt` they carry.
+fn drawn_narration(snapshot: &Value, call_id: &str) -> Vec<String> {
+    let stamp = |row: &Value, what: &str| {
+        row["createdAt"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what} carries the createdAt the client sorts by"))
+            .to_string()
+    };
+    let mut rows = snapshot["thread"]["messages"]
+        .as_array()
+        .expect("the transcript")
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .map(|message| {
+            (
+                stamp(message, "an assistant row"),
+                message["text"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.extend(
+        snapshot["thread"]["activities"]
+            .as_array()
+            .expect("the work log")
+            .iter()
+            .filter(|activity| activity["payload"]["data"]["toolCallId"] == call_id)
+            .map(|activity| {
+                (
+                    stamp(activity, "a work row"),
+                    format!("<{}>", activity["kind"].as_str().unwrap_or_default()),
+                )
+            }),
+    );
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows.into_iter().map(|(_, drawn)| drawn).collect()
+}
+
 async fn start_text_parts_turn(
     peer: &ExternalOpenCode,
     suffix: &str,
@@ -5388,6 +5506,117 @@ async fn opencode_reconcile_lands_a_lost_suffix_in_its_own_rows_below_the_tool()
             "a reloaded block still reads below the tool call: {recovered:?}"
         );
     }
+    restarted.stop().await;
+    peer.task.abort();
+}
+
+/// A block the stream dropped in the *middle* of a turn goes back between the
+/// rows it was spoken between, not under them.
+///
+/// The turn's shape is the previous test's, with the loss moved: the provider's
+/// history holds a block spoken after the tool call and before the block the
+/// stream was cut off in, and another spoken after everything. Both are minted
+/// by the one merge, seconds after every row on screen — so a recovered block
+/// that took the clock could only ever draw last, and the middle one drawing in
+/// the middle is a claim about nothing else.
+///
+/// The row it is inserted above must also be left where it was: a merge that
+/// bought placement by restamping the developer's existing transcript would be a
+/// worse defect than the one it fixed.
+#[tokio::test]
+async fn opencode_reconcile_lands_a_lost_middle_block_between_the_rows_it_was_spoken_between() {
+    let idle_release = Arc::new(Notify::new());
+    let peer = ExternalOpenCode::narrating_past_a_lost_middle(Arc::clone(&idle_release)).await;
+    let registry = tempfile::tempdir().unwrap();
+    let database = registry.path().join("registry.sqlite");
+    let (_workspace, server, mut client, subscription) =
+        start_text_parts_turn_at(&peer, "lost-middle", Some(&database)).await;
+    // Read as far as the block the stream is about to be cut off in, rather than
+    // as far as the *first* thing said: the stop has to land after the developer
+    // has been shown the row the recovered block belongs above, or the test would
+    // be about a transcript that had not been drawn yet.
+    let before = client
+        .values_until(&subscription, |item| {
+            item["event"]["type"] == "thread.message-sent"
+                && item["event"]["payload"]["text"] == "The tree holds "
+        })
+        .await;
+    let turn_id = last_session(&before, "running the turn whose stream was lost")["payload"]
+        ["session"]["activeTurnId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // When the developer was shown it. The merge may put a block above this row
+    // and may not move it.
+    let cut_off_at = before
+        .last()
+        .expect("the block that was streaming when the stream died")["event"]["payload"]
+        ["createdAt"]
+        .as_str()
+        .expect("the streamed block's createdAt")
+        .to_string();
+    client
+        .call(
+            "orchestration.dispatchCommand",
+            interrupt_turn("parts-thread-lost-middle", Some(&turn_id)),
+        )
+        .await
+        .expect_success();
+    client.events_through_the_turn(&subscription).await;
+
+    let interrupted = server
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-lost-middle")
+        .await;
+    assert_eq!(interrupted["thread"]["latestTurn"]["state"], "interrupted");
+    let drawn = [
+        "Reading the tree first. ",
+        "<tool.updated>",
+        "<tool.completed>",
+        // Never streamed, and spoken between the row above it and the row below
+        // it. This is the position the merge cannot reach by taking the clock.
+        "Eleven, by the look of it. ",
+        "The tree holds eleven files.",
+        // Never streamed either, and spoken after everything, so it belongs at
+        // the end — one merge, two blocks, two places.
+        "Nothing else to add.",
+    ];
+    assert_eq!(
+        drawn_narration(&interrupted, "call-parts-1"),
+        drawn,
+        "a recovered turn draws in the order the provider spoke it"
+    );
+    let cut_off_row = interrupted["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["text"] == "The tree holds eleven files.")
+        .expect("the cut-off block's row");
+    assert_eq!(
+        cut_off_row["createdAt"].as_str(),
+        Some(cut_off_at.as_str()),
+        "the row a block was inserted above keeps the moment it was drawn at"
+    );
+
+    client.close().await;
+    server.stop().await;
+
+    // The reload half. The transcript is stored in the order the fold appended
+    // it — a recovered block is appended like any other row and is only *drawn*
+    // in the middle — so an ordinal that did not travel with the stamp would
+    // read the turn back in a different order than the developer left it in.
+    let restarted = TestServer::start_at_with_config(&database, peer.config(None)).await;
+    let reloaded = restarted
+        .connect()
+        .await
+        .into_thread_snapshot("parts-thread-lost-middle")
+        .await;
+    assert_eq!(
+        drawn_narration(&reloaded, "call-parts-1"),
+        drawn,
+        "a reloaded transcript draws the recovered block in the same place"
+    );
     restarted.stop().await;
     peer.task.abort();
 }

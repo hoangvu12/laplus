@@ -1435,6 +1435,28 @@ pub enum Change {
         turn_id: String,
         text: String,
     },
+    /// A narration block laplus never saw, recovered from provider history and
+    /// minted where the provider says it was spoken rather than where the
+    /// recovery happened. `thread.message-sent` with `streaming: true`, exactly
+    /// like [`Change::AssistantDelta`] — the whole of the difference is the
+    /// `createdAt` the row is created with.
+    ///
+    /// **Why it is a change of its own.** Live text belongs at the end of the
+    /// transcript because that is where it happened, so a delta may take the
+    /// clock and nothing else. A block the stream dropped happened *earlier*,
+    /// between rows the developer is already looking at, and the transcript's
+    /// only ordering key is `createdAt` — `deriveTimelineEntries`
+    /// (`apps/web/src/session-logic.ts`) concatenates message rows and work
+    /// rows and sorts the lot by it. Taking the clock at merge time is what put
+    /// a recovered mid-turn block below every row on screen however the merge
+    /// behaved. Naming the neighbour instead is what puts it back.
+    AssistantBlockRecovered {
+        message_id: String,
+        turn_id: String,
+        text: String,
+        /// The row the provider lists this block immediately before.
+        before: Anchor,
+    },
     /// The buffered assistant message, which is authoritative.
     /// `thread.message-sent` with `streaming: false`, which the client replaces
     /// with.
@@ -1506,6 +1528,27 @@ pub enum Change {
     Reverted { turn_count: u64 },
 }
 
+/// A row already on screen, named the way a driver is able to name one.
+///
+/// The knowledge is split, so the answer is too. A driver reconciling an
+/// interrupted turn holds the provider's part list and knows which of those
+/// parts it has already drawn; what it does not hold is the `createdAt` the
+/// fold gave any of them, because the fold takes that stamp after the driver
+/// has stopped looking. So a recovered block names its neighbour by an identity
+/// both halves share — the message id a text part was minted under, or the
+/// provider's own call id for a tool — and [`placed_before`] resolves the
+/// moment against the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchor {
+    /// An assistant message, by the id its part was minted under.
+    Message(String),
+    /// A tool call, by the provider's call id. A call has more than one work row
+    /// — invocation, then result — and the **first** of them is the anchor: a
+    /// block spoken before the call belongs above the whole of it rather than
+    /// between the two halves.
+    ToolCall(String),
+}
+
 impl Change {
     /// What the project list is told about this change, if anything.
     ///
@@ -1539,6 +1582,7 @@ impl Change {
             Change::Deleted => Some(Listing::Removal),
             _ if thread.lifecycle.deleted() => None,
             Change::AssistantDelta { .. }
+            | Change::AssistantBlockRecovered { .. }
             | Change::Activity(_)
             | Change::Checkpointed(_)
             | Change::RevertRequested { .. }
@@ -1778,7 +1822,7 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
         } => {
             thread.latest_user_message_at = Some(at.to_string());
             let (mut payload, verdict) =
-                message_sent(thread, message_id, "user", text, Some(turn_id), false, at);
+                message_sent(thread, message_id, "user", text, Some(turn_id), false, at, at);
             if let Some(message) = thread.messages.iter_mut().find(|message| message.id == *message_id) {
                 message.attachments = attachments.clone();
             }
@@ -2148,6 +2192,31 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 Some(turn_id),
                 true,
                 at,
+                at,
+            );
+            reconciled = verdict;
+            payload
+        }
+        // The one row on this feed that is not created at the moment it is
+        // folded in. `at` still stamps everything a repeat would churn — the
+        // conversation's `updatedAt`, the event's `occurredAt`, the turn stamps
+        // — and only the transcript position moves.
+        Change::AssistantBlockRecovered {
+            message_id,
+            turn_id,
+            text,
+            before,
+        } => {
+            let created_at = placed_before(thread, before).unwrap_or_else(|| at.to_string());
+            let (payload, verdict) = message_sent(
+                thread,
+                message_id,
+                "assistant",
+                text,
+                Some(turn_id),
+                true,
+                at,
+                &created_at,
             );
             reconciled = verdict;
             payload
@@ -2164,6 +2233,7 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 text,
                 Some(turn_id),
                 false,
+                at,
                 at,
             );
             reconciled = verdict;
@@ -2275,6 +2345,54 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
 /// The reconciliation verdict is returned rather than counted here, which is
 /// the whole of why this module needs no `&self` — see `docs/adr/0025`.
 #[allow(clippy::too_many_arguments)]
+/// The moment a row must carry to render immediately above the row it names, or
+/// `None` when the transcript holds no such row.
+///
+/// **One millisecond earlier, because that is the smallest step the ordering key
+/// has.** The transcript is laid out by `createdAt` and by nothing else —
+/// `deriveTimelineEntries` (`apps/web/src/session-logic.ts`) concatenates
+/// message rows and work rows and sorts the lot by that string — so "above" is a
+/// strictly smaller stamp. Every stamp on this feed is rendered by
+/// [`crate::clock`] in one fixed shape, so a millisecond is both the resolution
+/// and the step.
+///
+/// **What that resolution costs, said plainly.** Two rows that landed inside one
+/// millisecond are already unordered against each other: the client's sort is
+/// stable and falls back to the order it holds them in, which puts *every*
+/// message row above *every* work row of the same millisecond whatever happened
+/// first. A block recovered between such a pair inherits that ambiguity and
+/// cannot do better — there is no stamp between them to take. `crate::store`
+/// makes the same observation from the other end, and answers it for a *reload*
+/// by storing each row's ordinal; what it cannot answer is where a row belongs
+/// that nobody stored.
+///
+/// Several blocks recovered before one anchor all take this same stamp and are
+/// ordered against each other by position instead: the fold appends them in
+/// provider order, a live client appends them in the order the events arrive,
+/// and a reload reads them back by ordinal — three routes to the one order.
+fn placed_before(thread: &Thread, before: &Anchor) -> Option<String> {
+    let anchored = match before {
+        Anchor::Message(message_id) => thread
+            .messages
+            .iter()
+            .find(|message| &message.id == message_id)
+            .map(|message| message.created_at.as_str()),
+        Anchor::ToolCall(call_id) => thread
+            .activities
+            .iter()
+            .find(|activity| {
+                activity.payload.pointer("/data/toolCallId").and_then(Value::as_str)
+                    == Some(call_id.as_str())
+            })
+            .map(|activity| activity.created_at.as_str()),
+    }?;
+    let millis = crate::clock::epoch_millis_from_iso(anchored)?;
+    Some(crate::clock::iso_from_epoch_millis(millis.saturating_sub(1)))
+}
+
+/// `created_at` is separate from `at` for exactly one caller — see
+/// [`Change::AssistantBlockRecovered`], which is a row that happened before the
+/// change carrying it. Everywhere else the two are the same string.
 fn message_sent(
     thread: &mut Thread,
     message_id: &str,
@@ -2283,6 +2401,7 @@ fn message_sent(
     turn_id: Option<&String>,
     streaming: bool,
     at: &str,
+    created_at: &str,
 ) -> (Value, Option<Reconciled>) {
     let mut reconciled = None;
     match thread
@@ -2325,7 +2444,7 @@ fn message_sent(
             attachments: Vec::new(),
             turn_id: turn_id.cloned(),
             streaming,
-            created_at: at.to_string(),
+            created_at: created_at.to_string(),
             updated_at: at.to_string(),
         }),
     }
@@ -2348,7 +2467,7 @@ fn message_sent(
         "text": text,
         "turnId": turn_id,
         "streaming": streaming,
-        "createdAt": at,
+        "createdAt": created_at,
         "updatedAt": at,
     });
 
@@ -2360,6 +2479,7 @@ impl Change {
         match self {
             Change::UserMessage { .. }
             | Change::AssistantDelta { .. }
+            | Change::AssistantBlockRecovered { .. }
             | Change::AssistantMessage { .. } => "thread.message-sent",
             Change::PromptQueued { .. } | Change::TurnDeliveryStateChanged { .. } => "thread.turn-delivery-state-changed",
             Change::MetaUpdated(_) => "thread.meta-updated",
@@ -2415,7 +2535,10 @@ pub(crate) fn bind_checkpoint_assistant_message(checkpoint: &mut Checkpoint, mes
 /// Three rules, and each is a decision this module's documentation argues:
 ///
 /// - **A delta owes nothing.** The buffered message supersedes it within the
-///   turn, and a row per token would put the disk in the streaming path.
+///   turn, and a row per token would put the disk in the streaming path. A
+///   recovered block owes nothing for the same reason and keeps the same debt:
+///   settlement closes it like any other part, and that write carries both the
+///   position and the `createdAt` the fold gave it.
 /// - **Everything else writes the row.** Every change moves `updatedAt` and most
 ///   of them move the latest turn with it. The row is a dozen small fields and
 ///   the writes are batched, so writing it unconditionally costs less than
@@ -2426,7 +2549,7 @@ pub(crate) fn bind_checkpoint_assistant_message(checkpoint: &mut Checkpoint, mes
 ///   be a different conversation.
 pub(crate) fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
     let message_id = match change {
-        Change::AssistantDelta { .. } => return Vec::new(),
+        Change::AssistantDelta { .. } | Change::AssistantBlockRecovered { .. } => return Vec::new(),
         Change::UserMessage { message_id, .. } | Change::AssistantMessage { message_id, .. } => {
             Some(message_id)
         }
