@@ -30,7 +30,11 @@ async fn idle_claude_releases_its_process_and_resumes_the_saved_session() {
         vec![INIT, ANSWER, DONE],
     ]);
     let workspace = Workspace::with(&["src/"]);
-    let server = TestServer::start_with_agent(&agent.configured()).await;
+    let mut config = ServerConfig::detect();
+    config.settings.providers.claude_agent.binary_path = agent.configured();
+    // Title generation must not share this conversation-only scripted process.
+    config.settings.text_generation_model_selection = json!({});
+    let server = TestServer::start_with(config).await;
     let mut client = server.connect().await;
     let subscription = client.open_conversation(&workspace, "thread-1").await;
     client
@@ -68,6 +72,8 @@ async fn idle_codex_releases_its_process_and_resumes_the_saved_thread() {
     let workspace = Workspace::with(&["src/"]);
     let mut config = ServerConfig::detect();
     config.settings.providers.codex.binary_path = codex.configured();
+    // Title generation must not overwrite the conversation process capture.
+    config.settings.text_generation_model_selection = json!({});
     let server = TestServer::start_with(config).await;
     let mut client = server.connect().await;
     client

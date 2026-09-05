@@ -1521,13 +1521,14 @@ mod tests {
     fn the_provider_fixture_pins_every_message_laplus_sends() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/codex-app-server/01-provider-probe.jsonl");
-        let expected: Vec<Value> = std::fs::read_to_string(&fixture)
+        let mut expected: Vec<Value> = std::fs::read_to_string(&fixture)
             .expect("reads the provider fixture")
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("a fixture record"))
             .filter(|record| record["dir"] == "send")
             .map(|record| record["msg"].clone())
             .collect();
+        expected[0]["params"]["clientInfo"]["version"] = json!(env!("CARGO_PKG_VERSION"));
 
         let actual = vec![
             Request::Initialize.message(1),
@@ -1677,13 +1678,14 @@ mod tests {
     fn the_turn_fixture_pins_every_message_laplus_sends() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/codex-app-server/01-plain-turn.jsonl");
-        let expected: Vec<Value> = std::fs::read_to_string(&fixture)
+        let mut expected: Vec<Value> = std::fs::read_to_string(&fixture)
             .expect("reads the turn fixture")
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("a fixture record"))
             .filter(|record| record["dir"] == "send")
             .map(|record| record["msg"].clone())
             .collect();
+        expected[0]["params"]["clientInfo"]["version"] = json!(env!("CARGO_PKG_VERSION"));
         let actual = vec![
             Request::Initialize.message(1),
             initialized(),

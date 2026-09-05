@@ -958,7 +958,7 @@ impl ScriptedCodex {
 
     pub fn assert_exchange(&self) {
         let mut actual = self.requests();
-        let expected: Vec<Value> = std::fs::read_to_string(
+        let mut expected: Vec<Value> = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../fixtures/codex-app-server/01-provider-probe.jsonl"),
         )
@@ -968,6 +968,7 @@ impl ScriptedCodex {
         .filter(|record| record["dir"] == "send")
         .map(|record| record["msg"].clone())
         .collect();
+        expected[0]["params"]["clientInfo"]["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
 
         let skills = actual
             .iter_mut()
