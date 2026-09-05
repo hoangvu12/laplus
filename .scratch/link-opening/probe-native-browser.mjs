@@ -1,15 +1,15 @@
 // Windows-only: actual Tauri WebView2 callbacks -> OS default browser.
 // Isolated app data/profile; never attaches to or stops the installed laplus.
-import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { createServer } from "node:http";
-import { createServer as createTcpServer } from "node:net";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeHttp from "node:http";
+import * as NodeNet from "node:net";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function freePort() {
-  const socket = createTcpServer();
+  const socket = NodeNet.createServer();
   await new Promise((resolve) => socket.listen(0, "127.0.0.1", resolve));
   const port = socket.address().port;
   await new Promise((resolve) => socket.close(resolve));
@@ -24,12 +24,12 @@ async function until(read, description) {
   throw new Error(`Timed out: ${description}`);
 }
 
-const root = mkdtempSync(join(tmpdir(), "laplus-native-link-"));
-mkdirSync(join(root, "webview"));
+const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "laplus-native-link-"));
+NodeFS.mkdirSync(NodePath.join(root, "webview"));
 const debugPort = await freePort();
 const appPort = await freePort();
 const requests = [];
-const fixture = createServer((request, response) => {
+const fixture = NodeHttp.createServer((request, response) => {
   if (request.url.startsWith("/native-link/")) {
     requests.push({ path: request.url, userAgent: request.headers["user-agent"] });
   }
@@ -40,17 +40,21 @@ const fixture = createServer((request, response) => {
 });
 await new Promise((resolve) => fixture.listen(0, "127.0.0.1", resolve));
 const fixtureOrigin = `http://127.0.0.1:${fixture.address().port}`;
-const shell = spawn(resolve("server/target/debug/laplus.exe"), ["--port", String(appPort)], {
-  windowsHide: true,
-  stdio: "ignore",
-  env: {
-    ...process.env,
-    LOCALAPPDATA: root,
-    APPDATA: root,
-    WEBVIEW2_USER_DATA_FOLDER: join(root, "webview"),
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort}`,
+const shell = NodeChildProcess.spawn(
+  NodePath.resolve("server/target/debug/laplus.exe"),
+  ["--port", String(appPort)],
+  {
+    windowsHide: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      LOCALAPPDATA: root,
+      APPDATA: root,
+      WEBVIEW2_USER_DATA_FOLDER: NodePath.join(root, "webview"),
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort}`,
+    },
   },
-});
+);
 let ws;
 try {
   const target = await until(async () => {
