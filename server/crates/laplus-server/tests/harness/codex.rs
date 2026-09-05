@@ -1004,6 +1004,30 @@ impl ScriptedCodex {
         self.assert_pid_reaped("conversation-pid", "conversation app-server");
     }
 
+    /// Idle eviction detaches the session before its graceful process shutdown.
+    pub async fn await_conversation_reaped(&self) {
+        #[cfg(not(windows))]
+        {
+            let pid = std::fs::read_to_string(self.directory.path().join("conversation-pid"))
+                .expect("the conversation recorded its process id");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline {
+                let running = std::process::Command::new("kill")
+                    .args(["-0", pid.trim()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !running {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        self.assert_conversation_reaped();
+    }
+
     fn assert_pid_reaped(&self, pid_file: &str, description: &str) {
         let pid = std::fs::read_to_string(self.directory.path().join(pid_file))
             .unwrap_or_else(|error| panic!("the {description} recorded its process id: {error}"));

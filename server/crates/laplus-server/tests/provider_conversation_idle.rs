@@ -99,7 +99,7 @@ async fn idle_codex_releases_its_process_and_resumes_the_saved_thread() {
             .expect_success();
         client.events_through_the_turn(&subscription).await;
         await_eviction(&server).await;
-        codex.assert_conversation_reaped();
+        codex.await_conversation_reaped().await;
         assert_eq!(codex.thread_requests().len(), index + 1);
     }
     let requests = codex.thread_requests();
