@@ -56,10 +56,11 @@ use tokio::sync::mpsc;
 
 fn quiet() -> IdleSession {
     IdleSession {
-        owned_opencode_server: true,
+        owned_resumable_process: true,
         turn_in_flight: false,
         prompt_waiting: false,
         request_outstanding: false,
+        background_work: false,
     }
 }
 
@@ -113,9 +114,19 @@ fn an_unanswered_request_refuses_the_reap_at_any_age() {
 }
 
 #[test]
+fn background_work_refuses_the_reap_after_the_root_finishes() {
+    let mut held = quiet();
+    held.background_work = true;
+    assert_eq!(
+        conversation_idle_decision(CONVERSATION_IDLE_WINDOW * 1000, held),
+        ConversationIdleDecision::Keep
+    );
+}
+
+#[test]
 fn an_external_endpoint_is_never_a_reap_candidate() {
     let mut external = quiet();
-    external.owned_opencode_server = false;
+    external.owned_resumable_process = false;
     assert_eq!(
         conversation_idle_decision(CONVERSATION_IDLE_WINDOW * 1000, external),
         ConversationIdleDecision::Keep

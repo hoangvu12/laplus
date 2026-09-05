@@ -270,24 +270,19 @@ fn externally_openable(url: &tauri::Url) -> bool {
 
 /// Hand a URL to whichever application the operating system opens it with.
 ///
-/// Three lines of standard library rather than `tauri-plugin-opener` (or any
-/// other opener crate): the plugin exists to expose the capability *to the
-/// page* through the IPC and its permission machinery, and this deliberately
-/// does not — the page asks for links to open by making the webview ask, which
-/// is the request this crate is already answering. What remains is spawning one
-/// well-known launcher per platform with the URL as a single argument, which no
-/// shell is involved in parsing. Best-effort by design: a failure to spawn is
-/// printed and otherwise dropped, because there is no surface to report it on
-/// and a dead click is the honest outcome of a machine with no default browser.
+/// On Windows use native URL activation, not Explorer's file-navigation parser.
+/// `that_detached` with `shellexecute-on-windows` calls ShellExecuteExW on this
+/// webview callback thread. The existing navigation policy allows only web/mail
+/// schemes. Other platforms use their standard URL launcher.
 fn open_in_the_system_browser(url: &str) {
-    let (program, arguments): (&str, [&str; 1]) = if cfg!(windows) {
-        ("explorer.exe", [url])
-    } else if cfg!(target_os = "macos") {
-        ("open", [url])
-    } else {
-        ("xdg-open", [url])
+    #[cfg(windows)]
+    let result = open::that_detached(url);
+    #[cfg(not(windows))]
+    let result = {
+        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(program).arg(url).spawn().map(|_| ())
     };
-    if let Err(error) = std::process::Command::new(program).args(arguments).spawn() {
+    if let Err(error) = result {
         eprintln!("laplus: could not open {url} in the system browser: {error}");
     }
 }

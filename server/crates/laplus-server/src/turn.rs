@@ -326,6 +326,10 @@ impl Driver for Claude {
     /// did not continue it: the CLI writes its reason to stderr and exits without
     /// a line of NDJSON, so the agent's own words are the only account of it —
     /// and they are only final once the child has gone. See [`Agent::stop`].
+    fn continuation_id(&self) -> Option<String> {
+        self.folding.session_id.clone()
+    }
+
     async fn stop(self, driving: &mut Driving, asked_to_stop: bool) -> Reaped {
         let folding = self.folding;
         let complaint = self.agent.stop().await;

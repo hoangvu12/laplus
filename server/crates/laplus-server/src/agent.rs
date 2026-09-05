@@ -209,6 +209,7 @@ pub fn pushed_permission_mode_for(runtime_mode: &str) -> &'static str {
 #[derive(Debug)]
 pub struct Agent {
     child: Child,
+    session_job: Option<crate::process::SessionJob>,
     /// `None` once stdin has been closed, which is how a session says there will
     /// be no more turns. The writer is *taken* rather than flagged, so closing
     /// it drops the handle — which is what the child reads as EOF — instead of
@@ -300,6 +301,13 @@ impl Agent {
         // `crate::process::bound_to_this_server`, and the dev servers its Bash
         // tool starts, which no kill of this handle has ever reached.
         crate::process::bound_to_this_server_async(&child);
+        let session_job = match crate::process::SessionJob::for_async(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                crate::process::terminate_tree_and_wait_async(&mut child).await;
+                return Err(error);
+            }
+        };
 
         // `take` rather than `expect` on each: all three were piped a few lines
         // above, so their absence is this function's own bug and not something a
@@ -344,6 +352,7 @@ impl Agent {
 
         Ok(Agent {
             child,
+            session_job: Some(session_job),
             stdin: Some(stdin),
             output,
             complaint,
@@ -525,6 +534,9 @@ impl Agent {
     /// uses is a grandchild a kill does not reach. The same case, and the same
     /// bound, as the exit grace above.
     async fn last_words(&mut self) -> Option<String> {
+        // The root may already have exited. Its helper processes still belong
+        // to this session, and may also hold the stderr pipe open.
+        drop(self.session_job.take());
         if let Some(reader) = self.stderr.take() {
             let _ = tokio::time::timeout(EXIT_GRACE, reader).await;
         }

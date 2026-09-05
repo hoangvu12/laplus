@@ -111,10 +111,9 @@
 //! and it gets no checkpoint — because no checkpoint status means "the developer
 //! ended the session" and both the ones there are would relabel the turn.
 //!
-//! ## A conversation-owned OpenCode server is given up when idle
+//! ## A conversation-owned provider process is given up when idle
 //!
-//! One more thing this loop does around the verbs, for one driver only: an
-//! OpenCode server laplus itself launched is given up after a bounded quiet
+//! A provider process laplus itself launched is given up after a bounded quiet
 //! stretch between turns (ADR-0057). The decision is a pure function of idle
 //! time and session conditions — [`conversation_idle_decision`] — armed as a
 //! deadline beside `interrupt_reconciliation`'s, and the reap itself is the
@@ -123,8 +122,9 @@
 //! independently of the process ([`crate::provider::ResumeCursor`]) and the
 //! next prompt attaches a fresh server that adopts the session by id
 //! (ADR-0041). An active turn, a queued prompt or an unanswered request
-//! refuses it at any age; an external endpoint (ADR-0036) and every Claude or
-//! Codex child are outside this machinery entirely.
+//! refuses it at any age, as does live delegated work. Claude and Codex use
+//! the same lifecycle once their continuation cursor is durable. External
+//! endpoints (ADR-0036) are never this machinery's to stop.
 //!
 //! ## A turn is also a point in time, and this is the only place that knows when
 //!
@@ -533,7 +533,7 @@ pub fn send_prompts(
 // Conversation-owned server idling
 // ---------------------------------------------------------------------------
 
-/// How long a conversation-owned OpenCode server may sit idle between turns
+/// How long a conversation-owned provider may sit idle between turns
 /// before this loop gives it up.
 ///
 /// [`crate::text_generation`]'s pool reaps at thirty seconds (ADR-0043), but a
@@ -554,17 +554,17 @@ pub const CONVERSATION_IDLE_WINDOW: std::time::Duration = std::time::Duration::f
 /// clock nor process lifetime can be made part of the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdleSession {
-    /// The agent is an OpenCode server laplus itself launched. An external
-    /// endpoint is operator-owned (ADR-0036) and never this machinery's to
-    /// kill; a Claude or Codex child belongs to its session task and has no
-    /// server to give up.
-    pub owned_opencode_server: bool,
+    /// Laplus owns this process and has saved the cursor needed to resume it.
+    /// External endpoints are never this machinery's to stop.
+    pub owned_resumable_process: bool,
     pub turn_in_flight: bool,
     pub prompt_waiting: bool,
     /// A permission request or a question the agent stopped for. Either one
     /// holds the server past any age — an answer must reach the agent that
     /// asked, and both kinds live in the same outstanding map here.
     pub request_outstanding: bool,
+    /// The root may have finished while a delegated agent is still working.
+    pub background_work: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,10 +594,11 @@ pub(crate) fn conversation_idle_decision_against(
     window: std::time::Duration,
     session: IdleSession,
 ) -> ConversationIdleDecision {
-    let quiet = session.owned_opencode_server
+    let quiet = session.owned_resumable_process
         && !session.turn_in_flight
         && !session.prompt_waiting
-        && !session.request_outstanding;
+        && !session.request_outstanding
+        && !session.background_work;
     match quiet && idle_for >= window {
         true => ConversationIdleDecision::Reap,
         false => ConversationIdleDecision::Keep,
@@ -621,8 +622,7 @@ pub(crate) fn conversation_idle_window() -> std::time::Duration {
         .unwrap_or(CONVERSATION_IDLE_WINDOW)
 }
 
-/// Whether this session's agent is an OpenCode server laplus itself launched —
-/// the only kind this loop may give up when idle.
+/// Whether laplus owns the process behind this session.
 ///
 /// Mirrors the condition [`crate::opencode::OpenCode::open`] uses to choose
 /// between spawning and attaching: `Start` is fixed for the session's life and
@@ -632,7 +632,7 @@ pub(crate) fn conversation_idle_window() -> std::time::Duration {
 fn reaps_when_idle(start: &Start) -> bool {
     match &start.driver {
         DriverStart::OpenCode(opencode_start) => opencode_start.settings.server_url.is_empty(),
-        DriverStart::Claude(_) | DriverStart::Codex(_) => false,
+        DriverStart::Claude(_) | DriverStart::Codex(_) => true,
     }
 }
 
@@ -691,7 +691,7 @@ async fn drive<D: Driver>(
     let idle_reaping = reaps_when_idle(&start);
     if idle_reaping && start.resume_cursor.is_some() {
         eprintln!(
-            "laplus: conversation {} resumed its OpenCode session (instance {}, provider session {}).",
+            "laplus: conversation {} resumed its provider session (instance {}, provider session {}).",
             start.thread_id,
             start.provider.instance_id,
             driver.continuation_id().as_deref().unwrap_or("unknown"),
@@ -1031,10 +1031,12 @@ async fn drive<D: Driver>(
                     continue;
                 };
                 let conditions = IdleSession {
-                    owned_opencode_server: idle_reaping,
+                    owned_resumable_process: idle_reaping && threads.get(&start.thread_id)
+                        .is_some_and(|thread| thread.provider_resume_cursor.is_some()),
                     turn_in_flight: driving.turn.is_some(),
                     prompt_waiting: waiting.is_some(),
                     request_outstanding: !driving.outstanding.is_empty(),
+                    background_work: threads.subagents().working(&start.thread_id),
                 };
                 match conversation_idle_decision_against(since.elapsed(), conversation_idle_window(), conditions) {
                     // Not quiet, or the window moved: the bottom of this
@@ -1059,7 +1061,7 @@ async fn drive<D: Driver>(
                             waiting = Some(prompt);
                         } else {
                             eprintln!(
-                                "laplus: conversation {} has sat idle for {}s; giving up its OpenCode server (instance {}, provider session {}).",
+                                "laplus: conversation {} has sat idle for {}s; giving up its provider process (instance {}, provider session {}).",
                                 start.thread_id,
                                 since.elapsed().as_secs(),
                                 start.provider.instance_id,
@@ -1083,6 +1085,8 @@ async fn drive<D: Driver>(
         // resets it from zero rather than pausing it, so a conversation talked
         // to in dribbles never crosses the window by accumulation.
         idle_deadline = if idle_reaping
+            && threads.get(&start.thread_id).is_some_and(|thread| thread.provider_resume_cursor.is_some())
+            && !threads.subagents().working(&start.thread_id)
             && accepting
             && listening
             && driving.turn.is_none()

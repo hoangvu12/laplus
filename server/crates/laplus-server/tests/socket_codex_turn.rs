@@ -1,6 +1,76 @@
 //! Codex turns at the socket boundary used by the real composer.
 
+/// A collaboration activity can refer back to the root. It must not create a
+/// permanently working child whose completion is handled only as a root event.
+#[tokio::test]
+async fn codex_root_activity_does_not_keep_a_completed_conversation_running() {
+    let codex = ScriptedCodex::plain_conversation();
+    let path = codex.directory().join("turn-events-before-pause");
+    let existing = std::fs::read_to_string(&path).unwrap();
+    let root_activity = json!({
+        "method": "item/completed",
+        "params": {"threadId": "codex-thread-1", "turnId": "codex-turn-1",
+            "item": {"type": "subAgentActivity", "id": "root-interaction",
+                "kind": "interacted", "agentThreadId": "codex-thread-1", "agentPath": "/root"}}
+    });
+    std::fs::write(path, format!("{existing}{root_activity}\n")).unwrap();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    client.call("orchestration.dispatchCommand", codex_thread("full-access")).await.expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client.call("orchestration.dispatchCommand", follow_up("codex-thread", "message-1", "Hello.")).await.expect_success();
+    client.values_until(&subscription, |item| {
+        item["event"]["payload"]["activity"]["kind"] == "turn.completed"
+    }).await;
+    let snapshot = server.connect().await.into_thread_snapshot("codex-thread").await;
+    let latest_state = snapshot["thread"]["latestTurn"]["state"].clone();
+    let session_status = snapshot["thread"]["session"]["status"].clone();
+    client.close().await;
+    server.stop().await;
+    assert_eq!(latest_state, "completed");
+    assert_ne!(session_status, "running", "the root became its own permanently working child");
+}
+
 mod harness;
+
+#[tokio::test]
+async fn codex_automatic_successor_renders_its_answer_and_finishes() {
+    let codex = ScriptedCodex::plain_conversation();
+    let path = codex.directory().join("turn-terminal");
+    let mut terminal = std::fs::read_to_string(&path).unwrap();
+    for event in [
+        json!({"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"automatic-2","status":"inProgress"}}}),
+        json!({"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"automatic-2","item":{"type":"agentMessage","id":"automatic-answer","text":"Automatic follow-up arrived."}}}),
+        json!({"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"automatic-2","status":"completed"}}}),
+    ] {
+        terminal.push_str(&format!("{event}\n"));
+    }
+    std::fs::write(path, terminal).unwrap();
+    let workspace = Workspace::with(&["src/main.rs"]);
+    let mut config = ServerConfig::detect();
+    config.settings.providers.codex.binary_path = codex.configured();
+    let server = TestServer::start_with(config).await;
+    let mut client = server.connect().await;
+    client.call("orchestration.dispatchCommand", create_project("project-1", workspace.path())).await.expect_success();
+    client.call("orchestration.dispatchCommand", codex_thread("full-access")).await.expect_success();
+    let subscription = client.watch_conversation("codex-thread").await;
+    client.call("orchestration.dispatchCommand", follow_up("codex-thread", "message-1", "Hello.")).await.expect_success();
+    let endings = std::cell::Cell::new(0);
+    client.values_until(&subscription, |item| {
+        if item["event"]["payload"]["activity"]["kind"] == "turn.completed" { endings.set(endings.get() + 1); }
+        endings.get() == 2
+    }).await;
+    let snapshot = server.connect().await.into_thread_snapshot("codex-thread").await;
+    assert_eq!(snapshot["thread"]["latestTurn"]["state"], "completed");
+    assert_eq!(snapshot["thread"]["session"]["status"], "ready");
+    assert!(snapshot["thread"]["messages"].as_array().unwrap().iter().any(|message| message["text"] == "Automatic follow-up arrived."));
+    assert_eq!(codex.turn_requests(), 1, "successor was provider-initiated");
+    server.stop().await;
+}
 
 use harness::codex::ScriptedCodex;
 use harness::agent::ScriptedAgent;

@@ -415,6 +415,9 @@ impl TestServer {
     /// A whole-process restart seam whose database, settings and stored
     /// attachment files share the caller-owned preferences directory.
     pub async fn start_persistent_with_config_in(preferences: &Path, mut config: ServerConfig) -> TestServer {
+        // Match start_on: this isolated listener must not inherit the
+        // developer's remote binding (0.0.0.0 is not a Windows connect address).
+        config = config.with_remote_access(RemoteAccess::none());
         config.preferences = preferences.to_path_buf();
         somewhere_that_is_not_the_developers(&mut config);
         config.preferences = preferences.to_path_buf();

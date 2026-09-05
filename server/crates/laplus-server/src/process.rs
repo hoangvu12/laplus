@@ -107,6 +107,52 @@ pub fn bound_to_this_server_async(child: &tokio::process::Child) {
     let _ = child;
 }
 
+/// Own the descendants of one provider session, even after its root exits.
+/// The process-wide job remains the crash backstop; this nested job closes at
+/// session disposal instead of retaining helpers until laplus itself exits.
+#[derive(Debug)]
+pub struct SessionJob {
+    #[cfg(windows)]
+    _job: win32job::Job,
+}
+
+impl SessionJob {
+    pub fn for_child(child: &Child) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            Self::from_handle(child.as_raw_handle() as isize)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    pub fn for_async(child: &tokio::process::Child) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let handle = child.raw_handle().ok_or_else(|| {
+                std::io::Error::other("provider exited before session supervision was attached")
+            })?;
+            Self::from_handle(handle as isize)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    #[cfg(windows)]
+    fn from_handle(handle: isize) -> std::io::Result<Self> {
+        let job = supervision_job().map_err(std::io::Error::other)?;
+        job.assign_process(handle).map_err(std::io::Error::other)?;
+        Ok(Self { _job: job })
+    }
+}
+
 /// The one job object this process owns, created on first use.
 ///
 /// A `OnceLock` rather than a field on the server, because the thing being
@@ -387,6 +433,31 @@ mod supervision {
             if held >= wanted || Instant::now() >= deadline {
                 return held;
             }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn disposing_a_session_reaps_descendants_after_its_root_exited() {
+        use std::io::Write;
+        let observer = supervision_job().expect("observer job");
+        // Keep the root blocked until both jobs are attached, so the test
+        // measures disposal rather than the separately documented spawn race.
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "set /p ready= & ping -n 60 127.0.0.1 > nul"])
+            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().expect("root starts");
+        observer.assign_process(child.as_raw_handle() as isize).expect("observe tree");
+        let session = SessionJob::for_child(&child).expect("session job");
+        child.stdin.take().unwrap().write_all(b"ready\n").expect("release root");
+        assert!(holds_at_least(&observer, 2) >= 2, "helper joined the tree");
+        child.kill().expect("root exits independently");
+        child.wait().expect("root is reaped");
+        terminate_tree_and_wait(&mut child);
+        drop(session);
+        let deadline = Instant::now() + SETTLES_WITHIN;
+        while !observer.query_process_id_list().expect("members").is_empty() {
+            assert!(Instant::now() < deadline, "session helper survived its exited root");
             std::thread::sleep(Duration::from_millis(20));
         }
     }

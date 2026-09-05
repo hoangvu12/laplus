@@ -39,6 +39,11 @@ laplus-server = { path = "../laplus-server" }
 serde_json.workspace = true
 tokio.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# Native URL activation through ShellExecuteExW; Explorer is a file manager,
+# not the default-browser dispatch API. Keep this capability in Rust.
+open = { version = "5.4.2", features = ["shellexecute-on-windows"] }
+
 [build-dependencies]
 tauri-build = { version = "2", default-features = false, features = [] }
 # To read one field out of upstream's `package.json` — the version the embedded

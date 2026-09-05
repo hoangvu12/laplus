@@ -532,6 +532,10 @@ impl Driver for Codex {
         self.app_server.close_input();
     }
 
+    fn continuation_id(&self) -> Option<String> {
+        Some(self.thread_id.clone())
+    }
+
     async fn stop(self, driving: &mut Driving, asked_to_stop: bool) -> Reaped {
         let complaint = self.app_server.stop().await;
         let death = (driving.turn.is_some() && !asked_to_stop).then(|| match complaint {
@@ -563,8 +567,21 @@ fn decide(
     let mut decided = Decided::default();
     match folded {
         ConversationFold::Nothing
-        | ConversationFold::ThreadStarted { .. }
-        | ConversationFold::TurnStarted { .. } => {}
+        | ConversationFold::ThreadStarted { .. } => {}
+        ConversationFold::TurnStarted { .. } => {
+            // Codex can continue autonomously after a completed turn. Open a
+            // UI turn for those events; an ordinary RPC start already has one.
+            if driving.turn.is_none() {
+                let turn_id = crate::threads::fresh_turn_id();
+                decided.opens = Some(turn_id.clone());
+                driving.turn = Some(crate::session::InFlight {
+                    turn_id,
+                    assistant_message_id: None,
+                    tools: HashMap::new(),
+                    stopped: None,
+                });
+            }
+        }
         ConversationFold::TitleUpdated { title } => {
             decided.changes.push(Change::MetaUpdated(crate::threads::MetaUpdate {
                 title: Some(title),
@@ -1458,6 +1475,7 @@ fn drift_clause(drift: Drift) -> Option<String> {
 
 struct AppServer {
     child: AsyncChild,
+    session_job: Option<crate::process::SessionJob>,
     stdin: Option<AsyncChildStdin>,
     output: async_mpsc::Receiver<String>,
     deferred: VecDeque<String>,
@@ -1497,6 +1515,13 @@ impl AppServer {
         // `node` and `codex.exe` under it join the job by inheritance — which is
         // the tree `terminate_tree_and_wait` walks by hand on the graceful path.
         crate::process::bound_to_this_server_async(&child);
+        let session_job = match crate::process::SessionJob::for_async(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                crate::process::terminate_tree_and_wait_async(&mut child).await;
+                return Err(error);
+            }
+        };
         let stdin = child.stdin.take().ok_or_else(missing_async_pipe)?;
         let stdout = child.stdout.take().ok_or_else(missing_async_pipe)?;
         let child_stderr = child.stderr.take().ok_or_else(missing_async_pipe)?;
@@ -1528,6 +1553,7 @@ impl AppServer {
 
         Ok(AppServer {
             child,
+            session_job: Some(session_job),
             stdin: Some(stdin),
             output,
             deferred: VecDeque::new(),
@@ -1650,6 +1676,7 @@ impl AppServer {
     }
 
     async fn last_words(&mut self) -> Option<String> {
+        drop(self.session_job.take());
         if let Some(stderr) = self.stderr.take() {
             let _ = tokio::time::timeout(EXIT_GRACE, stderr).await;
         }
@@ -1682,6 +1709,7 @@ fn missing_async_pipe() -> std::io::Error {
 
 struct Client {
     child: Child,
+    _session_job: crate::process::SessionJob,
     stdin: Option<ChildStdin>,
     output: mpsc::Receiver<String>,
     pending: HashMap<u64, String>,
@@ -1722,6 +1750,13 @@ impl Client {
         // reaps this tree, and this is what covers the run where `Drop` does not
         // get to happen.
         crate::process::bound_to_this_server(&child);
+        let session_job = match crate::process::SessionJob::for_child(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                crate::process::terminate_tree_and_wait(&mut child);
+                return Err(format!("Codex process supervision failed: {error}"));
+            }
+        };
         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let (Some(stdin), Some(stdout), Some(child_stderr)) = pipes else {
             let _ = child.kill();
@@ -1755,6 +1790,7 @@ impl Client {
 
         Ok(Client {
             child,
+            _session_job: session_job,
             stdin: Some(stdin),
             output,
             pending: HashMap::new(),

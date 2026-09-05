@@ -899,13 +899,16 @@ impl ScriptedCodex {
     pub fn assert_missing_resume_capture_prefix(&self) {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/codex-app-server/06-resume-missing.jsonl");
-        let expected: Vec<Value> = std::fs::read_to_string(fixture)
+        let mut expected: Vec<Value> = std::fs::read_to_string(fixture)
             .expect("reads capture 06")
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("a capture 06 record"))
             .filter(|record| record["dir"] == "send")
             .map(|record| record["msg"].clone())
             .collect();
+        // Pin the protocol while requiring the handshake to identify this
+        // build, rather than the older release that recorded the fixture.
+        expected[0]["params"]["clientInfo"]["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
         let actual: Vec<Value> = self.requests().into_iter().take(expected.len()).collect();
         assert_eq!(
             actual, expected,

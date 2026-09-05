@@ -293,7 +293,25 @@ impl ConversationState {
             if let Some(id) = object.get("id") {
                 return self.fold_request(method, id, params);
             }
-            return self.fold_notification(method, params);
+            let mut folded = self.fold_notification(method, params);
+            // Collaboration messages can target the root (for example a child
+            // messaging its parent). That does not make the root its own child:
+            // its terminal events are handled by the root turn lifecycle.
+            if let Some(root) = self.thread_id.as_deref() {
+                self.subagent_paths.remove(root);
+                match &mut folded {
+                    ConversationFold::SubagentActivity(activity)
+                    | ConversationFold::NestedSubagentActivity(activity)
+                        if activity.agent_thread_id == root => return ConversationFold::Nothing,
+                    ConversationFold::CollaborationStarted(call)
+                    | ConversationFold::CollaborationCompleted(call) => {
+                        call.receiver_thread_ids.retain(|id| id != root);
+                        call.agents.retain(|agent| agent.thread_id != root);
+                    }
+                    _ => {}
+                }
+            }
+            return folded;
         }
 
         let Some(result) = object.get("result") else {
@@ -350,6 +368,22 @@ impl ConversationState {
             }
         }
         match method {
+            "turn/started" => {
+                let turn = &params["turn"];
+                let Some(turn_id) = turn["id"].as_str() else {
+                    return self.unknown_event();
+                };
+                // A delayed duplicate start must not reopen a completed turn.
+                if self.turn_id.as_deref() == Some(turn_id)
+                    && self.turn_status.as_deref().is_some_and(|status| status != "inProgress")
+                {
+                    return ConversationFold::Nothing;
+                }
+                self.turn_id = Some(turn_id.to_string());
+                self.turn_status = Some("inProgress".to_string());
+                self.turn_error = None;
+                ConversationFold::TurnStarted { turn_id: turn_id.to_string() }
+            }
             "thread/name/updated" => {
                 let Some(title) = params
                     .get("name")
