@@ -852,7 +852,7 @@ impl Driver for Mimir {
         self.events.task.abort();
         self.events.incoming.close();
     }
-    async fn stop(mut self, _: &mut Driving, asked_to_stop: bool) -> Reaped {
+    async fn stop(mut self, driving: &mut Driving, asked_to_stop: bool) -> Reaped {
         if let Some(attachment) = self.mcp.take() {
             let _ = tokio::time::timeout(
                 CONTROL_TIMEOUT,
@@ -875,7 +875,8 @@ impl Driver for Mimir {
         self.bridge.stop().await;
         Reaped {
             refused: None,
-            death: (!asked_to_stop).then(|| {
+            // Normal idle eviction releases the bridge, not an unfinished turn.
+            death: (!asked_to_stop && (driving.turn.is_some() || self.history_gap)).then(|| {
                 if self.history_gap {
                     protocol::HISTORY_WARNING.into()
                 } else {

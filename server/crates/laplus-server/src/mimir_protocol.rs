@@ -225,6 +225,7 @@ pub(crate) struct Projection {
     root_agent: Option<String>,
     blocks: BTreeMap<String, String>,
     unfinished_root_ids: std::collections::BTreeSet<String>,
+    // Seen children and their accepted structured report, until run completion.
     children: HashMap<String, Option<String>>,
     pub plan: Option<Value>,
     serial: u64,
@@ -331,7 +332,8 @@ impl Projection {
         let turn = driving.turn.as_ref().map(|t| t.turn_id.clone());
         let child = parent.map(|_| agent);
         let key = format!(
-            "mimir:{}:{}:{}:{}:{}",
+            "mimir:{}:{}:{}:{}:{}:{}",
+            turn.as_deref().unwrap_or("background"),
             text(source, "run_id"),
             agent,
             source["turn"],
@@ -343,7 +345,7 @@ impl Projection {
                 .filter(|p| Some(*p) != self.root_agent.as_deref())
                 .map(str::to_string);
             let first = !self.children.contains_key(child);
-            self.children.insert(child.into(), parent_child.clone());
+            self.children.entry(child.into()).or_default();
             let mut update = crate::subagents::Update::for_child(child);
             update.parent_child_id = parent_child;
             update.state = Some(crate::subagents::State::Working);
@@ -365,6 +367,11 @@ impl Projection {
                 }
                 "tool_started" | "tool_finished" => {
                     let row = tool_row(data, kind == "tool_finished", turn.clone(), at);
+                    if kind == "tool_finished" {
+                        if let Some(report) = reported_result(data) {
+                            self.children.insert(child.into(), Some(report));
+                        }
+                    }
                     update.entries.push(crate::subagents::NewEntry {
                         key: Some(format!("tool:{}", text(data, "id"))),
                         kind: child_tool_kind(text(data, "name")),
@@ -380,10 +387,13 @@ impl Projection {
                                 .and_then(Value::as_str),
                             None | Some("completed")
                         );
+                    let report = self.children.get_mut(child).and_then(Option::take);
                     update.outcome = Some(if error {
                         crate::subagents::Outcome::failed(Some(text(data, "message").into()))
                     } else {
-                        crate::subagents::Outcome::completed(Some(message_text(&data["message"])))
+                        crate::subagents::Outcome::completed(
+                            report.or_else(|| Some(message_text(&data["message"]))),
+                        )
                     });
                     out.changes.push(Change::Activity(child_row(
                         child,
@@ -665,6 +675,18 @@ fn status_row(data: &Value, turn: Option<String>, at: &str) -> Option<Activity> 
     ))
 }
 
+fn reported_result(data: &Value) -> Option<String> {
+    if text(data, "name") != "report_subagent_result" || data["is_error"] != false {
+        return None;
+    }
+    let details: Value = serde_json::from_str(text(data, "details_json")).ok()?;
+    let summary = details
+        .pointer("/subagent_report/summary")?
+        .as_str()?
+        .trim();
+    (!summary.is_empty()).then(|| summary.to_string())
+}
+
 fn tool_row(data: &Value, finished: bool, turn: Option<String>, at: &str) -> Activity {
     let id = text(data, "id");
     let name = text(data, "name");
@@ -678,6 +700,7 @@ fn tool_row(data: &Value, finished: bool, turn: Option<String>, at: &str) -> Act
         "web_search" | "fetch_url" => ("web_search", "Web"),
         "view_image" => ("image_view", "View image"),
         "mcp" => ("mcp_tool_call", "MCP"),
+        "report_subagent_result" => ("dynamic_tool_call", "Report"),
         _ => ("dynamic_tool_call", name),
     };
     let status = if !finished {
@@ -887,6 +910,32 @@ mod tests {
             reported_usage: None,
         }
     }
+    #[test]
+    fn mimir_reopened_sessions_namespace_message_ids_by_laplus_turn() {
+        let ids: Vec<_> = ["first-turn", "resumed-turn"].into_iter().map(|turn_id| {
+            let mut projection = Projection::default();
+            let mut driving = driving();
+            driving.turn.as_mut().unwrap().turn_id = turn_id.into();
+            let delta = projection.event(
+                &observation("root", None, json!({"text_delta":{"index":0,"value":"Reply"}})),
+                &mut driving, "now",
+            );
+            let Change::AssistantDelta { message_id, .. } = &delta.changes[0] else {
+                panic!("expected streamed reply");
+            };
+            let completed = projection.event(
+                &observation("root", None, json!({"content_block_stop":{"index":0}})),
+                &mut driving, "later",
+            );
+            assert!(matches!(&completed.changes[0], Change::AssistantMessage { message_id: id, .. } if id == message_id));
+            message_id.clone()
+        }).collect();
+        assert_ne!(
+            ids[0], ids[1],
+            "SDK observation counters can restart on reopen"
+        );
+    }
+
     #[test]
     fn mimir_checkpoint_outcomes_use_contract_status_and_never_relabel_a_user_stop() {
         for (stopped, error, expected) in [
@@ -1161,6 +1210,56 @@ mod tests {
             "grandchild"
         );
     }
+    #[test]
+    fn mimir_child_structured_report_is_a_result_only_after_successful_completion() {
+        for (report_error, run_error) in [(false, false), (true, false), (false, true)] {
+            let mut projection = Projection::default();
+            let mut driving = driving();
+            let report = json!({"id":"report-1","name":"report_subagent_result",
+                "is_error":report_error,"output":"Rendered report",
+                "details_json":json!({"subagent_report":{"summary":"Two verified observations"}}).to_string()});
+            let observed = projection.event(
+                &observation("child", Some("root"), json!({"tool_finished":report})),
+                &mut driving,
+                "now",
+            );
+            assert!(observed.child_streams[0].outcome.is_none());
+            assert!(observed.settles.is_none());
+            let terminal = if run_error {
+                json!({"run_error":{"message":"Review failed"}})
+            } else {
+                json!({"run_complete":{"message":null,"execution":{"terminal_cause":"completed"}}})
+            };
+            let result = projection.event(
+                &observation("child", Some("root"), terminal),
+                &mut driving,
+                "later",
+            );
+            let expected = if run_error {
+                crate::subagents::Outcome::failed(Some("Review failed".into()))
+            } else {
+                crate::subagents::Outcome::completed(
+                    (!report_error).then(|| "Two verified observations".into()),
+                )
+            };
+            assert_eq!(result.child_streams[0].outcome, Some(expected));
+            assert!(result.settles.is_none());
+            let next = projection.event(
+                &observation(
+                    "child",
+                    Some("root"),
+                    json!({"run_complete":{"message":null}}),
+                ),
+                &mut driving,
+                "next run",
+            );
+            assert_eq!(
+                next.child_streams[0].outcome,
+                Some(crate::subagents::Outcome::completed(None))
+            );
+        }
+    }
+
     #[test]
     fn mimir_catalog_uses_native_option_descriptor_and_plan_decisions_are_terminal() {
         let catalog = json!([{"id":"local","name":"Local","models":[{"id":"org/model","name":"Model","reasoning_levels":["low","high"]}]}]);
