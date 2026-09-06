@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "laplus-server"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "atomic-write-file",
  "axum",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "laplus-shell"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "laplus-server",
  "open",
@@ -5576,7 +5576,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.14"
+version = "0.1.15"
 
 [[package]]
 name = "yasna"

@@ -3705,6 +3705,90 @@ pub(crate) mod tests {
         );
     }
 
+    /// The same hard kill, one conversation over: an OpenCode prompt was queued
+    /// behind the turn that was running, and the process went before anything
+    /// could deliver it. A session ending in failure calls
+    /// [`Threads::pending_retryable`] so the developer is offered Retry; a
+    /// process that is killed calls nothing, and the queued prompt comes back
+    /// with `retryable` still false — waiting on a session that no longer
+    /// exists, with no way to send it and no way to be rid of it.
+    #[test]
+    fn a_prompt_queued_when_the_app_closed_comes_back_offering_retry() {
+        let (threads, _shell) = threads();
+        let mut row = a_thread("thread-1").row();
+        row.latest_turn = Some(LatestTurn {
+            turn_id: "turn-1".to_string(),
+            state: TurnState::Running,
+            requested_at: "2026-07-26T00:23:04.909Z".to_string(),
+            started_at: Some("2026-07-26T00:23:04.909Z".to_string()),
+            completed_at: None,
+            assistant_message_id: None,
+            source_proposed_plan: None,
+        });
+        row.pending_turn = Some(PendingTurn {
+            turn_id: "turn-2".to_string(),
+            prompts: vec![Prompt {
+                turn_id: "turn-2".to_string(),
+                text: "and then this".to_string(),
+                attachments: Vec::new(),
+                followups: Vec::new(),
+                wanted: Retune {
+                    runtime_mode: "full-access".to_string(),
+                    model: None,
+                },
+            }],
+            message_ids: vec!["message-2".to_string()],
+            model_selection: json!({"instanceId": "opencode", "model": "anthropic/claude-opus-5"}),
+            interaction_mode: "default".to_string(),
+            title_seed: None,
+            source_proposed_plan: None,
+            retryable: false,
+        });
+
+        threads.restore(vec![Conversation {
+            thread: row,
+            messages: Vec::new(),
+            activities: Vec::new(),
+            checkpoints: Vec::new(),
+        }]);
+
+        let pending = threads
+            .get("thread-1")
+            .expect("the conversation")
+            .pending_turn
+            .expect("the queued prompt is still owed to the developer");
+        assert_eq!(pending.turn_id, "turn-2");
+        assert_eq!(
+            pending.prompts.first().map(|prompt| prompt.text.as_str()),
+            Some("and then this"),
+            "the prompt itself has to survive, or Retry has nothing to send"
+        );
+        assert!(
+            pending.retryable,
+            "a queued prompt came back waiting on a session that no longer exists"
+        );
+    }
+
+    /// A prompt that had already been handed to a provider is not a prompt to
+    /// offer again. Delivery clears the pending turn, so there is nothing here
+    /// for a restart to mark, and a restart must not invent one.
+    #[test]
+    fn a_restart_does_not_invent_a_queued_prompt() {
+        let (threads, _shell) = threads();
+        threads.restore(vec![Conversation {
+            thread: a_thread("thread-1").row(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            checkpoints: Vec::new(),
+        }]);
+
+        assert!(threads
+            .get("thread-1")
+            .expect("the conversation")
+            .pending_turn
+            .is_none());
+    }
+
     #[test]
     fn a_provider_cursor_is_remembered_without_changing_the_socket_thread() {
         let (threads, mut shell) = threads();

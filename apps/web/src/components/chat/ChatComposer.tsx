@@ -178,6 +178,7 @@ import {
   type LucideIcon,
   LockIcon,
   LockOpenIcon,
+  PaperclipIcon,
   PenLineIcon,
   SparklesIcon,
   XIcon,
@@ -998,6 +999,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerEditorRef = useRef<ComposerPromptEditorHandle>(null);
   const composerFormRef = useRef<HTMLFormElement>(null);
   const composerSurfaceRef = useRef<HTMLDivElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const composerSelectLockRef = useRef(false);
   const composerMenuOpenRef = useRef(false);
   const composerMenuItemsRef = useRef<ComposerCommandItem[]>([]);
@@ -1271,6 +1273,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const collapsedComposerPrimaryActionLabel = "Send message";
   const showMobilePendingAnswerActions =
     isMobileViewport && !isComposerCollapsedMobile && pendingPrimaryAction !== null;
+  // Paste and drop are the only other ways in, and a phone has neither.
+  const showComposerAttachAction = pendingUserInputs.length === 0;
 
   // ------------------------------------------------------------------
   // Prompt helpers
@@ -3177,6 +3181,47 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 }
                 className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
               >
+                {showComposerAttachAction ? (
+                  <>
+                    <input
+                      ref={attachmentInputRef}
+                      type="file"
+                      multiple
+                      accept="image/*"
+                      className="hidden"
+                      data-chat-composer-attach-input="true"
+                      onChange={(event) => {
+                        const files = Array.from(event.currentTarget.files ?? []);
+                        // Cleared so picking the same file twice in a row still
+                        // fires a change event.
+                        event.currentTarget.value = "";
+                        addComposerImages(files);
+                        focusComposer();
+                      }}
+                    />
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            data-chat-composer-attach="true"
+                            className="shrink-0 text-muted-foreground/70 hover:text-foreground/80"
+                            // The mobile composer collapses when it loses focus,
+                            // and opening the picker would take it.
+                            onPointerDown={(event) => event.preventDefault()}
+                            onClick={() => attachmentInputRef.current?.click()}
+                            aria-label="Attach images"
+                          />
+                        }
+                      >
+                        <PaperclipIcon />
+                      </TooltipTrigger>
+                      <TooltipPopup side="top">Attach images</TooltipPopup>
+                    </Tooltip>
+                  </>
+                ) : null}
                 <ComposerFooterPrimaryActions
                   compact={isComposerPrimaryActionsCompact}
                   activeContextWindow={activeContextWindow}

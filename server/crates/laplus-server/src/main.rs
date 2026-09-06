@@ -31,6 +31,12 @@ use laplus_server::{endpoints, Server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Before anything is started, so that everything started after it is a
+    // member of the supervision job from the moment it is created rather than
+    // from the moment this server gets round to assigning it. See
+    // `laplus_server::process::supervise_this_process`.
+    laplus_server::process::supervise_this_process();
+
     let requested = match launch::invoked() {
         Ok(Invoked::Version) => {
             println!("{}", laplus_server::version::PRODUCT_VERSION);

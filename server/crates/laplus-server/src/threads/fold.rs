@@ -964,7 +964,7 @@ impl Thread {
 
     /// A conversation as it comes back from a restart.
     ///
-    /// Two things are deliberately not what was stored:
+    /// Three things are deliberately not what was stored:
     ///
     /// - **There is no session.** A session is a running process, and after a
     ///   restart there is none. The first turn on this thread starts one, with
@@ -974,6 +974,15 @@ impl Thread {
     ///   leaving it `running` would show a conversation working forever. The
     ///   turn's `completedAt` is the last moment the thread is known to have
     ///   changed, which is the closest true answer available.
+    /// - **A queued prompt becomes retryable**, for the same reason and by the
+    ///   same argument one step further on. A session that *ends* in failure
+    ///   calls [`crate::threads::Threads::pending_retryable`], so the developer
+    ///   is offered Retry; a process that is killed calls nothing, and the
+    ///   prompt would come back queued behind a turn that is now `interrupted`,
+    ///   waiting on a session that no longer exists. Nothing left running can
+    ///   deliver it and nothing else will mark it, so the restart says what the
+    ///   ending would have said. The prompt itself is untouched — Retry sends
+    ///   what the developer wrote.
     pub fn restored(stored: Conversation) -> Thread {
         let row = stored.thread;
         let latest_turn = row.latest_turn.map(|turn| match turn.state {
@@ -983,6 +992,10 @@ impl Thread {
                 ..turn
             },
             _ => turn,
+        });
+        let pending_turn = row.pending_turn.map(|pending| crate::threads::PendingTurn {
+            retryable: true,
+            ..pending
         });
 
         Thread {
@@ -1008,7 +1021,7 @@ impl Thread {
             checkpoints: stored.checkpoints,
             session: None,
             latest_turn,
-            pending_turn: row.pending_turn,
+            pending_turn,
             latest_user_message_at: row.latest_user_message_at,
             provider_resume_cursor: row.provider_resume_cursor,
             // Kept for the same reason the checkpoints are: an archived or

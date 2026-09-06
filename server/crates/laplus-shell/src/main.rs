@@ -98,6 +98,11 @@ mod assets {
 }
 
 fn main() -> ExitCode {
+    // Before the runtime, the server and the window, so that every process any
+    // of them starts inherits the supervision job at creation. See
+    // `laplus_server::process::supervise_this_process`.
+    laplus_server::process::supervise_this_process();
+
     let port = match launch::requested_port() {
         Ok(port) => port,
         Err(message) => return fail(&message),

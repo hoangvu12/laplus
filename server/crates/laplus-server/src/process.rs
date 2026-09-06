@@ -180,28 +180,92 @@ fn supervision_job() -> Result<win32job::Job, win32job::JobError> {
     win32job::Job::create_with_limit_info(&limits)
 }
 
+/// Join this server to its own job, so that everything it starts is a member
+/// from the moment it is created.
+///
+/// **This is what closes the spawn race**, and it closes it by inheritance
+/// rather than by being quick. [`bound_to_this_server`] can only assign a child
+/// *after* `spawn` returns, which leaves a window with two ways to lose a
+/// process: the child starts its own child inside it — a dev server, the
+/// `codex.exe` under `codex.cmd` — and that grandchild is created outside the
+/// job; or laplus dies inside it, and the whole tree is outside. Windows has a
+/// direct answer, `PROC_THREAD_ATTRIBUTE_JOB_LIST`, which assigns during process
+/// creation; reaching it from `std::process::Command` needs
+/// `CommandExt::raw_attribute`, which is unstable, and reaching it any other way
+/// means writing `CreateProcessW` by hand and giving up tokio's pipes.
+///
+/// The inherited half of the same guarantee needs neither. A process created by
+/// a process in a job joins that job as it is created, so once laplus is a
+/// member there is no window left to lose anything in: the assignment that used
+/// to be a race has already happened, before the child's first instruction.
+///
+/// Called at startup by both binaries. Lazy initialisation in [`join_the_job`]
+/// stays as it was, because a call this misses is still a child bound the old
+/// way rather than a child not bound at all.
+///
+/// **Nested session jobs are unaffected**, which is the property that makes this
+/// safe to do: a process already in a job can still be assigned to a second one
+/// beneath it (Windows 8 and later), and closing that nested job terminates its
+/// own members without touching the job above. That is how [`SessionJob`] can go
+/// on reaping one conversation while laplus and every other conversation carry
+/// on.
+///
+/// **What this does not close.** A grandchild created between `spawn` and
+/// [`SessionJob`]'s assignment still joins only this process-wide job, not that
+/// conversation's — so it is reaped when laplus exits rather than when the
+/// conversation is disposed of. Smaller than the leak above, and still open.
+pub fn supervise_this_process() {
+    #[cfg(windows)]
+    let _ = the_job();
+}
+
+/// [`SUPERVISION`], created on first use, with this process in it.
+///
+/// The self-assignment is reported and not fatal for the same reason the
+/// creation failure below is: a server that refused to start because Windows
+/// would not nest its job — a CI container, a debugger, a job with the breakaway
+/// limit set — would supervise its children worse than one that carries on
+/// assigning them by hand, which is what every version before this did.
+#[cfg(windows)]
+fn the_job() -> Option<&'static win32job::Job> {
+    SUPERVISION
+        .get_or_init(|| {
+            let job = match supervision_job() {
+                Ok(job) => job,
+                Err(error) => {
+                    eprintln!(
+                        "laplus: cannot supervise child processes through a job object: {error}. \
+                         Agents will still be stopped when laplus exits normally, but one that \
+                         survives an abrupt exit will have to be ended by hand."
+                    );
+                    return None;
+                }
+            };
+            if let Err(error) = job.assign_current_process() {
+                eprintln!(
+                    "laplus: laplus could not join its own supervision job: {error}. \
+                     Children are still bound one at a time, so a process started in the \
+                     moment between a spawn and its binding may outlive an abrupt exit."
+                );
+            }
+            Some(job)
+        })
+        .as_ref()
+}
+
 /// Put one process handle into [`SUPERVISION`], if there is one to put it in.
+///
+/// Still called at every spawn site even though [`supervise_this_process`] has
+/// usually made it redundant: assigning a process to the job it is already in
+/// succeeds, and on the machine where self-assignment was refused this is the
+/// only binding a child gets.
 #[cfg(windows)]
 fn join_the_job(handle: isize) {
-    let job = SUPERVISION.get_or_init(|| {
-        match supervision_job() {
-            Ok(job) => Some(job),
-            Err(error) => {
-                eprintln!(
-                    "laplus: cannot supervise child processes through a job object: {error}. \
-                     Agents will still be stopped when laplus exits normally, but one that \
-                     survives an abrupt exit will have to be ended by hand."
-                );
-                None
-            }
-        }
-    });
-
     // A process that is already in a job this server does not own — a CI
     // container, a debugger — cannot always be re-assigned, and one that exited
     // between `spawn` and here cannot be assigned at all. Both are ordinary, and
     // both leave the cooperative paths doing what they already did.
-    if let Some(job) = job.as_ref() {
+    if let Some(job) = the_job() {
         if let Err(error) = job.assign_process(handle) {
             eprintln!("laplus: a child process could not be supervised: {error}");
         }
@@ -524,6 +588,54 @@ mod supervision {
         assert!(
             members.contains(&(child.id() as usize)),
             "a child that went through `bound_to_this_server` is not in the job: {members:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The spawn race, closed at the only place it can be closed.
+    ///
+    /// Assignment after `spawn` leaves a window: a child that starts its own
+    /// child before this server gets to `assign_process` puts that grandchild
+    /// outside the job, and laplus dying inside the window leaves the whole tree
+    /// outside it. Windows offers no way to assign during creation from
+    /// `std::process::Command` — `PROC_THREAD_ATTRIBUTE_JOB_LIST` needs
+    /// `CommandExt::raw_attribute`, which is not stable — but it does offer the
+    /// other end of the same guarantee: **membership is inherited at creation**,
+    /// so a laplus that is itself in the job has no window at all.
+    ///
+    /// So this asserts the property that makes the window disappear, and it
+    /// asserts it on a tree nothing bound: a child of this process, and a child
+    /// of that child, are both in the job without anything having assigned them.
+    #[test]
+    fn a_tree_spawned_after_this_process_joined_is_supervised_without_being_bound() {
+        supervise_this_process();
+        let job = SUPERVISION
+            .get()
+            .expect("supervision was initialised by the call above")
+            .as_ref()
+            .expect("this platform gives laplus a job object");
+
+        let mut child = a_tree();
+
+        // Three: this process, the `cmd.exe` it started, and the `ping` that
+        // `cmd.exe` started. The grandchild is the one that matters — it is the
+        // dev server a Claude tool starts and the `codex.exe` under `codex.cmd`,
+        // and nothing in this server ever holds a handle to it.
+        let held = holds_at_least(job, 3);
+        let members = job.query_process_id_list().expect("the job can be queried");
+        assert!(
+            members.contains(&(std::process::id() as usize)),
+            "laplus is not in its own job, so nothing it starts inherits it: {members:?}"
+        );
+        assert!(
+            members.contains(&(child.id() as usize)),
+            "a child nothing bound is outside the job: {members:?}"
+        );
+        assert!(
+            held >= 3,
+            "the grandchild did not inherit the job at creation, so the spawn              race is still open: {members:?}"
         );
 
         let _ = child.kill();
