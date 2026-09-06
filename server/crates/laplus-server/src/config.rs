@@ -502,6 +502,16 @@ pub struct OpenCodeSettings {
     pub custom_models: Vec<String>,
 }
 
+/// An explicitly configured local Mimir runtime bridge. Credentials remain in Mimir.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MimirSettings {
+    pub enabled: bool,
+    pub binary_path: String,
+    pub bridge_command: String,
+}
+
+
 impl std::fmt::Debug for OpenCodeSettings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

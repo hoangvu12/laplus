@@ -502,6 +502,10 @@ fn dispatch_scoped(
         refs::INIT => Init::read(payload)
             .map(|call| deferred_on(&services.repositories, |kept| call.run(kept)))
             .map_err(DispatchError::Declared),
+        crate::review::GET_DIFF_PREVIEW => crate::review::DiffPreview::read(payload)
+            .map(|call| Answer::Deferred(Deferred::new(move || call.run())))
+            .map_err(DispatchError::Declared),
+
         // The two diffs. Both run git over a range of the developer's own
         // history, so both are deferred; both take the registry with them,
         // because a diff is asked for by thread and has to be run in the folder
@@ -953,11 +957,19 @@ mod tests {
         );
     }
 
-    /// Both diffs run git over a range of the developer's history, so neither
-    /// may be answered where the socket's only reader is waiting for it.
+    /// Live and saved diffs run git, so none may be answered where the
+    /// socket's only reader is waiting for it.
     #[test]
     fn the_diff_methods_answer_with_deferred_work() {
         let services = services();
+        let preview = dispatch_without_grant(
+            &services,
+            "review.getDiffPreview",
+            &json!({"cwd": "."}),
+        )
+        .expect("dispatches the sidebar's live diff RPC");
+        assert!(matches!(preview, Answer::Deferred(_)), "review ran inline");
+
         let asked = json!({
             "threadId": "thread-1",
             "fromTurnCount": 0,

@@ -11,7 +11,12 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { type ChatMessage, type SessionPhase, type Thread } from "../types";
-import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
+import {
+  type ComposerImageAttachment,
+  type DraftId,
+  type DraftThreadState,
+  useComposerDraftStore,
+} from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
@@ -27,6 +32,64 @@ export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
+
+export function getMimirSlashCommandError(input: {
+  provider: ProviderDriverKind;
+  prompt: string;
+  thread: Thread | undefined;
+  busy: boolean;
+}): string | null {
+  if (input.provider !== "mimir" || !input.prompt.trimStart().startsWith("/")) return null;
+  const thread = input.thread;
+  const pending = thread?.messages.some(
+    (message) => message.deliveryState === "queued" || message.deliveryState === "retryable",
+  );
+  if (
+    input.busy ||
+    thread?.session?.status === "running" ||
+    thread?.session?.status === "starting" ||
+    thread?.session?.activeTurnId != null ||
+    thread?.latestTurn?.state === "running" ||
+    pending
+  ) {
+    return "Wait for Mimir to become idle and resolve pending messages before sending slash commands; commands cannot be queued.";
+  }
+  return null;
+}
+
+export async function runMimirPlanDecision(
+  target: ScopedThreadRef | DraftId,
+  dispatch: () => Promise<boolean>,
+): Promise<void> {
+  let modeChanged = false;
+  const submittedMode = useComposerDraftStore.getState().getComposerDraft(target)?.interactionMode;
+  const unsubscribe = useComposerDraftStore.subscribe((state) => {
+    if (state.getComposerDraft(target)?.interactionMode !== submittedMode) {
+      modeChanged = true;
+    }
+  });
+  try {
+    if (await dispatch()) {
+      // Both SDK decisions select Build. Do not override a newer local choice,
+      // even if the user changed away from and back to the submitted mode.
+      if (!modeChanged) useComposerDraftStore.getState().setInteractionMode(target, "default");
+    }
+  } finally {
+    unsubscribe();
+  }
+}
+
+export function clearSubmittedSteerText(
+  target: ScopedThreadRef | DraftId,
+  submittedText: string,
+): boolean {
+  const store = useComposerDraftStore.getState();
+  if (store.getComposerDraft(target)?.prompt !== submittedText) return false;
+  // Steering submits text only. Attachments added while awaiting its response
+  // belong to the next send, not to the acknowledged steering request.
+  store.setPrompt(target, "");
+  return true;
+}
 
 export function startNewThreadForProject(
   projectRef: ScopedProjectRef | null,

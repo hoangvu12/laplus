@@ -729,8 +729,8 @@ impl Thread {
                 }
                 value
             }).collect::<Vec<Value>>(),
-            "proposedPlans": [],
-            "activities": self.activities.iter().map(Activity::to_value).collect::<Vec<Value>>(),
+            "proposedPlans": self.proposed_plans(),
+            "activities": self.activities.iter().filter(|a| a.kind != "plan.artifact").map(Activity::to_value).collect::<Vec<Value>>(),
             "checkpoints": self
                 .checkpoints
                 .iter()
@@ -782,7 +782,7 @@ impl Thread {
             // delta and an activity both skip ([`Change::reaches_the_shell`]).
             "hasPendingApprovals": self.has_pending_approvals(),
             "hasPendingUserInput": self.has_pending_user_input(),
-            "hasActionableProposedPlan": false,
+            "hasActionableProposedPlan": self.proposed_plans().iter().any(|plan| plan["status"] == "review-pending"),
         });
         self.lifecycle.write_onto(&mut summary);
         summary
@@ -931,6 +931,13 @@ impl Thread {
             .flatten()
             .all(|stamp| stamp < message_at)
     }
+
+    /// Canonical plan artifacts use the existing durable activity store, not a
+    /// second database or a provider-private schema. They render as plans only.
+    pub fn proposed_plans(&self) -> Vec<Value> {
+        self.activities.iter().filter(|a| a.kind == "plan.artifact").map(|a| a.payload.clone()).collect()
+    }
+
 
     /// The model slug to start the agent with, if the selection names one.
     pub fn model(&self) -> Option<String> {
@@ -1173,15 +1180,18 @@ impl LatestTurn {
     /// `threads` table in [`crate::store`], which keeps this shape verbatim
     /// rather than spreading it over six columns nothing queries.
     pub fn to_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "turnId": self.turn_id,
             "state": self.state.as_str(),
             "requestedAt": self.requested_at,
             "startedAt": self.started_at,
             "completedAt": self.completed_at,
             "assistantMessageId": self.assistant_message_id,
-            "sourceProposedPlan": self.source_proposed_plan,
-        })
+        });
+        if let Some(source) = &self.source_proposed_plan {
+            value["sourceProposedPlan"] = source.clone();
+        }
+        value
     }
 }
 
@@ -1247,6 +1257,8 @@ pub struct MetaUpdate {
 /// possible to do inconsistently. Each member is one `OrchestrationEvent` type.
 #[derive(Debug, Clone)]
 pub enum Change {
+    /// A stable native plan artifact. `thread.proposed-plan-upserted`.
+    ProposedPlan(Value),
     /// The developer's prompt, in the transcript. `thread.message-sent`.
     UserMessage {
         message_id: String,
@@ -2286,6 +2298,21 @@ pub fn fold(thread: &mut Thread, change: &Change, sequence: i64, at: &str) -> Re
                 "createdAt": at,
             })
         }
+        Change::ProposedPlan(plan) => {
+            let id = format!("plan:{}", plan["id"].as_str().expect("validated plan id"));
+            let mut plan = plan.clone();
+            plan["updatedAt"] = json!(at);
+            let previous = thread.activities.iter().position(|a| a.kind == "plan.artifact" && a.id == id);
+            if let Some(index) = previous {
+                plan["createdAt"] = thread.activities[index].payload["createdAt"].clone();
+                if plan["turnId"].is_null() { plan["turnId"] = thread.activities[index].payload["turnId"].clone(); }
+            }
+            let row = Activity { id, tone: "info", kind: "plan.artifact".into(), summary: "Saved plan".into(),
+                payload: plan.clone(), turn_id: plan["turnId"].as_str().map(str::to_string), sequence: Some(sequence), created_at: at.into() };
+            if let Some(index) = previous { thread.activities[index] = row; } else { thread.activities.push(row); }
+            json!({"threadId":thread.id,"proposedPlan":plan})
+        }
+
         Change::Activity(activity) => {
             // Numbered as it is folded in, so the row the client sorts by
             // sequence and the row a late client finds in the snapshot are the
@@ -2569,6 +2596,8 @@ impl Change {
             Change::InterruptRequested { .. } => "thread.turn-interrupt-requested",
             Change::Session(_) => "thread.session-set",
             Change::SessionStopRequested => "thread.session-stop-requested",
+            Change::ProposedPlan(_) => "thread.proposed-plan-upserted",
+
             Change::Activity(_) => "thread.activity-appended",
             Change::Checkpointed(_) => "thread.turn-diff-completed",
             Change::RevertRequested { .. } => "thread.checkpoint-revert-requested",
@@ -2643,6 +2672,14 @@ pub(crate) fn durable(thread: &Thread, change: &Change) -> Vec<Write> {
             });
         }
     }
+
+    if let Change::ProposedPlan(plan) = change {
+        let id = format!("plan:{}", plan["id"].as_str().expect("validated plan id"));
+        if let Some((ordinal, activity)) = at(&thread.activities, |a| a.id == id && a.kind == "plan.artifact") {
+            writes.push(Write::Activity { thread_id: thread.id.clone(), ordinal, activity: Box::new(activity.clone()) });
+        }
+    }
+
 
     if let Change::Activity(appended) = change {
         if let Some((ordinal, activity)) = at(&thread.activities, |activity| {

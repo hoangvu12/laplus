@@ -20,6 +20,8 @@ apps/cli/THIRD_PARTY_NOTICES.md
 .tanstack
 .vitest-*
 __screenshots__/
+# Browser evidence may contain ephemeral pairing state; never commit it.
+/.playwright-cli/
 
 # The Cargo workspace root is server/, so its build directory is there too.
 server/target/

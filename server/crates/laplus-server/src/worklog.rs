@@ -478,7 +478,7 @@ pub fn subagent_row_key(child_id: &str) -> String {
 /// a compile error here rather than a Stop that silently draws none.
 pub fn child_row_key(driver: crate::provider::DriverKind, child_id: &str) -> String {
     match driver {
-        crate::provider::DriverKind::Claude | crate::provider::DriverKind::OpenCode => {
+        crate::provider::DriverKind::Claude | crate::provider::DriverKind::OpenCode | crate::provider::DriverKind::Mimir => {
             subagent_row_key(child_id)
         }
         crate::provider::DriverKind::Codex => crate::codex::agent_row_key(child_id),

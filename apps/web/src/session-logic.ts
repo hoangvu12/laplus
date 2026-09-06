@@ -74,6 +74,8 @@ export interface WorkLogEntry {
   tone: "thinking" | "tool" | "info" | "error";
   toolTitle?: string;
   toolData?: unknown;
+  /** Full provider result, separate from the short row preview. */
+  toolResult?: unknown;
   itemType?: ToolLifecycleItemType;
   requestKind?: PendingApproval["requestKind"];
   /** From runtime item / task payload `status` when present (e.g. tool.updated). */
@@ -150,7 +152,7 @@ export interface ActivePlanState {
   explanation?: string | null;
   steps: Array<{
     step: string;
-    status: "pending" | "inProgress" | "completed";
+    status: "pending" | "inProgress" | "completed" | "failed" | "cancelled";
   }>;
 }
 
@@ -160,6 +162,8 @@ export interface LatestProposedPlanState {
   updatedAt: string;
   turnId: TurnId | null;
   planMarkdown: string;
+  decision?: "implement" | "save-and-stop" | undefined;
+  status?: ProposedPlan["status"];
   implementedAt: string | null;
   implementationThreadId: ThreadId | null;
 }
@@ -506,9 +510,6 @@ function parseUserInputQuestions(
           };
         })
         .filter((option): option is UserInputQuestion["options"][number] => option !== null);
-      if (options.length === 0) {
-        return null;
-      }
       return {
         id: question.id,
         header: question.header,
@@ -597,10 +598,7 @@ export function deriveActivePlanState(
   if (!Array.isArray(rawPlan)) {
     return null;
   }
-  const steps: Array<{
-    step: string;
-    status: "pending" | "inProgress" | "completed";
-  }> = [];
+  const steps: ActivePlanState["steps"] = [];
   for (const entry of rawPlan) {
     if (!entry || typeof entry !== "object") {
       continue;
@@ -610,7 +608,12 @@ export function deriveActivePlanState(
       continue;
     }
     const status =
-      record.status === "completed" || record.status === "inProgress" ? record.status : "pending";
+      record.status === "completed" ||
+      record.status === "inProgress" ||
+      record.status === "failed" ||
+      record.status === "cancelled"
+        ? record.status
+        : "pending";
     steps.push({
       step: record.step,
       status,
@@ -684,9 +687,41 @@ export function findSidebarProposedPlan(input: {
 }
 
 export function hasActionableProposedPlan(
-  proposedPlan: LatestProposedPlanState | Pick<ProposedPlan, "implementedAt"> | null,
+  proposedPlan:
+    | LatestProposedPlanState
+    | Pick<ProposedPlan, "implementedAt" | "decision" | "status">
+    | null,
 ): boolean {
-  return proposedPlan !== null && proposedPlan.implementedAt === null;
+  return (
+    proposedPlan !== null &&
+    proposedPlan.implementedAt === null &&
+    proposedPlan.decision !== "implement" &&
+    (proposedPlan.status === undefined ||
+      proposedPlan.status === "review-pending" ||
+      proposedPlan.status === "saved-stopped")
+  );
+}
+
+export function getMimirPlanDecisionAvailability(
+  proposedPlan: LatestProposedPlanState | null,
+  session: SessionActivityState | null,
+  busy: boolean,
+): { canImplement: boolean; canSaveAndStop: boolean } {
+  // A reopened idle session need not have any historical latestTurn metadata.
+  // A saved plan remains readable during refinement, but cannot be decided then.
+  const canImplement =
+    hasActionableProposedPlan(proposedPlan) &&
+    !busy &&
+    session?.status !== "running" &&
+    session?.status !== "starting" &&
+    !session?.activeTurnId;
+  return {
+    canImplement,
+    canSaveAndStop:
+      canImplement &&
+      proposedPlan?.decision !== "save-and-stop" &&
+      proposedPlan?.status !== "saved-stopped",
+  };
 }
 
 export function deriveWorkLogEntries(
@@ -697,7 +732,14 @@ export function deriveWorkLogEntries(
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
-    if (activity.kind === "context-window.updated") continue;
+    // Telemetry feeds the context meter, not the transcript. Include the old
+    // Mimir carriers so persisted conversations also regain readable tool groups.
+    if (
+      activity.kind === "context-window.updated" ||
+      activity.kind === "context.usage" ||
+      activity.kind === "tokens.usage"
+    )
+      continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
     entries.push(toDerivedWorkLogEntry(activity));
@@ -803,6 +845,11 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
   if (title) {
     entry.toolTitle = title;
   }
+  const toolResult = asRecord(payload?.data)?.result;
+  if (toolResult !== undefined && toolResult !== null) {
+    entry.toolResult = toolResult;
+  }
+
   if (itemType === "mcp_tool_call") {
     const data = asRecord(payload?.data);
     if (data?.item !== undefined) {
@@ -938,6 +985,7 @@ function mergeDerivedWorkLogEntries(
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
+  const toolResult = next.toolResult ?? previous.toolResult;
   const subagentChildId = next.subagentChildId ?? previous.subagentChildId;
   return {
     ...previous,
@@ -954,6 +1002,7 @@ function mergeDerivedWorkLogEntries(
     ...(toolCallId ? { toolCallId } : {}),
     ...(toolLifecycleStatus !== undefined ? { toolLifecycleStatus } : {}),
     ...(toolData !== undefined ? { toolData } : {}),
+    ...(toolResult !== undefined ? { toolResult } : {}),
     ...(subagentChildId ? { subagentChildId } : {}),
   };
 }
@@ -996,6 +1045,8 @@ function toLatestProposedPlanState(proposedPlan: ProposedPlan): LatestProposedPl
     updatedAt: proposedPlan.updatedAt,
     turnId: proposedPlan.turnId,
     planMarkdown: proposedPlan.planMarkdown,
+    ...(proposedPlan.decision ? { decision: proposedPlan.decision } : {}),
+    ...(proposedPlan.status ? { status: proposedPlan.status } : {}),
     implementedAt: proposedPlan.implementedAt,
     implementationThreadId: proposedPlan.implementationThreadId,
   };
@@ -1428,9 +1479,30 @@ function collectChangedFiles(value: unknown, target: string[], seen: Set<string>
 }
 
 function extractChangedFiles(payload: Record<string, unknown> | null): string[] {
+  const data = asRecord(payload?.data);
+  const kind = asTrimmedString(data?.kind)?.toLowerCase();
+  const toolName = asTrimmedString(data?.toolName ?? data?.tool)?.toLowerCase();
+  // A read/search result names files too, but those are not mutations. Guard
+  // known read-only families without dropping edit metadata from custom tools.
+  if (
+    kind === "read" ||
+    kind === "search" ||
+    toolName === "read" ||
+    toolName === "read_file" ||
+    toolName === "read_skill" ||
+    toolName === "view_image" ||
+    toolName === "grep" ||
+    toolName === "glob" ||
+    toolName === "list" ||
+    toolName === "search_contents_by_grep" ||
+    toolName === "search_paths_by_glob"
+  ) {
+    return [];
+  }
+
   const changedFiles: string[] = [];
   const seen = new Set<string>();
-  collectChangedFiles(asRecord(payload?.data), changedFiles, seen, 0);
+  collectChangedFiles(data, changedFiles, seen, 0);
   return changedFiles;
 }
 

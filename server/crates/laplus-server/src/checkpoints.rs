@@ -243,26 +243,7 @@ pub fn capture(root: &Path, reference: &str) -> Result<(), Unavailable> {
     let index = ScratchIndex::new();
     let environment = index.environment();
 
-    // Only when there is a commit to read. A repository the developer has just
-    // run `git init` in has a `HEAD` that names a branch with nothing behind it,
-    // and `read-tree` on that is an error rather than an empty tree.
-    if present(root, "HEAD") {
-        run(root, &environment, &["read-tree", "HEAD"])?;
-    }
-    // The path is `.` rather than the whole repository, so a project opened as
-    // one package inside a monorepo checkpoints that package. `-A` is what puts
-    // untracked files in — the agent's brand new file — and it obeys
-    // `.gitignore`, which is what keeps a build directory out.
-    run(root, &environment, &["add", "-A", "--", "."])?;
-
-    let tree = object(root, &environment, &["write-tree"])?;
-    if tree.is_empty() {
-        return Err(Unavailable::Refused {
-            detail: "git write-tree named no tree, so there is nothing to checkpoint."
-                .to_string(),
-            exit_code: None,
-        });
-    }
+    let tree = stage_working_tree(root, &environment)?;
 
     // Parentless: see this module's documentation. The message is for a
     // developer who goes looking with `git show`.
@@ -281,6 +262,44 @@ pub fn capture(root: &Path, reference: &str) -> Result<(), Unavailable> {
 
     run(root, &environment, &["update-ref", reference, &commit])?;
     Ok(())
+}
+
+/// Photograph the project in a private index, shared by checkpoints and live
+/// review. Neither path stages anything in the developer's real index.
+fn stage_working_tree(
+    root: &Path,
+    environment: &[(&str, &std::ffi::OsStr)],
+) -> Result<String, Unavailable> {
+    // An unborn HEAD has no tree to seed the index with.
+    if present(root, "HEAD") {
+        run(root, environment, &["read-tree", "HEAD"])?;
+    }
+    // Scope to this project inside a monorepo. -A includes new files while
+    // respecting .gitignore, just as the saved-turn checkpoints always have.
+    run(root, environment, &["add", "-A", "--", "."])?;
+    let tree = object(root, environment, &["write-tree"])?;
+    if tree.is_empty() {
+        return Err(Unavailable::Refused {
+            detail: "git write-tree named no tree, so there is nothing to checkpoint.".to_string(),
+            exit_code: None,
+        });
+    }
+    Ok(tree)
+}
+
+/// The live project against HEAD (or an empty tree before the first commit).
+/// Reuses checkpoint staging without creating a commit or a checkpoint ref.
+pub(crate) fn working_tree_patch(root: &Path, ignore_whitespace: bool) -> Result<Patch, Unavailable> {
+    let index = ScratchIndex::new();
+    let environment = index.environment();
+    let from = if present(root, "HEAD") {
+        "HEAD".to_string()
+    } else {
+        run(root, &environment, &["read-tree", "--empty"])?;
+        object(root, &environment, &["write-tree"])?
+    };
+    let to = stage_working_tree(root, &environment)?;
+    patch_trees(root, &from, &to, ignore_whitespace, true)
 }
 
 /// Put the working tree back to the photograph under `reference`.
@@ -598,6 +617,14 @@ fn named(status: &str) -> &'static str {
     }
 }
 
+/// The bounded patch and whether any output was omitted. Live review has a
+/// dedicated flag for this; saved-turn diffs also carry the notice in the text.
+#[derive(Default)]
+pub(crate) struct Patch {
+    pub diff: String,
+    pub truncated: bool,
+}
+
 /// The patch between two checkpoints, bounded.
 ///
 /// Read a piece at a time out of the child rather than with
@@ -613,20 +640,39 @@ pub fn patch(
     to: &str,
     ignore_whitespace: bool,
 ) -> Result<String, Unavailable> {
+    patch_trees(root, &commitish(from), &commitish(to), ignore_whitespace, false)
+        .map(|patch| patch.diff)
+}
+
+/// The same bounded reader for commits or the scratch tree used by live review.
+/// Live sources opt into cwd-relative paths and a subtree pathspec; saved
+/// checkpoint diffs retain their existing repository-relative path semantics.
+pub(crate) fn patch_trees(
+    root: &Path,
+    from: &str,
+    to: &str,
+    ignore_whitespace: bool,
+    relative_to_root: bool,
+) -> Result<Patch, Unavailable> {
     let mut arguments = vec![
         "diff",
         "--patch",
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
     ];
     if ignore_whitespace {
         arguments.push("--ignore-all-space");
     }
-    let from = commitish(from);
-    let to = commitish(to);
-    arguments.push(&from);
-    arguments.push(&to);
+    if relative_to_root {
+        arguments.push("--relative");
+    }
+    arguments.extend_from_slice(&[from, to, "--"]);
+    if relative_to_root {
+        arguments.push(".");
+    }
 
     let mut child = git::started(root, &arguments, &[])
         .stdout(std::process::Stdio::piped())
@@ -643,7 +689,10 @@ pub fn patch(
         // is the only order that terminates.
         let _ = child.kill();
         let _ = child.wait();
-        return Ok(cut(read));
+        return Ok(Patch {
+            diff: cut(read),
+            truncated: true,
+        });
     }
 
     let finished = child.wait_with_output().map_err(|error| Unavailable::Refused {
@@ -653,7 +702,10 @@ pub fn patch(
     if !finished.status.success() {
         return Err(git::refusal(&finished));
     }
-    Ok(read)
+    Ok(Patch {
+        diff: read,
+        truncated: false,
+    })
 }
 
 /// Read at most `most` bytes, saying whether that is where it stopped.

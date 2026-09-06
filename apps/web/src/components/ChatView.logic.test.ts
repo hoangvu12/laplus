@@ -1,12 +1,30 @@
+// @vitest-environment happy-dom
+import { act, cleanup, renderHook } from "@testing-library/react";
+import { Atom } from "effect/unstable/reactivity";
+import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import type {
+  EnvironmentThread,
+  EnvironmentThreadShell,
+} from "@t3tools/client-runtime/state/shell";
+
 import {
   EnvironmentId,
   MessageId,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { DraftId, useComposerDraftStore } from "../composerDraftStore";
+import {
+  appAtomRegistry,
+  AppAtomRegistryProvider,
+  resetAppAtomRegistryForTests,
+} from "../rpc/atomRegistry";
+import { useThread } from "../state/entities";
+import { environmentThreadDetails, environmentThreadShells } from "../state/threads";
 
 import type { Thread } from "../types";
 import {
@@ -17,6 +35,7 @@ import {
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  getMimirSlashCommandError,
   dismissBranchMismatchForSession,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
@@ -64,6 +83,55 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     ...overrides,
   };
 }
+describe("Mimir slash command queue boundary", () => {
+  it("blocks commands while running, locally submitting, or holding pending work", () => {
+    const base = {
+      provider: ProviderDriverKind.make("mimir"),
+      prompt: " /goal pause",
+      busy: false,
+    };
+    for (const thread of [
+      makeThread({ latestTurn: { ...completedTurn, state: "running" } }),
+      makeThread({ session: { ...readySession, status: "starting" } }),
+      makeThread({ session: { ...readySession, status: "running" } }),
+      ...(["queued", "retryable"] as const).map((deliveryState) =>
+        makeThread({
+          messages: [
+            {
+              id: MessageId.make("pending"),
+              role: "user",
+              text: "Queued text",
+              createdAt: now,
+              updatedAt: now,
+              turnId: TurnId.make("queued-turn"),
+              streaming: false,
+              deliveryState,
+            },
+          ],
+        }),
+      ),
+    ]) {
+      expect(getMimirSlashCommandError({ ...base, thread })).toContain("commands cannot be queued");
+      expect(
+        getMimirSlashCommandError({ ...base, thread, prompt: "Ordinary follow-up" }),
+      ).toBeNull();
+      expect(
+        getMimirSlashCommandError({ ...base, thread, provider: ProviderDriverKind.make("codex") }),
+      ).toBeNull();
+    }
+    expect(getMimirSlashCommandError({ ...base, thread: makeThread(), busy: true })).not.toBeNull();
+    for (const prompt of [
+      "/goal",
+      "/goal show",
+      "/goal 30m finish tests",
+      "/goal pause",
+      "/compress",
+      "/init",
+    ]) {
+      expect(getMimirSlashCommandError({ ...base, prompt, thread: makeThread() })).toBeNull();
+    }
+  });
+});
 
 const completedTurn = {
   turnId: TurnId.make("turn-1"),
@@ -470,6 +538,56 @@ describe("startNewThreadForProject", () => {
       }),
     ).toBe(false);
     expect(called).toBe(false);
+  });
+});
+
+describe("draft thread admission", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    resetAppAtomRegistryForTests();
+    useComposerDraftStore.setState({ draftsByThreadKey: {}, draftThreadsByThreadKey: {} });
+  });
+
+  it("does not subscribe a local draft until the shell admits it, even during promotion", () => {
+    const ref = scopeThreadRef(environmentId, threadId);
+    const draftId = DraftId.make("draft-admission");
+    useComposerDraftStore
+      .getState()
+      .setProjectDraftThreadId(scopeProjectRef(environmentId, projectId), draftId, { threadId });
+    const shellAtom = Atom.make<EnvironmentThreadShell | null>(null);
+    vi.spyOn(environmentThreadShells, "threadShellAtom").mockReturnValue(shellAtom);
+    const detail = vi
+      .spyOn(environmentThreadDetails, "detailAtom")
+      .mockReturnValue(Atom.make<EnvironmentThread | null>(null));
+    const { result } = renderHook(() => useThread(ref), { wrapper: AppAtomRegistryProvider });
+    expect(result.current).toBeNull();
+    expect(detail).not.toHaveBeenCalled();
+
+    act(() => useComposerDraftStore.getState().markDraftThreadPromoting(draftId, ref));
+    expect(detail).not.toHaveBeenCalled();
+    act(() =>
+      appAtomRegistry.set(shellAtom, {
+        ...makeThread(),
+        latestUserMessageAt: null,
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+        hasActionableProposedPlan: false,
+      }),
+    );
+    expect(detail).toHaveBeenCalledWith(ref);
+  });
+
+  it("still subscribes an unknown server thread so real not-found errors can surface", () => {
+    const ref = scopeThreadRef(environmentId, ThreadId.make("missing-thread"));
+    vi.spyOn(environmentThreadShells, "threadShellAtom").mockReturnValue(
+      Atom.make<EnvironmentThreadShell | null>(null),
+    );
+    const detail = vi
+      .spyOn(environmentThreadDetails, "detailAtom")
+      .mockReturnValue(Atom.make<EnvironmentThread | null>(null));
+    renderHook(() => useThread(ref), { wrapper: AppAtomRegistryProvider });
+    expect(detail).toHaveBeenCalledWith(ref);
   });
 });
 

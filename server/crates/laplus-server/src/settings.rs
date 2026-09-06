@@ -492,6 +492,27 @@ fn provider_instances(instances: &Map<String, Value>) -> Result<Map<String, Valu
                     settings.custom_models,
                 )
             }
+            crate::provider::DriverKind::Mimir => {
+                for field in config.keys() {
+                    if !matches!(field.as_str(), "binaryPath" | "bridgeCommand") {
+                        return Err(unrecognised(&format!("providerInstances.{instance_id}.config.{field}")));
+                    }
+                }
+                let binary = config.get("binaryPath").map(|v| text("binaryPath", v)).transpose()?
+                    .unwrap_or_else(|| "mimir".to_string());
+                let command = config.get("bridgeCommand").map(|v| text("bridgeCommand", v)).transpose()?
+                    .unwrap_or_else(|| "/org.mimir.bridge:serve".to_string());
+                if binary.trim().is_empty() || !command.starts_with('/') || !command.contains(':')
+                    || command.chars().any(char::is_whitespace) {
+                    return Err("Mimir needs a binaryPath and a qualified bridgeCommand such as /org.mimir.bridge:serve.".to_string());
+                }
+                normalized.insert(instance_id.clone(), json!({
+                    "driver": driver, "displayName": display_name, "enabled": enabled,
+                    "config": {"binaryPath": binary, "bridgeCommand": command}
+                }));
+                continue;
+            }
+
             crate::provider::DriverKind::OpenCode => {
                 let settings = opencode(&config)?;
                 normalized.insert(instance_id.clone(), json!({

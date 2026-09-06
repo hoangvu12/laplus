@@ -396,6 +396,18 @@ pub struct PromptAttachment {
 pub struct Retune {
     pub runtime_mode: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub model_options: Value,
+    #[serde(default = "default_interaction")]
+    pub interaction_mode: String,
+}
+
+fn default_interaction() -> String { "default".into() }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeControl {
+    Steer { text: String },
+    DecidePlan { plan_id: String, implement: bool, turn_id: Option<String> },
 }
 
 /// OpenCode work accepted while another turn owns the session, until a provider
@@ -421,6 +433,7 @@ pub struct PendingTurn {
 /// the rule "a signal is never queued behind a prompt" has to be got right.
 #[derive(Debug, Clone)]
 pub enum Signal {
+    Control(NativeControl),
     /// The developer answered a permission request.
     Answer(Answered),
     /// The developer answered the agent's questions.
@@ -1419,6 +1432,12 @@ impl Threads {
     /// `Err` is reserved for a conversation this server has never heard of,
     /// which is a client naming something that does not exist rather than
     /// anything about a session.
+    pub fn control(&self, thread_id: &str, control: NativeControl) -> Result<(), String> {
+        let running = self.live(thread_id)?.ok_or("The provider session is not running")?;
+        running.try_send(Signal::Control(control)).map_err(|_| "The provider control channel is full or closed".to_string())
+    }
+
+
     fn live(&self, thread_id: &str) -> Result<Option<mpsc::Sender<Signal>>, String> {
         let entry = self.find(thread_id).ok_or_else(unknown(thread_id))?;
         let live = lock(&entry.live);
@@ -3735,6 +3754,8 @@ pub(crate) mod tests {
                 wanted: Retune {
                     runtime_mode: "full-access".to_string(),
                     model: None,
+                    model_options: Value::Null,
+                    interaction_mode: "default".into(),
                 },
             }],
             message_ids: vec!["message-2".to_string()],

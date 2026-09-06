@@ -244,8 +244,20 @@ pub(crate) trait Driver: Send + Sized {
     /// optional.
     fn next(&mut self, driving: &mut Driving) -> impl Future<Output = Option<Decided>> + Send;
 
+    /// Additional independently streamed root blocks that teardown must persist.
+    /// Most protocols track one message on InFlight; block-oriented ones own more.
+    fn take_unfinished_message_ids(&mut self) -> Vec<String> { Vec::new() }
+
+
     /// Give the agent one turn.
     fn send(&mut self, prompt: &Prompt) -> impl Future<Output = std::io::Result<()>> + Send;
+
+    fn steer(&mut self, _text: &str) -> impl Future<Output = std::io::Result<()>> + Send {
+        async { Err(std::io::Error::other("This provider does not support explicit steering")) }
+    }
+    fn decide_plan(&mut self, _id: &str, _implement: bool) -> impl Future<Output = std::io::Result<Decided>> + Send {
+        async { Err(std::io::Error::other("This provider does not support native saved-plan decisions")) }
+    }
 
     /// Stop the turn in flight without ending the session.
     ///
@@ -401,7 +413,15 @@ pub enum DriverStart {
     Claude(ClaudeSettings),
     Codex(crate::config::CodexSettings),
     OpenCode(OpenCodeStart),
+    Mimir(MimirStart),
 }
+
+#[derive(Debug, Clone)]
+pub struct MimirStart {
+    pub settings: crate::config::MimirSettings,
+    pub mcp: std::sync::Arc<dyn crate::mcp::Platform>,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeStart {
@@ -421,6 +441,7 @@ impl DriverStart {
             DriverStart::Claude(settings) => Ok(settings),
             DriverStart::Codex(_) => Err("the Codex turn driver has not landed yet".to_string()),
             DriverStart::OpenCode(_) => Err("OpenCode settings were paired with the Claude driver".to_string()),
+            DriverStart::Mimir(_) => Err("Mimir settings were paired with the Claude driver".to_string()),
         }
     }
 
@@ -431,6 +452,7 @@ impl DriverStart {
                 Err("Codex settings were paired with the Claude driver".to_string())
             }
             DriverStart::OpenCode(_) => Err("OpenCode settings were paired with the Codex driver".to_string()),
+            DriverStart::Mimir(_) => Err("Mimir settings were paired with the Codex driver".to_string()),
         }
     }
 
@@ -466,9 +488,22 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, att
         text,
         attachments,
         followups: Vec::new(),
-        wanted: Retune { runtime_mode: start.runtime_mode.clone(), model: start.model.clone() },
+        wanted: Retune { runtime_mode: start.runtime_mode.clone(), model: start.model.clone(), model_options: Value::Null, interaction_mode: "default".into() },
     })
 }
+
+/// A saved-plan decision may reopen an idle-reaped bridge; steering never does.
+pub fn control(threads: &Threads, start: &Start, control: crate::threads::NativeControl) -> Result<(), String> {
+    if !matches!(start.driver, DriverStart::Mimir(_)) { return Err("This provider does not support native controls".into()); }
+    if matches!(control, crate::threads::NativeControl::DecidePlan { .. }) {
+        let driving = threads.clone(); let starting = start.clone();
+        let _ = threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+            tokio::spawn(drive::<crate::mimir::Mimir>(driving, starting, incoming, signals, epoch))
+        });
+    }
+    threads.control(&start.thread_id, control)
+}
+
 
 pub fn send_prompt(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
     let driving = threads.clone();
@@ -488,6 +523,12 @@ pub fn send_prompt(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(
                 ))
             })
         }
+        DriverStart::Mimir(_) => {
+            threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+                tokio::spawn(drive::<crate::mimir::Mimir>(driving, starting, incoming, signals, epoch))
+            })
+        }
+
         DriverStart::OpenCode(_) => {
             threads.attach(&start.thread_id, move |incoming, signals, epoch| {
                 tokio::spawn(drive::<crate::opencode::OpenCode>(driving, starting, incoming, signals, epoch))
@@ -513,6 +554,36 @@ pub fn send_prompt(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(
         }
     })
 }
+
+async fn native_control<D: Driver>(threads: &Threads, start: &Start, driver: &mut D, driving: &mut Driving, control: crate::threads::NativeControl) {
+    let result = match control {
+        crate::threads::NativeControl::Steer { text } => {
+            if driving.turn.is_none() { Err(std::io::Error::other("Mimir steering requires a running turn")) }
+            else { driver.steer(&text).await.map(|_| Decided { changes: vec![Change::Activity(Activity::info("turn.steered", "Guidance sent to Mimir", json!({"detail":text}), driving.turn.as_ref().map(|t|t.turn_id.clone())))], ..Default::default() }) }
+        }
+        crate::threads::NativeControl::DecidePlan { plan_id, implement, turn_id } => {
+            if driving.turn.is_some() { Err(std::io::Error::other("A saved-plan decision requires an idle Mimir session")) }
+            else {
+                if implement { baseline(threads, start).await; }
+                match driver.decide_plan(&plan_id, implement).await {
+                    Ok(decided) => {
+                        if let Some(turn_id) = turn_id {
+                            running(threads, start, &turn_id);
+                            driving.turn = Some(InFlight { turn_id, assistant_message_id: None, tools: HashMap::new(), stopped: None });
+                        }
+                        Ok(decided)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    };
+    match result {
+        Ok(decided) => spend(threads, start, decided),
+        Err(error) => { threads.apply(&start.thread_id, Change::Activity(Activity::failed("provider.control-failed", &error.to_string()))); }
+    }
+}
+
 
 pub fn send_prompts(
     threads: &Threads,
@@ -632,7 +703,7 @@ pub(crate) fn conversation_idle_window() -> std::time::Duration {
 fn reaps_when_idle(start: &Start) -> bool {
     match &start.driver {
         DriverStart::OpenCode(opencode_start) => opencode_start.settings.server_url.is_empty(),
-        DriverStart::Claude(_) | DriverStart::Codex(_) => true,
+        DriverStart::Claude(_) | DriverStart::Codex(_) | DriverStart::Mimir(_) => true,
     }
 }
 
@@ -771,6 +842,10 @@ async fn drive<D: Driver>(
         // settled.
         while let Ok(signal) = signals.try_recv() {
             match signal {
+                Signal::Control(control) => {
+                    native_control(&threads, &start, &mut driver, &mut driving, control).await;
+                }
+
                 Signal::Answer(answered) => {
                     answer(&threads, &start, &mut driver, &mut driving, answered).await
                 }
@@ -918,7 +993,13 @@ async fn drive<D: Driver>(
                 if let Some(opened) = decided.opens.take() {
                     running(&threads, &start, &opened);
                 }
+                let retires = decided.retires;
                 spend(&threads, &start, decided);
+                if retires {
+                    // End this source before draining controls or admitting any
+                    // queued prompt. Teardown preserves partial replies and drafts.
+                    break;
+                }
                 if let Some(refused) = reverts {
                     refused.revert(&mut start);
                     // Republished because the mode this turn was announced under
@@ -953,6 +1034,10 @@ async fn drive<D: Driver>(
             // The agent stopped producing: it exited, or its output was
             // abandoned. Either way there is nothing more to publish.
             Next::Event(None) => break,
+            Next::Signal(Some(Signal::Control(control))) => {
+                native_control(&threads, &start, &mut driver, &mut driving, control).await;
+            }
+
             Next::Signal(Some(Signal::Answer(answered))) => {
                 answer(&threads, &start, &mut driver, &mut driving, answered).await;
             }
@@ -973,7 +1058,17 @@ async fn drive<D: Driver>(
                 asked_to_stop = true;
                 break;
             }
-            Next::Signal(None) => listening = false,
+            Next::Signal(None) => {
+                listening = false;
+                // Shutdown drops both senders. A queued prompt disables the
+                // prompt receive arm, so it cannot observe EOF until A finishes.
+                // Close input here too; an unresponsive A must not hold shutdown
+                // (and its durable queued draft) hostage.
+                if accepting && prompts.is_closed() {
+                    accepting = false;
+                    driver.close_input();
+                }
+            }
             Next::Prompt(Some(prompt)) if D::STEERS_ACTIVE_TURN && driving.turn.is_some() => {
                 // OpenCode accepts another prompt while its session is busy.
                 // It remains part of the active Laplus turn: no baseline,
@@ -1125,7 +1220,7 @@ async fn drive<D: Driver>(
     // against them would report the assumption as checked on a turn where
     // nothing checked it.
     if let Some(active) = driving.turn.as_mut() {
-        if let Some(message_id) = active.assistant_message_id.take() {
+        for message_id in active.assistant_message_id.take().into_iter().chain(driver.take_unfinished_message_ids()) {
             threads.apply(
                 &start.thread_id,
                 Change::AssistantMessage {
@@ -2199,6 +2294,9 @@ pub(crate) struct Decided {
     /// The changes to apply, in the order they were decided — which is the order
     /// the developer saw the work happen.
     pub(crate) changes: Vec<Change>,
+    /// Retire the source after publishing these changes, without queue advance.
+    /// The driver still owes its normal bounded stop and failure explanation.
+    pub(crate) retires: bool,
     /// What the driver learned about the conversation's delegated children.
     ///
     /// Beside `changes` rather than among them, and the reason is where the two
@@ -2428,6 +2526,8 @@ pub fn prepare(thread: &Thread, settings: &Settings, mcp: std::sync::Arc<dyn cra
         crate::provider::ConfiguredInstance::Codex(instance) => {
             DriverStart::Codex(instance.settings)
         }
+        crate::provider::ConfiguredInstance::Mimir(instance) => DriverStart::Mimir(MimirStart { settings: instance.settings, mcp }),
+
         crate::provider::ConfiguredInstance::OpenCode(instance) => DriverStart::OpenCode(OpenCodeStart { settings: instance.settings, mcp }),
     };
 

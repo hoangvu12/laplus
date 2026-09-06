@@ -262,6 +262,7 @@ enum Command {
         thread_id: String,
     },
     StartTurn(Box<StartTurn>),
+    NativeControl { thread_id: String, control: crate::threads::NativeControl },
     RetryTurn { thread_id: String },
     InterruptTurn(InterruptTurn),
     RespondToApproval(RespondToApproval),
@@ -597,6 +598,7 @@ impl Shell {
             Command::Unsnooze { thread_id } => self.unsnooze(&thread_id)?,
             Command::Delete { thread_id } => self.delete(&thread_id)?,
             Command::StartTurn(start) => self.start_turn(&start, config)?,
+            Command::NativeControl { thread_id, control } => self.native_control(&thread_id, control, config)?,
             Command::RetryTurn { thread_id } => self.retry_turn(&thread_id, config)?,
             Command::InterruptTurn(interrupt) => self.interrupt_turn(&interrupt)?,
             Command::RespondToApproval(respond) => self.respond_to_approval(&respond)?,
@@ -1718,6 +1720,23 @@ impl Shell {
             selection_for(&thread, selection)?;
         }
         let effective_selection = start.model_selection.as_ref().unwrap_or(&thread.model_selection);
+        if thread.provider.driver == "mimir" {
+            // A durable queued turn joins its messages into one SDK prompt.
+            // Joining native slash commands changes their meaning (for example,
+            // /goal pause + /goal clear becomes a new objective).
+            if start.message.text.trim_start().starts_with('/')
+                && (thread.session.as_ref().is_some_and(|session|
+                    session.status.is_working() || session.active_turn_id.is_some())
+                    || thread.pending_turn.is_some())
+            {
+                return Err(CommandError::new("Wait for Mimir to become idle and resolve pending messages before sending slash commands; commands cannot be queued."));
+            }
+            crate::mimir_protocol::configuration(effective_selection.get("model").and_then(Value::as_str),
+                effective_selection.get("options").unwrap_or(&Value::Null),
+                start.interaction_mode.as_deref().unwrap_or(&thread.interaction_mode),
+                start.runtime_mode.as_deref().unwrap_or(&thread.runtime_mode)).map_err(CommandError::new)?;
+        }
+
         refuse_unavailable_opencode_model(&thread.provider.driver, &thread.provider.instance_id, effective_selection, config)?;
         let prepared = crate::session::prepare(
             &thread,
@@ -1725,7 +1744,7 @@ impl Shell {
             Arc::clone(&self.inner.mcp),
         ).map_err(CommandError::new)?;
         let attachments = match thread.provider.driver.as_str() {
-            "claudeAgent" | "codex" => crate::attachments::resolve_all_required(
+            "claudeAgent" | "codex" | "mimir" => crate::attachments::resolve_all_required(
                 &start.message.attachments,
                 &start.message.message_id,
                 &config.preferences,
@@ -1744,17 +1763,17 @@ impl Shell {
                 .map_err(CommandError::new)?;
         }
 
-        // OpenCode accepts every message that arrives before the active turn's
-        // settlement as one queued turn. The messages remain distinct rows,
-        // but share the queued turn identity so the session can deliver them
-        // together at that boundary.
+        // OpenCode and Mimir keep messages arriving before settlement in one
+        // durable queued turn. Distinct message rows share a turn identity and
+        // can be retried together after their owned session ends.
+        let durable_queue = matches!(thread.provider.driver.as_str(), "opencode" | "mimir");
         let active_turn = self.inner.threads.active_turn(&start.thread_id);
         let latest_turn = self.inner.threads.latest_turn(&start.thread_id);
-        let turn_id = if thread.provider.driver == "opencode"
+        let turn_id = if durable_queue
             && active_turn.is_some()
             && latest_turn != active_turn
         {
-            latest_turn.expect("a queued OpenCode turn has a latest turn")
+            latest_turn.expect("a queued turn has a latest turn")
         } else {
             threads::fresh_turn_id()
         };
@@ -1867,10 +1886,12 @@ impl Shell {
             wanted: crate::threads::Retune {
                 runtime_mode: starting.runtime_mode.clone(),
                 model: starting.model.clone(),
+                model_options: thread.model_selection.get("options").cloned().unwrap_or(Value::Null),
+                interaction_mode: thread.interaction_mode.clone(),
             },
         };
         let title_attachments = prompt.attachments.clone();
-        let queued = thread.provider.driver == "opencode" && active_turn.is_some();
+        let queued = durable_queue && active_turn.is_some();
         if queued {
             self.inner
                 .threads
@@ -1930,8 +1951,8 @@ impl Shell {
 
     fn retry_turn(&self, thread_id: &str, config: &ServerConfig) -> Result<i64, CommandError> {
         let thread = self.open_thread(thread_id)?;
-        if thread.provider.driver != "opencode" {
-            return Err(CommandError::new("Only OpenCode queued turns can be retried."));
+        if !matches!(thread.provider.driver.as_str(), "opencode" | "mimir") {
+            return Err(CommandError::new("This provider does not support queued turn Retry."));
         }
         let project = self.project(&thread.project_id)?;
         let (pending, mut thread) = self
@@ -2050,6 +2071,29 @@ impl Shell {
     fn not_open(&self, thread_id: &str) -> CommandError {
         CommandError::new(format!("Thread '{thread_id}' is not open."))
     }
+
+    fn native_control(&self, thread_id: &str, mut control: crate::threads::NativeControl, config: &ServerConfig) -> Result<i64, CommandError> {
+        let thread = self.open_thread(thread_id)?;
+        if thread.provider.driver != "mimir" { return Err(CommandError::new("This provider does not support native Mimir controls")); }
+        let working = thread.session.as_ref().is_some_and(|s|s.status.is_working());
+        match &mut control {
+            crate::threads::NativeControl::Steer { .. } if !working => return Err(CommandError::new("Steering requires a running Mimir turn")),
+            crate::threads::NativeControl::DecidePlan { plan_id, implement, turn_id } => {
+                if working || thread.pending_turn.is_some() { return Err(CommandError::new("Wait for Mimir to become idle before deciding its saved plan")); }
+                let plans = thread.proposed_plans();
+                let plan = plans.iter().find(|p|p["id"].as_str()==Some(plan_id.as_str())).ok_or_else(||CommandError::new("The named saved plan is not available"))?;
+                if !matches!(plan["status"].as_str(),Some("review-pending"|"saved-stopped")) { return Err(CommandError::new("The named plan is no longer awaiting a decision")); }
+                if *implement { *turn_id = Some(threads::fresh_turn_id()); }
+            }
+            _ => {}
+        }
+        let project = self.project(&thread.project_id)?;
+        let prepared = crate::session::prepare(&thread,&config.settings,Arc::clone(&self.inner.mcp)).map_err(CommandError::new)?;
+        let start = crate::session::starting(&thread,&where_the_work_happens(&thread,&project),prepared);
+        crate::session::control(&self.inner.threads,&start,control).map_err(CommandError::new)?;
+        self.inner.threads.apply(thread_id,Change::Activity(crate::threads::Activity::info("provider.control-requested","Mimir control requested",json!({}),None))).ok_or_else(||self.not_open(thread_id))
+    }
+
 
     fn open_thread(&self, thread_id: &str) -> Result<Thread, CommandError> {
         self.inner
@@ -3316,6 +3360,23 @@ impl Command {
                         .transpose()?,
                 }))
             }
+            "thread.turn.steer" | "thread.plan.decide" => {
+                let field = |key: &str| -> Result<String, CommandError> {
+                    non_blank(payload.get(key).and_then(Value::as_str).unwrap_or("").to_string(), key, kind)
+                };
+                let thread_id = field("threadId")?;
+                let control = if kind == "thread.turn.steer" {
+                    crate::threads::NativeControl::Steer { text: field("text")? }
+                } else {
+                    let decision = field("decision")?;
+                    if !matches!(decision.as_str(), "implement" | "save-and-stop") {
+                        return Err(CommandError::new("Plan decision must be implement or save-and-stop"));
+                    }
+                    crate::threads::NativeControl::DecidePlan { plan_id: field("planId")?, implement: decision == "implement", turn_id: None }
+                };
+                Ok(Command::NativeControl { thread_id, control })
+            }
+
             "thread.turn.retry" => Ok(Command::RetryTurn {
                 thread_id: non_blank(
                     read_about_a_thread::<AboutAThread>(payload, kind)?.thread_id,
@@ -3467,6 +3528,7 @@ impl Command {
             | Command::StopSession { thread_id } => Some(thread_id),
             Command::StartTurn(start) => Some(&start.thread_id),
             Command::RetryTurn { thread_id } => Some(thread_id),
+            Command::NativeControl { thread_id, .. } => Some(thread_id),
             Command::InterruptTurn(interrupt) => Some(&interrupt.thread_id),
             Command::RespondToApproval(respond) => Some(&respond.thread_id),
             Command::RespondToUserInput(respond) => Some(&respond.thread_id),

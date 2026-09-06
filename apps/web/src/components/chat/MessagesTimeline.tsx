@@ -1900,6 +1900,16 @@ function buildToolCallExpandedBody(
   if (workEntry.detail?.trim()) {
     blocks.push(workEntry.detail.trim());
   }
+  if (workEntry.toolResult !== undefined && workEntry.toolResult !== null) {
+    const result =
+      typeof workEntry.toolResult === "string"
+        ? workEntry.toolResult.trim()
+        : JSON.stringify(workEntry.toolResult, null, 2);
+    if (result && result !== workEntry.detail?.trim()) {
+      blocks.push(`Output\n${result}`);
+    }
+  }
+
   const changedFiles = workEntry.changedFiles ?? [];
   if (changedFiles.length > 0) {
     blocks.push(

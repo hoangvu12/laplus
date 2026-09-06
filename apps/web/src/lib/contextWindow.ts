@@ -52,7 +52,12 @@ export function deriveLatestContextWindowSnapshot(
 ): ContextWindowSnapshot | null {
   for (let index = activities.length - 1; index >= 0; index -= 1) {
     const activity = activities[index];
-    if (!activity || activity.kind !== "context-window.updated") {
+    // Earlier Mimir sessions persisted occupancy under context.usage. Read it
+    // through the same meter; cumulative tokens.usage is not context fullness.
+    if (
+      !activity ||
+      (activity.kind !== "context-window.updated" && activity.kind !== "context.usage")
+    ) {
       continue;
     }
 

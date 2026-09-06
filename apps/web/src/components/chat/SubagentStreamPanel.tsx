@@ -360,10 +360,9 @@ export function SubagentStreamPanel(props: SubagentStreamPanelProps) {
   );
   const state = query.data ?? null;
 
-  // An unresolvable child is said out loud rather than left as a blank tab: a
-  // conversation whose children were deleted with it, or a reference from a
-  // build before the stream model existed, both land here.
-  if (query.error !== null) {
+  // A failed live subscription does not erase the work already received. Only
+  // show the unavailable surface when there is no observed history to read.
+  if (query.error !== null && (!state?.stream || state.entries.length === 0)) {
     return (
       <div
         className="flex min-h-0 flex-1 items-center justify-center p-6 text-center text-xs text-muted-foreground"
@@ -406,6 +405,21 @@ export function SubagentStreamPanel(props: SubagentStreamPanelProps) {
       streamState={state.stream.state}
     >
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 px-3 py-3">
+        {query.error !== null ? (
+          <div
+            role="status"
+            className="flex items-center justify-between gap-2 px-1 text-xs text-muted-foreground"
+          >
+            <span>Live updates unavailable. Showing recorded work.</span>
+            <button
+              type="button"
+              className="shrink-0 underline underline-offset-2"
+              onClick={query.refresh}
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
         {state.entries.map((entry) => (
           <SubagentStreamEntry
             key={entry.id}

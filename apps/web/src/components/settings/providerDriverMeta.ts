@@ -3,9 +3,11 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  MimirSettings,
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
+import { BotIcon } from "lucide-react";
 import type * as Schema from "effect/Schema";
 import { ClaudeAI, CursorIcon, GrokIcon, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
 
@@ -66,6 +68,12 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     label: "OpenCode",
     icon: OpenCodeIcon,
     settingsSchema: OpenCodeSettings,
+  },
+  {
+    value: ProviderDriverKind.make("mimir"),
+    label: "Mimir",
+    icon: BotIcon,
+    settingsSchema: MimirSettings,
   },
 ];
 
