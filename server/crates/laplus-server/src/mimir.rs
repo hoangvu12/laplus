@@ -88,7 +88,7 @@ impl Bootstrap {
     /// Fail closed when Windows security tooling or identity lookup is unavailable.
     #[cfg(windows)]
     async fn restrict_windows_acl(&self) -> Result<(), String> {
-        let script = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $env:LAPLUS_MIMIR_LAUNCH_DIR -AclObject $acl; $check=Get-Acl -LiteralPath $env:LAPLUS_MIMIR_LAUNCH_DIR; if(!$check.AreAccessRulesProtected -or $check.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner/DACL mismatch'}; foreach($r in $check.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])){if($r.IdentityReference.Value -ne $sid.Value){throw 'unexpected trustee'}}"#;
+        let script = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $path=$env:LAPLUS_MIMIR_LAUNCH_DIR; $acl=Get-Acl -LiteralPath $path; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach($existing in @($acl.Access)){[void]$acl.RemoveAccessRuleSpecific($existing)}; $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); [void]$acl.AddAccessRule($rule); [System.IO.DirectoryInfo]::new($path).SetAccessControl($acl); $check=Get-Acl -LiteralPath $path; $rules=@($check.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])); if(!$check.AreAccessRulesProtected -or $check.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'owner/DACL mismatch'}; if($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].InheritanceFlags -ne 'ContainerInherit, ObjectInherit' -or $rules[0].PropagationFlags -ne 'None'){throw 'unexpected access rule'}"#;
         let mut command = Command::new("powershell.exe");
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -1008,6 +1008,25 @@ mod tests {
             assert_eq!(
                 std::fs::metadata(&launch.dir).unwrap().permissions().mode() & 0o777,
                 0o700
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let script = r#"$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $dir=Get-Acl -LiteralPath $env:LAPLUS_MIMIR_LAUNCH_DIR; $file=Get-Acl -LiteralPath $env:LAPLUS_MIMIR_LAUNCH_FILE; $dirRules=@($dir.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])); $fileRules=@($file.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])); if(!$dir.AreAccessRulesProtected -or $dir.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or $dirRules.Count -ne 1 -or $dirRules[0].IdentityReference.Value -ne $sid.Value){throw 'directory ACL mismatch'}; if($fileRules.Count -ne 1 -or $fileRules[0].IdentityReference.Value -ne $sid.Value -or !$fileRules[0].IsInherited -or $fileRules[0].AccessControlType -ne 'Allow'){throw 'launch file ACL mismatch'}"#;
+            let mut command = Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .env("LAPLUS_MIMIR_LAUNCH_DIR", &launch.dir)
+                .env("LAPLUS_MIMIR_LAUNCH_FILE", &path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::process::without_a_console(command.as_std_mut());
+            let status = tokio::time::timeout(CONTROL_TIMEOUT, command.status()).await;
+            assert!(
+                matches!(status, Ok(Ok(status)) if status.success()),
+                "Mimir bootstrap ACL is private and inherited by launch.json"
             );
         }
         drop(launch);
