@@ -333,7 +333,12 @@ impl Projection {
         let child = parent.map(|_| agent);
         let key = format!(
             "mimir:{}:{}:{}:{}:{}:{}",
-            turn.as_deref().unwrap_or("background"),
+            // A child's stream can outlive its parent's Laplus turn.
+            if child.is_some() {
+                "child"
+            } else {
+                turn.as_deref().unwrap_or("background")
+            },
             text(source, "run_id"),
             agent,
             source["turn"],
@@ -933,6 +938,39 @@ mod tests {
         assert_ne!(
             ids[0], ids[1],
             "SDK observation counters can restart on reopen"
+        );
+    }
+
+    #[test]
+    fn mimir_child_text_remains_one_block_when_the_parent_turn_finishes() {
+        let mut projection = Projection::default();
+        let mut driving = driving();
+        let first = projection.event(
+            &observation(
+                "child",
+                Some("root"),
+                json!({"text_delta":{"index":0,"value":"First "}}),
+            ),
+            &mut driving,
+            "now",
+        );
+        driving.turn = None;
+        let last = projection.event(
+            &observation(
+                "child",
+                Some("root"),
+                json!({"text_delta":{"index":0,"value":"last"}}),
+            ),
+            &mut driving,
+            "later",
+        );
+        assert_eq!(
+            first.child_streams[0].entries[0].key,
+            last.child_streams[0].entries[0].key
+        );
+        assert_eq!(
+            last.child_streams[0].entries[0].payload["text"],
+            "First last"
         );
     }
 

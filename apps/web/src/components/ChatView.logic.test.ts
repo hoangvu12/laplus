@@ -35,6 +35,7 @@ import {
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  deriveLockedProvider,
   getMimirSlashCommandError,
   dismissBranchMismatchForSession,
   getStartedThreadModelChangeBlockReason,
@@ -83,6 +84,67 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     ...overrides,
   };
 }
+describe("deriveLockedProvider", () => {
+  const mimirInstance = ProviderInstanceId.make("mimir_mimir");
+  const input = {
+    selectedProvider: null,
+    threadProvider: mimirInstance,
+    providers: [{ instanceId: mimirInstance, driver: ProviderDriverKind.make("mimir") }],
+    providerInstances: {},
+  };
+
+  it.each([
+    ["mimir_mimir", "mimir"],
+    ["codex_personal", "codex"],
+    ["claudeAgent", "claudeAgent"],
+    ["acme_local", "acme_agent"],
+  ])("locks restored %s threads to driver %s, not the instance slug", (instance, driver) => {
+    const instanceId = ProviderInstanceId.make(instance);
+    const thread = makeThread({
+      modelSelection: { instanceId, model: "saved-model" },
+      latestTurn: completedTurn,
+      session: null,
+    });
+    const selection = {
+      ...input,
+      thread,
+      threadProvider: thread.modelSelection.instanceId,
+      providers: [{ instanceId, driver: ProviderDriverKind.make(driver) }],
+    };
+    expect(deriveLockedProvider(selection)).toBe(driver);
+    expect(thread.modelSelection.instanceId).toBe(instanceId);
+  });
+
+  it("uses the environment's configured driver before snapshots arrive", () => {
+    const selection = {
+      ...input,
+      thread: makeThread({ latestTurn: completedTurn }),
+      providers: [],
+      providerInstances: { [mimirInstance]: { driver: ProviderDriverKind.make("mimir") } },
+    };
+    expect(deriveLockedProvider(selection)).toBe("mimir");
+  });
+
+  it("resolves the selected instance only when the thread instance is unknown", () => {
+    const selection = {
+      ...input,
+      thread: makeThread({ latestTurn: completedTurn }),
+      threadProvider: ProviderInstanceId.make("removed_instance"),
+      selectedProvider: mimirInstance,
+    };
+    expect(deriveLockedProvider(selection)).toBe("mimir");
+    expect(deriveLockedProvider({ ...selection, selectedProvider: null })).toBeNull();
+    expect(deriveLockedProvider({ ...selection, threadProvider: null })).toBe("mimir");
+  });
+
+  it("keeps live session authority and leaves unstarted drafts unlocked", () => {
+    expect(deriveLockedProvider({ ...input, thread: makeThread({ session: readySession }) })).toBe(
+      readySession.providerName,
+    );
+    expect(deriveLockedProvider({ ...input, thread: makeThread() })).toBeNull();
+  });
+});
+
 describe("Mimir slash command queue boundary", () => {
   it("blocks commands while running, locally submitting, or holding pending work", () => {
     const base = {

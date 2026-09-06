@@ -1552,20 +1552,23 @@ export function deriveTimelineEntries(
   proposedPlans: ReadonlyArray<ProposedPlan>,
   workEntries: ReadonlyArray<WorkLogEntry>,
 ): TimelineEntry[] {
+  // IDs only need to be unique within their source collections at the contract
+  // boundary. Namespace the merged timeline keys so a restored provider activity
+  // cannot hide a later message that reuses the same opaque SDK ID.
   const messageRows: TimelineEntry[] = messages.map((message) => ({
-    id: message.id,
+    id: `message:${message.id}`,
     kind: "message",
     createdAt: message.createdAt,
     message,
   }));
   const proposedPlanRows: TimelineEntry[] = proposedPlans.map((proposedPlan) => ({
-    id: proposedPlan.id,
+    id: `proposed-plan:${proposedPlan.id}`,
     kind: "proposed-plan",
     createdAt: proposedPlan.createdAt,
     proposedPlan,
   }));
   const workRows: TimelineEntry[] = workEntries.map((entry) => ({
-    id: entry.id,
+    id: `work:${entry.id}`,
     kind: "work",
     createdAt: entry.createdAt,
     entry,

@@ -7,6 +7,86 @@ import {
   resolveAssistantMessageCopyState,
   resolveWorkEntryActivation,
 } from "./MessagesTimeline.logic";
+import { deriveTimelineEntries } from "../../session-logic";
+
+describe("restart timeline identity", () => {
+  it("keeps a reply visible when its message id collides with an older thinking activity", () => {
+    const collidedId = "mimir:reopened-run:1:1:0";
+    const timelineEntries = deriveTimelineEntries(
+      [
+        {
+          id: "old-user",
+          role: "user",
+          text: "Initial prompt",
+          turnId: "old-turn",
+          createdAt: "2026-09-06T22:10:11.139Z",
+          updatedAt: "2026-09-06T22:10:11.139Z",
+          streaming: false,
+        },
+        {
+          id: "old-answer",
+          role: "assistant",
+          text: "Initial answer",
+          turnId: "old-turn",
+          createdAt: "2026-09-06T22:11:54.788Z",
+          updatedAt: "2026-09-06T22:11:55.972Z",
+          streaming: false,
+        },
+        {
+          id: "new-user",
+          role: "user",
+          text: "Reply only: Restart verified.",
+          turnId: "new-turn",
+          createdAt: "2026-09-06T22:40:04.147Z",
+          updatedAt: "2026-09-06T22:40:04.147Z",
+          streaming: false,
+        },
+        {
+          id: collidedId,
+          role: "assistant",
+          text: "Restart verified.",
+          turnId: "new-turn",
+          createdAt: "2026-09-06T22:40:08.067Z",
+          updatedAt: "2026-09-06T22:40:08.197Z",
+          streaming: false,
+        },
+      ] as never,
+      [],
+      [
+        {
+          id: collidedId,
+          turnId: "old-turn" as never,
+          createdAt: "2026-09-06T22:10:30.646Z",
+          label: "Thinking",
+          tone: "thinking",
+        },
+      ],
+    );
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      latestTurn: {
+        turnId: "new-turn" as never,
+        state: "completed",
+        startedAt: "2026-09-06T22:40:04.148Z",
+        completedAt: "2026-09-06T22:40:08.352Z",
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(
+      rows.some(
+        (row) =>
+          row.kind === "message" &&
+          row.message.role === "assistant" &&
+          row.message.text === "Restart verified.",
+      ),
+    ).toBe(true);
+  });
+});
 
 describe("computeMessageDurationStart", () => {
   it("returns message createdAt when there is no preceding user message", () => {
