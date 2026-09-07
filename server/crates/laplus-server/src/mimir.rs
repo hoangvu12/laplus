@@ -93,6 +93,8 @@ impl Bootstrap {
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("LAPLUS_MIMIR_LAUNCH_DIR", &self.dir)
+            // Windows PowerShell must not load modules from an inherited pwsh 7 path.
+            .env_remove("PSModulePath")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1074,6 +1076,7 @@ mod tests {
                 .args(["-NoProfile", "-NonInteractive", "-Command", script])
                 .env("LAPLUS_MIMIR_LAUNCH_DIR", &launch.dir)
                 .env("LAPLUS_MIMIR_LAUNCH_FILE", &path)
+                .env_remove("PSModulePath")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
