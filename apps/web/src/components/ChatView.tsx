@@ -1229,6 +1229,10 @@ function ChatViewContent(props: ChatViewProps) {
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
   );
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
+
+  const setComposerDraftSkillSelections = useComposerDraftStore(
+    (store) => store.setSkillSelections,
+  );
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const setComposerDraftTerminalContexts = useComposerDraftStore(
     (store) => store.setTerminalContexts,
@@ -4600,6 +4604,14 @@ function ChatViewContent(props: ChatViewProps) {
     const context = composerRef.current?.getSendContext();
     if (!context?.providerAvailable || context.selectedProvider !== "mimir") return;
 
+    if (sendEnvMode === "worktree" && !activeThread.worktreePath) {
+      setThreadError(
+        activeThread.id,
+        "Mimir skills are available after the new worktree is created. Send the first message without a skill selection.",
+      );
+      return;
+    }
+
     preparingMimirSkillsRef.current = true;
     setIsPreparingMimirSkills(true);
     setThreadError(activeThread.id, null);
@@ -4649,6 +4661,8 @@ function ChatViewContent(props: ChatViewProps) {
     interactionMode,
     isLocalDraftThread,
     prepareThreadSession,
+    sendEnvMode,
+
     setThreadError,
   ]);
 
@@ -5038,6 +5052,8 @@ function ChatViewContent(props: ChatViewProps) {
         composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
         composerElementContextsRef.current = composerElementContextsSnapshot;
         setComposerDraftPrompt(composerDraftTarget, promptForSend);
+
+        setComposerDraftSkillSelections(composerDraftTarget, composerSkillSelections);
         addComposerDraftImages(composerDraftTarget, retryComposerImages);
         setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
         setComposerDraftElementContexts(composerDraftTarget, composerElementContextsSnapshot);

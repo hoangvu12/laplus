@@ -26,6 +26,13 @@ export type ComposerPromptSegment =
       context: TerminalContextDraft | null;
     };
 
+export type ComposerSkillIdentity = {
+  name: string;
+  visibleText: string;
+  start: number;
+  end: number;
+};
+
 function rangeIncludesIndex(start: number, end: number, index: number): boolean {
   return start <= index && index < end;
 }
@@ -124,40 +131,44 @@ function forEachMentionMatch(
   });
 }
 
-function splitPromptTextIntoComposerSegments(text: string): ComposerPromptSegment[] {
+function splitPromptTextIntoComposerSegments(
+  text: string,
+  promptOffset: number,
+  skillSelections: ReadonlyArray<ComposerSkillIdentity>,
+
+  explicitSkillSelectionsOnly: boolean,
+): ComposerPromptSegment[] {
   const segments: ComposerPromptSegment[] = [];
-  if (!text) {
-    return segments;
-  }
+  if (!text) return segments;
 
   const tokenMatches = collectComposerInlineTokens(text);
   let cursor = 0;
   for (const match of tokenMatches) {
-    if (match.start < cursor) {
+    if (match.start < cursor) continue;
+    if (
+      match.type === "skill" &&
+      explicitSkillSelectionsOnly &&
+      !skillSelections.some(
+        (selection) =>
+          selection.start === promptOffset + match.start &&
+          selection.end === promptOffset + match.end &&
+          selection.name === match.value &&
+          selection.visibleText === match.source,
+      )
+    ) {
       continue;
     }
 
-    if (match.start > cursor) {
-      pushTextSegment(segments, text.slice(cursor, match.start));
-    }
-
+    if (match.start > cursor) pushTextSegment(segments, text.slice(cursor, match.start));
     if (match.type === "mention") {
-      segments.push({
-        type: "mention",
-        path: match.value,
-        source: match.source,
-      });
+      segments.push({ type: "mention", path: match.value, source: match.source });
     } else {
       segments.push({ type: "skill", name: match.value });
     }
-
     cursor = match.end;
   }
 
-  if (cursor < text.length) {
-    pushTextSegment(segments, text.slice(cursor));
-  }
-
+  if (cursor < text.length) pushTextSegment(segments, text.slice(cursor));
   return segments;
 }
 
@@ -198,6 +209,9 @@ export function selectionTouchesMentionBoundary(
 export function splitPromptIntoComposerSegments(
   prompt: string,
   terminalContexts: ReadonlyArray<TerminalContextDraft> = [],
+  skillSelections: ReadonlyArray<ComposerSkillIdentity> = [],
+
+  explicitSkillSelectionsOnly = false,
 ): ComposerPromptSegment[] {
   if (!prompt) {
     return [];
@@ -207,7 +221,14 @@ export function splitPromptIntoComposerSegments(
   let terminalContextIndex = 0;
   forEachPromptSegmentSlice(prompt, (slice) => {
     if (slice.type === "text") {
-      segments.push(...splitPromptTextIntoComposerSegments(slice.text));
+      segments.push(
+        ...splitPromptTextIntoComposerSegments(
+          slice.text,
+          slice.promptOffset,
+          skillSelections,
+          explicitSkillSelectionsOnly,
+        ),
+      );
       return false;
     }
 

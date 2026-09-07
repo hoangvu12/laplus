@@ -212,7 +212,11 @@ import { formatProviderSkillDisplayName } from "../../providerSkillPresentation"
 import { searchProviderSkills } from "../../providerSkillSearch";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
-import { selectedComposerSkill, type ComposerSkillSelection } from "../../composerSkills";
+import {
+  selectMimirSkillCatalog,
+  selectedComposerSkill,
+  type ComposerSkillSelection,
+} from "../../composerSkills";
 
 const IMAGE_SIZE_LIMIT_LABEL = `${Math.round(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES / (1024 * 1024))}MB`;
 
@@ -917,18 +921,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => selectedProviderEntry?.snapshot ?? null,
     [selectedProviderEntry],
   );
-  const selectedProviderSkills = useMemo(() => {
-    if (selectedProvider !== "mimir") return selectedProviderStatus?.skills ?? [];
-    const row = [...(activeThread?.activities ?? [])]
-      .reverse()
-      .find((activity) => activity.kind === "provider.skills");
-    const skills = (row?.payload as { skills?: ServerProvider["skills"] } | null)?.skills;
-    return Array.isArray(skills) ? skills : [];
-  }, [activeThread?.activities, selectedProvider, selectedProviderStatus]);
+  const selectedMimirSkillCatalog = useMemo(
+    () =>
+      selectedProvider === "mimir"
+        ? selectMimirSkillCatalog(activeThread?.activities ?? [], selectedInstanceId, gitCwd)
+        : null,
+    [activeThread?.activities, gitCwd, selectedInstanceId, selectedProvider],
+  );
+  const selectedProviderSkills =
+    selectedProvider === "mimir"
+      ? isPreparingMimirSkills
+        ? []
+        : (selectedMimirSkillCatalog?.skills ?? [])
+      : (selectedProviderStatus?.skills ?? []);
 
-  const skillScopeRef = useRef(`${selectedInstanceId}:${activeThreadId ?? "draft"}`);
+  const skillScopeRef = useRef(
+    `${selectedInstanceId}:${gitCwd ?? ""}:${selectedMimirSkillCatalog?.scope.sdkSessionId ?? ""}`,
+  );
   useEffect(() => {
-    const scope = `${selectedInstanceId}:${activeThreadId ?? "draft"}`;
+    const scope = `${selectedInstanceId}:${gitCwd ?? ""}:${selectedMimirSkillCatalog?.scope.sdkSessionId ?? ""}`;
     const scopeChanged = skillScopeRef.current !== scope;
     skillScopeRef.current = scope;
     if (scopeChanged && composerSkillSelections.length > 0) {
@@ -941,9 +952,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       return;
     }
-    const hasSessionCatalog = (activeThread?.activities ?? []).some(
-      (activity) => activity.kind === "provider.skills",
-    );
+    const hasSessionCatalog = selectedMimirSkillCatalog !== null;
     if (!hasSessionCatalog || isPreparingMimirSkills) return;
     const retained = composerSkillSelections.filter((selection) =>
       selectedProviderSkills.some(
@@ -954,13 +963,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       setComposerDraftSkillSelections(composerDraftTarget, retained);
     }
   }, [
-    activeThread?.activities,
+    gitCwd,
     activeThreadId,
     composerDraftTarget,
     composerSkillSelections,
     isPreparingMimirSkills,
     selectedInstanceId,
     selectedProvider,
+    selectedMimirSkillCatalog,
     selectedProviderSkills,
     setComposerDraftSkillSelections,
   ]);
@@ -1131,14 +1141,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const pathTriggerQuery = composerTrigger?.kind === "path" ? composerTrigger.query : "";
   const isPathTrigger = composerTriggerKind === "path";
 
-  const skillMenuWasOpenRef = useRef(false);
+  const skillMenuScopeRef = useRef("");
   useEffect(() => {
     const isOpen = composerTriggerKind === "skill" && isMimir;
-    if (isOpen && !skillMenuWasOpenRef.current) {
+    const scope = `${selectedInstanceId}:${gitCwd ?? ""}:${activeThreadId ?? "draft"}`;
+    if (isOpen && skillMenuScopeRef.current !== scope) {
       onPrepareMimirSkills();
     }
-    skillMenuWasOpenRef.current = isOpen;
-  }, [composerTriggerKind, isMimir, onPrepareMimirSkills]);
+    skillMenuScopeRef.current = isOpen ? scope : "";
+  }, [
+    activeThreadId,
+    composerTriggerKind,
+    gitCwd,
+    isMimir,
+    onPrepareMimirSkills,
+    selectedInstanceId,
+  ]);
   const workspaceEntries = useComposerPathSearch({
     environmentId,
     cwd: isPathTrigger ? gitCwd : null,
@@ -3181,6 +3199,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     : []
                 }
                 skills={selectedProviderSkills}
+                skillSelections={composerSkillSelections}
+                explicitSkillSelectionsOnly={isMimir}
                 {...(showMobilePendingAnswerActions ? { className: "max-sm:pb-11" } : {})}
                 onRemoveTerminalContext={removeComposerTerminalContextFromDraft}
                 onChange={onPromptChange}

@@ -1263,6 +1263,18 @@ async fn mimir_socket_prepare_bootstraps_real_session_refreshes_and_reuses_it_fo
             .any(|request| request["action"] == "create")
     })
     .await;
+    {
+        let state = peer.shared.state.lock().unwrap();
+        let create = state
+            .requests
+            .iter()
+            .find(|request| request["action"] == "create")
+            .unwrap();
+        assert_eq!(create["configuration"]["provider"], "test");
+        assert_eq!(create["configuration"]["model"], "org/model");
+        assert_eq!(create["configuration"]["reasoning"], "high");
+        assert_eq!(create["configuration"]["mode"], "build");
+    }
     let snapshot = server
         .connect()
         .await
@@ -1277,7 +1289,11 @@ async fn mimir_socket_prepare_bootstraps_real_session_refreshes_and_reuses_it_fo
         .unwrap()
         .iter()
         .any(|activity| activity["kind"] == "provider.skills"
-            && activity["payload"]["skills"][0]["name"] == "review"));
+            && activity["payload"]["skills"][0]["name"] == "review"
+            && activity["payload"]["scope"]["providerInstanceId"] == "mimirLocal"
+            && activity["payload"]["scope"]["sdkSessionId"] == SESSION
+            && activity["payload"]["scope"]["cwd"]
+                == peer.shared.workspace.to_string_lossy().as_ref()));
 
     let mut second_prepare = prepare;
     second_prepare["commandId"] = json!("prepare-2");

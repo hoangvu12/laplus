@@ -48,6 +48,7 @@ import {
   startNewThreadForProject,
   shouldShowBranchMismatchBanner,
   shouldWriteThreadErrorToCurrentServerThread,
+  threadHasTurnStarted,
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -84,6 +85,33 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     ...overrides,
   };
 }
+describe("threadHasTurnStarted", () => {
+  it("does not promote a draft merely because skill preparation created an idle session", () => {
+    expect(
+      threadHasTurnStarted(
+        makeThread({
+          session: {
+            threadId,
+            status: "ready",
+            activeTurnId: null,
+            runtimeMode: "full-access",
+            providerName: "mimir",
+            providerInstanceId: ProviderInstanceId.make("mimir"),
+            lastError: null,
+            updatedAt: now,
+          },
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("promotes after the first message is admitted", () => {
+    expect(threadHasTurnStarted(makeThread({ messages: [{} as Thread["messages"][number]] }))).toBe(
+      true,
+    );
+  });
+});
+
 describe("deriveLockedProvider", () => {
   const mimirInstance = ProviderInstanceId.make("mimir_mimir");
   const input = {

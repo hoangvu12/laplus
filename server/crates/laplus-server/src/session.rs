@@ -397,6 +397,8 @@ pub struct Start {
     /// The model the child is running under — the launch flag at first, and then
     /// whatever a successful push has moved it to. See [`retune`].
     pub model: Option<String>,
+    pub model_options: serde_json::Value,
+    pub interaction_mode: String,
     /// The runtime mode the child is running under, on the same terms as
     /// [`Start::model`].
     ///
@@ -2589,6 +2591,8 @@ pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver)
         thread_id: thread.id.clone(),
         workspace_root: workspace_root.to_string(),
         model: thread.model(),
+        model_options: thread.model_selection.get("options").cloned().unwrap_or(serde_json::Value::Null),
+        interaction_mode: thread.interaction_mode.clone(),
         runtime_mode: thread.runtime_mode.clone(),
         resume_cursor: thread
             .provider_resume_cursor
@@ -2654,6 +2658,8 @@ mod continuation_tests {
             thread_id: thread.id.clone(),
             workspace_root: "/work".to_string(),
             model: thread.model(),
+            model_options: serde_json::Value::Null,
+            interaction_mode: thread.interaction_mode.clone(),
             runtime_mode: thread.runtime_mode.clone(),
             resume_cursor: None,
             provider: thread.provider.clone(),

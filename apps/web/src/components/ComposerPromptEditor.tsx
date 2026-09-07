@@ -79,6 +79,8 @@ import {
 import { FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
 import { ComposerPendingTerminalContextChip } from "./chat/ComposerPendingTerminalContexts";
 import { formatProviderSkillDisplayName } from "~/providerSkillPresentation";
+
+import type { ComposerSkillSelection } from "~/composerSkills";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { registerComposerInlineTokenPaste } from "./composerInlineTokenPaste";
 
@@ -474,6 +476,20 @@ function skillSignature(skills: ReadonlyArray<ServerProviderSkill>): string {
     .join("\u001e");
 }
 
+function skillSelectionSignature(selections: ReadonlyArray<ComposerSkillSelection>): string {
+  return selections
+    .map((selection) =>
+      [
+        selection.name,
+        selection.path ?? "",
+        selection.visibleText,
+        selection.start,
+        selection.end,
+      ].join("\u001f"),
+    )
+    .join("\u001e");
+}
+
 function clampExpandedCursor(value: string, cursor: number): number {
   if (!Number.isFinite(cursor)) return value.length;
   return Math.max(0, Math.min(value.length, Math.floor(cursor)));
@@ -821,13 +837,20 @@ function $setComposerEditorPrompt(
   prompt: string,
   terminalContexts: ReadonlyArray<TerminalContextDraft>,
   skillMetadata: ReadonlyMap<string, ComposerSkillMetadata>,
+  skillSelections: ReadonlyArray<ComposerSkillSelection>,
+  explicitSkillSelectionsOnly: boolean,
 ): void {
   const root = $getRoot();
   root.clear();
   const paragraph = $createParagraphNode();
   root.append(paragraph);
 
-  const segments = splitPromptIntoComposerSegments(prompt, terminalContexts);
+  const segments = splitPromptIntoComposerSegments(
+    prompt,
+    terminalContexts,
+    skillSelections,
+    explicitSkillSelectionsOnly,
+  );
   for (const segment of segments) {
     if (segment.type === "mention") {
       paragraph.append($createComposerMentionNode(segment.path));
@@ -881,6 +904,9 @@ interface ComposerPromptEditorProps {
   cursor: number;
   terminalContexts: ReadonlyArray<TerminalContextDraft>;
   skills: ReadonlyArray<ServerProviderSkill>;
+
+  skillSelections: ReadonlyArray<ComposerSkillSelection>;
+  explicitSkillSelectionsOnly: boolean;
   disabled: boolean;
   placeholder: string;
   className?: string;
@@ -1262,10 +1288,14 @@ function ComposerInlineTokenPastePlugin() {
 function ComposerSurroundSelectionPlugin(props: {
   terminalContexts: ReadonlyArray<TerminalContextDraft>;
   skills: ReadonlyArray<ServerProviderSkill>;
+  skillSelections: ReadonlyArray<ComposerSkillSelection>;
+  explicitSkillSelectionsOnly: boolean;
 }) {
   const [editor] = useLexicalComposerContext();
   const terminalContextsRef = useRef(props.terminalContexts);
   const skillMetadataRef = useRef(skillMetadataByName(props.skills));
+
+  const skillSelectionsRef = useRef(props.skillSelections);
   const pendingSurroundSelectionRef = useRef<{
     value: string;
     expandedStart: number;
@@ -1284,6 +1314,10 @@ function ComposerSurroundSelectionPlugin(props: {
   useEffect(() => {
     skillMetadataRef.current = skillMetadataByName(props.skills);
   }, [props.skills]);
+
+  useEffect(() => {
+    skillSelectionsRef.current = props.skillSelections;
+  }, [props.skillSelections]);
 
   const applySurroundInsertion = useEffectEvent((inputData: string): boolean => {
     const surroundCloseSymbol = SURROUND_SYMBOLS_MAP.get(inputData);
@@ -1329,7 +1363,13 @@ function ComposerSurroundSelectionPlugin(props: {
         selectionSnapshot.expandedEnd,
       );
       const nextValue = `${selectionSnapshot.value.slice(0, selectionSnapshot.expandedStart)}${inputData}${selectedText}${surroundCloseSymbol}${selectionSnapshot.value.slice(selectionSnapshot.expandedEnd)}`;
-      $setComposerEditorPrompt(nextValue, terminalContextsRef.current, skillMetadataRef.current);
+      $setComposerEditorPrompt(
+        nextValue,
+        terminalContextsRef.current,
+        skillMetadataRef.current,
+        skillSelectionsRef.current,
+        props.explicitSkillSelectionsOnly,
+      );
       const selectionStart = collapseExpandedComposerCursor(
         nextValue,
         selectionSnapshot.expandedStart,
@@ -1530,6 +1570,9 @@ function ComposerPromptEditorInner({
   cursor,
   terminalContexts,
   skills,
+
+  skillSelections,
+  explicitSkillSelectionsOnly,
   disabled,
   placeholder,
   className,
@@ -1546,7 +1589,12 @@ function ComposerPromptEditorInner({
   const terminalContextsSignatureRef = useRef(terminalContextsSignature);
   const skillsSignature = skillSignature(skills);
   const skillsSignatureRef = useRef(skillsSignature);
+
+  const selectionsSignature = skillSelectionSignature(skillSelections);
+  const selectionsSignatureRef = useRef(selectionsSignature);
   const skillMetadataRef = useRef(skillMetadataByName(skills));
+
+  const skillSelectionsRef = useRef(skillSelections);
   const snapshotRef = useRef({
     value,
     cursor: initialCursor,
@@ -1567,6 +1615,10 @@ function ComposerPromptEditorInner({
     skillMetadataRef.current = skillMetadataByName(skills);
   }, [skills]);
 
+  useLayoutEffect(() => {
+    skillSelectionsRef.current = skillSelections;
+  }, [skillSelections]);
+
   useEffect(() => {
     editor.setEditable(!disabled);
   }, [disabled, editor]);
@@ -1576,11 +1628,14 @@ function ComposerPromptEditorInner({
     const previousSnapshot = snapshotRef.current;
     const contextsChanged = terminalContextsSignatureRef.current !== terminalContextsSignature;
     const skillsChanged = skillsSignatureRef.current !== skillsSignature;
+
+    const selectionsChanged = selectionsSignatureRef.current !== selectionsSignature;
     if (
       previousSnapshot.value === value &&
       previousSnapshot.cursor === normalizedCursor &&
       !contextsChanged &&
-      !skillsChanged
+      !skillsChanged &&
+      !selectionsChanged
     ) {
       return;
     }
@@ -1594,6 +1649,8 @@ function ComposerPromptEditorInner({
     terminalContextsSignatureRef.current = terminalContextsSignature;
     skillsSignatureRef.current = skillsSignature;
 
+    selectionsSignatureRef.current = selectionsSignature;
+
     const rootElement = editor.getRootElement();
     const isFocused = Boolean(rootElement && document.activeElement === rootElement);
     if (previousSnapshot.value === value && !contextsChanged && !skillsChanged && !isFocused) {
@@ -1603,9 +1660,15 @@ function ComposerPromptEditorInner({
     isApplyingControlledUpdateRef.current = true;
     editor.update(() => {
       const shouldRewriteEditorState =
-        previousSnapshot.value !== value || contextsChanged || skillsChanged;
+        previousSnapshot.value !== value || contextsChanged || skillsChanged || selectionsChanged;
       if (shouldRewriteEditorState) {
-        $setComposerEditorPrompt(value, terminalContexts, skillMetadataRef.current);
+        $setComposerEditorPrompt(
+          value,
+          terminalContexts,
+          skillMetadataRef.current,
+          skillSelections,
+          explicitSkillSelectionsOnly,
+        );
       }
       if (shouldRewriteEditorState || isFocused) {
         $setSelectionAtComposerOffset(normalizedCursor);
@@ -1614,7 +1677,16 @@ function ComposerPromptEditorInner({
     queueMicrotask(() => {
       isApplyingControlledUpdateRef.current = false;
     });
-  }, [cursor, editor, skillsSignature, terminalContexts, terminalContextsSignature, value]);
+  }, [
+    cursor,
+    editor,
+    selectionsSignature,
+    skillSelections,
+    skillsSignature,
+    terminalContexts,
+    terminalContextsSignature,
+    value,
+  ]);
 
   const focusAt = useCallback(
     (nextCursor: number) => {
@@ -1772,7 +1844,12 @@ function ComposerPromptEditorInner({
         />
         <OnChangePlugin onChange={handleEditorChange} />
         <ComposerCommandKeyPlugin {...(onCommandKeyDown ? { onCommandKeyDown } : {})} />
-        <ComposerSurroundSelectionPlugin terminalContexts={terminalContexts} skills={skills} />
+        <ComposerSurroundSelectionPlugin
+          terminalContexts={terminalContexts}
+          skills={skills}
+          skillSelections={skillSelections}
+          explicitSkillSelectionsOnly={explicitSkillSelectionsOnly}
+        />
         <ComposerHomeEndKeyPlugin />
         <ComposerInlineTokenArrowPlugin />
         <ComposerInlineTokenSelectionNormalizePlugin />
@@ -1790,6 +1867,9 @@ export function ComposerPromptEditor({
   cursor,
   terminalContexts,
   skills,
+
+  skillSelections,
+  explicitSkillSelectionsOnly,
   disabled,
   placeholder,
   className,
@@ -1812,6 +1892,9 @@ export function ComposerPromptEditor({
           initialValueRef.current,
           initialTerminalContextsRef.current,
           initialSkillMetadataRef.current,
+
+          skillSelections,
+          explicitSkillSelectionsOnly,
         );
       },
       onError: (error) => {
@@ -1828,6 +1911,8 @@ export function ComposerPromptEditor({
         cursor={cursor}
         terminalContexts={terminalContexts}
         skills={skills}
+        skillSelections={skillSelections}
+        explicitSkillSelectionsOnly={explicitSkillSelectionsOnly}
         disabled={disabled}
         placeholder={placeholder}
         onRemoveTerminalContext={onRemoveTerminalContext}

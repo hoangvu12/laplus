@@ -1,4 +1,8 @@
-import type { PromptSkillSelection, ServerProviderSkill } from "@t3tools/contracts";
+import type {
+  OrchestrationThreadActivity,
+  PromptSkillSelection,
+  ServerProviderSkill,
+} from "@t3tools/contracts";
 
 export interface ComposerSkillSelection {
   name: string;
@@ -7,6 +11,49 @@ export interface ComposerSkillSelection {
   /** UTF-16 offsets while the text is edited in the browser. */
   start: number;
   end: number;
+}
+
+export interface MimirSkillCatalogScope {
+  providerInstanceId: string;
+  cwd: string;
+  sdkSessionId: string;
+}
+
+export interface MimirSkillCatalog {
+  scope: MimirSkillCatalogScope;
+  skills: ServerProviderSkill[];
+}
+
+function isMimirSkillCatalog(value: unknown): value is MimirSkillCatalog {
+  if (!value || typeof value !== "object") return false;
+  const payload = value as Partial<MimirSkillCatalog>;
+  const scope = payload.scope as Partial<MimirSkillCatalogScope> | undefined;
+  return (
+    Array.isArray(payload.skills) &&
+    typeof scope?.providerInstanceId === "string" &&
+    typeof scope.cwd === "string" &&
+    typeof scope.sdkSessionId === "string" &&
+    scope.sdkSessionId.length > 0
+  );
+}
+
+export function selectMimirSkillCatalog(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  providerInstanceId: string,
+  cwd: string | null,
+): MimirSkillCatalog | null {
+  if (!cwd) return null;
+  for (let index = activities.length - 1; index >= 0; index -= 1) {
+    const activity = activities[index];
+    if (activity?.kind !== "provider.skills" || !isMimirSkillCatalog(activity.payload)) continue;
+    if (
+      activity.payload.scope.providerInstanceId === providerInstanceId &&
+      activity.payload.scope.cwd === cwd
+    ) {
+      return activity.payload;
+    }
+  }
+  return null;
 }
 
 export function selectedComposerSkill(

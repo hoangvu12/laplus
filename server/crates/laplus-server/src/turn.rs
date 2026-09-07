@@ -1495,6 +1495,8 @@ mod tests {
             thread_id: "thread-1".to_string(),
             workspace_root: ".".to_string(),
             model: None,
+            model_options: serde_json::Value::Null,
+            interaction_mode: "default".to_string(),
             runtime_mode: "full-access".to_string(),
             resume_cursor: None,
             provider: crate::provider::registration(crate::provider::CLAUDE_DRIVER)

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { OrchestrationThreadActivity } from "@t3tools/contracts";
 
 import {
   encodeComposerSkills,
+  selectMimirSkillCatalog,
   reconcileComposerSkills,
   selectedComposerSkill,
 } from "./composerSkills";
@@ -27,5 +29,27 @@ describe("composer skills", () => {
         textRange: { start: 9, end: 16 },
       },
     ]);
+  });
+
+  it("selects only the newest catalog for the requested provider and canonical cwd", () => {
+    const catalog = (providerInstanceId: string, cwd: string, sdkSessionId: string, name: string) =>
+      ({
+        kind: "provider.skills",
+        payload: {
+          scope: { providerInstanceId, cwd, sdkSessionId },
+          skills: [{ ...skill, name }],
+        },
+      }) as unknown as OrchestrationThreadActivity;
+    const activities = [
+      catalog("mimir-a", "/work", "stale", "stale"),
+      catalog("mimir-b", "/work", "other-provider", "wrong"),
+      catalog("mimir-a", "/other", "other-cwd", "wrong"),
+      catalog("mimir-a", "/work", "current", "current"),
+    ];
+
+    expect(selectMimirSkillCatalog(activities, "mimir-a", "/work")?.skills[0]?.name).toBe(
+      "current",
+    );
+    expect(selectMimirSkillCatalog(activities, "mimir-a", "/missing")).toBeNull();
   });
 });

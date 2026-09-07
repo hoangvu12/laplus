@@ -6,6 +6,7 @@ use crate::{
     session::{Decided, Driver, Driving, Opened, Reaped, Reply, Start},
 };
 use futures_util::StreamExt;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     io::{self, Write},
@@ -575,6 +576,20 @@ async fn attach_mcp(
     Ok(Some(McpAttachment { id, _grant: grant }))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillCatalogScope {
+    provider_instance_id: String,
+    cwd: String,
+    sdk_session_id: String,
+}
+fn skill_catalog_change(snapshot: &Value, scope: &SkillCatalogScope) -> Result<crate::threads::Change, String> {
+    Ok(crate::threads::Change::Activity(crate::threads::Activity::info(
+        "provider.skills", "Mimir session skills",
+        json!({"scope":scope,"skills":protocol::skills(snapshot)?}), None,
+    )))
+}
+
 pub(crate) struct Mimir {
     bridge: Bridge,
     events: Events,
@@ -585,6 +600,7 @@ pub(crate) struct Mimir {
     // Each successful save-and-stop owns one asynchronous SDK cancellation boundary.
     pending_save_resyncs: u8,
     mcp: Option<McpAttachment>,
+    skill_scope: SkillCatalogScope,
 }
 impl Driver for Mimir {
     const COALESCES_QUEUED_PROMPTS: bool = true;
@@ -620,7 +636,8 @@ impl Driver for Mimir {
         )
         .startable_for("Mimir CLI")?;
         let mut bridge = Bridge::start(&binary, &settings.bridge_command, &workspace).await?;
-        let snapshot=match bridge.client.api(if resume.is_some(){"open"}else{"create"}, if let Some(id)=&resume{json!({"id":id})}else{json!({"cwd":workspace,"configuration":{"provider":null,"model":null,"reasoning":null,"mode":"build"}})}).await {
+        let configuration = protocol::configuration(start.model.as_deref(), &start.model_options, &start.interaction_mode, &start.runtime_mode)?;
+        let snapshot=match bridge.client.api(if resume.is_some(){"open"}else{"create"}, if let Some(id)=&resume{json!({"id":id})}else{json!({"cwd":workspace,"configuration":configuration})}).await {
             Ok(snapshot)=>snapshot,Err(error)=>{bridge.stop().await;return Err(error);}
         };
         let id = match snapshot.pointer("/info/id").and_then(Value::as_str) {
@@ -645,15 +662,8 @@ impl Driver for Mimir {
             };
         let mut projection = protocol::Projection::default();
         let mut decided = projection.snapshot(&snapshot, None, &crate::clock::now_iso());
-        let skills = protocol::skills(&snapshot)?;
-        decided.changes.push(crate::threads::Change::Activity(
-            crate::threads::Activity::info(
-                "provider.skills",
-                "Mimir session skills",
-                json!({"skills":skills}),
-                None,
-            ),
-        ));
+        let skill_scope = SkillCatalogScope { provider_instance_id: start.provider.instance_id.clone(), cwd: workspace.to_string_lossy().into_owned(), sdk_session_id: id.clone() };
+        decided.changes.push(skill_catalog_change(&snapshot, &skill_scope)?);
         if snapshot["active_request"].is_null() {
             // A saved-plan decision can reopen without sending a prompt. Publish
             // the idle attach state rather than leaving the UI starting forever.
@@ -693,6 +703,7 @@ impl Driver for Mimir {
                 history_gap: false,
                 pending_save_resyncs: 0,
                 mcp,
+                skill_scope,
             },
             decided,
         })
@@ -711,18 +722,9 @@ impl Driver for Mimir {
         let mut decided = self
             .projection
             .snapshot(&snapshot, None, &crate::clock::now_iso());
-        match protocol::skills(&snapshot) {
-            Ok(skills) => decided.changes.push(crate::threads::Change::Activity(
-                crate::threads::Activity::info(
-                    "provider.skills",
-                    "Mimir session skills",
-                    json!({"skills": skills}),
-                    None,
-                ),
-            )),
-            Err(error) => decided.changes.push(crate::threads::Change::Activity(
-                crate::threads::Activity::failed("provider.skills", &error),
-            )),
+        match skill_catalog_change(&snapshot, &self.skill_scope) {
+            Ok(change) => decided.changes.push(change),
+            Err(error) => decided.changes.push(crate::threads::Change::Activity(crate::threads::Activity::failed("provider.skills", &error))),
         }
         Ok(decided)
     }
@@ -743,18 +745,9 @@ impl Driver for Mimir {
                 let mut decided =
                 self.projection
                         .snapshot(&snapshot, Some(driving), &crate::clock::now_iso());
-                match protocol::skills(&snapshot) {
-                    Ok(skills) => decided.changes.push(crate::threads::Change::Activity(
-                        crate::threads::Activity::info(
-                            "provider.skills",
-                            "Mimir session skills",
-                            json!({"skills":skills}),
-                            None,
-                        ),
-                    )),
-                    Err(error) => decided.changes.push(crate::threads::Change::Activity(
-                        crate::threads::Activity::failed("provider.skills", &error),
-                    )),
+                match skill_catalog_change(&snapshot, &self.skill_scope) {
+                    Ok(change) => decided.changes.push(change),
+                    Err(error) => decided.changes.push(crate::threads::Change::Activity(crate::threads::Activity::failed("provider.skills", &error))),
                 }
                 decided
             }

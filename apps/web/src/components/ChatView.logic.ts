@@ -406,6 +406,11 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
+/** Preparation may create an idle provider session before the draft is sent. */
+export function threadHasTurnStarted(thread: Thread | null | undefined): boolean {
+  return Boolean(thread && (thread.latestTurn !== null || thread.messages.length > 0));
+}
+
 // Sessions carry driver kinds; persisted model/composer selections carry instance
 // ids. Resolve those ids in this environment instead of treating their open slugs
 // as driver names (e.g. `mimir_mimir` is an instance of `mimir`).

@@ -1720,7 +1720,7 @@ impl Shell {
                 "This server cannot prepare a git worktree for a thread. Run the conversation in the project's own checkout instead.",
             ));
         }
-        let (thread, pending) =
+        let (mut thread, pending) =
             self.candidate_thread(&prepare.thread_id, prepare.bootstrap.as_ref(), config)?;
         if thread.provider.driver != "mimir" {
             return Err(CommandError::new(
@@ -1738,9 +1738,18 @@ impl Shell {
             &prepare.runtime_mode,
         )
         .map_err(CommandError::new)?;
+        let selection_changed = thread.model_selection != prepare.model_selection;
+        let preparation_changed = selection_changed
+            || thread.runtime_mode != prepare.runtime_mode
+            || thread.interaction_mode != prepare.interaction_mode;
         if thread.session.as_ref().is_some_and(|session| {
             session.status.is_working() || session.status == SessionStatus::Ready
         }) {
+            if preparation_changed {
+                return Err(CommandError::new(
+                    "The active Mimir session was prepared with a different model or mode",
+                ));
+            }
             self.inner
                 .threads
                 .refresh(&prepare.thread_id)
@@ -1754,6 +1763,27 @@ impl Shell {
                 )
                 .ok_or_else(|| self.not_open(&prepare.thread_id));
         }
+        if !pending && selection_changed {
+            self.inner
+                .threads
+                .apply(
+                    &prepare.thread_id,
+                    Change::MetaUpdated(MetaUpdate {
+                        title: None,
+                        title_regeneration: None,
+                        regenerate_title: false,
+                        previous_title: None,
+                        model_selection: Some(prepare.model_selection.clone()),
+                        branch: None,
+                        worktree_path: None,
+                    }),
+                )
+                .ok_or_else(|| self.not_open(&prepare.thread_id))?;
+        }
+        thread.model_selection = prepare.model_selection.clone();
+        thread.runtime_mode = prepare.runtime_mode.clone();
+        thread.interaction_mode = prepare.interaction_mode.clone();
+
         let project = self.project(&thread.project_id)?;
         let prepared =
             crate::session::prepare(&thread, &config.settings, Arc::clone(&self.inner.mcp))
