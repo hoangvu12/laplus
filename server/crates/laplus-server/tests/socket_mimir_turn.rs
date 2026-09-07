@@ -43,6 +43,14 @@ enum McpMode {
     RefusePrompt,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SaveResync {
+    #[default]
+    None,
+    Immediate,
+    AfterNextCompletion,
+}
+
 #[derive(Default)]
 struct PeerState {
     mcp_mode: McpMode,
@@ -54,6 +62,8 @@ struct PeerState {
     sinks: Vec<mpsc::UnboundedSender<String>>,
     cursors: Vec<Option<String>>,
     refuse_plan: bool,
+    save_resync: SaveResync,
+    save_resync_pending: usize,
     plan: Value,
     question: Value,
     configuration: Value,
@@ -92,6 +102,9 @@ impl PeerState {
         let id = self.active.take().unwrap();
         self.completed.push(id.clone());
         self.emit(json!({"completed":{"request_id":id,"stop_reason":"end_turn","error":null}}));
+        for _ in 0..std::mem::take(&mut self.save_resync_pending) {
+            self.emit(json!("resync"));
+        }
     }
 }
 impl Shared {
@@ -253,6 +266,14 @@ async fn api(
             } else {
                 assert_eq!(request["decision"], "save_and_stop");
                 state.plan["status"] = json!("saved_stopped");
+                match state.save_resync {
+                    SaveResync::None => {}
+                    SaveResync::Immediate => state.emit(json!("resync")),
+                    SaveResync::AfterNextCompletion => {
+                        state.save_resync_pending =
+                            state.save_resync_pending.checked_add(1).unwrap()
+                    }
+                }
                 json!({"accepted":null})
             }
         }
@@ -786,6 +807,270 @@ async fn mimir_socket_saved_plan_decisions_have_stable_identity_and_are_native()
         .clone();
     assert_eq!(snapshot["proposedPlans"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["proposedPlans"][0]["id"], PLAN);
+    client.close().await;
+    server.stop().await;
+}
+#[tokio::test]
+async fn mimir_socket_save_and_stop_resync_is_not_a_history_gap() {
+    let peer = Peer::start().await;
+    peer.shared.state.lock().unwrap().save_resync = SaveResync::Immediate;
+    let (server, mut client, subscription) = open(&peer).await;
+    dispatch(
+        &mut client,
+        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
+    )
+    .await;
+    client.events_through_the_turn(&subscription).await;
+    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let state = peer.shared.state.lock().unwrap();
+            if state.cursors.len() >= 2
+                || state
+                    .requests
+                    .iter()
+                    .any(|request| request["action"] == "release")
+            {
+                break;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("save resync is either resumed or misclassified promptly");
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await["thread"]
+        .clone();
+    assert_eq!(snapshot["session"]["status"], "ready");
+    assert!(!snapshot.to_string().contains("provider.history-gap"));
+    {
+        let state = peer.shared.state.lock().unwrap();
+        assert_eq!(
+            state.cursors.len(),
+            2,
+            "resume the SSE stream after the save boundary"
+        );
+        let cursor = format!("random-opaque-epoch:{}", state.events.len());
+        assert_eq!(
+            state.cursors[1].as_deref(),
+            Some(cursor.as_str()),
+            "resume after the consumed resync cursor"
+        );
+        assert!(!state
+            .requests
+            .iter()
+            .any(|request| request["action"] == "release"));
+    }
+    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"implement-1","threadId":"thread-1","planId":PLAN,"decision":"implement"})).await;
+    client.events_through_the_turn(&subscription).await;
+    let implemented = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await;
+    assert_eq!(implemented["thread"]["session"]["status"], "ready");
+    assert!(implemented["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["text"] == "Implementation done"));
+    client.close().await;
+    server.stop().await;
+}
+async fn delayed_save_resync_after_new_work(implement: bool, saves: usize) {
+    let peer = Peer::start().await;
+    peer.shared.state.lock().unwrap().save_resync = SaveResync::AfterNextCompletion;
+    let (server, mut client, subscription) = open(&peer).await;
+    dispatch(
+        &mut client,
+        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
+    )
+    .await;
+    client.events_through_the_turn(&subscription).await;
+    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
+        })
+        .await;
+
+    for index in 1..saves {
+        dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":format!("save-{index}"),"threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let state = peer.shared.state.lock().unwrap();
+            let accepted = state
+                .requests
+                .iter()
+                .filter(|request| {
+                    request["action"] == "decide_plan" && request["decision"] == "save_and_stop"
+                })
+                .count();
+            if accepted == saves {
+                break;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every save reached the bridge before newer work");
+    if implement {
+        dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"implement-1","threadId":"thread-1","planId":PLAN,"decision":"implement"})).await;
+    } else {
+        dispatch(
+            &mut client,
+            follow_up("thread-1", "after-save", "Continue after save"),
+        )
+        .await;
+    }
+    client.events_through_the_turn(&subscription).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let state = peer.shared.state.lock().unwrap();
+            if state.cursors.len() >= 2
+                || state
+                    .requests
+                    .iter()
+                    .any(|request| request["action"] == "release")
+            {
+                break;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delayed save resync is either resumed or misclassified promptly");
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await["thread"]
+        .clone();
+    assert_eq!(snapshot["session"]["status"], "ready");
+    assert!(!snapshot.to_string().contains("provider.history-gap"));
+    let expected = if implement {
+        "Implementation done"
+    } else {
+        "Root answer"
+    };
+    let matching: Vec<_> = snapshot["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["text"] == expected)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        if implement { 1 } else { 2 },
+        "newer reply must neither be lost nor replayed"
+    );
+    if !implement {
+        assert_ne!(matching[0]["turnId"], matching[1]["turnId"]);
+    }
+    {
+        let state = peer.shared.state.lock().unwrap();
+        assert_eq!(state.cursors.len(), saves + 1);
+        let cursor = format!("random-opaque-epoch:{}", state.events.len());
+        assert_eq!(
+            state.cursors[saves].as_deref(),
+            Some(cursor.as_str()),
+            "resume after every delayed save cursor"
+        );
+        assert!(!state
+            .requests
+            .iter()
+            .any(|request| request["action"] == "release"));
+    }
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn mimir_socket_delayed_save_resync_survives_immediate_implement() {
+    delayed_save_resync_after_new_work(true, 1).await;
+}
+
+#[tokio::test]
+async fn mimir_socket_delayed_save_resync_survives_immediate_prompt() {
+    delayed_save_resync_after_new_work(false, 1).await;
+}
+
+#[tokio::test]
+async fn mimir_socket_two_delayed_saves_consume_two_resyncs() {
+    delayed_save_resync_after_new_work(false, 2).await;
+}
+
+#[tokio::test]
+async fn mimir_socket_excess_delayed_save_resync_remains_fatal() {
+    let peer = Peer::start().await;
+    peer.shared.state.lock().unwrap().save_resync = SaveResync::AfterNextCompletion;
+    let (server, mut client, subscription) = open(&peer).await;
+    dispatch(
+        &mut client,
+        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
+    )
+    .await;
+    client.events_through_the_turn(&subscription).await;
+    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
+    client
+        .values_until(&subscription, |item| {
+            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
+        })
+        .await;
+    {
+        let mut state = peer.shared.state.lock().unwrap();
+        assert_eq!(state.save_resync_pending, 1);
+        state.save_resync_pending += 1;
+    }
+    dispatch(
+        &mut client,
+        follow_up("thread-1", "after-save", "Continue after save"),
+    )
+    .await;
+    client.events_through_the_turn(&subscription).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if peer
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| request["action"] == "release")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the excess resync retires the source");
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-1")
+        .await["thread"]
+        .clone();
+    assert_eq!(snapshot["session"]["status"], "error");
+    assert!(snapshot.to_string().contains("provider.history-gap"));
+    assert_eq!(
+        peer.shared.state.lock().unwrap().cursors.len(),
+        2,
+        "only the correlated resync reconnects"
+    );
     client.close().await;
     server.stop().await;
 }

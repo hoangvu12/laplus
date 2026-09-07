@@ -395,6 +395,7 @@ enum Received {
     Event(Value),
     Snapshot(Value),
     Gap,
+    Resync(String),
     Failed(String),
 }
 struct Events {
@@ -407,18 +408,22 @@ impl Drop for Events {
     }
 }
 impl Events {
-    fn start(client: Client, id: String) -> Self {
+    fn start(client: Client, id: String, cursor: Option<String>) -> Self {
         let (tx, incoming) = mpsc::channel(64);
         let task = tokio::spawn(async move {
-            if let Err(error) = read_events(&client, &id, &tx).await {
+            if let Err(error) = read_events(&client, &id, cursor, &tx).await {
                 let _ = tx.send(Received::Failed(error)).await;
             }
         });
         Self { incoming, task }
     }
 }
-async fn read_events(client: &Client, id: &str, tx: &mpsc::Sender<Received>) -> Result<(), String> {
-    let mut cursor: Option<String> = None;
+async fn read_events(
+    client: &Client,
+    id: &str,
+    mut cursor: Option<String>,
+    tx: &mpsc::Sender<Received>,
+) -> Result<(), String> {
     let mut failures = 0;
     loop {
         let mut url = client.endpoint.join("events").expect("fixed path");
@@ -476,7 +481,15 @@ async fn read_events(client: &Client, id: &str, tx: &mpsc::Sender<Received>) -> 
                             .ok_or("Mimir SSE omitted its event")?
                             .clone();
                         if event.as_str() == Some("resync") {
-                            let _ = tx.send(Received::Gap).await;
+                            // SDK run cancellation uses a normal session event. Keep
+                            // its cursor so a causally expected save-and-stop boundary
+                            // can resume after it instead of replaying it forever.
+                            let received = frame
+                                .id
+                                .clone()
+                                .map(Received::Resync)
+                                .unwrap_or(Received::Gap);
+                            let _ = tx.send(received).await;
                             return Ok(());
                         }
                         let refresh = event.get("completed").is_some()
@@ -559,6 +572,8 @@ pub(crate) struct Mimir {
     projection: protocol::Projection,
     failed: bool,
     history_gap: bool,
+    // Each successful save-and-stop owns one asynchronous SDK cancellation boundary.
+    pending_save_resyncs: u8,
     mcp: Option<McpAttachment>,
 }
 impl Driver for Mimir {
@@ -648,7 +663,7 @@ impl Driver for Mimir {
             provider: start.provider.clone(),
             value: json!({"version":1,"sessionId":id}),
         });
-        let events = Events::start(bridge.client.clone(), id.clone());
+        let events = Events::start(bridge.client.clone(), id.clone(), None);
         Ok(Opened {
             driver: Self {
                 bridge,
@@ -657,6 +672,7 @@ impl Driver for Mimir {
                 projection,
                 failed: false,
                 history_gap: false,
+                pending_save_resyncs: 0,
                 mcp,
             },
             decided,
@@ -683,6 +699,33 @@ impl Driver for Mimir {
                     .snapshot(&snapshot, Some(driving), &crate::clock::now_iso())
             }
             Received::Gap => {
+                self.history_gap = true;
+                Decided {
+                    changes: vec![crate::threads::Change::Activity(
+                        crate::threads::Activity::failed(
+                            "provider.history-gap",
+                            protocol::HISTORY_WARNING,
+                        ),
+                    )],
+                    retires: true,
+                    ..Default::default()
+                }
+            }
+            Received::Resync(cursor) if self.pending_save_resyncs > 0 => {
+                self.pending_save_resyncs = self
+                    .pending_save_resyncs
+                    .checked_sub(1)
+                    .expect("positive pending save count");
+                // Published bridge 0.2.1 delivers each Plan run cancellation
+                // asynchronously after successful save-and-stop. Newer work may
+                // already have been folded by then; resuming after this event's
+                // exact cursor neither replays that work nor skips later events.
+                // Explicit gaps, cursorless resync and excess resyncs remain fatal.
+                self.events =
+                    Events::start(self.bridge.client.clone(), self.id.clone(), Some(cursor));
+                Decided::default()
+            }
+            Received::Resync(_) => {
                 self.history_gap = true;
                 Decided {
                     changes: vec![crate::threads::Change::Activity(
@@ -808,7 +851,19 @@ impl Driver for Mimir {
             .map_err(io::Error::other)
     }
     async fn decide_plan(&mut self, id: &str, implement: bool) -> io::Result<Decided> {
+        if !implement && self.pending_save_resyncs == u8::MAX {
+            return Err(io::Error::other(
+                "Too many Save-and-stop cancellations are still pending",
+            ));
+        }
         let result=self.bridge.client.api("decide_plan",json!({"id":self.id,"plan_id":id,"decision":if implement{"implement"}else{"save_and_stop"}})).await.map_err(io::Error::other)?;
+        if !implement {
+            // Each successful bridge mutation is one correlation boundary.
+            self.pending_save_resyncs = self
+                .pending_save_resyncs
+                .checked_add(1)
+                .expect("pending save count was bounded before mutation");
+        }
         if implement {
             self.projection.accepted_request = Some(
                 protocol::required(&result, "accepted")
