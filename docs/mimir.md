@@ -7,30 +7,28 @@ There is no second agent loop or ACP dependency.
 
 ## Install
 
-1. Install and configure Mimir; confirm your chosen model works there first.
-2. Download the **bridge** and **context companion** archives from
-   [mimir-bridge releases](https://github.com/wasimysaid/mimir-bridge/releases).
-   Check the release's exact compatible Mimir revision and checksums. The Wasm
-   packages are shared across Windows, macOS and Linux; the Mimir executable is
-   platform-specific. These prerelease packages require matching host APIs, not
-   just a matching `0.1.0` version string.
-3. Extract both archives and explicitly install their package directories:
+1. Install Mimir from [mimir-shim](https://github.com/wasimysaid/mimir-shim)
+   and configure your provider; confirm your chosen model works there first.
+2. Download the bridge ZIP and checksums from
+   [mimir-plugins releases](https://github.com/wasimysaid/mimir-plugins/releases).
+   Check the release's compatible Mimir version. The same Wasm plugin runs across
+   Windows, macOS and Linux; only the Mimir executable is platform-specific.
+3. Verify the checksum, extract the ZIP into a `bridge` directory and install it:
    ```sh
-   mimir plugin install ./org.mimir.bridge
-   mimir plugin install ./org.mimir.context
+   mimir plugin install ./bridge
    ```
-   Enable both plugins if previously disabled, then restart Laplus. Installation
-   preserves existing enablement; Laplus never installs or enables plugins for you.
+   Enable `org.mimir.bridge` if previously disabled, then restart Laplus.
+   Installation preserves enablement; Laplus never installs or enables plugins.
 4. In **Settings → Providers → Add provider → Mimir**, choose the executable path
    (for example `C:\Tools\mimir.exe` on Windows) and keep the bridge command
    `/org.mimir.bridge:serve`. Enable the instance.
 5. Pick a configured Mimir model in the composer. Provider keys stay in Mimir;
    do not put credentials in Laplus settings or command arguments.
 
-The [standalone bridge repository](https://github.com/wasimysaid/mimir-bridge)
-contains the protocol, plugin source, build instructions and real-host/browser
-harnesses. Installing prebuilt packages needs no SDK access; source builds
-currently require access to the private Mimir SDK repository.
+The public plugin repository contains installable packages and setup instructions,
+not the private bridge implementation or SDK. No Rust toolchain or source access
+is needed. The Mimir installer supplies `configure-mimir`; do not install the old
+`org.mimir.context` companion alongside it.
 
 ## Native workflow
 
@@ -49,7 +47,7 @@ currently require access to the private Mimir SDK repository.
   Slash commands require an idle session with no queued/retryable work; they are
   never combined with queued prose or sent as live steering.
 - Ask to use `configure-mimir` to inspect or change Mimir configuration. The
-  companion provides lazy guidance, not automatic edits. Specify project/global
+  skill comes with the Mimir installer, not the bridge. Specify project/global
   scope; never paste credentials into chat.
 
 ## Boundaries
