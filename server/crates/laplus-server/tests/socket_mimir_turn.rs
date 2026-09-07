@@ -546,17 +546,10 @@ async fn mimir_refuses_queued_slash_commands_without_publishing_or_dispatching_t
     )
     .await;
     client.events_through_the_turn(&subscription).await;
-    // The queue has its own turn and must still drain after command rejection.
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            if peer.shared.state.lock().unwrap().completed.len() == 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+    wait_for_peer(&peer, "queue drains after command rejection", |state| {
+        state.completed.len() == 2
     })
-    .await
-    .unwrap();
+    .await;
     let prompts: Vec<Value> = peer
         .shared
         .state
@@ -810,40 +803,52 @@ async fn mimir_socket_saved_plan_decisions_have_stable_identity_and_are_native()
     client.close().await;
     server.stop().await;
 }
+async fn save_answered_plan(client: &mut SocketClient, subscription: &str) {
+    dispatch(
+        client,
+        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
+    )
+    .await;
+    client.events_through_the_turn(subscription).await;
+    dispatch(client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
+    client
+        .values_until(subscription, |item| {
+            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
+        })
+        .await;
+}
+
+async fn wait_for_peer(peer: &Peer, description: &str, ready: impl Fn(&PeerState) -> bool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if ready(&peer.shared.state.lock().unwrap()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(description);
+}
+
+async fn wait_for_save_resync(peer: &Peer) {
+    wait_for_peer(peer, "save resync resumes or retires the source", |state| {
+        state.cursors.len() >= 2
+            || state
+                .requests
+                .iter()
+                .any(|request| request["action"] == "release")
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn mimir_socket_save_and_stop_resync_is_not_a_history_gap() {
     let peer = Peer::start().await;
     peer.shared.state.lock().unwrap().save_resync = SaveResync::Immediate;
     let (server, mut client, subscription) = open(&peer).await;
-    dispatch(
-        &mut client,
-        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
-    )
-    .await;
-    client.events_through_the_turn(&subscription).await;
-    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
-    client
-        .values_until(&subscription, |item| {
-            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
-        })
-        .await;
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let state = peer.shared.state.lock().unwrap();
-            if state.cursors.len() >= 2
-                || state
-                    .requests
-                    .iter()
-                    .any(|request| request["action"] == "release")
-            {
-                break;
-            }
-            drop(state);
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("save resync is either resumed or misclassified promptly");
+    save_answered_plan(&mut client, &subscription).await;
+    wait_for_save_resync(&peer).await;
     let snapshot = server
         .connect()
         .await
@@ -890,41 +895,26 @@ async fn delayed_save_resync_after_new_work(implement: bool, saves: usize) {
     let peer = Peer::start().await;
     peer.shared.state.lock().unwrap().save_resync = SaveResync::AfterNextCompletion;
     let (server, mut client, subscription) = open(&peer).await;
-    dispatch(
-        &mut client,
-        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
-    )
-    .await;
-    client.events_through_the_turn(&subscription).await;
-    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
-    client
-        .values_until(&subscription, |item| {
-            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
-        })
-        .await;
+    save_answered_plan(&mut client, &subscription).await;
 
     for index in 1..saves {
         dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":format!("save-{index}"),"threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
     }
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let state = peer.shared.state.lock().unwrap();
-            let accepted = state
+    wait_for_peer(
+        &peer,
+        "every save reached the bridge before newer work",
+        |state| {
+            state
                 .requests
                 .iter()
                 .filter(|request| {
                     request["action"] == "decide_plan" && request["decision"] == "save_and_stop"
                 })
-                .count();
-            if accepted == saves {
-                break;
-            }
-            drop(state);
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("every save reached the bridge before newer work");
+                .count()
+                == saves
+        },
+    )
+    .await;
     if implement {
         dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"implement-1","threadId":"thread-1","planId":PLAN,"decision":"implement"})).await;
     } else {
@@ -935,23 +925,7 @@ async fn delayed_save_resync_after_new_work(implement: bool, saves: usize) {
         .await;
     }
     client.events_through_the_turn(&subscription).await;
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let state = peer.shared.state.lock().unwrap();
-            if state.cursors.len() >= 2
-                || state
-                    .requests
-                    .iter()
-                    .any(|request| request["action"] == "release")
-            {
-                break;
-            }
-            drop(state);
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delayed save resync is either resumed or misclassified promptly");
+    wait_for_save_resync(&peer).await;
     let snapshot = server
         .connect()
         .await
@@ -1017,18 +991,7 @@ async fn mimir_socket_excess_delayed_save_resync_remains_fatal() {
     let peer = Peer::start().await;
     peer.shared.state.lock().unwrap().save_resync = SaveResync::AfterNextCompletion;
     let (server, mut client, subscription) = open(&peer).await;
-    dispatch(
-        &mut client,
-        respond_to_user_input("thread-1", "question-request-8", json!({"question-99":"A"})),
-    )
-    .await;
-    client.events_through_the_turn(&subscription).await;
-    dispatch(&mut client,json!({"type":"thread.plan.decide","commandId":"save-1","threadId":"thread-1","planId":PLAN,"decision":"save-and-stop"})).await;
-    client
-        .values_until(&subscription, |item| {
-            item["event"]["payload"]["proposedPlan"]["decision"] == "save-and-stop"
-        })
-        .await;
+    save_answered_plan(&mut client, &subscription).await;
     {
         let mut state = peer.shared.state.lock().unwrap();
         assert_eq!(state.save_resync_pending, 1);
@@ -1040,24 +1003,13 @@ async fn mimir_socket_excess_delayed_save_resync_remains_fatal() {
     )
     .await;
     client.events_through_the_turn(&subscription).await;
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            if peer
-                .shared
-                .state
-                .lock()
-                .unwrap()
-                .requests
-                .iter()
-                .any(|request| request["action"] == "release")
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+    wait_for_peer(&peer, "the excess resync retires the source", |state| {
+        state
+            .requests
+            .iter()
+            .any(|request| request["action"] == "release")
     })
-    .await
-    .expect("the excess resync retires the source");
+    .await;
     let snapshot = server
         .connect()
         .await
@@ -1080,20 +1032,7 @@ async fn mimir_socket_reconnect_uses_opaque_cursor_but_gap_requires_deliberate_r
     let peer = Peer::start().await;
     let (server, mut client, subscription) = open(&peer).await;
     peer.shared.state.lock().unwrap().sinks.clear();
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let reconnected = {
-                let state = peer.shared.state.lock().unwrap();
-                state.cursors.len() >= 2
-            };
-            if reconnected {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("SSE reconnects");
+    wait_for_peer(&peer, "SSE reconnects", |state| state.cursors.len() >= 2).await;
     {
         let mut state = peer.shared.state.lock().unwrap();
         assert!(state.cursors[1]
