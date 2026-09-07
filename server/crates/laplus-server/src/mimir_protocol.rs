@@ -649,7 +649,7 @@ fn child_tool_kind(name: &str) -> crate::subagents::EntryKind {
     match name {
         "shell" => crate::subagents::EntryKind::Command,
         "read_file" => crate::subagents::EntryKind::Read,
-        "create" | "edit_file" => crate::subagents::EntryKind::Edit,
+        "create" | "write_file" | "edit_file" => crate::subagents::EntryKind::Edit,
         "search_contents_by_grep" | "search_paths_by_glob" => crate::subagents::EntryKind::Read,
         _ => crate::subagents::EntryKind::Tool,
     }
@@ -700,6 +700,7 @@ fn tool_row(data: &Value, finished: bool, turn: Option<String>, at: &str) -> Act
         "shell" => ("command_execution", "Run"),
         "read_file" | "read_skill" => ("dynamic_tool_call", "Read"),
         "create" => ("file_change", "Create"),
+        "write_file" => ("file_change", "Write"),
         "edit_file" => ("file_change", "Edit"),
         "search_contents_by_grep" | "search_paths_by_glob" => ("dynamic_tool_call", "Search"),
         "web_search" | "fetch_url" => ("web_search", "Web"),
@@ -1137,6 +1138,7 @@ mod tests {
         for (name, expected) in [
             ("shell", "command_execution"),
             ("create", "file_change"),
+            ("write_file", "file_change"),
             ("edit_file", "file_change"),
             ("search_contents_by_grep", "dynamic_tool_call"),
         ] {

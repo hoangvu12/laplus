@@ -1,7 +1,14 @@
 import React, { type SVGProps, useId } from "react";
 import { cn } from "~/lib/utils";
+import mimirLogo from "~/assets/mimir.png";
 
 export type Icon = React.FC<SVGProps<SVGSVGElement>>;
+
+export const MimirIcon: Icon = (props) => (
+  <svg {...props} viewBox="0 0 24 24">
+    <image href={mimirLogo} width="24" height="24" preserveAspectRatio="xMidYMid meet" />
+  </svg>
+);
 
 export const GitIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 256 256">

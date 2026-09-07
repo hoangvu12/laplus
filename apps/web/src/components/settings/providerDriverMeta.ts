@@ -7,9 +7,16 @@ import {
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
-import { BotIcon } from "lucide-react";
 import type * as Schema from "effect/Schema";
-import { ClaudeAI, CursorIcon, GrokIcon, type Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import {
+  ClaudeAI,
+  CursorIcon,
+  GrokIcon,
+  type Icon,
+  MimirIcon,
+  OpenAI,
+  OpenCodeIcon,
+} from "../Icons";
 
 type ProviderSettingsSchema = {
   readonly fields: Readonly<Record<string, Schema.Top>>;
@@ -72,7 +79,7 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
   {
     value: ProviderDriverKind.make("mimir"),
     label: "Mimir",
-    icon: BotIcon,
+    icon: MimirIcon,
     settingsSchema: MimirSettings,
   },
 ];
