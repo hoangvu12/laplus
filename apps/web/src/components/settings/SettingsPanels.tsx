@@ -127,9 +127,11 @@ function withoutProviderInstanceFavorites(
   return favorites.filter((favorite) => favorite.provider !== instanceId);
 }
 
-const PROVIDER_SETTINGS = DRIVER_OPTIONS.map((definition) => ({
-  provider: definition.value,
-}));
+// Only legacy drivers have implicit default slots. New drivers are explicit
+// providerInstances and must never be destructured from the closed legacy map.
+const PROVIDER_SETTINGS = DRIVER_OPTIONS.filter((definition) =>
+  Object.hasOwn(DEFAULT_UNIFIED_SETTINGS.providers, definition.value),
+).map((definition) => ({ provider: definition.value }));
 
 function ProviderLastChecked({ lastCheckedAt }: { lastCheckedAt: string | null }) {
   useRelativeTimeTick();

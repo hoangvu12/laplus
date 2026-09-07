@@ -182,6 +182,30 @@ export function makeProviderSettingsSchema<const Fields extends Schema.Struct.Fi
   );
 }
 
+// Mimir is configured only through providerInstances, not the legacy providers map.
+export const MimirSettings = makeProviderSettingsSchema(
+  {
+    binaryPath: makeBinaryPathSetting("mimir").pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description:
+          "Path to Mimir. Configure provider accounts and credentials in Mimir, not Laplus.",
+        providerSettingsForm: { placeholder: "mimir", clearWhenEmpty: "omit" },
+      }),
+    ),
+    bridgeCommand: makeBinaryPathSetting("/org.mimir.bridge:serve").pipe(
+      Schema.annotateKey({
+        title: "Bridge command",
+        description:
+          "Requires the separately installed Mimir bridge plugin. See docs/mimir.md for setup and compatible downloads. Sessions use Mimir's full-access execution policy.",
+        providerSettingsForm: { placeholder: "/org.mimir.bridge:serve", clearWhenEmpty: "omit" },
+      }),
+    ),
+  },
+  { order: ["binaryPath", "bridgeCommand"] },
+);
+export type MimirSettings = typeof MimirSettings.Type;
+
 export const CodexSettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(

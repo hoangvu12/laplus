@@ -124,6 +124,8 @@ impl Service {
                 self.generate_opencode(instance, directory, model, operation, attachments)
                     .await
             }
+            ConfiguredInstance::Mimir(_) => Err(Error("Mimir auxiliary text generation is not supported; choose another text-generation provider.".into())),
+
             ConfiguredInstance::Codex(instance) => {
                 if !matches!(operation, Operation::ThreadTitle { .. }) {
                     return Err(Error("Codex only supports thread-title text generation in this build.".into()));

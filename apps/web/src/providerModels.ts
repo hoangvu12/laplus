@@ -48,9 +48,12 @@ export function getProviderDisplayName(
 
 export function getProviderInteractionModeToggle(
   providers: ReadonlyArray<ServerProvider>,
-  provider: ProviderDriverKind,
+  instanceId: ProviderInstanceId,
 ): boolean {
-  return getProviderSnapshot(providers, provider)?.showInteractionModeToggle ?? true;
+  return (
+    providers.find((candidate) => candidate.instanceId === instanceId)?.showInteractionModeToggle ??
+    true
+  );
 }
 
 export function isProviderEnabled(

@@ -24,17 +24,18 @@ function ChatThreadRouteView() {
     threadRef === null ? null : environmentShell.stateAtom(threadRef.environmentId),
   );
   const serverThreadShell = useThreadShell(threadRef);
-  const serverThreadDetail = useThreadDetail(threadRef);
-  const serverThreadStatus = useThreadStatus(threadRef);
   const environmentThreadRefs = useEnvironmentThreadRefs(threadRef?.environmentId ?? null);
   const bootstrapComplete = shell.data?.snapshot._tag === "Some";
   const environmentHasServerThreads = environmentThreadRefs.length > 0;
-  const draftThreadExists = useComposerDraftStore((store) =>
-    threadRef ? store.getDraftThreadByRef(threadRef) !== null : false,
-  );
   const draftThread = useComposerDraftStore((store) =>
     threadRef ? store.getDraftThreadByRef(threadRef) : null,
   );
+  const draftThreadExists = draftThread !== null;
+  // Like useThread, wait for shell admission before requesting a draft's
+  // preallocated server ID. Both hooks can start the detail subscription.
+  const serverThreadRef = draftThreadExists && serverThreadShell === null ? null : threadRef;
+  const serverThreadDetail = useThreadDetail(serverThreadRef);
+  const serverThreadStatus = useThreadStatus(serverThreadRef);
   const environmentHasDraftThreads = useComposerDraftStore((store) => {
     if (!threadRef) {
       return false;

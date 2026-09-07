@@ -384,6 +384,27 @@ describe("derivePendingUserInputs", () => {
 });
 
 describe("deriveActivePlanState", () => {
+  it("preserves failed and cancelled tasks rather than making them pending", () => {
+    const plan = [
+      { step: "Inspect", status: "completed" },
+      { step: "Verify", status: "failed" },
+      { step: "Publish", status: "cancelled" },
+    ];
+    expect(
+      deriveActivePlanState(
+        [
+          makeActivity({
+            id: "terminal-tasks",
+            kind: "turn.plan.updated",
+            turnId: "turn-1",
+            payload: { plan },
+          }),
+        ],
+        TurnId.make("turn-1"),
+      )?.steps,
+    ).toEqual(plan);
+  });
+
   it("returns the latest plan update for the active turn", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
@@ -1497,6 +1518,108 @@ describe("deriveWorkLogEntries", () => {
     ]);
   });
 
+  it.each([
+    ["read_file", { paths: ["src/main.ts"] }],
+    ["read_skill", { name: "code-review", path: "SKILL.md" }],
+    ["view_image", { path: "assets/logo.png" }],
+    ["search_contents_by_grep", { pattern: "TODO", path: "src" }],
+    ["search_paths_by_glob", { pattern: "*.ts", path: "src" }],
+    ["read", { filePath: "src/main.ts" }],
+    ["grep", { pattern: "TODO", path: "src" }],
+    ["glob", { pattern: "*.ts", path: "src" }],
+  ])("does not treat %s input or result paths as edits", (toolName, input) => {
+    const result = { files: [{ path: "src/main.ts", content: "File contents, not an edit" }] };
+    const [entry] = deriveWorkLogEntries([
+      makeActivity({
+        kind: "tool.completed",
+        summary: "Read/search target",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Read/search target",
+          detail: "src/main.ts",
+          data: { toolCallId: "call-1", toolName, input, result },
+        },
+      }),
+    ]);
+
+    expect(entry?.changedFiles).toBeUndefined();
+    expect(entry).toMatchObject({
+      itemType: "dynamic_tool_call",
+      detail: "src/main.ts",
+      toolResult: result,
+    });
+  });
+
+  it.each(["read", "grep", "glob"])(
+    "preserves native OpenCode %s output without an edit affordance",
+    (tool) => {
+      const output = "src/main.ts: contents or matching lines";
+      const [entry] = deriveWorkLogEntries([
+        makeActivity({
+          kind: "tool.completed",
+          summary: tool,
+          payload: {
+            itemType: "dynamic_tool_call",
+            title: tool,
+            detail: output,
+            data: {
+              toolCallId: "oc-call",
+              toolName: tool,
+              tool,
+              state: { input: { filePath: "src/main.ts" }, output },
+            },
+          },
+        }),
+      ]);
+      expect(entry?.changedFiles).toBeUndefined();
+      expect(entry).toMatchObject({ detail: output, toolTitle: tool });
+    },
+  );
+
+  it.each(["read", "search"])(
+    "honors an explicit %s family for provider-specific tools",
+    (kind) => {
+      const [entry] = deriveWorkLogEntries([
+        makeActivity({
+          kind: "tool.completed",
+          payload: {
+            itemType: "dynamic_tool_call",
+            data: {
+              kind,
+              toolName: "provider_specific_tool",
+              input: { path: "src" },
+              result: { path: "src/main.ts" },
+            },
+          },
+        }),
+      ]);
+      expect(entry?.changedFiles).toBeUndefined();
+    },
+  );
+
+  it.each(["file_change", "dynamic_tool_call", "mcp_tool_call"])(
+    "keeps genuine edit metadata for %s",
+    (itemType) => {
+      const [entry] = deriveWorkLogEntries([
+        makeActivity({
+          kind: "tool.completed",
+          payload: {
+            itemType,
+            title: "Edit",
+            data: {
+              toolName: "edit_file",
+              input: { path: "src/main.ts" },
+              changes: [{ path: "src/main.ts", additions: 1, deletions: 1 }],
+              result: { path: "src/main.ts", success: true },
+            },
+          },
+        }),
+      ]);
+      expect(entry?.changedFiles).toEqual(["src/main.ts"]);
+      expect(entry).toMatchObject({ toolResult: { path: "src/main.ts", success: true } });
+    },
+  );
+
   it("drops duplicated tool detail when it only repeats the title", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
@@ -1911,6 +2034,109 @@ describe("deriveWorkLogEntries context window handling", () => {
 
     expect(entries).toHaveLength(1);
     expect(entries[0]?.label).toBe("Ran command");
+  });
+
+  it("hides persisted Mimir telemetry without hiding tools, questions or provider notices", () => {
+    const activities = [
+      makeActivity({
+        id: "old-context",
+        kind: "context.usage",
+        summary: "Context window",
+        tone: "info",
+        payload: { usedTokens: 100, maxTokens: 128_000 },
+      }),
+      makeActivity({
+        id: "old-tokens",
+        kind: "tokens.usage",
+        summary: "Token usage",
+        tone: "info",
+        payload: { usage: { input_tokens: 1000 } },
+      }),
+      makeActivity({
+        id: "native-context",
+        kind: "context-window.updated",
+        summary: "Context window updated",
+        tone: "info",
+      }),
+      makeActivity({
+        id: "tool",
+        kind: "tool.completed",
+        summary: "Read file",
+        payload: { itemType: "dynamic_tool_call", data: { toolCallId: "read-1" } },
+      }),
+      makeActivity({
+        id: "question",
+        kind: "user-input.requested",
+        summary: "Which file?",
+        tone: "info",
+      }),
+      makeActivity({
+        id: "gap",
+        kind: "provider.history-gap",
+        summary: "Transient history may be missing",
+        tone: "info",
+      }),
+      makeActivity({
+        id: "error",
+        kind: "provider.error",
+        summary: "Token usage unavailable",
+        tone: "error",
+      }),
+    ];
+    const entries = deriveWorkLogEntries(activities);
+
+    expect(entries.map((entry) => entry.id).sort()).toEqual(["error", "gap", "question", "tool"]);
+    // Hide carriers in presentation, not by destroying the persisted telemetry.
+    expect(activities).toHaveLength(7);
+  });
+
+  it("collapses read lifecycle updates across telemetry while keeping a distinct search call", () => {
+    const tool = (
+      id: string,
+      sequence: number,
+      kind: string,
+      title: string,
+      callId: string,
+      detail: string,
+    ) =>
+      makeActivity({
+        id,
+        sequence,
+        kind,
+        summary: title,
+        turnId: "turn-1",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title,
+          detail,
+          status: kind === "tool.completed" ? "completed" : "inProgress",
+          data: { toolCallId: callId },
+        },
+      });
+    const entries = deriveWorkLogEntries([
+      tool("read-running", 1, "tool.updated", "Read", "read-1", "src/main.ts"),
+      makeActivity({ id: "context", sequence: 2, kind: "context.usage", tone: "info" }),
+      makeActivity({ id: "tokens", sequence: 3, kind: "tokens.usage", tone: "info" }),
+      tool("read-done", 4, "tool.completed", "Read", "read-1", "src/main.ts (42 lines)"),
+      tool("search-done", 5, "tool.completed", "Search", "search-1", "TODO in src"),
+    ]);
+
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toMatchObject({
+      id: "read-done",
+      itemType: "dynamic_tool_call",
+      toolTitle: "Read",
+      toolCallId: "read-1",
+      toolLifecycleStatus: "completed",
+      detail: "src/main.ts (42 lines)",
+    });
+    expect(entries[1]).toMatchObject({
+      id: "search-done",
+      itemType: "dynamic_tool_call",
+      toolTitle: "Search",
+      toolCallId: "search-1",
+      detail: "TODO in src",
+    });
   });
 
   it("keeps context compaction activities as normal work log entries", () => {

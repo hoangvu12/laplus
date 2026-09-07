@@ -83,6 +83,7 @@ import {
   findLatestProposedPlan,
   deriveWorkLogEntries,
   hasActionableProposedPlan,
+  getMimirPlanDecisionAvailability,
   isLatestTurnSettled,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
@@ -256,6 +257,9 @@ import {
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  getMimirSlashCommandError,
+  clearSubmittedSteerText,
+  runMimirPlanDecision,
   dismissBranchMismatchForSession,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
@@ -1158,6 +1162,9 @@ function ChatViewContent(props: ChatViewProps) {
     reportFailure: false,
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
+  const decideThreadPlan = useAtomCommand(threadEnvironment.decidePlan, { reportFailure: false });
+  const steerThreadTurn = useAtomCommand(threadEnvironment.steerTurn, { reportFailure: false });
+  const [isSessionControlBusy, setIsSessionControlBusy] = useState(false);
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
     reportFailure: false,
   });
@@ -1257,7 +1264,6 @@ function ChatViewContent(props: ChatViewProps) {
   const [localServerErrorsByThreadKey, setLocalServerErrorsByThreadKey] = useState<
     Record<string, LocalThreadErrorEntry>
   >({});
-  const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
@@ -1722,11 +1728,6 @@ function ChatViewContent(props: ChatViewProps) {
     activeThread?.modelSelection.instanceId ??
     activeProject?.defaultModelSelection?.instanceId ??
     null;
-  const lockedProvider = deriveLockedProvider({
-    thread: activeThread,
-    selectedProvider: selectedProviderByThreadId,
-    threadProvider,
-  });
   // Once a thread selects an environment, never substitute the primary
   // environment's config while the selected environment is still loading.
   const serverConfig = activeThread
@@ -1841,12 +1842,20 @@ function ChatViewContent(props: ChatViewProps) {
     versionMismatchServerLabel,
   ]);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const lockedProvider = deriveLockedProvider({
+    thread: activeThread,
+    selectedProvider: selectedProviderByThreadId,
+    threadProvider,
+    providers: providerStatuses,
+    providerInstances: settings.providerInstances,
+  });
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
     selectedProviderByThreadId ?? threadProvider,
   );
   const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
+  const isConnecting = phase === "connecting";
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
   const pendingApprovals = useMemo(
@@ -1890,15 +1899,16 @@ function ChatViewContent(props: ChatViewProps) {
   const activePendingIsResponding = activePendingUserInput
     ? respondingUserInputRequestIds.includes(activePendingUserInput.requestId)
     : false;
+  const isMimirSession = lockedProvider === "mimir";
   const activeProposedPlan = useMemo(() => {
-    if (!latestTurnSettled) {
+    if (!latestTurnSettled && !isMimirSession) {
       return null;
     }
     return findLatestProposedPlan(
       activeThread?.proposedPlans ?? [],
       activeLatestTurn?.turnId ?? null,
     );
-  }, [activeLatestTurn?.turnId, activeThread?.proposedPlans, latestTurnSettled]);
+  }, [activeLatestTurn?.turnId, activeThread?.proposedPlans, latestTurnSettled, isMimirSession]);
   const sidebarProposedPlan = useMemo(
     () =>
       findSidebarProposedPlan({
@@ -1916,8 +1926,8 @@ function ChatViewContent(props: ChatViewProps) {
   const planSidebarLabel = sidebarProposedPlan || interactionMode === "plan" ? "Plan" : "Tasks";
   const showPlanFollowUpPrompt =
     pendingUserInputs.length === 0 &&
-    interactionMode === "plan" &&
-    latestTurnSettled &&
+    (interactionMode === "plan" || isMimirSession) &&
+    (latestTurnSettled || isMimirSession) &&
     hasActionableProposedPlan(activeProposedPlan);
   const activePendingApproval = pendingApprovals[0] ?? null;
   const {
@@ -1935,6 +1945,11 @@ function ChatViewContent(props: ChatViewProps) {
     threadError,
   });
   const isWorking = phase === "running" || isSendBusy || isConnecting || isRevertingCheckpoint;
+  const mimirPlanDecisionAvailability = getMimirPlanDecisionAvailability(
+    activeProposedPlan,
+    activeThread?.session ?? null,
+    isWorking || isSessionControlBusy || activeEnvironmentUnavailable,
+  );
   const activeWorkStartedAt = deriveActiveWorkStartedAt(
     activeLatestTurn,
     activeThread?.session ?? null,
@@ -4484,6 +4499,88 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
 
+  const onPlanDecision = async (planId: string, decision: "implement" | "save-and-stop") => {
+    if (
+      !activeThread ||
+      !isMimirSession ||
+      !showPlanFollowUpPrompt ||
+      !(decision === "implement"
+        ? mimirPlanDecisionAvailability.canImplement
+        : mimirPlanDecisionAvailability.canSaveAndStop) ||
+      activeProposedPlan?.id !== planId ||
+      sendInFlightRef.current ||
+      activeEnvironmentUnavailable
+    )
+      return;
+    sendInFlightRef.current = true;
+    setIsSessionControlBusy(true);
+    setThreadError(activeThread.id, null);
+    try {
+      await runMimirPlanDecision(composerDraftTarget, async () => {
+        const result = await decideThreadPlan({
+          environmentId,
+          input: { threadId: activeThread.id, planId, decision },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            activeThread.id,
+            error instanceof Error ? error.message : "Failed to decide plan.",
+          );
+        }
+        return result._tag === "Success";
+      });
+    } finally {
+      sendInFlightRef.current = false;
+      setIsSessionControlBusy(false);
+    }
+  };
+
+  const onSteer = async () => {
+    const context = composerRef.current?.getSendContext();
+    const submittedText = promptRef.current;
+    const text = submittedText.trim();
+    if (
+      !activeThread ||
+      !isMimirSession ||
+      phase !== "running" ||
+      !text ||
+      !context ||
+      context.images.length ||
+      context.terminalContexts.length ||
+      context.elementContexts.length ||
+      context.previewAnnotations.length ||
+      context.reviewComments.length ||
+      sendInFlightRef.current ||
+      activeEnvironmentUnavailable
+    )
+      return;
+    sendInFlightRef.current = true;
+    setIsSessionControlBusy(true);
+    setThreadError(activeThread.id, null);
+    try {
+      const result = await steerThreadTurn({
+        environmentId,
+        input: { threadId: activeThread.id, text },
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            activeThread.id,
+            error instanceof Error ? error.message : "Failed to steer turn.",
+          );
+        }
+      } else if (clearSubmittedSteerText(composerDraftTarget, submittedText)) {
+        promptRef.current = "";
+        composerRef.current?.resetCursorState();
+      }
+    } finally {
+      sendInFlightRef.current = false;
+      setIsSessionControlBusy(false);
+    }
+  };
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     if (
@@ -4527,7 +4624,7 @@ function ChatViewContent(props: ChatViewProps) {
         composerPreviewAnnotations.length +
         composerReviewComments.length,
     });
-    if (showPlanFollowUpPrompt && activeProposedPlan) {
+    if (showPlanFollowUpPrompt && activeProposedPlan && ctxSelectedProvider !== "mimir") {
       const followUp = resolvePlanFollowUpSubmission({
         draftText: trimmed,
         planMarkdown: activeProposedPlan.planMarkdown,
@@ -4556,6 +4653,17 @@ function ChatViewContent(props: ChatViewProps) {
       composerRef.current?.resetCursorState();
       return;
     }
+    const slashCommandError = getMimirSlashCommandError({
+      provider: ctxSelectedProvider,
+      prompt: promptForSend,
+      thread: activeThread,
+      busy: isWorking || isSessionControlBusy,
+    });
+    if (slashCommandError) {
+      setThreadError(activeThread.id, slashCommandError);
+      return;
+    }
+
     if (!hasSendableContent) {
       if (expiredTerminalContextCount > 0) {
         const toastCopy = buildExpiredTerminalContextToastCopy(
@@ -4753,7 +4861,7 @@ function ChatViewContent(props: ChatViewProps) {
         ...(localCheckoutBranchMismatch
           ? { branch: localCheckoutBranchMismatch.currentBranch }
           : {}),
-        runtimeMode,
+        runtimeMode: ctxSelectedProvider === "mimir" ? "full-access" : runtimeMode,
         interactionMode,
       });
       if (settingsResult._tag === "Failure") {
@@ -4777,7 +4885,7 @@ function ChatViewContent(props: ChatViewProps) {
                       projectId: activeProject.id,
                       title,
                       modelSelection: threadCreateModelSelection,
-                      runtimeMode,
+                      runtimeMode: ctxSelectedProvider === "mimir" ? "full-access" : runtimeMode,
                       interactionMode,
                       branch: activeThreadBranch,
                       worktreePath: activeThread.worktreePath,
@@ -4811,7 +4919,7 @@ function ChatViewContent(props: ChatViewProps) {
           },
           modelSelection: ctxSelectedModelSelection,
           titleSeed: title,
-          runtimeMode,
+          runtimeMode: ctxSelectedProvider === "mimir" ? "full-access" : runtimeMode,
           interactionMode,
           ...(bootstrap ? { bootstrap } : {}),
           createdAt: messageCreatedAt,
@@ -5901,7 +6009,7 @@ function ChatViewContent(props: ChatViewProps) {
                             respondingRequestIds={respondingRequestIds}
                             showPlanFollowUpPrompt={showPlanFollowUpPrompt}
                             activeProposedPlan={activeProposedPlan}
-                            activePlan={activePlan as { turnId?: TurnId } | null}
+                            activePlan={activePlan}
                             sidebarProposedPlan={sidebarProposedPlan as { turnId?: TurnId } | null}
                             planSidebarLabel={planSidebarLabel}
                             planSidebarOpen={planSidebarOpen}
@@ -5925,6 +6033,10 @@ function ChatViewContent(props: ChatViewProps) {
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
                             onInterrupt={onInterrupt}
+                            onSteer={onSteer}
+                            onPlanDecision={onPlanDecision}
+                            mimirPlanDecisionAvailability={mimirPlanDecisionAvailability}
+                            isSessionControlBusy={isSessionControlBusy}
                             onImplementPlanInNewThread={onImplementPlanInNewThread}
                             onRespondToApproval={onRespondToApproval}
                             onSelectActivePendingUserInputOption={

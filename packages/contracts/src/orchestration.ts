@@ -245,6 +245,18 @@ export const OrchestrationProposedPlan = Schema.Struct({
   id: OrchestrationProposedPlanId,
   turnId: Schema.NullOr(TurnId),
   planMarkdown: TrimmedNonEmptyString,
+  decision: Schema.optional(Schema.Literals(["implement", "save-and-stop"])),
+  status: Schema.optional(
+    Schema.Literals([
+      "drafting",
+      "review-pending",
+      "saved-stopped",
+      "accepted",
+      "implementing",
+      "completed",
+      "abandoned",
+    ]),
+  ),
   implementedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   implementationThreadId: Schema.NullOr(ThreadId).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
@@ -1040,6 +1052,21 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadPlanDecideCommand = Schema.Struct({
+  type: Schema.Literal("thread.plan.decide"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  planId: OrchestrationProposedPlanId,
+  decision: Schema.Literals(["implement", "save-and-stop"]),
+});
+
+const ThreadTurnSteerCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.steer"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  text: TrimmedNonEmptyString,
+});
+
 const ThreadTurnInterruptCommand = Schema.Struct({
   type: Schema.Literal("thread.turn.interrupt"),
   commandId: CommandId,
@@ -1115,6 +1142,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
+  ThreadPlanDecideCommand,
+  ThreadTurnSteerCommand,
   ThreadTurnInterruptCommand,
   ThreadTurnRetryCommand,
   ThreadApprovalRespondCommand,
@@ -1145,6 +1174,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
   ClientThreadTurnStartCommand,
+  ThreadPlanDecideCommand,
+  ThreadTurnSteerCommand,
   ThreadTurnInterruptCommand,
   ThreadTurnRetryCommand,
   ThreadApprovalRespondCommand,

@@ -4,6 +4,8 @@ import {
   ProjectId,
   type ModelSelection,
   type ProviderDriverKind,
+  type ProviderInstanceConfigMap,
+  type ProviderInstanceId,
   type ServerProvider,
   type ScopedProjectRef,
   type ScopedThreadRef,
@@ -11,7 +13,12 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { type ChatMessage, type SessionPhase, type Thread } from "../types";
-import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
+import {
+  type ComposerImageAttachment,
+  type DraftId,
+  type DraftThreadState,
+  useComposerDraftStore,
+} from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
@@ -27,6 +34,64 @@ export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
+
+export function getMimirSlashCommandError(input: {
+  provider: ProviderDriverKind;
+  prompt: string;
+  thread: Thread | undefined;
+  busy: boolean;
+}): string | null {
+  if (input.provider !== "mimir" || !input.prompt.trimStart().startsWith("/")) return null;
+  const thread = input.thread;
+  const pending = thread?.messages.some(
+    (message) => message.deliveryState === "queued" || message.deliveryState === "retryable",
+  );
+  if (
+    input.busy ||
+    thread?.session?.status === "running" ||
+    thread?.session?.status === "starting" ||
+    thread?.session?.activeTurnId != null ||
+    thread?.latestTurn?.state === "running" ||
+    pending
+  ) {
+    return "Wait for Mimir to become idle and resolve pending messages before sending slash commands; commands cannot be queued.";
+  }
+  return null;
+}
+
+export async function runMimirPlanDecision(
+  target: ScopedThreadRef | DraftId,
+  dispatch: () => Promise<boolean>,
+): Promise<void> {
+  let modeChanged = false;
+  const submittedMode = useComposerDraftStore.getState().getComposerDraft(target)?.interactionMode;
+  const unsubscribe = useComposerDraftStore.subscribe((state) => {
+    if (state.getComposerDraft(target)?.interactionMode !== submittedMode) {
+      modeChanged = true;
+    }
+  });
+  try {
+    if (await dispatch()) {
+      // Both SDK decisions select Build. Do not override a newer local choice,
+      // even if the user changed away from and back to the submitted mode.
+      if (!modeChanged) useComposerDraftStore.getState().setInteractionMode(target, "default");
+    }
+  } finally {
+    unsubscribe();
+  }
+}
+
+export function clearSubmittedSteerText(
+  target: ScopedThreadRef | DraftId,
+  submittedText: string,
+): boolean {
+  const store = useComposerDraftStore.getState();
+  if (store.getComposerDraft(target)?.prompt !== submittedText) return false;
+  // Steering submits text only. Attachments added while awaiting its response
+  // belong to the next send, not to the acknowledged steering request.
+  store.setPrompt(target, "");
+  return true;
+}
 
 export function startNewThreadForProject(
   projectRef: ScopedProjectRef | null,
@@ -341,22 +406,15 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
-// `threadProvider` is the open branded driver kind carried by the session.
-// Unknown driver kinds degrade to `null` (i.e. "unlocked"), which is the safe
-// rollback / fork behavior — the routing layer is the right place to surface
-// "driver not installed" errors, not the lock state.
-//
-// `selectedProvider` takes the same open-string shape because the composer
-// now tracks the picker selection as a `ProviderInstanceId` (e.g.
-// `codex_personal`). Custom instance ids that don't directly match a
-// registered driver resolve to `null` here, which matches the existing
-// "unknown driver -> unlocked" semantics. Callers that want the lock to track
-// a custom instance's underlying driver kind should resolve the instance id
-// upstream and pass the correlated kind.
+// Sessions carry driver kinds; persisted model/composer selections carry instance
+// ids. Resolve those ids in this environment instead of treating their open slugs
+// as driver names (e.g. `mimir_mimir` is an instance of `mimir`).
 export function deriveLockedProvider(input: {
   thread: Thread | null | undefined;
-  selectedProvider: string | null;
-  threadProvider: string | null;
+  selectedProvider: ProviderInstanceId | null;
+  threadProvider: ProviderInstanceId | null;
+  providers: ReadonlyArray<Pick<ServerProvider, "instanceId" | "driver">>;
+  providerInstances: ProviderInstanceConfigMap;
 }): ProviderDriverKind | null {
   if (!threadHasStarted(input.thread)) {
     return null;
@@ -365,15 +423,14 @@ export function deriveLockedProvider(input: {
   if (sessionProvider && isProviderDriverKind(sessionProvider)) {
     return sessionProvider;
   }
-  const narrowedThreadProvider =
-    input.threadProvider && isProviderDriverKind(input.threadProvider)
-      ? input.threadProvider
-      : null;
-  const narrowedSelectedProvider =
-    input.selectedProvider && isProviderDriverKind(input.selectedProvider)
-      ? input.selectedProvider
-      : null;
-  return narrowedThreadProvider ?? narrowedSelectedProvider ?? null;
+  for (const instanceId of [input.threadProvider, input.selectedProvider]) {
+    if (instanceId === null) continue;
+    const driver =
+      input.providerInstances[instanceId]?.driver ??
+      input.providers.find((provider) => provider.instanceId === instanceId)?.driver;
+    if (driver) return driver;
+  }
+  return null;
 }
 
 export function getStartedThreadModelChangeBlockReason(input: {

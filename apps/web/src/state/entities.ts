@@ -20,6 +20,7 @@ import type {
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
+import { useComposerDraftStore } from "../composerDraftStore";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentProjects } from "./projects";
 import { environmentServerConfigsAtom } from "./server";
@@ -155,7 +156,13 @@ export function useThreadStatus(ref: ScopedThreadRef | null): EnvironmentThreadS
 /** Detail collections composed with shell-authoritative thread/workspace metadata. */
 export function useThread(ref: ScopedThreadRef | null): EnvironmentThread | null {
   const shell = useThreadShell(ref);
-  const detail = useThreadDetail(ref);
+  const isLocalDraft = useComposerDraftStore(
+    (store) => ref !== null && store.getDraftThreadByRef(ref) !== null,
+  );
+  // A draft's preallocated ID is not a server resource yet. Shell admission,
+  // not sending/promotion intent, starts the detail subscription and HTTP load.
+  // Unknown server IDs still subscribe so genuine not-found errors surface.
+  const detail = useThreadDetail(isLocalDraft && shell === null ? null : ref);
   return useMemo(() => mergeEnvironmentThread(detail, shell), [detail, shell]);
 }
 

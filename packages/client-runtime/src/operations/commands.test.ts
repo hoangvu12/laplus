@@ -25,6 +25,8 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import {
   archiveThread,
   createProject,
+  decideThreadPlan,
+  steerThreadTurn,
   pinThread,
   rejectThreadUserInput,
   reorderPinnedThread,
@@ -78,6 +80,52 @@ const makeSupervisor = Effect.fn("TestEnvironmentCommands.makeSupervisor")(funct
 });
 
 describe("environment commands", () => {
+  it.effect("dispatches plan decisions and steering with their own identities", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      const provideSupervisor = Effect.provideService(
+        EnvironmentSupervisor.EnvironmentSupervisor,
+        supervisor,
+      );
+      for (const decision of ["implement", "save-and-stop"] as const) {
+        yield* decideThreadPlan({
+          commandId: CommandId.make(decision),
+          threadId: ThreadId.make("thread-1"),
+          planId: "sdk-plan-42",
+          decision,
+        }).pipe(provideSupervisor);
+      }
+      yield* steerThreadTurn({
+        commandId: CommandId.make("steer"),
+        threadId: ThreadId.make("thread-1"),
+        text: "Focus on tests",
+      }).pipe(provideSupervisor);
+      expect(dispatched).toEqual([
+        {
+          type: "thread.plan.decide",
+          commandId: "implement",
+          threadId: "thread-1",
+          planId: "sdk-plan-42",
+          decision: "implement",
+        },
+        {
+          type: "thread.plan.decide",
+          commandId: "save-and-stop",
+          threadId: "thread-1",
+          planId: "sdk-plan-42",
+          decision: "save-and-stop",
+        },
+        {
+          type: "thread.turn.steer",
+          commandId: "steer",
+          threadId: "thread-1",
+          text: "Focus on tests",
+        },
+      ]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
   it.effect("dispatches user-input rejection as its own command", () =>
     Effect.gen(function* () {
       const dispatched: ClientOrchestrationCommand[] = [];

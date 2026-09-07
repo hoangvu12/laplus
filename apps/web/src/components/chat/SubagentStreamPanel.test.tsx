@@ -454,6 +454,19 @@ describe("the subagent work stream surface", () => {
     expect(unwired).not.toContain("data-subagent-open-diff");
   });
 
+  it.each(["working", "completed"])(
+    "keeps observed %s work readable when its subscription fails",
+    (state) => {
+      const markup = render(
+        { stream: stream({ state }), entries: [message("observed", 1, "Actual child evidence")] },
+        "The subscription could not decode a later event",
+      );
+      expect(markup).toContain("Actual child evidence");
+      expect(markup).not.toContain('data-subagent-state="unavailable"');
+      expect(markup).toContain("Live updates unavailable");
+    },
+  );
+
   it("distinguishes loading, a child that has done nothing, and one that is gone", () => {
     expect(render(null)).toContain('data-subagent-state="loading"');
     expect(render({ stream: stream({ state: "pending" }), entries: [] })).toContain(

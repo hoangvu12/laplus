@@ -74,6 +74,7 @@ pub const CLAUDE_DRIVER: &str = "claudeAgent";
 pub const CODEX_INSTANCE_ID: &str = "codex";
 pub const CODEX_DRIVER: &str = "codex";
 pub const OPENCODE_DRIVER: &str = "opencode";
+pub const MIMIR_DRIVER: &str = "mimir";
 pub const REFRESH: &str = "server.refreshProviders";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +82,7 @@ pub enum DriverKind {
     Claude,
     Codex,
     OpenCode,
+    Mimir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,8 @@ pub const REGISTRY: &[Registration] = &[
         driver: OPENCODE_DRIVER,
         kind: DriverKind::OpenCode,
     },
+    Registration { driver: MIMIR_DRIVER, kind: DriverKind::Mimir },
+
 ];
 
 pub fn registration(driver: &str) -> Option<Registration> {
@@ -159,10 +163,19 @@ pub struct OpenCodeInstance {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct MimirInstance {
+    pub identity: ProviderIdentity,
+    pub display_name: String,
+    pub settings: crate::config::MimirSettings,
+}
+
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConfiguredInstance {
     Claude(ClaudeInstance),
     Codex(CodexInstance),
     OpenCode(OpenCodeInstance),
+    Mimir(MimirInstance),
 }
 
 impl ConfiguredInstance {
@@ -171,6 +184,7 @@ impl ConfiguredInstance {
             ConfiguredInstance::Claude(instance) => &instance.identity,
             ConfiguredInstance::Codex(instance) => &instance.identity,
             ConfiguredInstance::OpenCode(instance) => &instance.identity,
+            ConfiguredInstance::Mimir(instance) => &instance.identity,
         }
     }
 
@@ -179,6 +193,7 @@ impl ConfiguredInstance {
             ConfiguredInstance::Claude(instance) => instance.settings.enabled,
             ConfiguredInstance::Codex(instance) => instance.settings.enabled,
             ConfiguredInstance::OpenCode(instance) => instance.settings.enabled,
+            ConfiguredInstance::Mimir(instance) => instance.settings.enabled,
         }
     }
 
@@ -189,7 +204,7 @@ impl ConfiguredInstance {
             ConfiguredInstance::OpenCode(instance) => {
                 crate::provider_maintenance::opencode_action(&instance.settings.binary_path, search)
             }
-            ConfiguredInstance::Claude(_) | ConfiguredInstance::Codex(_) => None,
+            ConfiguredInstance::Claude(_) | ConfiguredInstance::Codex(_) | ConfiguredInstance::Mimir(_) => None,
         }
     }
 }
@@ -237,6 +252,18 @@ pub(crate) fn configured_instance(settings: &Settings, instance_id: &str) -> Opt
             .map(ConfiguredInstance::Codex),
         DriverKind::OpenCode => opencode_instance(settings, instance_id)
             .map(ConfiguredInstance::OpenCode),
+        DriverKind::Mimir => {
+            let envelope = settings.provider_instances.get(instance_id)?;
+            Some(ConfiguredInstance::Mimir(MimirInstance {
+                identity: ProviderIdentity { instance_id: instance_id.to_string(), driver: MIMIR_DRIVER.to_string() },
+                display_name: envelope.get("displayName")?.as_str()?.to_string(),
+                settings: crate::config::MimirSettings {
+                    enabled: envelope.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                    binary_path: envelope.pointer("/config/binaryPath")?.as_str()?.to_string(),
+                    bridge_command: envelope.pointer("/config/bridgeCommand")?.as_str()?.to_string(),
+                },
+            }))
+        }
     }
 }
 
@@ -1212,7 +1239,10 @@ pub(crate) fn reserve_skill_rescan(config: &ConfigStore) -> ProbeReservations {
     let current = config.current();
     let instance_ids = current.settings.provider_instances.keys()
         .filter(|instance_id| {
-            resolve_instance(&current.settings, instance_id, None).is_ok()
+            // Only reserve generations for drivers the rescan actually handles.
+            // A no-op reservation would discard an in-flight startup catalog.
+            matches!(resolve_instance(&current.settings, instance_id, None),
+                Ok(ConfiguredInstance::Claude(_) | ConfiguredInstance::Codex(_)))
         })
         .cloned().collect::<Vec<_>>();
     ProbeReservations { probes: instance_ids.into_iter().map(|instance_id| {
@@ -1250,7 +1280,7 @@ pub(crate) fn rescan_skills_reserved(
                 );
                 publish_one(config, probe, instance_id, expected, provider);
             }
-            Some(ConfiguredInstance::OpenCode(_)) => {}
+            Some(ConfiguredInstance::OpenCode(_) | ConfiguredInstance::Mimir(_)) => {}
             None => {}
         }
     }
@@ -1927,6 +1957,7 @@ fn refresh_instance_reserved(
             describe_codex(&instance, search, roots, &lifetime)
         }
         Some(ConfiguredInstance::OpenCode(instance)) => describe_opencode(&instance, search, &config.current().preferences),
+        Some(ConfiguredInstance::Mimir(instance)) => crate::mimir::describe(&instance, search, Path::new(&config.current().cwd)),
         None => return,
     };
     if let Some(message) = &provider.message {
@@ -2519,6 +2550,50 @@ mod tests {
         );
         assert!(!store.apply_providers_if_current(initial, |_| true, |_| Vec::new()));
     }
+
+    #[tokio::test]
+    async fn a_skill_rescan_cannot_discard_initial_mimir_or_opencode_probe_publication() {
+        for driver in [MIMIR_DRIVER, OPENCODE_DRIVER] {
+            let mut config = crate::config::ServerConfig::detect();
+            let instance_id = format!("{driver}Local");
+            let driver_config = if driver == MIMIR_DRIVER {
+                serde_json::json!({"binaryPath":"","bridgeCommand":"/org.mimir.bridge:serve"})
+            } else {
+                serde_json::json!({"binaryPath":"","serverUrl":"","serverPassword":"","customModels":[]})
+            };
+            let declaration = serde_json::json!({"driver":driver,"displayName":driver,"enabled":true,"config":driver_config});
+            config.settings.provider_instances = serde_json::Map::from_iter([(instance_id.clone(), declaration.clone())]);
+            let store = ConfigStore::new(config);
+            assert!(resolve_instance(&store.current().settings, &instance_id, None).is_ok());
+            let initial = reserve_probes(&store).probes.pop().unwrap().1;
+            let (frames, mut written) = tokio::sync::mpsc::channel(4);
+            let mut subscriptions = crate::subscriptions::Subscriptions::new(
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), frames);
+            let request_id = crate::wire::RequestId::from("probe-watch");
+            subscriptions.start(request_id.clone(), store.subscribe()).await;
+            assert!(written.recv().await.unwrap().contains("snapshot"));
+
+            // Adding a project while startup is probing schedules a skills-only
+            // rescan. These drivers perform no such rescan, so it cannot own a
+            // newer generation and silently invalidate their real probe.
+            let rescan = reserve_skill_rescan(&store);
+            rescan_skills_reserved(&store, &[], rescan);
+            let mut provider = describe(&ClaudeSettings { enabled:false, ..settings() }, &Search::over(&[]), &[]);
+            provider.instance_id = instance_id.clone();
+            provider.driver = driver.into();
+            provider.display_name = driver.into();
+            provider.enabled = true;
+            provider.installed = true;
+            provider.status = ProviderState::Ready;
+            publish_one(&store, initial, instance_id.clone(), Some(declaration), provider);
+            assert_eq!(store.current().providers.len(), 1, "the successful startup probe must publish for {driver}");
+            subscriptions.acknowledge(&request_id);
+            let event = tokio::time::timeout(std::time::Duration::from_secs(60), written.recv()).await.unwrap().unwrap();
+            assert!(event.contains("providerStatuses") && event.contains(&instance_id));
+            assert!(subscriptions.interrupt(&request_id).await);
+        }
+    }
+
 
     /// Nothing is spawned and nothing is searched for a driver the developer
     /// turned off.

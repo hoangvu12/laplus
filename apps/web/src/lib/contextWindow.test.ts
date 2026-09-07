@@ -61,6 +61,75 @@ describe("contextWindow", () => {
     });
   });
 
+  it.each([0, 12_000])(
+    "reads persisted Mimir occupancy of %s tokens without inventing usage totals",
+    (usedTokens) => {
+      const snapshot = deriveLatestContextWindowSnapshot([
+        makeActivity("mimir-context-1", "context.usage", {
+          usedTokens,
+          maxTokens: 128_000,
+          detail: "Mimir context occupancy (not billable usage or cost).",
+        }),
+        makeActivity("mimir-usage-1", "tokens.usage", {
+          usage: { input_tokens: 900_000, output_tokens: 10_000 },
+          detail: "Mimir token counts; monetary cost is unavailable.",
+        }),
+      ]);
+
+      expect(snapshot).toMatchObject({
+        usedTokens,
+        maxTokens: 128_000,
+        remainingTokens: 128_000 - usedTokens,
+        usedPercentage: (usedTokens / 128_000) * 100,
+        totalProcessedTokens: null,
+        inputTokens: null,
+        outputTokens: null,
+        compactsAutomatically: false,
+      });
+    },
+  );
+
+  it.each(["context-window.updated", "context.usage"])(
+    "uses the latest valid %s reading in mixed native and persisted Mimir history",
+    (latestKind) => {
+      const olderKind = latestKind === "context.usage" ? "context-window.updated" : "context.usage";
+      const snapshot = deriveLatestContextWindowSnapshot([
+        makeActivity("older", olderKind, { usedTokens: 1_000, maxTokens: 128_000 }),
+        makeActivity("newer", latestKind, { usedTokens: 2_000, maxTokens: 128_000 }),
+        makeActivity("cumulative", "tokens.usage", { usage: { input_tokens: 900_000 } }),
+        makeActivity("invalid", "context.usage", { usedTokens: -1, maxTokens: 128_000 }),
+      ]);
+
+      expect(snapshot?.usedTokens).toBe(2_000);
+      expect(snapshot?.totalProcessedTokens).toBeNull();
+    },
+  );
+
+  it("does not let malformed legacy rows replace a complete canonical reading", () => {
+    const snapshot = deriveLatestContextWindowSnapshot([
+      makeActivity("native", "context-window.updated", {
+        usedTokens: 4_000,
+        maxTokens: 128_000,
+        totalProcessedTokens: 240_000,
+        compactsAutomatically: true,
+      }),
+      makeActivity("missing", "context.usage", {}),
+      makeActivity("invalid", "context.usage", { usedTokens: "5000" }),
+      makeActivity("not-finite", "context.usage", { usedTokens: Infinity }),
+    ]);
+
+    expect(snapshot).toMatchObject({
+      usedTokens: 4_000,
+      totalProcessedTokens: 240_000,
+      compactsAutomatically: true,
+    });
+    expect(
+      deriveLatestContextWindowSnapshot([
+        makeActivity("tokens-only", "tokens.usage", { usage: { input_tokens: 900_000 } }),
+      ]),
+    ).toBeNull();
+  });
+
   it("formats compact token counts", () => {
     expect(formatContextWindowTokens(999)).toBe("999");
     expect(formatContextWindowTokens(1400)).toBe("1.4k");
