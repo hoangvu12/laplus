@@ -47,13 +47,13 @@ pub(super) async fn attach(shared: &Shared, request: Value) -> Json<Value> {
         // A peer error is untrusted, including its code; neither credential form
         // may survive in activities, snapshots, or logs.
         return Json(
-            json!({"version":1,"error":{"code":authorization,"message":authorization.strip_prefix("Bearer ").unwrap()}}),
+            json!({"version":2,"error":{"code":authorization,"message":authorization.strip_prefix("Bearer ").unwrap()}}),
         );
     }
     if mode == McpMode::MalformedAttach {
-        return Json(json!({"version":1,"result":{}}));
+        return Json(json!({"version":2,"result":{}}));
     }
-    Json(json!({"version":1,"result":{"attachment_id":"host-attachment-1"}}))
+    Json(json!({"version":2,"result":{"attachment_id":"host-attachment-1"}}))
 }
 
 #[derive(Debug)]

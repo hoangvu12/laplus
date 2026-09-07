@@ -139,6 +139,19 @@ export type ProviderApprovalDecision = typeof ProviderApprovalDecision.Type;
 export const ProviderUserInputAnswers = Schema.Record(Schema.String, Schema.Unknown);
 export type ProviderUserInputAnswers = typeof ProviderUserInputAnswers.Type;
 
+export const PromptSkillSelection = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  path: Schema.NullOr(TrimmedNonEmptyString),
+  visibleText: TrimmedNonEmptyString,
+  textRange: Schema.NullOr(
+    Schema.Struct({
+      start: NonNegativeInt,
+      end: NonNegativeInt,
+    }),
+  ),
+});
+export type PromptSkillSelection = typeof PromptSkillSelection.Type;
+
 export const PROVIDER_SEND_TURN_MAX_INPUT_CHARS = 120_000;
 export const PROVIDER_SEND_TURN_MAX_ATTACHMENTS = 8;
 export const PROVIDER_SEND_TURN_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -1012,6 +1025,17 @@ const ThreadTurnStartBootstrap = Schema.Struct({
 
 export type ThreadTurnStartBootstrap = typeof ThreadTurnStartBootstrap.Type;
 
+export const ThreadSessionPrepareCommand = Schema.Struct({
+  type: Schema.Literal("thread.session.prepare"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+  bootstrap: Schema.optional(ThreadTurnStartBootstrap),
+  createdAt: IsoDateTime,
+});
+
 export const ThreadTurnStartCommand = Schema.Struct({
   type: Schema.Literal("thread.turn.start"),
   commandId: CommandId,
@@ -1021,6 +1045,8 @@ export const ThreadTurnStartCommand = Schema.Struct({
     role: Schema.Literal("user"),
     text: Schema.String,
     attachments: Schema.Array(ChatAttachment),
+
+    skills: Schema.optional(Schema.Array(PromptSkillSelection)),
   }),
   modelSelection: Schema.optional(ModelSelection),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -1042,6 +1068,8 @@ const ClientThreadTurnStartCommand = Schema.Struct({
     role: Schema.Literal("user"),
     text: Schema.String,
     attachments: Schema.Array(UploadChatAttachment),
+
+    skills: Schema.optional(Schema.Array(PromptSkillSelection)),
   }),
   modelSelection: Schema.optional(ModelSelection),
   titleSeed: Schema.optional(TrimmedNonEmptyString),
@@ -1141,6 +1169,7 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadMetaUpdateCommand,
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
+  ThreadSessionPrepareCommand,
   ThreadTurnStartCommand,
   ThreadPlanDecideCommand,
   ThreadTurnSteerCommand,
@@ -1173,6 +1202,7 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadMetaUpdateCommand,
   ThreadRuntimeModeSetCommand,
   ThreadInteractionModeSetCommand,
+  ThreadSessionPrepareCommand,
   ClientThreadTurnStartCommand,
   ThreadPlanDecideCommand,
   ThreadTurnSteerCommand,

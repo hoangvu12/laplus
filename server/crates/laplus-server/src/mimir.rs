@@ -164,7 +164,7 @@ impl Client {
             })
     }
     async fn api(&self, action: &str, mut fields: Value) -> Result<Value, String> {
-        fields["version"] = json!(1);
+        fields["version"] = json!(protocol::VERSION);
         fields["action"] = json!(action);
         let body = serde_json::to_vec(&fields).map_err(|_| "Cannot encode Mimir request")?;
         if body.len() > protocol::MAX_FRAME {
@@ -338,6 +338,14 @@ fn readiness(line: &[u8]) -> Result<Option<Value>, String> {
             .pointer("/capabilities/actions")
             .and_then(Value::as_array)
             .ok_or("Mimir bridge omitted capabilities")?;
+
+        if value
+            .pointer("/capabilities/session_control/skills")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err("Mimir bridge does not support required session skill inputs".into());
+        }
         for action in [
             "catalog",
             "create",
@@ -591,7 +599,7 @@ impl Driver for Mimir {
         let resume = match &start.resume_cursor {
             Some(cursor)
                 if cursor.provider == start.provider
-                    && cursor.value.get("version") == Some(&json!(1)) =>
+                    && cursor.value.get("version") == Some(&json!(protocol::VERSION)) =>
             {
                 Some(protocol::required(&cursor.value, "sessionId")?.to_string())
             }
@@ -637,6 +645,15 @@ impl Driver for Mimir {
             };
         let mut projection = protocol::Projection::default();
         let mut decided = projection.snapshot(&snapshot, None, &crate::clock::now_iso());
+        let skills = protocol::skills(&snapshot)?;
+        decided.changes.push(crate::threads::Change::Activity(
+            crate::threads::Activity::info(
+                "provider.skills",
+                "Mimir session skills",
+                json!({"skills":skills}),
+                None,
+            ),
+        ));
         if snapshot["active_request"].is_null() {
             // A saved-plan decision can reopen without sending a prompt. Publish
             // the idle attach state rather than leaving the UI starting forever.
@@ -663,7 +680,7 @@ impl Driver for Mimir {
         ));
         decided.provider_resume_cursor = Some(crate::provider::ResumeCursor {
             provider: start.provider.clone(),
-            value: json!({"version":1,"sessionId":id}),
+            value: json!({"version":protocol::VERSION,"sessionId":id}),
         });
         let events = Events::start(bridge.client.clone(), id.clone(), None);
         Ok(Opened {
@@ -684,6 +701,32 @@ impl Driver for Mimir {
         self.projection.take_unfinished_message_ids()
     }
 
+    async fn refresh(&mut self) -> io::Result<Decided> {
+        let snapshot = self
+            .bridge
+            .client
+            .api("snapshot", json!({"id": self.id}))
+            .await
+            .map_err(io::Error::other)?;
+        let mut decided = self
+            .projection
+            .snapshot(&snapshot, None, &crate::clock::now_iso());
+        match protocol::skills(&snapshot) {
+            Ok(skills) => decided.changes.push(crate::threads::Change::Activity(
+                crate::threads::Activity::info(
+                    "provider.skills",
+                    "Mimir session skills",
+                    json!({"skills": skills}),
+                    None,
+                ),
+            )),
+            Err(error) => decided.changes.push(crate::threads::Change::Activity(
+                crate::threads::Activity::failed("provider.skills", &error),
+            )),
+        }
+        Ok(decided)
+    }
+
     async fn next(&mut self, driving: &mut Driving) -> Option<Decided> {
         if self.failed {
             return None;
@@ -697,8 +740,23 @@ impl Driver for Mimir {
                     .event(&event, driving, &crate::clock::now_iso())
             }
             Received::Snapshot(snapshot) => {
+                let mut decided =
                 self.projection
-                    .snapshot(&snapshot, Some(driving), &crate::clock::now_iso())
+                        .snapshot(&snapshot, Some(driving), &crate::clock::now_iso());
+                match protocol::skills(&snapshot) {
+                    Ok(skills) => decided.changes.push(crate::threads::Change::Activity(
+                        crate::threads::Activity::info(
+                            "provider.skills",
+                            "Mimir session skills",
+                            json!({"skills":skills}),
+                            None,
+                        ),
+                    )),
+                    Err(error) => decided.changes.push(crate::threads::Change::Activity(
+                        crate::threads::Activity::failed("provider.skills", &error),
+                    )),
+                }
+                decided
             }
             Received::Gap => {
                 self.history_gap = true;
@@ -769,8 +827,22 @@ impl Driver for Mimir {
             .map_err(io::Error::other)?;
         let mut text = Vec::new();
         let mut images = Vec::new();
-        for (message, attachments) in prompt.messages() {
+        let mut skills = Vec::new();
+        let mut byte_offset = 0_u64;
+        for (message, attachments, selected_skills) in prompt.messages() {
+            for skill in selected_skills {
+                let text_range = skill.text_range.as_ref().map(|range| {
+                    json!({"start":range.start + byte_offset,"end":range.end + byte_offset})
+                });
+                skills.push(json!({
+                    "name":skill.name,
+                    "path":skill.path,
+                    "visible_text":skill.visible_text,
+                    "text_range":text_range,
+                }));
+            }
             text.push(message);
+            byte_offset += message.len() as u64 + 2;
             for attachment in attachments {
                 if !attachment.mime.starts_with("image/") {
                     return Err(io::Error::other(
@@ -783,7 +855,7 @@ impl Driver for Mimir {
         }
         // There is one queue: session::drive holds next turns locally. Never
         // also submit follow_up, or a single click would create two requests.
-        let accepted=self.bridge.client.api("prompt",json!({"id":self.id,"input":{"text":text.join("\n\n"),"images":images},"delivery":"start"})).await.map_err(io::Error::other)?;
+        let accepted=self.bridge.client.api("prompt",json!({"id":self.id,"input":{"text":text.join("\n\n"),"images":images,"skills":skills},"delivery":"start"})).await.map_err(io::Error::other)?;
         self.projection.accepted_request = Some(
             protocol::required(&accepted, "accepted")
                 .map_err(io::Error::other)?
@@ -1093,14 +1165,14 @@ mod tests {
     #[test]
     fn mimir_readiness_requires_version_and_native_controls() {
         assert_eq!(readiness(b"{\"type\":\"notice\"}").unwrap(), None);
-        let mut ready = json!({"version":1,"endpoint":"http://127.0.0.1:9000","capabilities":{"actions":["catalog","create","open","snapshot","configure","prompt","answer","cancel","release","decide_plan","steer"]}});
+        let mut ready = json!({"version":2,"endpoint":"http://127.0.0.1:9000","capabilities":{"actions":["catalog","create","open","snapshot","configure","prompt","answer","cancel","release","decide_plan","steer"],"session_control":{"skills":true}}});
         let wire = |ready: &Value| {
             serde_json::to_vec(&json!({"outcome":"display","message":ready.to_string()})).unwrap()
         };
         assert!(readiness(&wire(&ready)).unwrap().is_some());
-        ready["version"] = json!(2);
-        assert!(readiness(&wire(&ready)).is_err());
         ready["version"] = json!(1);
+        assert!(readiness(&wire(&ready)).is_err());
+        ready["version"] = json!(2);
         ready["capabilities"]["actions"]
             .as_array_mut()
             .unwrap()
@@ -1122,10 +1194,10 @@ mod tests {
             count.fetch_add(1, Ordering::SeqCst);
             assert_eq!(headers["authorization"], "Bearer private-test-token");
             assert!(headers.get("origin").is_none());
-            assert_eq!(value["version"], 1);
+            assert_eq!(value["version"], 2);
             assert_eq!(value["action"], "prompt");
             Json(
-                json!({"version":1,"error":{"code":"sdk_error","message":"refused private-test-token"}}),
+                json!({"version":2,"error":{"code":"sdk_error","message":"refused private-test-token"}}),
             )
         }
         let count = Arc::new(AtomicUsize::new(0));

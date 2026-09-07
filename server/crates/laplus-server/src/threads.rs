@@ -331,6 +331,8 @@ pub struct Prompt {
     pub turn_id: String,
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<PromptSkill>,
     /// Later developer messages coalesced into this provider turn, in their
     /// original message order. Keeping their text and images together prevents
     /// a provider encoder from flattening `text B, text C, image B, image C`.
@@ -345,6 +347,24 @@ pub struct Prompt {
 pub struct PromptMessage {
     pub text: String,
     pub attachments: Vec<PromptAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<PromptSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSkill {
+    pub name: String,
+    pub path: Option<String>,
+    pub visible_text: String,
+    pub text_range: Option<PromptTextRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptTextRange {
+    pub start: u64,
+    pub end: u64,
 }
 
 impl Prompt {
@@ -352,16 +372,24 @@ impl Prompt {
         self.followups.push(PromptMessage {
             text: next.text,
             attachments: next.attachments,
+            skills: next.skills,
         });
         self.followups.extend(next.followups);
     }
 
-    pub fn messages(&self) -> impl Iterator<Item = (&str, &[PromptAttachment])> {
-        std::iter::once((self.text.as_str(), self.attachments.as_slice())).chain(
-            self.followups
-                .iter()
-                .map(|message| (message.text.as_str(), message.attachments.as_slice())),
+    pub fn messages(&self) -> impl Iterator<Item = (&str, &[PromptAttachment], &[PromptSkill])> {
+        std::iter::once((
+            self.text.as_str(),
+            self.attachments.as_slice(),
+            self.skills.as_slice(),
+        ))
+        .chain(self.followups.iter().map(|message| {
+            (
+                message.text.as_str(),
+                message.attachments.as_slice(),
+                message.skills.as_slice(),
         )
+        }))
     }
 }
 
@@ -434,6 +462,9 @@ pub struct PendingTurn {
 #[derive(Debug, Clone)]
 pub enum Signal {
     Control(NativeControl),
+
+    /// Re-read session-scoped presentation without starting a model turn.
+    Refresh,
     /// The developer answered a permission request.
     Answer(Answered),
     /// The developer answered the agent's questions.
@@ -1437,6 +1468,15 @@ impl Threads {
         running.try_send(Signal::Control(control)).map_err(|_| "The provider control channel is full or closed".to_string())
     }
 
+
+    pub fn refresh(&self, thread_id: &str) -> Result<(), String> {
+        let running = self
+            .live(thread_id)?
+            .ok_or("The provider session is not running")?;
+        running
+            .try_send(Signal::Refresh)
+            .map_err(|_| "The provider signal channel is full or closed".to_string())
+    }
 
     fn live(&self, thread_id: &str) -> Result<Option<mpsc::Sender<Signal>>, String> {
         let entry = self.find(thread_id).ok_or_else(unknown(thread_id))?;
@@ -3750,6 +3790,8 @@ pub(crate) mod tests {
                 turn_id: "turn-2".to_string(),
                 text: "and then this".to_string(),
                 attachments: Vec::new(),
+
+                skills: Vec::new(),
                 followups: Vec::new(),
                 wanted: Retune {
                     runtime_mode: "full-access".to_string(),

@@ -182,6 +182,7 @@ import {
   useComposerDraftStore,
   type DraftId,
 } from "../composerDraftStore";
+import { encodeComposerSkills } from "../composerSkills";
 import {
   appendTerminalContextsToPrompt,
   formatTerminalContextLabel,
@@ -1161,6 +1162,12 @@ function ChatViewContent(props: ChatViewProps) {
   const setThreadInteractionMode = useAtomCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
+
+  const prepareThreadSession = useAtomCommand(threadEnvironment.prepareSession, {
+    reportFailure: false,
+  });
+  const [isPreparingMimirSkills, setIsPreparingMimirSkills] = useState(false);
+  const preparingMimirSkillsRef = useRef(false);
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const decideThreadPlan = useAtomCommand(threadEnvironment.decidePlan, { reportFailure: false });
   const steerThreadTurn = useAtomCommand(threadEnvironment.steerTurn, { reportFailure: false });
@@ -4581,6 +4588,70 @@ function ChatViewContent(props: ChatViewProps) {
     }
   };
 
+  const onPrepareMimirSkills = useCallback(async () => {
+    if (
+      preparingMimirSkillsRef.current ||
+      !activeThread ||
+      !activeProject ||
+      activeEnvironmentUnavailable
+    ) {
+      return;
+    }
+    const context = composerRef.current?.getSendContext();
+    if (!context?.providerAvailable || context.selectedProvider !== "mimir") return;
+
+    preparingMimirSkillsRef.current = true;
+    setIsPreparingMimirSkills(true);
+    setThreadError(activeThread.id, null);
+    try {
+      const result = await prepareThreadSession({
+        environmentId,
+        input: {
+          threadId: activeThread.id,
+          modelSelection: context.selectedModelSelection,
+          runtimeMode: "full-access",
+          interactionMode,
+          ...(isLocalDraftThread
+            ? {
+                bootstrap: {
+                  createThread: {
+                    projectId: activeProject.id,
+                    title: activeThread.title,
+                    modelSelection: context.selectedModelSelection,
+                    runtimeMode: "full-access",
+                    interactionMode,
+                    branch: activeThread.branch,
+                    worktreePath: activeThread.worktreePath,
+                    createdAt: activeThread.createdAt,
+                  },
+                },
+              }
+            : {}),
+          createdAt: new Date().toISOString(),
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          activeThread.id,
+          error instanceof Error ? error.message : "Failed to prepare Mimir skills.",
+        );
+      }
+    } finally {
+      preparingMimirSkillsRef.current = false;
+      setIsPreparingMimirSkills(false);
+    }
+  }, [
+    activeEnvironmentUnavailable,
+    activeProject,
+    activeThread,
+    environmentId,
+    interactionMode,
+    isLocalDraftThread,
+    prepareThreadSession,
+    setThreadError,
+  ]);
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     if (
@@ -4603,6 +4674,7 @@ function ChatViewContent(props: ChatViewProps) {
       elementContexts: composerElementContexts,
       previewAnnotations: composerPreviewAnnotations,
       reviewComments: composerReviewComments,
+      skillSelections: composerSkillSelections,
       selectedProvider: ctxSelectedProvider,
       selectedModel: ctxSelectedModel,
       selectedProviderModels: ctxSelectedProviderModels,
@@ -4916,6 +4988,15 @@ function ChatViewContent(props: ChatViewProps) {
             role: "user",
             text: outgoingMessageText,
             attachments: turnAttachmentsResult.value,
+            ...(ctxSelectedProvider === "mimir"
+              ? {
+                  skills: encodeComposerSkills(
+                    outgoingMessageText,
+                    promptForSend,
+                    composerSkillSelections,
+                  ),
+                }
+              : {}),
           },
           modelSelection: ctxSelectedModelSelection,
           titleSeed: title,
@@ -5997,6 +6078,7 @@ function ChatViewContent(props: ChatViewProps) {
                             isConnecting={isConnecting}
                             isSendBusy={isSendBusy}
                             isPreparingWorktree={isPreparingWorktree}
+                            isPreparingMimirSkills={isPreparingMimirSkills}
                             environmentUnavailable={activeEnvironmentUnavailableState}
                             activePendingApproval={activePendingApproval}
                             pendingApprovals={pendingApprovals}
@@ -6032,6 +6114,7 @@ function ChatViewContent(props: ChatViewProps) {
                             composerTerminalContextsRef={composerTerminalContextsRef}
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
+                            onPrepareMimirSkills={onPrepareMimirSkills}
                             onInterrupt={onInterrupt}
                             onSteer={onSteer}
                             onPlanDecision={onPlanDecision}
