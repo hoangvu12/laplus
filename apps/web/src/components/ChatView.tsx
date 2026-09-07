@@ -182,7 +182,11 @@ import {
   useComposerDraftStore,
   type DraftId,
 } from "../composerDraftStore";
-import { encodeComposerSkills } from "../composerSkills";
+import {
+  encodeComposerSkills,
+  resolveMimirSkillPreparation,
+  type MimirSkillPreparation,
+} from "../composerSkills";
 import {
   appendTerminalContextsToPrompt,
   formatTerminalContextLabel,
@@ -1167,7 +1171,9 @@ function ChatViewContent(props: ChatViewProps) {
     reportFailure: false,
   });
   const [isPreparingMimirSkills, setIsPreparingMimirSkills] = useState(false);
-  const preparingMimirSkillsRef = useRef(false);
+  const preparingMimirSkillsRef = useRef<(MimirSkillPreparation & { threadId: ThreadId }) | null>(
+    null,
+  );
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const decideThreadPlan = useAtomCommand(threadEnvironment.decidePlan, { reportFailure: false });
   const steerThreadTurn = useAtomCommand(threadEnvironment.steerTurn, { reportFailure: false });
@@ -2448,6 +2454,19 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [draftId, routeThreadKey, routeThreadRef, serverThread],
   );
+
+  useEffect(() => {
+    const preparation = preparingMimirSkillsRef.current;
+    if (!preparation || activeThread?.id !== preparation.threadId) return;
+    const outcome = resolveMimirSkillPreparation(activeThread.activities, preparation);
+    if (outcome.status === "pending") return;
+
+    preparingMimirSkillsRef.current = null;
+    setIsPreparingMimirSkills(false);
+    if (outcome.status === "failed") {
+      setThreadError(preparation.threadId, outcome.message);
+    }
+  }, [activeThread, setThreadError]);
 
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
@@ -4594,7 +4613,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onPrepareMimirSkills = useCallback(async () => {
     if (
-      preparingMimirSkillsRef.current ||
+      preparingMimirSkillsRef.current !== null ||
       !activeThread ||
       !activeProject ||
       activeEnvironmentUnavailable
@@ -4612,7 +4631,13 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
-    preparingMimirSkillsRef.current = true;
+    const preparation = {
+      threadId: activeThread.id,
+      providerInstanceId: context.selectedModelSelection.instanceId,
+      cwd: gitCwd ?? activeProject.workspaceRoot,
+      previousActivityIds: new Set(activeThread.activities.map((activity) => activity.id)),
+    };
+    preparingMimirSkillsRef.current = preparation;
     setIsPreparingMimirSkills(true);
     setThreadError(activeThread.id, null);
     try {
@@ -4642,27 +4667,36 @@ function ChatViewContent(props: ChatViewProps) {
           createdAt: new Date().toISOString(),
         },
       });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThread.id,
-          error instanceof Error ? error.message : "Failed to prepare Mimir skills.",
-        );
+      if (result._tag === "Failure") {
+        if (preparingMimirSkillsRef.current === preparation) {
+          preparingMimirSkillsRef.current = null;
+          setIsPreparingMimirSkills(false);
+        }
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            activeThread.id,
+            error instanceof Error ? error.message : "Failed to prepare Mimir skills.",
+          );
+        }
       }
-    } finally {
-      preparingMimirSkillsRef.current = false;
-      setIsPreparingMimirSkills(false);
+    } catch (error) {
+      if (preparingMimirSkillsRef.current === preparation) {
+        preparingMimirSkillsRef.current = null;
+        setIsPreparingMimirSkills(false);
+      }
+      setThreadError(activeThread.id, chatActionErrorMessage(error));
     }
   }, [
     activeEnvironmentUnavailable,
     activeProject,
     activeThread,
     environmentId,
+    gitCwd,
     interactionMode,
     isLocalDraftThread,
     prepareThreadSession,
     sendEnvMode,
-
     setThreadError,
   ]);
 

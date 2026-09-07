@@ -24,6 +24,17 @@ export interface MimirSkillCatalog {
   skills: ServerProviderSkill[];
 }
 
+export interface MimirSkillPreparation {
+  providerInstanceId: string;
+  cwd: string;
+  previousActivityIds: ReadonlySet<string>;
+}
+
+export type MimirSkillPreparationOutcome =
+  | { status: "pending" }
+  | { status: "ready" }
+  | { status: "failed"; message: string };
+
 function isMimirSkillCatalog(value: unknown): value is MimirSkillCatalog {
   if (!value || typeof value !== "object") return false;
   const payload = value as Partial<MimirSkillCatalog>;
@@ -54,6 +65,37 @@ export function selectMimirSkillCatalog(
     }
   }
   return null;
+}
+export function resolveMimirSkillPreparation(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  preparation: MimirSkillPreparation,
+): MimirSkillPreparationOutcome {
+  for (let index = activities.length - 1; index >= 0; index -= 1) {
+    const activity = activities[index];
+    if (!activity || preparation.previousActivityIds.has(activity.id)) continue;
+    if (
+      activity.tone === "error" &&
+      (activity.kind === "provider.skills" || activity.kind === "session.failed")
+    ) {
+      const payload =
+        activity.payload && typeof activity.payload === "object"
+          ? (activity.payload as { detail?: unknown })
+          : null;
+      return {
+        status: "failed",
+        message: typeof payload?.detail === "string" ? payload.detail : activity.summary,
+      };
+    }
+    if (
+      activity.kind === "provider.skills" &&
+      isMimirSkillCatalog(activity.payload) &&
+      activity.payload.scope.providerInstanceId === preparation.providerInstanceId &&
+      activity.payload.scope.cwd === preparation.cwd
+    ) {
+      return { status: "ready" };
+    }
+  }
+  return { status: "pending" };
 }
 
 export function selectedComposerSkill(

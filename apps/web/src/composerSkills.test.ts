@@ -3,6 +3,7 @@ import type { OrchestrationThreadActivity } from "@t3tools/contracts";
 
 import {
   encodeComposerSkills,
+  resolveMimirSkillPreparation,
   selectMimirSkillCatalog,
   reconcileComposerSkills,
   selectedComposerSkill,
@@ -51,5 +52,65 @@ describe("composer skills", () => {
       "current",
     );
     expect(selectMimirSkillCatalog(activities, "mimir-a", "/missing")).toBeNull();
+  });
+
+  it("keeps preparation pending through acknowledgement until a new matching catalog arrives", () => {
+    const oldCatalog = {
+      id: "old-catalog",
+      kind: "provider.skills",
+      tone: "info",
+      summary: "Mimir session skills",
+      payload: {
+        scope: { providerInstanceId: "mimir-a", cwd: "/work", sdkSessionId: "session-a" },
+        skills: [skill],
+      },
+    } as unknown as OrchestrationThreadActivity;
+    const pending = {
+      providerInstanceId: "mimir-a",
+      cwd: "/work",
+      previousActivityIds: new Set([oldCatalog.id]),
+    };
+
+    expect(resolveMimirSkillPreparation([oldCatalog], pending)).toEqual({ status: "pending" });
+    const wrongScope = {
+      ...oldCatalog,
+      id: "wrong-scope",
+      payload: {
+        scope: { providerInstanceId: "mimir-b", cwd: "/work", sdkSessionId: "session-b" },
+        skills: [skill],
+      },
+    } as OrchestrationThreadActivity;
+    expect(resolveMimirSkillPreparation([oldCatalog, wrongScope], pending)).toEqual({
+      status: "pending",
+    });
+    const refreshed = { ...oldCatalog, id: "refreshed" } as OrchestrationThreadActivity;
+    expect(resolveMimirSkillPreparation([oldCatalog, refreshed], pending)).toEqual({
+      status: "ready",
+    });
+  });
+
+  it("ends preparation on a new asynchronous catalog or session failure", () => {
+    const pending = {
+      providerInstanceId: "mimir-a",
+      cwd: "/work",
+      previousActivityIds: new Set<string>(),
+    };
+    const failure = (kind: string) =>
+      ({
+        id: `failed-${kind}`,
+        kind,
+        tone: "error",
+        summary: "Preparation failed",
+        payload: { detail: "SDK unavailable" },
+      }) as unknown as OrchestrationThreadActivity;
+
+    expect(resolveMimirSkillPreparation([failure("provider.skills")], pending)).toEqual({
+      status: "failed",
+      message: "SDK unavailable",
+    });
+    expect(resolveMimirSkillPreparation([failure("session.failed")], pending)).toEqual({
+      status: "failed",
+      message: "SDK unavailable",
+    });
   });
 });

@@ -1297,6 +1297,9 @@ async fn mimir_socket_prepare_bootstraps_real_session_refreshes_and_reuses_it_fo
 
     let mut second_prepare = prepare;
     second_prepare["commandId"] = json!("prepare-2");
+    second_prepare["modelSelection"] =
+        json!({"instanceId":"mimirLocal","model":"test/org/other","options":{"reasoning":"low"}});
+    second_prepare["interactionMode"] = json!("plan");
     dispatch(&mut client, second_prepare).await;
     wait_for_peer(
         &peer,

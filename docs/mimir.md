@@ -7,6 +7,9 @@ There is no second agent loop or ACP dependency.
 
 ## Install
 
+This revision requires **Mimir 0.2.8 (plugin ABI 5) and bridge 0.3.0 (protocol 2)**.
+Update the host, plugin and Laplus together; bridge 0.2.1 is not compatible.
+
 1. Install Mimir from [mimir-shim](https://github.com/wasimysaid/mimir-shim)
    and configure your provider; confirm your chosen model works there first.
 2. Download the bridge ZIP and checksums from
@@ -46,6 +49,12 @@ is needed. The Mimir installer supplies `configure-mimir`; do not install the ol
   goal; `/goal <objective>` starts one. `/compress` and `/init` also run natively.
   Slash commands require an idle session with no queued/retryable work; they are
   never combined with queued prose or sent as live steering.
+- Type `$` and select a skill from the workspace/session catalog. First use prepares
+  the real session without spending a model turn. Selecting an entry carries its
+  identity into Mimir; merely typing `$name` is ordinary text, not explicit activation.
+  Selections survive draft restore and queued turns. Existing worktrees are supported;
+  create a worktree separately before skill discovery in a new worktree.
+
 - Ask to use `configure-mimir` to inspect or change Mimir configuration. The
   skill comes with the Mimir installer, not the bridge. Specify project/global
   scope; never paste credentials into chat.

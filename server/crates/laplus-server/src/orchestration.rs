@@ -1739,17 +1739,9 @@ impl Shell {
         )
         .map_err(CommandError::new)?;
         let selection_changed = thread.model_selection != prepare.model_selection;
-        let preparation_changed = selection_changed
-            || thread.runtime_mode != prepare.runtime_mode
-            || thread.interaction_mode != prepare.interaction_mode;
         if thread.session.as_ref().is_some_and(|session| {
             session.status.is_working() || session.status == SessionStatus::Ready
         }) {
-            if preparation_changed {
-                return Err(CommandError::new(
-                    "The active Mimir session was prepared with a different model or mode",
-                ));
-            }
             self.inner
                 .threads
                 .refresh(&prepare.thread_id)
