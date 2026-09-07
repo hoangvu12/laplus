@@ -136,7 +136,7 @@ async fn partial_survives_restart(fail_stream: bool) {
         for sink in &peer.shared.state.lock().unwrap().sinks {
             sink.send(format!(
                 "event: closed\ndata: {}\n\n",
-                json!({"version":1,"session_id":SESSION})
+                json!({"version":2,"session_id":SESSION})
             ))
             .unwrap();
         }
@@ -210,13 +210,13 @@ async fn mimir_recovery_gap_cannot_attribute_retained_a_text_or_question_to_queu
         ];
         let mut bytes = format!(
             "event: gap\ndata: {}\n\n",
-            json!({"version":1,"reason":"replay_unavailable","cursor":"random-opaque-epoch:1"})
+            json!({"version":2,"reason":"replay_unavailable","cursor":"random-opaque-epoch:1"})
         );
         for event in tail {
             let frame = format!(
                 "id: random-opaque-epoch:{}\nevent: session\ndata: {}\n\n",
                 state.events.len() + 1,
-                json!({"version":1,"event":event})
+                json!({"version":2,"event":event})
             );
             state.events.push(frame.clone());
             bytes.push_str(&frame);
@@ -290,7 +290,7 @@ async fn mimir_recovery_gap_while_running_preserves_queued_work_for_deliberate_r
                 state.emit(json!("resync"));
             } else {
                 for sink in &state.sinks {
-                    sink.send(format!("event: gap\ndata: {}\n\n", json!({"version":1,"reason":"replay_unavailable","cursor":"random-opaque-epoch:0"}))).unwrap();
+                    sink.send(format!("event: gap\ndata: {}\n\n", json!({"version":2,"reason":"replay_unavailable","cursor":"random-opaque-epoch:0"}))).unwrap();
                 }
             }
         }
@@ -385,7 +385,7 @@ async fn mimir_recovery_sdk_tail_after_ready_cannot_reach_queued_b() {
                 state.emit(json!("resync"));
             } else {
                 for sink in &state.sinks {
-                    sink.send(format!("event: gap\ndata: {}\n\n", json!({"version":1,"reason":"replay_unavailable","cursor":"random-opaque-epoch:1"}))).unwrap();
+                    sink.send(format!("event: gap\ndata: {}\n\n", json!({"version":2,"reason":"replay_unavailable","cursor":"random-opaque-epoch:1"}))).unwrap();
                 }
             }
         }

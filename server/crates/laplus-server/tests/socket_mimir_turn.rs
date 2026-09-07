@@ -90,7 +90,7 @@ impl PeerState {
         let frame = format!(
             "id: random-opaque-epoch:{}\nevent: session\ndata: {}\n\n",
             self.events.len() + 1,
-            json!({"version":1,"event":event})
+            json!({"version":2,"event":event})
         );
         self.events.push(frame.clone());
         self.sinks.retain(|tx| tx.send(frame.clone()).is_ok());
@@ -141,7 +141,7 @@ impl Shared {
         if let Some(id) = &state.active {
             requests.push(json!({"id":id,"status":"running"}));
         }
-        json!({"info":{"id":SESSION,"cwd":self.workspace,"title":"Peer session","live":true},"configuration":state.configuration,"active_request":state.active,"requests":requests,"messages":[],"plan":state.plan,"user_request":state.question})
+        json!({"info":{"id":SESSION,"cwd":self.workspace,"title":"Peer session","live":true},"configuration":state.configuration,"active_request":state.active,"requests":requests,"messages":[],"plan":state.plan,"user_request":state.question,"skills":[{"name":"review","description":"Review changes","path":null,"bundled":false}]})
     }
 }
 async fn api(
@@ -150,7 +150,7 @@ async fn api(
     Json(request): Json<Value>,
 ) -> Json<Value> {
     shared.authenticate(&headers);
-    assert_eq!(request["version"], 1);
+    assert_eq!(request["version"], 2);
     if request["action"] == "attach_mcp" {
         return mcp_tests::attach(&shared, request).await;
     }
@@ -159,7 +159,7 @@ async fn api(
     let action = request["action"].as_str().unwrap();
     if action == "decide_plan" && state.refuse_plan {
         return Json(
-            json!({"version":1,"error":{"code":"sdk_error","message":"Plan is no longer current"}}),
+            json!({"version":2,"error":{"code":"sdk_error","message":"Plan is no longer current"}}),
         );
     }
     if !matches!(action, "catalog" | "create") {
@@ -167,7 +167,7 @@ async fn api(
     }
     if action == "prompt" && state.mcp_mode == McpMode::RefusePrompt {
         return Json(
-            json!({"version":1,"error":{"code":"sdk_error","message":"prompt refused after attach"}}),
+            json!({"version":2,"error":{"code":"sdk_error","message":"prompt refused after attach"}}),
         );
     }
     let result = match action {
@@ -175,7 +175,7 @@ async fn api(
             assert_eq!(request["attachment_id"], "host-attachment-1");
             if state.mcp_mode == McpMode::RefuseDetach {
                 return Json(
-                    json!({"version":1,"error":{"code":"sdk_error","message":"detach failed"}}),
+                    json!({"version":2,"error":{"code":"sdk_error","message":"detach failed"}}),
                 );
             }
             json!({"detached":true})
@@ -210,10 +210,10 @@ async fn api(
             if request["input"]["text"] == "/goal" {
                 state.emit(json!({"display":"No goal is set for this session."}));
                 state.finish();
-                return Json(json!({"version":1,"result":{"accepted":id}}));
+                return Json(json!({"version":2,"result":{"accepted":id}}));
             }
             if state.manual_turns {
-                return Json(json!({"version":1,"result":{"accepted":id}}));
+                return Json(json!({"version":2,"result":{"accepted":id}}));
             }
             state.observe(
                 false,
@@ -295,7 +295,7 @@ async fn api(
         }
         _ => panic!("unexpected API action {action}"),
     };
-    Json(json!({"version":1,"result":result}))
+    Json(json!({"version":2,"result":result}))
 }
 async fn events(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     shared.authenticate(&headers);
@@ -308,7 +308,7 @@ async fn events(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
     );
     tx.send(format!(
         "event: ready\ndata: {}\n\n",
-        json!({"version":1,"session_id":SESSION,"cursor":format!("random-opaque-epoch:{}", state.events.len())})
+        json!({"version":2,"session_id":SESSION,"cursor":format!("random-opaque-epoch:{}", state.events.len())})
     ))
     .unwrap();
     let after = headers
@@ -379,7 +379,7 @@ impl Peer {
         if mcp_mode != McpMode::Unavailable {
             actions.extend(["attach_mcp", "detach_mcp"]);
         }
-        let ready=json!({"outcome":"display","message":json!({"version":1,"endpoint":endpoint,"capabilities":{"actions":actions}}).to_string()}).to_string();
+        let ready=json!({"outcome":"display","message":json!({"version":2,"endpoint":endpoint,"capabilities":{"actions":actions,"session_control":{"skills":true}}}).to_string()}).to_string();
         let script = if cfg!(windows) {
             format!(
                 "@echo off\r\necho %~4>>\"{}\"\r\necho {}\r\nping -n 601 127.0.0.1 >nul\r\n",
@@ -1047,7 +1047,7 @@ async fn mimir_socket_reconnect_uses_opaque_cursor_but_gap_requires_deliberate_r
         for sink in &state.sinks {
             sink.send(format!(
                 "event: gap\ndata: {}\n\n",
-                json!({"version":1,"reason":"replay_unavailable","cursor":"different-epoch:77"})
+                json!({"version":2,"reason":"replay_unavailable","cursor":"different-epoch:77"})
             ))
             .unwrap();
         }
@@ -1222,6 +1222,135 @@ async fn mimir_socket_saved_plan_survives_restart_and_failed_decision_stays_unan
             .iter()
             .any(|r| r["action"] == "open" && r["id"] == SESSION));
     }
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn mimir_socket_prepare_bootstraps_real_session_refreshes_and_reuses_it_for_send() {
+    let peer = Peer::start().await;
+    let server = TestServer::start_with(peer.config()).await;
+    let mut client = server.connect().await;
+    dispatch(
+        &mut client,
+        create_project("project-1", &peer.shared.workspace),
+    )
+    .await;
+    let prepare = json!({
+        "type": "thread.session.prepare",
+        "commandId": "prepare-1",
+        "threadId": "thread-prepared",
+        "modelSelection": {"instanceId":"mimirLocal","model":"test/org/model","options":{"reasoning":"high"}},
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "bootstrap": {"createThread": {
+            "projectId": "project-1",
+            "title": "Prepared draft",
+            "modelSelection": {"instanceId":"mimirLocal","model":"test/org/model","options":{"reasoning":"high"}},
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": null,
+            "worktreePath": null,
+            "createdAt": "2026-09-07T00:00:00.000Z"
+        }},
+        "createdAt": "2026-09-07T00:00:00.000Z"
+    });
+    dispatch(&mut client, prepare.clone()).await;
+    wait_for_peer(&peer, "preparation creates the SDK session", |state| {
+        state
+            .requests
+            .iter()
+            .any(|request| request["action"] == "create")
+    })
+    .await;
+    {
+        let state = peer.shared.state.lock().unwrap();
+        let create = state
+            .requests
+            .iter()
+            .find(|request| request["action"] == "create")
+            .unwrap();
+        assert_eq!(create["configuration"]["provider"], "test");
+        assert_eq!(create["configuration"]["model"], "org/model");
+        assert_eq!(create["configuration"]["reasoning"], "high");
+        assert_eq!(create["configuration"]["mode"], "build");
+    }
+    let snapshot = server
+        .connect()
+        .await
+        .into_thread_snapshot("thread-prepared")
+        .await;
+    assert!(snapshot["thread"]["messages"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(snapshot["thread"]["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|activity| activity["kind"] == "provider.skills"
+            && activity["payload"]["skills"][0]["name"] == "review"
+            && activity["payload"]["scope"]["providerInstanceId"] == "mimirLocal"
+            && activity["payload"]["scope"]["sdkSessionId"] == SESSION
+            && activity["payload"]["scope"]["cwd"]
+                == peer.shared.workspace.to_string_lossy().as_ref()));
+
+    let mut second_prepare = prepare;
+    second_prepare["commandId"] = json!("prepare-2");
+    second_prepare["modelSelection"] =
+        json!({"instanceId":"mimirLocal","model":"test/org/other","options":{"reasoning":"low"}});
+    second_prepare["interactionMode"] = json!("plan");
+    dispatch(&mut client, second_prepare).await;
+    wait_for_peer(
+        &peer,
+        "repeated preparation refreshes the same session",
+        |state| {
+            state
+                .requests
+                .iter()
+                .filter(|request| request["action"] == "snapshot")
+                .count()
+                >= 1
+        },
+    )
+    .await;
+
+    let subscription = client.watch_conversation("thread-prepared").await;
+    let mut turn = follow_up("thread-prepared", "message-selected", "Use $review 🙂");
+    turn["message"]["skills"] = json!([{
+        "name": "review",
+        "path": null,
+        "visibleText": "$review",
+        "textRange": {"start": 4, "end": 11}
+    }]);
+    dispatch(&mut client, turn).await;
+    let (_, question) = client.events_until_user_input(&subscription).await;
+    assert_eq!(question, "question-request-8");
+    let state = peer.shared.state.lock().unwrap();
+    assert_eq!(
+        state
+            .requests
+            .iter()
+            .filter(|request| request["action"] == "create")
+            .count(),
+        1
+    );
+    let prompt = state
+        .requests
+        .iter()
+        .find(|request| request["action"] == "prompt")
+        .unwrap();
+    assert_eq!(prompt["id"], SESSION);
+    assert_eq!(
+        prompt["input"]["skills"][0],
+        json!({
+            "name": "review",
+            "path": null,
+            "visible_text": "$review",
+            "text_range": {"start": 4, "end": 11}
+        })
+    );
+    drop(state);
     client.close().await;
     server.stop().await;
 }

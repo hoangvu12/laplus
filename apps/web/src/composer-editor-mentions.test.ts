@@ -112,8 +112,34 @@ describe("splitPromptIntoComposerSegments", () => {
     ]);
   });
 
-  it("splits skill tokens followed by whitespace into skill segments", () => {
+  it("keeps typed skill-shaped text as text without a selected-chip identity", () => {
+    expect(splitPromptIntoComposerSegments("Use $review-follow-up please", [], [], true)).toEqual([
+      { type: "text", text: "Use $review-follow-up please" },
+    ]);
+  });
+  it("retains implicit skill chips for providers that use the existing text-token behavior", () => {
     expect(splitPromptIntoComposerSegments("Use $review-follow-up please")).toEqual([
+      { type: "text", text: "Use " },
+      { type: "skill", name: "review-follow-up" },
+      { type: "text", text: " please" },
+    ]);
+  });
+
+  it("splits only an explicitly selected skill into a skill segment", () => {
+    expect(
+      splitPromptIntoComposerSegments(
+        "Use $review-follow-up please",
+        [],
+        [
+          {
+            name: "review-follow-up",
+            visibleText: "$review-follow-up",
+            start: 4,
+            end: 21,
+          },
+        ],
+      ),
+    ).toEqual([
       { type: "text", text: "Use " },
       { type: "skill", name: "review-follow-up" },
       { type: "text", text: " please" },
@@ -151,10 +177,12 @@ describe("splitPromptIntoComposerSegments", () => {
     ]);
   });
 
-  it("keeps skill parsing alongside mentions and terminal placeholders", () => {
+  it("keeps selected skill parsing alongside mentions and terminal placeholders", () => {
     expect(
       splitPromptIntoComposerSegments(
         `Inspect ${INLINE_TERMINAL_CONTEXT_PLACEHOLDER}$review-follow-up after @AGENTS.md `,
+        [],
+        [{ name: "review-follow-up", visibleText: "$review-follow-up", start: 9, end: 26 }],
       ),
     ).toEqual([
       { type: "text", text: "Inspect " },

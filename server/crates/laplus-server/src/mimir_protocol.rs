@@ -1,4 +1,4 @@
-//! Pure bridge-v1 decoding and SDK observation -> native conversation translation.
+//! Pure bridge-v2 decoding and SDK observation -> native conversation translation.
 //! No host-private Mimir types, clocks, credentials or transport live here.
 
 use crate::session::{Decided, Driving, Finished, Settles};
@@ -7,7 +7,7 @@ use crate::threads::{Activity, Change};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const HISTORY_WARNING: &str = "Mimir event history is incomplete. The bridge session was stopped to prevent replies or questions from reaching the wrong turn. Already-observed text and queued messages were retained; unseen text, tools or child history may be missing. Retry a queued message or send again to reopen the saved conversation.";
 
@@ -88,7 +88,7 @@ pub fn version(value: &Value) -> Result<(), String> {
     if value.get("version").and_then(Value::as_u64) == Some(VERSION) {
         Ok(())
     } else {
-        Err("Incompatible Mimir bridge protocol; install/enable a protocol-v1 org.mimir.bridge plugin explicitly.".into())
+        Err("Incompatible Mimir bridge protocol; install/enable org.mimir.bridge 0.3.0 (protocol v2) explicitly.".into())
     }
 }
 
@@ -161,6 +161,16 @@ pub fn models(catalog: &Value) -> Result<Vec<crate::config::ProviderModel>, Stri
         }
     }
     Ok(result)
+}
+
+pub fn skills(snapshot: &Value) -> Result<Vec<Value>, String> {
+    snapshot.get("skills").and_then(Value::as_array).ok_or("Mimir snapshot omitted skills")?.iter().map(|skill| {
+        let name = required(skill, "name")?;
+        let description = skill.get("description").and_then(Value::as_str).unwrap_or("");
+        let path = skill.get("path").cloned().unwrap_or(Value::Null);
+        let bundled = skill.get("bundled").and_then(Value::as_bool).ok_or("Mimir skill omitted bundled")?;
+        Ok(json!({"name":name,"description":description,"path":path,"enabled":true,"bundled":bundled}))
+    }).collect()
 }
 
 pub fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -843,7 +853,7 @@ mod tests {
     use super::*;
     #[test]
     fn mimir_sse_split_unicode_and_opaque_cursor() {
-        let wire = b"id: nonce:42\r\nevent: session\r\ndata: {\"version\":1,\"event\":{\"display\":\"\xc3\xa9\"}}\r\n\r\n";
+        let wire = b"id: nonce:42\r\nevent: session\r\ndata: {\"version\":2,\"event\":{\"display\":\"\xc3\xa9\"}}\r\n\r\n";
         for split in 0..wire.len() {
             let mut decoder = SseDecoder::default();
             let mut frames = decoder.push(&wire[..split]).unwrap();
@@ -857,7 +867,7 @@ mod tests {
     #[test]
     fn mimir_sse_refuses_version_truncation_and_size() {
         assert!(SseDecoder::default()
-            .push(b"event: ready\ndata: {\"version\":2}\n\n")
+            .push(b"event: ready\ndata: {\"version\":1}\n\n")
             .is_err());
         let mut decoder = SseDecoder::default();
         decoder.push(b"data: {").unwrap();

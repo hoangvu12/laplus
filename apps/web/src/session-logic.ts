@@ -732,6 +732,7 @@ export function deriveWorkLogEntries(
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
+    if (activity.kind === "provider.skills") continue;
     // Telemetry feeds the context meter, not the transcript. Include the old
     // Mimir carriers so persisted conversations also regain readable tool groups.
     if (

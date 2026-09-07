@@ -85,9 +85,10 @@ export type ServerProviderSlashCommand = typeof ServerProviderSlashCommand.Type;
 export const ServerProviderSkill = Schema.Struct({
   name: TrimmedNonEmptyString,
   description: Schema.optional(TrimmedNonEmptyString),
-  path: TrimmedNonEmptyString,
+  path: Schema.NullOr(TrimmedNonEmptyString),
   scope: Schema.optional(TrimmedNonEmptyString),
   enabled: Schema.Boolean,
+  bundled: Schema.optional(Schema.Boolean),
   displayName: Schema.optional(TrimmedNonEmptyString),
   shortDescription: Schema.optional(TrimmedNonEmptyString),
 });

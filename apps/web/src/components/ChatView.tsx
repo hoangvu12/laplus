@@ -183,6 +183,11 @@ import {
   type DraftId,
 } from "../composerDraftStore";
 import {
+  encodeComposerSkills,
+  resolveMimirSkillPreparation,
+  type MimirSkillPreparation,
+} from "../composerSkills";
+import {
   appendTerminalContextsToPrompt,
   formatTerminalContextLabel,
   type TerminalContextDraft,
@@ -1161,6 +1166,14 @@ function ChatViewContent(props: ChatViewProps) {
   const setThreadInteractionMode = useAtomCommand(threadEnvironment.setInteractionMode, {
     reportFailure: false,
   });
+
+  const prepareThreadSession = useAtomCommand(threadEnvironment.prepareSession, {
+    reportFailure: false,
+  });
+  const [isPreparingMimirSkills, setIsPreparingMimirSkills] = useState(false);
+  const preparingMimirSkillsRef = useRef<(MimirSkillPreparation & { threadId: ThreadId }) | null>(
+    null,
+  );
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const decideThreadPlan = useAtomCommand(threadEnvironment.decidePlan, { reportFailure: false });
   const steerThreadTurn = useAtomCommand(threadEnvironment.steerTurn, { reportFailure: false });
@@ -1222,6 +1235,10 @@ function ChatViewContent(props: ChatViewProps) {
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
   );
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
+
+  const setComposerDraftSkillSelections = useComposerDraftStore(
+    (store) => store.setSkillSelections,
+  );
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const setComposerDraftTerminalContexts = useComposerDraftStore(
     (store) => store.setTerminalContexts,
@@ -2437,6 +2454,19 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [draftId, routeThreadKey, routeThreadRef, serverThread],
   );
+
+  useEffect(() => {
+    const preparation = preparingMimirSkillsRef.current;
+    if (!preparation || activeThread?.id !== preparation.threadId) return;
+    const outcome = resolveMimirSkillPreparation(activeThread.activities, preparation);
+    if (outcome.status === "pending") return;
+
+    preparingMimirSkillsRef.current = null;
+    setIsPreparingMimirSkills(false);
+    if (outcome.status === "failed") {
+      setThreadError(preparation.threadId, outcome.message);
+    }
+  }, [activeThread, setThreadError]);
 
   const focusComposer = useCallback(() => {
     composerRef.current?.focusAtEnd();
@@ -4581,6 +4611,95 @@ function ChatViewContent(props: ChatViewProps) {
     }
   };
 
+  const onPrepareMimirSkills = useCallback(async () => {
+    if (
+      preparingMimirSkillsRef.current !== null ||
+      !activeThread ||
+      !activeProject ||
+      activeEnvironmentUnavailable
+    ) {
+      return;
+    }
+    const context = composerRef.current?.getSendContext();
+    if (!context?.providerAvailable || context.selectedProvider !== "mimir") return;
+
+    if (sendEnvMode === "worktree" && !activeThread.worktreePath) {
+      setThreadError(
+        activeThread.id,
+        "Mimir skills are available after the new worktree is created. Send the first message without a skill selection.",
+      );
+      return;
+    }
+
+    const preparation = {
+      threadId: activeThread.id,
+      providerInstanceId: context.selectedModelSelection.instanceId,
+      cwd: gitCwd ?? activeProject.workspaceRoot,
+      previousActivityIds: new Set(activeThread.activities.map((activity) => activity.id)),
+    };
+    preparingMimirSkillsRef.current = preparation;
+    setIsPreparingMimirSkills(true);
+    setThreadError(activeThread.id, null);
+    try {
+      const result = await prepareThreadSession({
+        environmentId,
+        input: {
+          threadId: activeThread.id,
+          modelSelection: context.selectedModelSelection,
+          runtimeMode: "full-access",
+          interactionMode,
+          ...(isLocalDraftThread
+            ? {
+                bootstrap: {
+                  createThread: {
+                    projectId: activeProject.id,
+                    title: activeThread.title,
+                    modelSelection: context.selectedModelSelection,
+                    runtimeMode: "full-access",
+                    interactionMode,
+                    branch: activeThread.branch,
+                    worktreePath: activeThread.worktreePath,
+                    createdAt: activeThread.createdAt,
+                  },
+                },
+              }
+            : {}),
+          createdAt: new Date().toISOString(),
+        },
+      });
+      if (result._tag === "Failure") {
+        if (preparingMimirSkillsRef.current === preparation) {
+          preparingMimirSkillsRef.current = null;
+          setIsPreparingMimirSkills(false);
+        }
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            activeThread.id,
+            error instanceof Error ? error.message : "Failed to prepare Mimir skills.",
+          );
+        }
+      }
+    } catch (error) {
+      if (preparingMimirSkillsRef.current === preparation) {
+        preparingMimirSkillsRef.current = null;
+        setIsPreparingMimirSkills(false);
+      }
+      setThreadError(activeThread.id, chatActionErrorMessage(error));
+    }
+  }, [
+    activeEnvironmentUnavailable,
+    activeProject,
+    activeThread,
+    environmentId,
+    gitCwd,
+    interactionMode,
+    isLocalDraftThread,
+    prepareThreadSession,
+    sendEnvMode,
+    setThreadError,
+  ]);
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     if (
@@ -4603,6 +4722,7 @@ function ChatViewContent(props: ChatViewProps) {
       elementContexts: composerElementContexts,
       previewAnnotations: composerPreviewAnnotations,
       reviewComments: composerReviewComments,
+      skillSelections: composerSkillSelections,
       selectedProvider: ctxSelectedProvider,
       selectedModel: ctxSelectedModel,
       selectedProviderModels: ctxSelectedProviderModels,
@@ -4916,6 +5036,15 @@ function ChatViewContent(props: ChatViewProps) {
             role: "user",
             text: outgoingMessageText,
             attachments: turnAttachmentsResult.value,
+            ...(ctxSelectedProvider === "mimir"
+              ? {
+                  skills: encodeComposerSkills(
+                    outgoingMessageText,
+                    promptForSend,
+                    composerSkillSelections,
+                  ),
+                }
+              : {}),
           },
           modelSelection: ctxSelectedModelSelection,
           titleSeed: title,
@@ -4957,6 +5086,8 @@ function ChatViewContent(props: ChatViewProps) {
         composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
         composerElementContextsRef.current = composerElementContextsSnapshot;
         setComposerDraftPrompt(composerDraftTarget, promptForSend);
+
+        setComposerDraftSkillSelections(composerDraftTarget, composerSkillSelections);
         addComposerDraftImages(composerDraftTarget, retryComposerImages);
         setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
         setComposerDraftElementContexts(composerDraftTarget, composerElementContextsSnapshot);
@@ -5997,6 +6128,7 @@ function ChatViewContent(props: ChatViewProps) {
                             isConnecting={isConnecting}
                             isSendBusy={isSendBusy}
                             isPreparingWorktree={isPreparingWorktree}
+                            isPreparingMimirSkills={isPreparingMimirSkills}
                             environmentUnavailable={activeEnvironmentUnavailableState}
                             activePendingApproval={activePendingApproval}
                             pendingApprovals={pendingApprovals}
@@ -6032,6 +6164,7 @@ function ChatViewContent(props: ChatViewProps) {
                             composerTerminalContextsRef={composerTerminalContextsRef}
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
+                            onPrepareMimirSkills={onPrepareMimirSkills}
                             onInterrupt={onInterrupt}
                             onSteer={onSteer}
                             onPlanDecision={onPlanDecision}

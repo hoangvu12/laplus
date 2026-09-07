@@ -205,7 +205,7 @@ impl OpenCodeClient {
                 "moveChanges": false
             })),
         )
-        .await
+            .await
     }
     pub async fn prompt(&self, id: &str, body: &Value) -> Result<(), OpenCodeError> {
         let response = self
@@ -236,7 +236,7 @@ impl OpenCodeClient {
             &format!("session/{id}/abort"),
             Option::<&()>::None,
         )
-        .await
+            .await
     }
     pub async fn revert(&self, id: &str, body: &Value) -> Result<Value, OpenCodeError> {
         self.request_json(Method::POST, &format!("session/{id}/revert"), Some(body))
@@ -3049,7 +3049,7 @@ impl crate::session::Driver for OpenCode {
         self.stop_verification = StopVerification::default();
         let parts = prompt
             .messages()
-            .flat_map(|(text, attachments)| prompt_parts(text, attachments))
+            .flat_map(|(text, attachments, _)| prompt_parts(text, attachments))
             .collect::<Vec<_>>();
         if parts.is_empty() { return Err(std::io::Error::other("OpenCode prompt has no resolvable text or attachments")); }
         let mut body = serde_json::json!({"parts": parts});

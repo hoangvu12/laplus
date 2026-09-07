@@ -261,6 +261,8 @@ enum Command {
     Delete {
         thread_id: String,
     },
+    PrepareSession(PrepareSession),
+
     StartTurn(Box<StartTurn>),
     NativeControl { thread_id: String, control: crate::threads::NativeControl },
     RetryTurn { thread_id: String },
@@ -597,6 +599,8 @@ impl Shell {
             Command::Snooze { thread_id, until } => self.snooze(&thread_id, until)?,
             Command::Unsnooze { thread_id } => self.unsnooze(&thread_id)?,
             Command::Delete { thread_id } => self.delete(&thread_id)?,
+            Command::PrepareSession(prepare) => self.prepare_session(&prepare, config)?,
+
             Command::StartTurn(start) => self.start_turn(&start, config)?,
             Command::NativeControl { thread_id, control } => self.native_control(&thread_id, control, config)?,
             Command::RetryTurn { thread_id } => self.retry_turn(&thread_id, config)?,
@@ -1676,7 +1680,138 @@ impl Shell {
             .map_err(CommandError::new)
     }
 
+    fn candidate_thread(
+        &self,
+        thread_id: &str,
+        bootstrap: Option<&Bootstrap>,
+        config: &ServerConfig,
+    ) -> Result<(Thread, bool), CommandError> {
+        if self.inner.threads.contains(thread_id) {
+            return Ok((self.open_thread(thread_id)?, false));
+        }
+        let Some(fields) = bootstrap.and_then(|bootstrap| bootstrap.create_thread.clone()) else {
+            return Err(CommandError::new(format!(
+                "There is no thread '{thread_id}' on this server, and the command did not ask for one to be created."
+            )));
+        };
+        let project = self.project(&fields.project_id)?;
+        Ok((
+            CreateThread {
+                thread_id: thread_id.to_string(),
+                thread: fields,
+            }
+            .to_thread(&project, &config.settings)?,
+            true,
+        ))
+    }
+
+    /// Prepare the real conversation session without submitting a prompt.
+    fn prepare_session(
+        &self,
+        prepare: &PrepareSession,
+        config: &ServerConfig,
+    ) -> Result<i64, CommandError> {
+        if prepare
+            .bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| bootstrap.prepare_worktree.is_some())
+        {
+            return Err(CommandError::new(
+                "This server cannot prepare a git worktree for a thread. Run the conversation in the project's own checkout instead.",
+            ));
+        }
+        let (mut thread, pending) =
+            self.candidate_thread(&prepare.thread_id, prepare.bootstrap.as_ref(), config)?;
+        if thread.provider.driver != "mimir" {
+            return Err(CommandError::new(
+                "Session preparation is supported only by Mimir",
+            ));
+        }
+        selection_for(&thread, &prepare.model_selection)?;
+        crate::mimir_protocol::configuration(
+            prepare.model_selection.get("model").and_then(Value::as_str),
+            prepare
+                .model_selection
+                .get("options")
+                .unwrap_or(&Value::Null),
+            &prepare.interaction_mode,
+            &prepare.runtime_mode,
+        )
+        .map_err(CommandError::new)?;
+        let selection_changed = thread.model_selection != prepare.model_selection;
+        if thread.session.as_ref().is_some_and(|session| {
+            session.status.is_working() || session.status == SessionStatus::Ready
+        }) {
+            self.inner
+                .threads
+                .refresh(&prepare.thread_id)
+                .map_err(CommandError::new)?;
+            return self
+                .inner
+                .threads
+                .apply(
+                    &prepare.thread_id,
+                    Change::Session(thread.session.clone().expect("checked above")),
+                )
+                .ok_or_else(|| self.not_open(&prepare.thread_id));
+        }
+        if !pending && selection_changed {
+            self.inner
+                .threads
+                .apply(
+                    &prepare.thread_id,
+                    Change::MetaUpdated(MetaUpdate {
+                        title: None,
+                        title_regeneration: None,
+                        regenerate_title: false,
+                        previous_title: None,
+                        model_selection: Some(prepare.model_selection.clone()),
+                        branch: None,
+                        worktree_path: None,
+                    }),
+                )
+                .ok_or_else(|| self.not_open(&prepare.thread_id))?;
+        }
+        thread.model_selection = prepare.model_selection.clone();
+        thread.runtime_mode = prepare.runtime_mode.clone();
+        thread.interaction_mode = prepare.interaction_mode.clone();
+
+        let project = self.project(&thread.project_id)?;
+        let prepared =
+            crate::session::prepare(&thread, &config.settings, Arc::clone(&self.inner.mcp))
+                .map_err(CommandError::new)?;
+        let starting = crate::session::starting(
+            &thread,
+            &where_the_work_happens(&thread, &project),
+            prepared,
+        );
+        if pending {
+            self.inner
+                .threads
+                .create(thread)
+                .map_err(CommandError::new)?;
+        }
+        let sequence = self
+            .inner
+            .threads
+            .apply(
+                &prepare.thread_id,
+                Change::Session(crate::threads::Session {
+                    status: SessionStatus::Starting,
+                    runtime_mode: starting.runtime_mode.clone(),
+                    active_turn_id: None,
+                    last_error: None,
+                    updated_at: now_iso(),
+                }),
+            )
+            .ok_or_else(|| self.not_open(&prepare.thread_id))?;
+        crate::session::prepare_session(&self.inner.threads, &starting)
+            .map_err(CommandError::new)?;
+        Ok(sequence)
+    }
+
     /// Send a turn: put the prompt in the transcript and hand it to the agent.
+
     ///
     /// Returns as soon as the prompt is queued. Nothing here waits for a process
     /// to start, let alone for the agent to answer — the developer has just
@@ -1690,31 +1825,10 @@ impl Shell {
         }
 
         // Bootstrapping is how the UI's composer starts a *new* conversation.
-        // Build the candidate now, but do not publish it until every part of its
-        // first turn has passed the same preflight as an existing thread. A
-        // refused first turn must leave a draft as what it was: absent here.
-        let pending = if !self.inner.threads.contains(&start.thread_id) {
-            let Some(create) = start.bootstrap_thread() else {
-                return Err(CommandError::new(format!(
-                    "There is no thread '{}' on this server, and the turn did not ask for one to \
-                     be created.",
-                    start.thread_id
-                )));
-            };
-            let project = self.project(&create.thread.project_id)?;
-            Some(create.to_thread(&project, &config.settings)?)
-        } else {
-            None
-        };
-
-        // Everything that can still refuse the turn happens before anything is
-        // published. A refusal that had already created the draft or put the
-        // prompt in its transcript would leave a conversation with no agent
-        // alive to settle it.
-        let thread = match &pending {
-            Some(thread) => thread.clone(),
-            None => self.open_thread(&start.thread_id)?,
-        };
+        // Candidate construction is shared with session preparation so opening
+        // the skill picker and pressing Send resolve exactly the same thread.
+        let (thread, pending) =
+            self.candidate_thread(&start.thread_id, start.bootstrap.as_ref(), config)?;
         let project = self.project(&thread.project_id)?;
         if let Some(selection) = &start.model_selection {
             selection_for(&thread, selection)?;
@@ -1756,10 +1870,10 @@ impl Shell {
             ),
         }.map_err(CommandError::new)?;
 
-        if let Some(thread) = pending {
+        if pending {
             self.inner
                 .threads
-                .create(thread)
+                .create(thread.clone())
                 .map_err(CommandError::new)?;
         }
 
@@ -1882,6 +1996,8 @@ impl Shell {
             turn_id: turn_id.clone(),
             text: start.message.text.clone(),
             attachments,
+
+            skills: start.message.skills.clone(),
             followups: Vec::new(),
             wanted: crate::threads::Retune {
                 runtime_mode: starting.runtime_mode.clone(),
@@ -2651,6 +2767,18 @@ struct CreateThreadPayload {
     thread: ThreadFields,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareSession {
+    thread_id: String,
+    model_selection: Value,
+    runtime_mode: String,
+    interaction_mode: String,
+
+    #[serde(default)]
+    bootstrap: Option<Bootstrap>,
+}
+
 /// `thread.turn.start` — the command the whole ticket exists to answer.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2689,6 +2817,9 @@ struct TurnMessage {
     /// asset service the spec puts out of scope.
     #[serde(default)]
     attachments: Vec<Value>,
+
+    #[serde(default)]
+    skills: Vec<crate::threads::PromptSkill>,
 }
 
 /// The work a turn asks to have done before it starts.
@@ -2995,15 +3126,6 @@ impl StartTurn {
         self.bootstrap
             .as_ref()
             .is_some_and(|bootstrap| bootstrap.prepare_worktree.is_some())
-    }
-
-    /// The thread this turn asks to have created, if it asks for one.
-    fn bootstrap_thread(&self) -> Option<CreateThread> {
-        let fields = self.bootstrap.as_ref()?.create_thread.clone()?;
-        Some(CreateThread {
-            thread_id: self.thread_id.clone(),
-            thread: fields,
-        })
     }
 }
 
@@ -3314,6 +3436,27 @@ impl Command {
             // The overrides are checked only where one arrived, which is what
             // keeps absent meaning "leave the thread's alone" — see
             // [`StartTurn`], where that is why the fields have no default.
+            "thread.session.prepare" => {
+                let prepare: PrepareSession = read(payload, kind)?;
+                let thread_id = non_blank(prepare.thread_id, "threadId", kind)?;
+                named_by_the_contract(
+                    &prepare.runtime_mode,
+                    &RUNTIME_MODES,
+                    "runtime mode",
+                    &thread_id,
+                )?;
+                named_by_the_contract(
+                    &prepare.interaction_mode,
+                    &INTERACTION_MODES,
+                    "interaction mode",
+                    &thread_id,
+                )?;
+                Ok(Command::PrepareSession(PrepareSession {
+                    thread_id,
+                    ..prepare
+                }))
+            }
+
             "thread.turn.start" => {
                 let start: StartTurn = read(payload, kind)?;
                 let thread_id = non_blank(start.thread_id, "threadId", kind)?;
@@ -3526,6 +3669,8 @@ impl Command {
             | Command::Snooze { thread_id, .. }
             | Command::Unsnooze { thread_id }
             | Command::StopSession { thread_id } => Some(thread_id),
+            Command::PrepareSession(prepare) => Some(&prepare.thread_id),
+
             Command::StartTurn(start) => Some(&start.thread_id),
             Command::RetryTurn { thread_id } => Some(thread_id),
             Command::NativeControl { thread_id, .. } => Some(thread_id),

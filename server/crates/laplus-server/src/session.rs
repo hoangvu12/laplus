@@ -259,6 +259,14 @@ pub(crate) trait Driver: Send + Sized {
         async { Err(std::io::Error::other("This provider does not support native saved-plan decisions")) }
     }
 
+    fn refresh(&mut self) -> impl Future<Output = std::io::Result<Decided>> + Send {
+        async {
+            Err(std::io::Error::other(
+                "This provider does not expose refreshable session presentation",
+            ))
+    }
+    }
+
     /// Stop the turn in flight without ending the session.
     ///
     /// Nothing is waited for: what the request did arrives through
@@ -389,6 +397,8 @@ pub struct Start {
     /// The model the child is running under — the launch flag at first, and then
     /// whatever a successful push has moved it to. See [`retune`].
     pub model: Option<String>,
+    pub model_options: serde_json::Value,
+    pub interaction_mode: String,
     /// The runtime mode the child is running under, on the same terms as
     /// [`Start::model`].
     ///
@@ -487,6 +497,8 @@ pub fn send(threads: &Threads, start: &Start, turn_id: String, text: String, att
         turn_id,
         text,
         attachments,
+
+        skills: Vec::new(),
         followups: Vec::new(),
         wanted: Retune { runtime_mode: start.runtime_mode.clone(), model: start.model.clone(), model_options: Value::Null, interaction_mode: "default".into() },
     })
@@ -504,6 +516,22 @@ pub fn control(threads: &Threads, start: &Start, control: crate::threads::Native
     threads.control(&start.thread_id, control)
 }
 
+
+/// Start a real provider session without manufacturing a user turn. Mimir uses
+/// this to expose the catalog discovered in its session snapshot before send.
+pub fn prepare_session(threads: &Threads, start: &Start) -> Result<(), String> {
+    let DriverStart::Mimir(_) = &start.driver else {
+        return Err("Session preparation is supported only by Mimir".into());
+    };
+    let driving = threads.clone();
+    let starting = start.clone();
+    threads.attach(&start.thread_id, move |incoming, signals, epoch| {
+        tokio::spawn(drive::<crate::mimir::Mimir>(
+            driving, starting, incoming, signals, epoch,
+        ))
+    });
+    Ok(())
+}
 
 pub fn send_prompt(threads: &Threads, start: &Start, prompt: Prompt) -> Result<(), String> {
     let driving = threads.clone();
@@ -845,6 +873,18 @@ async fn drive<D: Driver>(
                 Signal::Control(control) => {
                     native_control(&threads, &start, &mut driver, &mut driving, control).await;
                 }
+                Signal::Refresh => match driver.refresh().await {
+                    Ok(decided) => spend(&threads, &start, decided),
+                    Err(error) => {
+                        threads.apply(
+                            &start.thread_id,
+                            Change::Activity(Activity::failed(
+                                "provider.skills",
+                                &error.to_string(),
+                            )),
+                        );
+                    }
+                },
 
                 Signal::Answer(answered) => {
                     answer(&threads, &start, &mut driver, &mut driving, answered).await
@@ -1037,6 +1077,15 @@ async fn drive<D: Driver>(
             Next::Signal(Some(Signal::Control(control))) => {
                 native_control(&threads, &start, &mut driver, &mut driving, control).await;
             }
+            Next::Signal(Some(Signal::Refresh)) => match driver.refresh().await {
+                Ok(decided) => spend(&threads, &start, decided),
+                Err(error) => {
+                    threads.apply(
+                        &start.thread_id,
+                        Change::Activity(Activity::failed("provider.skills", &error.to_string())),
+                    );
+                }
+            },
 
             Next::Signal(Some(Signal::Answer(answered))) => {
                 answer(&threads, &start, &mut driver, &mut driving, answered).await;
@@ -2542,6 +2591,8 @@ pub fn starting(thread: &Thread, workspace_root: &str, prepared: PreparedDriver)
         thread_id: thread.id.clone(),
         workspace_root: workspace_root.to_string(),
         model: thread.model(),
+        model_options: thread.model_selection.get("options").cloned().unwrap_or(serde_json::Value::Null),
+        interaction_mode: thread.interaction_mode.clone(),
         runtime_mode: thread.runtime_mode.clone(),
         resume_cursor: thread
             .provider_resume_cursor
@@ -2607,6 +2658,8 @@ mod continuation_tests {
             thread_id: thread.id.clone(),
             workspace_root: "/work".to_string(),
             model: thread.model(),
+            model_options: serde_json::Value::Null,
+            interaction_mode: thread.interaction_mode.clone(),
             runtime_mode: thread.runtime_mode.clone(),
             resume_cursor: None,
             provider: thread.provider.clone(),
